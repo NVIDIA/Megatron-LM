@@ -85,9 +85,10 @@ import torch.distributed as dist
 import torch.distributed.nn as dist_nn
 import torch.utils.data
 
-from megatron.core import parallel_state
 from megatron.core._rank_utils import safe_get_rank
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.utils import get_attr_wrapped_model
 from megatron.training import get_args
 from megatron.training.distillation.utils import (
     BATCHED_TAR_RE,
@@ -107,6 +108,7 @@ from megatron.training.distillation.utils import (
     iter_logprobs_tar_entries,
     pad_and_stack_cu_seqlens,
     peek_first_logprobs_metadata,
+    resolve_distillation_process_groups,
     slice_tensor_for_cp_rank,
     sorted_batched_tars,
     storage_basename,
@@ -212,8 +214,9 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
 
     Shard discovery refreshes the directory listing after known shards are
     exhausted so a concurrent writer can publish more data; remote refreshes
-    use a per-PP-stage rank-0 broadcast (TP×DP×CP group) to avoid object-store
-    list storms without deadlocking under PP>1.
+    use a per-PP-stage rank-0 broadcast (TP×DP×CP group, ``tp_dp_cp_group``;
+    ``None`` selects the group of the global parallel state) to avoid
+    object-store list storms without deadlocking under PP>1.
 
     Yields ``(start_sample, values_list, indices_list)``, one entry per load
     iteration (lists have one entry per load microbatch step), with CP
@@ -237,6 +240,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         msc_prefetch_depth: int = 2,
         ignore_hash: bool = False,
         meta: Optional[Dict[str, Any]] = None,
+        tp_dp_cp_group: Optional[dist.ProcessGroup] = None,
     ):
         self.logprobs_dir = logprobs_dir
         self.cp_rank = cp_rank
@@ -244,6 +248,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         self.dp_rank = dp_rank
         self.dp_size = dp_size
         self.start_iteration = start_iteration
+        self._tp_dp_cp_group = tp_dp_cp_group
 
         self._remote_logprobs = is_remote_storage_path(logprobs_dir)
         self._msc_prefetch_depth = max(0, msc_prefetch_depth)
@@ -255,7 +260,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         self._decode_threads = max(1, decode_threads)
 
         if meta is None:
-            meta = peek_first_logprobs_metadata(logprobs_dir)
+            meta = peek_first_logprobs_metadata(logprobs_dir, tp_dp_cp_group=tp_dp_cp_group)
         if meta is None:
             raise FileNotFoundError(
                 f"No batched tar shards (or unreadable metadata) found in '{logprobs_dir}'."
@@ -402,7 +407,12 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         """
         prefix = batched_tar_prefix(dp_save)
         all_urls = v2_sorted_batched_tars(
-            storage_glob_with_caching(self.logprobs_dir, f"*{prefix}*.tar", cached=False)
+            storage_glob_with_caching(
+                self.logprobs_dir,
+                f"*{prefix}*.tar",
+                cached=False,
+                tp_dp_cp_group=self._tp_dp_cp_group,
+            )
         )
         new_urls = []
         for url in all_urls:
@@ -763,6 +773,7 @@ class LegacyTeacherTarDataset(TeacherTarDataset):
         msc_prefetch_depth: int = 2,
         ignore_hash: bool = False,
         meta: Optional[Dict[str, Any]] = None,
+        tp_dp_cp_group: Optional[dist.ProcessGroup] = None,
     ):
         # NOTE: intentionally bypass the v2 base ``__init__`` because it
         # demands v2 metadata fields and constructs a LogprobsReshardPlan
@@ -773,6 +784,7 @@ class LegacyTeacherTarDataset(TeacherTarDataset):
         self.dp_rank = dp_rank
         self.dp_size = dp_size
         self.start_iteration = start_iteration
+        self._tp_dp_cp_group = tp_dp_cp_group
 
         self._remote_logprobs = is_remote_storage_path(logprobs_dir)
         self._msc_prefetch_depth = max(0, msc_prefetch_depth)
@@ -834,6 +846,7 @@ class LegacyTeacherTarDataset(TeacherTarDataset):
                 dp_size,
                 int(args.micro_batch_size),
                 int(args.global_batch_size),
+                tp_dp_cp_group=tp_dp_cp_group,
             )
         )
         if dp_size_saved != dp_size:
@@ -849,7 +862,13 @@ class LegacyTeacherTarDataset(TeacherTarDataset):
 
     @staticmethod
     def _compute_dp_remapping(
-        logprobs_dir: str, dp_rank: int, dp_size: int, micro_batch_size: int, global_batch_size: int
+        logprobs_dir: str,
+        dp_rank: int,
+        dp_size: int,
+        micro_batch_size: int,
+        global_batch_size: int,
+        *,
+        tp_dp_cp_group: Optional[dist.ProcessGroup] = None,
     ) -> Tuple[List[int], List[Tuple[int, int]], int, int]:
         """Map current-rank microbatches to ``(saved_rank, saved_mb)`` pairs.
 
@@ -860,7 +879,7 @@ class LegacyTeacherTarDataset(TeacherTarDataset):
         ...``.  Mapping through the global microbatch index supports arbitrary
         saved/current DP ratios without special stride/interleave cases.
         """
-        dp_size_saved = detect_saved_dp_size(logprobs_dir)
+        dp_size_saved = detect_saved_dp_size(logprobs_dir, tp_dp_cp_group=tp_dp_cp_group)
 
         if dp_size_saved is None:
             dp_size_saved = dp_size
@@ -903,7 +922,12 @@ class LegacyTeacherTarDataset(TeacherTarDataset):
     def _discover_shards(self, already_processed: set, dp_save: int) -> List[str]:
         prefix = batched_tar_prefix(dp_save)
         all_urls = sorted_batched_tars(
-            storage_glob_with_caching(self.logprobs_dir, f"*{prefix}*.tar", cached=False)
+            storage_glob_with_caching(
+                self.logprobs_dir,
+                f"*{prefix}*.tar",
+                cached=False,
+                tp_dp_cp_group=self._tp_dp_cp_group,
+            )
         )
         new_urls = []
         for url in all_urls:
@@ -1032,16 +1056,18 @@ def make_teacher_tar_dataset(
     decode_lookahead: Optional[int] = None,
     msc_prefetch_depth: int = 2,
     ignore_hash: bool = False,
+    tp_dp_cp_group: Optional[dist.ProcessGroup] = None,
 ) -> TeacherTarDataset:
     """Build the right :class:`TeacherTarDataset` for the on-disk format.
 
-    Peeks any existing tar's ``_meta.json`` (rank-0 on the TP×DP×CP group,
-    then broadcast) to read ``saver.format_version``; instantiates
-    :class:`TeacherTarDataset` for v2 tars and :class:`LegacyTeacherTarDataset`
-    for v1.  Callers should always go through this factory rather than
-    constructing the classes directly.
+    Peeks any existing tar's ``_meta.json`` (rank-0 on the TP×DP×CP group
+    *tp_dp_cp_group*, then broadcast) to read ``saver.format_version``;
+    instantiates :class:`TeacherTarDataset` for v2 tars and
+    :class:`LegacyTeacherTarDataset` for v1.  Callers should always go through
+    this factory rather than constructing the classes directly.  ``None``
+    selects the TP×DP×CP group of the global parallel state.
     """
-    meta = peek_first_logprobs_metadata(logprobs_dir)
+    meta = peek_first_logprobs_metadata(logprobs_dir, tp_dp_cp_group=tp_dp_cp_group)
     fmt = (meta or {}).get("saver", {}).get("format_version", 1)
     cls: type = TeacherTarDataset if fmt >= 2 else LegacyTeacherTarDataset
     return cls(
@@ -1056,6 +1082,7 @@ def make_teacher_tar_dataset(
         msc_prefetch_depth=msc_prefetch_depth,
         ignore_hash=ignore_hash,
         meta=meta,
+        tp_dp_cp_group=tp_dp_cp_group,
     )
 
 
@@ -1169,6 +1196,9 @@ class CachedLogitsKDLoss:
         msc_prefetch_depth: For remote MSC tar shards, how many whole
             shard objects to materialize into the MSC cache ahead of
             sequential tar consumption.
+        pg_collection: Process groups of the student model; the loss uses its
+            ``tp``, ``cp``, ``dp_gtp_remat`` and ``tp_dp_cp`` groups.  ``None``
+            selects the groups of the global parallel state.
     """
 
     def __init__(
@@ -1177,20 +1207,23 @@ class CachedLogitsKDLoss:
         decode_threads: int = 1,
         msc_prefetch_depth: int = 2,
         ignore_hash: bool = False,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         self.logprobs_dir = logprobs_dir
         self._decode_threads = decode_threads
         self._msc_prefetch_depth = msc_prefetch_depth
         self._ignore_hash = ignore_hash
 
-        # ---- parallel-state bookkeeping ----
-        self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        self.tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        self.tp_group = parallel_state.get_tensor_model_parallel_group()
-        self.cp_rank = parallel_state.get_context_parallel_rank()
-        self.cp_size = parallel_state.get_context_parallel_world_size()
-        self.dp_rank = parallel_state.get_data_parallel_rank()
-        self.dp_size = parallel_state.get_data_parallel_world_size()
+        # ---- process groups of the student model ----
+        pg_collection = resolve_distillation_process_groups(pg_collection, "CachedLogitsKDLoss")
+        self.tp_group = pg_collection.tp
+        self.tp_rank = self.tp_group.rank()
+        self.tp_size = self.tp_group.size()
+        self.cp_rank = pg_collection.cp.rank()
+        self.cp_size = pg_collection.cp.size()
+        self.dp_rank = pg_collection.dp_gtp_remat.rank()
+        self.dp_size = pg_collection.dp_gtp_remat.size()
+        self._tp_dp_cp_group = pg_collection.tp_dp_cp
 
         # Whether this run packs multiple documents per sequence (--sft).
         # Gates the sequence-length trim below: trimming the raw tail only
@@ -1241,6 +1274,7 @@ class CachedLogitsKDLoss:
             decode_threads=self._decode_threads,
             msc_prefetch_depth=self._msc_prefetch_depth,
             ignore_hash=self._ignore_hash,
+            tp_dp_cp_group=self._tp_dp_cp_group,
         )
         # Remote shard discovery uses a per-PP-stage collective, so keep the
         # iterable in the main training process (all last-PP ranks participate).
@@ -1426,12 +1460,13 @@ class LossFuncCallable:
             model (LanguageModule): The model (can be wrapped)
         """
         if self.kd_func is None:
-            # Construct here so parallel_state is initialized by now
+            # Constructed on the first call, on the process groups of the model being trained.
             self.kd_func = CachedLogitsKDLoss(
                 logprobs_dir=self.logprobs_dir,
                 decode_threads=self.decode_threads,
                 msc_prefetch_depth=self.msc_prefetch_depth,
                 ignore_hash=self.ignore_hash,
+                pg_collection=get_attr_wrapped_model(model, "pg_collection"),
             )
 
         # LM loss
@@ -1457,7 +1492,7 @@ class LossFuncCallable:
             loss_kd = self.kd_func(logits)
             loss_kd = self._mask_loss(loss_kd, loss_mask)
             # Requires extra TP reduction
-            dist.all_reduce(loss_kd, group=parallel_state.get_tensor_model_parallel_group())
+            dist.all_reduce(loss_kd, group=self.kd_func.tp_group)
         except StopIteration as e:
             # Last-PP ranks all hit this; keep the failure loud but avoid a
             # full traceback storm across TP×DP×CP.
