@@ -14,7 +14,7 @@ import torch
 
 import pretrain_gpt
 import pretrain_hybrid
-from megatron.core import parallel_state
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.training.utils import is_first_or_last_pipeline_stage
 from tests.unit_tests.test_utilities import Utils
@@ -32,6 +32,14 @@ class _FakeGroup:
 
     def size(self):
         return len(self.ranks)
+
+
+class _Wrapper:
+    def __init__(self, module):
+        self.module = module
+
+    def __call__(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
 
 
 class _HostValue:
@@ -317,3 +325,47 @@ def test_get_batch_reads_on_a_tensor_parallel_grid_unlike_the_global_one(module,
         torch.testing.assert_close(tokens.cpu(), expected)
     finally:
         Utils.destroy_model_parallel()
+
+
+def test_vlm_get_batch_broadcasts_over_the_supplied_tensor_parallel_group(monkeypatch):
+    import pretrain_vlm
+
+    _forbid_global_process_groups(monkeypatch)
+    tp_group = _FakeGroup(1, [3, 7])
+    monkeypatch.setattr(
+        pretrain_vlm,
+        "get_args",
+        lambda: SimpleNamespace(context_parallel_size=1, sequence_parallel=False),
+    )
+    calls = []
+
+    def broadcast_data(keys, data, datatype, tp_group=None):
+        calls.append((tuple(keys), tp_group))
+        return {key: torch.zeros(1, 4, dtype=datatype) for key in keys}
+
+    monkeypatch.setattr(tensor_parallel, "broadcast_data", broadcast_data)
+
+    pretrain_vlm.get_batch(None, pg_collection=ProcessGroupCollection(tp=tp_group))
+
+    assert calls == [
+        (("tokens", "position_ids", "labels"), tp_group),
+        (("image", "loss_mask"), tp_group),
+    ]
+
+
+def test_vlm_forward_step_passes_the_model_groups(monkeypatch):
+    import pretrain_vlm
+
+    pgs = ProcessGroupCollection(tp=_FakeGroup(0, [0]))
+    output = object()
+    model = _Wrapper(Mock(spec=[], pg_collection=pgs, return_value=(output, object())))
+    fetch = Mock(return_value=(None,) * 7)
+    monkeypatch.setattr(pretrain_vlm, "get_batch", fetch)
+    monkeypatch.setattr(pretrain_vlm, "get_timers", lambda: Mock())
+    data_iterator = object()
+
+    output_tensor, _ = pretrain_vlm.forward_step(data_iterator, model)
+
+    assert output_tensor is output
+    assert fetch.call_args.args == (data_iterator,)
+    assert fetch.call_args.kwargs["pg_collection"] is pgs
