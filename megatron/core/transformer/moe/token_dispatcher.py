@@ -1969,7 +1969,13 @@ class _NCCLEPManager(_DispatchManager):
             self.token_probs = probs.gather(1, self.token_indices.masked_fill(invalid_routes, 0))
             self.token_probs = self.token_probs.masked_fill(invalid_routes, 0)
         self.num_local_tokens = num_tokens
-        self._is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+        # tokens_per_sample marks fixed-length samples (inter-document masking), whose per-rank
+        # count is fixed like BSHD; only variable-length packing needs the config bound.
+        self._is_thd = (
+            packed_seq_params is not None
+            and packed_seq_params.qkv_format == "thd"
+            and packed_seq_params.tokens_per_sample is None
+        )
 
     def _dispatch_token_bound(self) -> int:
         """Upper bound on the tokens one rank feeds into a dispatch, fixed at bootstrap.
@@ -1977,7 +1983,9 @@ class _NCCLEPManager(_DispatchManager):
         BSHD microbatches all have the first microbatch's shape. Packed (THD) microbatches vary
         per rank and per step, so the bound comes from the config: max_seqlen_per_dp_cp_rank is
         the per-CP-rank ceiling the mcore packing schedulers enforce, otherwise seq_length is the
-        packed length, split over CP. Both are sequence-parallel slices under TP.
+        packed length, split over CP. Both are sequence-parallel slices under TP. The bound is
+        identical on every rank, as NCCL EP bootstrap requires, so a rank whose input exceeds it
+        is a configuration error.
         """
         if not self._is_thd:
             return self.num_local_tokens
@@ -1995,9 +2003,12 @@ class _NCCLEPManager(_DispatchManager):
                 "per rank, and packed (THD) inputs vary per rank: set seq_length (the packed "
                 "sequence length) or max_seqlen_per_dp_cp_rank in the config."
             )
-        # Inter-document masking with micro_batch_size > 1 is THD with a fixed
-        # micro_batch_size * seq_length tokens per rank.
-        bound = max(bound, self.num_local_tokens)
+        if self.num_local_tokens > bound:
+            raise RuntimeError(
+                f"'ncclep' got {self.num_local_tokens} packed tokens on this rank, above the "
+                f"{bound} per-rank bound from {source}; raise max_seqlen_per_dp_cp_rank or "
+                "seq_length to the real per-rank maximum."
+            )
         utils.log_single_rank(
             logger, logging.INFO, f"ncclep: max dispatch tokens per rank {bound} from {source}"
         )
@@ -2087,10 +2098,16 @@ class _NCCLEPManager(_DispatchManager):
         # opaque ProcessGroup._get_backend()._comm_ptr() access that dynamo cannot trace.
         self._ensure_bootstrap()
         if hidden_states.shape[0] > self._max_tokens_per_rank:
+            remedy = (
+                "raise max_seqlen_per_dp_cp_rank or seq_length to the real per-rank maximum"
+                if self._is_thd
+                else "non-packed (BSHD) inputs are sized from the first microbatch, so later "
+                "microbatches must not carry more tokens per rank"
+            )
             raise RuntimeError(
                 f"'ncclep' dispatch got {hidden_states.shape[0]} tokens on this rank, above the "
                 f"{self._max_tokens_per_rank} its NCCL EP buffers were sized for at bootstrap; "
-                "raise max_seqlen_per_dp_cp_rank or seq_length to the real per-rank maximum."
+                f"{remedy}."
             )
         # Fresh buffer per dispatch; held until the matching combine consumes it.
         self._buffer = new_nccl_ep_buffer(

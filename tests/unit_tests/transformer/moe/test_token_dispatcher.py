@@ -799,9 +799,6 @@ def test_ncclep_padding_mask_marks_routes_invalid(routing_mode):
             dict(seq_length=4096, context_parallel_size=2, tensor_model_parallel_size=2),
             2048,
         ),
-        # THD: the first dispatch already exceeds the config bound (inter-document masking with
-        # micro_batch_size > 1); the measured count wins.
-        (True, 3000, dict(seq_length=2048), 3008),
     ],
 )
 def test_ncclep_bootstrap_token_bound(
@@ -831,6 +828,50 @@ def test_ncclep_thd_requires_a_sequence_length_bound(monkeypatch):
     manager._is_thd = True
     with pytest.raises(ValueError, match="max_seqlen_per_dp_cp_rank"):
         manager._ensure_bootstrap()
+
+
+def test_ncclep_thd_rejects_first_microbatch_above_the_bound(monkeypatch):
+    """The bound must be identical on every rank for the NCCL EP bootstrap, so a rank above it
+    fails before the collective instead of silently enlarging its own buffers."""
+    bootstrap_calls = []
+    monkeypatch.setattr(token_dispatcher, "is_nccl_ep_bootstrapped", lambda: False)
+    monkeypatch.setattr(
+        token_dispatcher, "ensure_nccl_ep_bootstrapped", lambda *a, **kw: bootstrap_calls.append(kw)
+    )
+    manager = _ncclep_manager_stub(seq_length=2048)
+    manager.num_local_tokens = 3000
+    manager._is_thd = True
+    with pytest.raises(RuntimeError, match="per-rank bound from seq_length"):
+        manager._ensure_bootstrap()
+    assert not bootstrap_calls
+
+
+def test_ncclep_fixed_length_packed_input_uses_the_measured_bound():
+    """tokens_per_sample marks fixed-length samples (inter-document masking, any micro batch
+    size): their per-rank count is fixed like BSHD, so the config bound is not required."""
+    manager = _ncclep_manager_stub()
+    routing_map = torch.tensor([[0, 1]] * 4, dtype=torch.int32)
+    probs = torch.full((4, manager.num_experts), 0.25)
+    manager.setup_metadata(
+        routing_map, probs, packed_seq_params=PackedSeqParams(qkv_format="thd", tokens_per_sample=2)
+    )
+    assert not manager._is_thd
+    manager.setup_metadata(routing_map, probs, packed_seq_params=PackedSeqParams(qkv_format="thd"))
+    assert manager._is_thd
+
+
+@pytest.mark.parametrize("is_thd", [False, True])
+def test_ncclep_dispatch_guard_names_the_right_remedy(monkeypatch, is_thd):
+    monkeypatch.setattr(token_dispatcher, "is_nccl_ep_bootstrapped", lambda: True)
+    manager = _ncclep_manager_stub()
+    manager._bootstrapped = True
+    manager._max_tokens_per_rank = 128
+    manager._is_thd = is_thd
+    with pytest.raises(RuntimeError, match="sized for") as excinfo:
+        manager.dispatch(torch.zeros(192, manager.hidden_dim))
+    message = str(excinfo.value)
+    assert ("seq_length" in message) is is_thd
+    assert ("first microbatch" in message) is not is_thd
 
 
 def test_hybridep_sparse_fallback_marks_empty_routes_invalid(monkeypatch):
