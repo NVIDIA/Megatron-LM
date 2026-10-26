@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import signal
 from dataclasses import dataclass, field
@@ -501,16 +501,16 @@ class CheckpointConfig:
     """Number of latest checkpoint to be saved."""
 
     save_optim: bool = True
-    """Do not save current optimizer."""
+    """Save the optimizer state with every checkpoint (``--no-save-optim`` disables it)."""
 
     save_rng: bool = True
-    """Do not save current rng state."""
+    """Save the RNG state with every checkpoint (``--no-save-rng`` disables it)."""
 
     load: str | None = None
     """Directory containing a model checkpoint."""
 
     load_optim: bool = True
-    """Do not load optimizer when loading checkpoint."""
+    """Load the optimizer state when loading a checkpoint (``--no-load-optim`` disables it)."""
 
     load_main_params_from_ckpt: bool = False
     """Load main parameters from checkpoint. When loading a model from a checkpoint without loading
@@ -519,7 +519,7 @@ class CheckpointConfig:
     """
 
     load_rng: bool = True
-    """Do not load rng state when loading checkpoint."""
+    """Load the RNG state when loading a checkpoint (``--no-load-rng`` disables it)."""
 
     non_persistent_save_interval: int | None = None
     """Number of iterations between non-persistent saves."""
@@ -737,6 +737,32 @@ class CheckpointConfig:
     --load-main-params-from-ckpt and any optimizer. Supports the tensorwise, mxfp8, blockwise and
     nvfp4 recipes (not delayed scaling) and, with --ckpt-fully-parallel-load, only the broadcast
     exchange algorithm. Pass it explicitly on the inference command line."""
+
+    dist_ckpt_workers: int = 1
+    """Number of workers for distributed checkpointing. Only used for async save.
+    If set to 1, the checkpointing is performed in a single process."""
+
+    override_ckpt_iteration: int | None = None
+    """Override the iteration stored in the loaded checkpoint. Also resets
+    consumed_train_samples accordingly so the data loader replays samples from that
+    iteration onward."""
+
+    ckpt_drop_redundant_extra_state: bool = False
+    """Drop TE `_extra_state` artifacts that carry no irreplaceable state (no FP8, or
+    block/current FP8 scaling) from the distributed checkpoint, keeping them local instead
+    of writing them. Only delayed-scaling `_extra_state` (amax history + scale) is ever
+    needed and it is always persisted regardless of this flag. By default (flag off) all
+    `_extra_state` are persisted, preserving the previous behavior. Older checkpoints load
+    unchanged either way."""
+
+    @property
+    def use_dist_ckpt(self) -> bool:
+        """Whether ``ckpt_format`` names a distributed checkpoint (everything but ``torch``).
+
+        Derived, never stored: ``update_use_dist_ckpt`` keeps the legacy ``args`` copy for the
+        readers that still take their checkpoint settings from the argument namespace.
+        """
+        return self.ckpt_format != "torch"
 
     def __post_init__(self):
         from megatron.training.utils import has_nvrx_checkpointing_async_support
