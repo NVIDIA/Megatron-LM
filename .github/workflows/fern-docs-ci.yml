@@ -34,7 +34,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          fetch-tags: true
           persist-credentials: false
+
+      - name: Checkout frozen version content
+        run: python3 docs/fern/scripts/fern_versions.py extract-content
 
       - name: Set up Fern CLI
         uses: ./.github/actions/setup-fern

@@ -53,32 +53,10 @@ jobs:
           persist-credentials: false
 
       - name: Checkout frozen version content
-        run: |
-          set -eo pipefail
-          for version_file in docs/fern/versions/v*.yml; do
-            [ -e "$version_file" ] || continue
-            version=$(basename "$version_file" .yml)
-            if git rev-parse "$version" >/dev/null 2>&1; then
-              mkdir -p "docs/fern/versions/${version}-content"
-              git archive "$version" -- docs/ | tar -x --strip-components=1 -C "docs/fern/versions/${version}-content"
-              find "docs/fern/versions/${version}-content" -name '*.md' -exec sed -i 's/<img \([^>]*[^/]\)>/<img \1 \/>/g' {} +
-              echo "Extracted docs from $version"
-            else
-              echo "::warning::Tag $version not found — skipping content checkout"
-            fi
-          done
+        run: python3 docs/fern/scripts/fern_versions.py extract-content
 
       - name: Set up Fern CLI
         uses: ./.github/actions/setup-fern
-
-      - name: Stamp version in docs.yml
-        run: |
-          VERSION=$(curl -sf https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r .tag_name)
-          if [ -n "$VERSION" ] && [ "$VERSION" != "null" ]; then
-            sed -i 's/display-name: "Latest"/display-name: "Latest · '"${VERSION}"'"/' docs/fern/docs.yml
-          fi
-          echo "--- docs.yml versions after stamp ---"
-          grep "display-name:" docs/fern/docs.yml
 
       - name: Publish Docs
         env:

@@ -20,6 +20,9 @@ versions:
   - display-name: "0.20.0 (latest)"
     path: versions/v0.20.0.yml
     slug: latest
-  - display-name: nightly
+  - display-name: "nightly"
     path: versions/nightly.yml
     slug: nightly
+  - display-name: "Archives"
+    path: versions/archives.yml
+    slug: archives
