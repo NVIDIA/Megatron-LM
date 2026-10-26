@@ -605,6 +605,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         training_path=False,
     ),
     KernelEntry(
+        name="inference_zero_padding_rows",
+        sources=("megatron/core/inference/contexts/zero_padding_rows_kernel.py",),
+        tests=(K + "test_inference_kernels.py",),
+        kind="triton",
+        training_path=False,
+    ),
+    KernelEntry(
         name="inference_moe_kernels",
         sources=(
             "megatron/core/inference/moe/activations.py",
@@ -770,6 +777,24 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="MXFP8Tensor dispatches the Megatron quantize kernel (replayed: "
         "test_mxfp8_quantize_replays) or FlashInfer mxfp8_quantize / mm_mxfp8 / fused MoE, which need "
         "flashinfer on Blackwell and are not replayed in CI.",
+    ),
+    KernelEntry(
+        name="inference_flashinfer_nvfp4_moe",
+        sources=("megatron/core/inference/moe/flashinfer_nvfp4.py",),
+        tests=(
+            K + "test_inference_kernels.py",
+            K + "test_moe_kernels.py",
+            "tests/unit_tests/inference/test_flashinfer_nvfp4.py",
+        ),
+        kind="dispatch",
+        training_path=False,
+        notes="FlashInfer nvfp4_quantize (per-expert weights and per-token activations) feeding "
+        "CuteDslMoEWrapper (Relu2 or SwiGLU; two-stage finalize under deterministic algorithms or "
+        "batch_invariant_mode). The quantizer and the MoE are replayed in "
+        "test_inference_kernels.py (MoELayer level in "
+        "test_inference_nvfp4_moe_layer_replays) and checked for batch invariance across batch "
+        "sizes in test_flashinfer_nvfp4_moe_is_batch_invariant; all need FlashInfer >= 0.7.0 "
+        "on Blackwell and are not replayed in CI.",
     ),
     KernelEntry(
         name="inference_request_seed_sampling",
