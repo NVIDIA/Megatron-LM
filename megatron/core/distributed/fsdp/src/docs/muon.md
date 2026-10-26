@@ -108,6 +108,21 @@ in [issue #6161](https://github.com/NVIDIA/Megatron-LM/issues/6161).** Assign
 each whole matrix, its gradient, and its momentum to one persistent owner;
 other ranks hold empty shards for that matrix.
 
+Using the same five tensors as the background example, one possible owner
+assignment is:
+
+```text
+One group buffer, 52 elements total, no padding
+
+rank 0 [ 0,12): | P0 row 0              | P0 row 1               |
+rank 1 [12,28): | P1 row 0      | P1 row 1      | P1 row 2      | P1 row 3       |
+rank 2 [28,28): empty
+rank 3 [28,44): | P2 row 0      | P2 row 1      | P2 row 2      | P2 row 3       |
+rank 4 [44,52): | P3    | P4                    |
+```
+
+Every matrix is whole on its owner. Rank 2 owns no tensors in this group.
+
 1. Materialize the module's weights from owners for forward/backward.
 2. Reduce each matrix's gradient to its owner.
 3. Update momentum, orthogonalize, and update weights locally on the owner.
