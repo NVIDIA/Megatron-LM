@@ -1782,6 +1782,44 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         """
         return self.self_attention.linear_qkv.layer_norm_weight.data
 
+    def is_cuda_graph_capturable(self) -> bool:
+        """Whether per-layer CUDA graph capture may take this layer.
+
+        A layer that hosts an Engram module is never capturable: its hashed lookup and the
+        lookup's all-to-all have data-dependent shapes and host synchronizations. Otherwise
+        the layer defers to its attention and MLP submodules, each of which may declare
+        itself uncapturable through an ``is_cuda_graph_capturable()`` method of its own;
+        submodules that do not define one are assumed capturable.
+        """
+        if self.engram is not None:
+            return False
+        for submodule in (self.self_attention, self.cross_attention, self.mlp):
+            predicate = getattr(submodule, "is_cuda_graph_capturable", None)
+            if predicate is not None and not predicate():
+                return False
+        return True
+
+    def _moe_cuda_graph_outputs_shared_expert(self) -> bool:
+        """Whether a ``moe_router`` partial CUDA graph of this MoE layer outputs the shared
+        expert's result.
+
+        True when the shared expert runs inside the graph: it exists and is not overlapped
+        with the expert-parallel communication. A megakernel backend fuses the shared expert
+        into the eager megakernel, so its graph has no shared-expert output.
+        """
+        return (
+            self.config.moe_shared_expert_intermediate_size is not None
+            and not self.config.moe_shared_expert_overlap
+            and getattr(self.mlp, "megakernel_experts", None) is None
+        )
+
+    def _attention_in_cuda_graph(self) -> bool:
+        """Whether this layer's attention is inside the configured capture scope."""
+        return not isinstance(self.self_attention, IdentityOp) and (
+            not self.config.cuda_graph_modules
+            or CudaGraphModule.attn in self.config.cuda_graph_modules
+        )
+
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
         Get the static inputs for the transformer layer. Besides the hidden_states that is
@@ -1796,10 +1834,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         # Captured forward needs attention-side static input only when this
         # layer's attention is inside the captured scope.
-        attn_in_graph = not isinstance(self.self_attention, IdentityOp) and (
-            not self.config.cuda_graph_modules
-            or CudaGraphModule.attn in self.config.cuda_graph_modules
-        )
+        attn_in_graph = self._attention_in_cuda_graph()
 
         if self._is_thd_cuda_graph():
             if attn_in_graph:
@@ -1906,10 +1941,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             submodules += [self.pre_mlp_layernorm, self.mlp]
         elif self.is_moe_layer and CudaGraphModule.moe_router in self.config.cuda_graph_modules:
             submodules += [self.pre_mlp_layernorm, self.mlp.router]
-            if (
-                self.config.moe_shared_expert_intermediate_size is not None
-                and not self.config.moe_shared_expert_overlap
-            ):
+            if self._moe_cuda_graph_outputs_shared_expert():
                 submodules += [self.mlp.shared_experts]
         return submodules
 
@@ -1925,7 +1957,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         packed_seq_params = kwargs.pop('packed_seq_params', None)
         if packed_seq_params is None:
             return
-        for name in ('cu_seqlens_q', 'cu_seqlens_kv', 'cu_seqlens_q_padded', 'cu_seqlens_kv_padded'):
+        for name in (
+            'cu_seqlens_q',
+            'cu_seqlens_kv',
+            'cu_seqlens_q_padded',
+            'cu_seqlens_kv_padded',
+        ):
             offsets = getattr(packed_seq_params, name)
             if offsets is None or offsets.numel() != self.config.thd_max_packed_sequences + 1:
                 raise ValueError(
@@ -2111,10 +2148,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             shared_expert_output, routing_map = None, None
             # residual is the last element in the CUDA graph output.
             residual = cuda_graph_output.pop()
-            if (
-                self.config.moe_shared_expert_intermediate_size is not None
-                and not self.config.moe_shared_expert_overlap
-            ):
+            if self._moe_cuda_graph_outputs_shared_expert():
                 # The shared expert output is the last second element in the CUDA graph output.
                 shared_expert_output = cuda_graph_output.pop()
 

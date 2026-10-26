@@ -4360,17 +4360,38 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         "MOK does not support per-layer whole-layer CUDA Graph capture"
                     )
-                if any(
-                    scope in self.cuda_graph_modules
-                    for scope in (
-                        CudaGraphModule.moe,
-                        CudaGraphModule.moe_router,
-                        CudaGraphModule.moe_preprocess,
-                    )
-                ):
+                # The megakernel (dispatch, routed and shared experts, combine) has
+                # data-dependent work and is never captured, so 'moe' stays rejected.
+                # 'moe_preprocess' captures the native dispatcher's preprocessing, which MOK
+                # replaces. 'moe_router' is accepted for the Transformer Engine
+                # implementation only: the graph then ends after the router and the
+                # static-shape route compaction ([tokens, topk], no host synchronization),
+                # and the megakernel runs eagerly on the graph outputs
+                # (MoELayer._megakernel_capture_outputs). The local implementation drives
+                # MoE partial capture through MoETransformerLayer's intermediate-tensor
+                # protocol, which the megakernel path does not implement.
+                rejected_scopes = [CudaGraphModule.moe, CudaGraphModule.moe_preprocess]
+                if self.cuda_graph_impl == "local":
+                    rejected_scopes.append(CudaGraphModule.moe_router)
+                if any(scope in self.cuda_graph_modules for scope in rejected_scopes):
                     raise ValueError(
-                        "MOK does not support per-layer CUDA Graph scopes containing "
-                        "moe/moe_router/moe_preprocess"
+                        "MOK supports only the moe_router MoE scope, and only with "
+                        "cuda_graph_impl='transformer_engine'; per-layer CUDA Graph scopes "
+                        "containing moe/moe_preprocess (or moe_router with "
+                        "cuda_graph_impl='local') are not supported"
+                    )
+                if (
+                    CudaGraphModule.moe_router in self.cuda_graph_modules
+                    and self.recompute_granularity == "selective"
+                    and {"moe", "layernorm"} & set(self.recompute_modules or [])
+                ):
+                    # Neither combination has been validated with the megakernel graph
+                    # outputs: 'moe' would put the captured router inside the MoE
+                    # checkpoint, and the 'layernorm' recompute registers its hook on every
+                    # graph output, including the integer expert indices.
+                    raise ValueError(
+                        "MOK with the moe_router CUDA Graph scope does not support "
+                        "recompute_modules 'moe' or 'layernorm'"
                     )
             elif self.cuda_graph_impl not in ("none", "full_iteration"):
                 raise ValueError(f"MOK does not support cuda_graph_impl={self.cuda_graph_impl!r}")

@@ -55,9 +55,9 @@ Startup validates the following before model allocation:
 - the memory dimension is divisible by the positive number of hash heads;
 - the versioned tokenizer-map artifact matches the configured tokenizer vocabulary, pad ID,
   selected layers, maximum order, and hash seed;
-- FSDP is off, and CUDA graphs are either off or Transformer Engine per-layer capture restricted
-  to the MoE scopes (`moe`, `moe_router`, `moe_preprocess`), which leave the Engram-hosting
-  attention-type layers eager;
+- FSDP is off, and CUDA graphs are either off or Transformer Engine per-layer capture with
+  explicit `cuda_graph_modules` (e.g. `attn`, `moe_router`, `moe_preprocess`); the
+  Engram-hosting layer declares itself uncapturable and stays eager while the rest is captured;
 - the sequence-packing scheduler (and dynamic CP, which selects it) is off, and hash-routed MoE
   layers (`--moe-num-hash-layers`) are not combined with sequence parallelism;
 - packed (THD) sequences use the `--sft` family (schedulers including `--use-varlen-dataset`
@@ -273,6 +273,6 @@ checkpoints, and packed THD rows (document boundaries from EOS, from `cu_seqlens
 Context parallelism is supported with and without packed rows. The dense half after the two
 projections runs as fused Triton kernels (`fused_dense.py`, `EngramConfig.dense_impl`, overridable
 with `MEGATRON_ENGRAM_DENSE_IMPL=reference`) where they apply, and falls back to the PyTorch op
-chain under CP or the sequence-parallel halo. CUDA graphs other than MoE-scope per-layer
-capture, FSDP, inference serving, offload, DeepEP, communication overlap, request
+chain under CP or the sequence-parallel halo. CUDA graphs other than Transformer Engine
+per-layer capture with explicit scopes, FSDP, inference serving, offload, DeepEP, communication overlap, request
 deduplication, and FP8 table storage are intentionally deferred and rejected during startup.

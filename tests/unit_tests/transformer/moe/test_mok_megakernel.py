@@ -17,9 +17,11 @@ from megatron.core.transformer.moe.megakernel.mok import weights as mok_weights
 def test_megakernel_forward_preserves_packed_routing_metadata(monkeypatch, recompute):
     from megatron.core.packed_seq_params import PackedSeqParams
     from megatron.core.transformer.moe import moe_layer
+    from megatron.core.transformer.moe.moe_utils import MoECudaGraphTensorStore
 
     layer = moe_layer.MoELayer.__new__(moe_layer.MoELayer)
     torch.nn.Module.__init__(layer)
+    layer.cudagraph_tensor_store = MoECudaGraphTensorStore()
     layer.config = SimpleNamespace(moe_megakernel_backend="mok", sequence_parallel=False)
     layer.attn_tp_group = SimpleNamespace(size=lambda: 1)
     layer.tp_group = object()

@@ -227,3 +227,58 @@ def test_invalid_configuration_messages(tmp_path):
     )
     with pytest.raises(ValueError, match="vocabulary mismatch"):
         config.validate_startup(_startup_transformer_config(), 17)
+
+
+def _cuda_graph_engram_config(tmp_path):
+    artifact = write_tokenizer_map(tmp_path / "map.json", vocab_size=16, layer_ids=(1,))
+    return EngramConfig(
+        global_vocab_sizes=(17, 19),
+        layer_ids=(1,),
+        max_ngram_order=3,
+        num_hash_heads=2,
+        memory_dim=8,
+        kernel_size=4,
+        hash_seed=0,
+        boundary_token_id=0,
+        tokenizer_map_path=str(artifact),
+    )
+
+
+@pytest.mark.parametrize(
+    "modules",
+    [["moe_router", "moe_preprocess"], ["attn"], ["attn", "moe_router", "moe_preprocess"]],
+)
+def test_cuda_graph_scopes_that_keep_the_engram_layer_eager_are_accepted(tmp_path, modules):
+    """Explicit per-layer TE scopes are accepted, including attn.
+
+    The Engram-hosting layer declares itself uncapturable, so _layer_is_graphable leaves it
+    eager under any explicit scope while the other attention-type layers are captured.
+    """
+    config = _cuda_graph_engram_config(tmp_path)
+    config.validate_startup(
+        _startup_transformer_config(
+            cuda_graph_impl="transformer_engine", cuda_graph_modules=modules
+        ),
+        16,
+    )
+
+
+@pytest.mark.parametrize(
+    "impl,modules,match",
+    [
+        # Whole-layer TE capture (no explicit scope) stays rejected.
+        ("transformer_engine", [], "explicit"),
+        ("transformer_engine", None, "explicit"),
+        # Full-iteration and local capture do not go through the per-layer decision.
+        ("full_iteration", None, "full_iteration"),
+        ("local", ["attn"], "local"),
+    ],
+)
+def test_cuda_graph_modes_that_capture_the_engram_layer_are_rejected(
+    tmp_path, impl, modules, match
+):
+    config = _cuda_graph_engram_config(tmp_path)
+    with pytest.raises(ValueError, match=match):
+        config.validate_startup(
+            _startup_transformer_config(cuda_graph_impl=impl, cuda_graph_modules=modules), 16
+        )

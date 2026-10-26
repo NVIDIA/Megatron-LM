@@ -2201,6 +2201,12 @@ def _layer_is_graphable(layer, config):
     if not isinstance(layer, GraphableMegatronModule):
         return False
 
+    # Layers declare their own eligibility (e.g. a layer hosting Engram, or an attention
+    # variant with host synchronizations). This applies under every scope, including the
+    # whole-layer one, so such a layer stays eager while the rest of the model is captured.
+    if not layer.is_cuda_graph_capturable():
+        return False
+
     # If cuda_graph_modules is not set, every layer is graphed.
     if not config.cuda_graph_modules:
         return True

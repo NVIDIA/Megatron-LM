@@ -356,27 +356,73 @@ class MoKMegakernel(MegakernelBackend):
         self.is_first_microbatch = True
         return out
 
+    def compact_routes(
+        self, num_tokens: int, probs: torch.Tensor, routing_map: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compact the authoritative dense route set into MOK's fixed ``[tokens, K]`` inputs.
+
+        Missing routes are encoded as expert -1 with zero weight. Shapes depend only on
+        ``num_tokens`` and the static top-k, and the conversion never reads device data on
+        the host, so it may run inside a captured CUDA graph (the ``moe_router`` scope captures
+        it together with the router; see ``MoELayer.forward``).
+
+        Args:
+            num_tokens: Number of token rows of the MoE input (all dims but the hidden one).
+            probs: Router probabilities, flattened to ``[num_tokens, num_experts]``.
+            routing_map: Token-to-expert routing map matching ``probs``.
+
+        Returns:
+            ``(router_weights, top_experts)``: float32 and int32 tensors of shape
+            ``[num_tokens, topk]``.
+        """
+        probs = probs.reshape(num_tokens, -1)
+        routing_map = routing_map.reshape(num_tokens, -1)
+        return routing_map_to_mok_inputs(probs, routing_map, self.topk)
+
     def forward(
-        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+        routes_are_compact: bool = False,
     ) -> torch.Tensor:
         """Run the fused MoE megakernel (dispatch, routed/shared experts, combine).
 
         Args:
             hidden_states: Input activations of shape ``[..., hidden_size]``.
-            probs: Router probabilities, flattened to ``[num_tokens, num_experts]``.
-            routing_map: Token-to-expert routing map matching ``probs``.
+            probs: Router probabilities, flattened to ``[num_tokens, num_experts]``; or, when
+                ``routes_are_compact``, the ``[num_tokens, topk]`` float32 router weights
+                returned by :meth:`compact_routes`.
+            routing_map: Token-to-expert routing map matching ``probs``; or, when
+                ``routes_are_compact``, the ``[num_tokens, topk]`` int32 expert indices
+                returned by :meth:`compact_routes`.
+            routes_are_compact: Whether ``probs``/``routing_map`` were already compacted
+                (e.g. inside the router's CUDA graph).
 
         Returns:
             MoE output with the same shape as ``hidden_states``.
         """
         original_shape = hidden_states.shape
         x = hidden_states.reshape(-1, original_shape[-1]).contiguous()
-        probs = probs.reshape(x.shape[0], -1)
-        routing_map = routing_map.reshape(x.shape[0], -1)
 
-        # Compact the authoritative route set directly into MOK's fixed [tokens, K]
-        # representation. Missing routes are encoded as expert -1 with zero weight.
-        router_weights, top_experts = routing_map_to_mok_inputs(probs, routing_map, self.topk)
+        if routes_are_compact:
+            router_weights, top_experts = probs, routing_map
+            expected = (x.shape[0], self.topk)
+            if (
+                tuple(router_weights.shape) != expected
+                or tuple(top_experts.shape) != expected
+                or router_weights.dtype != torch.float32
+                or top_experts.dtype != torch.int32
+            ):
+                raise ValueError(
+                    "compact MOK routes must be float32 weights and int32 experts of shape "
+                    f"{expected}, got {router_weights.dtype}{tuple(router_weights.shape)} and "
+                    f"{top_experts.dtype}{tuple(top_experts.shape)}"
+                )
+        else:
+            # Compact the authoritative route set directly into MOK's fixed [tokens, K]
+            # representation. Missing routes are encoded as expert -1 with zero weight.
+            router_weights, top_experts = self.compact_routes(x.shape[0], probs, routing_map)
 
         output = _MoKAutograd.apply(
             self,

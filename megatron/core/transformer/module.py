@@ -274,6 +274,18 @@ class GraphableMegatronModule(MegatronModule):
             return
         self.cuda_graphs[cg_index].backward_dw()
 
+    def is_cuda_graph_capturable(self) -> bool:
+        """Whether per-layer CUDA graph capture may take this layer.
+
+        ``_layer_is_graphable`` consults this before applying the configured
+        ``cuda_graph_modules`` scope, so a layer that returns ``False`` stays eager under
+        every per-layer scope while the rest of the model is still captured. Layers
+        override it to aggregate what their submodules declare; the decision belongs to
+        the modules that know about their own host synchronizations and data-dependent
+        shapes, not to the graph-discovery code.
+        """
+        return True
+
     def _is_thd_cuda_graph(self):
         """Check if THD format with CUDA Graph is being used."""
         return (

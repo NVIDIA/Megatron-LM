@@ -459,6 +459,15 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         )
         self.reset_parameters()
 
+    def is_cuda_graph_capturable(self) -> bool:
+        """Whether per-layer CUDA graph capture may take a layer hosting this module.
+
+        Chunkwise context parallelism swaps the packed THD layout with an all-to-all whose
+        route and split sizes are built on the host from cu_seqlens, so it cannot be captured;
+        the layer then runs eagerly while other layers in the capture scope are still graphed.
+        """
+        return not self.chunkwise_context_parallel
+
     def supports_two_stage_attention(self) -> bool:
         """Output-norm recomputation requires the original atomic forward path."""
         return not self.recompute_norm_out

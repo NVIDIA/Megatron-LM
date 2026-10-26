@@ -68,7 +68,15 @@ def test_mxfp8_shared_expert_config_expresses_bf16_module(monkeypatch, recwarn):
             "variable_seq_lengths": True,
         },
         {"moe_shared_expert_gate": True},
+        {"moe_shared_expert_gate": True, "moe_layer_recompute": True},
         {"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": True, "moe_shared_expert_gate": True},
+        {
+            "fp8": "hybrid",
+            "fp8_recipe": "mxfp8",
+            "fp8_param": True,
+            "moe_shared_expert_gate": True,
+            "moe_layer_recompute": True,
+        },
         {
             "fp8": "hybrid",
             "fp8_recipe": "mxfp8",
@@ -124,6 +132,14 @@ def test_native_single_grouped_weights_do_not_require_op_fuser():
             },
             "does not support inference_optimized",
         ),
+        (
+            {
+                "moe_shared_expert_gate": True,
+                "moe_shared_expert_overlap": True,
+                "moe_token_dispatcher_type": "alltoall",
+            },
+            "does not support MCore shared-expert overlap",
+        ),
     ],
 )
 def test_mok_rejects_key_incompatible_configurations(overrides, error):
@@ -137,21 +153,36 @@ def test_mok_rejects_per_layer_whole_layer_cuda_graph(cuda_graph_impl):
         _mok_transformer_config(cuda_graph_impl=cuda_graph_impl, cuda_graph_modules=[])
 
 
-@pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
 @pytest.mark.parametrize(
-    "cuda_graph_modules",
+    "cuda_graph_impl,cuda_graph_modules",
     [
-        [CudaGraphModule.moe],
-        [CudaGraphModule.moe_router],
-        [CudaGraphModule.moe_preprocess],
-        [CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
-    ],
+        (impl, modules)
+        for impl in ["local", "transformer_engine"]
+        for modules in [
+            [CudaGraphModule.moe],
+            [CudaGraphModule.moe_preprocess],
+            [CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
+        ]
+    ]
+    # The local implementation drives MoE partial capture through MoETransformerLayer's
+    # intermediate-tensor protocol, which the megakernel path does not implement.
+    + [("local", [CudaGraphModule.moe_router])],
 )
 def test_mok_rejects_per_layer_cuda_graph_covering_moe(cuda_graph_impl, cuda_graph_modules):
-    with pytest.raises(ValueError, match="moe/moe_router/moe_preprocess"):
+    with pytest.raises(ValueError, match="MOK supports only the moe_router MoE scope"):
         _mok_transformer_config(
             cuda_graph_impl=cuda_graph_impl, cuda_graph_modules=cuda_graph_modules
         )
+
+
+def test_mok_accepts_moe_router_scope_with_transformer_engine():
+    # The router and the static-shape route compaction are captured; the megakernel stays eager.
+    cuda_graph_modules = [CudaGraphModule.attn, CudaGraphModule.moe_router]
+    config = _mok_transformer_config(
+        cuda_graph_impl="transformer_engine", cuda_graph_modules=cuda_graph_modules
+    )
+
+    assert config.cuda_graph_modules == cuda_graph_modules
 
 
 @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
