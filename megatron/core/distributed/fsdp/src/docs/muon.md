@@ -19,7 +19,8 @@ determine how the buffers are partitioned:
 - `RowAtomic`: keeps rows intact, with equal-sized rank segments. This is
   the default for ordinary floating-point parameters.
 - `BlockAtomic(k)`: keeps blocks of `k` consecutive rows intact, with
-  equal-sized rank segments. MXFP8 uses `k=32`.
+  equal-sized rank segments. Keeping each quantization block on one rank
+  simplifies blockwise quantization. MXFP8 uses `k=32`.
 - `TensorAtomic`: assigns each complete parameter to one rank. Rank
   segments may differ in size or be empty. Keeping weights, gradients,
   and momentum on the same owner makes Muon's optimizer step
