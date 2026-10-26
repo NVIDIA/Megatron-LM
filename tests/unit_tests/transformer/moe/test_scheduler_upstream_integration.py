@@ -106,3 +106,59 @@ def test_fresh_home_load_resets_authoritative_train_state(monkeypatch):
     target, source = _checkpoint_args(True), _checkpoint_args(False)
     assert prepare_home_expert_checkpoint_load(target, [], source)
     assert all(value == 0 for value in vars(state).values())
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_scheduler_moon_router_compact_scores_match_dense_gradients(monkeypatch, fused):
+    """Exercise the real router-to-planner contract, including TE's dense scores."""
+    from dataclasses import replace
+
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.transformer.moe import router as router_module
+    from megatron.core.transformer.moe.router import TopKRouter
+    from tests.unit_tests.test_utilities import Utils
+    from tests.unit_tests.transformer.moe.test_virtual_experts import (
+        _virtual_expert_hybridep_config,
+    )
+
+    monkeypatch.setattr(router_module, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
+    Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=2)
+    config = _virtual_expert_hybridep_config(
+        moe_virtual_expert_load_balance=False,
+        moe_enable_scheduler=True,
+        moe_scheduler_planner_type="moon_ep",
+        moe_scheduler_num_idle_experts=4,
+        num_moe_experts=8,
+        moe_router_topk=2,
+        moe_router_load_balancing_type="none",
+        moe_router_score_function="softmax",
+        moe_router_fusion=fused,
+    )
+    try:
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        compact = TopKRouter(config, pg).cuda()
+        dense = TopKRouter(
+            replace(
+                config,
+                moe_enable_scheduler=False,
+                moe_token_dispatcher_type="alltoall",
+                moe_router_fusion=False,
+            ),
+            pg,
+        ).cuda()
+        torch.manual_seed(123)
+        logits = torch.randn(16, 8, device="cuda", requires_grad=True)
+        reference = logits.detach().clone().requires_grad_()
+        scores, ids = compact.routing(logits.view(8, 2, 8))
+        expected, mask = dense.routing(reference.view(8, 2, 8))
+        assert ids.dtype == torch.int64 and scores.shape == ids.shape == (16, 2)
+        context = SchedulerContext(1, 8, 4, (0, 1, 2, 3), 2, 0, 2, True)
+        MoonEPLoadPlanner(4)._validate_inputs(scores, ids, context)
+        torch.testing.assert_close(scores, expected.gather(1, ids))
+        assert mask.gather(1, ids).all()
+        dy = torch.randn_like(expected)
+        (scores * dy.gather(1, ids)).sum().backward()
+        (expected * dy).sum().backward()
+        torch.testing.assert_close(logits.grad, reference.grad, rtol=2e-4, atol=1e-6)
+    finally:
+        Utils.destroy_model_parallel()

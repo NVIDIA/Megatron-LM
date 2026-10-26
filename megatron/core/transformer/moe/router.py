@@ -584,8 +584,12 @@ class TopKRouter(Router):
         )
         backend = config.moe_flex_dispatcher_backend
 
-        if config.moe_virtual_expert_load_balance:
-            # The MoonEP planner consumes int64 IDs for every routing mode.
+        if config.moe_virtual_expert_load_balance or (
+            config.moe_enable_scheduler
+            and config.moe_scheduler_planner_type == "moon_ep"
+            and config.moe_hybridep_routing_map_mode == "indices"
+        ):
+            # Both MoonEP entry points consume int64 IDs for every routing mode.
             return torch.int64
         elif fused_dense_routing and backend in ("deepep", "deepepv2", "ncclep"):
             return torch.int64
