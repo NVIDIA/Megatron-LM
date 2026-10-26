@@ -122,8 +122,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_dsv4_dev_replay.py",),
         kind="triton",
         notes="Real CuTe compaction forward/unique-store backward and Triton/compiled integer "
-        "routing metadata replay. External sparse-attention backward is not certified here; "
+        "routing metadata replay. Stock sparse-attention backward is not certified here; "
         "numerical CP/indexer parity remains in the dev CSA tests.",
+    ),
+    KernelEntry(
+        name="aligned_hca_backward",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/aligned_hca.py",
+        ),
+        tests=(K + "test_dsv4_dev_replay.py",),
+        kind="dispatch",
+        notes="Real aligned HCA autograd replay with prepared packing and side-stream contention.",
     ),
     KernelEntry(
         name="dev_csa_fused_compressor_dispatch",
