@@ -694,7 +694,9 @@ def _get_megatron_optimizer_based_on_param_groups(
         # factor, so summing it over every rank is correct by construction.
         setattr(optimizer, 'grad_stats_parallel_group', torch.distributed.group.WORLD)
     elif config.fp16 or config.bf16:
-        optimizer = Float16OptimizerWithFloat16Params(optimizer, config, grad_scaler, init_state_fn)
+        optimizer = Float16OptimizerWithFloat16Params(
+            optimizer, config, grad_scaler, init_state_fn, pg_collection=pg_collection
+        )
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
     else:
         # FP32 optimizer.
@@ -927,7 +929,7 @@ def _get_megatron_emerging_optimizer(
                 continue
             if config.bf16:
                 optimizer = Float16OptimizerWithFloat16Params(
-                    optimizer, config, None, init_state_fn
+                    optimizer, config, None, init_state_fn, pg_collection=pg_collection
                 )
             else:
                 optimizer = FP32Optimizer(optimizer, config, init_state_fn)
