@@ -70,7 +70,20 @@ from megatron.core.transformer.wide_residual import (
     wide_residual_recompute_enabled,
 )
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+from megatron.core.utils import (
+    WrappedTensor,
+    deprecate_inference_params,
+    make_viewless_tensor,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
+
+
+def _nvtx_layer_tag(layer_config) -> str:
+    """Hybrid symbol of a layer for its NVTX range; the config class name for custom layers."""
+    if layer_utils.get_custom_layer_type(layer_config) is not None:
+        return type(layer_config).__name__
+    return layer_utils.get_layer_symbol_from_config(layer_config)
 
 
 @dataclass
@@ -895,6 +908,13 @@ class HybridStack(MegatronModule):
                             layer_input_ids = cp_layout_state.get_layer_input_ids(
                                 physical_layer_idx, input_ids
                             )
+                        # One range per layer at the call site: it stays on the host when the
+                        # layer's submodules are CUDA-graphed, so graph replays project onto it.
+                        layer_range = (
+                            f"hybrid.layer{layer.layer_number:02d}."
+                            f"{_nvtx_layer_tag(layer_config)}"
+                        )
+                        nvtx_range_push(layer_range)
                         with inner_quant_context:
                             if is_custom_layer and not isinstance(
                                 layer, HyperConnectionHybridLayer
@@ -972,6 +992,7 @@ class HybridStack(MegatronModule):
                                     inference_context=inference_context,
                                     packed_seq_params=layer_packed_seq_params,
                                 )
+                        nvtx_range_pop(layer_range)
 
                         if isinstance(hidden_states, tuple):
                             hidden_states = hidden_states[0]

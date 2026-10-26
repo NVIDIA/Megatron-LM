@@ -42,6 +42,8 @@ from megatron.core.utils import (
     get_pg_rank,
     is_using_quantization_scales,
     log_single_rank,
+    nvtx_range_pop,
+    nvtx_range_push,
 )
 
 logger = logging.getLogger(__name__)
@@ -1093,12 +1095,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         # Inference consumes logits in fp32: emit them so when the head can, upcast otherwise.
         emit_fp32 = in_inference_mode and self.lm_head_can_emit_fp32
+        nvtx_range_push("LM::output_layer")
         logits, _ = self.output_layer(
             hidden_states,
             weight=output_weight,
             runtime_gather_output=runtime_gather_output,
             output_dtype=torch.float32 if emit_fp32 else None,
         )
+        nvtx_range_pop("LM::output_layer")
         # Apply MuP output scaling to logits
         logits = self._scale_logits(logits)
         if in_inference_mode:
