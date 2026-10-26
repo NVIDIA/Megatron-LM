@@ -175,7 +175,10 @@ def _build_gpt_model(
     config: MLATransformerConfig, pre_process: bool = True, post_process: bool = True
 ) -> GPTModel:
     """Build a GPTModel with the DSA transformer block spec."""
-    spec = get_transformer_block_with_experimental_attention_variant_spec(config)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    spec = get_transformer_block_with_experimental_attention_variant_spec(
+        config, pp_rank=pg_collection.pp.rank()
+    )
     model = GPTModel(
         config=config,
         transformer_layer_spec=spec,
@@ -185,7 +188,7 @@ def _build_gpt_model(
         post_process=post_process,
         parallel_output=False,  # Gather logits across TP for easy comparison
         position_embedding_type='rope',
-        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+        pg_collection=pg_collection,
     )
     return model.cuda()
 

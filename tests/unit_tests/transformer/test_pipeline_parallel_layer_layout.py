@@ -1,19 +1,22 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""A custom pipeline layout builds the stage of the pipeline rank the caller passes."""
+"""A pipeline stage builds the layers of the pipeline rank the caller passes. Omitting the rank
+falls back to the global pipeline rank with a warning, unless the model has one stage."""
+
+import warnings
 
 import pytest
 import torch
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, process_groups_config
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.core.transformer.enums import LayerType
 from megatron.core.transformer.transformer_block import TransformerBlock, get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, forbid_global_process_groups
 
 # Two pipeline ranks with two virtual stages each. The stages are listed in
 # (vp_stage, pp_rank) order: (0, 0), (0, 1), (1, 0), (1, 1).
@@ -29,6 +32,42 @@ LAYOUTS = [
     pytest.param(INTERLEAVED_LAYOUT, 5, INTERLEAVED_STAGES, id="interleaved"),
     pytest.param(UNEVEN_LAYOUT, 4, UNEVEN_STAGES, id="uneven"),
 ]
+
+# Two pipeline ranks without a custom layout: four layers split evenly.
+EVEN_STAGES = [[(0, 2)], [(2, 2)]]
+PLACEMENTS = LAYOUTS + [pytest.param(None, 4, EVEN_STAGES, id="even-split")]
+
+# Every function that places layers on a pipeline stage, with the argument it falls back on.
+_PLACEMENT_FALLBACKS = {
+    ("get_transformer_layer_offset", "pp_rank"),
+    ("get_num_layers_to_build", "pp_rank"),
+    ("PipelineParallelLayerLayout.get_layer_offset", "pp_rank"),
+    ("PipelineParallelLayerLayout.get_num_layers_to_build", "pp_rank"),
+}
+
+
+@pytest.fixture(autouse=True)
+def fresh_warning_registry(monkeypatch):
+    """Each test observes the first fallback warning of every owner."""
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+
+
+def _fallbacks(record):
+    """Return the (owner, argument) pairs of the fallback warnings in ``record``.
+
+    Also checks that each warning carries the removal version and points at this file, which
+    omitted the argument.
+    """
+    pairs = set()
+    for w in record:
+        if not issubclass(w.category, ProcessGroupFallbackWarning):
+            continue
+        message = str(w.message)
+        assert "deprecated since Megatron Core 0.21 and will be removed in 0.23" in message
+        assert w.filename == __file__
+        owner, _, rest = message.partition(" was called without `")
+        pairs.add((owner, rest.partition("`")[0]))
+    return pairs
 
 
 def _make_config(layout, num_layers):
@@ -60,38 +99,70 @@ def _forbid_global_pipeline_state(monkeypatch):
     monkeypatch.setattr(parallel_state, "get_virtual_pipeline_model_parallel_world_size", forbidden)
 
 
-@pytest.mark.parametrize("layout, num_layers, expected", LAYOUTS)
+@pytest.mark.parametrize("layout, num_layers, expected", PLACEMENTS)
 def test_explicit_pp_rank_selects_the_stage(monkeypatch, layout, num_layers, expected):
-    """With pp_rank given, counts and offsets come from the layout alone."""
+    """With pp_rank given, counts and offsets come from the config alone, without a warning."""
     config = _make_config(layout, num_layers)
     _forbid_global_pipeline_state(monkeypatch)
 
-    for pp_rank, stages in enumerate(expected):
-        for vp_stage, (offset, count) in zip(_vp_stages(config, stages), stages):
-            assert get_transformer_layer_offset(config, vp_stage, pp_rank) == offset
-            assert get_num_layers_to_build(config, vp_stage, pp_rank) == count
-            assert config.pipeline_model_parallel_layout.get_layer_id_list(
-                layer_type=LayerType.decoder, vp_stage=vp_stage, pp_rank=pp_rank
-            ) == list(range(offset, offset + count))
+    with forbid_global_process_groups(), warnings.catch_warnings():
+        warnings.simplefilter("error", ProcessGroupFallbackWarning)
+        for pp_rank, stages in enumerate(expected):
+            for vp_stage, (offset, count) in zip(_vp_stages(config, stages), stages):
+                assert get_transformer_layer_offset(config, vp_stage, pp_rank) == offset
+                assert get_num_layers_to_build(config, vp_stage, pp_rank) == count
+                if layout is not None:
+                    assert config.pipeline_model_parallel_layout.get_layer_id_list(
+                        layer_type=LayerType.decoder, vp_stage=vp_stage, pp_rank=pp_rank
+                    ) == list(range(offset, offset + count))
 
 
-@pytest.mark.parametrize("layout, num_layers, expected", LAYOUTS)
-def test_default_pp_rank_comes_from_the_global_grid(monkeypatch, layout, num_layers, expected):
-    """Without pp_rank, the global grid's pipeline rank selects the stage."""
+@pytest.mark.parametrize("layout, num_layers, expected", PLACEMENTS)
+def test_omitted_pp_rank_warns_and_uses_the_global_rank(monkeypatch, layout, num_layers, expected):
+    """Without pp_rank, the global pipeline rank selects the stage, and each function warns."""
     config = _make_config(layout, num_layers)
-    # initialize_model_parallel sets the global virtual pipeline size from the same config.
-    vp_size = config.virtual_pipeline_model_parallel_size
-    monkeypatch.setattr(
-        parallel_state, "get_virtual_pipeline_model_parallel_world_size", lambda: vp_size
-    )
+    pipeline_layout = config.pipeline_model_parallel_layout
 
     for pp_rank, stages in enumerate(expected):
+        # parallel_state.set_pipeline_model_parallel_rank overrides the rank the same way.
         monkeypatch.setattr(
             parallel_state, "get_pipeline_model_parallel_rank", lambda rank=pp_rank: rank
         )
         for vp_stage, (offset, count) in zip(_vp_stages(config, stages), stages):
-            assert get_transformer_layer_offset(config, vp_stage) == offset
-            assert get_num_layers_to_build(config, vp_stage) == count
+            process_groups_config._warned_global_process_group_fallbacks.clear()
+            with warnings.catch_warnings(record=True) as record:
+                warnings.simplefilter("always")
+                assert get_transformer_layer_offset(config, vp_stage) == offset
+                assert get_num_layers_to_build(config, vp_stage) == count
+                if layout is not None:
+                    assert pipeline_layout.get_layer_id_list(
+                        layer_type=LayerType.decoder, vp_stage=vp_stage
+                    ) == list(range(offset, offset + count))
+            expected_fallbacks = {
+                pair
+                for pair in _PLACEMENT_FALLBACKS
+                if layout is not None or not pair[0].startswith("PipelineParallelLayerLayout")
+            }
+            assert _fallbacks(record) == expected_fallbacks
+
+
+@pytest.mark.parametrize("layout", [None, "EtttL"])
+def test_single_pipeline_stage_needs_no_pp_rank(layout):
+    """With one pipeline stage, every rank is stage 0, so no rank is read and nothing warns."""
+    config = TransformerConfig(
+        num_layers=3,
+        hidden_size=64,
+        num_attention_heads=4,
+        pipeline_model_parallel_layout=layout,
+        use_cpu_initialization=True,
+    )
+
+    with forbid_global_process_groups(), warnings.catch_warnings():
+        warnings.simplefilter("error", ProcessGroupFallbackWarning)
+        assert get_transformer_layer_offset(config) == 0
+        assert get_num_layers_to_build(config) == 3
+        if layout is not None:
+            assert config.pipeline_model_parallel_layout.get_layer_id_list() == [0, 1, 2]
 
 
 @pytest.mark.parametrize(
@@ -123,6 +194,35 @@ def test_layout_uses_its_own_virtual_pipeline_size(
                 pipeline_layout.get_num_layers_to_build(LayerType.decoder, None, pp_rank)
             with pytest.raises(AssertionError, match="vp_stage must be passed"):
                 pipeline_layout.get_layer_offset(LayerType.decoder, None, pp_rank)
+
+
+class TestOmittedPipelineRankOnTheGlobalGrid:
+    """Without pp_rank, a stage of the global PP=2 grid builds that stage, with a warning."""
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("layout, num_layers, expected", PLACEMENTS)
+    def test_omitted_pp_rank_matches_the_global_pipeline_rank(self, layout, num_layers, expected):
+        pp_size = 2
+        if Utils.world_size % pp_size != 0:
+            pytest.skip(f"needs a world size divisible by {pp_size}")
+        config = _make_config(layout, num_layers)
+        Utils.initialize_model_parallel(
+            pipeline_model_parallel_size=pp_size,
+            virtual_pipeline_model_parallel_size=config.virtual_pipeline_model_parallel_size,
+        )
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        stages = expected[pp_rank]
+
+        with pytest.warns(ProcessGroupFallbackWarning) as record:
+            for vp_stage, (offset, count) in zip(_vp_stages(config, stages), stages):
+                assert get_transformer_layer_offset(config, vp_stage) == offset
+                assert get_num_layers_to_build(config, vp_stage) == count
+        assert _fallbacks(record) == {
+            ("get_transformer_layer_offset", "pp_rank"),
+            ("get_num_layers_to_build", "pp_rank"),
+        }
 
 
 class TestTransformerBlockOnItsOwnPipelineGrid:
