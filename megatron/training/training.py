@@ -4018,6 +4018,15 @@ def train(
         preserves the default behavior.
     """
     args = get_args()
+    if config.pipeline_model_parallel_prewarm and (
+        getattr(args, "use_megatron_fsdp", False) or getattr(args, "use_torch_fsdp2", False)
+    ):
+        raise ValueError(
+            "pipeline_model_parallel_prewarm does not support Megatron-FSDP or Torch-FSDP2 "
+            "because it bypasses the FSDP module hooks. Disable pipeline_model_parallel_prewarm "
+            "when using FSDP."
+        )
+
     timers = get_timers()
     fault_injector_kwargs = {}
     for f in dataclasses.fields(FaultInjectorConfig):

@@ -1232,9 +1232,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         return self.self_attention.linear_qkv.layer_norm_weight.data
 
-    def get_layer_static_inputs(
-        self, seq_length, micro_batch_size, *, for_pipeline_prewarm=False
-    ):
+    def get_layer_static_inputs(self, seq_length, micro_batch_size, *, for_pipeline_prewarm=False):
         """
         Get synthetic inputs for the transformer layer. Besides the hidden_states that is
         generated in GraphableMegatronModule, we also add the attention_mask.
@@ -1246,9 +1244,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             Dict[str, torch.Tensor]: A dictionary containing the static inputs for the layer.
         """
         static_inputs = super().get_layer_static_inputs(
-            seq_length,
-            micro_batch_size,
-            for_pipeline_prewarm=for_pipeline_prewarm,
+            seq_length, micro_batch_size, for_pipeline_prewarm=for_pipeline_prewarm
         )
         device = torch.cuda.current_device()
 
@@ -1276,9 +1272,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 cu_seqlens[1:] = max_T
 
                 static_inputs["cu_seqlens_q"] = cu_seqlens
-                static_inputs["cu_seqlens_kv"] = cu_seqlens.clone()
-                static_inputs["cu_seqlens_q_padded"] = cu_seqlens.clone()
-                static_inputs["cu_seqlens_kv_padded"] = cu_seqlens.clone()
+                if for_pipeline_prewarm:
+                    # Match real self-attention batches. Fused DSA scoring uses Q/K aliasing
+                    # to recognize matching sequence boundaries without a device sync.
+                    padded_cu_seqlens = cu_seqlens.clone()
+                    static_inputs["cu_seqlens_kv"] = cu_seqlens
+                    static_inputs["cu_seqlens_q_padded"] = padded_cu_seqlens
+                    static_inputs["cu_seqlens_kv_padded"] = padded_cu_seqlens
+                else:
+                    # CUDA Graph capture needs independently writable static buffers.
+                    static_inputs["cu_seqlens_kv"] = cu_seqlens.clone()
+                    static_inputs["cu_seqlens_q_padded"] = cu_seqlens.clone()
+                    static_inputs["cu_seqlens_kv_padded"] = cu_seqlens.clone()
 
             slen_for_mask = self.config.max_seqlen_per_dp_cp_rank
             if self.config.sequence_parallel:
@@ -1303,12 +1308,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     )
             else:
                 slen_per_cp = seq_length // self.config.context_parallel_size
-                static_inputs["attention_mask"] = (
-                    ~(torch.tril(torch.ones((slen_per_cp, seq_length))).bool())
-                    .to(device)
-                    .reshape(1, 1, slen_per_cp, seq_length)
-                    .tile(micro_batch_size, 1, 1, 1)
-                )
+                static_inputs["attention_mask"] = torch.ones(
+                    (micro_batch_size, 1, slen_per_cp, seq_length), dtype=torch.bool, device=device
+                ).triu_(diagonal=1)
 
         # Add input_ids for hash-based MoE routing.
         # Only add for layers that actually use hash routing,
@@ -2001,9 +2003,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 "output arity."
             )
 
-    def get_layer_static_inputs(
-        self, seq_length, micro_batch_size, *, for_pipeline_prewarm=False
-    ):
+    def get_layer_static_inputs(self, seq_length, micro_batch_size, *, for_pipeline_prewarm=False):
         """Override to produce n-stream hidden_states of shape [s, b, n*C].
 
         CUDA graph capture and pipeline prewarm create synthetic buffers whose shapes are
@@ -2011,9 +2011,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         on n-stream hidden states of shape [s, b, n*C].
         """
         static_inputs = super().get_layer_static_inputs(
-            seq_length,
-            micro_batch_size,
-            for_pipeline_prewarm=for_pipeline_prewarm,
+            seq_length, micro_batch_size, for_pipeline_prewarm=for_pipeline_prewarm
         )
         if not for_pipeline_prewarm and self._uses_mhc_recompute_attn_cuda_graph_split():
             # The captured callable begins at the attention consumer, after the

@@ -69,7 +69,11 @@ def _get_quantization_context(layer, is_mtp):
 
 
 def _build_packed_seq_params(config, kwargs):
-    """Convert synthetic THD metadata tensors into eager PackedSeqParams."""
+    """Convert synthetic THD metadata tensors into eager PackedSeqParams.
+
+    TransformerLayer only reconstructs these kwargs at CUDA Graph capture entry points;
+    its eager forward path requires PackedSeqParams already assembled.
+    """
     if 'cu_seqlens_q' not in kwargs:
         return
 
@@ -88,12 +92,7 @@ def _build_packed_seq_params(config, kwargs):
 
 
 def _build_layer_inputs(
-    layer,
-    model_chunk,
-    config,
-    seq_length,
-    micro_batch_size,
-    rotary_pos_emb_cache,
+    layer, model_chunk, config, seq_length, micro_batch_size, rotary_pos_emb_cache
 ):
     """Build one eager synthetic sample for a local transformer layer."""
     if not hasattr(layer, 'get_layer_static_inputs'):
@@ -102,9 +101,7 @@ def _build_layer_inputs(
         )
 
     static_inputs = layer.get_layer_static_inputs(
-        seq_length,
-        micro_batch_size,
-        for_pipeline_prewarm=True,
+        seq_length, micro_batch_size, for_pipeline_prewarm=True
     )
     hidden_states = static_inputs.pop('hidden_states')
     kwargs = static_inputs
@@ -140,12 +137,7 @@ def _reset_temporary_state(model, config, optimizers):
 
 
 def prewarm_pipeline_model_parallel(
-    model,
-    config,
-    seq_length,
-    micro_batch_size,
-    optimizers=(),
-    pg_collection=None,
+    model, config, seq_length, micro_batch_size, optimizers=(), pg_collection=None
 ):
     """Initialize local lazy kernels concurrently on all pipeline stages.
 
@@ -156,13 +148,25 @@ def prewarm_pipeline_model_parallel(
     if getattr(config, 'moe_paged_stash', False):
         from megatron.core.transformer.moe.paged_stash import PagedStashManager
 
-        assert not PagedStashManager.get_instance().enabled, (
-            "Pipeline prewarm must run before the first Paged Stash schedule."
-        )
+        assert (
+            not PagedStashManager.get_instance().enabled
+        ), "Pipeline prewarm must run before the first Paged Stash schedule."
 
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     local_layers = _discover_local_layers(model)
+    if not local_layers:
+        log_on_each_pipeline_stage(
+            logger=logger,
+            tp_group=pg_collection.tp,
+            dp_cp_group=pg_collection.dp_cp,
+            level=logging.WARNING,
+            msg=(
+                'Pipeline-parallel prewarm found no local decoder or MTP layers. '
+                'This stage will not prewarm any kernels; nested decoders such as '
+                'language_model.decoder are not discovered.'
+            ),
+        )
 
     torch.distributed.barrier()
     torch.cuda.synchronize()
@@ -194,10 +198,12 @@ def prewarm_pipeline_model_parallel(
         key: value.clone() if torch.is_tensor(value) else value
         for key, value in dsa_tracker.items()
     }
-    loss_scale_backups = (
-        (DSAIndexerLossAutoScaler, DSAIndexerLossAutoScaler.main_loss_backward_scale),
-        (MoEAuxLossAutoScaler, MoEAuxLossAutoScaler.main_loss_backward_scale),
-    )
+    loss_scale_backups = []
+    for loss_scaler in (DSAIndexerLossAutoScaler, MoEAuxLossAutoScaler):
+        loss_scale = loss_scaler.main_loss_backward_scale
+        loss_scale_backups.append(
+            (loss_scaler, loss_scale, loss_scale.clone() if loss_scale is not None else None)
+        )
 
     layers = [layer for layer, _is_mtp, _model_chunk in local_layers]
     try:
@@ -270,11 +276,13 @@ def prewarm_pipeline_model_parallel(
                         else _get_quantization_context(layer, is_mtp)
                     )
                     with inner_quantization_context:
+                        # Keep prewarm eager even when local CUDA Graphs are enabled. This
+                        # bypasses module hooks, so the training entry point rejects FSDP.
                         outputs = layer.forward(*args, **kwargs)
                     differentiable_outputs = _collect_differentiable_tensors(outputs)
-                    assert differentiable_outputs, (
-                        "Pipeline prewarm must produce at least one differentiable tensor."
-                    )
+                    assert (
+                        differentiable_outputs
+                    ), "Pipeline prewarm must produce at least one differentiable tensor."
                     torch.autograd.backward(
                         differentiable_outputs,
                         grad_tensors=[
@@ -299,7 +307,9 @@ def prewarm_pipeline_model_parallel(
         _reset_temporary_state(model, config, optimizers)
         dsa_tracker.clear()
         dsa_tracker.update(dsa_tracker_backup)
-        for loss_scaler, loss_scale in loss_scale_backups:
+        for loss_scaler, loss_scale, backup in loss_scale_backups:
+            if loss_scale is not None:
+                loss_scale.copy_(backup)
             loss_scaler.main_loss_backward_scale = loss_scale
 
         del buffer_backups

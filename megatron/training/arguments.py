@@ -4072,6 +4072,12 @@ def _add_distributed_args(parser):
     group = dist_init_factory.build_group(parser, "distributed init")
 
     group.add_argument(
+        '--pipeline-model-parallel-prewarm',
+        action='store_true',
+        help='Initialize lazy kernels concurrently across pipeline stages before training. '
+        'Requires pipeline model parallel size > 1 and does not support FSDP.',
+    )
+    group.add_argument(
         '--decoder-first-pipeline-num-layers',
         type=int,
         default=None,

@@ -1116,6 +1116,15 @@ class TransformerConfig(ModelParallelConfig):
     its local PP/VPP model chunks. The passes do not use pipeline P2P communication, so pipeline
     stages can initialize their local kernels concurrently. This does not capture or replay CUDA
     Graphs and can be used independently of ``cuda_graph_impl``.
+
+    Layer discovery covers top-level ``decoder`` and ``mtp`` stacks, including through model
+    wrappers. Nested decoders such as ``language_model.decoder`` are not discovered. A stage
+    with no discovered layers logs a warning and still participates in the prewarm barriers.
+    THD inputs require ``sequence_packing_scheduler``; otherwise the synthetic inputs use SBHD,
+    even if the dataset supplies packed sequences during training.
+
+    Megatron-FSDP and Torch-FSDP2 are not supported because the synthetic layer forward calls
+    bypass FSDP module hooks.
     """
 
     ##################
@@ -3266,9 +3275,9 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.pipeline_model_parallel_prewarm:
-            assert self.pipeline_model_parallel_size > 1, (
-                "pipeline_model_parallel_prewarm requires pipeline_model_parallel_size > 1."
-            )
+            assert (
+                self.pipeline_model_parallel_size > 1
+            ), "pipeline_model_parallel_prewarm requires pipeline_model_parallel_size > 1."
 
         if self.cuda_graph_impl != "none":
 
