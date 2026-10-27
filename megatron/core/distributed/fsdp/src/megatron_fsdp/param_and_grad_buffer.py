@@ -4680,7 +4680,8 @@ class AllGatherPipeline:
         suggested_prefetch_size: Optional[int],
         double_buffer_units: set,
     ) -> List[int]:
-        """Extend a bucket list using the communication-size heuristic."""
+        """Extend a bucket list using the communication-size heuristic. Buckets that are
+        not sharded on the gathering group need no all-gather and count zero toward the size."""
         parameter_groups = self.buffer.parameter_groups
         result = list(bucket_ids)
 
@@ -4704,17 +4705,16 @@ class AllGatherPipeline:
         if suggested_prefetch_size is None:
             suggested_prefetch_size = 500_000_000
 
-        base_all_gather_size = sum(
-            parameter_groups[bucket_id].model_weight_buffer.bucket_index.size
-            for bucket_id in result
-        )
+        def all_gather_size(bucket_id):
+            if not self.get_fsdp_buffer(bucket_id).is_data_distributed:
+                return 0
+            return parameter_groups[bucket_id].model_weight_buffer.bucket_index.size
+
+        base_all_gather_size = sum(all_gather_size(bucket_id) for bucket_id in result)
         bucket_id = next_bucket_id()
         while bucket_id is not None:
             prefetched_size = (
-                sum(
-                    parameter_groups[result_bucket_id].model_weight_buffer.bucket_index.size
-                    for result_bucket_id in result
-                )
+                sum(all_gather_size(result_bucket_id) for result_bucket_id in result)
                 - base_all_gather_size
             )
             if prefetched_size >= suggested_prefetch_size:
