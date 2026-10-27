@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Callable, Literal, Optional
 
 import torch
 
@@ -131,6 +131,13 @@ class MXFP8Tensor:
     # Legacy direct constructors have unknown logical dtype until their next
     # successful update.
     dtype: Optional[torch.dtype] = field(default=None, kw_only=True)
+    # Optional write-through target. When set, quantize_ hands the logical value to this
+    # callable instead of writing data and scale, which then hold only broadcast
+    # placeholders describing the logical geometry. FlashInfer's routed MoE uses this so
+    # refit updates its kernel layout directly, without a second canonical weight copy.
+    writeback: Optional[Callable[[torch.Tensor], None]] = field(
+        default=None, kw_only=True, repr=False, compare=False
+    )
 
     @property
     def shape(self) -> torch.Size:
@@ -186,7 +193,9 @@ class MXFP8Tensor:
         if self.backend == "flashinfer" and value.dtype == torch.float32:
             value = value.to(dtype=torch.bfloat16)
         value = value.contiguous()
-        if (
+        if self.writeback is not None:
+            self.writeback(value)
+        elif (
             self.backend == "triton"
             and self.data.dtype == torch.float8_e4m3fn
             and self.data.is_contiguous()

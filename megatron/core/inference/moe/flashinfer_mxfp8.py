@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -24,6 +25,9 @@ except ImportError as exc:
     HAVE_FLASHINFER_ROUTED_MXFP8 = False
     _FLASHINFER_ROUTED_MXFP8_IMPORT_ERROR = exc
 
+from megatron.core.inference.quantization.mxfp8_quantize import (
+    mxfp8_quantize_into as mcore_mxfp8_quantize_into,
+)
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
 logger = logging.getLogger(__name__)
@@ -108,6 +112,29 @@ def _shuffle_routed_scale(scale: torch.Tensor) -> torch.Tensor:
     return _block_scale_interleave(scale_u8[row_indices]).contiguous().view(torch.uint8)
 
 
+def _repack_routed_mxfp8_expert(
+    data: torch.Tensor, scale: torch.Tensor, routed_data: torch.Tensor, routed_scale: torch.Tensor
+) -> None:
+    """Repack one expert from MCore's MXFP8 layout into its routed slot without requantizing.
+
+    MCore stores row-major MXFP8 data with cuBLAS-swizzled UE8M0 scales, but TRT-LLM kernels
+    require 128-aligned Major-K data and their interleaved scale layout.
+    """
+    logical_rows, logical_cols = data.shape
+    padded_rows, padded_cols = routed_data.shape
+    padded_data = torch.zeros(padded_rows, padded_cols, dtype=data.dtype, device=data.device)
+    padded_data[:logical_rows, :logical_cols].copy_(data)
+    routed_data.copy_(shuffle_matrix_a(padded_data.view(torch.uint8), 128).view(data.dtype))
+
+    logical_scale = torch.zeros(
+        padded_rows, padded_cols // 32, dtype=torch.uint8, device=data.device
+    )
+    logical_scale[:logical_rows, : logical_cols // 32].copy_(
+        _unshuffle_cublas_scale(scale, logical_rows, logical_cols)
+    )
+    routed_scale.copy_(_shuffle_routed_scale(logical_scale))
+
+
 def prepare_routed_mxfp8_weights(
     weight: MXFP8Tensor, out: FlashInferRoutedMXFP8Weight | None = None
 ) -> FlashInferRoutedMXFP8Weight:
@@ -158,26 +185,10 @@ def prepare_routed_mxfp8_weights(
         routed_data = out.data
         routed_scale = out.scale
 
-    # MCore and FlashInfer use different kernel-specific layouts for the same MXFP8
-    # weights. MCore stores row-major MXFP8 data with cuBLAS-swizzled UE8M0 scales but TRT-LLM
-    # kernels require 128-aligned Major-K data and its interleaved scale layout. Repack the data
-    # and scales into TRT-LLM's 128-aligned Major-K layout without requantizing.
     for expert in range(experts):
-        padded_data = torch.zeros(
-            padded_rows, padded_cols, dtype=weight.data.dtype, device=weight.data.device
+        _repack_routed_mxfp8_expert(
+            weight.data[expert], weight.scale[expert], routed_data[expert], routed_scale[expert]
         )
-        padded_data[:logical_rows, :logical_cols].copy_(weight.data[expert])
-        routed_data[expert].copy_(
-            shuffle_matrix_a(padded_data.view(torch.uint8), 128).view(weight.data.dtype)
-        )
-
-        logical_scale = torch.zeros(
-            padded_rows, scale_cols, dtype=torch.uint8, device=weight.data.device
-        )
-        logical_scale[:logical_rows, : logical_cols // 32].copy_(
-            _unshuffle_cublas_scale(weight.scale[expert], logical_rows, logical_cols)
-        )
-        routed_scale[expert].copy_(_shuffle_routed_scale(logical_scale))
 
     if out is not None:
         return out
@@ -189,6 +200,137 @@ def prepare_routed_mxfp8_weights(
         padded_rows=padded_rows,
         padded_cols=padded_cols,
     )
+
+
+# One expert-sized MXFP8 staging buffer per (device, stream, shape). Refit may finalize
+# parameters concurrently on several copy streams, so writebacks never share staging
+# storage across streams; work on one stream is ordered and can reuse it.
+_WRITEBACK_STAGING: dict[tuple[int, int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _writeback_staging(
+    rows: int, cols: int, scale_numel: int, scale_dtype: torch.dtype, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    stream = torch.cuda.current_stream(device)
+    key = (device.index, stream.cuda_stream, rows, cols)
+    staging = _WRITEBACK_STAGING.get(key)
+    if staging is None:
+        with torch.inference_mode(False):
+            staging = (
+                torch.empty(rows, cols, dtype=torch.float8_e4m3fn, device=device),
+                torch.empty(scale_numel, dtype=scale_dtype, device=device),
+            )
+        _WRITEBACK_STAGING[key] = staging
+    return staging
+
+
+def _broadcast_placeholder(like: torch.Tensor) -> torch.Tensor:
+    """A tensor with the shape, dtype and device of like, backed by a single element.
+
+    It satisfies geometry checks on released canonical storage, and in-place writes into
+    it fail instead of silently landing somewhere the kernel never reads.
+    """
+    with torch.inference_mode(False):
+        return torch.empty(1, dtype=like.dtype, device=like.device).expand(like.shape)
+
+
+def attach_routed_mxfp8_writeback(
+    weight: MXFP8Tensor, routed: FlashInferRoutedMXFP8Weight, expert: int
+) -> None:
+    """Redirect one canonical expert weight's in-place updates into its routed slot.
+
+    The canonical data and scale storage is released. Afterwards weight.quantize_ (and
+    copy_, which refit uses) quantizes the logical value with the same Megatron kernel as
+    the canonical path into an expert-sized staging buffer and repacks it into routed in
+    place, so the routed bytes match a canonical update followed by a full repack and
+    CUDA-graph addresses are preserved. Reading weight.data or weight.scale afterwards
+    does not return the weight's value.
+    """
+    if weight.writeback is not None:
+        raise RuntimeError("expert weight already writes through to a routed MXFP8 layout")
+    if weight.backend != "triton":
+        raise ValueError(
+            "routed MXFP8 writeback requires the Triton/cublas canonical layout; "
+            f"got backend={weight.backend!r}."
+        )
+    rows, cols = weight.data.shape
+    if (rows, cols) != (routed.logical_rows, routed.logical_cols):
+        raise ValueError(
+            f"expert weight shape {(rows, cols)} does not match the routed layout's logical "
+            f"shape {(routed.logical_rows, routed.logical_cols)}"
+        )
+    scale_numel = weight.scale.numel()
+    scale_dtype = weight.scale.dtype
+    device = weight.data.device
+    routed_data = routed.data[expert]
+    routed_scale = routed.scale[expert]
+
+    def writeback(value: torch.Tensor) -> None:
+        staging_data, staging_scale = _writeback_staging(
+            rows, cols, scale_numel, scale_dtype, device
+        )
+        mcore_mxfp8_quantize_into(value, staging_data, staging_scale)
+        _repack_routed_mxfp8_expert(staging_data, staging_scale, routed_data, routed_scale)
+
+    weight.data = _broadcast_placeholder(weight.data)
+    weight.scale = _broadcast_placeholder(weight.scale)
+    weight.writeback = writeback
+
+
+def prepare_routed_mxfp8_expert_weights(
+    expert_weights: Sequence[MXFP8Tensor],
+) -> FlashInferRoutedMXFP8Weight:
+    """Repack per-expert canonical weights into one routed stack that they write through to.
+
+    Each expert is repacked directly from its canonical storage, which is then released and
+    replaced by a writeback into the routed slot (see attach_routed_mxfp8_writeback).
+    Only the routed copy stays resident, so FlashInfer MXFP8 holds one copy of the expert
+    weights, and refits still update the weights in place.
+    """
+    require_flashinfer_routed_mxfp8()
+    if not expert_weights:
+        raise ValueError("expected at least one expert weight")
+    first = expert_weights[0]
+    logical_rows, logical_cols = first.data.shape
+    padded_rows = _round_up(logical_rows, 128)
+    padded_cols = _round_up(logical_cols, 128)
+    with torch.inference_mode(False):
+        routed = FlashInferRoutedMXFP8Weight(
+            data=torch.empty(
+                len(expert_weights),
+                padded_rows,
+                padded_cols,
+                dtype=first.data.dtype,
+                device=first.data.device,
+            ),
+            scale=torch.empty(
+                len(expert_weights),
+                padded_rows * (padded_cols // 32),
+                dtype=torch.uint8,
+                device=first.data.device,
+            ),
+            logical_rows=logical_rows,
+            logical_cols=logical_cols,
+            padded_rows=padded_rows,
+            padded_cols=padded_cols,
+        )
+    for expert, weight in enumerate(expert_weights):
+        if weight.writeback is not None:
+            raise RuntimeError(
+                f"expert {expert} already writes through to a routed MXFP8 layout; its "
+                "canonical storage was released, so the routed layout cannot be rebuilt from it"
+            )
+        if weight.backend != "triton" or tuple(weight.data.shape) != (logical_rows, logical_cols):
+            raise ValueError(
+                f"expert {expert} weight must use the Triton/cublas layout with shape "
+                f"{(logical_rows, logical_cols)}; got backend={weight.backend!r} "
+                f"shape={tuple(weight.data.shape)}"
+            )
+        _repack_routed_mxfp8_expert(
+            weight.data, weight.scale, routed.data[expert], routed.scale[expert]
+        )
+        attach_routed_mxfp8_writeback(weight, routed, expert)
+    return routed
 
 
 def pack_routed_mxfp8_routing(

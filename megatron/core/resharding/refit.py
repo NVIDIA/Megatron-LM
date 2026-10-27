@@ -337,9 +337,10 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
     decoder = core.decoder if hasattr(core, 'decoder') else core
 
     # 1. Quantize selected decoder weights -> persistent MXFP8Tensor buffers.
-    # Routed FlashInfer MoE weights are derived from MCore's canonical Triton/cublas
-    # representation. The reshard transform updates those canonical buffers, then
-    # refresh_flashinfer_mxfp8_weights refreshes the derived buffers in place.
+    # Routed FlashInfer MoE weights start from MCore's canonical Triton/cublas
+    # representation. Once the routed stack is built, each canonical expert buffer writes
+    # through to its routed slot, so the reshard transform updates the kernel's weights
+    # directly and refresh_flashinfer_mxfp8_weights only reports that a sync is needed.
     backend = resolve_mxfp8_backend(lm.config.inference_grouped_gemm_backend)
     persistent_buffers = quantize_params_to_mxfp8(decoder, backend=backend)
 
