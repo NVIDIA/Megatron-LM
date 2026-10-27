@@ -1804,6 +1804,7 @@ _CHAT_LOGPROBS = {
                 "content": "<30><31>",
                 "prompt_token_ids": [10, 2],
                 "generation_token_ids": [30, 31],
+                "generation_log_probs": [-0.5, -0.25],
                 "raw_text": "<10><2><30><31>",
             },
             "stop",
@@ -1815,7 +1816,12 @@ _CHAT_LOGPROBS = {
             {},
             {"eval_mode": False},
             None,
-            {"content": "<30><31>", "prompt_token_ids": [10, 2], "generation_token_ids": [30, 31]},
+            {
+                "content": "<30><31>",
+                "prompt_token_ids": [10, 2],
+                "generation_token_ids": [30, 31],
+                "generation_log_probs": [-0.5, -0.25],
+            },
             "stop",
             None,
             id="rl-default-echoes-token-ids",
@@ -1925,11 +1931,7 @@ async def test_chat_response_format(
     }
     choice_0, choice_1 = payload["choices"]
     assert (choice_0["index"], choice_1["index"]) == (0, 1)
-    assert choice_0["message"] == {
-        "role": "assistant",
-        "generation_log_probs": [-0.5, -0.25],
-        **expected_message,
-    }
+    assert choice_0["message"] == {"role": "assistant", **expected_message}
     assert choice_0["finish_reason"] == expected_finish_reason
     assert choice_0["logprobs"] == expected_logprobs
     assert (choice_0["moe_topk_indices"], choice_0["prompt_moe_topk_indices"]) == (
@@ -2210,7 +2212,7 @@ async def test_chat_real_parsers_shape_the_message(
     if "tool_calls" in message:
         # Ids are minted per call; the function is what the parser decided.
         message["tool_calls"] = [call["function"] for call in message["tool_calls"]]
-    assert message == {"role": "assistant", "generation_log_probs": None, **expected_message}
+    assert message == {"role": "assistant", **expected_message}
     assert choice["finish_reason"] == expected_finish_reason
 
 
