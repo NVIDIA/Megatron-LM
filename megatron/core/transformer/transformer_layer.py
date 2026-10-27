@@ -699,9 +699,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 "without subclass-specific attention state."
             )
 
-        using_fused_tp_inference_kernel = (
-            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
-        )
+        using_fused_tp_inference_kernel = self._using_fused_tp_inference()
         if using_fused_tp_inference_kernel:
             self._set_proj_residual(residual)
 
@@ -831,9 +829,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 hidden_states, residual_stream_recompute_context=residual_stream_recompute_context
             )
 
-        using_fused_tp_inference_kernel = (
-            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
-        )
+        using_fused_tp_inference_kernel = self._using_fused_tp_inference()
         if using_fused_tp_inference_kernel:
             # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
             # operation in attention's out_proj (linear_proj)
@@ -1038,9 +1034,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         ``attn_state``. Base uses that state for an optional residual connection and
         otherwise performs the ordinary bias-dropout-add.
         """
-        using_fused_tp_inference_kernel = (
-            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
-        )
+        using_fused_tp_inference_kernel = self._using_fused_tp_inference()
         residual_connection = self._get_self_attention_residual_connection(operation="write")
         recompute_context = (
             residual_stream_recompute_context if residual_connection is not None else None
@@ -1465,9 +1459,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             and not isinstance(self.mlp, IdentityOp)
         )
 
-        using_fused_tp_inference_kernel = (
-            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
-        )
+        using_fused_tp_inference_kernel = self._using_fused_tp_inference()
         moe_kwargs = {}
         if self.is_moe_layer and input_ids is not None:
             moe_kwargs["input_ids"] = input_ids
@@ -1581,9 +1573,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             )
             return self._legacy_forward_post_mlp(self, mlp_output_with_bias, residual)
 
-        using_fused_tp_inference_kernel = (
-            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
-        )
+        using_fused_tp_inference_kernel = self._using_fused_tp_inference()
 
         residual_connection = self._get_mlp_residual_connection(operation="write")
         recompute_context = (
@@ -1701,6 +1691,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
     def get_fc2_fused_tp_handoff(self) -> FusedTPHandoff:
         """Get the MLP FC2 handoff for the next layer's QKV."""
         return self.mlp.linear_fc2.fused_tp_handoff
+
+    def _using_fused_tp_inference(self) -> bool:
+        """Whether attention's linear_proj and MLP's linear_fc2 own the residual adds.
+
+        With fused TP communication they do in inference, but only in eval mode: in
+        training mode the inference linears run their training path, so the layer keeps
+        its own bias-dropout-add even while InferenceMode is active.
+        """
+        return (
+            self.config.inference_fuse_tp_communication
+            and InferenceMode.is_active()
+            and not self.training
+        )
 
     def _set_proj_next_layer_norm_weights(self, weights: Tensor):
         """Set next layer norm weights for attention/mixer's linear_proj."""

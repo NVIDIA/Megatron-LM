@@ -85,6 +85,12 @@ class FusedTPHandoff:
     Whether the fused kernel runs is decided per forward (NVLS support, dtype, shape,
     symmetric memory size, batch-invariant mode), so the row-parallel layer records it
     here on every forward and the column-parallel layer reads it instead of assuming it.
+
+    The record is written only when the row-parallel layer's Python runs. A CUDA graph
+    bakes in the decisions made at capture, so the record stays valid as long as the two
+    layers are replayed together or run eagerly together: inference CUDA graphs capture
+    whole transformer layers or the whole block, and TransformerBlock links two layers
+    only when they are graphed alike.
     """
 
     def __init__(self):
@@ -562,9 +568,6 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         """
         Forward pass.
         """
-        if self.training:
-            return super().forward(x)
-
         # A residual passed in or handed over via _set_residual means the caller skips
         # its own residual add, so the output must include it whether or not the fused
         # kernel runs.
@@ -572,6 +575,12 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             residual = self.residual
         self.residual = None
         self.fused_tp_handoff.next_layer_input_in_symm_buffer = False
+        if self.training:
+            # The caller hands over the residual only in eval mode: its training-mode
+            # bias-dropout-add also applies dropout, which this layer does not.
+            assert residual is None, "residual add handed over in training mode"
+            return super().forward(x)
+
         if self.tp_size == 1:
             x = _apply_linear(x, self.weight, self.config)
         else:
