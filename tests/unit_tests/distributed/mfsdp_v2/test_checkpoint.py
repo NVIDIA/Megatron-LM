@@ -123,15 +123,10 @@ def test_post_wrap_assign_true_load_raises(distributed_setup):
 
 
 def _build_sharded(
-    model: nn.Module,
-    mesh: DeviceMesh,
-    device: torch.device,
-    *,
-    param_dtype: torch.dtype | None = None,
-    zero_init: bool = False,
+    mesh: DeviceMesh, device: torch.device, *, param_dtype: torch.dtype, zero_init: bool
 ) -> tuple[nn.Module, torch.optim.Optimizer, dict[str, torch.Size]]:
-    """Shard the model's children and return the model, optimizer, and original global shapes."""
-    model = model.to(device=device, dtype=param_dtype)
+    """Build and shard a TinyModel, returning it, its optimizer, and original global shapes."""
+    model = _TinyModel().to(device=device, dtype=param_dtype)
     global_shapes = {key: value.shape for key, value in model.state_dict().items()}
     if zero_init:
         # Zero the destination weights so they are obviously different from the saved (trained)
@@ -139,11 +134,25 @@ def _build_sharded(
         for parameter in model.parameters():
             nn.init.zeros_(parameter)
     with fully_shard_context(device=device):
-        for child in model.children():
-            fully_shard(child, mesh=mesh, placements=_default_placements())
+        fully_shard(model.fc1, mesh=mesh, placements=_default_placements())
+        fully_shard(model.fc2, mesh=mesh, placements=_default_placements())
     optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
     # main_weight is fp32 by default, so a bf16 model feeds the fp32 optimizer bf16 grads; the
     # adapter casts them around each step.
+    fully_shard_optimizer(optimizer)
+    return model, optimizer, global_shapes
+
+
+def _build_packed_sharded(
+    mesh: DeviceMesh, device: torch.device
+) -> tuple[nn.Module, torch.optim.Optimizer, dict[str, torch.Size]]:
+    """Build and shard a PackedModel, returning it, its optimizer, and original global shapes."""
+    model = _PackedModel().to(device=device)
+    global_shapes = {key: value.shape for key, value in model.state_dict().items()}
+    with fully_shard_context(device=device):
+        fully_shard(model.block, mesh=mesh, placements=_default_placements())
+        fully_shard(model.linear, mesh=mesh, placements=_default_placements())
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
     fully_shard_optimizer(optimizer)
     return model, optimizer, global_shapes
 
@@ -302,7 +311,7 @@ def test_checkpoint_roundtrip_default_placements(
 
     # Source: train one step so weights and optimizer state are non-trivial, then save.
     model, optimizer, global_shapes = _build_sharded(
-        _TinyModel(), mesh, device, param_dtype=param_dtype, zero_init=False
+        mesh, device, param_dtype=param_dtype, zero_init=False
     )
     _train_one_step(model, optimizer, device, param_dtype=param_dtype)
     model_snapshot, optimizer_snapshot = _snapshot_state(model, optimizer)
@@ -314,9 +323,7 @@ def test_checkpoint_roundtrip_default_placements(
         _assert_optimizer_matches_snapshot(optimizer, optimizer_snapshot)
 
         # Destination: zero-initialized, so a correct load is non-trivial.
-        model, optimizer, _ = _build_sharded(
-            _TinyModel(), mesh, device, param_dtype=param_dtype, zero_init=True
-        )
+        model, optimizer, _ = _build_sharded(mesh, device, param_dtype=param_dtype, zero_init=True)
         load_checkpoint(model, optimizer, checkpoint_dir)
 
     local_nonempty = _assert_model_matches_snapshot(model, model_snapshot)
@@ -342,7 +349,7 @@ def test_saved_chunks_match_the_stable_path(
     world_size = distributed_setup.world_size
     mesh = init_device_mesh(device.type, (world_size,))
 
-    model, optimizer, global_shapes = _build_sharded(_PackedModel(), mesh, device)
+    model, optimizer, global_shapes = _build_packed_sharded(mesh, device)
     _train_one_step(
         model, optimizer, device, param_dtype=torch.float32, in_features=4, out_features=16
     )
@@ -382,7 +389,7 @@ def test_saved_chunks_tile_every_parameter(distributed_setup, tmp_path_dist_ckpt
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
 
-    model, optimizer, global_shapes = _build_sharded(_PackedModel(), mesh, device)
+    model, optimizer, global_shapes = _build_packed_sharded(mesh, device)
     _train_one_step(
         model, optimizer, device, param_dtype=torch.float32, in_features=4, out_features=16
     )
@@ -443,7 +450,7 @@ def test_metadata_attach_issues_no_collectives(
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
 
-    model, optimizer, global_shapes = _build_sharded(_PackedModel(), mesh, device)
+    model, optimizer, global_shapes = _build_packed_sharded(mesh, device)
     _train_one_step(
         model, optimizer, device, param_dtype=torch.float32, in_features=4, out_features=16
     )
