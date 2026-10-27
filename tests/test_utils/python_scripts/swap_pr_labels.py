@@ -244,7 +244,7 @@ class PRReviewTracker:
         logger.info(f"Pending expert teams: {pending_expert_teams}, reviewers: {pending_expert}")
         logger.info(f"Pending final teams: {pending_final_teams}, reviewers: {pending_final}")
 
-        needs_final_review = bool(final_required)
+        needs_final_review = bool(final_required or final_non_approvers)
 
         # 5. State machine: update labels based on current stage and pending reviewers
         if self.stage == self.APPROVED:

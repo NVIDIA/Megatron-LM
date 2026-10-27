@@ -190,6 +190,44 @@ class TestReviewLabels(ApprovalFixture):
         self.swap_labels(self.tracker(), {"rl-reviewer": "CHANGES_REQUESTED"})
         self.assert_no_label_changes()
 
+    def test_core_member_requesting_changes_requires_final_review(self):
+        for reviewer in ("nemo-reviewer", "adlr-reviewer"):
+            with self.subTest(reviewer=reviewer):
+                self.pr.reset_mock()
+                self.swap_labels(self.tracker(), {reviewer: "CHANGES_REQUESTED"})
+                self.pr.add_to_labels.assert_called_once_with("Final Review")
+                self.pr.remove_from_labels.assert_not_called()
+
+    def test_core_member_approval_allows_advancement(self):
+        for reviewer in ("nemo-reviewer", "adlr-reviewer"):
+            for stage in (None, "Final Review"):
+                with self.subTest(reviewer=reviewer, stage=stage):
+                    self.pr.reset_mock()
+                    self.pr.labels = [] if stage is None else [SimpleNamespace(name=stage)]
+                    self.swap_labels(self.tracker(), {reviewer: "APPROVED"})
+                    self.pr.add_to_labels.assert_called_once_with("Approved")
+                    if stage:
+                        self.pr.remove_from_labels.assert_called_once_with("Final Review")
+                    else:
+                        self.pr.remove_from_labels.assert_not_called()
+
+    def test_core_member_requesting_changes_reverts_approved_to_final_review(self):
+        self.pr.labels = [SimpleNamespace(name="Approved")]
+        for reviewer in ("nemo-reviewer", "adlr-reviewer"):
+            with self.subTest(reviewer=reviewer):
+                self.pr.reset_mock()
+                self.swap_labels(self.tracker(), {reviewer: "CHANGES_REQUESTED"})
+                self.pr.remove_from_labels.assert_called_once_with("Approved")
+                self.pr.add_to_labels.assert_called_once_with("Final Review")
+
+    def test_core_member_requesting_changes_blocks_final_review_advancement(self):
+        self.pr.labels = [SimpleNamespace(name="Final Review")]
+        for reviewer in ("nemo-reviewer", "adlr-reviewer"):
+            with self.subTest(reviewer=reviewer):
+                self.pr.reset_mock()
+                self.swap_labels(self.tracker(), {reviewer: "CHANGES_REQUESTED"})
+                self.assert_no_label_changes()
+
     def test_changes_requested_reverts_an_already_approved_pr(self):
         self.pr.labels = [SimpleNamespace(name="Approved")]
         self.swap_labels(self.tracker(), {"rl-reviewer": "CHANGES_REQUESTED"})
