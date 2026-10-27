@@ -1,6 +1,8 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/ssd_bmm.py
 # Adapted from vLLM project (Apache-2.0).
+# The varlen backward is adapted from (Apache-2.0):
+# https://github.com/state-spaces/mamba/blob/v2.3.2.post1/mamba_ssm/ops/triton/ssd_bmm.py
 
 import torch
 import triton
@@ -234,5 +236,251 @@ def _bmm_chunk_fwd(
             IS_CAUSAL=causal,
             HAS_TARGET_ROWS=has_target_rows,
             dot_dtype=dot_dtype,
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------------------------
+# Backward. Adapted from mamba_ssm (state-spaces/mamba v2.3.2.post1) for varlen chunks: chunk c
+# covers tokens [cu_chunk_seqlens[c], cu_chunk_seqlens[c + 1]) and never spans two sequences.
+# Token addressing uses those offsets; seq_idx is per token of the (unpadded) packed layout, so
+# the seq_idx tests of the original kernels stay valid unchanged.
+# pylint: disable=possibly-used-before-assignment  (variables guarded by the same
+# constexpr flag, e.g. HAS_SEQ_IDX, at definition and use)
+# ---------------------------------------------------------------------------------------------
+
+
+@triton.autotune(
+    configs=autotune_configs(
+        [
+            triton.Config(
+                {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_CS': 64},
+                num_stages=3,
+                num_warps=8,
+            ),
+            triton.Config(
+                {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_CS': 32},
+                num_stages=4,
+                num_warps=4,
+            ),
+            triton.Config(
+                {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_CS': 32},
+                num_stages=4,
+                num_warps=4,
+            ),
+            triton.Config(
+                {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_CS': 32},
+                num_stages=4,
+                num_warps=4,
+            ),
+            triton.Config(
+                {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_CS': 32},
+                num_stages=4,
+                num_warps=4,
+            ),
+            triton.Config(
+                {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_CS': 32},
+                num_stages=4,
+                num_warps=4,
+            ),
+            triton.Config(
+                {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_CS': 32},
+                num_stages=5,
+                num_warps=2,
+            ),
+            triton.Config(
+                {'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_CS': 32},
+                num_stages=5,
+                num_warps=2,
+            ),
+            triton.Config(
+                {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_CS': 32},
+                num_stages=4,
+                num_warps=2,
+            ),
+        ]
+    ),
+    key=['chunk_size', 'K'],
+)
+@triton.jit
+def _bmm_chunk_bwd_kernel(
+    chunk_offsets_ptr,  # varlen: (nchunks + 1,) token offsets
+    # Pointers to matrices
+    a_ptr,
+    dout_ptr,
+    db_ptr,
+    res_ptr,
+    # Matrix dimensions
+    seqlen,
+    chunk_size,
+    K,
+    ngroups,
+    stride_a_batch,
+    stride_a_seqlen,
+    stride_a_head,
+    stride_ak,
+    stride_dout_batch,
+    stride_dout_chunk,
+    stride_dout_head,
+    stride_dout_csize_m,
+    stride_dout_csize_n,
+    stride_db_batch,
+    stride_db_seqlen,
+    stride_db_head,
+    stride_db_k,
+    stride_res_batch,
+    stride_res_seqlen,
+    stride_res_head,
+    stride_res_k,
+    # Meta-parameters
+    dot_dtype: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_CS: tl.constexpr,
+):
+    pid_b = tl.program_id(axis=1)
+    pid_ch = tl.program_id(axis=2).to(tl.int64)
+    pid_c = pid_ch // ngroups
+    chunk_start = tl.load(chunk_offsets_ptr + pid_c).to(tl.int64)
+    chunk_end = tl.load(chunk_offsets_ptr + pid_c + 1).to(tl.int64)
+    pid_h = pid_ch - pid_c * ngroups
+    num_pid_n = tl.cdiv(K, BLOCK_SIZE_N)
+    pid_m = tl.program_id(axis=0) // num_pid_n
+    pid_n = tl.program_id(axis=0) % num_pid_n
+
+    a_ptr += pid_b * stride_a_batch + chunk_start * stride_a_seqlen + pid_h * stride_a_head
+    dout_ptr += pid_b * stride_dout_batch + pid_c * stride_dout_chunk + pid_h * stride_dout_head
+
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_cs = tl.arange(0, BLOCK_SIZE_CS)
+    dout_ptrs = dout_ptr + (
+        offs_m[:, None] * stride_dout_csize_n + offs_cs[None, :] * stride_dout_csize_m
+    )
+    a_ptrs = a_ptr + (offs_cs[:, None] * stride_a_seqlen + offs_n[None, :] * stride_ak)
+    chunk_size_limit = chunk_end - chunk_start
+
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for cs in range(0, tl.cdiv(chunk_size_limit, BLOCK_SIZE_CS)):
+        dout = tl.load(
+            dout_ptrs,
+            mask=(offs_m[:, None] < chunk_size)
+            & (offs_cs[None, :] < chunk_size_limit - cs * BLOCK_SIZE_CS),
+            other=0.0,
+        ).to(dot_dtype)
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_cs[:, None] < chunk_size_limit - cs * BLOCK_SIZE_CS) & (offs_n[None, :] < K),
+            other=0.0,
+        ).to(dot_dtype)
+        acc += tl.dot(dout, a)
+        dout_ptrs += BLOCK_SIZE_CS * stride_dout_csize_m
+        a_ptrs += BLOCK_SIZE_CS * stride_a_seqlen
+
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    if HAS_RESIDUAL:
+        res_ptr += (
+            pid_b * stride_res_batch + chunk_start * stride_res_seqlen + pid_h * stride_res_head
+        )
+        res_ptrs = res_ptr + (offs_m[:, None] * stride_res_seqlen + offs_n[None, :] * stride_res_k)
+        res = tl.load(
+            res_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < K)
+        ).to(tl.float32)
+        acc += res
+    db = acc.to(db_ptr.dtype.element_ty)
+
+    db_ptr += pid_b * stride_db_batch + chunk_start * stride_db_seqlen + pid_h * stride_db_head
+    db_ptrs = db_ptr + (offs_m[:, None] * stride_db_seqlen + offs_n[None, :] * stride_db_k)
+    tl.store(db_ptrs, db, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < K))
+
+
+def _bmm_chunk_bwd(cu_chunk_seqlens, a, dout, residual=None, out=None):
+    """
+    Argument:
+        a: (batch, seqlen, k) or (batch, seqlen, ngroups, k)
+        dout: (batch, nchunks, chunk_size, chunk_size)
+            or (batch, nchunks, ngroups, chunk_size, chunk_size)
+        residual: (batch, seqlen, k) or (batch, seqlen, ngroups, k)
+    Return:
+        out: (batch, seqlen, k) or (batch, seqlen, ngroups, k)
+
+    If there was seq_idx in the fwd pass, then dout[i, j] for seq_idx[i] != seq_idx[j] should
+    already be zeroed out before calling this function.
+    """
+    # Check constraints.
+    has_groups = a.dim() == 4
+    if not has_groups:
+        batch, seqlen, k = a.shape
+    else:
+        batch, seqlen, ngroups, k = a.shape
+    nchunks, chunk_size = dout.shape[1], dout.shape[-1]
+    if a.stride(-1) != 1 and a.stride(-2) != 1:
+        a = a.contiguous()
+    if dout.stride(-1) != 1 and dout.stride(-2) != 1:
+        dout = dout.contiguous()
+    if residual is not None:
+        assert (
+            residual.shape == (batch, seqlen, k) if not has_groups else (batch, seqlen, ngroups, k)
+        )
+        if residual.stride(-1) != 1 and residual.stride(1) != 1:
+            residual = residual.contiguous()
+    # Allocates output.
+    if out is not None:
+        assert out.shape == a.shape
+        assert out.stride(-1) == 1 or out.stride(1) == 1
+    else:
+        out = torch.empty_like(a)
+    dot_dtype = (
+        tl.bfloat16
+        if a.dtype == torch.bfloat16 or dout.dtype == torch.bfloat16
+        else (tl.float16 if a.dtype == torch.float16 or dout.dtype == torch.float16 else tl.float32)
+    )
+    grid = lambda META: (
+        triton.cdiv(chunk_size, META['BLOCK_SIZE_M']) * triton.cdiv(k, META['BLOCK_SIZE_N']),
+        batch,
+        nchunks if not has_groups else nchunks * ngroups,
+    )
+    residual_strides = (
+        (
+            residual.stride(0),
+            residual.stride(1),
+            0 if not has_groups else residual.stride(2),
+            residual.stride(-1),
+        )
+        if residual is not None
+        else (0, 0, 0, 0)
+    )
+    with torch.cuda.device(a.device.index):
+        _bmm_chunk_bwd_kernel[grid](
+            cu_chunk_seqlens,
+            a,
+            dout,
+            out,
+            residual,
+            seqlen,
+            chunk_size,
+            k,
+            ngroups if has_groups else 1,
+            a.stride(0),
+            a.stride(1),
+            0 if not has_groups else a.stride(2),
+            a.stride(-1),
+            dout.stride(0),
+            dout.stride(1),
+            0 if not has_groups else dout.stride(2),
+            dout.stride(-2),
+            dout.stride(-1),
+            out.stride(0),
+            out.stride(1),
+            0 if not has_groups else out.stride(2),
+            out.stride(-1),
+            residual_strides[0],
+            residual_strides[1],
+            residual_strides[2],
+            residual_strides[3],
+            dot_dtype,
+            HAS_RESIDUAL=residual is not None,
         )
     return out
