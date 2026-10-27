@@ -875,8 +875,8 @@ def vllm_fused_moe(
                 activation_clamp_scale,
             )
     elif is_swiglu:
-        # intermediate1 is [num_valid, 2N] (gate | up); reduce to [num_valid, N] via
-        # SiLU(gate) * up over the valid_tokens*topk live rows only.
+        # intermediate1 is [num_valid, 2N] (gate | up, or interleaved blocks); reduce to
+        # [num_valid, N] via SiLU(gate) * up over the valid_tokens*topk live rows only.
         intermediate1 = bounded_silu_mul(
             intermediate1, (valid_tokens * topk).to(torch.int32), glu_options=glu_options
         )

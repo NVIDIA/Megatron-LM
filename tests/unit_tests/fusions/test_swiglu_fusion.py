@@ -49,6 +49,25 @@ def test_clamped_swiglu_config_rejects_unsupported_paths(kwargs, match):
         _clamped_swiglu_config(**kwargs)
 
 
+def test_swiglu_config_accepts_linear_offset():
+    config = _clamped_swiglu_config(activation_func_clamp_value=None, glu_linear_offset=1.0)
+    assert config.glu_linear_offset == 1.0
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"use_te_activation_func": True},
+        {"use_transformer_engine_op_fuser": True, "moe_grouped_gemm": True},
+    ],
+    ids=("te_activation_func", "te_op_fuser"),
+)
+def test_swiglu_config_rejects_linear_offset_on_te_glu(kwargs):
+    """The Transformer Engine GLU activations would silently drop the offset."""
+    with pytest.raises(ValueError, match="glu_linear_offset"):
+        _clamped_swiglu_config(activation_func_clamp_value=None, glu_linear_offset=1.0, **kwargs)
+
+
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("linear_clamp_scale", [None, 3.0], ids=("gate_only", "gate_and_linear"))
 @pytest.mark.parametrize("with_bias", [False, True])

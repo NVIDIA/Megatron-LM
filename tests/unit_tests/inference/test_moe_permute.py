@@ -136,6 +136,55 @@ def test_batch_invariant_clamped_squared_relu_matches_training_rounding():
     assert torch.equal(actual, expected)
 
 
+def test_batch_invariant_squared_relu_without_probs():
+    """With moe_apply_probs_on_input the probabilities were applied to the expert input, so
+    the kernel leaves them out, which is bit-identical to a unit probability."""
+    from megatron.core.inference.moe.batch_invariant import squared_relu_with_probs
+
+    torch.manual_seed(31)
+    rows, hidden = 37, 512
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    permutation_map = torch.arange(rows, device="cuda", dtype=torch.int32)
+    ones = torch.ones(rows, device="cuda", dtype=torch.float32)
+
+    actual = squared_relu_with_probs(x, permutation_map, _vt(rows), None)
+    assert torch.equal(actual, squared_relu_with_probs(x, permutation_map, _vt(rows), ones))
+
+
+@pytest.mark.parametrize(
+    "kernel",
+    ["padded_swiglu", "bounded_silu_mul", "swiglu_with_probs", "weighted_silu_mul_bounded"],
+)
+def test_swiglu_clamp_value_propagates_nan(kernel):
+    """activation_func_clamp_value keeps NaN FC1 outputs NaN, as training's torch.clamp does,
+    instead of clamping them to a finite value."""
+    from megatron.core.inference.moe import activations, batch_invariant
+    from megatron.core.inference.moe.activations import GLUOptions
+
+    torch.manual_seed(37)
+    rows, ffn = 4, 64
+    x = torch.randn(rows, 2 * ffn, device="cuda", dtype=torch.bfloat16)
+    x[0, 3] = float("nan")  # gate of output column 3
+    x[1, ffn + 5] = float("nan")  # linear half of output column 5
+    expected_nan = torch.zeros(rows, ffn, dtype=torch.bool, device="cuda")
+    expected_nan[0, 3] = expected_nan[1, 5] = True
+    perm = torch.arange(rows, device="cuda", dtype=torch.int32)
+    probs = torch.rand(rows, device="cuda", dtype=torch.float32)
+    glu = GLUOptions(clamp_value=0.5)
+
+    run = {
+        "padded_swiglu": lambda: activations.padded_swiglu(x, perm, _vt(rows), glu_options=glu),
+        "bounded_silu_mul": lambda: activations.bounded_silu_mul(x, _vt(rows), glu_options=glu),
+        "swiglu_with_probs": lambda: batch_invariant.swiglu_with_probs(
+            x, perm, _vt(rows), probs, glu_options=glu
+        ),
+        "weighted_silu_mul_bounded": lambda: batch_invariant.weighted_silu_mul_bounded(
+            x, probs, _vt(rows * ffn), glu_options=glu
+        ),
+    }[kernel]
+    assert torch.equal(run().isnan(), expected_nan)
+
+
 @pytest.mark.internal
 class TestComputeLocalTokensPerExpert:
 
@@ -336,6 +385,31 @@ class TestPermuteTokens:
             torch.testing.assert_close(
                 perm_h[i], hidden[src], msg=f"Row {i} (src={src}) hidden mismatch"
             )
+
+    @pytest.mark.parametrize("alignment", [1, 16])
+    def test_scale_by_probs(self, alignment):
+        """moe_apply_probs_on_input: rows are BF16(prob * token), as training scales the
+        expert input, and the permuted probabilities become 1."""
+        from megatron.core.inference.moe.permute import permute_tokens
+
+        num_tokens, num_experts = 64, 8
+        hidden, probs, routing_map = _make_inputs(num_tokens, 128, 1, num_experts)
+        perm_h, perm_p, perm_map, offs = permute_tokens(
+            hidden,
+            probs,
+            routing_map,
+            0,
+            num_experts,
+            _vt(num_tokens),
+            alignment=alignment,
+            scale_by_probs=True,
+        )
+
+        real = (perm_map[: offs[-1].item()] >= 0).nonzero(as_tuple=True)[0]
+        src = perm_map[real].long()
+        expected = (hidden[src].float() * probs[src]).to(torch.bfloat16)
+        torch.testing.assert_close(perm_h[real], expected, atol=0, rtol=0)
+        torch.testing.assert_close(perm_p[real], torch.ones_like(perm_p[real]))
 
     @pytest.mark.parametrize("alignment", [1, 16, 32, 64, 128])
     @pytest.mark.parametrize("num_tokens,topk,num_experts", [(16, 2, 4), (64, 4, 8), (128, 8, 32)])

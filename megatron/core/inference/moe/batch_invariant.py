@@ -14,7 +14,7 @@ from megatron.core.inference.communication.torch_symm_triton.utils import (
     is_device_nvls_capable,
     sync_threads,
 )
-from megatron.core.inference.moe.activations import GLUOptions, _glu_columns, _glu_inputs
+from megatron.core.inference.moe.activations import GLUOptions, glu_columns, glu_inputs
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     grouped_gemm_batch_invariant,
     grouped_gemm_batch_invariant_alignment,
@@ -141,7 +141,7 @@ def _swiglu_with_probs_kernel(
     computed in FP32 with a single BF16 round at the end. The hard clamp (CLAMP)
     precedes it in FP32, as in training's fused clamped weighted-swiglu. Input row
     width is 2*ffn_size: gate = first half, up = second half (megatron chunk
-    convention), or interleaved blocks (see _glu_columns). Fixed NUM_BLOCKS CTAs
+    convention), or interleaved blocks (see glu_columns). Fixed NUM_BLOCKS CTAs
     iterating rows -> CUDA-graph safe.
     """
     pid = tl.program_id(0)
@@ -159,12 +159,12 @@ def _swiglu_with_probs_kernel(
                 for offset in tl.range(0, ffn_size, BLOCK_SIZE):
                     cols = offset + tl.arange(0, BLOCK_SIZE)
                     mask = cols < ffn_size
-                    gate_cols, up_cols = _glu_columns(cols, ffn_size, INTERLEAVE)
+                    gate_cols, up_cols = glu_columns(cols, ffn_size, INTERLEAVE)
                     gate = tl.load(input_ptr + row_i64 * two_n + gate_cols, mask=mask).to(
                         tl.float32
                     )
                     up = tl.load(input_ptr + row_i64 * two_n + up_cols, mask=mask).to(tl.float32)
-                    gate, up = _glu_inputs(gate, up, clamp_value, linear_offset, CLAMP, OFFSET)
+                    gate, up = glu_inputs(gate, up, clamp_value, linear_offset, CLAMP, OFFSET)
                     # Match training's fused SiLU instruction order. Multiplying
                     # by sigmoid can round differently before MXFP8 quantization.
                     value = (gate / (1.0 + libdevice.exp(-gate))) * up * prob
@@ -189,7 +189,9 @@ def swiglu_with_probs(
 
     ``zero_padding`` initializes aligned dummy rows because MXFP8 quantization and
     grouped GEMM have no permutation map with which to skip them. ``glu_options``
-    holds the clamp, linear offset and FC1 interleaving of the gated activation.
+    holds the clamp, linear offset and FC1 interleaving of the gated activation; ``x``
+    stays in the FC1 layout (gate | up, or interleaved blocks), which the kernel reads
+    directly.
     """
     num_rows, two_ffn = x.shape
     ffn_size = two_ffn // 2
@@ -240,7 +242,7 @@ def _weighted_silu_mul_bounded_kernel(
     (= valid_tokens * topk * HALF_N — the live prefix of the flat token-major
     layout). Rows beyond the bound are neither read nor written.
 
-    The GLU options (_glu_columns, _glu_inputs) only select and transform the FP32
+    The GLU options (glu_columns, glu_inputs) only select and transform the FP32
     inputs of that sequence, as training's fused clamped weighted-swiglu does. Without
     APPLY_WEIGHTS the weight is 1 (it was applied to the expert input), which the
     multiply would leave exact.
@@ -253,10 +255,10 @@ def _weighted_silu_mul_bounded_kernel(
         xmask = (xindex < xbound) & (xindex < xnumel)
         x0 = xindex % HALF_N
         x1 = xindex // HALF_N
-        gate_cols, up_cols = _glu_columns(x0, HALF_N, INTERLEAVE)
+        gate_cols, up_cols = glu_columns(x0, HALF_N, INTERLEAVE)
         tmp0 = tl.load(in_ptr0 + (gate_cols + 2 * HALF_N * x1), xmask).to(tl.float32)
         tmp8 = tl.load(in_ptr0 + (up_cols + 2 * HALF_N * x1), xmask).to(tl.float32)
-        tmp0, tmp8 = _glu_inputs(tmp0, tmp8, clamp_value, linear_offset, CLAMP, OFFSET)
+        tmp0, tmp8 = glu_inputs(tmp0, tmp8, clamp_value, linear_offset, CLAMP, OFFSET)
         tmp1 = tmp0.to(tl.float32)
         tmp2 = -tmp1
         tmp3 = libdevice.exp(tmp2)
@@ -286,10 +288,12 @@ def weighted_silu_mul_bounded(
 ) -> torch.Tensor:
     """SwiGLU with routing weights applied at the activation (training parity).
 
-    y: [rows, 2*half_n] bf16 (gate | up); weights_flat: [rows] fp32 routing
-    probabilities, or None when they were applied to the expert input;
-    bound_elems: device scalar = live_rows * half_n; glu_options: clamp, linear
-    offset and FC1 interleaving of the gated activation.
+    y: [rows, 2*half_n] bf16, laid out as (gate | up) or, with
+    glu_options.interleave_size, as interleaved gate and up blocks (see glu_columns;
+    the kernel reads either layout directly, so do not de-interleave beforehand);
+    weights_flat: [rows] fp32 routing probabilities, or None when they were applied to
+    the expert input; bound_elems: device scalar = live_rows * half_n; glu_options:
+    clamp, linear offset and FC1 interleaving of the gated activation.
     Returns [rows, half_n] bf16; rows beyond the live bound are untouched.
 
     num_programs defaults to SMs * 8 waves (Inductor's persistent-grid sizing;

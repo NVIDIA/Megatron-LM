@@ -1179,12 +1179,17 @@ _EXPERT_OPTIONS = {
 }
 
 
-def _skip_unless_inference_backend(backend):
+def _skip_unless_inference_backend(backend, batch_invariant=False):
     if backend == "torch":
         from megatron.core.inference.moe.fused_moe import HAVE_GROUPED_MM
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            HAVE_DEEPGEMM_BF16,
+        )
 
         if not HAVE_GROUPED_MM or torch.cuda.get_device_capability()[0] < 9:
             pytest.skip("The torch grouped-GEMM backend needs torch grouped_mm and SM90+")
+        if batch_invariant and not HAVE_DEEPGEMM_BF16:
+            pytest.skip("Batch-invariant torch MoE path requires DeepGEMM bf16 grouped kernels.")
 
 
 @pytest.mark.internal
@@ -1275,10 +1280,18 @@ class TestInferenceGroupedMLPMatchesTraining:
     def _rel_err(actual, expected):
         return ((actual - expected).norm() / expected.norm()).item()
 
+    @pytest.mark.parametrize("batch_invariant", [False, True], ids=["default", "batch_invariant"])
     @pytest.mark.parametrize("option", list(_EXPERT_OPTIONS))
     @pytest.mark.parametrize("backend", ["vllm", "torch"])
-    def test_inference_matches_training(self, backend, option):
-        _skip_unless_inference_backend(backend)
+    def test_inference_matches_training(self, backend, option, batch_invariant):
+        """With batch_invariant, inference runs the batch-invariant kernels. Training applies
+        the linear offset and the interleave in its unfused GLU, whose BF16 roundings those
+        kernels do not reproduce, so the comparison stays a tolerance check."""
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+
+        _skip_unless_inference_backend(backend, batch_invariant)
         overrides = _EXPERT_OPTIONS[option]
         _set_random_seed(seed_=123, data_parallel_random_init=False)
         experts = self._make_experts(backend, **overrides)
@@ -1287,7 +1300,8 @@ class TestInferenceGroupedMLPMatchesTraining:
         )
 
         expected = self._training_forward(experts, hidden, probs, routing_map)
-        actual = self._inference_forward(experts, hidden, probs, routing_map)
+        with set_batch_invariant_mode(batch_invariant):
+            actual = self._inference_forward(experts, hidden, probs, routing_map)
 
         assert actual.shape == expected.shape
         assert self._rel_err(actual, expected) <= self.tol

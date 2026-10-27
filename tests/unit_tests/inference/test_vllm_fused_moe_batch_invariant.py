@@ -117,6 +117,22 @@ def _weighted_swiglu_reference(y, probs_flat):
     return (torch.nn.functional.silu(gate) * up * probs_flat[:, None]).to(y.dtype)
 
 
+def _glu_options_reference(y, probs_flat, glu_options):
+    """_weighted_swiglu_reference with training's GLU options (TEGroupedMLP's unfused glu)."""
+    y = y.float()
+    if glu_options.interleave_size is not None:
+        size = glu_options.interleave_size
+        y = y.reshape(y.shape[0], -1, 2, size).transpose(1, 2).reshape(y.shape)
+    gate, up = y.chunk(2, dim=-1)
+    if glu_options.clamp_value is not None:
+        gate = gate.clamp(max=glu_options.clamp_value)
+        up = up.clamp(min=-glu_options.clamp_value, max=glu_options.clamp_value)
+    out = torch.nn.functional.silu(gate) * (up + glu_options.linear_offset)
+    if probs_flat is not None:
+        out = out * probs_flat[:, None]
+    return out.to(torch.bfloat16)
+
+
 class TestWeightedSwigluKernels:
 
     def test_swiglu_with_probs_matches_fused_training_order(self):
@@ -178,6 +194,43 @@ class TestWeightedSwigluKernels:
         y2[live:] = float("nan")
         out2 = batch_invariant.weighted_silu_mul_bounded(y2, probs, bound)
         assert torch.equal(out2[:live], out[:live])
+
+    @pytest.mark.parametrize("weighted", [True, False], ids=["weighted", "unweighted"])
+    @pytest.mark.parametrize(
+        "options",
+        [
+            dict(clamp_value=0.5),
+            dict(linear_offset=1.0),
+            dict(interleave_size=32),
+            dict(clamp_value=0.5, interleave_size=64),
+        ],
+        ids=["clamp", "offset", "interleave", "clamp+interleave"],
+    )
+    def test_glu_options_match_reference(self, options, weighted):
+        """Both kernels apply the training GLU options; unweighted (moe_apply_probs_on_input)
+        leaves the probability out. Interleaving is checked on the flat-index kernel too."""
+        from megatron.core.inference.moe import batch_invariant
+        from megatron.core.inference.moe.activations import GLUOptions
+
+        torch.manual_seed(12)
+        rows, ffn = 256, 256
+        y = (torch.randn(rows, 2 * ffn, device="cuda") * 2.0).bfloat16()
+        probs = torch.rand(rows, device="cuda", dtype=torch.float32)
+        glu = GLUOptions(**options)
+        weights = probs if weighted else None
+        expected = _glu_options_reference(y, weights, glu)
+        # The options must matter at this scale, or a dropped option would pass.
+        assert not torch.allclose(expected, _glu_options_reference(y, weights, GLUOptions()))
+
+        bound = torch.tensor(rows * ffn, dtype=torch.int64, device="cuda")
+        actual = batch_invariant.weighted_silu_mul_bounded(y, weights, bound, glu_options=glu)
+        torch.testing.assert_close(actual, expected)
+        if weighted:
+            perm_map = torch.arange(rows, device="cuda", dtype=torch.int32)
+            actual = batch_invariant.swiglu_with_probs(
+                y, perm_map, _vt(rows), probs, glu_options=glu
+            )
+            torch.testing.assert_close(actual, expected)
 
     def test_weighted_silu_mul_bounded_grid_size_is_bit_inert(self):
         # num_programs is an occupancy knob only: the kernel is elementwise

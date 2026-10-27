@@ -3489,6 +3489,26 @@ class TransformerConfig(ModelParallelConfig):
                     "when activation_func_clamp_value is not None for SwiGLU"
                 )
 
+        # The Transformer Engine GLU activations have no linear offset, so the paths that use
+        # them would train without glu_linear_offset while every other path applies it.
+        if self.gated_linear_unit and self.glu_linear_offset != 0.0:
+            if self.use_te_activation_func:
+                raise ValueError(
+                    "glu_linear_offset is not supported with use_te_activation_func: the "
+                    "Transformer Engine GLU activations have no linear offset. Set "
+                    "use_te_activation_func=False."
+                )
+            if (
+                self.use_transformer_engine_op_fuser
+                and self.moe_grouped_gemm
+                and self.activation_func == F.silu
+            ):
+                raise ValueError(
+                    "glu_linear_offset with SwiGLU experts is not supported with "
+                    "use_transformer_engine_op_fuser: the fused grouped-MLP SwiGLU has no "
+                    "linear offset. Unset use_transformer_engine_op_fuser."
+                )
+
         if self.apply_rope_fusion:
             if self.multi_latent_attention:
                 warnings.warn(
