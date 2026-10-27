@@ -2,8 +2,10 @@
 
 import gc
 import logging
+import math
 import os
 from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import pytest
@@ -35,6 +37,274 @@ from tests.unit_tests.test_utilities import Utils
 EPSILON = 0.30
 EPSILON_A2A = 0.30
 DELTA = 20  # MiB
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.parametrize("fraction", [0.0, 0.5, 0.7, 0.8, 1.0])
+def test_partial_offload_backward_does_not_accumulate_reloaded_groups(monkeypatch, fraction):
+    """Actual H2D reloads must stay one group ahead of a sequential backward pass.
+
+    A chain of sin operations saves one equally sized activation per group. Warmup
+    uses an online fraction quota; the final policy reserves the last group and
+    selects an independent prefix. Reloading at every resident boundary would pull
+    all earlier offloaded groups back to GPU before any of them are consumed.
+
+    Observe real reload events and saved-tensor consumption without changing stream
+    ordering or calling the scheduler ourselves. Use interfaces shared with the
+    unfixed implementation so the same test can demonstrate the original regression.
+    """
+    num_groups = 9
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    off_interface.reset_instance()
+    input_tensor = torch.full((512, 512), 0.1, device="cuda", requires_grad=True)
+    group_bytes = input_tensor.numel() * input_tensor.element_size()
+    backward_order = []
+    reload_events = []
+    samples = []
+    current_backward_group = None
+    offloaded_groups = {}
+
+    def sample(event):
+        # Count only initially offloaded groups. A CUDA tensor here was allocated
+        # by reload but has not yet been retrieved through saved_tensors_hooks.
+        # No synchronize is inserted: allocation/retention already occurs when the
+        # asynchronous H2D copy is enqueued, even if the copy has not completed.
+        pending = {
+            index: sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in group._tensors.values()
+                if isinstance(tensor, torch.Tensor) and tensor.is_cuda
+            )
+            for group, index in offloaded_groups.items()
+        }
+        pending = {index: size for index, size in pending.items() if size}
+        samples.append((event, current_backward_group, tuple(pending), sum(pending.values())))
+
+    def record_backward(grad, index):
+        nonlocal current_backward_group
+        current_backward_group = index
+        backward_order.append(index)
+        sample("backward")
+        return grad
+
+    def forward(record=False):
+        off_interface.init_chunk_handler(
+            pp_rank=0,
+            vp_size=None,
+            vp_stage=None,
+            min_offloaded_tensor_size=1,
+            delta_offload_bytes_across_pp_ranks=0,
+            activation_offload_fraction=fraction,
+        )
+        output = input_tensor
+        for index in range(num_groups):
+            scope = off_interface(True, output, "core_attn")
+            with scope as activation:
+                output = activation.sin()
+            output = scope.group_offload(output)
+            if record:
+                output.register_hook(lambda grad, index=index: record_backward(grad, index))
+        return output
+
+    original_reload_event = OffloadTensorGroup.record_reload_event
+    original_pop = OffloadTensorGroup.pop_tensor
+
+    def record_reload_event(group, stream):
+        original_reload_event(group, stream)
+        if group in offloaded_groups:
+            reload_events.append((current_backward_group, offloaded_groups[group]))
+            sample("reload")
+
+    def pop_tensor(group, tag):
+        tensor = original_pop(group, tag)
+        if group in offloaded_groups:
+            sample("consume")
+        return tensor
+
+    try:
+        # Discover the groups and let the production warmup policy apply the
+        # fraction; do not manually construct or edit either scheduling queue.
+        reference = input_tensor
+        for _ in range(num_groups):
+            reference = reference.sin()
+        expected_grad = torch.autograd.grad(reference.sum(), input_tensor)[0]
+        expected_output = reference.detach()
+        del reference
+
+        output = forward()
+        manager = PipelineOffloadManager.get_instance()
+        warmup_chunk = manager.cur_forward_chunk()
+        warmup_indices = [
+            index
+            for index, group in enumerate(warmup_chunk.offload_groups)
+            if any(isinstance(state, tuple) for state in group._tensors.values())
+        ]
+        assert len(warmup_indices) == math.ceil(num_groups * fraction)
+        # Check the quota at every prefix, including the three-group case where
+        # fraction 0.7 deliberately offloads all three to favor GPU headroom.
+        for count in range(1, num_groups + 1):
+            assert sum(index < count for index in warmup_indices) == math.ceil(count * fraction)
+        assert all(group.offload for group in warmup_chunk.offload_groups)
+        assert all(
+            group.total_offload_bytes == group_bytes and group.total_tensor_count == 1
+            for group in warmup_chunk.offload_groups
+        )
+        pool = manager._cpu_tensor_pool
+        warmup_allocations = pool._stats["total_allocated"]
+        assert warmup_allocations == len(warmup_indices)
+        torch.testing.assert_close(output, expected_output)
+        torch.cuda.synchronize()
+        output.sum().backward()
+        torch.testing.assert_close(input_tensor.grad, expected_grad)
+        torch.cuda.synchronize()
+        del output
+        input_tensor.grad = None
+        off_interface.reset()
+
+        output = forward(record=True)
+        chunk = PipelineOffloadManager.get_instance().cur_forward_chunk()
+        assert len(chunk.offload_groups) == num_groups
+        offloaded_groups = {
+            group: index
+            for index, group in enumerate(chunk.offload_groups)
+            if any(isinstance(state, tuple) for state in group._tensors.values())
+        }
+        eligible_count = num_groups - 1
+        num_offloaded = eligible_count - int(eligible_count * (1 - fraction))
+        assert list(offloaded_groups.values()) == list(range(num_offloaded))
+        assert all(len(group._tensors) == 1 for group in chunk.offload_groups)
+        # Equal-shaped buffers are reused across the different warmup/steady masks.
+        assert pool._stats["total_allocated"] == warmup_allocations
+        torch.testing.assert_close(output, expected_output)
+
+        monkeypatch.setattr(OffloadTensorGroup, "record_reload_event", record_reload_event)
+        monkeypatch.setattr(OffloadTensorGroup, "pop_tensor", pop_tensor)
+        torch.cuda.synchronize()
+        output.sum().backward()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(input_tensor.grad, expected_grad)
+        assert backward_order == list(reversed(range(num_groups)))
+        assert [index for _, index in reload_events] == list(reversed(range(num_offloaded)))
+        assert all(not group._tensors for group in chunk.offload_groups)
+        peak_pending = max(len(pending) for _, _, pending, _ in samples)
+        peak_pending_bytes = max(size for _, _, _, size in samples)
+        print(
+            f"Partial offload cadence: fraction={fraction}, groups={num_groups}, "
+            f"warmup_offloaded={len(warmup_indices)}, pool_bytes={warmup_allocations * group_bytes}, "
+            f"offloaded={num_offloaded}, "
+            f"peak_pending_groups={peak_pending}, peak_pending_bytes={peak_pending_bytes}, "
+            f"reloads=(backward_group, reload_group) "
+            f"{reload_events}"
+        )
+        assert peak_pending <= 1 and peak_pending_bytes <= group_bytes, (
+            "Backward reload accumulation: expected at most one prefetched activation "
+            f"({group_bytes} bytes), got {peak_pending} groups / {peak_pending_bytes} bytes; "
+            f"samples={samples}"
+        )
+        assert all(
+            target == current - 1 for current, target in reload_events
+        ), f"Reload exceeded the next-group prefetch window: {reload_events}"
+    finally:
+        torch.cuda.synchronize()
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.parametrize("fraction", [0.5, 1.0])
+@pytest.mark.parametrize("core_layers", [(True, True, True), (True, False, False, False)])
+@pytest.mark.parametrize("pre_reload", [False, True])
+def test_margin_groups_allow_prefetch_after_delayed_norm_commit(
+    monkeypatch, fraction, core_layers, pre_reload
+):
+    """Norm commits after attention; resident margins must not consume prefetch slots."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    off_interface.reset_instance()
+    input_tensor = torch.full((128, 128), 0.1, device="cuda", requires_grad=True)
+
+    def forward():
+        off_interface.init_chunk_handler(
+            pp_rank=0,
+            vp_size=None,
+            vp_stage=None,
+            min_offloaded_tensor_size=1,
+            delta_offload_bytes_across_pp_ranks=0,
+            activation_offload_fraction=fraction,
+        )
+        output = input_tensor
+        for has_core in core_layers:
+            norm_scope = off_interface(True, output, "attn_norm")
+            with norm_scope as residual:
+                output = residual.sin()
+            if has_core:
+                core_scope = off_interface(True, output, "core_attn")
+                with core_scope as activation:
+                    output = activation.sin()
+                output = core_scope.group_offload(output)
+            # Match the production residual path: norm's commit is delayed until
+            # after attention and residual addition, but its start marker is first.
+            output = norm_scope.group_offload(output + residual)
+        return output
+
+    try:
+        reference = input_tensor
+        for has_core in core_layers:
+            residual = reference
+            reference = reference.sin()
+            if has_core:
+                reference = reference.sin()
+            reference = reference + residual
+        expected_grad = torch.autograd.grad(reference.sum(), input_tensor)[0]
+        expected_output = reference.detach()
+        del reference
+
+        output = forward()
+        torch.cuda.synchronize()
+        output.sum().backward()
+        torch.cuda.synchronize()
+        del output
+        input_tensor.grad = None
+        off_interface.reset()
+
+        output = forward()
+        chunk = PipelineOffloadManager.get_instance().cur_forward_chunk()
+        last_by_name = {group._name: group for group in chunk.offload_groups}
+        for group in chunk.offload_groups:
+            if group is last_by_name[group._name]:
+                assert group.is_offload_margin and not group.offload
+                assert group not in chunk._groups_to_reload
+            else:
+                assert not group.is_offload_margin
+                # This includes groups kept resident by fraction, whose slots
+                # must remain present to avoid reverting partial-offload cadence.
+                assert group in chunk._groups_to_reload
+
+        reload_streams = []
+        original_reload = chunk.reload
+
+        def record_reload(state, non_blocking=None):
+            reload_streams.append(torch.cuda.current_stream())
+            return original_reload(state, non_blocking=non_blocking)
+
+        monkeypatch.setattr(chunk, "reload", record_reload)
+        torch.cuda.synchronize()
+        if pre_reload:
+            chunk.pre_reload_last_layer()
+        output.sum().backward()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, expected_output)
+        torch.testing.assert_close(input_tensor.grad, expected_grad)
+        assert reload_streams
+        assert all(
+            stream == chunk.h2d_stream for stream in reload_streams
+        ), "A delayed norm commit caused a compute-stream fallback reload"
+        assert not chunk._groups_to_reload
+        assert all(not group._tensors for group in chunk.offload_groups)
+    finally:
+        torch.cuda.synchronize()
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
 
 
 def _reset_cuda_memory() -> None:
@@ -215,6 +485,63 @@ def _make_warmup_chunk(groups: List["OffloadTensorGroup"]) -> ChunkOffloadHandle
     return handler
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_warmup_fraction_counts_every_group_per_module_and_keeps_view_metadata():
+    base = torch.ones(64, 96, device="cuda")
+    opt_out = torch.ones(16, device="cuda")
+    opt_out._do_not_offload = True
+    tensors_by_group = [
+        ("qkv_linear", [torch.ones(16, device="cuda")]),
+        ("core_attn", [torch.ones(16, device="cuda")]),
+        ("attn_proj", [torch.ones(16, device="cuda")]),
+        ("qkv_linear", []),
+        ("core_attn", [torch.ones(16), torch.ones(1, device="cuda"), opt_out]),
+        ("attn_proj", [torch.ones(16, device="cuda")]),
+        ("qkv_linear", [torch.ones(16, device="cuda")]),
+        ("core_attn", [torch.ones(16, device="cuda")]),
+        ("attn_proj", [torch.ones(16, device="cuda")]),
+        ("expert_fc1", []),
+        ("expert_fc1", [base[:, :80].detach(), base[:, 16:], base[::8, ::8]]),
+    ]
+    groups = []
+    for group_index, (name, tensors) in enumerate(tensors_by_group):
+        group = OffloadTensorGroup(name)
+        for tensor_index, tensor in enumerate(tensors):
+            group.push_tensor((group_index, tensor_index), tensor)
+        groups.append(group)
+    chunk = _make_warmup_chunk(groups)
+    chunk.min_offloaded_tensor_size = 16
+    chunk._activation_offload_fraction = 0.5
+    chunk._groups_to_offload = list(groups)
+    try:
+        for group in groups:
+            chunk.bulk_offload(group._name, [])
+        torch.cuda.synchronize()
+        # Each module selects occurrences 1 and 3. The empty QKV and ineligible
+        # attention groups in occurrence 2 must not shift the next selection.
+        assert [
+            i
+            for i, group in enumerate(groups)
+            if any(isinstance(state, tuple) for state in group._tensors.values())
+        ] == [0, 1, 2, 6, 7, 8]
+        assert groups[3].total_offload_bytes == groups[4].total_offload_bytes == 0
+        assert chunk.cpu_tensor_pool._stats["allocation_requests"] == 6
+        # The skipped MoE group has no CPU pool, but its storage-sized copies,
+        # logical gather, and redundant storage still have complete metadata.
+        skipped = groups[10]
+        storage_bytes = base.untyped_storage().nbytes()
+        gather_bytes = base[::8, ::8].numel() * base.element_size()
+        assert not skipped.use_cpu_pool
+        assert all(isinstance(tensor, torch.Tensor) for tensor in skipped._tensors.values())
+        assert skipped.total_tensor_count == 3
+        assert skipped.total_offload_bytes == 2 * storage_bytes + gather_bytes
+        assert skipped.duplicate_storage_tensor_count == 2
+        assert skipped.duplicate_storage_bytes == storage_bytes + gather_bytes
+        assert all(group.offload for group in groups)
+    finally:
+        torch.cuda.synchronize()
+
+
 def _run_post_warmup_callback(chunk: ChunkOffloadHandler) -> None:
     """Drive post_warmup_callback over a single hand-built chunk."""
     manager = PipelineOffloadManager.__new__(PipelineOffloadManager)
@@ -362,8 +689,6 @@ def test_bulk_offload_group_does_not_flag_views_copying_their_own_bytes(caplog, 
     group = OffloadTensorGroup("core_attn")
     group.push_tensor((1, 0), base[:512])
     group.push_tensor((1, 1), base[512:])
-    # Low-coverage strided views are gathered, so they too copy only their own
-    # elements even though the gathered spans interleave in the storage.
     other_group = OffloadTensorGroup("core_attn")
     other_group.push_tensor((2, 0), base[:, :8])
     other_group.push_tensor((2, 1), base[:, 8:16])
@@ -436,6 +761,9 @@ def _build_gpt_model(
     offload_modules: Optional[List[str]],
     min_offloaded_tensor_size: int,
     is_mla: bool,
+    activation_offload_fraction: float = 1.0,
+    attention_backend: AttnBackend = AttnBackend.unfused,
+    qk_layernorm: bool = True,
 ) -> GPTModel:
     """Build a GPTModel that uses TE-based transformer layer spec."""
     model_parallel_cuda_manual_seed(seed)
@@ -446,7 +774,8 @@ def _build_gpt_model(
         hidden_size=hidden_size,
         num_attention_heads=num_attention_heads,
         use_cpu_initialization=True,
-        attention_backend=AttnBackend.unfused,
+        attention_backend=attention_backend,
+        qk_layernorm=qk_layernorm and not is_mla,
         bf16=True,
         # Recompute
         recompute_modules=["layernorm", "moe_act"] if num_experts is not None else ["layernorm"],
@@ -458,6 +787,7 @@ def _build_gpt_model(
         fine_grained_activation_offloading=fine_grained_activation_offloading,
         offload_modules=offload_modules,
         min_offloaded_tensor_size=min_offloaded_tensor_size,
+        activation_offload_fraction=activation_offload_fraction,
     )
     gpt_model = GPTModel(
         config=transformer_config,
@@ -465,6 +795,7 @@ def _build_gpt_model(
             num_experts=num_experts,
             moe_grouped_gemm=num_experts is not None,
             multi_latent_attention=is_mla,
+            qk_layernorm=qk_layernorm and not is_mla,
         ),
         vocab_size=vocab_size,
         max_sequence_length=seq_length,
@@ -495,6 +826,43 @@ def _restore_params(model: torch.nn.Module, params: Dict[str, torch.Tensor]) -> 
     with torch.no_grad():
         for name, p in model.named_parameters():
             p.copy_(params[name].to(device=p.device, dtype=p.dtype))
+
+
+def _expected_unique_offload_bytes(manager, offload_modules):
+    # For these PP=1 tests, the manager's summary window ends at the first
+    # backward chunk, including when the schedule runs multiple microbatches.
+    # Multiple copies of one storage increase PCIe traffic, but that GPU
+    # allocation can only be freed once. Compare memory savings to unique bytes.
+    chunk = manager._cached_chunks_backward[0]
+    return sum(
+        group.total_offload_bytes - group.duplicate_storage_bytes
+        for group in chunk.offload_groups
+        if group.offload and group._name in offload_modules
+    )
+
+
+@pytest.mark.parametrize("num_chunks", [1, 2])
+def test_expected_unique_offload_bytes_uses_first_backward_chunk(num_chunks):
+    def group(name, offload, total_bytes, duplicate_bytes=0):
+        return SimpleNamespace(
+            _name=name,
+            offload=offload,
+            total_offload_bytes=total_bytes,
+            duplicate_storage_bytes=duplicate_bytes,
+        )
+
+    first_chunk = SimpleNamespace(
+        offload_groups=[
+            group("core_attn", True, 100, 20),
+            group("core_attn", False, 900),
+            group("attn_proj", True, 700),
+        ]
+    )
+    second_chunk = SimpleNamespace(offload_groups=[group("core_attn", True, 500)])
+    chunks = [first_chunk, second_chunk][:num_chunks]
+    manager = SimpleNamespace(_cached_chunks_forward=chunks, _cached_chunks_backward=chunks)
+
+    assert _expected_unique_offload_bytes(manager, ["core_attn"]) == 80
 
 
 def _run_one_iter_and_capture(
@@ -540,22 +908,145 @@ def _run_one_iter_and_capture(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.parametrize("fraction", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize("offload_core_attn", [False, True])
+def test_packed_qkv_offload_requires_unpacked_inputs(fraction, offload_core_attn):
+    """Reject packed inputs only when core attention can actually be offloaded."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    off_interface.reset_instance()
+    try:
+        model = _build_gpt_model(
+            seed=123,
+            num_layers=3,
+            hidden_size=256,
+            num_attention_heads=4,
+            vocab_size=1024,
+            seq_length=128,
+            num_experts=None,
+            fine_grained_activation_offloading=True,
+            offload_modules=["core_attn", "attn_proj"] if offload_core_attn else ["qkv_linear"],
+            min_offloaded_tensor_size=1024,
+            is_mla=False,
+            activation_offload_fraction=fraction,
+            attention_backend=AttnBackend.fused,
+            qk_layernorm=False,
+        ).cuda()
+        input_ids, position_ids, attention_mask = _make_gpt_inputs(
+            seq_length=128, micro_batch_size=1, device=torch.device("cuda")
+        )
+        off_interface.reset()
+        if offload_core_attn and fraction > 0:
+            with pytest.raises(ValueError, match="core_attn offloading does not support packed"):
+                model(input_ids, position_ids, attention_mask)
+        else:
+            output = model(input_ids, position_ids, attention_mask)
+            output.float().sum().backward()
+    finally:
+        torch.cuda.synchronize()
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.parametrize("attention_backend", [AttnBackend.fused, AttnBackend.flash])
+def test_partial_offload_warmup_preserves_attention_output(monkeypatch, attention_backend):
+    """Projection must not free the output retained by fused/FlashAttention backward."""
+    from transformer_engine.pytorch.attention.dot_product_attention import dot_product_attention
+
+    # TE caches backend selection across models; changing only the environment
+    # can otherwise make both parameters exercise the same cached backend.
+    monkeypatch.setattr(
+        dot_product_attention,
+        "_attention_backends",
+        dict(dot_product_attention._attention_backends, attention_params=None),
+    )
+    for name in ("NVTE_FUSED_ATTN", "NVTE_FLASH_ATTN", "NVTE_UNFUSED_ATTN"):
+        monkeypatch.delenv(name, raising=False)
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    off_interface.reset_instance()
+    try:
+        inputs = dict(
+            zip(
+                ("input_ids", "position_ids", "attention_mask"),
+                _make_gpt_inputs(seq_length=128, micro_batch_size=1, device=torch.device("cuda")),
+            )
+        )
+        model_args = dict(
+            seed=123,
+            num_layers=3,
+            hidden_size=256,
+            num_attention_heads=4,
+            vocab_size=1024,
+            seq_length=128,
+            num_experts=None,
+            min_offloaded_tensor_size=1024,
+            is_mla=False,
+            attention_backend=attention_backend,
+        )
+        baseline = _build_gpt_model(
+            **model_args, fine_grained_activation_offloading=False, offload_modules=None
+        ).cuda()
+        params = _capture_params(baseline)
+        model_parallel_cuda_manual_seed(123)
+        torch.manual_seed(123)
+        expected_output, expected_grads, _ = _run_one_iter_and_capture(
+            baseline, **inputs, enable_offload_reset=False
+        )
+        backend_key = (
+            "use_fused_attention"
+            if attention_backend == AttnBackend.fused
+            else "use_flash_attention"
+        )
+        assert dot_product_attention._attention_backends[backend_key]
+        del baseline
+        model = _build_gpt_model(
+            **model_args,
+            fine_grained_activation_offloading=True,
+            offload_modules=["qkv_linear", "core_attn", "attn_proj"],
+            activation_offload_fraction=0.5,
+        ).cuda()
+        _restore_params(model, params)
+        model_parallel_cuda_manual_seed(123)
+        torch.manual_seed(123)
+        output, grads, _ = _run_one_iter_and_capture(model, **inputs, enable_offload_reset=True)
+        torch.testing.assert_close(output, expected_output, rtol=1e-3, atol=1e-3)
+        assert grads.keys() == expected_grads.keys()
+        for name, expected_grad in expected_grads.items():
+            if expected_grad is None:
+                assert grads[name] is None
+            else:
+                torch.testing.assert_close(
+                    grads[name],
+                    expected_grad,
+                    rtol=1e-3,
+                    atol=1e-3,
+                    msg=lambda msg, name=name: f"{name}: {msg}",
+                )
+    finally:
+        torch.cuda.synchronize()
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.parametrize(
-    "is_moe, is_mla, offload_modules",
+    "is_moe, is_mla, offload_modules, activation_offload_fraction",
     [
         # Dense GPT modules
-        (False, True, ["attn_norm"]),
-        (True, False, ["qkv_linear"]),
-        (True, False, ["core_attn"]),
+        (False, True, ["attn_norm"], 1.0),
+        (True, False, ["qkv_linear"], 1.0),
+        (True, False, ["core_attn"], 1.0),
         # # attn_proj depends on core_attn (validated in TransformerConfig.__post_init__)
-        (True, True, ["core_attn", "attn_proj"]),
-        (True, False, ["mlp_norm"]),
-        (True, False, ["expert_fc1"]),
-        (True, False, ["moe_act"]),
+        (True, True, ["core_attn", "attn_proj"], 1.0),
+        (True, False, ["mlp_norm"], 1.0),
+        (True, False, ["expert_fc1"], 1.0),
+        (True, False, ["moe_act"], 1.0),
+        # One eager partial-offload case across attention and MoE groups.
+        (True, False, ["core_attn", "attn_proj", "expert_fc1"], 0.5),
     ],
 )
 def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
-    is_moe: bool, is_mla: bool, offload_modules: List[str]
+    is_moe: bool, is_mla: bool, offload_modules: List[str], activation_offload_fraction: float
 ):
     """
     Initialize a GPTModel and verify:
@@ -641,6 +1132,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             offload_modules=offload_modules,
             min_offloaded_tensor_size=1024,  # force offloading for UT determinism
             is_mla=is_mla,
+            activation_offload_fraction=activation_offload_fraction,
         ).cuda()
         _restore_params(off_model, base_params)
         off_model.train()
@@ -661,9 +1153,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
         )
 
         mgr = PipelineOffloadManager.get_instance()
-        expected_offload_bytes = int(
-            sum(mgr.offload_summary_bytes.get(k, 0) for k in offload_modules)
-        )
+        expected_offload_bytes = _expected_unique_offload_bytes(mgr, offload_modules)
         expected_offload_mib = expected_offload_bytes / (1024**2)
 
         _reset_cuda_memory()
@@ -821,6 +1311,7 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
             num_attention_heads=num_attention_heads,
             use_cpu_initialization=True,
             attention_backend=AttnBackend.unfused,
+            qk_layernorm=not is_mla,
             # Recompute
             recompute_modules=["layernorm", "moe_act"],
             recompute_granularity="selective",
@@ -843,7 +1334,10 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
             GPTModel(
                 config=transformer_config,
                 transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
-                    num_experts=num_experts, moe_grouped_gemm=True, multi_latent_attention=is_mla
+                    num_experts=num_experts,
+                    moe_grouped_gemm=True,
+                    multi_latent_attention=is_mla,
+                    qk_layernorm=not is_mla,
                 ),
                 vocab_size=vocab_size,
                 max_sequence_length=seq_length,
@@ -934,9 +1428,7 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
             )
 
             mgr = PipelineOffloadManager.get_instance()
-            expected_offload_bytes = int(
-                sum(mgr.offload_summary_bytes.get(k, 0) for k in offload_modules)
-            )
+            expected_offload_bytes = _expected_unique_offload_bytes(mgr, offload_modules)
             expected_offload_mib = expected_offload_bytes / (1024**2)
 
             _reset_cuda_memory()
@@ -1018,6 +1510,7 @@ def _build_gpt_model_with_cuda_graph(
         num_attention_heads=num_attention_heads,
         use_cpu_initialization=True,
         attention_backend=AttnBackend.unfused,
+        qk_layernorm=not is_mla,
         bf16=True,
         # Recompute
         recompute_modules=["layernorm", "moe_act"] if num_experts is not None else ["layernorm"],
@@ -1043,6 +1536,7 @@ def _build_gpt_model_with_cuda_graph(
             num_experts=num_experts,
             moe_grouped_gemm=num_experts is not None,
             multi_latent_attention=is_mla,
+            qk_layernorm=not is_mla,
         ),
         vocab_size=vocab_size,
         max_sequence_length=seq_length,

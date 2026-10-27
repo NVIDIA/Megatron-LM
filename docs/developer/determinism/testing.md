@@ -52,6 +52,11 @@ non-empty `tests` tuple or an explicit `exempt_reason` (for example a
 multi-rank NVLS collective that needs an NVLink peer group, or an allocator
 with no compute kernel). Exemptions are visible coverage debt, not silence.
 
+The shared unit-test fixtures restore the saved cuDNN flags inside PyTorch's
+scoped backend-mutation context. This allows teardown after importing
+`torch.testing._internal.common_utils`, which freezes bare flag assignments,
+while preserving the frozen state outside restoration.
+
 ## Golden-value error diagnostics
 
 The functional comparison logs differences even when they pass tolerance. For

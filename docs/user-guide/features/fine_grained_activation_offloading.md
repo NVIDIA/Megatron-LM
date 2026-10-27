@@ -79,8 +79,9 @@ With full-iteration CUDA graphs (local graph impl, `full_iteration` in `cuda_gra
 `--activation-offload-fraction` (`TransformerConfig.activation_offload_fraction`) is a fraction
 over eligible offload groups, not a byte fraction and not a selector for which module names are
 enabled. It is used together with `--offload-modules`: all module names listed in
-`--offload-modules` still register their offload groups, and the fraction is applied once across
-the combined eligible groups from all configured modules.
+`--offload-modules` still register their offload groups, and the steady-state fraction is applied once across
+the combined eligible groups from all configured modules. Warmup uses the per-module policy
+described in [Warmup and Adaptive Offloading](#warmup-and-adaptive-offloading).
 
 The manager keeps the first N% of eligible groups in forward execution order and leaves the later
 groups on GPU. For example, with
@@ -184,11 +185,38 @@ Forward pass (Layer N):                    Backward pass (Layer N):
 3. **`group_offload`**: Triggers asynchronous D2H copy on a dedicated CUDA stream (`d2h_stream`), optionally releases GPU storage of input tensors.
 4. **Backward**: Before the group's backward, tensors are reloaded from CPU to GPU on `h2d_stream`, and the compute stream waits for the transfer to complete.
 
+Committed forward groups occupy slots in the backward reload queue, including groups kept on GPU
+by the fraction or PP-rank delta policy. These resident groups are consumed as no-op slots without
+recording a reload event. The group-start autograd marker retains the corresponding forward group
+so backward can consume its current no-op slot before preloading the next group.
+
+Groups explicitly reserved by the post-warmup margin policy are excluded from this queue. Their
+backward markers still trigger prefetches, providing compute time to reload earlier groups. This
+also handles delayed norm commits: although `attn_norm` starts before `core_attn`, it commits after
+the attention residual addition. Enqueuing both resident margin groups in commit order would spend
+the first two prefetch opportunities consuming their slots instead of reloading earlier activations.
+Warmup has no reserved margin yet, so all warmup groups retain their reload slots.
+
 ### Warmup and Adaptive Offloading
 
-The first training iteration serves as a **warmup phase** where the manager records tensor groups, their sizes, and the execution order. After warmup, a `post_warmup_callback` runs to:
+The first training iteration serves as a **warmup phase** where the manager records tensor groups,
+their candidate transfer sizes, and the execution order without requiring a CPU copy for every group.
+Because the final group count is not yet known, each chunk uses a separate online quota for each
+module name. Its kth occurrence is selected when `ceil(k * activation_offload_fraction)` increases.
+For example, fraction 0.5 selects occurrences 1, 3, 5, ... of each configured module. Every group
+advances its module's counter, including empty groups and groups with no eligible tensors; those
+groups perform no copy and do not shift the selection of later occurrences. This keeps corresponding
+`core_attn` and `attn_proj` groups aligned when both occur once per layer, so projection offload does
+not release an output still held on GPU for attention backward. Fraction 0 performs no copies;
+fraction 1 offloads every eligible warmup group. Each module rounds up independently, favoring GPU
+memory headroom; the sum can exceed a single quota rounded over all modules together.
 
-1. **Reserve margin**: The last N groups (by deduplication count) are kept on GPU to avoid reload blocking the compute stream.
+This temporary warmup selection does not change the groups' eligibility for later iterations. It
+also does not add explicit cache eviction. After warmup, `post_warmup_callback` computes the normal
+policy independently, preserving the preference for earlier forward groups:
+
+
+1. **Reserve margin**: The last group of each module name is kept on GPU and excluded from the reload queue, leaving its backward marker available to trigger prefetches.
 2. **Apply PP rank delta**: Higher PP ranks offload fewer bytes (controlled by `delta_offload_bytes_across_pp_ranks`).
 3. **Apply fraction**: Only the first N% of the remaining eligible groups are offloaded across all configured modules (controlled by `activation_offload_fraction`).
 4. **Print summary table**: An ASCII table of per-rank offload bytes is printed for debugging.
@@ -196,6 +224,26 @@ The first training iteration serves as a **warmup phase** where the manager reco
 ### CPU Tensor Pool
 
 A 'OffloadTensorPool` (on CPU with pinned memory) caches allocated tensors by `(shape, dtype)`. This avoids repeated `cudaMallocHost` / `cudaFreeHost` calls and reduces D2H latency after the first iteration.
+
+Non-contiguous views covering at least half their storage are transferred as full storage and
+restored with their original shape, stride, and storage offset. Smaller views use a contiguous copy.
+
+`core_attn` offloading does not support packed Q/K/V inputs with non-contiguous views sharing
+storage. Attention checks the actual inputs after Q/K normalization and rotary embedding and
+raises `ValueError` during training when the offload fraction is positive. Gathering these views
+would change the layout retained by fused attention backward. Use unpacked attention inputs or
+remove `core_attn` and its dependent `attn_proj` from `offload_modules`. This restriction does not
+apply when core attention offloading is disabled or the fraction is zero; it is not a blanket
+restriction on models without Q/K normalization.
+
+**TODO:** Support packed Q/K/V inputs with `core_attn` fine-grained activation offloading
+(FGAO). Preserve the layout required by attention backward while transferring each shared QKV
+storage only once in each direction. Add fused/FlashAttention forward and gradient parity tests,
+including partial offload and CUDA graphs, before removing the current runtime restriction.
+
+The determinism suite covers supported Q/K-normalized and RoPE inputs with partial and full
+offload. It compares logits and parameter gradients bit-for-bit against a resident baseline and
+across warmup/steady-state replays under side-stream contention.
 
 ### CUDA Graph Support
 
