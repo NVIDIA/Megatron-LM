@@ -1608,7 +1608,7 @@ def validate_args(args, defaults={}):
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
-        if args.use_distributed_optimizer:
+        if args.use_distributed_optimizer and args.optimizer in ('sgd', 'adam'):
             # If using distributed optimizer, must use distributed checkpointing.
             # Legacy checkpointing uses Gloo process groups to collect full distributed
             # optimizer state in the CPU memory of DP rank 0.

@@ -391,12 +391,16 @@ class PretrainConfigContainer(ConfigContainerBase):
         self.optimizer.validate_run(
             ddp_config=self.ddp,
             use_torch_fsdp2=self.dist.use_torch_fsdp2,
-            moe_single_grouped_weight=getattr(self.model, "moe_single_grouped_weight", False),
-            virtual_pipeline_model_parallel_size=getattr(
-                self.model, "virtual_pipeline_model_parallel_size", None
-            ),
             ckpt_format=self.checkpoint.ckpt_format,
         )
+        # Legacy providers have no model config; their model inputs are checked by the adapter.
+        if self.model is not None:
+            self.optimizer.validate_model(
+                moe_single_grouped_weight=getattr(self.model, "moe_single_grouped_weight", False),
+                virtual_pipeline_model_parallel_size=getattr(
+                    self.model, "virtual_pipeline_model_parallel_size", None
+                ),
+            )
         self.scheduler.validate_run(
             train_iters=self.train.train_iters,
             train_samples=self.train.train_samples,
@@ -478,7 +482,7 @@ class InferenceConfigContainer(ConfigContainerBase):
     state machine, or straggler detection.
 
     Explicitly NOT included (relative to ``PretrainConfigContainer``): ``TrainingConfig``,
-    ``SchedulerConfig``, ``ValidationConfig``,
+    ``OptimizerConfig``, ``SchedulerConfig``, ``ValidationConfig``,
     ``DistributedDataParallelConfig``, ``RerunStateMachineConfig``, ``StragglerDetectionConfig``.
     """
 

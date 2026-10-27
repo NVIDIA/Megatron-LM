@@ -5,14 +5,17 @@ import os
 from unittest import mock
 
 import pytest
+import torch
 import yaml
 
+from megatron.core.dist_checkpointing import load_common_state_dict
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
 from megatron.training.checkpointing import save_checkpoint
+from megatron.training.config import InferenceConfigContainer, InferenceSetupConfig
 from megatron.training.global_vars import set_args
 from megatron.training.utils.checkpoint_utils import (
     get_checkpoint_run_config_filename,
@@ -92,6 +95,42 @@ def test_save_checkpoint_writes_run_config(init_model_parallel, create_args, tmp
 
         loaded_config = read_run_config(run_config_filename)
         assert loaded_config == run_config_data
+
+
+def test_save_checkpoint_without_optimizer(
+    init_model_parallel, create_args, run_config, tmp_path_dist_ckpt, monkeypatch
+):
+    """A model-only save writes weights and run metadata with an inference container."""
+    from megatron.training import global_vars
+
+    args = create_args
+    args.ckpt_format = "torch_dist"
+    args.use_dist_ckpt = True
+    args.ckpt_assume_constant_structure = False
+    args.ckpt_load_validate_sharding_integrity = True
+    args.save_tokenizer_assets = False
+    cfg = InferenceConfigContainer(
+        model=None, checkpoint=run_config.checkpoint, inference=InferenceSetupConfig()
+    )
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+    model = MockModel(TransformerConfig(num_layers=1, kv_channels=1))
+
+    with TempNamedDir(tmp_path_dist_ckpt / "save_without_optimizer", sync=True) as save_dir:
+        args.save = save_dir
+        cfg.checkpoint.save = str(save_dir)
+        set_args(args)
+        save_checkpoint(123, [model], None, None, 0)
+
+        ckpt_dir = save_dir / "iter_0000123"
+        saved = load_common_state_dict(str(ckpt_dir))
+        for name, value in model.state_dict().items():
+            assert torch.equal(saved["model"][name], value)
+        assert "optimizer" not in saved
+        assert "opt_param_scheduler" not in saved
+        assert (save_dir / "latest_checkpointed_iteration.txt").read_text().strip() == "123"
+        saved_config = read_run_config(get_checkpoint_run_config_filename(str(ckpt_dir)))
+        assert saved_config["_target_"].endswith(".InferenceConfigContainer")
+        assert "optimizer" not in saved_config
 
 
 def test_save_checkpoint_writes_run_config_release(

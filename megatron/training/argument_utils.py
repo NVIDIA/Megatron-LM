@@ -795,6 +795,15 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
     rerunsm_kwargs["check_for_nan_in_loss"] = args.check_for_nan_in_loss_and_grad
 
     optim_cfg = _default_config_from_args(OptimizerConfig, args)
+    if model_cfg is None:
+        # Legacy model providers still own these inputs in args. Do not create a placeholder
+        # model config: that would select the native model builder instead of the provider.
+        optim_cfg.validate_model(
+            moe_single_grouped_weight=getattr(args, "moe_single_grouped_weight", False),
+            virtual_pipeline_model_parallel_size=getattr(
+                args, "virtual_pipeline_model_parallel_size", None
+            ),
+        )
     ddp_config = get_megatron_ddp_config(args, use_torch_fsdp2=getattr(args, "use_torch_fsdp2", False))
 
     cfg = PretrainConfigContainer(
@@ -838,7 +847,7 @@ def inference_cfg_container_from_args(
     """Build an InferenceConfigContainer from the argparse arguments.
 
     This mirrors ``pretrain_cfg_container_from_args`` but assembles only the configs that
-    inference needs (an optimizer settings section, but no scheduler, training, validation, DDP,
+    inference needs (no optimizer, scheduler, training, validation, DDP,
     rerun, or straggler configs). It is intended to be passed to ``initialize_megatron`` from inference entry points.
 
     Args:

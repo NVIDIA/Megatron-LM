@@ -2501,7 +2501,7 @@ def _forward_backward_grad_context(args):
 
 
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None, ddp_config=None):
-    """Build the model using a finalized DDP config, or legacy args if omitted."""
+    """Build the model using the supplied DDP config or the finalized run config."""
     cfg = get_run_config()
     args = get_args()
     args.model_type = model_type
@@ -2640,7 +2640,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         config = get_model_config(model[0])
 
         if ddp_config is None:
-            ddp_config = get_megatron_ddp_config(args, use_torch_fsdp2=cfg.dist.use_torch_fsdp2)
+            ddp_config = cfg.ddp
         if not cfg.dist.use_torch_fsdp2:
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
             ddp_config.bucket_size = resolve_ddp_bucket_size(

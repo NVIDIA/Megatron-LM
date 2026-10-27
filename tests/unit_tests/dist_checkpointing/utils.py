@@ -18,7 +18,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import unwrap_model
 from megatron.training.arguments import parse_args
 from megatron.training.global_vars import get_run_config, is_run_config_initialized
-from megatron.training.training import get_model
+from megatron.training.training import get_megatron_ddp_config, get_model
 
 try:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (
@@ -343,7 +343,10 @@ def setup_model_and_optimizer(
                 expert_model_parallel_size=ep,
                 expert_tensor_parallel_size=etp,
                 bf16=bf16,
-            )
+            ),
+            ddp_config=get_megatron_ddp_config(
+                mock_args, use_torch_fsdp2=mock_args.use_torch_fsdp2
+            ),
         )
 
     config = OptimizerConfig(
@@ -484,7 +487,10 @@ def setup_moe_model_and_optimizer(
                 use_grouped_mlp=use_grouped_mlp,
                 use_glu=use_glu,
                 bf16=bf16,
-            )
+            ),
+            ddp_config=get_megatron_ddp_config(
+                mock_args, use_torch_fsdp2=mock_args.use_torch_fsdp2
+            ),
         )
 
     config = OptimizerConfig(

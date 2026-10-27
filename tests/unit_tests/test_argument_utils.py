@@ -4,6 +4,7 @@ import signal
 import sys
 import types
 from argparse import ArgumentError, ArgumentParser, Namespace
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Callable, Literal, Optional, Union
@@ -1419,6 +1420,48 @@ class TestPretrainContainerFromArgsStructure:
         assert cfg.ddp.use_megatron_fsdp is enabled
         assert cfg.dist.fake_process_group is enabled
         assert not hasattr(cfg.dist, "use_megatron_fsdp")
+
+
+@pytest.mark.parametrize("native_model", [False, True])
+@pytest.mark.parametrize("valid", [False, True])
+@pytest.mark.parametrize("constraint", ["vpp", "grouped_weights"])
+def test_optimizer_model_constraints_use_the_model_owner(native_model, valid, constraint):
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.micro_batch_size = 1
+    args.global_batch_size = 1
+    args.ckpt_format = "torch"
+    args.use_distributed_optimizer = True
+    args.optimizer = "adam" if constraint == "vpp" else "muon"
+    args.overlap_param_gather = constraint == "vpp"
+    args.overlap_grad_reduce = constraint == "vpp"
+    args.overlap_param_gather_with_optimizer_step = constraint == "vpp"
+    model_inputs = dict(
+        virtual_pipeline_model_parallel_size=2 if valid else None,
+        moe_single_grouped_weight=not valid,
+    )
+    # Native model values must win even when the old args disagree.
+    args_valid = not valid if native_model else valid
+    args.virtual_pipeline_model_parallel_size = 2 if args_valid else None
+    args.moe_single_grouped_weight = not args_valid
+    model = SimpleNamespace(**model_inputs) if native_model else None
+    message = "interleaved pipeline" if constraint == "vpp" else "single-grouped-weight"
+    with nullcontext() if valid else pytest.raises(AssertionError, match=message):
+        cfg = pretrain_cfg_container_from_args(args, model_cfg=model)
+        cfg.validate()
+
+
+@pytest.mark.parametrize("optimizer", ["adam", "sgd", "muon", "dist_muon"])
+def test_legacy_checkpoint_gloo_requirement_uses_effective_optimizer(monkeypatch, optimizer):
+    args = _minimal_training_args(monkeypatch)
+    args.optimizer = optimizer
+    args.use_distributed_optimizer = True
+    args.use_gloo_process_groups = False
+    args.ckpt_format = "torch"
+    args.use_layer_wise_param_layout = False
+    with pytest.raises(AssertionError) if optimizer in ("adam", "sgd") else nullcontext():
+        validate_args(args)
 
 
 class TestCheckpointConfigMapping:

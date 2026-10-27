@@ -427,16 +427,8 @@ class OptimizerConfig:
     optimizer_cuda_graph: bool = False
     """If true, enables CUDA graph for optimizer step."""
 
-    def validate_run(
-        self,
-        *,
-        ddp_config: "DistributedDataParallelConfig",
-        use_torch_fsdp2: bool,
-        moe_single_grouped_weight: bool,
-        virtual_pipeline_model_parallel_size: int | None,
-        ckpt_format: str | None,
-    ) -> None:
-        """Check the validity of the config, alone and against the rest of the run."""
+    def validate(self) -> None:
+        """Check optimizer-local settings without modifying the config."""
         if self.lr is not None and self.min_lr is not None:
             assert self.min_lr <= self.lr
 
@@ -544,6 +536,25 @@ class OptimizerConfig:
                 "`--use-precision-aware-optimizer`, as the hybrid device optimizer reuses the "
                 "code path of this flag."
             )
+
+        if self.overlap_param_gather_with_optimizer_step:
+            assert self.use_distributed_optimizer, (
+                '--overlap-param-gather-with-optimizer-step only supported with '
+                'distributed optimizer'
+            )
+            assert (
+                self.overlap_param_gather
+            ), 'Must use --overlap-param-gather-with-optimizer-step with --overlap-param-gather'
+
+    def validate_run(
+        self,
+        *,
+        ddp_config: "DistributedDataParallelConfig",
+        use_torch_fsdp2: bool,
+        ckpt_format: str | None,
+    ) -> None:
+        """Check settings shared with DDP and checkpointing without modifying them."""
+        if self.optimizer_cpu_offload:
             assert not ddp_config.fp8_param_gather or self.fp8_recipe == "delayed", (
                 "When `--fp8-param-gather` is enabled, the optimizer cpu offload "
                 "must be used in conjunction with `--fp8-recipe delayed`."
@@ -573,34 +584,35 @@ class OptimizerConfig:
                     "Use --optimizer muon --use-distributed-optimizer instead."
                 )
 
-        assert not (will_be_layer_wise and moe_single_grouped_weight), (
-            "The LayerWise distributed optimizer does not support --moe-single-grouped-weight: "
-            "Muon semantics for a single grouped [E, N, K] expert weight are not defined. "
-            "Disable --moe-single-grouped-weight or use Adam/DistributedOptimizer."
-        )
-
         if self.use_distributed_optimizer:
             assert (
                 not use_torch_fsdp2
             ), "--use-torch-fsdp2 is not supported with MCore's distributed optimizer"
 
         if self.overlap_param_gather_with_optimizer_step:
-            assert self.use_distributed_optimizer, (
-                '--overlap-param-gather-with-optimizer-step only supported with '
-                'distributed optimizer'
+            assert ckpt_format == "torch", (
+                '--overlap-param-gather-with-optimizer-step not supported with '
+                'distributed checkpointing yet'
             )
-            assert (
-                self.overlap_param_gather
-            ), 'Must use --overlap-param-gather-with-optimizer-step with --overlap-param-gather'
+
+    def validate_model(
+        self, *, moe_single_grouped_weight: bool, virtual_pipeline_model_parallel_size: int | None
+    ) -> None:
+        """Check model-dependent constraints at the native or legacy model boundary."""
+        will_be_layer_wise = self.use_layer_wise_distributed_optimizer or (
+            self.optimizer not in ('sgd', 'adam')
+            and (self.use_distributed_optimizer or self.optimizer == 'dist_muon')
+        )
+        assert not (will_be_layer_wise and moe_single_grouped_weight), (
+            "The LayerWise distributed optimizer does not support --moe-single-grouped-weight: "
+            "Muon semantics for a single grouped [E, N, K] expert weight are not defined. "
+            "Disable --moe-single-grouped-weight or use Adam/DistributedOptimizer."
+        )
 
         if self.overlap_param_gather_with_optimizer_step:
             assert virtual_pipeline_model_parallel_size is not None, (
                 '--overlap-param-gather-with-optimizer-step only supported with '
                 'interleaved pipeline parallelism'
-            )
-            assert ckpt_format == "torch", (
-                '--overlap-param-gather-with-optimizer-step not supported with '
-                'distributed checkpointing yet'
             )
 
     @property

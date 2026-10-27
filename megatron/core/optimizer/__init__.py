@@ -1067,6 +1067,8 @@ def get_megatron_optimizer(
         Instance of MegatronOptimizer.
     """
 
+    config.validate()
+
     # A MimoModel routes to the heterogeneous per-module optimizer builder.
     from megatron.core.models.mimo.model.base import MimoModel
 
