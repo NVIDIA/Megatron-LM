@@ -1,10 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from contextlib import nullcontext
 from unittest.mock import patch
 
 import pytest
 import torch
 
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     _compute_index_scores,
     _kpool_compress_keys,
@@ -14,6 +16,8 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     rotate_activation,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_masking import (
+    build_dsattention_forward_mask,
+    can_prove_all_topk_rows_nonempty,
     generate_varlen_mask_params_for_positions,
 )
 
@@ -301,6 +305,75 @@ def test_kpool_chunked_topk_matches_full_score_reference(
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def _left_padded_causal_mask(sequence, paddings):
+    """Additive causal masks whose first padding keys and query rows are fully masked."""
+    positions = torch.arange(sequence, device="cuda")
+    causal = positions[None, :] <= positions[:, None]
+    masks = []
+    for padding in paddings:
+        valid = positions >= padding
+        visible = causal & valid[None, :] & valid[:, None]
+        masks.append(
+            torch.zeros(sequence, sequence, device="cuda").masked_fill(~visible, float("-inf"))
+        )
+    return torch.stack(masks)
+
+
+@pytest.mark.parametrize("score_mode", ["chunked", "full"])
+@pytest.mark.parametrize("mask_ndim", [2, 3])
+@pytest.mark.parametrize("always_select_tail", [False, True])
+@pytest.mark.parametrize("use_relu", [False, True])
+@pytest.mark.parametrize("input_mode", ["none", "fp8", "rotate"])
+def test_kpool_explicit_left_padding_matches_shifted_unpadded_suffix(
+    input_mode, use_relu, always_select_tail, mask_ndim, score_mode
+):
+    """Pools start at the first valid key, so left padding only shifts the selected tokens."""
+    torch.manual_seed(463)
+    sequence, batch, heads, dim, pool_size, index_topk = 16, 2, 3, 8, 4, 8
+    # A 2D mask shares one padding; a 3D mask gives each sample its own origin.
+    paddings = (2, 2) if mask_ndim == 2 else (2, 3)
+    # Positive operands keep scores positive, so ReLU cannot create zero-score ties.
+    q = torch.rand(sequence, batch, heads, dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.rand(sequence, batch, dim, device="cuda", dtype=torch.bfloat16)
+    weights = torch.rand(sequence, batch, heads, device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn_like(k)
+    ape = torch.randn(pool_size, dim, device="cuda")
+    options = dict(
+        use_relu=use_relu,
+        always_select_tail=always_select_tail,
+        fp8_indexer=input_mode == "fp8",
+        rotate_activation_enabled=input_mode == "rotate",
+        return_index_scores=score_mode == "full",
+    )
+
+    def select(rows, samples, mask):
+        args = (q[rows, samples], k[rows, samples], weights[rows, samples], index_topk, pool_size)
+        return fused_qk_topk_kpool(*args, gate[rows, samples], ape, mask=mask, **options)[1]
+
+    chunking = (
+        patch(
+            "megatron.core.transformer.experimental_attention_variant.dsa._KPOOL_SCORE_CHUNK_BYTES",
+            128,
+        )
+        if score_mode == "chunked"
+        else nullcontext()
+    )
+    with chunking:
+        with torch.no_grad():
+            mask = _left_padded_causal_mask(sequence, paddings)
+            padded = select(slice(None), slice(None), mask[0] if mask_ndim == 2 else mask)
+            for sample, padding in enumerate(paddings):
+                suffix_mask = _left_padded_causal_mask(sequence - padding, (0,))
+                expected = select(
+                    slice(padding, None),
+                    slice(sample, sample + 1),
+                    suffix_mask[0] if mask_ndim == 2 else suffix_mask,
+                )[0]
+                expected = torch.where(expected >= 0, expected + padding, expected)
+                torch.testing.assert_close(padded[sample, padding:], expected, rtol=0, atol=0)
+                assert torch.all(padded[sample, :padding] == -1)
+
+
 def test_kpool_chunked_topk_with_no_complete_pool():
     q = torch.randn(3, 1, 2, 8, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(3, 1, 8, device="cuda", dtype=torch.bfloat16)
@@ -312,6 +385,84 @@ def test_kpool_chunked_topk_with_no_complete_pool():
     scores, actual = fused_qk_topk_kpool(*args, return_index_scores=False)
     assert scores is None
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("return_index_scores", [False, True])
+def test_kpool_empty_query_keeps_fixed_width(return_index_scores):
+    scores, indices = fused_qk_topk_kpool(
+        torch.empty(0, 1, 2, 128),
+        torch.empty(7, 1, 128),
+        torch.empty(0, 1, 2),
+        2048,
+        4,
+        torch.empty(7, 1, 128),
+        torch.empty(4, 128),
+        return_index_scores=return_index_scores,
+    )
+    assert indices.shape == (1, 0, 2051)
+    if return_index_scores:
+        assert scores.shape == (1, 0, 1)
+    else:
+        assert scores is None
+
+
+@pytest.mark.parametrize("always_select_tail", [False, True])
+def test_kpool_nonempty_row_certificate_matches_plain_causal_selection(always_select_tail):
+    """Sparse attention may skip empty-row guards only when every KPool row selects a key."""
+    torch.manual_seed(462)
+    seqlen, pool_size, index_topk = 9, 4, 4
+    # DSAttention's plain-causal layout: no additive mask, bounds starts=0/ends=row+1.
+    float_mask, varlen_params, varlen_is_plain_causal = build_dsattention_forward_mask(
+        sq=seqlen,
+        skv=seqlen,
+        b=1,
+        device=torch.device("cuda"),
+        cp_size=1,
+        cp_rank=0,
+        cp_comm_type="p2p",
+        cp_group=None,
+        attn_mask_type=AttnMaskType.causal,
+        attention_mask=None,
+        position_ids=None,
+        packed_seq_params=None,
+    )
+    assert float_mask is None and varlen_is_plain_causal
+    varlen_starts, varlen_ends, key_positions = varlen_params
+    q = torch.randn(seqlen, 1, 2, 8, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(seqlen, 1, 8, device="cuda", dtype=torch.bfloat16)
+    weights = torch.ones(seqlen, 1, 2, device="cuda", dtype=torch.bfloat16)
+    _, indices = fused_qk_topk_kpool(
+        q,
+        k,
+        weights,
+        index_topk,
+        pool_size,
+        torch.zeros_like(k),
+        torch.zeros(pool_size, 8, device="cuda"),
+        mask=float_mask,
+        varlen_starts=varlen_starts,
+        varlen_ends=varlen_ends,
+        key_positions=key_positions,
+        always_select_tail=always_select_tail,
+    )
+    rows_nonempty = (indices >= 0).any(dim=-1)
+    # Without the tail, rows before the first complete causal pool select nothing.
+    assert rows_nonempty.all().item() is always_select_tail
+    certified = can_prove_all_topk_rows_nonempty(
+        computes_topk=True,
+        indexer_topk=index_topk,
+        kv_sequence_length=seqlen,
+        attention_mask=float_mask,
+        query_valid_rows=None,
+        varlen_is_plain_causal=varlen_is_plain_causal,
+        use_local_indexer_varlen=False,
+        varlen_starts=varlen_starts,
+        varlen_ends=varlen_ends,
+        key_positions=key_positions,
+        kpool_size=pool_size,
+        kpool_always_select_tail=always_select_tail,
+    )
+    assert certified is always_select_tail
 
 
 def test_compute_index_scores_preserves_autograd_graph():

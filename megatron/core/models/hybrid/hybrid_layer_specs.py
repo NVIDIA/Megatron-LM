@@ -1,4 +1,5 @@
 # Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
+from copy import deepcopy
 from dataclasses import replace
 from functools import partial
 
@@ -181,6 +182,14 @@ hybrid_stack_spec = ModuleSpec(
                     submodules=KimiDeltaAttentionSubmodules(
                         in_proj=TEColumnParallelLinear,
                         beta_proj=TEColumnParallelLinear,
+                        # Two-stage low-rank gates (GLM-5.3-Flash); only used when
+                        # config.kda_two_stage_gates=True, else IdentityOp.
+                        # f_a/g_a are replicated (TELinear parallel_mode="duplicated");
+                        # f_b/g_b are TP-sharded column-parallel.
+                        f_a_proj=TELinear,
+                        f_b_proj=TEColumnParallelLinear,
+                        g_a_proj=TELinear,
+                        g_b_proj=TEColumnParallelLinear,
                         out_norm=TENorm,
                         out_proj=TERowParallelLinear,
                     ),
@@ -384,6 +393,48 @@ hybrid_stack_spec = ModuleSpec(
 )
 
 
+def hybrid_glm53_stack_spec(config):
+    """Build the GLM-5.3-Flash training specification without changing generic defaults.
+
+    Latent Q/KV norms are explicit checkpoint parameters. The dense FFN also
+    needs its own pre-norm instead of the generic fused norm/linear module, so
+    it has the same structural rounding boundary as the standalone model norms.
+    Norm kernel numerical parity is qualified separately against the official HF
+    reference; this specification is not itself a numerical acceptance result.
+    Mapping and RMSNorm cast precision are explicit config profiles: the HF
+    reference and actor/serving paths need not select the same rounding profile.
+    """
+    required = {
+        "multi_latent_attention": True,
+        "experimental_attention_variant": "dsa",
+        "qk_pos_emb_head_dim": 0,
+        "kda_two_stage_gates": True,
+        "enable_hyper_connections": True,
+        "mhc_norm_eps_inside_sqrt": True,
+        "mhc_learned_output_contract": False,
+        "normalization": "RMSNorm",
+    }
+    for name, expected in required.items():
+        if getattr(config, name, None) != expected:
+            raise ValueError(f"hybrid_glm53_stack_spec requires {name}={expected!r}.")
+    if getattr(config, "dsa_indexer_kpool", 1) <= 1:
+        raise ValueError("hybrid_glm53_stack_spec requires dsa_indexer_kpool > 1.")
+    if (getattr(config, "dsa_indexer_loss_coeff", None) or 0.0) != 0.0:
+        raise ValueError("hybrid_glm53_stack_spec requires a frozen KPool selector (zero loss).")
+
+    spec = deepcopy(hybrid_stack_spec)
+    attention = spec.submodules.dsa_layer.submodules.self_attention.submodules
+    attention.q_layernorm = TENorm
+    attention.kv_layernorm = TENorm
+    dense_ffn = spec.submodules.mlp_layer.submodules
+    dense_ffn.pre_mlp_layernorm = TENorm
+    dense_ffn.mlp.keywords["submodules"].linear_fc1 = TEColumnParallelLinear
+    # Preserve the generic hybrid distributed-checkpoint key convention. Plain
+    # state_dict and rank-local conversion still expose pre_mlp_layernorm.weight.
+    dense_ffn.sharded_state_dict_keys_map = {"pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_"}
+    return spec
+
+
 gated_delta_product_stack_spec = ModuleSpec(
     module=HybridStack,
     submodules=HybridStackSubmodules(
@@ -392,6 +443,7 @@ gated_delta_product_stack_spec = ModuleSpec(
         ),
         gdn_layer=hybrid_stack_spec.submodules.gdn_layer,
         gdn2_layer=hybrid_stack_spec.submodules.gdn2_layer,
+        kda_layer=hybrid_stack_spec.submodules.kda_layer,
         attention_layer=hybrid_stack_spec.submodules.attention_layer,
         dsa_layer=hybrid_stack_spec.submodules.dsa_layer,
         mlp_layer=hybrid_stack_spec.submodules.mlp_layer,
@@ -438,6 +490,30 @@ hybrid_inference_stack_spec = ModuleSpec(
                     module=GatedDeltaNet2,
                     submodules=GatedDeltaNetSubmodules(
                         in_proj=InferenceLayerNormColumnParallelLinear,
+                        out_norm=TENorm,
+                        out_proj=InferenceRowParallelLinear,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
+        kda_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=TENorm,
+                self_attention=ModuleSpec(
+                    module=KimiDeltaAttention,
+                    submodules=KimiDeltaAttentionSubmodules(
+                        in_proj=InferenceColumnParallelLinear,
+                        beta_proj=InferenceColumnParallelLinear,
+                        # Two-stage low-rank gates (GLM-5.3-Flash); only used when
+                        # config.kda_two_stage_gates=True, else IdentityOp.
+                        # f_a/g_a replicated (TELinear parallel_mode="duplicated");
+                        # f_b/g_b TP-sharded inference column-parallel.
+                        f_a_proj=TELinear,
+                        f_b_proj=InferenceColumnParallelLinear,
+                        g_a_proj=TELinear,
+                        g_b_proj=InferenceColumnParallelLinear,
                         out_norm=TENorm,
                         out_proj=InferenceRowParallelLinear,
                     ),
@@ -602,6 +678,7 @@ gated_delta_product_inference_stack_spec = ModuleSpec(
         ),
         gdn_layer=hybrid_inference_stack_spec.submodules.gdn_layer,
         gdn2_layer=hybrid_inference_stack_spec.submodules.gdn2_layer,
+        kda_layer=hybrid_inference_stack_spec.submodules.kda_layer,
         attention_layer=hybrid_inference_stack_spec.submodules.attention_layer,
         dsa_layer=hybrid_inference_stack_spec.submodules.dsa_layer,
         mlp_layer=hybrid_inference_stack_spec.submodules.mlp_layer,

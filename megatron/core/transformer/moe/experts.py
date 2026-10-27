@@ -27,7 +27,7 @@ from megatron.core.extensions.transformer_engine import (
     TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
 )
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
-from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
+from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor, validate_mxfp8_tensor
 from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
@@ -284,6 +284,23 @@ class TEGroupedMLP(MegatronModule):
             name (str | None): module instance name passed top-down from its paranet module
         """
         super().__init__(config=config)
+        if getattr(config, "moe_apply_probs_after_fc2", False):
+            config._validate_moe_probs_after_fc2()
+            if type(self) is not TEGroupedMLP:
+                raise ValueError(
+                    "moe_apply_probs_after_fc2 supports the ordinary TEGroupedMLP only."
+                )
+            if (
+                not torch.distributed.is_initialized()
+                or pg_collection is None
+                or pg_collection.tp is None
+                or pg_collection.expt_tp is None
+                or torch.distributed.get_world_size(pg_collection.tp) != 1
+                or torch.distributed.get_world_size(pg_collection.expt_tp) != 1
+            ):
+                raise ValueError(
+                    "moe_apply_probs_after_fc2 requires explicit actual TP/ETP1 groups."
+                )
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
         assert not (
@@ -1142,6 +1159,38 @@ class TEGroupedMLP(MegatronModule):
             output (torch.Tensor): The output of the local experts.
         """
 
+        # Reject before the fused implementation's early return. The opt-in must
+        # not silently execute another probability placement or quantized path.
+        apply_probs_after_fc2 = getattr(self.config, "moe_apply_probs_after_fc2", False)
+        if apply_probs_after_fc2:
+            if (
+                self._with_fused_impl
+                or self._use_grouped_tensor
+                or output_buffer is not None
+                or grad_input_buffer is not None
+            ):
+                raise ValueError(
+                    "moe_apply_probs_after_fc2 does not support fused experts or output buffers."
+                )
+            if (
+                permuted_local_hidden_states.dtype not in (torch.bfloat16, torch.float32)
+                or permuted_probs.dtype != torch.float32
+            ):
+                raise ValueError(
+                    "moe_apply_probs_after_fc2 requires BF16/FP32 inputs and FP32 probabilities."
+                )
+            if (
+                permuted_local_hidden_states.ndim != 2
+                or permuted_local_hidden_states.shape[1] != self.input_size
+                or permuted_probs.ndim != 1
+                or permuted_probs.shape[0] != permuted_local_hidden_states.shape[0]
+                or permuted_probs.device != permuted_local_hidden_states.device
+            ):
+                raise ValueError(
+                    "moe_apply_probs_after_fc2 requires co-located [N,H] inputs "
+                    "and [N] probabilities."
+                )
+
         # Call fused impl if enabled
         if self._with_fused_impl:
             output = self._fused_forward(
@@ -1214,7 +1263,16 @@ class TEGroupedMLP(MegatronModule):
                 and self.config.moe_mlp_glu_interleave_size is not None
             )
 
-            if self.config.use_te_activation_func:
+            if apply_probs_after_fc2 and self.config.bias_activation_fusion:
+                # Unweighted fusion retains the selected SwiGLU/clamp backend;
+                # routing probabilities participate only after the real FC2.
+                intermediate_parallel = bias_swiglu_impl(
+                    intermediate_parallel,
+                    bias_parallel,
+                    self.config.activation_func_fp8_input_store,
+                    clamp_value=self.config.activation_func_clamp_value,
+                )
+            elif self.config.use_te_activation_func:
                 if bias_parallel is not None:
                     intermediate_parallel = intermediate_parallel + bias_parallel
                 if with_glu_interleaving:
@@ -1307,9 +1365,10 @@ class TEGroupedMLP(MegatronModule):
                             intermediate_parallel, tanh_clamp_scale
                         )
                     intermediate_parallel = self.activation_func(intermediate_parallel)
-                original_dtype = intermediate_parallel.dtype
-                intermediate_parallel = intermediate_parallel * permuted_probs
-                intermediate_parallel = intermediate_parallel.to(original_dtype)
+                if not apply_probs_after_fc2:
+                    original_dtype = intermediate_parallel.dtype
+                    intermediate_parallel = intermediate_parallel * permuted_probs
+                    intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
         # Only set up the checkpoint when a backward pass will actually follow.
@@ -1388,7 +1447,22 @@ class TEGroupedMLP(MegatronModule):
             forced_released_tensors=[permuted_local_hidden_states, fc1_output],
             delay_offload=self.config.delay_offload_until_cuda_graph,
         )
-        output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
+        if apply_probs_after_fc2:
+            if output_bias is not None:
+                raise ValueError("moe_apply_probs_after_fc2 requires bias-free FC2.")
+            if (
+                output.dtype != permuted_local_hidden_states.dtype
+                or output.shape != permuted_local_hidden_states.shape
+            ):
+                raise ValueError(
+                    "moe_apply_probs_after_fc2 requires an activation-dtype [N,H] FC2 output."
+                )
+            # HF transformers@93c8b7b GLM5Next Experts:132-136 weights the
+            # projected output in FP32, then casts before expert accumulation.
+            # Keep this ordinary autograd edge: probabilities need their VJP.
+            output = (output * permuted_probs).to(output.dtype)
+        else:
+            output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
 
         # upad and concat the output
         if unpadded_tokens_per_expert is not None:
@@ -1896,6 +1970,8 @@ class SequentialMLP(MegatronModule):
         name: str | None = None,
     ):
 
+        if getattr(config, "moe_apply_probs_after_fc2", False):
+            raise ValueError("moe_apply_probs_after_fc2 requires TEGroupedMLP, not SequentialMLP.")
         if config.moe_ffn_hidden_size == config.ffn_hidden_size:
             super().__init__(config=config)
         else:

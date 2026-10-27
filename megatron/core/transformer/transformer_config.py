@@ -283,7 +283,8 @@ class TransformerConfig(ModelParallelConfig):
 
     activation_func_clamp_value: Optional[float] = None
     """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
-    is quick_gelu or SwiGLU (MoE only)."""
+    is quick_gelu or SwiGLU. For SwiGLU, use_te_activation_func must be False, and the
+    TE op-fuser dense MLP (TEFusedMLP) rejects the clamp."""
 
     activation_func_tanh_clamp_scale: Optional[float] = None
     """If set, precondition the input of the activation function with `s * tanh(x / s)`, where `s`
@@ -495,6 +496,12 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_scoring_relu: bool = True
     """Whether DSA indexer should apply ReLU to q@k scores before weighting."""
 
+    dsa_indexer_hf_scoring: bool = False
+    """Use GLM5Next HF KPool scoring order: upcast projected head weights before
+    scaling, scale FP32 q@k before ReLU, and reduce heads with FP32 matmul.
+    Compression rounding and score-input quantization remain independent options.
+    """
+
     dsa_indexer_qk_proj_use_quantization: bool = True
     """Whether indexer query/key projections use the enclosing FP8/FP4 context.
     When disabled, these projections use the configured unquantized dtype (e.g. BF16).
@@ -579,6 +586,13 @@ class TransformerConfig(ModelParallelConfig):
     rotation. This does not change projection parameter or GEMM precision.
     """
 
+    dsa_indexer_kpool_key_dtype_compression: bool = False
+    """Cast pool probabilities to the key dtype before multiplication and reduction.
+    This matches the official GLM5Next HF compression arithmetic. False preserves
+    FP32 weighted reduction from the upstream KPool implementation. Score-input
+    quantization is independent of this compression precision choice.
+    """
+
     dsa_indexer_kpool_always_select_tail: bool = True
     """Append each query's incomplete causal pool after selected history pools.
     This widens the output to ``dsa_indexer_topk + dsa_indexer_kpool - 1``; unused slots are -1.
@@ -640,11 +654,41 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    mtp_enable_hyper_connections: Optional[bool] = None
+    """Override the MTP residual-stream architecture; None inherits the main decoder."""
+
+    rmsnorm_cast_before_weight: bool = False
+    """Round the normalized activation before applying RMSNorm gamma, matching HF GLM5Next.
+    This is an explicit numerical path, not a change to Transformer Engine's default.
+    """
+
+    kda_disable_fp8: bool = False
+    """Force KDA projections to BF16 even under FP8 training,
+    (KDA projections are BF16 in the checkpoint)."""
+
+    kda_conv_in_fp32: bool = False
+    """Retain KDA convolution weights in FP32, as official GLM5Next loading requires.
+    Convolution and SiLU accumulate before casting back to the activation dtype.
+    False preserves the existing projection-dtype convolution parameter contract.
+    """
+
+    kda_core_in_fp32: bool = False
+    """Run the GLM two-stage KDA core with FP32 Q/K/V/decay/beta storage.
+    Q/K normalization is external FP32 HF-style math when enabled; the FLA core
+    output is restored to activation dtype before gated output normalization.
+    This changes all recurrent-core intermediate dtypes, not only Q/K norms.
+    It does not select IEEE GEMMs or change global precision. Initial scope is
+    CP=1; False preserves the existing FLA dtype/normalization contract.
+    """
+
     kda_safe_gate: bool = False
     """Whether the KDA kernel should use bounded gate values."""
 
     kda_lower_bound: Optional[float] = None
     """Optional lower bound for KDA's bounded gate values."""
+
+    kda_two_stage_gates: bool = False
+    """Use low-rank f_b(f_a(x)) and g_b(g_a(x)) gates with a QKV-only input projection."""
 
     gdn_pre_gated_delta_rule_fusion: bool = False
     """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
@@ -1350,6 +1394,13 @@ class TransformerConfig(ModelParallelConfig):
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
 
+    moe_apply_probs_after_fc2: bool = False
+    """Apply FP32 routing probabilities after the expert output projection, then restore
+    its activation dtype. Matches the probability placement in HF GLM5Next routed experts.
+    Initially limited to bias-free BF16/FP32 TEGroupedMLP, TP/ETP1 and AllToAll dispatch.
+    The default retains probability weighting between the activation and FC2.
+    """
+
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
@@ -1619,6 +1670,33 @@ class TransformerConfig(ModelParallelConfig):
 
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""
+
+    mhc_norm_eps_inside_sqrt: bool = False
+    """Use HF GLM5Next FP32 normalize-before-projection with
+    rsqrt(mean(x**2) + layernorm_epsilon) for the mHC mapping norm.
+    When False, preserve the original projection-before-normalization path.
+    """
+
+    mhc_keep_mappings_in_fp32: bool = False
+    """Keep mHC coefficients and stream mixing in FP32 until the output cast."""
+
+    mhc_keep_pre_in_fp32: bool = False
+    """Keep input-aggregation coefficients in FP32 independently of residual mixing.
+    Official GLM5Next uses FP32 pre coefficients but activation-dtype post/residual
+    coefficients. Keeping all mappings in FP32 also keeps pre in FP32.
+    """
+
+    mhc_preserve_activation_dtype_rounding: bool = False
+    """Preserve eager activation-dtype intermediate rounding in compiled mHC residual updates.
+    Uses the opt-in Inductor emulate_precision_casts option for the native no-dropout
+    post-multiply/residual-add operator, including backward and checkpoint replay.
+    Requires compiler support and is incompatible with use_fused_mhc. False preserves
+    the existing compiler precision policy; this does not change global matmul precision.
+    """
+
+    mhc_learned_output_contract: bool = True
+    """Contract residual streams to the ordinary hidden width using token-dependent gating;
+    otherwise average the streams."""
 
     use_fused_mhc: bool = False
     """Use fused kernels for mHC operations when supported.
@@ -2154,14 +2232,82 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
             )
 
+    def _validate_moe_probs_after_fc2(self) -> None:
+        """Reject expert paths that do not implement the opt-in output-weighting contract."""
+        if not isinstance(self.moe_apply_probs_after_fc2, bool):
+            raise ValueError("moe_apply_probs_after_fc2 must be a bool.")
+        if not self.moe_apply_probs_after_fc2:
+            return
+        if (
+            self.transformer_impl != "transformer_engine"
+            or not self.moe_grouped_gemm
+            or not self.num_moe_experts
+            or not is_te_min_version("1.9.0.dev0")
+        ):
+            raise ValueError("moe_apply_probs_after_fc2 requires TEGroupedMLP and TE>=1.9.0.dev0.")
+        if (
+            self.fp16
+            or self.params_dtype not in (torch.bfloat16, torch.float32)
+            or self.fp8
+            or self.fp4
+            or self.fp8_param
+            or self.fp4_param
+            or self.activation_func_fp8_input_store
+            or self.quant_recipe is not None
+        ):
+            raise ValueError("moe_apply_probs_after_fc2 supports non-quantized BF16/FP32 only.")
+        if (
+            self.tensor_model_parallel_size != 1
+            or self.expert_tensor_parallel_size != 1
+            or self.sequence_parallel
+            or self.moe_token_dispatcher_type != "alltoall"
+            or self.moe_router_dtype != "fp32"
+        ):
+            raise ValueError(
+                "moe_apply_probs_after_fc2 requires TP/ETP1, no SP, AllToAll and FP32 routing."
+            )
+        if (
+            self.add_bias_linear
+            or not self.gated_linear_unit
+            or self.activation_func is not F.silu
+            or self.use_te_activation_func
+            or self.moe_mlp_glu_interleave_size is not None
+            or self.glu_linear_offset != 0
+            or self.moe_latent_size is not None
+            or self.activation_func_tanh_clamp_scale is not None
+            or self.activation_func_tanh_clamp_scale_linear is not None
+        ):
+            raise ValueError("moe_apply_probs_after_fc2 requires bias-free standard SwiGLU.")
+        if (
+            self.moe_apply_probs_on_input
+            or self.use_transformer_engine_op_fuser
+            or self.moe_use_grouped_tensor
+            or self.moe_single_grouped_weight
+            or self.moe_single_grouped_bias
+            or self.moe_megakernel_backend is not None
+        ):
+            raise ValueError(
+                "moe_apply_probs_after_fc2 does not support fused/packed experts "
+                "or input weighting."
+            )
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
         super().__post_init__()
+        self._validate_moe_probs_after_fc2()
         # Dynamic CP can assign a multi-rank group even when configured CP is one.
         has_context_parallelism = self.context_parallel_size > 1 or self.dynamic_context_parallel
+
+        if not isinstance(self.kda_core_in_fp32, bool):
+            raise ValueError("kda_core_in_fp32 must be a bool.")
+        if self.kda_core_in_fp32:
+            if not self.kda_two_stage_gates:
+                raise ValueError("kda_core_in_fp32 requires kda_two_stage_gates=True.")
+            if self.context_parallel_size != 1:
+                raise ValueError("kda_core_in_fp32 currently supports CP=1 only.")
 
         # Imported lazily because the module-spec module imports TransformerConfig.
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -2575,6 +2721,8 @@ class TransformerConfig(ModelParallelConfig):
                     "flag would only add per-microbatch prebuild work."
                 )
         if is_gated_delta_net_variant(self.experimental_attention_variant):
+            if self.experimental_attention_variant == "kda":
+                self.validate_kda()
             if not self.is_hybrid_model:
                 assert (
                     self.linear_attention_freq is not None
@@ -2705,6 +2853,15 @@ class TransformerConfig(ModelParallelConfig):
             if self.dsa_indexer_kpool < 1:
                 raise ValueError(
                     f"dsa_indexer_kpool must be positive, got {self.dsa_indexer_kpool}."
+                )
+            if self.dsa_indexer_hf_scoring and (
+                self.dsa_indexer_kpool <= 1
+                or self.dsa_indexer_weights_proj_output_dtype != "bf16"
+                or not self.dsa_indexer_scoring_relu
+            ):
+                raise ValueError(
+                    "dsa_indexer_hf_scoring requires KPool > 1, BF16 projection output "
+                    "and ReLU scoring."
                 )
             if self.dsa_indexer_kpool > 1:
                 if self.dsa_indexer_topk is None:
@@ -3604,6 +3761,11 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_modules = ["core_attn"]
 
         if self.recompute_granularity == "selective":
+            from megatron.core.ssm.kda_layer_config import KDALayerConfig
+
+            is_kda_variant = isinstance(self, KDALayerConfig) or (
+                self.experimental_attention_variant == "kda"
+            )
             if len(self.recompute_modules) > 0:
                 allowed_modules = {
                     "core_attn",
@@ -3645,6 +3807,7 @@ class TransformerConfig(ModelParallelConfig):
             if (
                 "gdn_norm_out" in self.recompute_modules
                 and not self.is_hybrid_model
+                and not is_kda_variant
                 and not is_gated_delta_net_variant(self.experimental_attention_variant)
             ):
                 raise ValueError(
@@ -3655,6 +3818,7 @@ class TransformerConfig(ModelParallelConfig):
             if (
                 "gdn" in self.recompute_modules
                 and not self.is_hybrid_model
+                and not is_kda_variant
                 and not is_gated_delta_net_variant(self.experimental_attention_variant)
             ):
                 raise ValueError(
@@ -3832,6 +3996,17 @@ class TransformerConfig(ModelParallelConfig):
         if self.use_fused_mhc:
             if not self.enable_hyper_connections:
                 raise ValueError("use_fused_mhc requires enable_hyper_connections=True.")
+        if self.use_fused_mhc and (
+            self.mhc_norm_eps_inside_sqrt
+            or self.mhc_keep_mappings_in_fp32
+            or self.mhc_keep_pre_in_fp32
+            or self.mhc_preserve_activation_dtype_rounding
+        ):
+            raise ValueError(
+                "use_fused_mhc does not support mhc_norm_eps_inside_sqrt, "
+                "mhc_keep_mappings_in_fp32, mhc_keep_pre_in_fp32 or "
+                "mhc_preserve_activation_dtype_rounding; use the unfused mHC path."
+            )
 
         valid_mhc_fused_backends = ("auto", "native", "triton", "cutile")
         if self.mhc_fused_backend not in valid_mhc_fused_backends:
@@ -4326,10 +4501,6 @@ class TransformerConfig(ModelParallelConfig):
             ):
                 raise ValueError(
                     "activation_func_clamp_value for SwiGLU must be finite and greater than zero."
-                )
-            if self.num_moe_experts is None:
-                raise ValueError(
-                    "activation_func_clamp_value for SwiGLU is only supported with MoE."
                 )
             if self.glu_linear_offset != 0.0:
                 raise ValueError(
@@ -5929,6 +6100,64 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     f"Unsupported scheduler: {self.sequence_packing_scheduler}. "
                     f"Available schedulers: {supported_schedulers}"
+                )
+
+    def validate_kda(self) -> None:
+        """Validate KDA-specific dimensions, including configs copied with from_config."""
+        if not isinstance(self.kda_core_in_fp32, bool):
+            raise ValueError("kda_core_in_fp32 must be a bool.")
+        if self.kda_core_in_fp32:
+            if not self.kda_two_stage_gates:
+                raise ValueError("kda_core_in_fp32 requires kda_two_stage_gates=True.")
+            if self.context_parallel_size != 1:
+                raise ValueError("kda_core_in_fp32 currently supports CP=1 only.")
+        if self.gdn_conv_pad_alignment is not None and self.gdn_conv_pad_alignment <= 0:
+            raise ValueError(
+                "gdn_conv_pad_alignment must be positive when set for KDA, got "
+                f"{self.gdn_conv_pad_alignment}."
+            )
+        if self.kda_safe_gate and (
+            self.kda_lower_bound is None or not (-5 <= self.kda_lower_bound < 0)
+        ):
+            raise ValueError(
+                "kda_lower_bound must be in the safe range [-5, 0) when kda_safe_gate=True, "
+                f"got {self.kda_lower_bound}."
+            )
+        required_positive = (
+            "linear_conv_kernel_dim",
+            "linear_key_head_dim",
+            "linear_value_head_dim",
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+        )
+        for name in required_positive:
+            value = getattr(self, name)
+            if value is None or value <= 0:
+                raise ValueError(f"{name} must be positive for KDA, got {value}.")
+        if self.linear_num_key_heads != self.linear_num_value_heads:
+            raise ValueError("KDA requires equal key and value head counts.")
+        if self.linear_key_head_dim != self.linear_value_head_dim:
+            raise ValueError("KDA requires equal key and value head dimensions.")
+        if (
+            self.context_parallel_size > 1
+            and self.linear_cp_mode == "chunkwise"
+            and self.deterministic_mode
+        ):
+            raise ValueError(
+                "KDA chunkwise context parallelism is incompatible with deterministic_mode "
+                "because the fallback convolution cannot exchange history across ranks."
+            )
+        if self.linear_num_key_heads % self.tensor_model_parallel_size != 0:
+            raise ValueError(
+                "KDA key/value head count must be divisible by tensor parallel size; "
+                f"got heads={self.linear_num_key_heads}, tp={self.tensor_model_parallel_size}."
+            )
+        if self.linear_cp_mode == "headwise":
+            tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
+            if self.linear_num_key_heads % tp_cp_size != 0:
+                raise ValueError(
+                    "KDA headwise context parallelism requires head count divisible by TP*CP; "
+                    f"got heads={self.linear_num_key_heads}, tp_cp={tp_cp_size}."
                 )
 
 

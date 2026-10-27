@@ -1240,7 +1240,15 @@ class TENorm:
             assert hasattr(
                 te.pytorch, "RMSNorm"
             ), "Transformer-Engine >= v0.11 required to use this feature"
-            if use_fused_residual:
+            if config.rmsnorm_cast_before_weight:
+                if use_fused_residual:
+                    raise ValueError(
+                        "rmsnorm_cast_before_weight does not support fused residual RMSNorm."
+                    )
+                from megatron.core.transformer.glm5_next_norm import GLM5NextRMSNorm
+
+                norm_module = GLM5NextRMSNorm
+            elif use_fused_residual:
                 assert (
                     TEFusedResidualRMSNorm is not None
                 ), "TEFusedResidualRMSNorm requires Transformer-Engine >= v1.13.0"
@@ -3512,6 +3520,13 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         @copy_signature(MLP.__init__)
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
+            if self.config.activation_func_clamp_value is not None:
+                # The TE activation ops built by _make_fused_impl do not clamp.
+                raise ValueError(
+                    f"{self.__class__.__name__} does not support activation_func_clamp_value: "
+                    "its Transformer Engine activation op does not clamp. Build the MLP "
+                    "without use_transformer_engine_op_fuser."
+                )
 
         def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
             """Construct fused module matching MLP."""

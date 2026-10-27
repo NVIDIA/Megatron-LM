@@ -720,14 +720,14 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
                 out, out_bias = te_checkpoint(
                     _checkpointed_compute,
-                    False,
+                    self.config.distribute_saved_activations,
                     tensor_parallel.random.get_cuda_rng_tracker,
                     self.pg_collection.tp,
                     hidden_states,
                 )
             else:
                 out, out_bias = tensor_parallel.checkpoint(
-                    _checkpointed_compute, False, hidden_states
+                    _checkpointed_compute, self.config.distribute_saved_activations, hidden_states
                 )
         else:
             out, out_bias = self._forward_compute(
