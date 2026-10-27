@@ -218,8 +218,12 @@ def set_duplicate_filter_groups(optimizer, pg_collection: ProcessGroupCollection
         )
     optimizer.tp_group = groups['tp']
     optimizer.expert_tp_group = groups.get('expt_tp', optimizer.tp_group)
-    optimizer.gtp_group = resolve_gtp_remat_group(pg_collection, is_expert=False)
-    optimizer.expert_gtp_group = resolve_gtp_remat_group(pg_collection, is_expert=True)
+    optimizer.gtp_group = resolve_gtp_remat_group(
+        pg_collection, is_expert=False, owner="get_megatron_optimizer"
+    )
+    optimizer.expert_gtp_group = resolve_gtp_remat_group(
+        pg_collection, is_expert=True, owner="get_megatron_optimizer"
+    )
     optimizer.duplicate_filter_groups_from_collection = True
 
 
