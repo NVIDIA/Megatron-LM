@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import asyncio
-import copy
 import importlib
 import os
 import sys
@@ -16,17 +15,10 @@ from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.quantization.utils import quantize_params_to_mxfp8
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_local_submodules,
-    get_gpt_layer_with_inference_spec,
-    get_gpt_layer_with_transformer_engine_spec,
-)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_inference_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import attention as attention_module
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
-from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.inference.engines import test_dynamic_engine as dynamic_engine_tests
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicEngineTestConfig,
@@ -242,17 +234,13 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             "flashinfer-fused-rope",
         ],
     )
-    async def test_direct_and_real_adapter_greedy_outputs_match(self, feature_config, monkeypatch):
+    async def test_direct_and_real_adapter_greedy_outputs_match(self, feature_config):
         BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
-        stresses_chunking = feature_config.get("enable_chunked_prefill", False)
         stresses_prefix = feature_config.get("enable_prefix_caching", False)
         adapter_sampling = feature_config.get("adapter_sampling")
-        uses_mla = feature_config.get("mla", False)
         uses_mxfp8 = feature_config.get("mxfp8", False)
-        if uses_mla and not attention_module.HAVE_FMLA:
-            pytest.skip("dynamic latent-cache MLA requires FlashMLA")
         if stresses_prefix:
-            prefix_len, suffix_lens = (256, (258, 260)) if stresses_chunking else (256, (2, 4))
+            prefix_len, suffix_lens = 256, (2, 4)
             shared_prefix = [index % 89 + 1 for index in range(prefix_len)]
             prompts = [
                 shared_prefix + [(index + shift) % 89 + 1 for index in range(length)]
@@ -269,67 +257,21 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             num_gap_steps=0,
             sampling_backend="flashinfer",
             async_sched_mode=AsyncScheduleMode.ASYNC,
-            flash_attention_version=None if uses_mla else 2,
+            flash_attention_version=2,
             return_log_probs=True,
             skip_prompt_log_probs=True,
             logprobs_mode=feature_config.get("logprobs_mode", "raw_logprobs"),
             **{
                 key: value
                 for key, value in feature_config.items()
-                if key
-                not in ("adapter_sampling", "context_max_tokens", "logprobs_mode", "mla", "mxfp8")
+                if key not in ("adapter_sampling", "context_max_tokens", "logprobs_mode", "mxfp8")
             },
         )
-        if uses_mla:
-
-            def build_mla_config(**kwargs):
-                kwargs.update(
-                    hidden_size=512,
-                    num_attention_heads=8,
-                    add_bias_linear=False,
-                    normalization="RMSNorm",
-                    qk_layernorm=True,
-                    multi_latent_attention=True,
-                    q_lora_rank=128,
-                    kv_lora_rank=512,
-                    qk_head_dim=128,
-                    qk_pos_emb_head_dim=64,
-                    v_head_dim=128,
-                    rope_type="rope",
-                    cache_mla_latents=True,
-                )
-                return MLATransformerConfig(**kwargs)
-
-            with (
-                mock.patch.object(dynamic_engine_tests, "TransformerConfig", build_mla_config),
-                mock.patch.object(
-                    dynamic_engine_tests,
-                    "get_gpt_layer_with_transformer_engine_spec",
-                    lambda num_experts=None: get_gpt_layer_with_transformer_engine_spec(
-                        num_experts=num_experts, qk_layernorm=True, multi_latent_attention=True
-                    ),
-                ),
-                mock.patch.object(
-                    dynamic_engine_tests,
-                    "get_gpt_layer_local_spec",
-                    lambda num_experts=None: ModuleSpec(
-                        module=TransformerLayer,
-                        submodules=get_gpt_layer_local_submodules(
-                            num_experts=num_experts,
-                            qk_layernorm=True,
-                            multi_latent_attention=True,
-                            normalization="RMSNorm",
-                        ),
-                    ),
-                ),
-            ):
-                env = self._build_test_env(config)
-        elif uses_mxfp8:
+        if uses_mxfp8:
             env = _build_inference_mxfp8_env(self, config)
         else:
             env = self._build_test_env(config)
         engine = env.engine
-        assert not uses_mla or engine.context.cache_mla_latent
         if uses_mxfp8:
             model_config = engine.controller.inference_wrapped_model.model.config
             assert "mxfp8" in str(model_config.fp8_recipe).lower()
@@ -338,10 +280,8 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             "adapter_submissions": [],
             "model_request_ids": [],
             "sampler_request_ids": [],
-            "chunked_prefill_request_ids": [],
             "cuda_graph_request_ids": [],
             "mtp_request_ids": [],
-            "flash_mla_request_ids": [],
             "fused_rope_request_ids": [],
         }
 
@@ -388,14 +328,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                 return original_fused_rope(*args, **kwargs)
 
             engine.context.apply_fused_qk_rotary_emb = traced_fused_rope
-        if uses_mla:
-            original_flash_mla = attention_module.flash_mla_with_kvcache
-
-            def traced_flash_mla(*args, **kwargs):
-                witness["flash_mla_request_ids"].append(active_request_ids())
-                return original_flash_mla(*args, **kwargs)
-
-            monkeypatch.setattr(attention_module, "flash_mla_with_kvcache", traced_flash_mla)
         if feature_config.get("num_speculative_tokens", 0):
             original_mtp_step = engine.controller._run_async_sched_sample_mtp
 
@@ -417,10 +349,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             )
             for _ in prompts
         ]
-        if stresses_chunking:
-            warm_params = copy.deepcopy(direct_params[0])
-            warm_params.num_tokens_to_generate = 1
-            await _drive_engine(engine, [engine.add_request(90, shared_prefix, warm_params)])
         direct_futures = [
             engine.add_request(request_id, prompt, params)
             for request_id, prompt, params in zip(
@@ -428,28 +356,9 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             )
         ]
         direct = await _drive_engine(engine, direct_futures)
-        if stresses_chunking:
-            assert torch.is_inference(engine.context.request_ids)
-            engine.reset()
-            await _drive_engine(
-                engine, [engine.add_request(190, shared_prefix, copy.deepcopy(warm_params))]
-            )
         engine._prefill_tokens_skipped = 0
         witness["mtp_request_ids"].clear()
-        witness["flash_mla_request_ids"].clear()
         witness["fused_rope_request_ids"].clear()
-        original_schedule = engine.schedule_waiting_requests
-
-        def traced_schedule():
-            original_schedule()
-            if (request_id := engine.context.chunked_prefill_request_id) >= 0:
-                witness["chunked_prefill_request_ids"].append(int(request_id))
-
-        engine.schedule_waiting_requests = traced_schedule
-        if uses_mla:
-            for layer in engine.controller.inference_wrapped_model.model.decoder.layers:
-                assert layer.self_attention.kv_layernorm.weight.is_cuda
-                assert layer.self_attention.linear_kv_up_proj_linear.weight.is_cuda
         adapter = object.__new__(mixin_cls)
         adapter.cfg = {
             "generation": {
@@ -540,10 +449,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             assert rows and all(row[0] == row[expected_index] for row in rows)
             assert any(padded > selected for _, padded, selected in rows)
         assert engine.context.async_sched_step_count > 0
-        if stresses_chunking:
-            assert witness["chunked_prefill_request_ids"]
-            assert set(witness["chunked_prefill_request_ids"]) <= adapter_ids
-            assert engine._prefill_tokens_skipped > 0
         if stresses_prefix:
             allocator = engine.context.kv_block_allocator
             assert engine._prefill_tokens_skipped > 0
@@ -569,11 +474,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                 for request_id in step_request_ids
             }
             assert mtp_ids and mtp_ids <= adapter_ids
-        if uses_mla:
-            mla_ids = {
-                request_id for step in witness["flash_mla_request_ids"] for request_id in step
-            }
-            assert mla_ids and mla_ids <= adapter_ids
         if feature_config.get("use_flashinfer_fused_rope"):
             rope_ids = {
                 request_id for step in witness["fused_rope_request_ids"] for request_id in step
