@@ -1434,8 +1434,8 @@ def _instrument_scenario_runtime(env, scenario, runtime):
     }
     active_tags = set(scenario.signals) & watched_modules.keys()
     # Expert-tensor-parallel layers may not shrink their weight shape; accept TP
-    # partition metadata as the witness only for those scenarios.
-    partition_metadata_witness = "etp" in scenario.signals
+    # partition metadata as proof of the split only for those scenarios.
+    accept_partition_metadata = "etp" in scenario.signals
     model = controller.inference_wrapped_model.model
     for module in model.modules():
         class_name = type(module).__name__
@@ -1499,7 +1499,7 @@ def _instrument_scenario_runtime(env, scenario, runtime):
                                 and (
                                     weight.shape[0] * size == output_size
                                     or (
-                                        partition_metadata_witness
+                                        accept_partition_metadata
                                         and getattr(weight, "tensor_model_parallel", False)
                                         and getattr(weight, "partition_dim", None) == 0
                                     )
@@ -1515,7 +1515,7 @@ def _instrument_scenario_runtime(env, scenario, runtime):
                                 and (
                                     weight.shape[1] * size == input_size
                                     or (
-                                        partition_metadata_witness
+                                        accept_partition_metadata
                                         and getattr(weight, "tensor_model_parallel", False)
                                         and getattr(weight, "partition_dim", None) == 1
                                     )
@@ -2305,8 +2305,8 @@ class TestAsyncSchedulePairwise(_AsyncPairwiseHarness):
 
     @pytest.mark.parametrize("scenario", _ASYNC_PAIR_SCENARIOS, ids=lambda case: case.name)
     @torch.inference_mode()
-    def test_async_streaming_matches_legacy_for_owned_pair(self, scenario):
-        """Coordinator streaming partials stay live and consistent with each owned feature."""
+    def test_async_streaming_matches_legacy_for_pair(self, scenario):
+        """Coordinator streaming partials stay live and consistent with each scenario's feature."""
         _check_scenario_prerequisite(scenario)
         try:
             self._assert_scenario_pair(scenario, streaming=True)

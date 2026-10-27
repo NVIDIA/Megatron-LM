@@ -907,11 +907,10 @@ def mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
 
 
 class _StreamingTransportTokenizer:
-    """Pickle-safe tokenizer for the real coordinator transport witness."""
+    """Pickle-safe tokenizer for the real coordinator transport test."""
 
     vocab_size = 100
     bos = None
-    eod = 99
 
     def tokenize(self, prompt):
         return prompt if isinstance(prompt, list) else [ord(char) % 99 for char in prompt]
@@ -1020,6 +1019,8 @@ class DynamicEngineTestConfig:
     # a recurrent head has no KV to append, so the gate stays off. See
     # DynamicInferenceContext.enable_mtp_kv_cache.
     mtp_layer_pattern: str = "M"
+    # Required by transformer_config validation when transformer_impl == "inference_optimized"
+    # and num_moe_experts is set: fp32 routing avoids dtype conversions during decode.
     moe_router_dtype: Optional[str] = None
     position_embedding_type: Optional[str] = None
     use_flashinfer_fused_rope: Optional[bool] = None
@@ -3627,7 +3628,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.internal
     @pytest.mark.skipif(
         int(os.environ.get("WORLD_SIZE", "1")) != 2,
-        reason="real KV handoff witness requires exactly two distributed ranks",
+        reason="the real KV handoff test requires exactly two distributed ranks",
     )
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
