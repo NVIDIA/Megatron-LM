@@ -10,6 +10,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.residual_connection import (
@@ -302,6 +304,18 @@ _RESIDUAL_STATE_PREFIXES = tuple(
 )
 
 
+def map_residual_sharded_state(state_dict: ShardedStateDict, prefix: str) -> None:
+    """Keep pre-split tensor names on disk while retaining current model dictionary keys.
+
+    Distributed loading looks up these tensor names before Module.load_state_dict
+    runs, so its compatibility hook alone cannot load a pre-split checkpoint.
+    """
+    apply_prefix_mapping(
+        state_dict,
+        {prefix + current: prefix + legacy for current, legacy in _RESIDUAL_STATE_PREFIXES},
+    )
+
+
 def load_residual_state(
     module, state_dict, prefix, local_metadata, strict, missing, unexpected, errors
 ):
@@ -417,6 +431,14 @@ class WideResidualTransformerLayer(TransformerLayer):
                     f"hidden_size={self.config.hidden_size}, got "
                     f"{connection.branch_hidden_size}."
                 )
+
+    def sharded_state_dict(
+        self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
+    ) -> ShardedStateDict:
+        """Preserve distributed checkpoint names from before the residual read/write split."""
+        state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        map_residual_sharded_state(state_dict, prefix)
+        return state_dict
 
     def _get_self_attention_residual_connection(
         self, operation: ResidualConnectionOperation
