@@ -25,7 +25,16 @@ from tests.unit_tests.test_utilities import (
 pytestmark = pytest.mark.skipif(Utils.world_size % 4 != 0, reason="needs a multiple of 4 ranks")
 
 # Collection fields that build_test_pg_collection sets to None.
-_NOT_BUILT = {"hcp", "gtp_remat", "expt_gtp_remat", "inter_dist_opt", "dp_cp_ag", "expt_dp_ag"}
+_NOT_BUILT = {
+    "hcp",
+    "gtp_remat",
+    "expt_gtp_remat",
+    "inter_dist_opt",
+    "dp_cp_ag",
+    "expt_dp_ag",
+    "intra_dp_cp_gloo",
+    "intra_expt_dp_gloo",
+}
 
 
 def _ranks(group):
