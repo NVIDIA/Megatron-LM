@@ -35,6 +35,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.grad_fanin import GradFanIn, grad_fanin_tap
 from megatron.core.transformer.moe import batch_invariant, moe_utils
 from megatron.core.transformer.moe.experts import (
     SequentialMLP,
@@ -901,6 +902,25 @@ def test_router_gating_linear_replays(router_dtype, with_bias):
         replays=3,
         contention=True,
         what="router_gating_linear",
+    )
+
+
+def test_router_gating_linear_grad_fanin_replays():
+    """Router input-gradient GEMM accumulating into a gradient fan-in (moe_fuse_input_grad)."""
+    seeded()
+    inp = torch.randn(8192, 4096, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(256, 4096, device="cuda", dtype=torch.bfloat16) * 0.02
+    weight = weight.detach().requires_grad_(True)
+
+    def fn(i, w):
+        fanin = GradFanIn(i)
+        with moe_utils.router_input_grad_fanin(fanin):
+            logits = moe_utils.router_gating_linear(i, w, None, torch.bfloat16)
+        # The tap is created last, so its gradient seeds the sum and the GEMM accumulates.
+        return logits, grad_fanin_tap(i, fanin) * 2.0
+
+    assert_replays_bit_exact(
+        fn, (inp, weight), replays=3, contention=True, what="router_gating_linear[grad fan-in]"
     )
 
 
@@ -1869,6 +1889,16 @@ class TestMoEModules:
                 {"moe_expert_capacity_factor": 0.5, "moe_pad_expert_input_to_capacity": True},
             ),
             pytest.param("alltoall", 2, {"moe_permute_fusion": HAVE_TE_PERMUTE}, id="alltoall-ep2"),
+            pytest.param(
+                "alltoall",
+                1,
+                {
+                    "moe_fuse_input_grad": True,
+                    "moe_router_dtype": None,
+                    "moe_shared_expert_intermediate_size": 1024,
+                },
+                id="alltoall-fuse-input-grad",
+            ),
             pytest.param(
                 "flex",
                 2,
