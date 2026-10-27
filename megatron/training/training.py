@@ -57,7 +57,10 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV1,
     FullyShardedDataParallelV2,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    RuntimePolicy,
+    fully_shard_context,
+)
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
@@ -2497,7 +2500,11 @@ def wrap_model_chunks_with_ddp(
         DP is FullyShardedDataParallel or DP is FullyShardedDataParallelV2
     ) and ddp_config.megatron_fsdp_version == 2
     construction_context = (
-        fully_shard_context(use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True)
+        fully_shard_context(
+            runtime_policy=RuntimePolicy(
+                use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True
+            )
+        )
         if is_mfsdp_v2
         else nullcontext()
     )
