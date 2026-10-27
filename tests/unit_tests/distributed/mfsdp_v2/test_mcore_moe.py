@@ -15,6 +15,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
+from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
@@ -56,25 +57,34 @@ def process_group_collections(distributed_setup):
         dp_cp=reference_group,
         embd=None,
         pos_embd=None,
+        mp=reference_group,
+        tp_ep_pp=reference_group,
     )
     model_parallel_cuda_manual_seed(1234)
     yield process_group_collection, reference_process_group_collection
     destroy_model_parallel()
 
 
-def test_build_train_step_and_clip(process_group_collections, distributed_setup):
+@pytest.mark.parametrize(
+    ("optimizer_name", "layer_pattern"), [("adam", "*E"), ("muon", "*E"), ("muon", "*-*E")]
+)
+def test_build_train_step_and_clip(
+    process_group_collections, distributed_setup, optimizer_name, layer_pattern
+):
     """Shard experts over expert-DP and clip their combined gradients."""
     process_group_collection, reference_process_group_collection = process_group_collections
     world_size = distributed_setup.world_size
+    if optimizer_name == "muon":
+        pytest.importorskip("emerging_optimizers")
     # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
     # initialization instead uses the globally configured EP=2 rank in its RNG seed.
     config = TransformerConfig(
-        num_layers=2,
+        num_layers=len(layer_pattern),
         hidden_size=64,
         num_attention_heads=4,
         num_moe_experts=4,
         expert_model_parallel_size=2,
-        moe_layer_freq=[0, 1],
+        moe_layer_freq=[int(layer == "E") for layer in layer_pattern],
         moe_token_dispatcher_type="alltoall",
         moe_router_topk=2,
         moe_grouped_gemm=True,
@@ -95,7 +105,7 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
         hybrid_stack_spec=hybrid_stack_spec,
         vocab_size=128,
         max_sequence_length=8,
-        hybrid_layer_pattern="*E",
+        hybrid_layer_pattern=layer_pattern,
         pg_collection=reference_process_group_collection,
     ).cuda()
     model = HybridModel(
@@ -103,7 +113,7 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
         hybrid_stack_spec=hybrid_stack_spec,
         vocab_size=128,
         max_sequence_length=8,
-        hybrid_layer_pattern="*E",
+        hybrid_layer_pattern=layer_pattern,
         pg_collection=process_group_collection,
     ).cuda()
     model.load_state_dict(reference_model.state_dict(), strict=False)
@@ -133,14 +143,46 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
         pg_collection=process_group_collection,
     )
     assert isinstance(model.module, FsdpModule)
-    assert isinstance(model.module.decoder.layers[1].mlp.experts, FsdpModule)
+    assert isinstance(model.module.decoder.layers[-1].mlp.experts, FsdpModule)
 
     optimizer_config = OptimizerConfig(
-        lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
+        optimizer=optimizer_name,
+        lr=1.0e-3,
+        weight_decay=0.0,
+        use_distributed_optimizer=False,
+        clip_grad=1.0e-4,
+        muon_split_qkv=False,
     )
-    reference_optimizer = get_megatron_optimizer(optimizer_config, [reference_model])
-    optimizer = get_megatron_optimizer(optimizer_config, [model])
-    assert isinstance(optimizer, FullyShardedOptimizer)
+    reference_optimizer = get_megatron_optimizer(
+        optimizer_config,
+        [reference_model],
+        pg_collection=reference_process_group_collection,
+        use_gloo_process_groups=False,
+    )
+    optimizer = get_megatron_optimizer(
+        optimizer_config,
+        [model],
+        pg_collection=process_group_collection,
+        use_gloo_process_groups=False,
+    )
+    if optimizer_name == "muon":
+        assert isinstance(optimizer, ChainedOptimizer)
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.muon import FsdpMuon
+
+        muon_optimizers = [
+            opt.optimizer
+            for opt in optimizer.chained_optimizers
+            if isinstance(opt.optimizer, FsdpMuon)
+        ]
+        meshes = {
+            param.device_mesh
+            for opt in muon_optimizers
+            for group in opt.param_groups
+            for param in group["params"]
+        }
+        assert sorted(mesh.size() for mesh in meshes) == [world_size // 2, world_size]
+    else:
+        assert isinstance(optimizer, FullyShardedOptimizer)
     optimizer.reload_model_params()
 
     local_batch_size = 2
@@ -160,6 +202,7 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
         return torch.nn.functional.mse_loss(output, targets)
 
     reference_losses = []
+    reference_norms = []
     for _ in range(5):
         reference_optimizer.zero_grad(set_to_none=True)
         (reference_loss,) = run_forward_backward_on_microbatches(reference_model, reference_forward)
@@ -169,6 +212,7 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
             reference_pre_clip_norm > optimizer_config.clip_grad
         ), "Reference gradients must exceed the clipping threshold to exercise clipping."
         reference_losses.append(reference_loss)
+        reference_norms.append(float(reference_pre_clip_norm))
 
     def forward():
         output = model(
@@ -179,13 +223,15 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
         return torch.nn.functional.mse_loss(output, targets[input_slice])
 
     losses = []
+    norms = []
     for _ in range(5):
         optimizer.zero_grad(set_to_none=True)
         (loss,) = run_forward_backward_on_microbatches(model, forward)
-        success, _, _ = optimizer.step()
+        success, norm, _ = optimizer.step()
         assert success
         torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
         losses.append(loss)
+        norms.append(float(norm))
 
     losses = torch.stack(losses)
     reference_losses = torch.stack(reference_losses)
@@ -195,4 +241,7 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
     assert torch.isfinite(losses).all()
     assert torch.isfinite(reference_losses).all()
     assert losses[-1] < losses[0]
-    torch.testing.assert_close(losses, reference_losses)
+    # Muon's Newton-Schulz matmuls use BF16 with the default "medium" precision.
+    tolerances = {"rtol": 1e-3, "atol": 1e-6} if optimizer_name == "muon" else {}
+    torch.testing.assert_close(losses, reference_losses, **tolerances)
+    torch.testing.assert_close(torch.tensor(norms), torch.tensor(reference_norms), **tolerances)

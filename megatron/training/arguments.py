@@ -1058,8 +1058,9 @@ def validate_args(args, defaults={}):
                 "GroupedTensor param buffers."
             )
         # Optimizer compatibility check.
-        assert args.optimizer in ('sgd', 'adam'), \
-            f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
+        assert args.optimizer in ('sgd', 'adam') or (
+            args.megatron_fsdp_version == 2 and args.optimizer == 'muon'
+        ), f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
 
         # Expert parameters may be sharded differently from non-expert parameters, in which
         # case both strategies have to be considered by model-wide checks.
@@ -1691,8 +1692,17 @@ def validate_args(args, defaults={}):
             args.use_distributed_optimizer = False
 
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
-        assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
-        assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
+        if args.use_megatron_fsdp:
+            assert args.megatron_fsdp_version == 2 and args.optimizer == 'muon', \
+                "Megatron-FSDP supports Muon with version 2."
+            assert not args.use_layer_wise_distributed_optimizer, \
+                "MFSDP v2 Muon manages its own optimizer sharding."
+            assert not args.muon_split_qkv, \
+                "MFSDP v2 Muon requires --muon-no-split-qkv."
+            assert args.ckpt_format == 'fsdp_dtensor', \
+                "MFSDP v2 Muon requires --ckpt-format fsdp_dtensor."
+        else:
+            assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
         if args.muon_tp_mode == 'layer_sharded':
             # optimizer == 'muon' is already guaranteed by the hoisted assert above.
