@@ -2914,7 +2914,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         )
 
     @staticmethod
-    def _install_runtime_witnesses(engine, feature):
+    def _install_runtime_witnesses(engine, feature, optimized=False):
         """Count calls on the feature path during the stressed engine run."""
         evidence = {
             "tp_reducing_forwards": 0,
@@ -2980,7 +2980,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
 
                 module.dispatch = traced_moe_dispatch
                 instrumented_layers += 1
-                if not case.get("optimized"):
+                if not optimized:
                     continue
                 experts = module.experts
                 original_expert = experts.forward
@@ -3070,7 +3070,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             model.rotary_pos_emb.inv_freq = model.rotary_pos_emb.inv_freq.cuda()
             model.rotary_pos_emb_cache.clear()
             assert model.config.hidden_size // model.config.num_attention_heads == 64
-        evidence = self._install_runtime_witnesses(engine, case["feature"])
+        evidence = self._install_runtime_witnesses(engine, case["feature"], case.get("optimized"))
         pool_size = allocator.pool_size
         storage_size = context.memory_buffer.untyped_storage().nbytes()
         finished = {}
