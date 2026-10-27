@@ -258,42 +258,41 @@ class MoKMegakernel(MegakernelBackend):
                 if self._routed_weight_view_cache is None
                 else self._routed_weight_view_cache
             )
-            if self.native_single_grouped_weights:
-                fc1_weight_view = _native_single_grouped_weight_view(
-                    self.routed_fc1_parameters[0],
-                    num_experts=self.num_local_experts,
-                    rows=2 * self.intermediate_size,
-                    columns=self.hidden_size,
-                    use_mxfp8=self.use_mxfp8_weights,
-                    cached_view=cached_fc1,
-                )
-                fc2_weight_view = _native_single_grouped_weight_view(
-                    self.routed_fc2_parameters[0],
-                    num_experts=self.num_local_experts,
-                    rows=self.hidden_size,
-                    columns=self.intermediate_size,
-                    use_mxfp8=self.use_mxfp8_weights,
-                    cached_view=cached_fc2,
-                )
-            else:
-                fc1_weight_view = _native_split_weight_view(
-                    self.routed_fc1_parameters,
-                    rows=2 * self.intermediate_size,
-                    columns=self.hidden_size,
-                    use_mxfp8=self.use_mxfp8_weights,
-                    cached_view=cached_fc1,
-                )
-                fc2_weight_view = _native_split_weight_view(
-                    self.routed_fc2_parameters,
-                    rows=self.hidden_size,
-                    columns=self.intermediate_size,
-                    use_mxfp8=self.use_mxfp8_weights,
-                    cached_view=cached_fc2,
-                )
+            fc1_weight_view = self._routed_weight_view(
+                self.routed_fc1_parameters,
+                rows=2 * self.intermediate_size,
+                columns=self.hidden_size,
+                cached_view=cached_fc1,
+            )
+            fc2_weight_view = self._routed_weight_view(
+                self.routed_fc2_parameters,
+                rows=self.hidden_size,
+                columns=self.intermediate_size,
+                cached_view=cached_fc2,
+            )
             self._routed_weight_view_cache = (fc1_weight_view, fc2_weight_view)
 
         self.is_first_microbatch = False
         return self._routed_weight_view_cache
+
+    def _routed_weight_view(self, parameters, *, rows, columns, cached_view):
+        """Select the storage adapter using this backend's layout and precision."""
+        if self.native_single_grouped_weights:
+            return _native_single_grouped_weight_view(
+                parameters[0],
+                num_experts=self.num_local_experts,
+                rows=rows,
+                columns=columns,
+                use_mxfp8=self.use_mxfp8_weights,
+                cached_view=cached_view,
+            )
+        return _native_split_weight_view(
+            parameters,
+            rows=rows,
+            columns=columns,
+            use_mxfp8=self.use_mxfp8_weights,
+            cached_view=cached_view,
+        )
 
     # Checkpoint contract: native MCore expert modules own the canonical parameters,
     # optimizer state, and checkpoint shards. This supports regular/distributed

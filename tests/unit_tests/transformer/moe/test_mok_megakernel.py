@@ -505,12 +505,28 @@ def test_output_gate_autograd_preserves_native_main_grad(monkeypatch, gated, mai
         lambda: (module.routed_fc1_parameters[0], module.routed_fc2_parameters[0]),
     )
 
+    def check_weight_arguments(arguments):
+        # Check the external ABI against native ownership, independently of the
+        # runtime's argument container. In particular gate/up share storage but
+        # must point at different halves of the combined FC1 parameter.
+        shared_gate, shared_up, shared_down, routed_gate, routed_up, routed_down = arguments
+        fc1 = shared.linear_fc1.weight
+        assert shared_gate.data_ptr() == fc1.data_ptr()
+        assert shared_up.data_ptr() == fc1[module.intermediate_size :].data_ptr()
+        assert shared_gate.untyped_storage().data_ptr() == fc1.untyped_storage().data_ptr()
+        assert shared_up.untyped_storage().data_ptr() == fc1.untyped_storage().data_ptr()
+        assert shared_down is shared.linear_fc2.weight
+        assert routed_gate is routed_up is module.routed_fc1_parameters[0]
+        assert routed_down is module.routed_fc2_parameters[0]
+
     def forward(*args, **kwargs):
+        check_weight_arguments(args[5:11])
         assert kwargs.get("shared_output_gate_weight") is gate
         assert ("shared_output_gate_weight" in kwargs) == gated
         return args[3].clone(), object()
 
     def backward(*args, **kwargs):
+        check_weight_arguments(args[7:13])
         assert kwargs.get("shared_output_gate_weight") is gate
         if gated:
             assert kwargs["shared_output_gate_main_grad"] is gate.main_grad

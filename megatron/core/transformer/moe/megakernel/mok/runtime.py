@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
@@ -51,6 +51,29 @@ def _gate_up_main_grad_arguments(main_grads, main_grad_storage_tables, intermedi
     return split_main_grads, (routed_fc1_table, routed_fc1_table, routed_fc2_table)
 
 
+class _MoKWeightArguments(NamedTuple):
+    """Non-owning references in the external MOK forward/backward ABI order.
+
+    Routed arguments may be tensors, MXFP8 tuples, or split-weight descriptors.
+    This transient tuple neither copies payloads nor registers/caches parameters.
+    """
+
+    shared_gate: torch.Tensor
+    shared_up: torch.Tensor
+    shared_down: torch.Tensor
+    routed_gate: object
+    routed_up: object
+    routed_down: object
+
+    @classmethod
+    def from_combined(cls, shared_fc1, shared_fc2, routed_fc1, routed_fc2, intermediate_size):
+        """Split only shared FC1 while retaining the caller's routed weight views."""
+        shared_gate, shared_up, routed_gate, routed_up = _gate_up_weight_arguments(
+            shared_fc1, routed_fc1, intermediate_size
+        )
+        return cls(shared_gate, shared_up, shared_fc2, routed_gate, routed_up, routed_fc2)
+
+
 class _MoKAutograd(torch.autograd.Function):
     """Autograd bridge from MCore parameters to MoK's functional API."""
 
@@ -96,8 +119,8 @@ class _MoKAutograd(torch.autograd.Function):
             # Non-single BF16/MXFP8 use SplitRoutedWeight objects consumed directly by MOK.
             fc1_forward = fc1_weight_view
             fc2_forward = fc2_weight_view
-        shared_gate, shared_up, routed_gate, routed_up = _gate_up_weight_arguments(
-            shared_fc1, fc1_forward, module.intermediate_size
+        weight_args = _MoKWeightArguments.from_combined(
+            shared_fc1, shared_fc2, fc1_forward, fc2_forward, module.intermediate_size
         )
         gate_kwargs = {}
         if shared_output_gate_weight is not None:
@@ -108,12 +131,7 @@ class _MoKAutograd(torch.autograd.Function):
             schedule,
             x,
             router_weights,
-            shared_gate,
-            shared_up,
-            shared_fc2,
-            routed_gate,
-            routed_up,
-            fc2_forward,
+            *weight_args,
             swiglu_limit=module.swiglu_limit,
             **gate_kwargs,
         )
@@ -145,8 +163,8 @@ class _MoKAutograd(torch.autograd.Function):
         else:
             backward_fc1 = fc1_weight_view
             backward_fc2 = fc2_weight_view
-        shared_gate, shared_up, routed_gate, routed_up = _gate_up_weight_arguments(
-            shared_fc1, backward_fc1, ctx.module.intermediate_size
+        weight_args = _MoKWeightArguments.from_combined(
+            shared_fc1, shared_fc2, backward_fc1, backward_fc2, ctx.module.intermediate_size
         )
         main_grads, main_grad_storage_tables = ctx.module.main_grad_arguments()
         main_grads, main_grad_storage_tables = _gate_up_main_grad_arguments(
@@ -168,12 +186,7 @@ class _MoKAutograd(torch.autograd.Function):
             grad_output.contiguous(),
             x,
             router_weights,
-            shared_gate,
-            shared_up,
-            shared_fc2,
-            routed_gate,
-            routed_up,
-            backward_fc2,
+            *weight_args,
             swiglu_limit=ctx.module.swiglu_limit,
             main_grads=main_grads,
             main_grad_storage_tables=main_grad_storage_tables,
