@@ -51,9 +51,43 @@ def _decoder_provider(split):
         **LAYER_SPLITS[split],
     )
 
-    def model_provider(pre_process=True, post_process=True, pg_collection=None):
+    def model_provider(pre_process=True, post_process=True, vp_stage=None, pg_collection=None):
         assert pg_collection is not None, "the converter must pass its process groups"
-        return TransformerBlock(config, get_gpt_layer_local_spec(), pg_collection=pg_collection)
+        return TransformerBlock(
+            config, get_gpt_layer_local_spec(), pg_collection=pg_collection, vp_stage=vp_stage
+        )
+
+    return model_provider
+
+
+def _interleaved_decoder_provider(calls):
+    """A model provider for eight decoder layers on two pipeline stages of two virtual stages.
+
+    It records the stage of each model chunk it builds.
+    """
+    config = TransformerConfig(
+        num_layers=8,
+        hidden_size=64,
+        num_attention_heads=4,
+        pipeline_model_parallel_size=2,
+        virtual_pipeline_model_parallel_size=2,
+        pipeline_dtype=torch.float32,
+        use_cpu_initialization=True,
+        perform_initialization=False,
+    )
+
+    def model_provider(pre_process=True, post_process=True, vp_stage=None, pg_collection=None):
+        calls.append(
+            dict(
+                pp_rank=pg_collection.pp.rank(),
+                vp_stage=vp_stage,
+                pre_process=pre_process,
+                post_process=post_process,
+            )
+        )
+        return TransformerBlock(
+            config, get_gpt_layer_local_spec(), pg_collection=pg_collection, vp_stage=vp_stage
+        )
 
     return model_provider
 
@@ -61,11 +95,12 @@ def _decoder_provider(split):
 def _recording_provider(calls):
     """A model provider that records the stage and the process groups of each model."""
 
-    def model_provider(pre_process=True, post_process=True, pg_collection=None):
+    def model_provider(pre_process=True, post_process=True, vp_stage=None, pg_collection=None):
         calls.append(
             dict(
                 pre_process=pre_process,
                 post_process=post_process,
+                vp_stage=vp_stage,
                 pg_collection=pg_collection,
                 pp_rank=None if pg_collection is None else pg_collection.pp.rank(),
                 tp_rank=None if pg_collection is None else pg_collection.tp.rank(),
@@ -87,12 +122,17 @@ def _set_up_converter_parallel_state(tensor_parallel_size=1, pipeline_parallel_s
     )
 
 
-def _make_loader(pg_collection, tensor_parallel_size=1, pipeline_parallel_size=2):
+def _make_loader(
+    pg_collection,
+    tensor_parallel_size=1,
+    pipeline_parallel_size=2,
+    virtual_pipeline_parallel_size=None,
+):
     loader = MegatronCheckpointLoaderBase(args=None, queue=None)
     loader.margs = SimpleNamespace(
         tensor_model_parallel_size=tensor_parallel_size,
         pipeline_model_parallel_size=pipeline_parallel_size,
-        virtual_pipeline_model_parallel_size=None,
+        virtual_pipeline_model_parallel_size=virtual_pipeline_parallel_size,
     )
     loader.pg_collection = pg_collection
     return loader
@@ -181,6 +221,29 @@ def test_saver_builds_each_pipeline_stage(converter_parallel_state, split):
     assert _saver_stage_layer_numbers(split, converter_parallel_state) == STAGE_LAYER_NUMBERS
 
 
+def test_loader_builds_each_virtual_pipeline_chunk(converter_parallel_state):
+    """Each virtual pipeline chunk holds its own layers, and only the first chunk of the first
+    stage and the last chunk of the last stage pre- and post-process."""
+    calls = []
+    loader = _make_loader(converter_parallel_state, virtual_pipeline_parallel_size=2)
+
+    all_models = _load_model_shards(loader, _interleaved_decoder_provider(calls))
+
+    # all_models[pp_rank][vp_stage] lists the model chunks of the stage's TP ranks.
+    layer_numbers = [
+        [[layer.layer_number for layer in chunk[0].layers] for chunk in stage]
+        for stage in all_models
+    ]
+    assert layer_numbers == [[[1, 2], [5, 6]], [[3, 4], [7, 8]]]
+    stages = [(c["pp_rank"], c["vp_stage"], c["pre_process"], c["post_process"]) for c in calls]
+    assert stages == [
+        (0, 0, True, False),
+        (0, 1, False, False),
+        (1, 0, False, False),
+        (1, 1, False, True),
+    ]
+
+
 def test_loader_builds_models_on_its_collection(no_global_process_groups):
     """The loader selects every rank on its collection and passes it to the model and loader."""
     pg_collection = build_checkpoint_converter_process_groups(
@@ -201,6 +264,8 @@ def test_loader_builds_models_on_its_collection(no_global_process_groups):
         (False, True, 1, 0),
         (False, True, 1, 1),
     ]
+    # Without a virtual pipeline, each stage is a single model built without a virtual stage.
+    assert all(c["vp_stage"] is None for c in calls)
     assert all(c["pg_collection"] is pg_collection for c in calls)
     assert [(load["pp_rank"], load["tp_rank"]) for load in loads] == [
         (0, 0),
