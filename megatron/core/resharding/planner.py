@@ -15,6 +15,7 @@ from megatron.core.utils import unwrap_model
 
 from .shard_planner import plan_sharded_transfer
 from .utils import (
+    _EXPERT_PARAM_RE,
     ParameterMetadata,
     ReshardPlan,
     ShardingDescriptor,
@@ -657,6 +658,133 @@ def _native_parameter_parts(
     return parts, None
 
 
+_STACK_EXPERTS_ENV = "MEGATRON_NCCL_M2N_STACK_EXPERTS"
+
+
+def _expert_family(resolved_name: str) -> str:
+    """``...experts.linear_fc1.weight17`` -> ``...experts.linear_fc1.weight``."""
+    head, _, tail = resolved_name.rpartition('.')
+    m = _EXPERT_PARAM_RE.match(tail)
+    return f"{head}.{m.group(1)}" if m else resolved_name
+
+
+def _is_stackable_expert(metadata: ParameterMetadata) -> bool:
+    """A per-expert, non-TP-sharded (ETP=1), unpacked, unstrided EP parameter."""
+    return (
+        metadata.is_ep
+        and metadata.global_expert_index is not None
+        and bool(metadata.expert_parallel_group_ranks)
+        and _tensor_mesh(metadata) == (metadata.owner_rank,)
+        and metadata.partition_sizes is None
+        and metadata.partition_stride == 1
+        and not metadata.is_gtp
+    )
+
+
+def _local_stack_names(
+    ep_ranks: tuple[int, ...],
+    by_expert: dict[int, ParameterMetadata],
+    experts_per_rank: int,
+    rank: int,
+) -> tuple[str, ...] | None:
+    """Local parameter names of ``rank``'s experts in one family, in expert order."""
+    if rank not in ep_ranks:
+        return None
+    first = ep_ranks.index(rank) * experts_per_rank
+    return tuple(by_expert[e].name for e in range(first, first + experts_per_rank))
+
+
+def _build_stacked_expert_specs(
+    dst_groups: dict[tuple[str, tuple[int, ...]], dict[int, ParameterMetadata]],
+    src_param_metadata: dict[str, list[ParameterMetadata]],
+    my_global_rank: int,
+) -> tuple[list[TensorReshardSpec], set[tuple[str, tuple[int, ...]]]]:
+    """Describe each expert family as one EP-sharded tensor per destination EP group.
+
+    Megatron assigns experts to EP ranks in contiguous blocks
+    (EP rank ``i`` owns global experts ``[i*k, (i+1)*k)``), so the experts of one
+    layer projection form a regular ``[E, *shape]`` tensor sharded on dim 0
+    over the EP mesh on both sides. One native call then replaces ``E``
+    single-rank copies. Families that do not satisfy every condition keep the
+    per-expert path. Returns the specs and the consumed ``dst_groups`` keys.
+    """
+    families: dict[tuple[str, tuple[int, ...]], dict[int, ParameterMetadata]] = {}
+    keys_by_family: dict[tuple[str, tuple[int, ...]], list] = {}
+    for key, dst_by_rank in dst_groups.items():
+        resolved_name, dst_mesh = key
+        if len(dst_mesh) != 1:
+            continue
+        meta = dst_by_rank[dst_mesh[0]]
+        if not _is_stackable_expert(meta):
+            continue
+        fam = (_expert_family(resolved_name), tuple(meta.expert_parallel_group_ranks))
+        families.setdefault(fam, {})[meta.global_expert_index] = meta
+        keys_by_family.setdefault(fam, []).append(key)
+
+    # Spread destination EP groups over source EP replicas round-robin.
+    dst_groups_by_family_name: dict[str, list[tuple[int, ...]]] = {}
+    for family_name, dst_ep in sorted(families):
+        dst_groups_by_family_name.setdefault(family_name, []).append(dst_ep)
+
+    specs: list[TensorReshardSpec] = []
+    consumed: set = set()
+    for (family_name, dst_ep), dst_by_expert in sorted(families.items()):
+        any_meta = next(iter(dst_by_expert.values()))
+        num_experts = any_meta.num_experts
+        if not num_experts or num_experts % len(dst_ep):
+            continue
+        kd = num_experts // len(dst_ep)
+        shape = tuple(any_meta.shape)
+        if set(dst_by_expert) != set(range(num_experts)) or any(
+            tuple(m.shape) != shape or m.dtype != any_meta.dtype or m.owner_rank != dst_ep[e // kd]
+            for e, m in dst_by_expert.items()
+        ):
+            continue
+        # Source EP replicas that hold every expert of this family whole.
+        src_by_group: dict[tuple[int, ...], dict[int, ParameterMetadata]] = {}
+        for e in range(num_experts):
+            for m in src_param_metadata.get(f"{family_name}{e}", ()) or ():
+                if _is_stackable_expert(m) and m.global_expert_index == e:
+                    src_by_group.setdefault(tuple(m.expert_parallel_group_ranks), {})[e] = m
+        candidates = []
+        for src_ep, by_e in sorted(src_by_group.items()):
+            if num_experts % len(src_ep) or set(by_e) != set(range(num_experts)):
+                continue
+            ks = num_experts // len(src_ep)
+            if all(
+                tuple(m.shape) == shape
+                and m.dtype == any_meta.dtype
+                and m.owner_rank == src_ep[e // ks]
+                for e, m in by_e.items()
+            ) and not set(src_ep) & set(dst_ep):
+                candidates.append((src_ep, by_e))
+        if not candidates:
+            continue
+        order = dst_groups_by_family_name[family_name].index(dst_ep)
+        src_ep, src_by_expert = candidates[order % len(candidates)]
+        ks = num_experts // len(src_ep)
+
+        specs.append(
+            TensorReshardSpec(
+                resolved_name=f"{family_name}[experts]",
+                src_ranks=src_ep,
+                dst_ranks=dst_ep,
+                global_shape=(num_experts,) + shape,
+                src_local_shape=(ks,) + shape,
+                dst_local_shape=(kd,) + shape,
+                dtype=any_meta.dtype,
+                src_shard_dim=0,
+                dst_shard_dim=0,
+                src_param_shape=(ks,) + shape,
+                dst_param_shape=(kd,) + shape,
+                src_stack_names=_local_stack_names(src_ep, src_by_expert, ks, my_global_rank),
+                dst_stack_names=_local_stack_names(dst_ep, dst_by_expert, kd, my_global_rank),
+            )
+        )
+        consumed.update(keys_by_family[(family_name, dst_ep)])
+    return specs, consumed
+
+
 def _build_tensor_reshard_specs(
     dst_param_metadata_by_rank: dict[int, dict[str, ParameterMetadata]],
     src_param_metadata: dict[str, list[ParameterMetadata]],
@@ -670,7 +798,14 @@ def _build_tensor_reshard_specs(
             dst_groups.setdefault((resolved_name, mesh), {})[metadata.owner_rank] = metadata
 
     specs: list[TensorReshardSpec] = []
+    consumed: set = set()
+    if os.environ.get(_STACK_EXPERTS_ENV, "1") != "0":
+        specs, consumed = _build_stacked_expert_specs(
+            dst_groups, src_param_metadata, my_global_rank
+        )
     for (resolved_name, dst_mesh), dst_by_rank in dst_groups.items():
+        if (resolved_name, dst_mesh) in consumed:
+            continue
         src_meta_list = _find_source_metadata(src_param_metadata, resolved_name)
         if not src_meta_list:
             # The generic schedule raises the authoritative missing-weight

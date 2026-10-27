@@ -71,6 +71,12 @@ class _LocalTransfer:
     src: torch.Tensor | None
     dst: torch.Tensor | None
     dst_view: torch.Tensor | None = None
+    # Expert-stacked destination staged in a temporary: per-expert parameters
+    # that receive ``dst.unbind(0)`` after the native call, their names, and the
+    # names that go through the receiver-side transform instead.
+    dst_scatter: list[torch.Tensor] | None = None
+    dst_scatter_names: tuple[str, ...] | None = None
+    dst_transformed: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -204,6 +210,27 @@ def _parameter_groups(
     if batch:
         batches.append(batch)
     return batches
+
+
+def _adjacent_stack_view(tensors: list[torch.Tensor]) -> torch.Tensor | None:
+    """Return a ``[n, *shape]`` view if the tensors are back-to-back in one storage."""
+    first = tensors[0]
+    if not first.is_contiguous():
+        return None
+    nbytes = first.numel() * first.element_size()
+    storage = first.untyped_storage()
+    for index, tensor in enumerate(tensors):
+        if (
+            tensor.shape != first.shape
+            or tensor.dtype != first.dtype
+            or not tensor.is_contiguous()
+            or tensor.untyped_storage().data_ptr() != storage.data_ptr()
+            or tensor.data_ptr() != first.data_ptr() + index * nbytes
+        ):
+            return None
+    view = first.new_empty(0)
+    view.set_(storage, first.storage_offset(), (len(tensors),) + tuple(first.shape))
+    return view
 
 
 class NCCLM2NCopyService(CopyService):
@@ -456,6 +483,63 @@ class NCCLM2NCopyService(CopyService):
         return _LocalTransfer(src=src, dst=dst, dst_view=dst_view)
 
     @staticmethod
+    def _local_stacked_tensor(
+        spec: TensorReshardSpec,
+        rank: int,
+        src_tensors: Mapping[str, torch.Tensor],
+        dst_tensors: Mapping[str, torch.Tensor],
+        transformed: frozenset[str] = frozenset(),
+    ) -> _LocalTransfer:
+        """Stage this rank's experts of one family as one ``[k, *shape]`` tensor.
+
+        Experts named in ``transformed`` are received into a staging tensor and
+        handed to the receiver-side transform instead of being written back.
+        """
+        src = None
+        dst = None
+        if rank in spec.src_ranks:
+            names = spec.src_stack_names
+            if names is None or any(name not in src_tensors for name in names):
+                raise RuntimeError(
+                    f"NCCL M2N source expert tensors for {spec.resolved_name} are unavailable "
+                    f"on rank {rank}"
+                )
+            experts = [_ensure_sendable(src_tensors[name]).detach() for name in names]
+            src = _adjacent_stack_view(experts)
+            if src is None:
+                src = torch.stack(experts)
+            if tuple(src.shape) != spec.src_local_shape or src.dtype != spec.dtype:
+                raise RuntimeError(
+                    f"NCCL M2N source expert metadata changed for {spec.resolved_name}: expected "
+                    f"{spec.src_local_shape}/{spec.dtype}, got {tuple(src.shape)}/{src.dtype}"
+                )
+        if rank in spec.dst_ranks:
+            names = spec.dst_stack_names
+            if names is None or any(name not in dst_tensors for name in names):
+                raise RuntimeError(
+                    f"NCCL M2N destination expert tensors for {spec.resolved_name} are unavailable "
+                    f"on rank {rank}"
+                )
+            experts = [dst_tensors[name].detach() for name in names]
+            if any(
+                tuple(t.shape) != spec.dst_local_shape[1:] or t.dtype != spec.dtype for t in experts
+            ):
+                raise RuntimeError(
+                    f"NCCL M2N destination expert metadata changed for {spec.resolved_name}"
+                )
+            dst = None if transformed else _adjacent_stack_view(experts)
+            if dst is None:
+                dst = torch.empty(spec.dst_local_shape, dtype=spec.dtype, device=experts[0].device)
+                return _LocalTransfer(
+                    src=src,
+                    dst=dst,
+                    dst_scatter=experts,
+                    dst_scatter_names=names,
+                    dst_transformed=transformed,
+                )
+        return _LocalTransfer(src=src, dst=dst)
+
+    @staticmethod
     def _placement(shard_dim: int | None) -> tuple[Any]:
         return (m2n.Replicate() if shard_dim is None else m2n.Shard(shard_dim),)
 
@@ -476,6 +560,37 @@ class NCCLM2NCopyService(CopyService):
                 f"NCCL M2N plan for {first_spec.resolved_name} has incomplete "
                 "packed component metadata"
             )
+
+        if first_spec.src_stack_names is not None or first_spec.dst_stack_names is not None:
+            transformed = frozenset()
+            if transform is not None and self.rank in first_spec.dst_ranks:
+                transformed = frozenset(
+                    name
+                    for name in first_spec.dst_stack_names or ()
+                    if transform.should_transform(name)
+                )
+            local = self._local_stacked_tensor(
+                first_spec, self.rank, src_tensors, dst_tensors, transformed
+            )
+            self._handle.reshard(
+                channel.comm,
+                m2n.DistTensor(
+                    local.src,
+                    local_shape=first_spec.src_local_shape,
+                    dtype=first_spec.dtype,
+                    mesh=channel.src_mesh,
+                    placements=self._placement(first_spec.src_shard_dim),
+                ),
+                m2n.DistTensor(
+                    local.dst,
+                    local_shape=first_spec.dst_local_shape,
+                    dtype=first_spec.dtype,
+                    mesh=channel.dst_mesh,
+                    placements=self._placement(first_spec.dst_shard_dim),
+                ),
+                stream=channel.stream,
+            )
+            return _PendingParameter(local_transfers=[local])
 
         src_override = None
         if self.rank in first_spec.src_ranks:
@@ -549,10 +664,40 @@ class NCCLM2NCopyService(CopyService):
             if local.dst_view is not None:
                 assert local.dst is not None
                 local.dst_view.copy_(local.dst)
+            if local.dst_scatter is not None:
+                assert local.dst is not None
+                NCCLM2NCopyService._scatter_stacked(local, transform)
 
         if pending.transform_args is not None:
             assert transform is not None
             transform.finalize_recv(*pending.transform_args)
+
+    @staticmethod
+    def _scatter_stacked(local: _LocalTransfer, transform: MXFP8ReshardTransform | None) -> None:
+        """Write a received expert stack back to its per-expert destinations."""
+        assert local.dst is not None and local.dst_scatter is not None
+        received = list(local.dst.unbind(0))
+        if not local.dst_transformed:
+            torch._foreach_copy_(local.dst_scatter, received)
+            return
+        assert transform is not None and local.dst_scatter_names is not None
+        params, values = [], []
+        for name, param, value in zip(local.dst_scatter_names, local.dst_scatter, received):
+            if name not in local.dst_transformed:
+                params.append(param)
+                values.append(value)
+                continue
+            full_slice = tuple(slice(None) for _ in value.shape)
+            recv_buffers = transform.prepare_recv(name, full_slice)
+            if len(recv_buffers) != 1:
+                raise RuntimeError(
+                    "NCCL M2N receiver-side MXFP8 conversion requires exactly one BF16 buffer "
+                    f"for {name}"
+                )
+            recv_buffers[0].copy_(value)
+            transform.finalize_recv(name, full_slice, recv_buffers)
+        if params:
+            torch._foreach_copy_(params, values)
 
     def execute_plan(
         self,
