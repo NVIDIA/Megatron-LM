@@ -8,9 +8,9 @@ import torch
 from utils import (
     build_checkpoint_converter_process_groups,
     initialize_checkpoint_converter_distributed,
-    install_checkpoint_converter_process_groups,
     print_memory_usage,
-    set_checkpoint_converter_pipeline_rank,
+    register_checkpoint_converter_process_groups,
+    set_checkpoint_converter_model_ranks,
 )
 
 
@@ -155,8 +155,8 @@ class MegatronCheckpointLoaderBase:
             self.margs.pipeline_model_parallel_size,
             self.margs.expert_model_parallel_size,
         )
-        # load_checkpoint() names legacy checkpoint files after the global ranks.
-        install_checkpoint_converter_process_groups(mpu, self.pg_collection)
+        # Code that reads the global groups instead of a collection sees the same groups.
+        register_checkpoint_converter_process_groups(mpu, self.pg_collection)
 
     def compute_true_vocab_size(self):
         """Determine the 'true' (non-padded) vocab size."""
@@ -186,7 +186,6 @@ class MegatronCheckpointLoaderBase:
           - A nested list of loaded models by [pipeline_rank][virtual_pipeline_rank].
           - consumed_train_samples, consumed_valid_samples
         """
-        from megatron.core import mpu
         from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
         from megatron.training import get_train_state
         from megatron.training.checkpointing import load_checkpoint
@@ -208,7 +207,9 @@ class MegatronCheckpointLoaderBase:
         def get_models_for_pipeline_stage(pp_rank, count, dtype):
             local_models_for_stage = [[] for _ in vp_stages]
             for tp_rank in range(count):
-                pg_collection.tp.set_rank(tp_rank)
+                set_checkpoint_converter_model_ranks(
+                    pg_collection, pipeline_rank=pp_rank, tensor_rank=tp_rank
+                )
                 model_list = []
 
                 for vp_stage in vp_stages:
@@ -228,15 +229,7 @@ class MegatronCheckpointLoaderBase:
                 self.margs.exit_on_missing_checkpoint = True
                 # Preserve training progress in the converted checkpoint.
                 load_checkpoint(
-                    model_list,
-                    None,
-                    None,
-                    restore_training_state=True,
-                    tp_group=pg_collection.tp,
-                    pp_group=pg_collection.pp,
-                    dp_cp_group=pg_collection.dp_cp_gtp_remat,
-                    dp_group=pg_collection.dp,
-                    expt_dp_group=pg_collection.expt_dp,
+                    model_list, None, None, restore_training_state=True, pg_collection=pg_collection
                 )
 
                 # Validate that train/valid samples match across ranks
@@ -261,7 +254,6 @@ class MegatronCheckpointLoaderBase:
 
         # Load shards for each pipeline rank
         for pp_rank in range(pp_size):
-            set_checkpoint_converter_pipeline_rank(mpu, pg_collection, pp_rank)
             all_models.append(get_models_for_pipeline_stage(pp_rank, tp_size, dtype))
 
         return all_models, consumed_train_samples, consumed_valid_samples

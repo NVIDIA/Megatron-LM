@@ -97,9 +97,9 @@ def build_checkpoint_converter_process_groups(
     torch.distributed must be initialized (see
     ``initialize_checkpoint_converter_distributed``).
 
-    All models of a converter share these groups. Before building or loading a
-    model, the converter sets that model's ranks on them, for example with
-    ``set_checkpoint_converter_pipeline_rank``.
+    All models of a converter share these groups. Before building, loading or
+    saving a model, the converter sets that model's ranks on them with
+    ``set_checkpoint_converter_model_ranks``.
 
     GTP rematerialization is not active during conversion. Its data-parallel
     groups therefore alias the corresponding non-GTP groups, matching
@@ -114,7 +114,7 @@ def build_checkpoint_converter_process_groups(
     GTP and distributed-optimizer groups, is set to None and the runtime
     context-parallel maps are empty. In a converter process, this is what
     ``ProcessGroupCollection.use_mpu_process_groups`` returns once
-    ``install_checkpoint_converter_process_groups`` mirrors the groups into
+    ``register_checkpoint_converter_process_groups`` registers the groups with
     ``parallel_state``.
 
     Args:
@@ -157,79 +157,78 @@ def build_checkpoint_converter_process_groups(
     return ProcessGroupCollection(**groups)
 
 
-def install_checkpoint_converter_process_groups(parallel_state, pg_collection):
-    """Mirror a converter's process groups into the global groups of ``parallel_state``.
+def register_checkpoint_converter_process_groups(parallel_state, pg_collection):
+    """Register a converter's process groups as the global groups of ``parallel_state``.
 
-    The converter passes ``pg_collection`` to the models it builds, but code that
-    takes no collection still reads the global groups during conversion. For
-    example, ``megatron.training.checkpointing`` names legacy checkpoint files
-    after the global tensor- and pipeline-parallel ranks. Mirroring the same group
-    objects keeps those reads consistent with the collection, including the ranks
-    the converter sets on its groups. The global pipeline rank also needs
-    ``set_checkpoint_converter_pipeline_rank``.
+    The converter passes ``pg_collection`` to the models it builds and to
+    ``load_checkpoint`` and ``save_checkpoint``. Registering it keeps code that still
+    reads the global groups during conversion, such as a model provider that takes no
+    collection, on the same group objects and ranks.
+
+    The fake groups are not torch.distributed groups, so the global rank lists of the
+    grid cannot be derived from them and stay unset. For the same reason, the global
+    pipeline rank is not available: ``get_pipeline_model_parallel_rank`` asks
+    torch.distributed for the rank of its group. Code on the conversion path takes the
+    stage from ``pg_collection.pp`` instead.
 
     Args:
         parallel_state: The ``megatron.core.parallel_state`` module.
         pg_collection: A collection built by ``build_checkpoint_converter_process_groups``.
+
+    Raises:
+        RuntimeError: Process groups are already registered in this process.
     """
-    parallel_state._TENSOR_MODEL_PARALLEL_GROUP = pg_collection.tp
-    parallel_state._CONTEXT_PARALLEL_GROUP = pg_collection.cp
-    parallel_state._PIPELINE_MODEL_PARALLEL_GROUP = pg_collection.pp
-    parallel_state._EXPERT_MODEL_PARALLEL_GROUP = pg_collection.ep
-    parallel_state._DATA_PARALLEL_GROUP = pg_collection.dp
-    parallel_state._DATA_PARALLEL_GROUP_WITH_CP = pg_collection.dp_cp
-    parallel_state._INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = pg_collection.intra_dp_cp
-    parallel_state._DATA_PARALLEL_GROUP_WITH_GTP_REMAT = pg_collection.dp_gtp_remat
-    parallel_state._DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = pg_collection.dp_cp_gtp_remat
-    # The collection has no intra-partial GTP fields; with GTP inactive they equal the
-    # intra-partial data-parallel group and the expert data-parallel group.
-    parallel_state._INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = (
-        pg_collection.intra_dp_cp
+    from dataclasses import fields
+
+    extras = {field.name: None for field in fields(parallel_state.StandardGridExtras)}
+    # GTP rematerialization is inactive and conversion has one distributed-optimizer
+    # instance, so the partial data-parallel groups that span GTP are the partial
+    # data-parallel group and the expert data-parallel group.
+    extras.update(
+        intra_dp_cp_gtp_remat=pg_collection.intra_dp_cp,
+        intra_expt_dp_gtp_remat=pg_collection.expt_dp_gtp_remat,
     )
-    parallel_state._EXPERT_DATA_PARALLEL_GROUP = pg_collection.expt_dp
-    parallel_state._EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = pg_collection.expt_dp_gtp_remat
-    parallel_state._INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = (
-        pg_collection.expt_dp_gtp_remat
+    parallel_state.register_process_groups(
+        pg_collection, extras=parallel_state.StandardGridExtras(**extras)
     )
-    parallel_state._EXPERT_TENSOR_PARALLEL_GROUP = pg_collection.expt_tp
-    parallel_state._EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP = pg_collection.tp_ep
-    parallel_state._EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP = pg_collection.tp_ep_pp
-    parallel_state._MODEL_PARALLEL_GROUP = pg_collection.mp
 
 
-def set_checkpoint_converter_pipeline_rank(parallel_state, pg_collection, pipeline_rank):
-    """Select the pipeline stage whose model the converter builds, loads or saves next.
+def set_checkpoint_converter_model_ranks(
+    pg_collection, *, pipeline_rank, tensor_rank, expert_rank=0
+):
+    """Select the model that the converter builds, loads or saves next.
 
-    Models take their stage from the pipeline group of ``pg_collection``. Code that
-    reads the global pipeline rank instead, such as legacy checkpoint names in
-    ``megatron.training.checkpointing``, needs the ``parallel_state`` override too:
-    ``get_pipeline_model_parallel_rank`` asks torch.distributed for the rank of its
-    group, which a fake group cannot answer.
+    All models of a converter share the fake groups of ``pg_collection``, so the
+    converter selects a model by setting its ranks on them. A model built afterwards
+    holds the layers of its ranks, and a checkpoint loaded or saved afterwards is named
+    after them. The expert tensor-parallel group of a converter has the tensor-parallel
+    size, so the expert tensor-parallel rank of a model is its tensor-parallel rank.
 
     Args:
-        parallel_state: The ``megatron.core.parallel_state`` module.
         pg_collection: A collection built by ``build_checkpoint_converter_process_groups``.
-        pipeline_rank: The pipeline-parallel rank to select.
+        pipeline_rank: Pipeline-parallel rank of the model.
+        tensor_rank: Tensor-parallel rank of the model.
+        expert_rank: Expert-parallel rank of the model.
     """
     pg_collection.pp.set_rank(pipeline_rank)
-    parallel_state.set_pipeline_model_parallel_rank(pipeline_rank)
+    pg_collection.tp.set_rank(tensor_rank)
+    pg_collection.expt_tp.set_rank(tensor_rank)
+    pg_collection.ep.set_rank(expert_rank)
 
 
 def initialize_checkpoint_converter_fake_process_groups(
     parallel_state, tensor_parallel_size, pipeline_parallel_size, expert_parallel_size
 ):
-    """Build a converter's process groups and mirror them into ``parallel_state``.
+    """Build a converter's process groups and register them with ``parallel_state``.
 
-    Converters that pass the returned collection to their models need the mirror
-    only for code that still reads the global groups. See
-    ``build_checkpoint_converter_process_groups`` and
-    ``install_checkpoint_converter_process_groups``.
+    See ``build_checkpoint_converter_process_groups`` and
+    ``register_checkpoint_converter_process_groups``.
 
     Returns:
-        ProcessGroupCollection: The fake groups now mirrored in ``parallel_state``.
+        ProcessGroupCollection: The fake groups, registered with ``parallel_state``.
     """
     pg_collection = build_checkpoint_converter_process_groups(
         tensor_parallel_size, pipeline_parallel_size, expert_parallel_size
     )
-    install_checkpoint_converter_process_groups(parallel_state, pg_collection)
+    register_checkpoint_converter_process_groups(parallel_state, pg_collection)
     return pg_collection
