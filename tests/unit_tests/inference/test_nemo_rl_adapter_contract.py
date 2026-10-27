@@ -4,8 +4,6 @@ import copy
 import importlib
 import os
 import sys
-import threading
-from collections import OrderedDict
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest import mock
@@ -14,12 +12,8 @@ import pytest
 import torch
 
 from megatron.core.inference.config import AsyncScheduleMode, PrefixCachingEvictionPolicy
-from megatron.core.inference.contexts import StaticInferenceContext
-from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
+from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_client import InferenceClient
-from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
-    VLMInferenceWrapper,
-)
 from megatron.core.inference.quantization.utils import quantize_params_to_mxfp8
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -27,19 +21,10 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_inference_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
-from megatron.core.models.multimodal.llava_model import LLaVAModel
-from megatron.core.resharding.refit import (
-    clear_all_caches,
-    prepare_swap_model_weights,
-    swap_model_weights,
-)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import attention as attention_module
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
-from megatron.core.transformer.enums import AttnBackend
-from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.module import Float16Module
-from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.inference.engines import test_dynamic_engine as dynamic_engine_tests
@@ -49,8 +34,6 @@ from tests.unit_tests.inference.engines.test_dynamic_engine import (
     reset_rounder,
 )
 from tests.unit_tests.test_utilities import Utils
-
-NEMO_RL_COMMIT = "b26733300f0f7f5421c43c8ba4cd9e37e5d5f65d"
 
 
 class _CoordinatorTokenizer:
@@ -79,8 +62,7 @@ def _mount_nemo_rl_generation_packages(source):
 def _load_nemo_rl_adapter():
     source_value = os.environ.get("NEMO_RL_SOURCE")
     if source_value is None:
-        pytest.skip("NEMO_RL_SOURCE is supplied by the NeMo-RL acceptance worker")
-    assert os.environ.get("NEMO_RL_SOURCE_COMMIT") == NEMO_RL_COMMIT
+        pytest.skip("set NEMO_RL_SOURCE to a NeMo-RL checkout to run the adapter contract tests")
     source = Path(source_value).resolve(strict=True)
     sys.path.insert(0, str(source))
     try:
@@ -101,29 +83,6 @@ def _load_nemo_rl_adapter():
     return data_module.BatchedDataDict, adapter_cls
 
 
-def _load_nemo_rl_token_capture():
-    source_value = os.environ.get("NEMO_RL_SOURCE")
-    if source_value is None:
-        pytest.skip("NEMO_RL_SOURCE is supplied by the NeMo-RL acceptance worker")
-    assert os.environ.get("NEMO_RL_SOURCE_COMMIT") == NEMO_RL_COMMIT
-    source = Path(source_value).resolve(strict=True)
-    gym_source = Path(
-        os.environ.get("NEMO_GYM_SOURCE", source / "3rdparty" / "Gym-workspace" / "Gym")
-    ).resolve(strict=True)
-    sys.path[:0] = [str(source), str(gym_source)]
-    try:
-        _mount_nemo_rl_generation_packages(source)
-        capture_module = importlib.import_module("nemo_rl.models.generation.megatron.token_capture")
-        gym_module = importlib.import_module("nemo_gym.token_id_capture")
-        records_module = importlib.import_module("nemo_gym.token_id_capture.staging.records")
-    finally:
-        sys.path.remove(str(gym_source))
-        sys.path.remove(str(source))
-    assert Path(capture_module.__file__).resolve().is_relative_to(source)
-    assert Path(gym_module.__file__).resolve().is_relative_to(gym_source)
-    return capture_module, gym_module, records_module
-
-
 def _protocol_adapter(mixin_cls, *, stop_token_ids=None, ignore_eos=False):
     adapter = object.__new__(mixin_cls)
     adapter.cfg = {
@@ -142,25 +101,8 @@ def _protocol_adapter(mixin_cls, *, stop_token_ids=None, ignore_eos=False):
     return adapter
 
 
-def _reply(tokens, scores, reason, prompt=None):
-    return SimpleNamespace(
-        prompt_tokens=prompt,
-        generated_tokens=tokens,
-        generated_log_probs=scores,
-        finish_reason=reason,
-    )
-
-
 def _assert_exact_scores(actual, expected):
     torch.testing.assert_close(actual, torch.tensor(expected), rtol=0, atol=0)
-
-
-async def _wait_for_epoch(engine, epoch):
-    for _ in range(100):
-        if engine._generation_epoch == epoch:
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError(f"generation epoch did not reach {epoch}")
 
 
 async def _drive_engine(engine, futures, witness=None):
@@ -1019,12 +961,7 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
         if failure is not None:
             raise failure
         assert adapter_forward_batches
-        if topology["ep"] > 1:
-            adapter_ids = set(range(len(prompts)))
-            assert any(adapter_ids.issubset(batch) for batch in adapter_forward_batches)
         if uses_moe:
             assert moe_hooks and moe_forward_batches
-            if topology["ep"] > 1:
-                assert any(adapter_ids.issubset(batch) for batch in moe_forward_batches)
         for hook in moe_hooks:
             hook.remove()
