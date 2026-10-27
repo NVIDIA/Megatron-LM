@@ -819,11 +819,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="inference_flashinfer_sampling",
         sources=("megatron/core/inference/sampling/flashinfer_sampling.py",),
+        tests=(K + "test_flashinfer_sampling.py",),
         kind="dispatch",
         training_path=False,
-        exempt_reason="FlashInfer top-k / top-p sampling kernels driven by an explicit torch.Generator "
-        "with deterministic=True; a seed-restore replay test needs flashinfer in the unit-test "
-        "container and is tracked as a follow-up.",
+        notes="Processed log-probs mask top-k logits (integer-count radix pivot) instead of "
+        "top_k_renorm_probs, whose multi-CTA float-atomic normalizer races at >~115K vocab, and "
+        "pass is_deterministic=True to the radix top_p_renorm_probs (FlashInfer >= 0.6.7); "
+        "replayed at 32K (top-p boundary ties) and 152K vocab, with negative controls on both "
+        "defaults. The top-k / top-p sampling kernels run with deterministic=True and an explicit "
+        "torch.Generator; their seed-restore replay is a follow-up.",
     ),
     KernelEntry(
         name="inference_tp_layers",

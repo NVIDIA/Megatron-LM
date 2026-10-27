@@ -16,6 +16,7 @@ from megatron.core.inference.sampling_params import (
     is_no_op_top_k,
     is_no_op_top_p,
 )
+from megatron.core.utils import is_flashinfer_min_version
 
 
 class FlashInferSampling(Sampling):
@@ -43,6 +44,12 @@ class FlashInferSampling(Sampling):
         del config, enable_cuda_graph
         self._vocab_size = vocab_size
         self._rng = rng
+        # From 0.6.7, FlashInfer renormalizes top-p with a radix kernel whose default float
+        # atomic histograms pick the kept set in a run-dependent order; request its integer
+        # accumulation. Older versions use a one-block-per-row kernel, deterministic as is.
+        self._top_p_renorm_kwargs = (
+            {"is_deterministic": True} if is_flashinfer_min_version("0.6.7") else {}
+        )
 
     def sample_kernel(
         self,
@@ -182,10 +189,15 @@ class FlashInferSampling(Sampling):
         top_k_safe = top_k.masked_fill(no_top_k, self._vocab_size)
         top_p_safe = top_p.masked_fill(no_top_p, 1.0)
 
-        probs = torch.softmax(scaled, dim=-1)
-        # Renormalize to the kept set (top-k first, then top-p) to match
-        renormed = flashinfer.sampling.top_k_renorm_probs(probs, top_k_safe)
-        renormed = flashinfer.sampling.top_p_renorm_probs(renormed, top_p_safe)
+        # Renormalize to the kept set, top-k first and then top-p, as the joint sampling kernel
+        # does. Top-k masks the logits rather than renormalizing probs: the mask's pivot comes
+        # from integer counts, whereas `top_k_renorm_probs` sums a row split over several CTAs
+        # (large vocabularies) with float atomics, so its result varies from run to run.
+        masked = flashinfer.sampling.top_k_mask_logits(scaled, top_k_safe)
+        probs = torch.softmax(masked, dim=-1)
+        renormed = flashinfer.sampling.top_p_renorm_probs(
+            probs, top_p_safe, **self._top_p_renorm_kwargs
+        )
         # Unfiltered rows of a mixed batch bypass the renorm rounding entirely.
         return torch.where(
             (no_top_k & no_top_p).unsqueeze(1),
