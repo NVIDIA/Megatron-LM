@@ -976,9 +976,11 @@ if HAVE_TE:
         # Number of per-rank sequence chunks in the input and the output with sequence
         # parallelism: a column-parallel module gathers its input chunks into TP output
         # chunks, and a row-parallel module scatters TP input chunks into one output chunk.
+        # TE's parallel_mode is what selects the collective, so it decides the chunks.
+        parallel_mode = getattr(module, "parallel_mode", None)
         tp_size = getattr(module, "tp_size", 1)
-        sp_input_chunks = tp_size if is_row_parallel_linear(module) else 1
-        sp_output_chunks = tp_size if is_column_parallel_linear(module) else 1
+        sp_input_chunks = tp_size if parallel_mode == "row" else 1
+        sp_output_chunks = tp_size if parallel_mode == "column" else 1
         _pad_funcs = {n: Fp8Padding(n) for n in {1, sp_input_chunks}}
         _unpad_funcs = {n: Fp8Unpadding(n) for n in {1, sp_output_chunks}}
 
@@ -1001,6 +1003,10 @@ if HAVE_TE:
                 input_chunks, output_chunks = 1, 1
 
             seq_len, batch_size, hidden_size = input_tensor.shape
+            assert seq_len % input_chunks == 0, (
+                f"Sequence length {seq_len} is not divisible by the {input_chunks} "
+                f"tensor-parallel ranks that {type(module).__name__} reduce-scatters it to"
+            )
             chunk_len = seq_len // input_chunks
             # Reshape to (S, B*H) to pad sequence dimension
             input_2d = input_tensor.reshape(seq_len, -1)

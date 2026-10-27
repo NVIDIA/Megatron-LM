@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from functools import partial
 from unittest.mock import Mock, patch
 
 import pytest
@@ -26,6 +27,7 @@ try:
 
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
+        TELayerNormColumnParallelLinear,
         TERowParallelLinear,
     )
 
@@ -185,6 +187,84 @@ class TestFP8Padding:
             assert output.shape == (6, 2, 4096)  # Back to original seq_len
 
 
+class _FakeSequenceParallelTELinear(nn.Module):
+    """One rank of a TE linear with sequence parallelism and an identity GEMM. The other ranks
+    contribute zeros to the reduce-scatter and copies of this rank's chunk to the all-gather."""
+
+    def __init__(self, parallel_mode, tp_size, rank):
+        super().__init__()
+        self.parallel_mode, self.tp_size, self.rank = parallel_mode, tp_size, rank
+        self.sequence_parallel = True
+
+    def forward(self, x):
+        if self.sequence_parallel and self.parallel_mode == "row":
+            return x.chunk(self.tp_size)[self.rank], None
+        if self.sequence_parallel and self.parallel_mode == "column":
+            return torch.cat([x] * self.tp_size), None
+        return x, None
+
+
+@contextmanager
+def _fake_fp8_padding(align):
+    """Pure-torch Fp8Padding / Fp8Unpadding with a fixed alignment, inside an FP8 context."""
+
+    def padded(splits):
+        return [-(-m // align) * align for m in splits]
+
+    class Padding:
+        def __init__(self, num_gemms):
+            self.num_gemms = num_gemms
+
+        def __call__(self, inp, splits):
+            assert len(splits) == self.num_gemms
+            pads = [(0, 0, 0, p - m) for m, p in zip(splits, padded(splits))]
+            chunks = [nn.functional.pad(c, pad) for c, pad in zip(inp.split(splits), pads)]
+            return torch.cat(chunks), padded(splits)
+
+    class Unpadding(Padding):
+        def __call__(self, inp, splits):
+            assert len(splits) == self.num_gemms
+            return torch.cat([c[:m] for c, m in zip(inp.split(padded(splits)), splits)])
+
+    with (
+        patch.object(fp8_utils, "Fp8Padding", Padding),
+        patch.object(fp8_utils, "Fp8Unpadding", Unpadding),
+        patch.object(fp8_utils.FP8GlobalStateManager, "is_fp8_enabled", return_value=True),
+    ):
+        yield
+
+
+@pytest.mark.skipif(not fp8_utils.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.parametrize("parallel_mode", ["row", "column", None])
+def test_fp8_padding_pads_each_sequence_parallel_chunk(parallel_mode):
+    """With sequence parallelism, each rank's chunk of the sequence is padded separately, as TE's
+    parallel_mode splits it, so the last rank gets exactly its rows back."""
+    tp_size, chunk_len, align = 4, 3, 4
+    module = _FakeSequenceParallelTELinear(parallel_mode, tp_size, rank=tp_size - 1)
+    seq_len = chunk_len if parallel_mode == "column" else chunk_len * tp_size
+    x = torch.randn(seq_len, 2, 8)
+    if parallel_mode == "row":
+        expected = x[-chunk_len:]
+    elif parallel_mode == "column":
+        expected = torch.cat([x] * tp_size)
+    else:
+        expected = x
+
+    with _fake_fp8_padding(align):
+        fp8_utils._wrap_te_linear_for_padding(module)
+        output, _ = module(x)
+
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not fp8_utils.HAVE_TE, reason="Transformer Engine is not installed")
+def test_fp8_padding_rejects_sequence_not_divisible_by_tp():
+    module = _FakeSequenceParallelTELinear("row", tp_size=4, rank=0)
+    with _fake_fp8_padding(align=4), pytest.raises(AssertionError, match="not divisible"):
+        fp8_utils._wrap_te_linear_for_padding(module)
+        module(torch.randn(10, 2, 8))
+
+
 @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
 class TestFP8PaddingSequenceParallel:
     """The padding wrapper on tensor-parallel TE linears with sequence parallelism.
@@ -195,8 +275,13 @@ class TestFP8PaddingSequenceParallel:
 
     TP = 2
     BATCH = 2
-    # The wrapper pads 40 tokens (20 per rank); 32 tokens (16 per rank) are already aligned.
+    PARALLEL_MODES = ["row", "column", "layernorm_column"]
+    # With the tensorwise recipe's 16-row alignment, the wrapper pads 40 tokens (20 per rank) and
+    # leaves 32 tokens (16 per rank) as they are.
     SEQ_LENS = [pytest.param(32, id="aligned"), pytest.param(40, id="padded")]
+    RECIPE_ALIGNMENT = 16
+    # Padding alignments: the recipe's, and the 32 rows of MXFP8 (which itself needs Blackwell).
+    ALIGNMENTS = [pytest.param(None, id="recipe_alignment"), pytest.param(32, id="mxfp8_alignment")]
 
     def setup_method(self, method):
         if Utils.world_size % self.TP != 0:
@@ -232,7 +317,13 @@ class TestFP8PaddingSequenceParallel:
         generator = torch.Generator().manual_seed(seq_len)
         x = torch.randn(seq_len, self.BATCH, in_features, generator=generator).bfloat16()
         weight = (torch.randn(out_features, in_features, generator=generator) * 0.05).bfloat16()
-        expected = torch.einsum("sbk,nk->sbn", x.double(), weight.double())
+        gemm_input = x.double()
+        if parallel_mode == "layernorm_column":
+            # TE initializes the norm's weight to one and its bias to zero.
+            gemm_input = torch.nn.functional.layer_norm(
+                gemm_input, (in_features,), eps=config.layernorm_epsilon
+            )
+        expected = torch.einsum("sbk,nk->sbn", gemm_input, weight.double())
 
         kwargs = dict(
             config=config,
@@ -250,9 +341,11 @@ class TestFP8PaddingSequenceParallel:
             x_local = x.chunk(self.TP, dim=2)[rank]
             expected = expected.chunk(self.TP, dim=0)[rank]
         else:
-            module = TEColumnParallelLinear(
-                in_features, out_features, gather_output=False, **kwargs
-            )
+            if parallel_mode == "layernorm_column":
+                linear_class = TELayerNormColumnParallelLinear
+            else:
+                linear_class = TEColumnParallelLinear
+            module = linear_class(in_features, out_features, gather_output=False, **kwargs)
             weight_shard = weight.chunk(self.TP, dim=0)[rank]
             x_local = x.chunk(self.TP, dim=0)[rank]
             expected = expected.chunk(self.TP, dim=2)[rank]
@@ -277,7 +370,7 @@ class TestFP8PaddingSequenceParallel:
         torch.distributed.all_reduce(sums, group=parallel_state.get_tensor_model_parallel_group())
         return (sums[0] / sums[1]).sqrt().item()
 
-    @pytest.mark.parametrize("parallel_mode", ["row", "column"])
+    @pytest.mark.parametrize("parallel_mode", PARALLEL_MODES)
     def test_wrapper_is_noop_outside_fp8(self, parallel_mode):
         module, x, expected = self._setup(self._config(), parallel_mode, seq_len=40)
         unwrapped = self._forward(module, x)
@@ -287,9 +380,10 @@ class TestFP8PaddingSequenceParallel:
         torch.testing.assert_close(wrapped, unwrapped)
         torch.testing.assert_close(wrapped.double(), expected, atol=2e-2, rtol=2e-2)
 
-    @pytest.mark.parametrize("parallel_mode", ["row", "column"])
+    @pytest.mark.parametrize("parallel_mode", PARALLEL_MODES)
     @pytest.mark.parametrize("seq_len", SEQ_LENS)
-    def test_wrapped_output_matches_unwrapped(self, parallel_mode, seq_len):
+    @pytest.mark.parametrize("align_size", ALIGNMENTS)
+    def test_wrapped_output_matches_unwrapped(self, parallel_mode, seq_len, align_size):
         config = self._config()
         module, x, expected = self._setup(config, parallel_mode, seq_len)
         unwrapped = self._forward(module, x, config)
@@ -302,10 +396,18 @@ class TestFP8PaddingSequenceParallel:
             return inner_forward(input_tensor, *args, **kwargs)
 
         module.forward = recording_forward
-        fp8_utils.prepare_model_for_fp8_inference(module)
+        with (
+            patch.object(
+                fp8_utils, "Fp8Padding", partial(fp8_utils.Fp8Padding, align_size=align_size)
+            ),
+            patch.object(
+                fp8_utils, "Fp8Unpadding", partial(fp8_utils.Fp8Unpadding, align_size=align_size)
+            ),
+        ):
+            fp8_utils.prepare_model_for_fp8_inference(module)
         wrapped = self._forward(module, x, config)
 
-        if seq_len == 40:
+        if (seq_len // self.TP) % (align_size or self.RECIPE_ALIGNMENT) != 0:
             assert inner_seq_lens[0] > x.shape[0], "the wrapper did not pad the FP8 input"
         assert module.sequence_parallel
         assert wrapped.shape == unwrapped.shape == expected.shape
