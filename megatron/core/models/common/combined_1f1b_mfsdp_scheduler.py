@@ -1,6 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    PrefetchMode,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 
 
 def _make_unshard_forward_hook(owner: FsdpModule):
@@ -11,7 +15,8 @@ def _make_unshard_forward_hook(owner: FsdpModule):
         if owner.is_root():
             context = owner.context
             context.allgather_stream.wait_stream(context.current_stream())
-        owner.unshard()
+        active = owner.context.prefetch_mode is PrefetchMode.RECORD_REPLAY
+        owner.unshard(Phase.FORWARD if active else None)
 
     return hook
 
@@ -21,7 +26,8 @@ def _make_unshard_backward_hook(owner: FsdpModule):
     backward."""
 
     def hook(submodule, _grad_output):
-        owner.unshard()
+        active = owner.context.prefetch_mode is PrefetchMode.RECORD_REPLAY
+        owner.unshard(Phase.BACKWARD if active else None)
 
     return hook
 

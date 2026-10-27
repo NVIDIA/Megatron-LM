@@ -31,7 +31,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .execution_order import ExecutionOrder
+from .execution_order import ExecutionEvent, ExecutionOrder, PrefetchMode
 from .module_utils import get_parameter_owner
 from .parameter_group import (
     FsdpParameter,
@@ -276,9 +276,6 @@ class FsdpModule:
         # This is the first MFSDP hook to run, so finalize the context here once
         # before any module begins communication.
         context.ensure_finalized()
-        # A reentrant checkpoint recomputes before the child module's backward-pre
-        # hook runs. The active autograd GraphTask identifies that recomputation.
-        is_recomputing = self.phase is Phase.BACKWARD or _is_in_backward()
         if self.phase is not Phase.BACKWARD:
             self.phase = Phase.FORWARD
         # forward/backward each span multiple lifecycle methods (pre_forward ->
@@ -291,15 +288,15 @@ class FsdpModule:
 
         # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
         # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
-        self.unshard(Phase.FORWARD, prefetch=not is_recomputing)
+        self.unshard(Phase.FORWARD)
 
-    def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
+    def unshard(self, phase: Phase | None = None) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
 
         Args:
-            phase: In what phase this module runs. None unshards for every phase.
-            prefetch: Whether to also prefetch successors in the module order of
-                ``phase``, which must then be FORWARD or BACKWARD.
+            phase: In what phase this module runs. FORWARD or BACKWARD calls
+                advance the execution order and prefetch when it is available.
+                None unshards for every phase without advancing the order.
 
         External schedulers invoking this directly (rather than through the
         automatic ``pre_forward`` hook) must first synchronize the all-gather
@@ -308,6 +305,19 @@ class FsdpModule:
         before this when ``self.is_root()``; the automatic forward path
         performs that root sync in ``pre_forward()`` immediately before this.
         """
+        context = self.context
+        order = None
+        if phase is not None:
+            if phase not in (Phase.FORWARD, Phase.BACKWARD):
+                raise ValueError(
+                    f"Unsharding requires a FORWARD, BACKWARD, or None phase, got {phase!r}."
+                )
+            execution_phase = phase
+            # A reentrant checkpoint recomputes before the child module's backward-pre
+            # hook runs. The active autograd GraphTask identifies that recomputation.
+            if phase is Phase.FORWARD and (self.phase is Phase.BACKWARD or _is_in_backward()):
+                execution_phase = Phase.RECOMPUTE
+            order = context._advance_execution_order(cast(nn.Module, self), execution_phase)
         with self._nvtx_range("unshard"):
             self._unshard_parameter_groups(phase)
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
@@ -317,47 +327,39 @@ class FsdpModule:
             for event in dict.fromkeys(self._unshard_events[p] for p in phases):
                 self.context.current_stream().wait_event(event)
 
-            if not prefetch:
-                return
-            context = self.context
-            match phase:
-                case Phase.FORWARD:
-                    self._prefetch_parameter_groups(
-                        context.forward_order, self._schedule_policy.forward_prefetch_size
-                    )
-                case Phase.BACKWARD:
-                    self._prefetch_parameter_groups(
-                        context.backward_order, self._schedule_policy.backward_prefetch_size
-                    )
-                case _:
-                    raise ValueError(
-                        f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}."
-                    )
+            if order is not None:
+                budget = (
+                    self._schedule_policy.forward_prefetch_size
+                    if execution_phase is Phase.FORWARD
+                    else self._schedule_policy.backward_prefetch_size
+                )
+                self._prefetch_parameter_groups(order, budget)
 
     def _prefetch_parameter_groups(
-        self, order: ExecutionOrder[nn.Module], prefetch_size: int | None
+        self, order: ExecutionOrder[ExecutionEvent], prefetch_size: int | None
     ) -> None:
-        """Prefetch successors from ``order`` according to this module's budget.
-
-        Successors are unsharded for this module's phase, which is the compute they
-        run next in ``order``.
-        """
-        module = cast(nn.Module, self)
-        order.advance(module)
-        next_module = order.next_item()
-        if prefetch_size is None:
-            if next_module is not None:
-                cast(FsdpModule, next_module)._unshard_parameter_groups(self.phase)
+        """Prefetch successors of the consumed demand according to its budget."""
+        if prefetch_size == 0:
             return
-
+        _, current_phase = order[order.position - 1]
         prefetched_size = 0
-        offset = 1
-        while next_module is not None and prefetched_size < prefetch_size:
-            fsdp_module = cast(FsdpModule, next_module)
-            fsdp_module._unshard_parameter_groups(self.phase)
+        for index in range(order.position, len(order)):
+            module_ref, next_phase = order[index]
+            # Preset forward/backward orders retain separate prefetch boundaries.
+            if (
+                self.context.prefetch_mode is PrefetchMode.PRESET
+                and next_phase is not current_phase
+            ):
+                break
+            module = module_ref()
+            if module is None:
+                raise RuntimeError("A module in the FSDP execution order was destroyed.")
+            fsdp_module = cast(FsdpModule, module)
+            phase = Phase.BACKWARD if next_phase is Phase.BACKWARD else Phase.FORWARD
+            fsdp_module._unshard_parameter_groups(phase)
             prefetched_size += fsdp_module.num_parameter_elements
-            offset += 1
-            next_module = order.next_item(offset)
+            if prefetch_size is None or prefetched_size >= prefetch_size:
+                break
 
     def _unshard_parameter_groups(self, phase: Phase | None) -> None:
         """Unshard parameter groups for compute in ``phase`` on the all-gather stream.
@@ -446,9 +448,13 @@ class FsdpModule:
         # and gather its weights normally, without this guard. grads_ready would
         # run once, after both depths' local gradient contributions have accumulated,
         # and perform the reduction.
-        # This likely requires addressing static prefetch order for repeated invocations first:
+        # This likely requires addressing preset prefetch order for repeated invocations first:
         # https://github.com/NVIDIA/Megatron-LM/issues/7764
         if self.phase is Phase.BACKWARD:
+            # Track every backward occurrence during capture/replay, including
+            # duplicate calls from shared-layer MTP.
+            if self.context.prefetch_mode is PrefetchMode.RECORD_REPLAY:
+                self.unshard(Phase.BACKWARD)
             return
         self.phase = Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
@@ -465,7 +471,7 @@ class FsdpModule:
             # fork each preceding module issues before its collective.
             context.reduce_scatter_stream.wait_stream(current_stream)
 
-        self.unshard(Phase.BACKWARD, prefetch=True)
+        self.unshard(Phase.BACKWARD)
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""

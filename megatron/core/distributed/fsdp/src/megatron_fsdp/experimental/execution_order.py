@@ -14,9 +14,15 @@
 
 """Weakly held construction or recorded module execution sequences."""
 
+import enum
 from collections.abc import Iterable, Iterator
-from typing import Generic, TypeVar
-from weakref import WeakKeyDictionary, ref
+from typing import TYPE_CHECKING, Generic, TypeVar
+from weakref import ref
+
+from .phase import Phase
+
+if TYPE_CHECKING:
+    from .module import FsdpModule
 
 T = TypeVar("T")
 
@@ -31,10 +37,10 @@ class ExecutionOrder(Generic[T]):
     """
 
     def __init__(self, items: Iterable[T] = ()) -> None:
-        """Create a weak execution sequence, preserving repeated occurrences."""
-        self._items: list[ref[T]] = []
+        """Create an execution sequence, preserving repeated occurrences."""
+        self._items: list[T] = []
         # An index identifies a unique item; None marks an ambiguous repeated item.
-        self._unique_index: WeakKeyDictionary[T, int | None] = WeakKeyDictionary()
+        self._unique_index: dict[T, int | None] = {}
         self._position = 0
         for item in items:
             self.append(item)
@@ -42,30 +48,67 @@ class ExecutionOrder(Generic[T]):
     def append(self, item: T) -> None:
         """Append an occurrence and mark previously seen items as repeated."""
         self._unique_index[item] = None if item in self._unique_index else len(self._items)
-        self._items.append(ref(item))
+        self._items.append(item)
 
     def __iter__(self) -> Iterator[T]:
-        """Iterate over live occurrences in execution order."""
-        for item_ref in self._items:
-            item = item_ref()
-            if item is not None:
-                yield item
+        """Iterate over occurrences in execution order."""
+        return iter(self._items)
 
-    def advance(self, item: T) -> None:
-        """Locate a unique demand call or consume the next expected repeated call."""
-        index = self._unique_index.get(item)
-        if index is None:
-            if not self._items or self._items[self._position]() is not item:
-                raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
-            index = self._position
-        self._position = (index + 1) % len(self._items)
+    def reset_cursor(self, position: int = 0) -> None:
+        """Reset traversal without changing the recorded sequence."""
+        self._position = position
 
-    def next_item(self, offset: int = 1) -> T | None:
-        """Look ahead from the last consumed occurrence without moving the cursor."""
-        if not self._items:
-            return None
-        index = (self._position - 1) % len(self._items)
-        next_index = index + offset
-        if next_index >= len(self._items):
-            return None
-        return self._items[next_index]()
+    def __len__(self) -> int:
+        return len(self._items)
+
+    @property
+    def position(self) -> int:
+        """Index of the next occurrence; len(order) means traversal is exhausted."""
+        return self._position
+
+    def __getitem__(self, index: int) -> T:
+        """Read an occurrence without advancing the cursor."""
+        return self._items[index]
+
+    def advance(self, item: T | None = None) -> T:
+        """Locate a unique demand call or consume the next expected repeated call.
+
+        With no item, consume the next occurrence without lookup.
+        """
+        if item is not None:
+            index = self._unique_index.get(item)
+            if index is None:
+                if not self._items or self._items[self._position % len(self._items)] != item:
+                    raise RuntimeError(
+                        "FSDP module calls diverged from the expected prefetch order."
+                    )
+                index = self._position % len(self._items)
+            self._position = index
+        if self._position >= len(self._items):
+            raise RuntimeError("Calls exceeded the execution order; reset its cursor first.")
+        result = self._items[self._position]
+        self._position += 1
+        return result
+
+
+class PrefetchMode(enum.Enum):
+    """Source of the parameter prefetch order.
+
+    PRESET uses a phase-tagged forward/backward order defined during construction,
+    without requiring an iteration scope. Prefetch stays within each phase;
+    recomputation gathers on demand.
+    RECORD_REPLAY applies only inside training iteration scopes. It records
+    phase-tagged module calls in the first scope and prefetches from that order
+    in later scopes. Recording gathers on demand. Scope exit switches to DEMAND,
+    retaining the captured order for the next training scope.
+    DEMAND gathers parameters only when needed, without recording, replaying, or
+    prefetching. Forward-only callers temporarily use this mode so validation does
+    not consume the training order.
+    """
+
+    PRESET = enum.auto()
+    RECORD_REPLAY = enum.auto()
+    DEMAND = enum.auto()
+
+
+ExecutionEvent = tuple[ref["FsdpModule"], Phase]

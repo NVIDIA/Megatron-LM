@@ -20,7 +20,7 @@ import math
 import os
 import sys
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -57,6 +57,12 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV2,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    iteration as fsdp_iteration,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    PrefetchMode,
+)
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
@@ -2562,6 +2568,26 @@ def _add_model_freeze_pre_wrap_hook(model_config, *, freeze_all_layers, freeze_b
         model_config.pre_wrap_hooks.append(freeze_hook)
 
 
+@contextmanager
+def _mfsdp_iteration(model, *, forward_only=False):
+    """Scope the shared MFSDP context around a complete training schedule."""
+    if not getattr(get_args(), "megatron_fsdp_record_iteration", False):
+        yield
+        return
+    # All VPP chunks are constructed in one fully_shard_context.
+    context = model[0].module.context
+    if forward_only:
+        previous_mode = context.prefetch_mode
+        context.prefetch_mode = PrefetchMode.DEMAND
+        try:
+            yield
+        finally:
+            context.prefetch_mode = previous_mode
+    else:
+        with fsdp_iteration(context):
+            yield
+
+
 def _forward_backward_grad_context(args):
     """Grad context for a train step's forward/backward pass.
 
@@ -3441,7 +3467,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             span_cm("megatron.train.iteration.forward_backward", tracer=_otel_step_tracer, num_microbatches=scheduled_num_microbatches)
             if _otel_sg_enabled('forward_backward') and _otel_step_tracer is not None else nullcontext()
         )
-        with grad_context, _fb_cm:
+        with grad_context, _fb_cm, _mfsdp_iteration(model, forward_only=forward_only):
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=forward_backward_data_iterator,
@@ -5729,7 +5755,7 @@ def evaluate(
     if eval_iters is None:
         eval_iters = cfg.validation.eval_iters
 
-    with torch.no_grad():
+    with torch.no_grad(), _mfsdp_iteration(model, forward_only=True):
         iteration = 0
         if verbose:
             print_rank_0(f'Evaluating on {eval_iters * eval_batch_size} samples')

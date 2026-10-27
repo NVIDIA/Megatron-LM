@@ -16,12 +16,13 @@
 
 from collections.abc import Callable
 from contextvars import ContextVar, Token
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, ref
 
 import torch
 from torch import nn
 
-from .execution_order import ExecutionOrder
+from .execution_order import ExecutionEvent, ExecutionOrder, PrefetchMode
+from .phase import Phase
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
 
@@ -43,11 +44,12 @@ class FsdpContext:
     The caller must call ``finish_grad_sync()`` after all gradient producers,
     including delayed weight-gradient computation, and before consuming gradients.
     """
-    # Static orders used to drive all-gather prefetch. We may want to switch to
-    # capturing runtime order if static module order proves too fragile. Each
-    # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_events``.
-    forward_order: ExecutionOrder[nn.Module]
-    backward_order: ExecutionOrder[nn.Module]
+
+    # Phase-tagged module execution order, either preset or captured from a full iteration.
+    # Capture records the actual call order; replay validates it and prefetches
+    # subsequent events. DEMAND mode preserves the order without consuming it
+    # or prefetching.
+    execution_order: ExecutionOrder[ExecutionEvent]
     # Topology metadata must not keep modules alive after construction.
     _roots: WeakKeyDictionary[nn.Module, None]
     # Names are relative to each FSDP root and absent until finalization.
@@ -96,8 +98,9 @@ class FsdpContext:
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
         self.caller_managed_grad_sync = caller_managed_grad_sync
-        self.forward_order = ExecutionOrder()
-        self.backward_order = ExecutionOrder()
+        self.execution_order = ExecutionOrder[ExecutionEvent]()
+        self.prefetch_mode = PrefetchMode.PRESET
+        self.iteration_captured = False
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
@@ -162,10 +165,10 @@ class FsdpContext:
                 if module not in registered_modules:
                     continue
                 self._module_names[module] = name
-                self.forward_order.append(module)
+                self.execution_order.append((ref(module), Phase.FORWARD))
 
         for root in reversed(list(self._roots)):
-            _collect_backward_order(root, registered_modules, self.backward_order)
+            _collect_backward_order(root, registered_modules, self.execution_order)
 
         self._registered_modules.clear()
         self.parameter_to_owner = None
@@ -187,6 +190,37 @@ class FsdpContext:
             raise RuntimeError(
                 "FSDP context is not finalized. Exit fully_shard_context to complete construction."
             )
+
+    @property
+    def iteration_recording(self) -> bool:
+        """Whether the active iteration is recording its execution order."""
+        return self.prefetch_mode is PrefetchMode.RECORD_REPLAY and not self.iteration_captured
+
+    def _advance_execution_order(
+        self, module: nn.Module, phase: Phase
+    ) -> ExecutionOrder[ExecutionEvent] | None:
+        """Consume and validate a demand, returning its order when prefetch is enabled."""
+        order = self.execution_order
+        if self.prefetch_mode is PrefetchMode.PRESET:
+            if not order or phase is Phase.RECOMPUTE:
+                return None
+            order.advance((ref(module), phase))
+            return order
+        elif self.prefetch_mode is PrefetchMode.DEMAND:
+            return None
+        elif self.prefetch_mode is PrefetchMode.RECORD_REPLAY:
+            if self.iteration_recording:
+                order.append((ref(module), phase))
+                return None
+            expected, expected_phase = order.advance()
+            if expected_phase != phase:
+                raise RuntimeError("FSDP module phase diverged from the expected execution order.")
+            owner = expected()
+            if owner is not module:
+                raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
+            return order
+        else:
+            raise ValueError(f"Unsupported FSDP prefetch mode: {self.prefetch_mode!r}.")
 
     def current_stream(self) -> torch.cuda.Stream:
         """Current stream on this context's device."""
@@ -263,11 +297,11 @@ def current_fully_shard_context() -> FsdpContext | None:
 
 
 def _collect_backward_order(
-    module: nn.Module, registered_modules: set[nn.Module], order: ExecutionOrder[nn.Module]
+    module: nn.Module, registered_modules: set[nn.Module], order: ExecutionOrder[ExecutionEvent]
 ) -> None:
-    """Collect one root's static backward prefetch order."""
+    """Collect one root's preset backward prefetch order."""
     if module in registered_modules:
-        order.append(module)
+        order.append((ref(module), Phase.BACKWARD))
 
     for child in reversed(list(module.children())):
         _collect_backward_order(child, registered_modules, order)
