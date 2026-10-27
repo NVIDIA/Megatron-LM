@@ -24,7 +24,6 @@ kernel-level half only; GDP has no batch-invariant mixer path, so
 
 import random
 import types
-from contextlib import nullcontext
 from unittest import mock
 
 import pytest
@@ -249,7 +248,7 @@ class TestGDPCudaGraphE2E:
             for n in (70, 129, 33, 200)
         ]
 
-    def _run(self, engine, prompts, stagger, trace_replays=False):
+    def _run(self, engine, prompts, stagger):
         """Drive the engine to completion, returning tokens and a per-step log.
 
         With `stagger`, two requests are held back and added once the first
@@ -276,12 +275,7 @@ class TestGDPCudaGraphE2E:
             )
             return original_replay(runner, *args, **kwargs)
 
-        replay_context = (
-            mock.patch.object(_CudaGraphRunner, "replay_graph_capture", new=traced_replay)
-            if trace_replays
-            else nullcontext()
-        )
-        with replay_context:
+        with mock.patch.object(_CudaGraphRunner, "replay_graph_capture", new=traced_replay):
             while engine.has_unfinished_requests() or pending:
                 if pending and step_log and step_log[-1][0] == 0 and step_log[-1][1] > 0:
                     for i, prompt in pending:
@@ -317,9 +311,7 @@ class TestGDPCudaGraphE2E:
             eager_outputs, eager_log, eager_replays = self._run(eager_engine, prompts, stagger)
 
             cg_engine = self._build_engine(model, num_cuda_graphs=NUM_CUDA_GRAPHS)
-            cg_outputs, cg_log, cg_replays = self._run(
-                cg_engine, prompts, stagger, trace_replays=True
-            )
+            cg_outputs, cg_log, cg_replays = self._run(cg_engine, prompts, stagger)
 
         assert set(eager_outputs) == set(range(len(prompts))), "not every request finished"
         for req_id in sorted(eager_outputs):

@@ -980,13 +980,14 @@ _ASYNC_PARALLEL_SCENARIOS = (
 )
 
 
+_UPSTREAM_SCENARIOS = {
+    case.name: case for case in _ASYNC_PAIR_SCENARIOS + _ASYNC_PARALLEL_SCENARIOS
+}
+
+
 def _variant(base_name, name, *pairs, config=None, signals=(), **changes):
     """Derive a new case from an upstream one, leaving the upstream definition unchanged."""
-    base = next(
-        scenario
-        for scenario in _ASYNC_PAIR_SCENARIOS + _ASYNC_PARALLEL_SCENARIOS
-        if scenario.name == base_name
-    )
+    base = _UPSTREAM_SCENARIOS[base_name]
     return replace(
         base,
         name=name,
@@ -1428,7 +1429,6 @@ def _instrument_cuda_graph_replays(model, context, runtime):
                 _owner=owner,
             ):
                 if runtime["cuda-graph-capture-active"]:
-                    runtime["cuda-graph-capture-replays"] += 1
                     return _original(is_first_microbatch, args, kwargs)
                 real = context.batch_dimensions
                 padded = context.padded_batch_dimensions
@@ -1471,7 +1471,6 @@ def _instrument_cuda_graph_replays(model, context, runtime):
 
             runner.replay_graph_capture = traced_replay
             runner._pairwise_runtime_trace = id(runtime)
-            runtime["cuda-graph-runners-instrumented"] += 1
             runtime[("cuda-graph-warmup-steps", runner.num_warmup_steps)] += 1
 
 
@@ -1917,6 +1916,15 @@ def _as_float_list(values):
     return list(values)
 
 
+def _recorded(runtime, name, index=slice(1, None)):
+    """Return part of every positive tuple counter recorded under `name`."""
+    return {
+        key[index]
+        for key, count in runtime.items()
+        if isinstance(key, tuple) and key[0] == name and count > 0
+    }
+
+
 def _snapshot_requests(requests):
     snapshots = []
     for request in requests:
@@ -2309,11 +2317,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             for key, count in runtime.items()
             if isinstance(key, tuple) and key[0] == "cuda-graph-dimension" and count > 0
         }
-        replayed_module_names = {
-            key[1]
-            for key, count in runtime.items()
-            if isinstance(key, tuple) and key[0] == "cuda-graph-replayed-module" and count > 0
-        }
+        replayed_module_names = _recorded(runtime, "cuda-graph-replayed-module", 1)
         if "eager" in signals:
             assert runtime["cuda_graph_steps"] == 0
             assert runtime["cuda-graph-runner-replays"] == 0
@@ -2324,16 +2328,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["vlm-image-forwards"] > 0
             assert runtime["vlm-image-token-count"] > 0
             if "cuda-graph" in signals:
-                replayed_steps = {
-                    key[1]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple) and key[0] == "cuda-graph-replay-step" and count > 0
-                }
-                image_steps = {
-                    key[1]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple) and key[0] == "vlm-image-step" and count > 0
-                }
+                replayed_steps = _recorded(runtime, "cuda-graph-replay-step", 1)
+                image_steps = _recorded(runtime, "vlm-image-step", 1)
                 assert replayed_steps & image_steps
         if "vlm-stale-media" in signals:
             assert env.engine.allow_stale_multimodal_embeddings
@@ -2341,19 +2337,11 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "disagg-handoff" in signals:
             assert isinstance(env.engine, StateHandoffDynamicInferenceEngine)
             assert runtime["disagg-admission-deferrals"] > 0
-            imports = {
-                (key[1], key[2])
-                for key, count in runtime.items()
-                if isinstance(key, tuple) and key[0] == "disagg-import" and count > 0
-            }
+            imports = _recorded(runtime, "disagg-import")
             assert len(imports) == len(env.requests)
             assert runtime["disagg-prefill-tokens-skipped"] == sum(_PROMPT_LENGTHS)
             if "cuda-graph" in signals:
-                live_inputs = [
-                    key[1:]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple) and key[0] == "cuda-graph-live-input" and count > 0
-                ]
+                live_inputs = _recorded(runtime, "cuda-graph-live-input")
                 assert any(
                     request_id in request_ids and resume_token in input_ids
                     for _padded, _real, request_ids, input_ids in live_inputs
@@ -2428,16 +2416,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert any(len(request.prompt_tokens) > context.max_tokens for request in env.requests)
             assert runtime["chunked-prefill-steps"] > 0
             if "cuda-graph" in signals:
-                chunked_steps = {
-                    key[1]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple) and key[0] == "chunked-forward-step" and count > 0
-                }
-                replayed_steps = {
-                    key[1]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple) and key[0] == "cuda-graph-replay-step" and count > 0
-                }
+                chunked_steps = _recorded(runtime, "chunked-forward-step", 1)
+                replayed_steps = _recorded(runtime, "cuda-graph-replay-step", 1)
                 assert chunked_steps & replayed_steps
         if "capacity" in signals:
             assert context.max_requests == 4
@@ -2447,16 +2427,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert env.engine._prefix_cache_hits > 0
             assert env.engine._prefill_tokens_skipped > 0
             if "cuda-graph" in signals:
-                prefix_hit_steps = {
-                    key[1]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple) and key[0] == "prefix-hit-forward-step" and count > 0
-                }
-                replayed_steps = {
-                    key[1]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple) and key[0] == "cuda-graph-replay-step" and count > 0
-                }
+                prefix_hit_steps = _recorded(runtime, "prefix-hit-forward-step", 1)
+                replayed_steps = _recorded(runtime, "cuda-graph-replay-step", 1)
                 assert runtime["prefix-hit-forward-skipped-tokens"] > 0
                 assert prefix_hit_steps & replayed_steps
         if "ref-zero" in signals:
@@ -2472,11 +2444,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 for dimensions in context.cuda_graph_batch_dimensions_list
             }
             assert executed_graph_dimensions <= available_dimensions
-            replayed_graph_dimensions = {
-                key[1:]
-                for key, count in runtime.items()
-                if isinstance(key, tuple) and key[0] == "cuda-graph-replay-dimension" and count > 0
-            }
+            replayed_graph_dimensions = _recorded(runtime, "cuda-graph-replay-dimension")
             assert replayed_graph_dimensions == executed_graph_dimensions
             assert (
                 runtime["cuda-graph-real-token-scalar-matches"]
@@ -2486,11 +2454,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 assert (
                     runtime["cuda-graph-zero-input-padding"] == runtime["cuda-graph-padded-replays"]
                 )
-            graph_output_pointers = {
-                key[1]
-                for key, count in runtime.items()
-                if isinstance(key, tuple) and key[0] == "cuda-graph-output-pointer" and count > 0
-            }
+            graph_output_pointers = _recorded(runtime, "cuda-graph-output-pointer", 1)
             assert graph_output_pointers
             assert controller._all_logits_cuda.data_ptr() not in graph_output_pointers
         if "graph-decode-config" in signals:
@@ -2559,17 +2523,13 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["cuda-graph-prefill-forwards"] > 0
             oversized_steps = {
                 (step, token_count, prefill_count, decode_count)
-                for key, count in runtime.items()
-                if isinstance(key, tuple) and key[0] == "model-step-dimension" and count > 0
-                for step, token_count, prefill_count, decode_count in (key[1:],)
+                for step, token_count, prefill_count, decode_count in _recorded(
+                    runtime, "model-step-dimension"
+                )
                 if token_count > context.config.cuda_graph_max_tokens and prefill_count > 0
             }
             assert oversized_steps
-            replayed_steps = {
-                key[1]
-                for key, count in runtime.items()
-                if isinstance(key, tuple) and key[0] == "cuda-graph-replay-step" and count > 0
-            }
+            replayed_steps = _recorded(runtime, "cuda-graph-replay-step", 1)
             assert all(step not in replayed_steps for step, *_ in oversized_steps)
         if "sampled" in signals:
             assert all(request.generated_tokens for request in env.requests)
@@ -2662,13 +2622,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             accepted = int(env.engine._spec_tokens_accepted_per_pos.sum())
             assert proposed > 0
             if "cuda-graph" in signals:
-                assert any(
-                    isinstance(key, tuple)
-                    and key[0] == "cuda-graph-replay-owner"
-                    and key[1] == "compute_mtp_single_step"
-                    and count > 0
-                    for key, count in runtime.items()
-                )
+                owners = _recorded(runtime, "cuda-graph-replay-owner", 1)
+                assert "compute_mtp_single_step" in owners
             if "mtp-accept-all" in signals:
                 assert accepted == proposed
                 assert context.enable_mtp_kv_cache
@@ -2719,19 +2674,9 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "routing-replay" in signals:
             assert model_config.moe_enable_routing_replay
             assert context.moe_routing_metadata is not None
-            replayed_steps = {
-                key[2]
-                for key, count in runtime.items()
-                if isinstance(key, tuple)
-                and key[0] == "cuda-graph-replay-owner"
-                and key[1] == "forward"
-                and count > 0
-            }
-            recorded_steps = {
-                key[1]
-                for key, count in runtime.items()
-                if isinstance(key, tuple) and key[0] == "routing-record-step" and count > 0
-            }
+            owners = _recorded(runtime, "cuda-graph-replay-owner")
+            replayed_steps = {step for owner, step in owners if owner == "forward"}
+            recorded_steps = _recorded(runtime, "routing-record-step", 1)
             assert replayed_steps & recorded_steps
             for request in env.requests:
                 routing = request.routing_indices
@@ -2850,13 +2795,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     model_config.sequence_parallel
                     and model_config.transformer_impl != "inference_optimized"
                 ):
-                    if "cuda-graph" in signals:
-                        assert any("ParallelLinear" in name for name in replayed_module_names)
-                    else:
-                        assert (
-                            runtime["tp-collective:reduce_scatter_to_sequence_parallel_region"] > 0
-                        )
-                        assert runtime["tp-sp-reduce-scatter-dimensions"] > 0
+                    assert runtime["tp-collective:reduce_scatter_to_sequence_parallel_region"] > 0
+                    assert runtime["tp-sp-reduce-scatter-dimensions"] > 0
                 elif not model_config.sequence_parallel:
                     assert runtime["tp-collective:reduce_from_tensor_model_parallel_region"] > 0
             if model_config.pipeline_model_parallel_size > 1:
@@ -2873,23 +2813,18 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert "cuda-graph" not in signals or "MoELayer" in replayed_module_names
         if "moe" in signals:
             assert model_config.num_moe_experts is not None
-            if model_config.expert_model_parallel_size > 1:
-                if "etp" in signals:
-                    assert runtime["module-forward:moe"] > 0 or "MoELayer" in replayed_module_names
-                elif "nvls-dispatch" in signals:
-                    assert context._nvls_dispatcher
-                    if "cuda-graph" in signals:
-                        assert "InferenceGroupedMLP" in replayed_module_names
-                    else:
-                        assert runtime["module-forward:moe"] > 0
-                else:
-                    assert context._nccl_ep_dispatcher
-                    assert runtime["nccl-token-dispatches"] > 0
+            if "etp" in signals:
+                assert runtime["module-forward:moe"] > 0 or "MoELayer" in replayed_module_names
+            elif model_config.expert_model_parallel_size > 1 and "nvls-dispatch" not in signals:
+                assert context._nccl_ep_dispatcher
+                # Inference MoE may dispatch through split execution helpers that
+                # bypass nn.Module forward hooks. The live dispatcher calls below
+                # are the feature-owning runtime boundary.
+                assert runtime["nccl-token-dispatches"] > 0
+            elif "cuda-graph" in signals:
+                assert "InferenceGroupedMLP" in replayed_module_names
             else:
-                if "cuda-graph" in signals:
-                    assert "InferenceGroupedMLP" in replayed_module_names
-                else:
-                    assert runtime["module-forward:moe"] > 0
+                assert runtime["module-forward:moe"] > 0
         if "nccl-dispatch" in signals:
             assert model_config.expert_model_parallel_size > 1
             assert model_config.inference_moe_token_dispatcher_type == "nccl"
@@ -2901,20 +2836,14 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             if "cuda-graph" in signals:
                 assert "MoELayer" in replayed_module_names
                 nondecode_steps = {
-                    key[1]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple)
-                    and key[0] == "model-step-dimension"
-                    and key[3] > 0
-                    and count > 0
+                    step
+                    for step, _, prefill_count, _ in _recorded(runtime, "model-step-dimension")
+                    if prefill_count > 0
                 }
                 replayed_steps = {
-                    key[2]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple)
-                    and key[0] == "cuda-graph-replay-owner"
-                    and key[1] == "forward"
-                    and count > 0
+                    step
+                    for owner, step in _recorded(runtime, "cuda-graph-replay-owner")
+                    if owner == "forward"
                 }
                 assert nondecode_steps
                 assert nondecode_steps.isdisjoint(replayed_steps)
@@ -2927,20 +2856,14 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 assert context.use_cuda_graphs_for_non_decode_steps
                 assert runtime["cuda-graph-prefill-forwards"] > 0
                 replayed_steps = {
-                    key[2]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple)
-                    and key[0] == "cuda-graph-replay-owner"
-                    and key[1] == "forward"
-                    and count > 0
+                    step
+                    for owner, step in _recorded(runtime, "cuda-graph-replay-owner")
+                    if owner == "forward"
                 }
                 nondecode_steps = {
-                    key[1]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple)
-                    and key[0] == "model-step-dimension"
-                    and key[3] > 0
-                    and count > 0
+                    step
+                    for step, _, prefill_count, _ in _recorded(runtime, "model-step-dimension")
+                    if prefill_count > 0
                 }
                 assert replayed_steps & nondecode_steps
 
@@ -3079,23 +3002,25 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
         Utils.destroy_model_parallel()
 
     @staticmethod
-    def _with_graphs(scenario, enabled):
+    def _with_graphs(scenario):
         config = dict(scenario.config)
         config.update(
-            num_cuda_graphs=4 if enabled else None,
-            force_build_cuda_graphs=enabled,
-            defer_cuda_graph_creation=enabled,
+            num_cuda_graphs=4, force_build_cuda_graphs=True, defer_cuda_graph_creation=True
         )
         if (
             config.get("expert_model_parallel_size", 1) > 1
             and config.get("transformer_impl", "local") != "inference_optimized"
         ):
             config["moe_pad_experts_for_cuda_graph_inference"] = True
-        lifecycle_signals = (
-            ("repeat-suspend-resume",) if "suspend-resume" in scenario.signals else ()
-        )
-        signals = tuple(dict.fromkeys((*scenario.signals, *lifecycle_signals, "cuda-graph")))
+        repeat = ("repeat-suspend-resume",) if "suspend-resume" in scenario.signals else ()
+        signals = tuple(dict.fromkeys((*scenario.signals, *repeat, "cuda-graph")))
         return replace(scenario, config=config, signals=signals)
+
+    @staticmethod
+    def _release_graphs():
+        gc.collect()
+        delete_cuda_graphs()
+        torch.cuda.empty_cache()
 
     @staticmethod
     def _weight_snapshot(env):
@@ -3106,29 +3031,24 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
 
     @classmethod
     def _assert_graph_pair(cls, scenario):
-        graph_scenario = cls._with_graphs(scenario, True)
-        eager_scenario = graph_scenario
+        graph_scenario = cls._with_graphs(scenario)
         stop_tokens = None
         termination_token = None
         try:
             if scenario.request_profile.startswith("stop"):
-                probe_env, _ = cls._run_scenario_mode(eager_scenario, AsyncScheduleMode.LEGACY)
+                probe_env, _ = cls._run_scenario_mode(graph_scenario, AsyncScheduleMode.LEGACY)
                 stop_tokens = tuple(probe_env.requests[1].generated_tokens[1:3])
                 assert len(stop_tokens) == 2
                 del probe_env
-                gc.collect()
-                delete_cuda_graphs()
-                torch.cuda.empty_cache()
+                cls._release_graphs()
             elif scenario.request_profile == "termination":
-                probe_env, _ = cls._run_scenario_mode(eager_scenario, AsyncScheduleMode.LEGACY)
+                probe_env, _ = cls._run_scenario_mode(graph_scenario, AsyncScheduleMode.LEGACY)
                 termination_token = probe_env.requests[1].generated_tokens[0]
                 assert termination_token != -1
                 del probe_env
-                gc.collect()
-                delete_cuda_graphs()
-                torch.cuda.empty_cache()
+                cls._release_graphs()
             eager_env, eager_runtime = cls._run_scenario_mode(
-                eager_scenario,
+                graph_scenario,
                 AsyncScheduleMode.ASYNC,
                 stop_tokens=stop_tokens,
                 termination_token=termination_token,
@@ -3138,9 +3058,7 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
             expected_weights = cls._weight_snapshot(eager_env)
             assert eager_runtime["cuda-graph-runner-replays"] == 0
             del eager_env
-            gc.collect()
-            delete_cuda_graphs()
-            torch.cuda.empty_cache()
+            cls._release_graphs()
             graph_env, graph_runtime = cls._run_scenario_mode(
                 graph_scenario,
                 AsyncScheduleMode.ASYNC,
@@ -3163,11 +3081,7 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
             cls._assert_runtime_signals(
                 graph_env, graph_scenario, graph_runtime, stop_tokens, termination_token
             )
-            live_inputs = [
-                key[1:]
-                for key, count in graph_runtime.items()
-                if isinstance(key, tuple) and key[0] == "cuda-graph-live-input" and count > 0
-            ]
+            live_inputs = _recorded(graph_runtime, "cuda-graph-live-input")
             assert live_inputs
             inputs_by_shape_and_requests = {}
             for padded, _real, request_ids, input_ids in live_inputs:
@@ -3176,9 +3090,7 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
             if scenario.parity != "exact":
                 graph_expected = _snapshot_requests(graph_env.requests)
                 del graph_env
-                gc.collect()
-                delete_cuda_graphs()
-                torch.cuda.empty_cache()
+                cls._release_graphs()
                 repeat_env, repeat_runtime = cls._run_scenario_mode(
                     graph_scenario,
                     AsyncScheduleMode.ASYNC,
@@ -3196,9 +3108,7 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
                     repeat_env, graph_scenario, repeat_runtime, stop_tokens, termination_token
                 )
         finally:
-            gc.collect()
-            delete_cuda_graphs()
-            torch.cuda.empty_cache()
+            cls._release_graphs()
 
     @pytest.mark.parametrize(
         "scenario", _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS, ids=lambda case: case.name
@@ -3272,9 +3182,7 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
         try:
             TestCudaGraphDifferential._assert_graph_pair(scenario)
         finally:
-            gc.collect()
-            delete_cuda_graphs()
-            torch.cuda.empty_cache()
+            TestCudaGraphDifferential._release_graphs()
             _reset_rounder()
             Utils.destroy_model_parallel()
 

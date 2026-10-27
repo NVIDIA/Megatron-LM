@@ -792,6 +792,7 @@ def test_mxfp8_swiglu_moe_replays():
     def run(x):
         return mcore_fused_moe(x, probs, fc1, fc2, ActivationType.SWIGLU, 1, 0, valid, routes)
 
+    # One route per token also makes the non-batch-invariant atomic combine exact.
     assert_replays_bit_exact(run, (x,), replays=3, backward=False, what="MXFP8 SwiGLU MoE")
 
 

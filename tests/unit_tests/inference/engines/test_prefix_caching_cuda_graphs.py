@@ -14,7 +14,6 @@ without CUDA graphs) and compared:
 
 import random
 import types
-from contextlib import nullcontext
 from unittest import mock
 
 import pytest
@@ -231,7 +230,7 @@ class TestPrefixCachingCudaGraphs:
             enable_prefix_caching=True,
         )
 
-    def _run_scenario(self, engine, batch_structure, prompts, trace_replays=False):
+    def _run_scenario(self, engine, batch_structure, prompts):
         """Run the prefix-sharing scenario with the given batch structure.
 
         Returns outputs, a per-step dimension log, and actual runner replay evidence.
@@ -268,12 +267,6 @@ class TestPrefixCachingCudaGraphs:
                 )
             return original_replay(runner, is_first_microbatch, args, kwargs)
 
-        replay_context = (
-            mock.patch.object(_CudaGraphRunner, "replay_graph_capture", new=traced_replay)
-            if trace_replays
-            else nullcontext()
-        )
-
         def _step_and_log():
             result = engine.step_modern()
             step_log.append(
@@ -286,14 +279,16 @@ class TestPrefixCachingCudaGraphs:
             for request in result["finished_requests"]:
                 finished[request.request_id] = list(request.generated_tokens)
 
-        with replay_context:
+        with mock.patch.object(_CudaGraphRunner, "replay_graph_capture", new=traced_replay):
             if batch_structure in ("prefill", "decode"):
+                # Add all 4 requests before first step.
                 for i, prompt in enumerate(prompts):
                     engine._add_request(self._make_request(i, prompt))
                 while engine.has_unfinished_requests():
                     _step_and_log()
 
             elif batch_structure == "mixed":
+                # Add req 0+1 first, step until both are decoding, then add 2+3.
                 for i in [0, 1]:
                     engine._add_request(self._make_request(i, prompts[i]))
                 reqs_added = False
@@ -334,7 +329,7 @@ class TestPrefixCachingCudaGraphs:
         # CG enabled.
         cg_engine = self._build_engine(model, mamba_config, num_cuda_graphs=2)
         cg_outputs, step_log, replay_evidence, replay_calls_by_step = self._run_scenario(
-            cg_engine, batch_structure, prompts, trace_replays=True
+            cg_engine, batch_structure, prompts
         )
 
         # 1. Correctness: generated tokens must match.

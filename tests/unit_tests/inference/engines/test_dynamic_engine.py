@@ -1357,6 +1357,7 @@ class DynamicInferenceEngineTestBase:
                     config=transformer_config, spec=layer_spec, use_transformer_engine=use_te
                 )
 
+            # GPT model.
             if test_config.model_provider == "gpt":
                 model = GPTModel(
                     config=transformer_config,
@@ -1549,6 +1550,7 @@ class DynamicInferenceEngineTestBase:
 
         delete_cuda_graphs()
 
+        # Inference engine.
         if test_config.defer_cuda_graph_creation:
             with mock.patch.object(
                 test_config.engine_cls, "create_cuda_graphs", autospec=True, return_value=None
