@@ -4,21 +4,24 @@
 
 The model-grid tests build a TP2 x PP2 collection on a TP1 x PP1 global grid and replace the
 global grid accessors that checkpointing uses with a stand-in that fails on any read. A read of
-the global grid therefore fails the test, and a shard named by the global ranks would land in a
-different directory.
+the global grid therefore fails the test, as does a fallback warning, and a shard named by the
+global ranks would land in a different directory.
 """
 
 import contextlib
 import os
+import warnings
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
 
+from megatron.core import process_groups_config
 from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
+    ProcessGroupFallbackWarning,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training import checkpointing
@@ -50,7 +53,7 @@ class _GlobalGridForbidden:
 
 @contextlib.contextmanager
 def _no_global_grid():
-    """Fail on any read of the global parallel grid made by checkpointing."""
+    """Fail on any read of the global parallel grid, or fallback warning, made by checkpointing."""
     with (
         mock.patch.object(checkpointing, "mpu", _GlobalGridForbidden()),
         mock.patch.object(
@@ -58,7 +61,9 @@ def _no_global_grid():
             "use_mpu_process_groups",
             side_effect=AssertionError("checkpointing built a collection from the global grid"),
         ),
+        warnings.catch_warnings(),
     ):
+        warnings.simplefilter("error", ProcessGroupFallbackWarning)
         yield
 
 
@@ -140,26 +145,43 @@ def test_get_checkpoint_name_reads_ranks_from_collection():
     assert dense_name == os.path.join("ckpt", "iter_0000005", "mp_rank_01", "model_optim_rng.pt")
 
 
-def test_checkpoint_pg_collection_resolution():
-    """An explicit collection wins over the model's, and only a model without one reads globals."""
+def test_checkpoint_pg_collection_resolution(monkeypatch):
+    """An explicit collection wins over the model's, and only a model without one reads globals.
+
+    That fallback warns, naming the function whose caller passed no collection.
+    """
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
     explicit, owned = ProcessGroupCollection(), ProcessGroupCollection()
     model = [SimpleNamespace(pg_collection=owned)]
 
-    assert checkpointing._checkpoint_pg_collection(model, explicit) is explicit
-    assert checkpointing._checkpoint_pg_collection(model) is owned
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ProcessGroupFallbackWarning)
+        resolved = checkpointing._checkpoint_pg_collection(model, explicit, "save_checkpoint")
+        assert resolved is explicit
+        resolved = checkpointing._checkpoint_pg_collection(model, None, "save_checkpoint")
+        assert resolved is owned
 
     global_grid = ProcessGroupCollection()
-    with mock.patch.object(
-        ProcessGroupCollection, "use_mpu_process_groups", return_value=global_grid
-    ) as use_mpu_process_groups:
-        assert checkpointing._checkpoint_pg_collection([SimpleNamespace()]) is global_grid
+    with (
+        mock.patch.object(
+            ProcessGroupCollection, "use_mpu_process_groups", return_value=global_grid
+        ) as use_mpu_process_groups,
+        pytest.warns(
+            ProcessGroupFallbackWarning,
+            match="load_checkpoint was called without `pg_collection`.*removed in 0.23",
+        ),
+    ):
+        resolved = checkpointing._checkpoint_pg_collection(
+            [SimpleNamespace()], None, "load_checkpoint"
+        )
+    assert resolved is global_grid
     use_mpu_process_groups.assert_called_once()
 
     multi_module = MultiModuleProcessGroupCollection(
         module_pgs={"language": owned}, language_model_module_name="language"
     )
     with pytest.raises(ValueError, match="MultiModuleProcessGroupCollection"):
-        checkpointing._checkpoint_pg_collection(model, multi_module)
+        checkpointing._checkpoint_pg_collection(model, multi_module, "save_checkpoint")
 
 
 @requires_four_rank_multiple
