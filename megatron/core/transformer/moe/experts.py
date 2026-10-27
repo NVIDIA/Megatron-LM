@@ -142,6 +142,19 @@ def _require_te_tanh_clamp_support(config) -> None:
     )
 
 
+def _require_flashinfer_unfused_finalize(config) -> None:
+    """Raise if a deterministic config's BF16 FlashInfer MoE cannot rule out the fused finalize."""
+    if HAVE_FLASHINFER_UNFUSED_FINALIZE or not (
+        config.deterministic_mode or config.batch_invariant_mode
+    ):
+        return
+    raise RuntimeError(
+        "deterministic_mode or batch_invariant_mode with BF16 FlashInfer MoE requires "
+        "flashinfer-python >= 0.6.15, whose cutlass_fused_moe accepts use_fused_finalize=False. "
+        "Upgrade flashinfer-python or select inference_grouped_gemm_backend 'torch' or 'vllm'."
+    )
+
+
 class GroupedLinearFc1Interface(Protocol):
     """Interface for linear_fc1 module in TEGroupedMLP."""
 
@@ -1743,16 +1756,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # FlashInfer's autotuner may select a GEMM2 tactic with a fused finalize, which
         # accumulates each token's top-k routes with output-dtype atomics in no fixed order.
         # use_fused_finalize=False rules those tactics out; the separate finalize kernel
-        # reduces each token's routes in order.
+        # reduces each token's routes in order. FlashInfer without the option is rejected
+        # when the weights are built if the config asks for determinism.
         finalize_kwargs = {}
-        if torch.are_deterministic_algorithms_enabled() or is_batch_invariant_mode_enabled():
-            if not HAVE_FLASHINFER_UNFUSED_FINALIZE:
-                raise RuntimeError(
-                    "Deterministic or batch-invariant BF16 FlashInfer MoE requires "
-                    "flashinfer-python >= 0.6.15, whose cutlass_fused_moe accepts "
-                    "use_fused_finalize=False. Upgrade flashinfer-python or select "
-                    "inference_grouped_gemm_backend 'torch' or 'vllm'."
-                )
+        if HAVE_FLASHINFER_UNFUSED_FINALIZE and (
+            torch.are_deterministic_algorithms_enabled() or is_batch_invariant_mode_enabled()
+        ):
             finalize_kwargs["use_fused_finalize"] = False
         output = fused_moe.cutlass_fused_moe(
             hidden_states,
@@ -1850,6 +1859,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 self._build_concatenated_weights()
                 if self._nvfp4_recipe is not None:
                     self._build_flashinfer_nvfp4_weights()
+                elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
+                    _require_flashinfer_unfused_finalize(self.config)
             self._concatenated_weights_built = True
 
         if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:

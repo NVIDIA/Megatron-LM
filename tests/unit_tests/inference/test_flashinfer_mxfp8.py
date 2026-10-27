@@ -361,31 +361,6 @@ def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):
     assert captured["output"] is None
 
 
-def _bf16_flashinfer_forward(monkeypatch, cutlass_fused_moe):
-    from megatron.core.transformer.moe import experts
-
-    monkeypatch.setattr(experts, "HAVE_FLASHINFER", True)
-    monkeypatch.setattr(
-        experts, "fused_moe", SimpleNamespace(cutlass_fused_moe=cutlass_fused_moe), raising=False
-    )
-    grouped_mlp = SimpleNamespace(
-        _uses_mxfp8_weights=False,
-        _nvfp4_weights=None,
-        _fc1_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
-        _fc2_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
-        _flashinfer_activation_type=object(),
-        _activation_clamp_scale=None,
-        _nvls_dispatcher=False,
-        ep_group=SimpleNamespace(size=lambda: 1, rank=lambda: 0),
-    )
-    return experts.InferenceGroupedMLP._flashinfer_forward(
-        grouped_mlp,
-        torch.empty(4, 8, dtype=torch.bfloat16),
-        torch.zeros(4, 2, dtype=torch.int64),
-        torch.zeros(4, 2, dtype=torch.float32),
-    )
-
-
 @pytest.mark.parametrize("mode", ["default", "deterministic", "batch_invariant"])
 def test_bf16_flashinfer_rules_out_fused_finalize_when_deterministic(monkeypatch, mode):
     """Fused-finalize GEMM2 tactics sum the top-k routes with atomics; the autotuner must not
@@ -398,25 +373,65 @@ def test_bf16_flashinfer_rules_out_fused_finalize_when_deterministic(monkeypatch
         captured.update(kwargs)
         return (torch.empty(4, 8, dtype=torch.bfloat16),)
 
+    monkeypatch.setattr(experts, "HAVE_FLASHINFER", True)
     monkeypatch.setattr(experts, "HAVE_FLASHINFER_UNFUSED_FINALIZE", True)
+    monkeypatch.setattr(
+        experts, "fused_moe", SimpleNamespace(cutlass_fused_moe=cutlass_fused_moe), raising=False
+    )
     monkeypatch.setattr(
         experts, "is_batch_invariant_mode_enabled", lambda: mode == "batch_invariant"
     )
+    grouped_mlp = SimpleNamespace(
+        _uses_mxfp8_weights=False,
+        _nvfp4_weights=None,
+        _fc1_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
+        _fc2_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
+        _flashinfer_activation_type=object(),
+        _activation_clamp_scale=None,
+        _nvls_dispatcher=False,
+        ep_group=SimpleNamespace(size=lambda: 1, rank=lambda: 0),
+    )
     with deterministic_algorithms(mode == "deterministic"):
-        _bf16_flashinfer_forward(monkeypatch, cutlass_fused_moe)
+        experts.InferenceGroupedMLP._flashinfer_forward(
+            grouped_mlp,
+            torch.empty(4, 8, dtype=torch.bfloat16),
+            torch.zeros(4, 2, dtype=torch.int64),
+            torch.zeros(4, 2, dtype=torch.float32),
+        )
 
     # FlashInfer defaults use_fused_finalize to True.
     assert captured.get("use_fused_finalize", True) is (mode == "default")
 
 
-def test_bf16_flashinfer_batch_invariance_requires_unfused_finalize(monkeypatch):
+@pytest.mark.parametrize("mode", ["deterministic_mode", "batch_invariant_mode"])
+def test_bf16_flashinfer_weight_build_requires_unfused_finalize(monkeypatch, mode):
+    """FlashInfer < 0.6.15 cannot rule out the fused finalize, so a deterministic or
+    batch-invariant config is rejected when BF16 FlashInfer expert weights are built."""
+    from megatron.core.inference.moe import InferenceGroupedGemmBackend
     from megatron.core.transformer.moe import experts
 
     monkeypatch.setattr(experts, "HAVE_FLASHINFER_UNFUSED_FINALIZE", False)
-    monkeypatch.setattr(experts, "is_batch_invariant_mode_enabled", lambda: True)
-    with pytest.raises(RuntimeError, match="flashinfer-python >= 0.6.15"):
-        _bf16_flashinfer_forward(
-            monkeypatch, lambda *args, **kwargs: pytest.fail("fused finalize stays selectable")
+    grouped_mlp = SimpleNamespace(
+        _concatenated_weights_built=False,
+        num_local_experts=1,
+        linear_fc1=SimpleNamespace(weight0=torch.empty(1, dtype=torch.bfloat16)),
+        linear_fc2=SimpleNamespace(weight0=torch.empty(1, dtype=torch.bfloat16)),
+        _build_concatenated_weights=lambda: None,
+        _nvfp4_recipe=None,
+        inference_grouped_gemm_backend=InferenceGroupedGemmBackend.FLASHINFER,
+        config=SimpleNamespace(
+            **{"deterministic_mode": False, "batch_invariant_mode": False, mode: True}
+        ),
+        _flashinfer_forward=lambda *args: pytest.fail("fused finalize stays selectable"),
+    )
+
+    with InferenceMode.active(), pytest.raises(RuntimeError, match="flashinfer-python >= 0.6.15"):
+        experts.InferenceGroupedMLP.forward(
+            grouped_mlp,
+            torch.empty(1, 1),
+            None,
+            torch.empty(1, 1),
+            routing_map=torch.zeros(1, 1, dtype=torch.int64),
         )
 
 

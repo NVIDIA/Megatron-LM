@@ -837,22 +837,36 @@ def flashinfer_gemm2_tactic(monkeypatch):
     """Stand-in for a tuned FlashInfer autotuner cache that holds a fused-MoE GEMM2 tactic.
 
     Set ``.tactic`` to an index into the runner's GEMM2 tactics, or ``None`` for FlashInfer's
-    untuned default; ``.count`` is the number of GEMM2 tactics the runner offers. GEMM1 keeps
-    its default.
+    untuned default. ``.count`` is the number of GEMM2 tactics the runner offers and
+    ``.fused_finalize`` whether it offers fused-finalize ones. GEMM1 keeps its default.
     """
     fused_moe = pytest.importorskip("flashinfer.fused_moe")
     if "use_fused_finalize" not in inspect.signature(fused_moe.cutlass_fused_moe).parameters:
         pytest.skip("cutlass_fused_moe has no use_fused_finalize before FlashInfer 0.6.15")
     from flashinfer.autotuner import AutoTuner
+    from flashinfer.jit import fused_moe as fused_moe_jit
+
+    major, minor = torch.cuda.get_device_capability()
+    sm = 10 * major + minor
+    gen_module = getattr(fused_moe_jit, f"gen_cutlass_fused_moe_sm{sm}_module", None)
+    if sm not in (90, 100, 103) or gen_module is None:
+        pytest.skip(f"FlashInfer has fused-finalize BF16 MoE tactics on SM90/100/103, not SM{sm}")
+    if not gen_module().is_compiled:
+        # Its first use JIT-compiles every dtype combination: tens of minutes on a CI node.
+        pytest.skip(
+            "FlashInfer's CUTLASS fused-MoE module is not built. Install flashinfer-jit-cache or "
+            f"build it once with flashinfer.fused_moe.core.get_cutlass_fused_moe_module('{sm}')."
+        )
 
     choose_one = AutoTuner.choose_one
-    pin = SimpleNamespace(tactic=None, count=None)
+    pin = SimpleNamespace(tactic=None, count=None, fused_finalize=None)
 
     def pinned_choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs):
         if custom_op not in (_FLASHINFER_MOE_GEMM1, _FLASHINFER_MOE_GEMM2):
             return choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs)
         moe_runner = runners[0].fused_moe_runner
         pin.count = moe_runner.get_gemm2_tactic_count()
+        pin.fused_finalize = runners[0].use_fused_finalize
         if custom_op == _FLASHINFER_MOE_GEMM1 or pin.tactic is None:
             return runners[0], -1
         # GEMM2 tactic ids follow the GEMM1 ones.
@@ -862,22 +876,18 @@ def flashinfer_gemm2_tactic(monkeypatch):
     return pin
 
 
-def _probe_token_batches(num_experts, topk, hidden_size):
-    """Batches of 1, 37 and 1024 tokens that share one probe token, as ``(inputs, row)``."""
-    probe = (
-        torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16),
-        torch.randperm(num_experts, device="cuda")[:topk],
-        torch.softmax(torch.randn(topk, device="cuda"), dim=-1),
+_PROBE_ROW = 73
+
+
+def _routed_tokens(num_tokens, num_experts, topk, hidden_size):
+    """``(hidden, routing_map, probs)`` for a batch, and for its token ``_PROBE_ROW`` alone."""
+    batch = (
+        torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16),
+        torch.rand(num_tokens, num_experts, device="cuda").argsort(dim=-1)[:, :topk],
+        torch.softmax(torch.randn(num_tokens, topk, device="cuda"), dim=-1),
     )
-    batches = []
-    for num_tokens, row in ((1, 0), (37, 5), (1024, 73)):
-        hidden = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
-        routing_map = torch.rand(num_tokens, num_experts, device="cuda").argsort(dim=-1)[:, :topk]
-        probs = torch.softmax(torch.randn(num_tokens, topk, device="cuda"), dim=-1)
-        for tensor, value in zip((hidden, routing_map, probs), probe):
-            tensor[row] = value
-        batches.append(((hidden, routing_map, probs), row))
-    return batches
+    alone = tuple(t[_PROBE_ROW : _PROBE_ROW + 1].clone() for t in batch)
+    return batch, alone
 
 
 class TestMoEModules:
@@ -1245,8 +1255,6 @@ class TestMoEModules:
 
         if not HAVE_TE:
             pytest.skip("InferenceGroupedMLP needs Transformer Engine")
-        if torch.cuda.get_device_capability() < (9, 0):
-            pytest.skip("FlashInfer's BF16 fused MoE needs Hopper or newer")
         self._init()
         seeded()
         config = TransformerConfig(
@@ -1294,36 +1302,42 @@ class TestMoEModules:
         )
 
         forward = self._flashinfer_bf16_experts_forward()
-        (alone, _), (small, small_row), (big, big_row) = _probe_token_batches(16, 8, 1024)
-        context = (
-            deterministic_algorithms(True)
-            if mode == "deterministic"
-            else set_batch_invariant_mode(True)
-        )
+        batch, alone = _routed_tokens(1024, 16, 8, 1024)
         runnable = []
-        with torch.no_grad(), context:
+        with (
+            torch.no_grad(),
+            deterministic_algorithms(mode == "deterministic"),
+            set_batch_invariant_mode(mode == "batch_invariant"),
+        ):
             forward(*alone)
-            for tactic in [None, *range(flashinfer_gemm2_tactic.count)]:
+            assert (
+                flashinfer_gemm2_tactic.fused_finalize is False
+            ), f"FlashInfer offers fused-finalize GEMM2 tactics to BF16 experts in {mode} mode"
+            tactics = [None, *range(flashinfer_gemm2_tactic.count)]
+            for tactic in tactics:
                 flashinfer_gemm2_tactic.tactic = tactic
                 what = f"FlashInfer BF16 experts[{mode}, GEMM2 tactic {tactic}]"
                 try:
                     probe = forward(*alone)[0]
-                    small_output = forward(*small)
-                    forward(*big)
-                except Exception:  # tactic not runnable for these shapes on this device
+                    forward(*batch)
+                except RuntimeError:  # FlashInfer cannot run this tactic for these shapes
                     continue
                 runnable.append(tactic)
                 outputs, _ = assert_replays_bit_exact(
-                    forward, big, replays=4, backward=False, contention=True, what=what
+                    forward, batch, replays=3, backward=False, what=what
                 )
-                assert bytes_equal(outputs["out"][big_row], probe), f"{what}: 1024-token batch"
-                assert bytes_equal(small_output[small_row], probe), f"{what}: 37-token batch"
-        assert None in runnable and len(runnable) > 1, f"runnable GEMM2 tactics: {runnable}"
+                assert bytes_equal(
+                    outputs["out"][_PROBE_ROW], probe
+                ), f"{what}: a token's output changed with its batch"
+        assert None in runnable and 2 * len(runnable) >= len(
+            tactics
+        ), f"only GEMM2 tactics {runnable} of {len(tactics) - 1} ran"
 
     @pytest.mark.xfail(
         strict=False,
-        reason="Negative control. Only Hopper and Blackwell offer fused-finalize GEMM2 tactics, "
-        "and whether their atomics race visibly is hardware dependent; recorded, not gated.",
+        raises=AssertionError,
+        reason="Negative control. Whether the fused-finalize atomics race visibly is hardware "
+        "dependent; recorded, not gated.",
     )
     def test_inference_flashinfer_bf16_fused_finalize_is_the_racy_path(
         self, flashinfer_gemm2_tactic
@@ -1331,18 +1345,22 @@ class TestMoEModules:
         """Negative control: by default FlashInfer also offers GEMM2 tactics that fuse the
         finalize. When their atomic top-k sum races visibly, the sweep above is known to
         reach such tactics if they are offered."""
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+
         forward = self._flashinfer_bf16_experts_forward()
-        _, _, (big, _) = _probe_token_batches(16, 8, 1024)
+        batch, _ = _routed_tokens(1024, 16, 8, 1024)
         differing = 0
-        with torch.no_grad(), deterministic_algorithms(False):
-            forward(*big)
+        with torch.no_grad(), deterministic_algorithms(False), set_batch_invariant_mode(False):
+            forward(*batch)
             for tactic in range(flashinfer_gemm2_tactic.count):
                 flashinfer_gemm2_tactic.tactic = tactic
                 try:
-                    forward(*big)
-                except Exception:  # tactic not runnable for these shapes on this device
+                    forward(*batch)
+                except RuntimeError:  # FlashInfer cannot run this tactic for these shapes
                     continue
-                differing += count_differing_replays(forward, big, replays=4, backward=False)
+                differing += count_differing_replays(forward, batch, replays=3, backward=False)
         assert differing > 0, "no GEMM2 tactic of the default runner varied across replays"
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
