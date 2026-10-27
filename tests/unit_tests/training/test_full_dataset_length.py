@@ -78,6 +78,29 @@ def test_length_probe_preserves_iteration_and_skips_restore(
     assert len(fallbacks) == (0 if pass_collection else 1)
 
 
+def test_length_probe_passes_the_collection_to_a_provider_that_takes_one(monkeypatch, run_config):
+    """The provider builds its probe loader on the ranks of the run's collection."""
+    args = SimpleNamespace(deduplicate_dataloader_across_context_parallel=False)
+    pg_collection = ProcessGroupCollection(mp=Mock())
+    calls = []
+
+    def provider(train_val_test_num_samples, *, restore_dataloader_state=True, pg_collection=None):
+        calls.append((train_val_test_num_samples, restore_dataloader_state, pg_collection))
+        return SimpleNamespace(_dataloader=range(42)), None, None
+
+    provider.supports_train_full_dataset = True
+    monkeypatch.setattr(training, "_reduce_sum_across_data_parallel_group", Mock(return_value=84))
+    reduce_max = Mock(return_value=84)
+    monkeypatch.setattr(training, "reduce_max_stat_across_model_parallel_group", reduce_max)
+
+    assert (
+        training._get_train_full_dataset_sample_count(args, provider, pg_collection=pg_collection)
+        == 84
+    )
+    assert calls == [(None, False, pg_collection)]
+    reduce_max.assert_called_once_with(84, group=pg_collection.mp)
+
+
 @pytest.mark.parametrize("field", ["train_iters", "train_samples"])
 def test_length_probe_rejects_explicit_horizon(field, run_config):
     args = SimpleNamespace(train_iters=None, train_samples=None)

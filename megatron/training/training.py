@@ -1553,6 +1553,8 @@ def _get_train_full_dataset_sample_count(args, dataset_provider, pg_collection=N
     Opt-in providers must accept ``restore_dataloader_state=False`` and expose
     the finite loader through ``_dataloader`` on ranks that own training data.
     Actual restoration happens after model setup resolves the checkpoint iteration.
+    A provider with a ``pg_collection`` parameter also receives ``pg_collection``,
+    which decides the ranks that own training data.
     The sample counts are reduced over the groups of ``pg_collection``. Omitting it is
     deprecated: they are then reduced over the global parallel state, with a
     ProcessGroupFallbackWarning.
@@ -1568,7 +1570,12 @@ def _get_train_full_dataset_sample_count(args, dataset_provider, pg_collection=N
             "--train-full-dataset cannot be combined with --train-iters or --train-samples"
         )
 
-    train_data_iterator, _, _ = dataset_provider(None, restore_dataloader_state=False)
+    if "pg_collection" in inspect.signature(dataset_provider).parameters:
+        train_data_iterator, _, _ = dataset_provider(
+            None, restore_dataloader_state=False, pg_collection=pg_collection
+        )
+    else:
+        train_data_iterator, _, _ = dataset_provider(None, restore_dataloader_state=False)
     local_num_samples = (
         len(train_data_iterator._dataloader)
         if hasattr(train_data_iterator, '_dataloader')
