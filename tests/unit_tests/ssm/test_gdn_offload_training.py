@@ -277,6 +277,10 @@ def test_gdn_offload_training(
         monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
     # Avoid attention-backward nondeterminism obscuring the offload comparison.
     # GDN still uses FLA: config.deterministic_mode would select its reference path.
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager  # type: ignore[import-untyped]
+
+    # Delayed-scaling buffers retain process groups across parametrized cases.
+    FP8GlobalStateManager.reset()
     monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
     Utils.initialize_model_parallel(tp, pp, vp, context_parallel_size=cp)
     off_interface.reset_instance()
@@ -394,5 +398,6 @@ def test_gdn_offload_training(
             del snapshots
     finally:
         torch.cuda.synchronize()
+        FP8GlobalStateManager.reset()
         off_interface.reset_instance()
         Utils.destroy_model_parallel()

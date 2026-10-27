@@ -82,6 +82,8 @@ def test_gdn_offload_with_te_graphs(
     if fused:
         pytest.importorskip("causal_conv1d", minversion="1.6.1")
         monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager  # type: ignore[import-untyped]
+
     monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
     Utils.initialize_model_parallel(tp, pp)
     initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
@@ -97,6 +99,8 @@ def test_gdn_offload_with_te_graphs(
         groups = ProcessGroupCollection.use_mpu_process_groups()
         references = []
         for enabled in (False, True):
+            # Each arm creates fresh modules; discard the previous arm's amax groups.
+            FP8GlobalStateManager.reset()
             off_interface.reset_instance()
             config = replace(
                 _training_config(
@@ -207,6 +211,7 @@ def test_gdn_offload_with_te_graphs(
         if helper is not None and helper.graphs_created():
             helper.delete_cuda_graphs()
         torch.cuda.synchronize()
+        FP8GlobalStateManager.reset()
         off_interface.reset_instance()
         destroy_num_microbatches_calculator()
         initialize_rng_tracker(force_reset=True)
