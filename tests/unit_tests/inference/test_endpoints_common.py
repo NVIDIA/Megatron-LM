@@ -690,6 +690,37 @@ async def test_disconnect_aborts_every_in_flight_request(path):
 
 
 @pytest.mark.asyncio
+@PATHS
+async def test_streaming_disconnect_aborts_every_open_stream(path, monkeypatch):
+    class PendingStreamingClient(ReplyingClient):
+        def add_request_streaming(
+            self, prompt_tokens, sampling_params, *, multi_modal_data=None, offload_params=None
+        ):
+            self.prompt_tokens.append(list(prompt_tokens))
+            self.sampling_params.append(sampling_params)
+            self.multi_modal_data.append(multi_modal_data)
+            self.offload_params.append(offload_params)
+            request_id = len(self.prompt_tokens)
+            self.streamed.append(request_id)
+            stream = AsyncStream(
+                request_id=request_id,
+                cancel=lambda request_id=request_id: self.aborted.append(request_id),
+            )
+            stream.put({"partial": {"request_id": request_id, "new_tokens": [12]}})
+            if request_id == 3:
+                self.drained.set()
+            return stream
+
+    client = PendingStreamingClient()
+    app = build_streaming_app(path, client, monkeypatch)
+
+    sent = await _post_then_disconnect(app, path, {**FAN_OUT_BODIES[path], "stream": True}, client)
+
+    assert client.aborted == [1, 2, 3]
+    assert not any(b"[DONE]" in message.get("body", b"") for message in sent)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("path", "expected_logs"),
     [
