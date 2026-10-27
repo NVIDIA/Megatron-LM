@@ -8,7 +8,10 @@ import torch
 
 from megatron.core import mpu
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 
 # Optional per-iteration packed SFT statistics. Individual sample lengths are
 # retained so the median for the global batch is exact.
@@ -26,8 +29,9 @@ def update_packed_sequence_stats(
         sample_lengths: Original sample lengths of the packed microbatch; zeros are padding.
         loss_mask: Loss mask of the microbatch, summed into the trained-token count.
         pg_collection: Process groups of the model the microbatch is for. Only its last
-            pipeline stage with tensor- and context-parallel rank 0 contributes. None reads
-            these ranks from the global parallel state.
+            pipeline stage with tensor- and context-parallel rank 0 contributes. Omitting it
+            is deprecated: these ranks are then read from the global parallel state, with a
+            ProcessGroupFallbackWarning.
     """
     global _packed_sequence_lengths_in_iteration
     global _packed_sequence_trained_tokens_in_iteration
@@ -46,6 +50,9 @@ def update_packed_sequence_stats(
         ):
             return
     elif torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
+        warn_global_process_group_fallback(
+            "update_packed_sequence_stats", deprecated_in="0.21", removed_in="0.23"
+        )
         if (
             not mpu.is_pipeline_last_stage(ignore_virtual=True)
             or mpu.get_tensor_model_parallel_rank() != 0
