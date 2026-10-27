@@ -477,6 +477,25 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         )
         self.tp_group = pg_collection.tp
 
+    def get_ssm_D(self, D: torch.Tensor, per_channel: bool = False) -> torch.Tensor:
+        """Lays out the skip parameter ``D`` for the SSM kernels.
+
+        With ``D_has_hdim``, ``D`` holds one coefficient per channel and is returned as
+        ``(nheads, headdim)``. Otherwise it holds one coefficient per head and is returned as
+        ``(nheads,)``, or, with ``per_channel``, broadcast to a stride-0 ``(nheads, headdim)``
+        view.
+
+        Args:
+            D: This rank's ``D``: ``self.D``, or its context-parallel slice ``self.cp.get_D()``.
+            per_channel: Return ``(nheads, headdim)`` for a per-head ``D`` as well, for kernels
+                that index ``D`` by channel.
+        """
+        if self.D_has_hdim:
+            return rearrange(D.float(), "(h p) -> h p", p=self.headdim)
+        if per_channel:
+            return repeat(D, "h -> h p", p=self.headdim)
+        return D
+
     def _mamba_chunk(
         self,
         hidden_states,
@@ -684,11 +703,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             B,
             C,
             self.chunk_size,
-            D=(
-                rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
-                if self.D_has_hdim
-                else self.cp.get_D()
-            ),
+            D=self.get_ssm_D(self.cp.get_D()),
             # ssm_prefill, MambaBatchInvariantDecode and the fused path this method
             # replaces all gate inside the scan; gating in self.norm afterwards is
             # the same algebra at different precision.
@@ -751,11 +766,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             self.cp.get_conv1d_bias(),
             self.cp.get_dt_bias().float(),
             A,
-            D=(
-                rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
-                if self.D_has_hdim
-                else self.cp.get_D()
-            ),
+            D=self.get_ssm_D(self.cp.get_D()),
             chunk_size=self.chunk_size,
             activation=self.activation,
             headdim=None if self.D_has_hdim else self.headdim,
@@ -998,11 +1009,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             last_chunk_indices=last_chunk_indices,
             seq_idx=seq_idx_for_varlen,
             out=y,
-            D=(
-                rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
-                if self.D_has_hdim
-                else self.cp.get_D()
-            ),
+            D=self.get_ssm_D(self.cp.get_D()),
             z=z if (self.config.batch_invariant_mode or not self.rmsnorm) else None,
             dt_bias=self.cp.get_dt_bias().float(),
             initial_states=initial_ssm_state,
@@ -1235,7 +1242,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
                 dt = repeat(dt, "b h -> b (h p)", p=self.headdim)
                 dt_bias = repeat(self.dt_bias, "h -> (h p)", p=self.headdim)
                 A = repeat(A, "h -> (h p) n", p=self.headdim, n=self.d_state)
-                D = self.D if self.D_has_hdim else repeat(self.D, "h -> (h p)", p=self.headdim)
+                D = rearrange(self.get_ssm_D(self.D, per_channel=True), "h p -> (h p)")
 
                 dt = F.softplus(dt + dt_bias.to(dtype=dt.dtype))
                 dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
@@ -1262,12 +1269,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
                 dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
                 ssm_state.copy_(ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
                 y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), C)
-                D = (
-                    rearrange(self.D, "(h p) -> h p", p=self.headdim)
-                    if self.D_has_hdim
-                    else rearrange(self.D, "h -> h 1")
-                )
-                y = y + D.to(dtype) * x
+                y = y + self.get_ssm_D(self.D, per_channel=True).to(dtype) * x
                 y = rearrange(y, "b h p -> b (h p)")
                 if not self.rmsnorm:
                     y = y * self.act(z)  # (B D)
@@ -1279,11 +1281,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             # Incorporate sequence dimension in einops rearrengements
             dt = repeat(dt, "b s h -> b s h p", p=self.headdim)
             dt_bias = repeat(self.dt_bias, "h -> h p", p=self.headdim)
-            D = (
-                rearrange(self.D, "(h p) -> h p", p=self.headdim)
-                if self.D_has_hdim
-                else repeat(self.D, "h -> h p", p=self.headdim)
-            )
+            D = self.get_ssm_D(self.D, per_channel=True)
             B = rearrange(B, "b s (g n) -> b s g n", g=self.ngroups_local_tp)
             C = rearrange(C, "b s (g n) -> b s g n", g=self.ngroups_local_tp)
             x_reshaped = rearrange(x, "b s (h p) -> b s h p", p=self.headdim)

@@ -193,12 +193,16 @@ def test_batch_invariant_decode_step_replays():
     )
 
 
-@pytest.mark.parametrize("D_has_hdim", [False, True])
-def test_selective_state_update_replays(D_has_hdim):
+# A per-channel D (D_has_hdim) only changes which D element each lane loads, so its layout is
+# replayed at a small batch.
+@pytest.mark.parametrize(
+    "batch, D_has_hdim", [(256, False), (8, True)], ids=["per_head_D", "per_channel_D"]
+)
+def test_selective_state_update_replays(batch, D_has_hdim):
     from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
 
     seeded()
-    batch, nheads, headdim, dstate, ngroups = 256, 32, 64, 128, 1
+    nheads, headdim, dstate, ngroups = 32, 64, 128, 1
     state = torch.randn(batch, nheads, headdim, dstate, device="cuda")
     x = torch.randn(batch, nheads, headdim, device="cuda", dtype=torch.bfloat16)
     dt = torch.rand(batch, nheads, device="cuda").unsqueeze(-1).expand(batch, nheads, headdim)

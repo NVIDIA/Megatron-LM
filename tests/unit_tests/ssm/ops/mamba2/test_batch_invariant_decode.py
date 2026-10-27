@@ -244,6 +244,52 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                     y_batch_invariant[0, 0], y_full[0, prefill_len], f"prefill_len={prefill_len}"
                 )
 
+    def test_mixer_adapter_per_channel_D_matches_full_scan(self):
+        """The mixer adapter lays out a per-channel D (``D_has_hdim``) the way prefill does."""
+        from types import SimpleNamespace
+
+        from megatron.core.ssm.mamba_mixer import MambaMixer
+        from megatron.core.ssm.ops.mamba2.batch_invariant_decode import MambaBatchInvariantDecode
+
+        A_log = torch.log(-self.A)
+        D = torch.randn(self.nh * self.headdim, device=self.device)  # one per channel
+        mixer = SimpleNamespace(
+            cp=SimpleNamespace(
+                get_A_log=lambda: A_log, get_D=lambda: D, get_dt_bias=lambda: self.dt_bias
+            ),
+            D_has_hdim=True,
+            headdim=self.headdim,
+            ngroups_local_tp=self.ngroups,
+            chunk_size=self.chunk_size,
+            rmsnorm=True,
+        )
+        mixer.get_ssm_D = MambaMixer.get_ssm_D.__get__(mixer, MambaMixer)
+        decoder = MambaBatchInvariantDecode(mixer)
+        # The reference scan and the prefill seeding use the A and D the adapter derives.
+        self.A = -torch.exp(A_log)
+        self.D = D.view(self.nh, self.headdim)
+
+        max_requests, slot, prefill_len = 4, 1, 50
+        x, dt, B, C = self._make_seq(prefill_len + 1)
+        y_full, _ = _full_scan(x, dt, self.A, B, C, self.D, self.dt_bias, self.chunk_size)
+        decoder.buffers = self._make_bufs(max_requests)
+        ssm_state = self._seed_from_prefill(
+            decoder.buffers, x, dt, B, C, prefill_len, slot, max_requests
+        )
+        # The adapter takes the mixer's flat (batch, 1, channels) layouts.
+        token = slice(prefill_len, prefill_len + 1)
+        x_token = x[:, token].flatten(2)
+        y = decoder.step(
+            x_token,
+            x_token,
+            dt[:, token],
+            B[:, token].flatten(2),
+            C[:, token].flatten(2),
+            torch.tensor([slot], dtype=torch.int32, device=self.device),
+            ssm_state,
+        )
+        self._assert_bitwise(y[0, 0], y_full[0, prefill_len].flatten(), "per-channel D")
+
     def test_rejects_bf16_state_cache(self):
         """A rounded state cache cannot preserve carry across multiple chunks."""
         x, dt, B, C = self._make_seq(1)

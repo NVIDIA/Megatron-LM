@@ -205,11 +205,16 @@ class TestMambaMixerDecode:
         return y.reshape(b, 1, H * P), conv_state, ssm_state
 
     @pytest.mark.parametrize(
+        "seq_len, slot_map",
+        [(1, False), (1, True), (3, True)],
+        ids=["batch_order", "slot_map", "speculative"],
+    )
+    @pytest.mark.parametrize(
         "D_has_hdim, uniform_D",
         [(False, False), (True, True), (True, False)],
         ids=["per_head_D", "per_channel_uniform_D", "per_channel_D"],
     )
-    def test_decode_matches_reference(self, D_has_hdim, uniform_D):
+    def test_decode_matches_reference(self, D_has_hdim, uniform_D, seq_len, slot_map):
         config = TransformerConfig(
             hidden_size=256, num_layers=1, num_attention_heads=1, use_cpu_initialization=True
         )
@@ -237,20 +242,61 @@ class TestMambaMixerDecode:
             else:
                 mixer.D.copy_(torch.randn(mixer.D.shape, generator=generator, device="cuda"))
 
+        # With a slot map (dynamic batching), requests 0 and 1 own state slots 2 and 0, and
+        # slot 1 belongs to a request outside the step. Without one (static batching),
+        # request i owns slot i.
         batch = 2
+        if slot_map:
+            batch_indices = torch.tensor([2, 0], dtype=torch.int64, device="cuda")
+            slots, num_slots = batch_indices, 3
+        else:
+            batch_indices = None
+            slots, num_slots = torch.arange(batch, device="cuda"), batch
         proj = 2 * mixer.d_inner_local_tp + 2 * mixer.ngroups_local_tp * mixer.d_state + H
         conv_shape, ssm_shape = mixer.mamba_state_shapes_per_request()
-        zxBCdt = torch.randn(batch, 1, proj, generator=generator, device="cuda")
-        conv_state = torch.randn(batch, *conv_shape, generator=generator, device="cuda")
-        ssm_state = 0.1 * torch.randn(batch, *ssm_shape, generator=generator, device="cuda")
-        y_ref, conv_state_ref, ssm_state_ref = self.reference_decode_step(
-            mixer, zxBCdt, conv_state, ssm_state
-        )
+        zxBCdt = torch.randn(batch, seq_len, proj, generator=generator, device="cuda")
+        conv_state = torch.randn(num_slots, *conv_shape, generator=generator, device="cuda")
+        ssm_state = 0.1 * torch.randn(num_slots, *ssm_shape, generator=generator, device="cuda")
+        # Speculative verification decodes several tokens per request and also keeps both
+        # states after each token, so a rejected draft can be rolled back.
+        speculative = seq_len > 1
+        int_conv_state = int_ssm_state = None
+        if speculative:
+            int_conv_state = torch.zeros(num_slots, seq_len, *conv_shape, device="cuda")
+            int_ssm_state = torch.zeros(num_slots, seq_len, *ssm_shape, device="cuda")
+
+        # The reference decodes one token at a time on each request's slot.
+        conv_state_ref, ssm_state_ref = conv_state.double(), ssm_state.double()
+        y_ref, int_conv_state_ref, int_ssm_state_ref = [], [], []
+        for s in range(seq_len):
+            y_s, conv_s, ssm_s = self.reference_decode_step(
+                mixer, zxBCdt[:, s : s + 1], conv_state_ref[slots], ssm_state_ref[slots]
+            )
+            conv_state_ref[slots], ssm_state_ref[slots] = conv_s, ssm_s
+            y_ref.append(y_s)
+            int_conv_state_ref.append(conv_s)
+            int_ssm_state_ref.append(ssm_s)
 
         with torch.no_grad(), InferenceMode.active():
-            y = mixer.ssm_decode(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
+            y = mixer.ssm_decode(
+                zxBCdt,
+                conv_state=conv_state,
+                ssm_state=ssm_state,
+                batch_indices=batch_indices,
+                intermediate_conv_state=int_conv_state,
+                intermediate_ssm_state=int_ssm_state,
+            )
 
-        # fp32 kernels against the float64 reference.
-        torch.testing.assert_close(conv_state.double(), conv_state_ref, atol=1e-4, rtol=1e-4)
-        torch.testing.assert_close(ssm_state.double(), ssm_state_ref, atol=1e-4, rtol=1e-4)
-        torch.testing.assert_close(y.double(), y_ref, atol=1e-4, rtol=1e-4)
+        # fp32 kernels against the float64 reference. The whole state pool is compared, so a
+        # write to a slot outside the step is caught too.
+        tols = dict(atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(conv_state.double(), conv_state_ref, **tols)
+        torch.testing.assert_close(ssm_state.double(), ssm_state_ref, **tols)
+        if speculative:
+            torch.testing.assert_close(
+                int_conv_state[slots].double(), torch.stack(int_conv_state_ref, dim=1), **tols
+            )
+            torch.testing.assert_close(
+                int_ssm_state[slots].double(), torch.stack(int_ssm_state_ref, dim=1), **tols
+            )
+        torch.testing.assert_close(y.double(), torch.cat(y_ref, dim=1), **tols)

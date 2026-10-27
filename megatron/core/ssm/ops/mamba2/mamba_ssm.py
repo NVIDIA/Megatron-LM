@@ -371,6 +371,12 @@ def selective_state_update(
     batch, seq_len, nheads, dim = x.shape
     dstate = state.shape[-1]
     ngroups = B.shape[-2]
+    if D is not None:
+        # The kernel reads D only through its strides, so a mis-shaped D would be read silently.
+        expected_D_shape = (nheads, dim)
+        assert (
+            D.shape == expected_D_shape
+        ), f"D must have shape (nheads, dim) = {expected_D_shape}, got {tuple(D.shape)}"
 
     out = torch.empty_like(x)
     grid = lambda META: (triton.cdiv(dim, META['BLOCK_SIZE_M']), batch, nheads)
