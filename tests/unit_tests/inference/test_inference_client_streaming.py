@@ -126,7 +126,7 @@ async def test_streaming_partial_for_unknown_request_is_dropped():
 
 
 async def test_client_stop_terminates_open_streams():
-    """stop() fails open streams and releases every local bookkeeping entry."""
+    """stop() finishes open streams so awaiters can exit."""
     client, fake_socket = _make_client()
 
     recv_queue = [[msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]]
@@ -140,15 +140,31 @@ async def test_client_stop_terminates_open_streams():
     client.start()
 
     iterator = client.add_request_streaming("hi", SamplingParams())
-    request_id = iterator.request_id
-    assert client.request_submission_times == {
-        request_id: client.request_submission_times[request_id]
-    }
-    assert client._pending_source_requests == {request_id}
     client.stop()
 
     with pytest.raises(InferenceRequestAborted, match="client stopped"):
         await anext(iterator)
+
+
+async def test_client_stop_releases_request_bookkeeping():
+    """stop() clears the submission time and source ownership of an open request."""
+    client, fake_socket = _make_client()
+
+    recv_queue = [[msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]]
+
+    def fake_recv(*args, **kwargs):
+        if recv_queue:
+            return recv_queue.pop(0)
+        raise zmq.Again()
+
+    fake_socket.recv_multipart.side_effect = fake_recv
+    client.start()
+
+    request_id = client.add_request_streaming("hi", SamplingParams()).request_id
+    assert set(client.request_submission_times) == {request_id}
+    assert client._pending_source_requests == {request_id}
+    client.stop()
+
     assert client.request_submission_times == {}
     assert client._pending_source_requests == set()
 

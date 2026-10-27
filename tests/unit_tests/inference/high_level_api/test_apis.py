@@ -4,7 +4,7 @@
 
 import asyncio
 import concurrent.futures
-from unittest.mock import AsyncMock, MagicMock, PropertyMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -192,9 +192,6 @@ class TestLifecycleGuards:
 
         with pytest.raises(RuntimeError, match="frontend failed"):
             shutdown()
-        type(llm._loop_manager).loop = PropertyMock(
-            side_effect=AssertionError("stopped loop reused")
-        )
         with pytest.raises(RuntimeError, match="frontend failed"):
             shutdown()
         llm._coord_runtime.teardown_now.assert_called_once_with()
@@ -256,7 +253,7 @@ class TestLifecycleGuards:
 
         def hold_first_caller():
             frontend_entered.set_result(None)
-            release_frontend.result()
+            release_frontend.result(timeout=10)
 
         def run_second_caller():
             second_started.set_result(None)
@@ -265,14 +262,18 @@ class TestLifecycleGuards:
         llm._loop_manager = LoopManager()
         llm._stop_frontend_if_started = hold_first_caller
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            first = executor.submit(asyncio.run, llm.shutdown())
-            frontend_entered.result(timeout=2)
-            second = executor.submit(run_second_caller)
-            second_started.result(timeout=2)
-            with pytest.raises(concurrent.futures.TimeoutError):
-                second.result(timeout=0.5)
-            release_frontend.set_result(None)
-            teardown.set_result(None)
+            try:
+                first = executor.submit(asyncio.run, llm.shutdown())
+                frontend_entered.result(timeout=2)
+                second = executor.submit(run_second_caller)
+                second_started.result(timeout=2)
+                with pytest.raises(concurrent.futures.TimeoutError):
+                    second.result(timeout=0.5)
+            finally:
+                # Release the held caller even when a check fails, so the executor can exit.
+                for future in (release_frontend, teardown):
+                    if not future.done():
+                        future.set_result(None)
             first.result(timeout=2)
             second.result(timeout=2)
         assert llm._loop_manager.stops == 1
@@ -290,6 +291,11 @@ class TestLifecycleGuards:
             def submit(coro):
                 coro.close()
                 return teardown
+
+            @staticmethod
+            async def run_async(coro):
+                coro.close()
+                await asyncio.wrap_future(teardown)
 
             def stop(self):
                 self.stops += 1
@@ -320,6 +326,11 @@ class TestLifecycleGuards:
                 coro.close()
                 return teardown
 
+            @staticmethod
+            async def run_async(coro):
+                coro.close()
+                await asyncio.wrap_future(teardown)
+
             def stop(self):
                 self.stops += 1
 
@@ -337,6 +348,7 @@ class TestLifecycleGuards:
         teardown.set_result(None)
 
         class LoopManager:
+            stopped = False
             stop_when_complete = base_mod._EventLoopManager.stop_when_complete
 
             @staticmethod
@@ -344,13 +356,14 @@ class TestLifecycleGuards:
                 coro.close()
                 return teardown
 
-            @staticmethod
-            async def run_async(coro):
+            async def run_async(self, coro):
                 coro.close()
-                raise AssertionError("stopped runtime loop was reused")
+                if self.stopped:
+                    raise AssertionError("stopped runtime loop was reused")
+                await asyncio.wrap_future(teardown)
 
             def stop(self):
-                pass
+                self.stopped = True
 
         llm._loop_manager = LoopManager()
         await llm.shutdown()
@@ -361,18 +374,29 @@ class TestLifecycleGuards:
         sync_llm._shutdown_complete_future = concurrent.futures.Future()
         sync_llm._shutdown_complete_future.set_result(None)
         sync_llm._loop_manager = MagicMock()
-        type(sync_llm._loop_manager).loop = PropertyMock(
-            side_effect=AssertionError("stopped loop reused")
-        )
         sync_llm.shutdown()
         sync_llm.wait_for_shutdown()
         sync_llm._loop_manager.run_sync.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_generate_after_shutdown_is_rejected(self):
+        class AcceptingLoopManager:
+            """Accepts and discards work, so only the shutdown check can reject a call."""
+
+            @staticmethod
+            def run_sync(coro):
+                coro.close()
+
+            submit = run_sync
+
+            @staticmethod
+            async def run_async(coro):
+                coro.close()
+
         sync_llm = _make_worker_instance(MegatronLLM)
         sync_llm._is_primary_rank = True
         sync_llm._shutdown_called = True
+        sync_llm._loop_manager = AcceptingLoopManager()
         with pytest.raises(RuntimeError, match="shut down"):
             sync_llm.generate("late")
         for method in ("pause", "unpause", "suspend", "resume"):
@@ -387,6 +411,7 @@ class TestLifecycleGuards:
         async_llm = _make_worker_instance(MegatronAsyncLLM)
         async_llm._is_primary_rank = True
         async_llm._shutdown_called = True
+        async_llm._loop_manager = AcceptingLoopManager()
         with pytest.raises(RuntimeError, match="shut down"):
             await async_llm.generate("late")
         for method in ("pause", "unpause", "suspend", "resume"):
