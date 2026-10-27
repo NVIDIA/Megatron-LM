@@ -1,8 +1,11 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
+
 import pytest
 import torch.distributed as dist
 
+from megatron.core import parallel_state, process_groups_config
 from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
@@ -208,6 +211,83 @@ class TestResolveGtpRematGroup:
 
         assert resolve_gtp_remat_group(wrapper, is_expert=False) is None
         assert resolve_gtp_remat_group(wrapper, is_expert=True) is None
+
+
+class TestGlobalFallbackWarnings:
+    """The global fallbacks of the GTP and DDP helpers warn instead of reading the grid silently.
+
+    These run without torch.distributed: the global groups are sentinels.
+    """
+
+    @pytest.fixture(autouse=True)
+    def fresh_warning_registry(self, monkeypatch):
+        monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+
+    @staticmethod
+    def _global_gtp_groups(mocker, size):
+        """Make the global grid answer a GTP group of ``size`` ranks, or None for size 0."""
+        group = None
+        if size:
+            group = mocker.Mock(spec=dist.ProcessGroup)
+            group.size.return_value = size
+        mocker.patch.object(
+            ProcessGroupCollection,
+            "use_mpu_process_groups",
+            return_value=ProcessGroupCollection(gtp_remat=group, expt_gtp_remat=group),
+        )
+        return group
+
+    @pytest.mark.parametrize("is_expert", [False, True])
+    def test_a_sharding_global_group_warns_naming_the_owner(self, mocker, is_expert):
+        group = self._global_gtp_groups(mocker, size=2)
+        with pytest.warns(FutureWarning, match="Owner was called without `pg_collection`"):
+            assert resolve_gtp_remat_group(None, is_expert, owner="Owner") is group
+
+    def test_a_collection_without_the_field_names_the_field(self, mocker):
+        self._global_gtp_groups(mocker, size=2)
+        pgs = ProcessGroupCollection(tp=mocker.Mock(spec=dist.ProcessGroup))
+        with pytest.warns(
+            FutureWarning, match=r"Owner was called without `pg_collection\.expt_gtp_remat`"
+        ):
+            resolve_gtp_remat_group(pgs, is_expert=True, owner="Owner")
+
+    @pytest.mark.parametrize("size", [0, 1])
+    def test_a_global_grid_without_gtp_is_silent(self, mocker, size):
+        # A missing or single-rank group leaves GTP off, as an absent field will once the
+        # fallback is removed, so the result does not depend on the global grid.
+        group = self._global_gtp_groups(mocker, size)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert resolve_gtp_remat_group(None, is_expert=False, owner="Owner") is group
+
+    def test_owner_none_leaves_the_warning_to_the_caller(self, mocker):
+        self._global_gtp_groups(mocker, size=2)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            resolve_gtp_remat_group(None, is_expert=False, owner=None)
+
+    def test_ddp_without_a_collection_warns(self, mocker):
+        sentinel = mocker.Mock(spec=dist.ProcessGroup)
+        mocker.patch.multiple(
+            parallel_state,
+            get_data_parallel_group=mocker.Mock(return_value=sentinel),
+            get_expert_data_parallel_group=mocker.Mock(return_value=sentinel),
+            get_tensor_model_parallel_group=mocker.Mock(return_value=sentinel),
+            get_gtp_weight_remat_group=mocker.Mock(return_value=None),
+            get_pipeline_model_parallel_group=mocker.Mock(return_value=sentinel),
+            get_expert_model_parallel_group=mocker.Mock(return_value=sentinel),
+            get_expert_gtp_weight_remat_group=mocker.Mock(return_value=None),
+        )
+        ddp_config = mocker.Mock(
+            num_distributed_optimizer_instances=1, use_distributed_optimizer=False
+        )
+        with pytest.warns(
+            FutureWarning, match="DistributedDataParallel was called without `pg_collection`"
+        ):
+            groups = ProcessGroupCollection.setup_process_groups_for_ddp(
+                None, mocker.Mock(), ddp_config
+            )
+        assert groups["dp_group"] is sentinel
 
 
 class TestRequireProcessGroups:

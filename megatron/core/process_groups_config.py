@@ -715,7 +715,8 @@ class ProcessGroupCollection:
         Helper method to set up process groups for DDP with proper validation and fallbacks.
 
         Args:
-            pg_collection: Optional process group collection. If None, uses parallel_state groups.
+            pg_collection: Optional process group collection. If None, uses parallel_state groups;
+                that fallback is deprecated and emits a ``ProcessGroupFallbackWarning``.
             config: Model config to extract context_parallel_size from.
             ddp_config: DDP config to extract num_distributed_optimizer_instances from.
 
@@ -732,6 +733,9 @@ class ProcessGroupCollection:
         logger = logging.getLogger(__name__)
 
         if pg_collection is None:
+            warn_global_process_group_fallback(
+                "DistributedDataParallel", deprecated_in="0.21", removed_in="0.23"
+            )
             # Use parallel_state groups
             return {
                 'dp_group': parallel_state.get_data_parallel_group(
@@ -876,6 +880,8 @@ def _get_gloo_mirror_group(
 def resolve_gtp_remat_group(
     pg_collection: Optional[Union["ProcessGroupCollection", "MultiModuleProcessGroupCollection"]],
     is_expert: bool,
+    *,
+    owner: Optional[str] = "resolve_gtp_remat_group",
 ) -> Optional[torch.distributed.ProcessGroup]:
     """Resolve the gtp_remat / expt_gtp_remat group for a weight-owning module.
 
@@ -883,6 +889,11 @@ def resolve_gtp_remat_group(
     caller passed no collection, or one predating the gtp_remat fields. The fallback keeps
     pre-pg_collection callers working — a collection that does carry the field is always
     honored, including when it holds a custom (non-MPU) group.
+
+    The fallback is deprecated. It warns when the global group shards weights (more than one
+    rank), the only case in which the result differs from the axis being off. Every caller
+    treats a missing or single-rank group as GTP off, which is what an absent field will mean
+    once the fallback is removed.
 
     A ``MultiModuleProcessGroupCollection`` is unwrapped to the language model's collection
     first: only the per-module collections carry the GTP axes, so the wrapper would
@@ -892,6 +903,8 @@ def resolve_gtp_remat_group(
     Args:
         pg_collection: Collection supplied by the caller, or None.
         is_expert: Select the expert axis (``expt_gtp_remat``) instead of the dense one.
+        owner: Name of the class or function the fallback warning names. None when the caller
+            has already warned about its own fallback.
     """
     attr = 'expt_gtp_remat' if is_expert else 'gtp_remat'
     if isinstance(pg_collection, MultiModuleProcessGroupCollection):
@@ -907,7 +920,15 @@ def resolve_gtp_remat_group(
     mpu_pgs = ProcessGroupCollection.use_mpu_process_groups(
         required_pgs=['gtp_remat', 'expt_gtp_remat']
     )
-    return getattr(mpu_pgs, attr)
+    group = getattr(mpu_pgs, attr)
+    if owner is not None and group is not None and group.size() > 1:
+        warn_global_process_group_fallback(
+            owner,
+            "pg_collection" if pg_collection is None else f"pg_collection.{attr}",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+    return group
 
 
 def amax_reduction_group(

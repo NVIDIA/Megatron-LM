@@ -185,7 +185,7 @@ def param_is_not_gtp_duplicate(
         deprecated_in="0.21",
         removed_in="0.23",
     )
-    return get_pg_rank(resolve_gtp_remat_group(None, is_expert=is_expert)) == 0
+    return get_pg_rank(resolve_gtp_remat_group(None, is_expert=is_expert, owner=None)) == 0
 
 
 def gtp_local_pad_zero_count(gtp_shard, range_start, range_end):
@@ -478,7 +478,9 @@ class VocabParallelEmbedding(torch.nn.Module):
                 )
 
         self.gtp_remat_size = 1
-        gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert=False)
+        gtp_remat_group = resolve_gtp_remat_group(
+            pg_collection, is_expert=False, owner=type(self).__name__
+        )
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
@@ -1311,7 +1313,9 @@ class ColumnParallelLinear(torch.nn.Module):
             self.weight = None
 
         self.gtp_remat_size = 1
-        gtp_remat_group = resolve_gtp_remat_group(pg_collection, self.is_expert)
+        gtp_remat_group = resolve_gtp_remat_group(
+            pg_collection, self.is_expert, owner=type(self).__name__
+        )
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
@@ -1711,7 +1715,9 @@ class RowParallelLinear(torch.nn.Module):
         setattr(self.weight, "allreduce", not use_expert_pgs)
 
         self.gtp_remat_size = 1
-        gtp_remat_group = resolve_gtp_remat_group(pg_collection, self.is_expert)
+        gtp_remat_group = resolve_gtp_remat_group(
+            pg_collection, self.is_expert, owner=type(self).__name__
+        )
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
