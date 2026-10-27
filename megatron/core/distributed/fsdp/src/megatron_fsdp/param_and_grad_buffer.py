@@ -4679,9 +4679,10 @@ class AllGatherPipeline:
         prefetch_order: PrefetchOrder,
         suggested_prefetch_size: Optional[int],
         double_buffer_units: set,
+        outer_fsdp_group_param_gather: bool = False,
     ) -> List[int]:
-        """Extend a bucket list using the communication-size heuristic. Buckets that are
-        not sharded on the gathering group need no all-gather and count zero toward the size."""
+        """Extend a bucket list using the communication-size heuristic. Buckets that need
+        neither a DP-Outer nor a DP-Shard all-gather count zero toward the size."""
         parameter_groups = self.buffer.parameter_groups
         result = list(bucket_ids)
 
@@ -4705,8 +4706,19 @@ class AllGatherPipeline:
         if suggested_prefetch_size is None:
             suggested_prefetch_size = 500_000_000
 
+        def needs_outer_gather(bucket_id):
+            group = parameter_groups[bucket_id]
+            if not outer_fsdp_group_param_gather or group.hfsdp_helper_wbuf is None:
+                return False
+            outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group(
+                is_expert_parallel=group.is_expert_param
+            )
+            return outer_fsdp_group.size() > 1
+
         def all_gather_size(bucket_id):
-            if not self.get_fsdp_buffer(bucket_id).is_data_distributed:
+            if not (
+                needs_outer_gather(bucket_id) or self.get_fsdp_buffer(bucket_id).is_data_distributed
+            ):
                 return 0
             return parameter_groups[bucket_id].model_weight_buffer.bucket_index.size
 
@@ -4852,7 +4864,11 @@ class AllGatherPipeline:
 
         if should_prefetch:
             ag_buckets = self._extend_by_prefetch_size(
-                ag_buckets, prefetch_order, suggested_AG_prefetch_size, double_buf_units
+                ag_buckets,
+                prefetch_order,
+                suggested_AG_prefetch_size,
+                double_buf_units,
+                outer_fsdp_group_param_gather=outer_fsdp_group_param_gather,
             )
 
         if pipeline_hfsdp_gathers and outer_fsdp_group_param_gather:
