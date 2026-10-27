@@ -214,7 +214,7 @@ class TestResolveGtpRematGroup:
 
 
 class TestGlobalFallbackWarnings:
-    """The global fallbacks of the GTP and DDP helpers warn instead of reading the grid silently.
+    """The global fallbacks of the group helpers warn instead of reading the grid silently.
 
     These run without torch.distributed: the global groups are sentinels.
     """
@@ -288,6 +288,88 @@ class TestGlobalFallbackWarnings:
                 None, mocker.Mock(), ddp_config
             )
         assert groups["dp_group"] is sentinel
+
+    # Every parallel_state accessor that setup_process_groups_for_optimizer reads when it falls
+    # back to the global grid.
+    _OPTIMIZER_GRID_ACCESSORS = (
+        "get_data_parallel_group",
+        "get_data_parallel_group_gloo",
+        "get_expert_data_parallel_group",
+        "get_expert_data_parallel_group_gloo",
+        "get_expert_gtp_weight_remat_group",
+        "get_expert_tensor_model_pipeline_parallel_group",
+        "get_gtp_weight_remat_group",
+        "get_inter_distributed_optimizer_instance_group",
+        "get_intra_distributed_optimizer_instance_group",
+        "get_model_parallel_group",
+    )
+
+    @classmethod
+    def _global_optimizer_groups(cls, mocker):
+        """Make the global grid answer one sentinel group, with GTP off, to the optimizer helper."""
+        sentinel = mocker.Mock(spec=dist.ProcessGroup)
+        accessors = {
+            name: mocker.Mock(return_value=sentinel) for name in cls._OPTIMIZER_GRID_ACCESSORS
+        }
+        # With GTP off, the fallback also reads the Gloo groups.
+        accessors["get_gtp_weight_remat_group"].return_value = None
+        accessors["get_expert_gtp_weight_remat_group"].return_value = None
+        mocker.patch.multiple(parallel_state, **accessors)
+        return sentinel, accessors
+
+    @staticmethod
+    def _model_chunk(mocker, num_distributed_optimizer_instances):
+        ddp_config = mocker.Mock(
+            num_distributed_optimizer_instances=num_distributed_optimizer_instances,
+            use_distributed_optimizer=True,
+        )
+        return mocker.Mock(ddp_config=ddp_config)
+
+    def test_optimizer_helper_without_a_collection_warns_once(self, mocker):
+        sentinel, accessors = self._global_optimizer_groups(mocker)
+        # Two optimizer instances make the fallback read the inter-instance group too.
+        chunks = [self._model_chunk(mocker, num_distributed_optimizer_instances=2)]
+        with pytest.warns(
+            FutureWarning,
+            match=r"ProcessGroupCollection\.setup_process_groups_for_optimizer was called "
+            r"without `pg_collection`",
+        ):
+            groups = ProcessGroupCollection.setup_process_groups_for_optimizer(None, chunks)
+        assert groups["dp_group"] is sentinel
+        assert groups["inter_dist_opt_group"] is sentinel
+        assert groups["intra_dp_cp_group_gloo"] is sentinel
+        for accessor in accessors.values():
+            accessor.assert_called()
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            ProcessGroupCollection.setup_process_groups_for_optimizer(None, chunks)
+
+    def test_strict_optimizer_helper_raises_before_reading_the_grid(self, mocker):
+        _, accessors = self._global_optimizer_groups(mocker)
+        chunks = [self._model_chunk(mocker, num_distributed_optimizer_instances=2)]
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", process_groups_config.ProcessGroupFallbackWarning)
+            with pytest.raises(process_groups_config.ProcessGroupFallbackWarning):
+                ProcessGroupCollection.setup_process_groups_for_optimizer(None, chunks)
+        for accessor in accessors.values():
+            accessor.assert_not_called()
+
+    def test_optimizer_helper_with_a_collection_is_silent(self, mocker):
+        _, accessors = self._global_optimizer_groups(mocker)
+        group = mocker.Mock(spec=dist.ProcessGroup)
+        pgs = ProcessGroupCollection(
+            dp=group, dp_cp=group, expt_dp=group, mp=group, tp_ep_pp=group, intra_dist_opt=group
+        )
+        chunks = [self._model_chunk(mocker, num_distributed_optimizer_instances=1)]
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
+                pgs, chunks, use_gloo_process_groups=False
+            )
+        assert groups["dp_group"] is group
+        for accessor in accessors.values():
+            accessor.assert_not_called()
 
 
 class TestRequireProcessGroups:
