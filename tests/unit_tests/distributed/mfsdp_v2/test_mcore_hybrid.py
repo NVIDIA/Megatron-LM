@@ -173,13 +173,9 @@ def test_hybrid_placements(model_parallel_cleanup, outer_strategy, inner_strateg
     graded = [p for p in model.parameters() if p.grad is not None]
     assert graded, "no gradients to inspect"
     for parameter in graded:
-        assert get_containing_parameter_group(
-            parameter
-        ).pre_optimizer_main_grad.mesh.mesh_dim_names == ("dp_outer", "dp_shard")
-        assert get_containing_parameter_group(parameter).pre_optimizer_main_grad.placements == (
-            expected_outer,
-            RowAtomic(),
-        )
+        gradient_buffer = get_containing_parameter_group(parameter).pre_optimizer_main_grad
+        assert gradient_buffer.mesh.mesh_dim_names == ("dp_outer", "dp_shard")
+        assert gradient_buffer.placements == (expected_outer, RowAtomic())
 
 
 @pytest.mark.parametrize("microbatches", [1, 2])
@@ -314,11 +310,7 @@ def test_moe_with_independent_hybrid_placements(
             is_expert = "experts" in name
             seen_expert.add(is_expert)
             outer = expert_outer if is_expert else dense_outer
-            assert get_containing_parameter_group(
-                parameter
-            ).pre_optimizer_main_grad.mesh.mesh_dim_names == ("dp_outer", "dp_shard")
-            assert get_containing_parameter_group(parameter).pre_optimizer_main_grad.placements == (
-                outer,
-                RowAtomic(),
-            ), name
+            gradient_buffer = get_containing_parameter_group(parameter).pre_optimizer_main_grad
+            assert gradient_buffer.mesh.mesh_dim_names == ("dp_outer", "dp_shard")
+            assert gradient_buffer.placements == (outer, RowAtomic()), name
     assert seen_expert == {False, True}
