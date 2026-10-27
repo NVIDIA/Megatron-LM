@@ -212,8 +212,6 @@ try:
                 return str(error), 400
 
         tasks = []
-        # Populated on the non-streaming path only; the streaming path aborts
-        # through the AsyncStream callback its generator already owns.
         request_ids = []
         # The submission loop itself can fail partway -- the zmq send, or
         # multimodal serialization on a malformed payload -- with the earlier
