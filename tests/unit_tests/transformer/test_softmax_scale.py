@@ -201,6 +201,7 @@ class TestPrefillKernelsSoftmaxScale(_GpuTestFixtureBase):
 
     def test_prefill_fa4_uses_config_softmax_scale(self):
         attn = _make_self_attention(softmax_scale=0.042)
+        attn.flash_attention_version = 4  # Auto selection depends on the device.
         head_dim = attn.config.kv_channels
         num_heads = attn.config.num_attention_heads
         captured = {}
@@ -223,6 +224,7 @@ class TestPrefillKernelsSoftmaxScale(_GpuTestFixtureBase):
 
     def test_prefill_fa3_uses_config_softmax_scale(self):
         attn = _make_self_attention(softmax_scale=0.042)
+        attn.flash_attention_version = 3  # Auto selection depends on the device.
         head_dim = attn.config.kv_channels
         num_heads = attn.config.num_attention_heads
         captured = {}
@@ -290,6 +292,7 @@ class TestDecodeKernelsSoftmaxScale(_GpuTestFixtureBase):
 
     def test_decode_fa3_uses_config_softmax_scale(self):
         attn = _make_self_attention(softmax_scale=0.042)
+        attn.flash_attention_version = 3  # Auto selection depends on the device.
 
         def patches(fake_kernel):
             return (
@@ -302,6 +305,7 @@ class TestDecodeKernelsSoftmaxScale(_GpuTestFixtureBase):
 
     def test_decode_fa4_uses_config_softmax_scale(self):
         attn = _make_self_attention(softmax_scale=0.042)
+        attn.flash_attention_version = 4  # Auto selection depends on the device.
 
         def patches(fake_kernel):
             return (

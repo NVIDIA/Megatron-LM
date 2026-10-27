@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import contextlib
 import copy
 from unittest import mock
 
@@ -20,8 +21,14 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.attention import Attention, SelfAttention
+from megatron.core.transformer.attention import (
+    Attention,
+    SelfAttention,
+    SelfAttentionSubmodules,
+    _flash_attn_majors,
+)
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.utils import is_te_min_version, unwrap_model
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
@@ -1016,3 +1023,144 @@ class TestFlashMLASoftcapRejected:
                 block_table=torch.zeros(2, 4, dtype=torch.int32),
                 is_decode_only=True,
             )
+
+
+class TestFlashAttentionDeviceSelection:
+    """Auto selection and FA4's num_splits follow what each kernel runs on the device.
+
+    As of flash-attn-4 4.0.0b36, FA4 runs paged KV on SM90/SM100/SM110 and splits the KV
+    sequence only on SM100/SM110; its Hopper forward asserts against split-KV, which dynamic
+    inference triggers past ~512 KV tokens, or at any length under CUDA graphs. FA3 runs on
+    Hopper only, and FA2 cannot run MLA prefill, whose q/k and v head dims differ.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_device_cache(self, monkeypatch):
+        monkeypatch.delenv("FLASH_ATTENTION_ARCH", raising=False)
+        _flash_attn_majors.cache_clear()
+        yield
+        _flash_attn_majors.cache_clear()
+
+    @staticmethod
+    def _attention(flash_attention_version=None, batch_invariant_mode=False):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            flash_attention_version=flash_attention_version,
+        )
+        submodules = SelfAttentionSubmodules(
+            linear_qkv=IdentityOp, core_attention=IdentityOp, linear_proj=IdentityOp
+        )
+        attn = SelfAttention(
+            config,
+            submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection(tp=None, cp=None),
+        )
+        attn.eval()
+        attn.batch_invariant_mode = batch_invariant_mode
+        return attn
+
+    @staticmethod
+    def _on_device(capability):
+        """Fake the compute capability of the device the (CPU) test tensors stand for."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch("torch.cuda.is_available", return_value=True))
+        stack.enter_context(mock.patch("torch.cuda.get_device_capability", return_value=capability))
+        return stack
+
+    @staticmethod
+    def _run(attn, is_decode_only, v_head_dim=8, qk_head_dim=8):
+        """Run flash_decode_and_prefill on two one-token requests; FA kernels must be faked."""
+        attn.flash_decode_and_prefill(
+            q=torch.zeros(2, 1, 4, qk_head_dim),
+            k=torch.zeros(2, 4, qk_head_dim),
+            v=torch.zeros(2, 4, v_head_dim),
+            max_seqlen_q=1 if is_decode_only else 2,
+            max_seqlen_k=1024,
+            cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 2, 4], dtype=torch.int32),
+            seqlens_k=torch.tensor([2, 2], dtype=torch.int32),
+            block_table=torch.zeros(2, 4, dtype=torch.int32),
+            is_decode_only=is_decode_only,
+        )
+
+    @pytest.mark.parametrize(
+        "capability, have_fa3, have_fa4, expected",
+        [
+            # FA3 runs only on Hopper; FA4 has no paged KV on SM80 or SM120.
+            pytest.param((8, 0), True, True, (False, False), id="sm80-fa2"),
+            pytest.param((9, 0), True, True, (False, True), id="sm90-fa3"),
+            # FA4 runs unsplit on Hopper, ahead of FA2, which cannot run MLA prefill.
+            pytest.param((9, 0), False, True, (True, False), id="sm90-fa4"),
+            pytest.param((9, 0), False, False, (False, False), id="sm90-fa2"),
+            pytest.param((10, 0), True, True, (True, False), id="sm100-fa4"),
+            pytest.param((10, 0), True, False, (False, False), id="sm100-fa2"),
+            pytest.param((11, 0), False, True, (True, False), id="sm110-fa4"),
+            pytest.param((12, 0), True, True, (False, False), id="sm120-fa2"),
+        ],
+    )
+    def test_auto_resolution(self, capability, have_fa3, have_fa4, expected):
+        attn = self._attention()
+        with (
+            self._on_device(capability),
+            mock.patch("megatron.core.transformer.attention.HAVE_FA3", have_fa3),
+            mock.patch("megatron.core.transformer.attention.HAVE_FA4", have_fa4),
+        ):
+            assert attn._resolve_flash_version(torch.device("cpu")) == expected
+
+    @pytest.mark.parametrize("is_decode_only", [False, True], ids=["prefill", "decode"])
+    @pytest.mark.parametrize("batch_invariant_mode", [False, True])
+    @pytest.mark.parametrize(
+        "capability",
+        [(8, 0), (9, 0), (10, 0), (11, 0), (12, 0)],
+        ids=["sm80", "sm90", "sm100", "sm110", "sm120"],
+    )
+    def test_fa4_num_splits(self, capability, batch_invariant_mode, is_decode_only):
+        """FA4's split heuristic (num_splits=0) runs only on SM100/SM110 and not batch-invariant."""
+        attn = self._attention(flash_attention_version=4, batch_invariant_mode=batch_invariant_mode)
+        kernel = mock.Mock(return_value=(torch.zeros(2, 4, 8), torch.zeros(4, 2)))
+        with (
+            self._on_device(capability),
+            mock.patch("megatron.core.transformer.attention.HAVE_FA4", True),
+            mock.patch("megatron.core.transformer.attention.flash_attn4_varlen_func", kernel),
+        ):
+            self._run(attn, is_decode_only)
+        kernel.assert_called_once()
+        can_split = capability[0] in (10, 11) and not batch_invariant_mode
+        assert kernel.call_args.kwargs["num_splits"] == (0 if can_split else 1)
+
+    def test_fa4_num_splits_follow_flash_attention_arch(self, monkeypatch):
+        """FA4 runs its Hopper kernels on Blackwell under FLASH_ATTENTION_ARCH=sm_90."""
+        monkeypatch.setenv("FLASH_ATTENTION_ARCH", "sm_90")
+        attn = self._attention(flash_attention_version=4)
+        kernel = mock.Mock(return_value=(torch.zeros(2, 4, 8), torch.zeros(4, 2)))
+        with (
+            self._on_device((10, 0)),
+            mock.patch("megatron.core.transformer.attention.HAVE_FA4", True),
+            mock.patch("megatron.core.transformer.attention.flash_attn4_varlen_func", kernel),
+        ):
+            self._run(attn, is_decode_only=True)
+        assert kernel.call_args.kwargs["num_splits"] == 1
+
+    def test_mla_head_dims_prefill_on_hopper_runs_fa4(self):
+        """With FA2 and FA4 installed (no FA3), Hopper prefill with MLA head dims runs FA4.
+
+        FA2 requires equal q/k and v head dims, so it cannot run MLA (q/k 192, v 128) prefill.
+        """
+        attn = self._attention()
+        fa4 = mock.Mock(return_value=(torch.zeros(2, 4, 128), torch.zeros(4, 2)))
+        fa2 = mock.Mock()
+        with (
+            self._on_device((9, 0)),
+            mock.patch("megatron.core.transformer.attention.HAVE_FA3", False),
+            mock.patch("megatron.core.transformer.attention.HAVE_FA4", True),
+            mock.patch("megatron.core.transformer.attention.flash_attn4_varlen_func", fa4),
+            mock.patch("megatron.core.transformer.attention.flash_attn_varlen_func", fa2),
+        ):
+            self._run(attn, is_decode_only=False, qk_head_dim=192, v_head_dim=128)
+        fa2.assert_not_called()
+        fa4.assert_called_once()
+        assert fa4.call_args.kwargs["num_splits"] == 1
