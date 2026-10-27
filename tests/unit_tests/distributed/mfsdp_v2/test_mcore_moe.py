@@ -13,6 +13,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataPa
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -56,14 +57,23 @@ def process_group_collections(distributed_setup):
         dp_cp=reference_group,
         embd=None,
         pos_embd=None,
+        mp=reference_group,
+        tp_ep_pp=reference_group,
     )
     model_parallel_cuda_manual_seed(1234)
     yield process_group_collection, reference_process_group_collection
     destroy_model_parallel()
 
 
-def test_build_train_step_and_clip(process_group_collections, distributed_setup):
-    """Shard experts over expert-DP and clip their combined gradients."""
+@pytest.mark.parametrize(
+    "enable_mhc,recompute_mhc",
+    [(False, False), (True, False), (True, True)],
+    ids=["plain", "mhc", "mhc-recompute"],
+)
+def test_build_train_step_and_clip(
+    process_group_collections, distributed_setup, enable_mhc, recompute_mhc
+):
+    """Match reference updates and clipping, including mHC's split-layer calls."""
     process_group_collection, reference_process_group_collection = process_group_collections
     world_size = distributed_setup.world_size
     # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
@@ -86,6 +96,13 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
         hidden_dropout=0.0,
         gradient_accumulation_fusion=False,
         attention_backend=AttnBackend.unfused,
+        enable_mhc_connections=enable_mhc,
+        mhc_num_residual_streams=2,
+        mhc_sinkhorn_iterations=3,
+        use_fused_mhc=enable_mhc,
+        recompute_granularity="selective" if recompute_mhc else None,
+        recompute_modules=["mhc"] if recompute_mhc else None,
+        mhc_recompute_layer_num=2 if recompute_mhc else None,
     )
     # Pair CPU initialization with an explicit common seed for the reference and EP model.
     torch.manual_seed(123)
@@ -108,6 +125,9 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
     ).cuda()
     model.load_state_dict(reference_model.state_dict(), strict=False)
     for model_layer, reference_layer in zip(model.decoder.layers, reference_model.decoder.layers):
+        if enable_mhc:
+            model_layer = model_layer.inner_layer
+            reference_layer = reference_layer.inner_layer
         if not isinstance(model_layer, MoETransformerLayer):
             continue
         for fc in ("linear_fc1", "linear_fc2"):
@@ -133,13 +153,22 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
         pg_collection=process_group_collection,
     )
     assert isinstance(model.module, FsdpModule)
-    assert isinstance(model.module.decoder.layers[1].mlp.experts, FsdpModule)
 
     optimizer_config = OptimizerConfig(
         lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
     )
-    reference_optimizer = get_megatron_optimizer(optimizer_config, [reference_model])
-    optimizer = get_megatron_optimizer(optimizer_config, [model])
+    reference_optimizer = get_megatron_optimizer(
+        optimizer_config,
+        [reference_model],
+        pg_collection=reference_process_group_collection,
+        use_gloo_process_groups=False,
+    )
+    optimizer = get_megatron_optimizer(
+        optimizer_config,
+        [model],
+        pg_collection=process_group_collection,
+        use_gloo_process_groups=False,
+    )
     assert isinstance(optimizer, FullyShardedOptimizer)
     optimizer.reload_model_params()
 
@@ -160,6 +189,7 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
         return torch.nn.functional.mse_loss(output, targets)
 
     reference_losses = []
+    reference_norms = []
     for _ in range(5):
         reference_optimizer.zero_grad(set_to_none=True)
         (reference_loss,) = run_forward_backward_on_microbatches(reference_model, reference_forward)
@@ -169,6 +199,7 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
             reference_pre_clip_norm > optimizer_config.clip_grad
         ), "Reference gradients must exceed the clipping threshold to exercise clipping."
         reference_losses.append(reference_loss)
+        reference_norms.append(float(reference_pre_clip_norm))
 
     def forward():
         output = model(
@@ -179,13 +210,15 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
         return torch.nn.functional.mse_loss(output, targets[input_slice])
 
     losses = []
+    norms = []
     for _ in range(5):
         optimizer.zero_grad(set_to_none=True)
         (loss,) = run_forward_backward_on_microbatches(model, forward)
-        success, _, _ = optimizer.step()
+        success, norm, _ = optimizer.step()
         assert success
         torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
         losses.append(loss)
+        norms.append(float(norm))
 
     losses = torch.stack(losses)
     reference_losses = torch.stack(reference_losses)
@@ -196,3 +229,15 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
     assert torch.isfinite(reference_losses).all()
     assert losses[-1] < losses[0]
     torch.testing.assert_close(losses, reference_losses)
+    torch.testing.assert_close(torch.tensor(norms), torch.tensor(reference_norms))
+
+    moe_layer = model.module.decoder.layers[1]
+    if enable_mhc:
+        for layer in model.module.decoder.layers:
+            assert isinstance(layer, HyperConnectionHybridLayer)
+            assert isinstance(layer, FsdpModule)
+            assert not isinstance(layer.inner_layer, FsdpModule)
+        moe_layer = moe_layer.inner_layer
+    assert isinstance(moe_layer.mlp.experts, FsdpModule)
+    for parameter in moe_layer.mlp.experts.parameters():
+        assert parameter.device_mesh.size() == world_size // 2

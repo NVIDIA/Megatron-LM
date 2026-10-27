@@ -40,6 +40,7 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
+from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
@@ -598,7 +599,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ddp_config: Data-parallel and sharding configuration.
             module: Root model module to shard.
             fsdp_unit_modules: Module types to shard as child FSDP units. If
-                unspecified, transformer, MoE transformer, and Mamba layers are used.
+                unspecified, transformer, MoE transformer, Mamba layers, and mHC
+                wrappers are used. An mHC wrapper owns its directly invoked inner layer.
             disable_bucketing: Compatibility argument that must remain ``False`` for
                 MFSDP v2.
             device: Device used to construct the data-parallel mesh and, when this wrapper
@@ -629,7 +631,34 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         self.ddp_config = ddp_config
 
         if fsdp_unit_modules is None:
-            fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+            fsdp_unit_modules = [
+                TransformerLayer,
+                MoETransformerLayer,
+                MambaLayer,
+                HyperConnectionHybridLayer,
+            ]
+
+        # mHC calls split TransformerLayer methods directly, bypassing the inner
+        # layer's __call__ and FSDP hooks. Let the selected wrapper own that layer;
+        # routed experts retain their separate expert-DP units below.
+        mhc_inner_layers = {
+            submodule.inner_layer
+            for submodule in module.modules()
+            if isinstance(submodule, HyperConnectionHybridLayer)
+            and any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules)
+        }
+
+        # mHC replay invokes norms before the enclosing wrapper's backward hook.
+        # Give parameterized norms their own gather and gradient-reduction hooks.
+        mhc_recompute_norms = set()
+        if config.recompute_granularity == "selective" and "mhc" in (
+            config.recompute_modules or []
+        ):
+            for layer in mhc_inner_layers:
+                for name in ("input_layernorm", "pre_mlp_layernorm"):
+                    norm = getattr(layer, name, None)
+                    if norm is not None and next(norm.parameters(), None) is not None:
+                        mhc_recompute_norms.add(norm)
 
         log_single_rank(
             logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", ddp_config
@@ -723,11 +752,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             **common_fully_shard_kwargs,
                         )
             for submodule in reversed(list(module.modules())):
-                if submodule is module:
-                    # The root is always sharded after selected child units so it is not
-                    # wrapped twice when its type also appears in fsdp_unit_modules.
+                if submodule is module or submodule in mhc_inner_layers:
+                    # Shard the root last; mHC inner layers belong to their wrapper.
                     continue
-                if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
+                if submodule in mhc_recompute_norms or any(
+                    isinstance(submodule, module_type) for module_type in fsdp_unit_modules
+                ):
                     if config.init_model_with_meta_device:
                         _materialize_owned_meta_modules(submodule, device)
                     fully_shard(
