@@ -654,17 +654,27 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
             mhc_inner_layers_to_skip.add(submodule.inner_layer)
 
-        # mHC replay invokes norms before the enclosing wrapper's backward hook.
-        # Give parameterized norms their own gather and gradient-reduction hooks.
-        mhc_recompute_norms = set()
-        if config.recompute_granularity == "selective" and "mhc" in (
+        # mHC replays saved operations from a block-output gradient hook, before
+        # the enclosing FSDP units enter pre_backward(). The replay manager restores
+        # activations but does not prepare FSDP parameters. Modules that read their
+        # own parameters during replay therefore need independent FSDP units: their
+        # forward hooks gather parameters, and their gradient hooks handle reduction.
+        # The current mHC path replays the input/pre-MLP norms this way; the mapping
+        # projection and gates are not replayed. Keep this selection aligned with
+        # the parameterized modules registered to the mHC recompute manager.
+        mhc_recompute_fsdp_units = set()
+        uses_mhc_recompute = config.recompute_granularity == "selective" and "mhc" in (
             config.recompute_modules or []
-        ):
-            for layer in mhc_inner_layers_to_skip:
-                for name in ("input_layernorm", "pre_mlp_layernorm"):
-                    norm = getattr(layer, name, None)
-                    if norm is not None and next(norm.parameters(), None) is not None:
-                        mhc_recompute_norms.add(norm)
+        )
+        if uses_mhc_recompute:
+            for inner_layer in mhc_inner_layers_to_skip:
+                for module_name in ("input_layernorm", "pre_mlp_layernorm"):
+                    replay_module = getattr(inner_layer, module_name, None)
+                    if replay_module is None:
+                        continue
+                    if next(replay_module.parameters(), None) is None:
+                        continue
+                    mhc_recompute_fsdp_units.add(replay_module)
 
         log_single_rank(
             logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", ddp_config
@@ -758,21 +768,29 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             **common_fully_shard_kwargs,
                         )
             for submodule in reversed(list(module.modules())):
-                if submodule is module or submodule in mhc_inner_layers_to_skip:
-                    # Shard the root last; mHC inner layers belong to their wrapper.
+                if submodule is module:
+                    # Shard the root after all selected child units.
                     continue
-                if submodule in mhc_recompute_norms or any(
+                if submodule in mhc_inner_layers_to_skip:
+                    # fully_shard(wrapper) recursively collects these inner parameters.
+                    continue
+
+                is_recompute_unit = submodule in mhc_recompute_fsdp_units
+                matches_unit_type = any(
                     isinstance(submodule, module_type) for module_type in fsdp_unit_modules
-                ):
-                    if config.init_model_with_meta_device:
-                        _materialize_owned_meta_modules(submodule, device)
-                    fully_shard(
-                        submodule,
-                        mesh=dp_mesh,
-                        placements=dense_placements,
-                        grad_scale=dense_grad_scale,
-                        **common_fully_shard_kwargs,
-                    )
+                )
+                if not (is_recompute_unit or matches_unit_type):
+                    continue
+
+                if config.init_model_with_meta_device:
+                    _materialize_owned_meta_modules(submodule, device)
+                fully_shard(
+                    submodule,
+                    mesh=dp_mesh,
+                    placements=dense_placements,
+                    grad_scale=dense_grad_scale,
+                    **common_fully_shard_kwargs,
+                )
             if config.init_model_with_meta_device:
                 _materialize_owned_meta_modules(module, device)
             fully_shard(
