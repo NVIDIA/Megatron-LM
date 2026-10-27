@@ -52,6 +52,7 @@ from megatron.core.post_training.modelopt.checkpointing import (
 from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
+    require_process_groups,
     warn_global_process_group_fallback,
 )
 from megatron.core.rerun_state_machine import RerunState, get_rerun_state_machine
@@ -720,22 +721,55 @@ def _build_sharded_state_dict_metadata(
     return metadata
 
 
-def save_grads(save_dir, state_dict, iteration, grad_label):
+def save_grads(
+    save_dir,
+    state_dict,
+    iteration,
+    grad_label,
+    *,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+):
     """Persist state_dict of grads onto disk. In case of wgrads, this collection should
     be performed before the grads are cleared but after they are reduced.
 
+    The first rank of each expert data-parallel group writes the file of its tensor, pipeline
+    and expert parallel ranks.
+
     NOTE: wgrads for non-expert layers will be duplicated if using expert parallelism, but
-    this can be handled in postprocessing."""
+    this can be handled in postprocessing.
+
+    Args:
+        pg_collection: Process groups of the model whose state is saved. It must set ``tp``,
+            ``pp``, ``ep`` and ``expt_dp``. The writers are the first ranks of
+            ``expt_dp_gtp_remat``, or of ``expt_dp`` for a collection without it. Omitting the
+            collection reads the global parallel grid, which is deprecated and warns.
+    """
 
     print_rank_0(
         f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] saving {grad_label} from iteration {iteration:7d}'
     )
 
-    if mpu.get_expert_data_parallel_rank() == 0:
-        # Create saving directory.
-        ep_rank = mpu.get_expert_model_parallel_rank()
-        pp_rank = mpu.get_pipeline_model_parallel_rank()
+    if pg_collection is None:
+        _warn_global_grid_fallback('save_grads', 'pg_collection')
+        expt_dp_rank = mpu.get_expert_data_parallel_rank()
         tp_rank = mpu.get_tensor_model_parallel_rank()
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        ep_rank = mpu.get_expert_model_parallel_rank()
+        pipeline_parallel = mpu.get_pipeline_model_parallel_world_size() > 1
+        expert_parallel = mpu.get_expert_model_parallel_world_size() > 1
+    else:
+        tp_group, pp_group, ep_group, expt_dp_group = require_process_groups(
+            pg_collection, ('tp', 'pp', 'ep', 'expt_dp'), owner='save_grads'
+        )
+        expt_dp_rank = get_pg_rank(_first_group(pg_collection.expt_dp_gtp_remat, expt_dp_group))
+        tp_rank = get_pg_rank(tp_group)
+        pp_rank = get_pg_rank(pp_group)
+        ep_rank = get_pg_rank(ep_group)
+        pipeline_parallel = get_pg_size(pp_group) > 1
+        expert_parallel = get_pg_size(ep_group) > 1
+
+    if expt_dp_rank == 0:
+        # Create saving directory.
         assert save_dir is not None
         assert iteration is not None
         save_dir = os.path.join(save_dir, grad_label, f'iter_{iteration:07d}')
@@ -743,9 +777,9 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
 
         # Save state_dict.
         checkpoint_name = f'mp_rank_{tp_rank:02d}'
-        if mpu.get_pipeline_model_parallel_world_size() > 1:
+        if pipeline_parallel:
             checkpoint_name += f'_{pp_rank:03d}'
-        if mpu.get_expert_model_parallel_world_size() > 1:
+        if expert_parallel:
             checkpoint_name += f'_{ep_rank:03d}'
         full_save_path = os.path.join(save_dir, f'{checkpoint_name}.pth')
         # Convert back to dict (e.g., from collections.defaultdict) for easy loading later.

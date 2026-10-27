@@ -4,7 +4,8 @@
 
 A helper whose caller omits a group still reads it from the global parallel grid, with the same
 accessor as before, but warns first. Given its groups, a helper reads no global state and does
-not warn. On the standard grid every name and writer matches the global fallback.
+not warn. The training loop and its debug loggers pass the model's collection, and on the
+standard grid every name and writer matches the global fallback.
 """
 
 import contextlib
@@ -19,13 +20,18 @@ import torch
 
 from megatron.core import process_groups_config
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
-from megatron.training import checkpointing
+from megatron.training import activation_logging, checkpointing, dgrad_logging
+from megatron.training import training as training_mod
 from tests.unit_tests.dist_checkpointing import TempNamedDir
+from tests.unit_tests.test_checkpointing import init_model_parallel
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.training.test_checkpointing_pg_collection import (
+    _grid_unlike_the_global_one,
     _no_global_grid,
     _StandInGroup,
+    requires_four_rank_multiple,
 )
+from tests.unit_tests.training.test_train_step_schedule_plumbing import _run as _run_train_step
 
 VERSIONS = "deprecated since Megatron Core 0.21 and will be removed in 0.23"
 
@@ -225,6 +231,68 @@ def test_generate_state_dict_warns_without_a_group(ckpt_format):
         assert model.metadata == [{"dp_cp_group": group}]
 
 
+def test_save_grads_names_files_by_the_collection(tmp_path, stand_in_ranks):
+    pg_collection = ProcessGroupCollection(
+        tp=_StandInGroup(1, 2),
+        pp=_StandInGroup(2, 4),
+        ep=_StandInGroup(3, 4),
+        expt_dp=_StandInGroup(0, 2),
+    )
+    with _no_global_grid():
+        checkpointing.save_grads(
+            str(tmp_path), {"chunk": {"w": torch.ones(2)}}, 7, "wgrads", pg_collection=pg_collection
+        )
+
+    saved = torch.load(tmp_path / "wgrads" / "iter_0000007" / "mp_rank_01_002_003.pth")
+    assert torch.equal(saved["chunk"]["w"], torch.ones(2))
+
+
+@pytest.mark.parametrize(
+    "expt_dp_rank,expt_dp_gtp_remat_rank,writes",
+    [(0, None, True), (1, None, False), (0, 1, False), (1, 0, True)],
+)
+def test_save_grads_writers(tmp_path, stand_in_ranks, expt_dp_rank, expt_dp_gtp_remat_rank, writes):
+    """The first rank of expt_dp_gtp_remat writes, or of expt_dp for a collection without it."""
+    single = _StandInGroup(0, 1)
+    pg_collection = ProcessGroupCollection(
+        tp=single, pp=single, ep=single, expt_dp=_StandInGroup(expt_dp_rank, 2)
+    )
+    if expt_dp_gtp_remat_rank is not None:
+        pg_collection.expt_dp_gtp_remat = _StandInGroup(expt_dp_gtp_remat_rank, 4)
+    with _no_global_grid():
+        checkpointing.save_grads(str(tmp_path), {}, 7, "wgrads", pg_collection=pg_collection)
+
+    assert (tmp_path / "wgrads" / "iter_0000007" / "mp_rank_00.pth").exists() == writes
+
+
+def test_save_grads_requires_the_groups_it_reads(tmp_path):
+    single = _StandInGroup(0, 1)
+    with pytest.raises(ValueError, match="save_grads requires pg_collection to set ep, expt_dp"):
+        checkpointing.save_grads(
+            str(tmp_path),
+            {},
+            7,
+            "wgrads",
+            pg_collection=ProcessGroupCollection(tp=single, pp=single),
+        )
+
+
+def test_save_grads_without_a_collection_warns_and_reads_the_global_grid(tmp_path):
+    global_grid = SimpleNamespace(
+        get_expert_data_parallel_rank=lambda: 0,
+        get_tensor_model_parallel_rank=lambda: 1,
+        get_pipeline_model_parallel_rank=lambda: 2,
+        get_expert_model_parallel_rank=lambda: 3,
+        get_pipeline_model_parallel_world_size=lambda: 4,
+        get_expert_model_parallel_world_size=lambda: 4,
+    )
+    with mock.patch.object(checkpointing, "mpu", global_grid), _record_warnings() as record:
+        checkpointing.save_grads(str(tmp_path), {}, 7, "wgrads")
+
+    assert _fallback_arguments(record, "save_grads") == ["pg_collection"]
+    assert (tmp_path / "wgrads" / "iter_0000007" / "mp_rank_01_002_003.pth").exists()
+
+
 # The global accessors that maybe_save_dataloader_state reads for each omitted group.
 _DATALOADER_GLOBAL_READS = {
     "tp_group": {"get_tensor_model_parallel_rank"},
@@ -361,6 +429,97 @@ def test_fully_parallel_load_group(monkeypatch, process_group, argument, global_
     assert global_grid.method_calls == ([] if pass_group else [global_read])
 
 
+def test_debug_loggers_pass_the_collection_to_save_grads(monkeypatch):
+    pg_collection = ProcessGroupCollection()
+    save_grads = mock.Mock()
+    monkeypatch.setattr(dgrad_logging, "save_grads", save_grads)
+    monkeypatch.setattr(activation_logging, "save_grads", save_grads)
+    dgrad_logger = dgrad_logging.DataGradLogger("save")
+    dgrad_logger._dgrads_state_dict["chunk"]["input0"] = torch.ones(1)
+    monkeypatch.setattr(dgrad_logging, "_LOGGER", dgrad_logger)
+    activation_logger = activation_logging.ActivationLogger("save")
+    activation_logger._activations_state_dict["chunk"]["input0"] = torch.ones(1)
+    monkeypatch.setattr(activation_logging, "_LOGGER", activation_logger)
+
+    dgrad_logging.save_dgrads(3, pg_collection=pg_collection)
+    activation_logging.save_activations(3, pg_collection=pg_collection)
+
+    assert [call.args[2:] for call in save_grads.call_args_list] == [
+        (3, "dgrads"),
+        (3, "activations"),
+    ]
+    for call in save_grads.call_args_list:
+        assert call.kwargs == {"pg_collection": pg_collection}
+
+
+def test_train_step_debug_dumps_use_the_model_collection(monkeypatch, run_config):
+    """The wgrad, dgrad and activation dumps are named by the ranks of the model's groups."""
+    run_config.train.micro_batch_size = 1
+    model_pg_collection, schedule_pg_collection = ProcessGroupCollection(), ProcessGroupCollection()
+    model = [
+        SimpleNamespace(
+            force_all_reduce=False,
+            zero_grad_buffer=lambda: None,
+            named_parameters=lambda: [],
+            pg_collection=model_pg_collection,
+        )
+    ]
+    dumps = {}
+
+    def record_dump(label):
+        def dump(*args, pg_collection):
+            dumps[label] = pg_collection
+
+        return dump
+
+    for name in (
+        "enable_activation_logging",
+        "disable_activation_logging",
+        "enable_dgrad_logging",
+        "disable_dgrad_logging",
+    ):
+        monkeypatch.setattr(training_mod, name, mock.Mock())
+    monkeypatch.setattr(training_mod, "save_activations", record_dump("activations"))
+    monkeypatch.setattr(training_mod, "save_dgrads", record_dump("dgrads"))
+    monkeypatch.setattr(training_mod, "save_grads", record_dump("wgrads"))
+
+    _run_train_step(
+        args_overrides=dict(
+            save="save", save_activations_interval=1, save_dgrads_interval=1, save_wgrads_interval=1
+        ),
+        model=model,
+        pg_collection=schedule_pg_collection,
+    )
+
+    assert dumps == {
+        "activations": model_pg_collection,
+        "dgrads": model_pg_collection,
+        "wgrads": model_pg_collection,
+    }
+
+
+@requires_four_rank_multiple
+def test_save_grads_on_model_grid(init_model_parallel, tmp_path_dist_ckpt):
+    """Each tensor/pipeline shard of a grid unlike the global one is written once, by its name."""
+    grid = _grid_unlike_the_global_one()
+    tp_rank, pp_rank = grid.tp.rank(), grid.pp.rank()
+    state_dict = {"chunk": {"tp": torch.tensor(tp_rank), "pp": torch.tensor(pp_rank)}}
+    with TempNamedDir(tmp_path_dist_ckpt / "test_save_grads_on_model_grid", sync=True) as save_dir:
+        with _no_global_grid():
+            checkpointing.save_grads(str(save_dir), state_dict, 7, "wgrads", pg_collection=grid)
+        torch.distributed.barrier()
+
+        iteration_dir = save_dir / "wgrads" / "iter_0000007"
+        assert sorted(os.listdir(iteration_dir)) == [
+            f"mp_rank_{t:02d}_{p:03d}.pth" for t in range(2) for p in range(2)
+        ]
+        for t in range(2):
+            for p in range(2):
+                saved = torch.load(iteration_dir / f"mp_rank_{t:02d}_{p:03d}.pth")
+                assert (saved["chunk"]["tp"].item(), saved["chunk"]["pp"].item()) == (t, p)
+        torch.distributed.barrier()
+
+
 @pytest.mark.skipif(
     Utils.world_size < 4 or Utils.world_size % 4 != 0,
     reason="Builds a TP2 x PP2 x EP2 grid, which needs a multiple of 4 ranks",
@@ -382,6 +541,7 @@ def test_standard_grid_names_and_writers_match_the_global_fallback(tmp_path_dist
             cp_group=pg_collection.cp,
         )
         rank = torch.distributed.get_rank()
+        state_dict = {"chunk": {"rank": torch.tensor(rank)}}
         iterator = SimpleNamespace(iterable=SimpleNamespace(save_state=lambda: {"rank": rank}))
 
         with TempNamedDir(
@@ -392,11 +552,13 @@ def test_standard_grid_names_and_writers_match_the_global_fallback(tmp_path_dist
                 fallback_rng = checkpointing.get_rng_state(
                     "torch_dist", pg_collection.tp, pg_collection.pp
                 )
+                checkpointing.save_grads(str(save_dir / "fallback"), state_dict, 7, "wgrads")
                 checkpointing.maybe_save_dataloader_state(iterator, 2, str(save_dir / "fallback"))
             assert _fallbacks(record) == [
                 ("get_checkpoint_name", "pg_collection"),
                 ("get_rng_state", "dp_group"),
                 ("get_rng_state", "dp_cp_group"),
+                ("save_grads", "pg_collection"),
                 ("maybe_save_dataloader_state", "tp_group"),
                 ("maybe_save_dataloader_state", "pp_group"),
                 ("maybe_save_dataloader_state", "dp_group"),
@@ -411,6 +573,13 @@ def test_standard_grid_names_and_writers_match_the_global_fallback(tmp_path_dist
                     pg_collection.pp,
                     dp_cp_group=pg_collection.dp_cp_gtp_remat,
                     dp_group=pg_collection.dp,
+                )
+                checkpointing.save_grads(
+                    str(save_dir / "collection"),
+                    state_dict,
+                    7,
+                    "wgrads",
+                    pg_collection=pg_collection,
                 )
                 checkpointing.maybe_save_dataloader_state(
                     iterator, 2, str(save_dir / "collection"), **groups
