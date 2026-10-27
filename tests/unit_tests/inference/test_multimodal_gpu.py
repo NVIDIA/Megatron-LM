@@ -1293,6 +1293,8 @@ def test_real_media_prefill_replays_actual_cuda_graph_with_eager_parity(model_pa
         graphed, graph_step, graph_finished = _run_request(graph_engine, 131, media, graph_trace)
     assert eager_encoder.call_count == graph_encoder.call_count == 1 and not eager_step["graphed"]
     assert graph_step["graphed"]
+    # The graph pads its batch to max_requests, so compare only the real request's logits.
+    graph_step = dict(graph_step, logits=graph_step["logits"][:, : eager_step["logits"].shape[1]])
     assert torch.equal(eager["tokens"], graphed["tokens"])
     _same(eager, eager_step, eager_finished, graphed, graph_step, graph_finished)
 
