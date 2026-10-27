@@ -3,6 +3,7 @@
 """Tests for the native NCCL M2N ReFIT copy service."""
 
 import importlib.util
+import os
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -13,6 +14,7 @@ from packaging.version import Version
 
 from megatron.core.resharding.copy_services.nccl_m2n_copy_service import (
     NCCLM2NCopyService,
+    _default_split_comm,
     _has_nccl_cuda_backend,
     _M2NChannel,
     _parameter_groups,
@@ -82,6 +84,19 @@ def test_validate_nccl_version_rejects_missing_library():
 def test_validate_nccl_version_rejects_unsupported_package(nccl_core):
     with pytest.raises(RuntimeError, match="requires the current NCCL4Py package"):
         _validate_nccl_version(nccl_core)
+
+
+def test_split_comm_defaults_on(monkeypatch):
+    monkeypatch.delenv("NCCL_RESHARD_SPLIT_COMM", raising=False)
+    _default_split_comm()
+    assert os.environ["NCCL_RESHARD_SPLIT_COMM"] == "1"
+
+
+@pytest.mark.parametrize("value", ["0", "1"])
+def test_split_comm_respects_user_setting(monkeypatch, value):
+    monkeypatch.setenv("NCCL_RESHARD_SPLIT_COMM", value)
+    _default_split_comm()
+    assert os.environ["NCCL_RESHARD_SPLIT_COMM"] == value
 
 
 @pytest.mark.launch_on_gb200

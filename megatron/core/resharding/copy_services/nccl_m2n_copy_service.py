@@ -36,6 +36,13 @@ _DEFAULT_MAX_GROUP_BYTES = 256 * 1024 * 1024
 _MAX_GROUP_BYTES_ENV = "MEGATRON_NCCL_M2N_MAX_GROUP_BYTES"
 _MAX_INT64 = (1 << 63) - 1
 
+# M2N split communicators (NCCL_RESHARD_SPLIT_COMM=1) made non-collocated refit
+# faster on every dense, MoE and hybrid layout we measured, by up to 8x, so
+# they are enabled by default. An explicit user setting is left untouched. The
+# default is applied before ``m2n.init()`` so the library sees it.
+_SPLIT_COMM_ENV = "NCCL_RESHARD_SPLIT_COMM"
+_SPLIT_COMM_DEFAULT = "1"
+
 _StagePair = tuple[tuple[int, ...], tuple[int, ...]]
 
 
@@ -164,6 +171,11 @@ def _max_group_bytes_from_env() -> int:
     return max_group_bytes
 
 
+def _default_split_comm() -> None:
+    """Enable M2N split communicators unless ``NCCL_RESHARD_SPLIT_COMM`` is set."""
+    os.environ.setdefault(_SPLIT_COMM_ENV, _SPLIT_COMM_DEFAULT)
+
+
 def _parameter_groups(
     specs: list[TensorReshardSpec], max_group_bytes: int
 ) -> list[list[list[TensorReshardSpec]]]:
@@ -240,6 +252,7 @@ class NCCLM2NCopyService(CopyService):
         if not isinstance(max_group_bytes, int) or not 0 < max_group_bytes <= _MAX_INT64:
             raise ValueError("max_group_bytes must be a positive int64 value")
         self._max_group_bytes = max_group_bytes
+        _default_split_comm()
         self._handle = m2n.init()
         self._is_source: bool | None = None
         self._is_destination: bool | None = None
