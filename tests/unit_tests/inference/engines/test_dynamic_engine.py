@@ -934,7 +934,6 @@ class DynamicEngineTestConfig:
     cuda_graph_warmup_steps: int = 3
     fp8: bool = False
     fp8_recipe: str = "tensorwise"
-    fp8_output_proj: bool = False
     zero_model_parameters: bool = False
     hidden_size: Optional[int] = None
     model_provider: str = "gpt"
@@ -967,8 +966,6 @@ class DynamicEngineTestConfig:
     transformer_impl: str = "local"
     inference_moe_token_dispatcher_type: str = "nccl"
     moe_enable_routing_replay: bool = False
-    moe_router_topk: int = 2
-    moe_router_pre_softmax: bool = False
     # If False, do not build cuda graphs in the tests, even if
     # num_cuda_graphs is set.
     # For tests concerning cuda-graph warmups, we set this to False
@@ -1296,15 +1293,12 @@ class DynamicInferenceEngineTestBase:
                 expert_tensor_parallel_size=test_config.expert_tensor_parallel_size,
                 num_moe_experts=num_moe_experts,
                 moe_grouped_gemm=test_config.moe_grouped_gemm,
-                moe_router_topk=test_config.moe_router_topk,
-                moe_router_pre_softmax=test_config.moe_router_pre_softmax,
                 sequence_parallel=test_config.sequence_parallel,
                 pipeline_dtype=torch.bfloat16,
                 add_bias_linear=test_config.expert_model_parallel_size == 1
                 and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe=test_config.fp8_recipe if test_config.fp8 else None,
-                fp8_output_proj=test_config.fp8_output_proj,
                 fp8_param=test_config.fp8 and test_config.fp8_recipe == "mxfp8",
                 quant_recipe=quant_recipe,
                 inference_sampling_seed=test_config.random_seed,
