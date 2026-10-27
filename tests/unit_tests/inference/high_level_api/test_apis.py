@@ -183,9 +183,6 @@ class TestLifecycleGuards:
         llm._is_primary_rank = True
         llm._coord_runtime = MagicMock()
         llm._coord_runtime.coord_addr = "tcp://coord:5555"
-        llm._context.block_size_tokens = 256
-        llm._context.enable_prefix_caching = True
-        llm._context.config.prefix_caching_coordinator_policy = "longest_prefix"
 
         started = {}
         monkeypatch.setattr(dist, "get_rank", lambda: 0)
@@ -211,8 +208,6 @@ class TestLifecycleGuards:
         assert started["default_top_p"] == 0.95
         assert started["default_top_k"] == 20
         assert started["eval_mode"] is True
-        assert started["block_size_tokens"] == 256
-        assert started["prefix_caching_coordinator_policy"] == "longest_prefix"
 
     @pytest.mark.asyncio
     async def test_async_serve_primary_rank_starts_frontend(self, monkeypatch):
@@ -227,9 +222,6 @@ class TestLifecycleGuards:
         llm._is_primary_rank = True
         llm._coord_runtime = MagicMock()
         llm._coord_runtime.coord_addr = "tcp://coord:5555"
-        llm._context.block_size_tokens = 256
-        llm._context.enable_prefix_caching = True
-        llm._context.config.prefix_caching_coordinator_policy = "longest_prefix"
 
         started = {}
         monkeypatch.setattr(dist, "get_rank", lambda: 0)
@@ -255,6 +247,31 @@ class TestLifecycleGuards:
         assert started["default_top_p"] == 0.95
         assert started["default_top_k"] == 20
         assert started["eval_mode"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cls", [MegatronLLM, MegatronAsyncLLM])
+    async def test_serve_forwards_prefix_caching_routing_settings(self, cls, monkeypatch):
+        """The frontend receives the KV block size and the prefix-caching routing policy."""
+        tgs = pytest.importorskip(
+            "megatron.core.inference.text_generation_server.dynamic_text_gen_server"
+            ".text_generation_server"
+        )
+        import torch.distributed as dist
+
+        llm = _make_worker_instance(cls)
+        llm._is_primary_rank = True
+        llm._coord_runtime = MagicMock()
+        llm._context.block_size_tokens = 256
+        llm._context.enable_prefix_caching = True
+        llm._context.config.prefix_caching_coordinator_policy = "longest_prefix"
+
+        started = {}
+        monkeypatch.setattr(dist, "get_rank", lambda: 0)
+        monkeypatch.setattr(tgs, "start_text_gen_server", lambda **kw: started.update(kw))
+
+        serving = llm.serve(ServeConfig(), blocking=False)
+        if cls is MegatronAsyncLLM:
+            await serving
         assert started["block_size_tokens"] == 256
         assert started["prefix_caching_coordinator_policy"] == "longest_prefix"
 
