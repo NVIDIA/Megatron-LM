@@ -241,11 +241,11 @@ class TestTrainingLoopPgCollection:
             pretrained_checkpoint=None,
             ckpt_convert_format=None,
         )
-        attached = []
+        attached, saver_pg_collections = [], []
 
         class _LogitsSaverHooks:
             def __init__(self, **kwargs):
-                pass
+                saver_pg_collections.append(kwargs["pg_collection"])
 
             def attach_hooks(self, model_chunk):
                 attached.append(model_chunk)
@@ -263,9 +263,16 @@ class TestTrainingLoopPgCollection:
         monkeypatch.setattr(training, "get_current_global_batch_size", lambda: 1)
         _forbid_global_reads(monkeypatch, training)
 
-        training.setup_model_and_optimizer(None, lambda: None, cfg_container=run_config)
+        # The run's collection has no pipeline parallelism; the model's own collection decides.
+        training.setup_model_and_optimizer(
+            None, lambda: None, cfg_container=run_config, pg_collection=ProcessGroupCollection()
+        )
 
         assert attached == (model if pp_group.rank() == 1 else [])
+        # The saver runs on the groups that decided its stage.
+        assert [id(groups) for groups in saver_pg_collections] == (
+            [id(model[0].pg_collection)] if pp_group.rank() == 1 else []
+        )
 
     @_needs_4_ranks
     def test_full_validation_lengths_come_from_the_collection(self, monkeypatch, run_config):
