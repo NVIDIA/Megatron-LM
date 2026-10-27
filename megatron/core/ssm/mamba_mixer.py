@@ -582,11 +582,14 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
 
         assert self.cp.cp_size == 1, "Context parallel not supported for Mamba inference decode"
 
+        # The decode kernels are batch-first: (1, b, proj_dim) -> (b, 1, proj_dim).
         # Static batching has no slot remapping, so batch_indices is None.
-        y = self.ssm_decode(zxBCdt, conv_state=conv_state, ssm_state=ssm_state, batch_indices=None)
+        y = self.ssm_decode(
+            zxBCdt.transpose(0, 1), conv_state=conv_state, ssm_state=ssm_state, batch_indices=None
+        )
 
-        # y has shape (1, b, d_inner), which is what out_proj expects
-        out, out_bias = self.out_proj(y)
+        # (b, 1, d_inner) -> (1, b, d_inner), which is what out_proj expects.
+        out, out_bias = self.out_proj(y.transpose(0, 1))
 
         return out, out_bias
 
