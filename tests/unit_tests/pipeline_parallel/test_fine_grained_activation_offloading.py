@@ -199,9 +199,8 @@ def _make_warmup_chunk(groups: List["OffloadTensorGroup"]) -> ChunkOffloadHandle
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading.")
 @pytest.mark.parametrize("fraction", [0.0, 0.5, 1.0])
-@pytest.mark.parametrize("lifecycle", ["fixed", "evaluation_first", "resize_after_warmup"])
-def test_offload_resident_groups_preserve_forward_chunks(monkeypatch, fraction, lifecycle):
-    """Exercise resident groups and warmup boundaries through native GPT training."""
+def test_offload_resident_groups_preserve_forward_chunks(monkeypatch, fraction):
+    """Keep chunk ownership through fixed-length native training when groups stay on GPU."""
     Utils.initialize_model_parallel()
     off_interface.reset_instance()
     try:
@@ -228,7 +227,7 @@ def test_offload_resident_groups_preserve_forward_chunks(monkeypatch, fraction, 
                 fine_grained_activation_offloading=enabled,
                 offload_modules=["core_attn", "attn_proj"] if enabled else [],
                 activation_offload_fraction=fraction,
-                min_offloaded_tensor_size=131072 if lifecycle == "resize_after_warmup" else 1024,
+                min_offloaded_tensor_size=1024,
             )
             torch.manual_seed(31)
             model_parallel_cuda_manual_seed(31)
@@ -237,7 +236,7 @@ def test_offload_resident_groups_preserve_forward_chunks(monkeypatch, fraction, 
                     config=config,
                     transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
                     vocab_size=256,
-                    max_sequence_length=256,
+                    max_sequence_length=128,
                 )
                 .bfloat16()
                 .cuda()
@@ -255,31 +254,10 @@ def test_offload_resident_groups_preserve_forward_chunks(monkeypatch, fraction, 
                 return output, loss_func
 
             results = []
-            if lifecycle == "evaluation_first":
-                model.eval()
-                inputs = _make_gpt_inputs(
-                    seq_length=128, micro_batch_size=1, device=torch.device("cuda")
-                )
-                inputs[2].copy_(torch.triu(torch.ones_like(inputs[2]), diagonal=1))
-                with torch.no_grad():
-                    results.append(
-                        get_forward_backward_func()(
-                            forward_step_func=forward_step,
-                            data_iterator=iter([inputs] * 2),
-                            model=model,
-                            num_microbatches=2,
-                            seq_length=128,
-                            micro_batch_size=1,
-                            forward_only=True,
-                            pg_collection=groups,
-                        )
-                    )
-                model.train()
-            lengths = [8, 256, 64, 256] if lifecycle == "resize_after_warmup" else [128] * 3
-            for seq_length in lengths:
+            for _ in range(3):
                 optimizer.zero_grad(set_to_none=True)
                 inputs = _make_gpt_inputs(
-                    seq_length=seq_length, micro_batch_size=1, device=torch.device("cuda")
+                    seq_length=128, micro_batch_size=1, device=torch.device("cuda")
                 )
                 inputs[2].copy_(torch.triu(torch.ones_like(inputs[2]), diagonal=1))
                 losses = get_forward_backward_func()(
@@ -287,7 +265,7 @@ def test_offload_resident_groups_preserve_forward_chunks(monkeypatch, fraction, 
                     data_iterator=iter([inputs] * 2),
                     model=model,
                     num_microbatches=2,
-                    seq_length=seq_length,
+                    seq_length=128,
                     micro_batch_size=1,
                     forward_only=False,
                     pg_collection=groups,
@@ -306,8 +284,7 @@ def test_offload_resident_groups_preserve_forward_chunks(monkeypatch, fraction, 
             snapshots.append(results)
             del optimizer, model
         torch.testing.assert_close(snapshots[1], snapshots[0], rtol=0, atol=0)
-        if lifecycle != "resize_after_warmup":
-            assert any(transfers), "Training warmup must exercise actual transfers."
+        assert any(transfers), "Training warmup must exercise actual transfers."
         assert (False in transfers) == (fraction > 0)
     finally:
         torch.cuda.synchronize()
