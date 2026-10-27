@@ -865,6 +865,12 @@ def test_attention_graph_split_scheduler_thd_replay(kind, chunks, monkeypatch):
             def valid(mb, tensor):
                 return tensor[valid_rows[mb % 2]]
 
+            # The eager reference recomputes mHC regions, including a separate input norm on
+            # Hybrid layers, whose checkpointed first pass runs without grad. That pass can round
+            # a few BF16 elements differently from the captured one. Offset or replay errors
+            # change whole documents, far beyond this tolerance.
+            tolerance = dict(rtol=2e-2, atol=2e-3)
+
             def parameter_grads(chunk):
                 return {
                     name: param.main_grad.detach().clone()
@@ -929,6 +935,7 @@ def test_attention_graph_split_scheduler_thd_replay(kind, chunks, monkeypatch):
                         torch.testing.assert_close(
                             valid(mb, output),
                             valid(mb, expected[chunk, mb][0]),
+                            **tolerance,
                             msg=lambda m: f'output count={count} chunk={chunk} mb={mb}: {m}',
                         )
                         pending[chunk, mb] = hidden, output
@@ -940,6 +947,7 @@ def test_attention_graph_split_scheduler_thd_replay(kind, chunks, monkeypatch):
                         torch.testing.assert_close(
                             hidden.grad,
                             expected[chunk, mb][1],
+                            **tolerance,
                             msg=lambda m: f'input grad count={count} chunk={chunk} mb={mb}: {m}',
                         )
                 assert not pending
@@ -959,6 +967,7 @@ def test_attention_graph_split_scheduler_thd_replay(kind, chunks, monkeypatch):
                         torch.testing.assert_close(
                             grad,
                             expected_params[chunk, count][name],
+                            **tolerance,
                             msg=lambda m: f'parameter {name} count={count} chunk={chunk}: {m}',
                         )
                     models[chunk].zero_grad_buffer()
