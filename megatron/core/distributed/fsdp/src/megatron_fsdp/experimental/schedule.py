@@ -21,12 +21,26 @@ from dataclasses import dataclass
 class SchedulePolicy:
     """Control communication scheduling for one FSDP module.
 
-    ``None`` prefetches one successor, preserving the default behavior. ``0``
-    disables prefetching. Positive values specify parameter-element budgets.
+    Attributes:
+        forward_prefetch_size: How much this module prefetches for its successors
+            in forward order. ``None`` (the default) prefetches one successor, ``0``
+            disables prefetching, and positive values are parameter-element budgets.
+        backward_prefetch_size: The same as ``forward_prefetch_size``, for backward
+            order.
+        unshard_rowwise_in_backward: Whether backward unshards and prefetches of this
+            module gather MXFP8 rowwise planes along with columnwise ones, keeping them
+            until post_backward. Enable it when activations recomputed in backward use
+            this module's MXFP8 weights. Otherwise, backward unshards gather only
+            columnwise planes, so either:
+            1) a recomputation that does not re-enter this module's forward hooks finds
+               no rowwise planes and fails in Transformer Engine; or
+            2) a recomputation that does re-enter them gathers the rowwise planes
+               separately on demand, without overlap, degrading performance.
     """
 
     forward_prefetch_size: int | None = None
     backward_prefetch_size: int | None = None
+    unshard_rowwise_in_backward: bool = False
 
     def __post_init__(self) -> None:
         """Validate non-negative prefetch budgets."""
