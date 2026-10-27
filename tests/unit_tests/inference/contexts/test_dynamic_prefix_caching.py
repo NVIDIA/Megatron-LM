@@ -2765,6 +2765,16 @@ PREFIX_CACHE_ENGINE_CASES = [
         id="ep4-moe-lru",
     ),
     pytest.param(
+        dict(
+            name="ep4-optimized-moe-lru",
+            feature="moe",
+            ep=4,
+            optimized=True,
+            policy=PrefixCachingEvictionPolicy.LRU,
+        ),
+        id="ep4-optimized-moe-lru",
+    ),
+    pytest.param(
         dict(name="gpt-chunked-lru", feature="chunked", policy=PrefixCachingEvictionPolicy.LRU),
         id="gpt-chunked-lru",
     ),
@@ -2864,6 +2874,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             pipeline_model_parallel_size=case.get("pp", 1),
             expert_model_parallel_size=case.get("ep", 1),
             use_moe_layer_spec=feature == "moe",
+            transformer_impl="inference_optimized" if case.get("optimized") else "local",
             model_provider=case.get("model_provider", "gpt"),
             ssm_mixer=case.get("ssm_mixer", "mamba"),
             enable_prefix_caching=enable_prefix_caching,
@@ -2908,8 +2919,14 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         evidence = {
             "tp_reducing_forwards": 0,
             "pipeline_forwards": 0,
+            "current_step": 0,
             "moe_dispatches": 0,
             "moe_request_ids": set(),
+            "moe_dispatch_request_steps": set(),
+            "moe_expert_steps": set(),
+            "moe_combine_steps": set(),
+            "moe_expert_backends": set(),
+            "prefix_hit_steps": set(),
             "fused_rope_calls": 0,
             "mamba_restores": 0,
             "gdp_prefills": 0,
@@ -2954,10 +2971,39 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                     evidence["moe_request_ids"].update(
                         request_id for request_id in active_request_ids.tolist() if request_id >= 0
                     )
+                    evidence["moe_dispatch_request_steps"].update(
+                        (evidence["current_step"], request_id)
+                        for request_id in active_request_ids.tolist()
+                        if request_id >= 0
+                    )
                     return _original(*args, **kwargs)
 
                 module.dispatch = traced_moe_dispatch
                 instrumented_layers += 1
+                if not case.get("optimized"):
+                    continue
+                experts = module.experts
+                original_expert = experts.forward
+
+                def traced_expert(*args, _experts=experts, _original=original_expert, **kwargs):
+                    routing_map = kwargs["routing_map"]
+                    assert routing_map.shape[0] == args[0].shape[0]
+                    evidence["moe_expert_steps"].add(evidence["current_step"])
+                    evidence["moe_expert_backends"].add(
+                        _experts.inference_grouped_gemm_backend.value
+                    )
+                    return _original(*args, **kwargs)
+
+                experts.forward = traced_expert
+                inference_dispatcher = module._inference_token_dispatcher
+                original_combine = inference_dispatcher.token_combine
+
+                def traced_combine(*args, _original=original_combine, **kwargs):
+                    result = _original(*args, **kwargs)
+                    evidence["moe_combine_steps"].add(evidence["current_step"])
+                    return result
+
+                inference_dispatcher.token_combine = traced_combine
             assert instrumented_layers > 0
 
         if feature == "fused-rope":
@@ -3016,11 +3062,11 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         context = engine.context
         allocator = context.kv_block_allocator
         engine.controller.tokenizer.detokenize = lambda tokens, **_: f"tok_{tokens[0]}"
+        model = engine.controller.inference_wrapped_model.model
         if case["feature"] == "fused-rope":
             # The shared test model is CPU-initialized, while FlashInfer requires
             # its cos/sin cache on CUDA. Establish that kernel precondition here;
             # lazy cache migration is owned by the separate fused-RoPE fix.
-            model = engine.controller.inference_wrapped_model.model
             model.rotary_pos_emb.inv_freq = model.rotary_pos_emb.inv_freq.cuda()
             model.rotary_pos_emb_cache.clear()
             assert model.config.hidden_size // model.config.num_attention_heads == 64
@@ -3106,6 +3152,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 feature_before = evidence[feature_key] if feature_key is not None else None
                 mamba_restores_before = evidence["mamba_restores"]
                 mtp_before = int(engine._spec_tokens_proposed_per_pos.sum())
+                evidence["current_step"] = step_count + 1
                 result = engine.step_modern()
                 step_count += 1
                 newly_cached_ids = {
@@ -3116,6 +3163,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 if engine._prefix_cache_hits > step_hits_before:
                     assert newly_cached_ids
                     cached_request_ids.update(newly_cached_ids)
+                    evidence["prefix_hit_steps"].add(step_count)
                     if feature_key is not None:
                         assert evidence[feature_key] > feature_before
                         if case["feature"] == "gdp":
@@ -3199,6 +3247,24 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             # Correlate live dispatcher request IDs with the cached follower.
             assert cached_request_ids & evidence["moe_request_ids"]
             feature_seen_for_cached_request = True
+
+        if enable_prefix_caching and case.get("optimized"):
+            # The optimized path must run dispatch, experts, and combine on a cache-hit step.
+            cached_dispatch_steps = {
+                step
+                for step, request_id in evidence["moe_dispatch_request_steps"]
+                if request_id in cached_request_ids
+            }
+            stressed_steps = (
+                evidence["prefix_hit_steps"]
+                & cached_dispatch_steps
+                & evidence["moe_expert_steps"]
+                & evidence["moe_combine_steps"]
+            )
+            assert stressed_steps
+            assert evidence["moe_expert_backends"] == {
+                model.config.inference_grouped_gemm_backend.value
+            }
 
         for request in finished.values():
             request.finalize_text(engine.controller.tokenizer)

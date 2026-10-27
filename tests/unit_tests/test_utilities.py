@@ -101,11 +101,13 @@ def _restore_torch_settings(settings):
     mode, warn_only = settings["deterministic"]
     torch.use_deterministic_algorithms(mode, warn_only=warn_only)
     torch.utils.deterministic.fill_uninitialized_memory = settings["fill_uninitialized_memory"]
-    (
-        torch.backends.cudnn.deterministic,
-        torch.backends.cudnn.benchmark,
-        torch.backends.cudnn.allow_tf32,
-    ) = settings["cudnn"]
+    # Some kernel libraries lock direct cuDNN mutation; avoid an identical write.
+    if settings["cudnn"] != _snapshot_torch_settings()["cudnn"]:
+        (
+            torch.backends.cudnn.deterministic,
+            torch.backends.cudnn.benchmark,
+            torch.backends.cudnn.allow_tf32,
+        ) = settings["cudnn"]
     (
         torch.backends.cuda.matmul.allow_tf32,
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,

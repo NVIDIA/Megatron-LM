@@ -42,6 +42,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     RequestOverflowError,
     TokenOverflowError,
 )
+from megatron.core.inference.disaggregation.engine import StateHandoffDynamicInferenceEngine
 from megatron.core.inference.engines import DynamicInferenceEngine, dynamic_engine
 from megatron.core.inference.engines.dynamic_engine import EngineState, RequestEntry
 from megatron.core.inference.headers import Headers
@@ -904,6 +905,7 @@ class DynamicEngineTestConfig:
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
     expert_model_parallel_size: int = 1
+    expert_tensor_parallel_size: int = 1
     # EP process groups can also exercise dense models; build MoE layers only
     # when a test explicitly owns that model behavior.
     use_moe_layer_spec: bool = False
@@ -948,8 +950,17 @@ class DynamicEngineTestConfig:
     cuda_graph_impl: Optional[str] = None
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
+    inference_grouped_gemm_backend: str = "vllm"
+    inference_moe_nvfp4_recipe: Optional[str] = None
     inference_moe_token_dispatcher_type: str = "nccl"
     moe_enable_routing_replay: bool = False
+    moe_router_topk: int = 2
+    moe_router_load_balancing_type: str = "aux_loss"
+    moe_router_score_function: str = "softmax"
+    moe_num_hash_layers: int = 0
+    moe_apply_probs_on_input: bool = False
+    moe_latent_size: Optional[int] = None
+    moe_use_norm_before_up_proj: bool = False
     # If False, do not build cuda graphs in the tests, even if
     # num_cuda_graphs is set.
     # For tests concerning cuda-graph warmups, we set this to False
@@ -958,6 +969,7 @@ class DynamicEngineTestConfig:
     # context attributes are set correctly.
     suspend_resume_interval: Optional[int] = None
     kv_cache_management_mode: str = "persist"
+    kv_transport_backend: str = "nixl"
     static_kv_memory_pointers: bool = True
     track_generated_token_events: bool = False
     track_paused_request_events: bool = False
@@ -1145,6 +1157,7 @@ class DynamicInferenceEngineTestBase:
                 kv_cache_management_mode=KVCacheManagementMode(
                     test_config.kv_cache_management_mode
                 ),
+                kv_transport_backend=test_config.kv_transport_backend,
                 static_kv_memory_pointers=test_config.static_kv_memory_pointers,
                 enable_chunked_prefill=test_config.enable_chunked_prefill,
                 enable_prefix_caching=test_config.enable_prefix_caching,
@@ -1167,7 +1180,7 @@ class DynamicInferenceEngineTestBase:
 
     @classmethod
     @torch.inference_mode()
-    def _build_test_env(cls, test_config):
+    def _build_test_env(cls, test_config, engine_cls=DynamicInferenceEngine):
         clear_nvte_env_vars()
         set_rounder(4)
 
@@ -1212,7 +1225,10 @@ class DynamicInferenceEngineTestBase:
                     else (
                         "fp32"
                         if test_config.transformer_impl == "inference_optimized"
-                        and test_config.expert_model_parallel_size > 1
+                        and (
+                            test_config.use_moe_layer_spec
+                            or test_config.expert_model_parallel_size > 1
+                        )
                         else None
                     )
                 ),
@@ -1228,10 +1244,15 @@ class DynamicInferenceEngineTestBase:
                 tensor_model_parallel_size=test_config.tensor_model_parallel_size,
                 pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
                 expert_model_parallel_size=test_config.expert_model_parallel_size,
+                expert_tensor_parallel_size=test_config.expert_tensor_parallel_size,
                 num_moe_experts=(
-                    None
-                    if test_config.expert_model_parallel_size == 1
-                    else test_config.expert_model_parallel_size
+                    max(2, test_config.expert_model_parallel_size)
+                    if test_config.use_moe_layer_spec or test_config.expert_model_parallel_size > 1
+                    else None
+                ),
+                moe_grouped_gemm=(
+                    test_config.use_moe_layer_spec
+                    and test_config.transformer_impl == "transformer_engine"
                 ),
                 sequence_parallel=test_config.sequence_parallel,
                 pipeline_dtype=torch.bfloat16,
@@ -1251,13 +1272,21 @@ class DynamicInferenceEngineTestBase:
                 activation_func=(
                     squared_relu
                     if test_config.transformer_impl == "inference_optimized"
-                    and test_config.expert_model_parallel_size > 1
+                    and (
+                        test_config.use_moe_layer_spec or test_config.expert_model_parallel_size > 1
+                    )
                     else torch.nn.functional.gelu
                 ),
                 inference_moe_token_dispatcher_type=(
                     test_config.inference_moe_token_dispatcher_type
                 ),
                 moe_enable_routing_replay=test_config.moe_enable_routing_replay,
+                moe_router_topk=test_config.moe_router_topk,
+                moe_router_load_balancing_type=test_config.moe_router_load_balancing_type,
+                moe_router_score_function=test_config.moe_router_score_function,
+                moe_apply_probs_on_input=test_config.moe_apply_probs_on_input,
+                moe_latent_size=test_config.moe_latent_size,
+                moe_use_norm_before_up_proj=test_config.moe_use_norm_before_up_proj,
                 normalization=(
                     "RMSNorm"
                     if test_config.transformer_impl == "inference_optimized"
@@ -1274,7 +1303,9 @@ class DynamicInferenceEngineTestBase:
                 transformer_config.num_moe_experts if test_config.use_moe_layer_spec else None
             )
             if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
-                layer_spec = get_gpt_layer_with_transformer_engine_spec(num_experts=num_experts)
+                layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                    num_experts=num_experts, moe_grouped_gemm=test_config.use_moe_layer_spec
+                )
             elif test_config.transformer_impl == "local":
                 layer_spec = get_gpt_layer_local_spec(num_experts=num_experts)
             elif test_config.transformer_impl == "inference_optimized":
@@ -1315,7 +1346,16 @@ class DynamicInferenceEngineTestBase:
                 moe_pad_experts_for_cuda_graph_inference=(
                     test_config.moe_pad_experts_for_cuda_graph_inference
                 ),
-                moe_router_dtype=test_config.moe_router_dtype,
+                moe_router_dtype=(
+                    test_config.moe_router_dtype
+                    if test_config.moe_router_dtype is not None
+                    else (
+                        "fp32"
+                        if test_config.transformer_impl == "inference_optimized"
+                        and test_config.use_moe_layer_spec
+                        else None
+                    )
+                ),
                 hidden_size=256,  # The Mamba layer places several constraints on this
                 **hybrid_mixer_kwargs(test_config.ssm_mixer),
                 num_attention_heads=16,
@@ -1330,10 +1370,11 @@ class DynamicInferenceEngineTestBase:
                 tensor_model_parallel_size=test_config.tensor_model_parallel_size,
                 pipeline_model_parallel_size=pp_size,
                 expert_model_parallel_size=test_config.expert_model_parallel_size,
+                expert_tensor_parallel_size=test_config.expert_tensor_parallel_size,
                 num_moe_experts=(
-                    None
-                    if test_config.expert_model_parallel_size == 1
-                    else test_config.expert_model_parallel_size
+                    max(2, test_config.expert_model_parallel_size)
+                    if test_config.use_moe_layer_spec or test_config.expert_model_parallel_size > 1
+                    else None
                 ),
                 sequence_parallel=test_config.sequence_parallel,
                 pipeline_dtype=torch.bfloat16,
@@ -1350,17 +1391,30 @@ class DynamicInferenceEngineTestBase:
                     else InferenceCudaGraphScope.none
                 ),
                 transformer_impl=test_config.transformer_impl,
+                inference_grouped_gemm_backend=test_config.inference_grouped_gemm_backend,
                 inference_moe_token_dispatcher_type=(
                     test_config.inference_moe_token_dispatcher_type
                 ),
                 moe_enable_routing_replay=test_config.moe_enable_routing_replay,
+                moe_num_hash_layers=test_config.moe_num_hash_layers,
+                hash_moe_vocab_size=(
+                    test_config.vocab_size if test_config.moe_num_hash_layers else None
+                ),
                 normalization=(
                     "RMSNorm"
                     if is_gdn or test_config.transformer_impl == "inference_optimized"
                     else "LayerNorm"
                 ),
-                layernorm_zero_centered_gamma=is_gdn,
-                activation_func=F.silu if is_gdn else F.gelu,
+                layernorm_zero_centered_gamma=is_gdn
+                and test_config.transformer_impl != "inference_optimized",
+                gated_linear_unit=is_gdn and test_config.use_moe_layer_spec,
+                activation_func=(
+                    squared_relu
+                    if test_config.transformer_impl == "inference_optimized"
+                    and test_config.use_moe_layer_spec
+                    and not is_gdn
+                    else (F.silu if is_gdn else F.gelu)
+                ),
                 is_hybrid_model=True,  # Needs to be set for correct out_proj init
             )
 
@@ -1369,13 +1423,18 @@ class DynamicInferenceEngineTestBase:
             # to the hybrid layer pattern so the model creates MTP blocks.
             mtp_suffix = ("/" + test_config.mtp_layer_pattern) * test_config.num_speculative_tokens
             recurrent_symbol = "G" if is_gdn else "M"
+            feedforward_symbol = "E" if test_config.use_moe_layer_spec else "-"
             if pp_size == 1:
-                mamba_pattern = recurrent_symbol + "*-" + mtp_suffix
+                mamba_pattern = recurrent_symbol + "*" + feedforward_symbol + mtp_suffix
             else:
-                mamba_pattern = recurrent_symbol + "*-|" + recurrent_symbol + "*-" + mtp_suffix
+                stage_pattern = recurrent_symbol + "*" + feedforward_symbol
+                mamba_pattern = stage_pattern + "|" + stage_pattern + mtp_suffix
             model = HybridModel(
                 config=transformer_config,
-                hybrid_stack_spec=hybrid_stack_spec_for(test_config.ssm_mixer),
+                hybrid_stack_spec=hybrid_stack_spec_for(
+                    test_config.ssm_mixer,
+                    inference_optimized=test_config.transformer_impl == "inference_optimized",
+                ),
                 vocab_size=test_config.vocab_size,
                 max_sequence_length=test_config.max_sequence_length,
                 parallel_output=True,
@@ -1420,7 +1479,7 @@ class DynamicInferenceEngineTestBase:
         delete_cuda_graphs()
 
         # Inference engine.
-        engine = DynamicInferenceEngine(text_generation_controller, inference_context)
+        engine = engine_cls(text_generation_controller, inference_context)
 
         # Test env.
         env = DynamicEngineTestEnv(config=test_config, requests=requests, engine=engine)
@@ -3215,6 +3274,42 @@ def test_stop_word_checkpoint_boundary_preserves_result_alignment(
 
 class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
+    @staticmethod
+    def _handoff_config(**overrides):
+        return DynamicEngineTestConfig(
+            num_requests=1,
+            min_prompt_length=70,
+            max_prompt_length=70,
+            num_tokens_to_generate=4,
+            num_gap_steps=0,
+            context_buffer_size_gb=0.02,
+            context_block_size_tokens=64,
+            context_max_requests=4,
+            context_max_tokens=128,
+            enable_prefix_caching=True,
+            flash_attention_version=4 if torch.cuda.get_device_capability()[0] >= 10 else 3,
+            use_moe_layer_spec=True,
+            transformer_impl="inference_optimized",
+            top_k=1,
+            **overrides,
+        )
+
+    @staticmethod
+    def _run_to_completion(env):
+        completed = []
+        while env.engine.has_unfinished_requests():
+            completed.extend(env.engine.step_modern()["finished_requests"])
+        assert len(completed) == 1
+        return completed[0]
+
+    @staticmethod
+    def _count_expert_forwards(env, counts, phase):
+        for module in env.engine.controller.inference_wrapped_model.model.modules():
+            if type(module).__name__ == "InferenceGroupedMLP":
+                module.register_forward_hook(
+                    lambda _module, _inputs, _output: counts.__setitem__(phase, counts[phase] + 1)
+                )
+
     @classmethod
     def setup_class(cls):
         Utils.initialize_model_parallel(
@@ -3229,6 +3324,202 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         delete_cuda_graphs()
         reset_rounder()
         Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="paged handoff witness requires latest flash attn"
+    )
+    @torch.inference_mode()
+    def test_moe_decode_after_local_kv_handoff_matches_uninterrupted_request(self):
+        config = self._handoff_config()
+
+        baseline = self._build_test_env(config)
+        baseline_request = baseline.requests[0]
+        baseline_request.sampling_params.termination_id = -1
+        baseline.engine._add_request(baseline_request)
+        expected = self._run_to_completion(baseline).generated_tokens
+        prompt = baseline_request.prompt_tokens.tolist()
+        del baseline
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        source = self._build_test_env(config, engine_cls=StateHandoffDynamicInferenceEngine)
+        assert source.requests[0].prompt_tokens.tolist() == prompt
+        source_request = source.requests[0]
+        source_request.sampling_params.termination_id = -1
+        source_request.sampling_params.do_kv_handoff = True
+        source_request.sampling_params.num_tokens_to_generate = 0
+        source.engine.context.kv_block_allocator.enable_handoff_pinning = True
+        source.engine._kv_transfer_role = "prefill"
+        source.engine._kv_peer_metas = {"transport": "local-copy"}
+        source.engine._pp_kv_peer_metas = [source.engine._kv_peer_metas]
+        expert_counts = {"prefill": 0, "decode": 0}
+        self._count_expert_forwards(source, expert_counts, "prefill")
+        source.engine._add_request(source_request)
+        prefill_result = self._run_to_completion(source)
+
+        handoff = prefill_result.disaggregated_params
+        assert handoff is not None
+        src_block_ids = handoff["block_ids"]
+        kv_meta = handoff["kv_meta"]
+        assert len(src_block_ids) == 2
+        assert len(kv_meta["resume_tokens"]) == 1
+        assert source.engine.pinned_handoff_block_count == 2
+
+        destination = self._build_test_env(config, engine_cls=StateHandoffDynamicInferenceEngine)
+        self._count_expert_forwards(destination, expert_counts, "decode")
+        decode_only_steps = []
+        original_forward = destination.engine.controller._dynamic_step_forward_logits
+
+        def record_decode_forward(*args, **kwargs):
+            decode_only_steps.append(destination.engine.context.is_decode_only())
+            return original_forward(*args, **kwargs)
+
+        destination.engine.controller._dynamic_step_forward_logits = record_decode_forward
+
+        class CompletedCopy:
+            storage_safe = True
+
+            @staticmethod
+            def poll():
+                return True
+
+            @staticmethod
+            def wait():
+                return True
+
+        class LocalCopyAgent:
+            is_push = False
+
+            def __init__(self):
+                self.copies = []
+
+            def begin_pull_blocks(self, _meta, source_blocks, destination_blocks):
+                src = torch.tensor(source_blocks, dtype=torch.long, device="cuda")
+                dst = torch.tensor(destination_blocks, dtype=torch.long, device="cuda")
+                payload = source.engine.context.memory_buffer.index_select(2, src)
+                destination.engine.context.memory_buffer.index_copy_(2, dst, payload)
+                assert torch.equal(
+                    destination.engine.context.memory_buffer.index_select(2, dst), payload
+                )
+                self.copies.append((list(source_blocks), list(destination_blocks)))
+                return CompletedCopy()
+
+        transfer = LocalCopyAgent()
+        destination.engine._kv_transfer_role = "decode"
+        destination.engine._kv_transfer_agent = transfer
+        decode_params = SamplingParams(num_tokens_to_generate=4, termination_id=-1, top_k=1)
+        future = destination.engine.add_request_with_kv_handoff(
+            0, prompt, decode_params, kv_meta, src_block_ids
+        )
+        assert destination.engine._poll_pending_kv_imports() == 1
+        assert destination.engine._admit_pending_kv_imports() == 1
+        assert transfer.copies and destination.engine.context.num_prefill_requests == 0
+
+        decoded = self._run_to_completion(destination)
+        assert decoded.generated_tokens == expected
+        assert future.done() and future.result().generated_tokens == expected
+        assert decode_only_steps and all(decode_only_steps)
+        assert expert_counts["prefill"] > 0 and expert_counts["decode"] > 0
+        assert destination.engine.pending_kv_import_count == 0
+        assert destination.engine.context.total_request_count == 0
+
+        source.engine.release_handoff_blocks(prefill_result.request_id)
+        assert source.engine.pinned_handoff_block_count == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="paged handoff witness requires latest flash attn"
+    )
+    @torch.inference_mode()
+    def test_moe_decode_after_nccl_kv_handoff_matches_uninterrupted_request(self):
+        if not torch.distributed.is_initialized() or torch.distributed.get_world_size() != 2:
+            pytest.skip("native NCCL handoff witness requires exactly two ranks")
+
+        config = self._handoff_config(kv_transport_backend="nccl", hidden_size=256)
+
+        baseline = self._build_test_env(config)
+        baseline_request = baseline.requests[0]
+        baseline_request.sampling_params.termination_id = -1
+        baseline.engine._add_request(baseline_request)
+        expected = self._run_to_completion(baseline).generated_tokens
+        prompt = baseline_request.prompt_tokens.tolist()
+        del baseline
+        gc.collect()
+        torch.cuda.empty_cache()
+        rank = torch.distributed.get_rank()
+        control_group = torch.distributed.new_group(backend="gloo")
+        env = self._build_test_env(config, engine_cls=StateHandoffDynamicInferenceEngine)
+        role = "prefill" if rank == 0 else "decode"
+        env.engine.setup_kv_transfer(role)
+        peer_metas = [None, None]
+        torch.distributed.all_gather_object(
+            peer_metas, env.engine._kv_transfer_agent.export_meta(), group=control_group
+        )
+        torch.distributed.barrier()  # Initialize the default NCCL communicator before P2P.
+        expert_count = {"count": 0}
+        self._count_expert_forwards(env, expert_count, "count")
+        payload = [None]
+        if rank == 0:
+            request = env.requests[0]
+            request.sampling_params.termination_id = -1
+            request.sampling_params.do_kv_handoff = True
+            request.sampling_params.num_tokens_to_generate = 0
+            env.engine._add_request(request)
+            prefill_result = self._run_to_completion(env)
+            payload[0] = {
+                "request_id": prefill_result.request_id,
+                "block_ids": prefill_result.disaggregated_params["block_ids"],
+                "kv_meta": prefill_result.disaggregated_params["kv_meta"],
+            }
+            assert env.engine.pinned_handoff_block_count == 2
+        torch.distributed.broadcast_object_list(payload, src=0, group=control_group)
+        handoff = payload[0]
+        ready = torch.empty(1, dtype=torch.int32)
+        if rank == 1:
+            env.engine._notify_kv_transfer_ready = lambda *_: torch.distributed.send(
+                ready, 0, group=control_group
+            )
+        future = None
+        if rank == 1:
+            future = env.engine.add_request_with_kv_handoff(
+                handoff["request_id"],
+                prompt,
+                SamplingParams(num_tokens_to_generate=4, termination_id=-1, top_k=1),
+                handoff["kv_meta"],
+                handoff["block_ids"],
+            )
+            assert env.engine.pending_kv_import_count == 1
+        if rank == 0:
+            torch.distributed.recv(ready, 1, group=control_group)
+            env.engine.push_handoff_kv(handoff["request_id"], [peer_metas[1]])
+            assert env.engine.pending_kv_push_count == 1
+            for handle in env.engine._pending_kv_pushes[0][1]:
+                handle.wait()
+            assert env.engine._poll_pending_kv_pushes() == 1
+            env.engine.release_handoff_blocks(handoff["request_id"])
+            assert env.engine.pinned_handoff_block_count == 0
+            decoded_tokens = None
+        else:
+            env.engine._pending_kv_imports[0].handle.wait()
+            assert env.engine._poll_pending_kv_imports() == 1
+            assert env.engine._admit_pending_kv_imports() == 1
+            assert env.engine.context.num_prefill_requests == 0
+            decoded = self._run_to_completion(env)
+            decoded_tokens = decoded.generated_tokens
+            assert future.done() and future.result().generated_tokens == expected
+            assert env.engine.pending_kv_import_count == 0
+            assert env.engine.context.total_request_count == 0
+        receipts = [None, None]
+        torch.distributed.all_gather_object(
+            receipts,
+            {"role": role, "experts": expert_count["count"], "tokens": decoded_tokens},
+            group=control_group,
+        )
+        assert receipts[0]["role"] == "prefill" and receipts[0]["experts"] > 0
+        assert receipts[1]["role"] == "decode" and receipts[1]["experts"] > 0
+        assert receipts[1]["tokens"] == expected
+        torch.distributed.destroy_process_group(control_group)
 
     @pytest.mark.internal
     @pytest.mark.skipif(

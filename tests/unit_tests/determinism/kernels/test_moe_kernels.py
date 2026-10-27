@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from megatron.core import parallel_state
 from megatron.core.activations import squared_relu
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_spec,
@@ -67,6 +68,16 @@ HAVE_TE_ROUTER = HAVE_TE and is_te_min_version("2.7.0")
 from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_DEEP_EP_V2
 
 NUM_TOKENS, HIDDEN, NUM_EXPERTS, TOPK = 16384, 2048, 64, 8
+
+
+class _InInferenceMode(torch.nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+    def forward(self, *args, **kwargs):
+        with InferenceMode.active():
+            return self.module(*args, **kwargs)
 
 
 # --- virtual-expert planning ----------------------------------------------------------------
@@ -1092,21 +1103,11 @@ class TestMoEModules:
     def test_inference_nvfp4_moe_layer_replays(self, gated):
         """Inference MoELayer through FlashInfer per-token NVFP4 squared-ReLU or SwiGLU experts."""
         from megatron.core.inference.moe.flashinfer_nvfp4 import HAVE_FLASHINFER_ROUTED_NVFP4
-        from megatron.core.inference.utils import InferenceMode
         from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
         from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
 
         if not HAVE_FLASHINFER_ROUTED_NVFP4 or torch.cuda.get_device_capability()[0] < 10:
             pytest.skip("per-token NVFP4 MoE needs FlashInfer >= 0.7.0 and Blackwell")
-
-        class _InInferenceMode(torch.nn.Module):
-            def __init__(self, module):
-                super().__init__()
-                self.module = module
-
-            def forward(self, hidden):
-                with InferenceMode.active():
-                    return self.module(hidden)
 
         self._init(ep=1)
         seeded()
