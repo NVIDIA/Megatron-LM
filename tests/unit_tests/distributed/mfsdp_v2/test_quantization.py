@@ -18,6 +18,7 @@ from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
+    SchedulePolicy,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
@@ -124,6 +125,50 @@ requires_mxfp8 = pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] < 10,
     reason="MXFP8 requires Blackwell-or-newer CUDA hardware.",
 )
+
+
+def _allocated_planes(module):
+    """Return whether the module's unsharded (rowwise, columnwise) MXFP8 planes are allocated."""
+    [group] = [g for g in module.parameter_groups if isinstance(g.model_weight, QuantizedDBuffer)]
+    unsharded = group._unsharded_model_weight
+    return unsharded.is_rowwise_allocated, unsharded.is_columnwise_allocated
+
+
+def _is_recomputing():
+    """Return whether forward runs inside autograd, i.e. as a backward recomputation."""
+    return torch._C._current_graph_task_id() != -1
+
+
+def _check_recompute_matches_no_recompute(distributed_setup, recipe, build, use_reentrant):
+    """Train builds without and with recomputation and check they match bit-exactly.
+
+    ``build(use_reentrant)`` returns a fully sharded model and its optimizer.
+    """
+    torch.manual_seed(1234 + distributed_setup.rank)
+    inputs = torch.randn(3, 32, 64, dtype=torch.bfloat16, device=distributed_setup.device)
+
+    def train(model, optimizer):
+        """Return per-step losses and sharded gradients, and the final sharded weights."""
+        losses, grads = [], []
+        for x in inputs:
+            optimizer.zero_grad(set_to_none=True)
+            # Reentrant checkpointing produces gradients only for inputs requiring grad.
+            x = x.clone().requires_grad_()
+            with te.autocast(recipe=recipe):
+                output = model(x)
+            loss = output.float().square().mean()
+            loss.backward()
+            losses.append(loss.detach())
+            grads.append([parameter.grad.to_local().clone() for parameter in model.parameters()])
+            optimizer.step()
+        weights = [parameter.to_local().clone() for parameter in model.parameters()]
+        return losses, grads, weights
+
+    expected_losses, expected_grads, expected_weights = train(*build(None))
+    losses, grads, weights = train(*build(use_reentrant))
+    torch.testing.assert_close(losses, expected_losses, rtol=0, atol=0)
+    torch.testing.assert_close(grads, expected_grads, rtol=0, atol=0)
+    torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
 
 
 def _check_mxfp8_mlp_matches_reference(
@@ -266,14 +311,6 @@ def test_mxfp8_unshard_gathers_rowwise_for_forward_and_columnwise_for_backward(d
         fully_shard(model.fc2, mesh=mesh, placements=_ZERO3_PLACEMENTS)
         fully_shard(model, mesh=mesh, placements=_ZERO3_PLACEMENTS)
 
-    def allocated_planes(module):
-        """Return whether the module's unsharded (rowwise, columnwise) planes are allocated."""
-        [group] = [
-            g for g in module.parameter_groups if isinstance(g.model_weight, QuantizedDBuffer)
-        ]
-        unsharded = group._unsharded_model_weight
-        return unsharded.is_rowwise_allocated, unsharded.is_columnwise_allocated
-
     def installed_planes(module):
         """Return whether the module's weight carries (rowwise, columnwise) data."""
         weight = module.weight
@@ -286,14 +323,14 @@ def test_mxfp8_unshard_gathers_rowwise_for_forward_and_columnwise_for_backward(d
     def check_forward(_module, _args):
         # fc1 runs forward GEMMs and prefetches fc2 for its forward GEMMs.
         for module in (model.fc1, model.fc2):
-            assert allocated_planes(module) == (True, False)
+            assert _allocated_planes(module) == (True, False)
             assert installed_planes(module) == (True, False)
         checked_phases.append("forward")
 
     def check_backward(_module, _grad_output):
         # fc2 runs data-gradient GEMMs and prefetches fc1 for its data-gradient GEMMs.
         for module in (model.fc2, model.fc1):
-            assert allocated_planes(module) == (False, True)
+            assert _allocated_planes(module) == (False, True)
             assert installed_planes(module) == (False, True)
         checked_phases.append("backward")
 
@@ -307,143 +344,158 @@ def test_mxfp8_unshard_gathers_rowwise_for_forward_and_columnwise_for_backward(d
 
     assert checked_phases == ["forward", "backward"]
     for module in (model.fc1, model.fc2):
-        assert allocated_planes(module) == (False, False)
+        assert _allocated_planes(module) == (False, False)
 
 
 @pytest.mark.launch_on_gb200
 @requires_mxfp8
 @pytest.mark.parametrize("placements", _MXFP8_PLACEMENTS)
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
+@pytest.mark.parametrize(
+    "unshard_rowwise_in_backward", [False, True], ids=["on_demand", "rowwise_in_backward"]
+)
 def test_mxfp8_activation_recompute_matches_no_recompute(
-    distributed_setup, use_reentrant, placements
+    distributed_setup, use_reentrant, placements, unshard_rowwise_in_backward
 ):
-    """Recomputation regathers rowwise planes in backward without changing numerics.
-
-    With sharded compute weights, backward prefetch gathers only columnwise planes,
-    so recomputed forwards must gather rowwise planes on demand. Replicated compute
-    weights need no gather and keep both planes installed. Shapes need padded
-    scales, which covers reinstalling padded scale copies on the Parameter TE saved
-    for backward.
-    """
+    """Recomputation regathers rowwise planes in backward without changing numerics."""
     device = distributed_setup.device
     if distributed_setup.world_size < 2:
         pytest.skip("Distributed MXFP8 coverage requires at least two ranks.")
 
     recipe = MXFP8BlockScaling()
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    policy = SchedulePolicy(unshard_rowwise_in_backward=unshard_rowwise_in_backward)
 
     def build(use_reentrant):
         with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
             torch.manual_seed(2026)
             model = _RecomputedMLP(device, use_reentrant)
         with fully_shard_context(FsdpContext(device=device)):
-            fully_shard(model.fc1, mesh=mesh, placements=placements)
-            fully_shard(model.fc2, mesh=mesh, placements=placements)
-            fully_shard(model, mesh=mesh, placements=placements)
+            fully_shard(model.fc1, mesh=mesh, placements=placements, schedule_policy=policy)
+            fully_shard(model.fc2, mesh=mesh, placements=placements, schedule_policy=policy)
+            fully_shard(model, mesh=mesh, placements=placements, schedule_policy=policy)
         optimizer = FusedAdam(model.parameters(), lr=0.01)
         fully_shard_optimizer(optimizer)
         return model, optimizer
 
-    torch.manual_seed(1234 + distributed_setup.rank)
-    inputs = torch.randn(3, 32, 64, dtype=torch.bfloat16, device=device)
-
-    def train(model, optimizer):
-        """Return per-step losses and sharded gradients, and the final sharded weights."""
-        losses, grads = [], []
-        for x in inputs:
-            optimizer.zero_grad(set_to_none=True)
-            # Reentrant checkpointing produces gradients only for inputs requiring grad.
-            x = x.clone().requires_grad_()
-            with te.autocast(recipe=recipe):
-                output = model(x)
-            loss = output.float().square().mean()
-            loss.backward()
-            losses.append(loss.detach())
-            grads.append([parameter.grad.to_local().clone() for parameter in model.parameters()])
-            optimizer.step()
-        weights = [parameter.to_local().clone() for parameter in model.parameters()]
-        return losses, grads, weights
-
-    expected_losses, expected_grads, expected_weights = train(*build(None))
-    losses, grads, weights = train(*build(use_reentrant))
-    torch.testing.assert_close(losses, expected_losses, rtol=0, atol=0)
-    torch.testing.assert_close(grads, expected_grads, rtol=0, atol=0)
-    torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
+    _check_recompute_matches_no_recompute(distributed_setup, recipe, build, use_reentrant)
 
 
 @pytest.mark.launch_on_gb200
 @requires_mxfp8
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
-def test_mxfp8_recompute_inside_fsdp_module_matches_no_recompute(
-    distributed_setup, use_reentrant
+@pytest.mark.parametrize(
+    "unshard_rowwise_in_backward", [False, True], ids=["on_demand", "rowwise_in_backward"]
+)
+def test_mxfp8_backward_unshard_gathers_rowwise_for_recompute(
+    distributed_setup, use_reentrant, unshard_rowwise_in_backward
 ):
-    """Recomputing a submodule of a root FsdpModule regathers its rowwise planes on demand.
+    """Checks rowwise planes are ready before a re-entered recomputation only when opted in.
 
-    With sharded compute weights, backward unshards the root with columnwise planes only.
-    The checkpoint inside the root's forward recomputes only ``proj``, without re-entering
-    the root's pre_forward, so the root's rowwise planes must be gathered when ``proj`` runs
-    again. Replicated compute weights keep both planes and are covered by
-    test_mxfp8_activation_recompute_matches_no_recompute.
+    Also checks both planes are released after backward.
     """
     device = distributed_setup.device
     if distributed_setup.world_size < 2:
         pytest.skip("Distributed MXFP8 coverage requires at least two ranks.")
 
     recipe = MXFP8BlockScaling()
+    with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
+        model = _RecomputedMLP(device, use_reentrant)
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    policy = SchedulePolicy(unshard_rowwise_in_backward=unshard_rowwise_in_backward)
+    with fully_shard_context(device=device):
+        fully_shard(model.fc1, mesh=mesh, placements=_ZERO3_PLACEMENTS, schedule_policy=policy)
+        fully_shard(model.fc2, mesh=mesh, placements=_ZERO3_PLACEMENTS, schedule_policy=policy)
+        fully_shard(model, mesh=mesh, placements=_ZERO3_PLACEMENTS, schedule_policy=policy)
+
+    # Prepended so it runs before the FSDP pre_forward that would gather on demand.
+    def check_recompute(module, _args):
+        if _is_recomputing():
+            assert _allocated_planes(module)[0] == unshard_rowwise_in_backward
+
+    for module in (model.fc1, model.fc2):
+        module.register_forward_pre_hook(check_recompute, prepend=True)
+
+    # Reentrant checkpointing produces gradients only for inputs requiring grad.
+    x = torch.randn(32, 64, dtype=torch.bfloat16, device=device, requires_grad=True)
+    with te.autocast(recipe=recipe):
+        output = model(x)
+    output.float().square().mean().backward()
+
+    for module in (model.fc1, model.fc2):
+        assert _allocated_planes(module) == (False, False)
+
+
+@pytest.mark.launch_on_gb200
+@requires_mxfp8
+@pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
+def test_mxfp8_recompute_inside_fsdp_module_matches_no_recompute(distributed_setup, use_reentrant):
+    """Checks recomputing ``proj`` inside the opted-in root matches no recompute bit-exactly."""
+    device = distributed_setup.device
+    if distributed_setup.world_size < 2:
+        pytest.skip("Distributed MXFP8 coverage requires at least two ranks.")
+
+    recipe = MXFP8BlockScaling()
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    policy = SchedulePolicy(unshard_rowwise_in_backward=True)
 
     def build(use_reentrant):
         with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
             torch.manual_seed(2026)
             model = _RecomputedBlockWithOwnedProj(device, use_reentrant)
         with fully_shard_context(device=device):
-            fully_shard(model, mesh=mesh, placements=_ZERO3_PLACEMENTS)
+            fully_shard(model, mesh=mesh, placements=_ZERO3_PLACEMENTS, schedule_policy=policy)
         optimizer = FusedAdam(model.parameters(), lr=0.01)
         fully_shard_optimizer(optimizer)
         return model, optimizer
 
-    def proj_planes(model):
-        """Return whether the root's unsharded (rowwise, columnwise) planes are allocated."""
-        [group] = [
-            g for g in model.parameter_groups if isinstance(g.model_weight, QuantizedDBuffer)
-        ]
-        unsharded = group._unsharded_model_weight
-        return unsharded.is_rowwise_allocated, unsharded.is_columnwise_allocated
+    _check_recompute_matches_no_recompute(distributed_setup, recipe, build, use_reentrant)
 
-    torch.manual_seed(1234 + distributed_setup.rank)
-    inputs = torch.randn(3, 32, 64, dtype=torch.bfloat16, device=device)
 
-    def train(model, optimizer):
-        """Return per-step losses and sharded gradients, and the final sharded weights."""
-        recomputed = []
-        if model.use_reentrant is not None:
-            # Registered after fully_shard(), so this runs after any FSDP hook on proj.
-            def check_recompute(_module, _args):
-                if torch._C._current_graph_task_id() != -1:
-                    assert proj_planes(model)[0], "proj recomputed without rowwise planes"
-                    recomputed.append(True)
+@pytest.mark.launch_on_gb200
+@requires_mxfp8
+@pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
+@pytest.mark.parametrize(
+    "unshard_rowwise_in_backward", [False, True], ids=["on_demand", "rowwise_in_backward"]
+)
+def test_mxfp8_backward_unshard_gathers_rowwise_for_recompute_inside_fsdp_module(
+    distributed_setup, use_reentrant, unshard_rowwise_in_backward
+):
+    """Checks recomputing ``proj`` inside the root fails without the opt-in.
 
-            model.proj.register_forward_pre_hook(check_recompute)
-        losses, grads = [], []
-        for x in inputs:
-            optimizer.zero_grad(set_to_none=True)
-            # Reentrant checkpointing produces gradients only for inputs requiring grad.
-            x = x.clone().requires_grad_()
-            with te.autocast(recipe=recipe):
-                output = model(x)
-            loss = output.float().square().mean()
+    With the opt-in, checks both planes are ready during recomputation and released after
+    backward.
+    """
+    device = distributed_setup.device
+    if distributed_setup.world_size < 2:
+        pytest.skip("Distributed MXFP8 coverage requires at least two ranks.")
+
+    recipe = MXFP8BlockScaling()
+    with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
+        model = _RecomputedBlockWithOwnedProj(device, use_reentrant)
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    policy = SchedulePolicy(unshard_rowwise_in_backward=unshard_rowwise_in_backward)
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_ZERO3_PLACEMENTS, schedule_policy=policy)
+
+    # Reentrant checkpointing produces gradients only for inputs requiring grad.
+    x = torch.randn(32, 64, dtype=torch.bfloat16, device=device, requires_grad=True)
+    with te.autocast(recipe=recipe):
+        output = model(x)
+    loss = output.float().square().mean()
+    if not unshard_rowwise_in_backward:
+        with pytest.raises(Exception, match="row-scaled"):
             loss.backward()
-            assert proj_planes(model) == (False, False)
-            losses.append(loss.detach())
-            grads.append([parameter.grad.to_local().clone() for parameter in model.parameters()])
-            optimizer.step()
-        if model.use_reentrant is not None:
-            assert len(recomputed) == len(inputs)
-        weights = [parameter.to_local().clone() for parameter in model.parameters()]
-        return losses, grads, weights
+        return
 
-    expected_losses, expected_grads, expected_weights = train(*build(None))
-    losses, grads, weights = train(*build(use_reentrant))
-    torch.testing.assert_close(losses, expected_losses, rtol=0, atol=0)
-    torch.testing.assert_close(grads, expected_grads, rtol=0, atol=0)
-    torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
+    recomputed = []
+
+    def check_recompute(_module, _args):
+        if _is_recomputing():
+            assert _allocated_planes(model) == (True, True)
+            recomputed.append(True)
+
+    model.proj.register_forward_pre_hook(check_recompute)
+    loss.backward()
+    assert recomputed == [True]
+    assert _allocated_planes(model) == (False, False)
