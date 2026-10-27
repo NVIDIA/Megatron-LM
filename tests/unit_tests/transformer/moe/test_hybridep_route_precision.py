@@ -16,7 +16,9 @@ pytestmark = pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("masked", [False, True])
 def test_route_precision_forward_backward_across_layouts(distributed_world, masked):
     group = distributed_world
-    assert group.size() == 4
+    if group.size() < 4:
+        pytest.skip("Route placement comparison needs at least four ranks.")
+    num_experts = 8 * group.size()
     device = torch.device("cuda", torch.cuda.current_device())
     generator = torch.Generator(device=device).manual_seed(98 + group.rank())
     values = torch.randn(512, 256, device=device, dtype=torch.bfloat16, generator=generator)
@@ -40,7 +42,7 @@ def test_route_precision_forward_backward_across_layouts(distributed_world, mask
         for ids in ([0, 1, 2, 3, 4, 5], [0, 1, 8, 9, 16, 24], [0, 8, 16, 17, 24, 25]):
             hidden = values.detach().clone().requires_grad_()
             indices = torch.tensor(ids, device=device, dtype=torch.int16).expand(512, -1).clone()
-            probs = torch.zeros(512, 32, device=device)
+            probs = torch.zeros(512, num_experts, device=device)
             probs[:, ids] = weights
             if masked:
                 indices[-64:] = -1
@@ -54,7 +56,7 @@ def test_route_precision_forward_backward_across_layouts(distributed_world, mask
                 num_sms_dispatch_api=4,
                 num_sms_combine_api=4,
                 topk_idx=indices,
-                num_of_experts=32,
+                num_of_experts=num_experts,
                 pad_multiple=32,
                 preserve_route_precision=True,
             )
