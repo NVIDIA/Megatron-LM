@@ -811,10 +811,12 @@ def test_gradients_follow_canonical_source_order(ep_group, dtype, backend):
                 replicas[1].fill_(2)
             elif rank == 1:
                 replicas[0].fill_(1)
-        handle = transport.start_grad_reduce(
-            native_grads=destinations, plan=plan, projections=(0, 1)
-        )
-        transport.wait_grad_reduce(handle)
+        # Peer-TMA launches one projection at a time; exercise the common API.
+        for projection in (1, 0):
+            handle = transport.start_grad_reduce(
+                native_grads=destinations, plan=plan, projections=(projection,)
+            )
+            transport.wait_grad_reduce(handle)
         for tensor in native:
             expected = torch.full_like(tensor, 7)
             if rank == 1:
