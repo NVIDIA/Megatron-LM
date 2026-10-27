@@ -1199,6 +1199,14 @@ class _HybridEPManager(_DispatchManager):
             and self.config.moe_hybridep_routing_map_mode == "indices"
             and not self.drop_and_pad
         )
+        if (
+            self.config.moe_hybridep_preserve_route_precision
+            and not self.use_dense_routing_for_bool_map
+        ):
+            raise ValueError(
+                "HybridEP route precision requires compact-index support and an expert count "
+                "within the backend int16 limit."
+            )
         if self.drop_and_pad:
             assert self.capacity_factor is not None
         self.capacity = None
@@ -1419,6 +1427,7 @@ class _HybridEPManager(_DispatchManager):
                 num_sms_preprocessing_api=self.config.moe_hybridep_num_sms_preprocessing,
                 topk_idx=self.topk_idx,
                 num_of_experts=self.num_experts,
+                preserve_route_precision=self.config.moe_hybridep_preserve_route_precision,
             )
         )
         if has_rank_capacity:

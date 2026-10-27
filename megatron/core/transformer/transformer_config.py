@@ -1343,6 +1343,14 @@ class TransformerConfig(ModelParallelConfig):
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
 
+    moe_hybridep_preserve_route_precision: bool = False
+    """Keep HybridEP expert routes separate until a final FP32 forward/dgrad reduction.
+
+    This removes rank-layout-dependent intermediate BF16 rounding. It increases communication
+    and metadata capacity by up to router top-k. Use the same setting for baseline and scheduler
+    comparisons. Requires the compact-index HybridEP path and excludes pad-to-capacity routing.
+    """
+
     moe_hybridep_pad_variable_tokens: bool = False
     """Dynamically pad uneven local token counts to the HybridEP group maximum before dispatch.
 
@@ -3219,6 +3227,18 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "Flex token dispatcher with deepep/deepepv2 backend does not support "
                     "moe_pad_expert_input_to_capacity"
+                )
+
+        if self.moe_hybridep_preserve_route_precision:
+            if (
+                self.moe_token_dispatcher_type != "flex"
+                or self.moe_flex_dispatcher_backend != "hybridep"
+                or self.moe_hybridep_routing_map_mode != "indices"
+                or self.moe_pad_expert_input_to_capacity
+            ):
+                raise ValueError(
+                    "moe_hybridep_preserve_route_precision requires flex/hybridep with "
+                    "compact indices and without pad-to-capacity routing."
                 )
 
         if self.moe_hybridep_routing_map_mode not in ("indices", "bool"):

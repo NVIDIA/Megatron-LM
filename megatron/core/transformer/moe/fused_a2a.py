@@ -1037,6 +1037,31 @@ class HybridEPExpertDispatch(torch.autograd.Function):
         return None, None, None, None, None, None, None, None, *grad_list
 
 
+class _HybridEPRouteExpand(torch.autograd.Function):
+    """Keep route gradients separate until one FP32 input-gradient reduction."""
+
+    @staticmethod
+    def forward(ctx, hidden, topk):
+        ctx.num_tokens, ctx.hidden_size = hidden.shape
+        ctx.topk = topk
+        return hidden.repeat_interleave(topk, dim=0)
+
+    @staticmethod
+    def backward(ctx, grad_hidden):
+        grad_hidden = grad_hidden.reshape(ctx.num_tokens, ctx.topk, ctx.hidden_size)
+        return grad_hidden.sum(dim=1, dtype=torch.float32).to(grad_hidden.dtype), None
+
+
+class _HybridEPRouteHandle(tuple):
+    """Retain the backend tuple contract, including the final overflow flag."""
+
+    def __new__(cls, handle, num_tokens, topk):
+        result = super().__new__(cls, handle)
+        result.num_tokens = num_tokens
+        result.topk = topk
+        return result
+
+
 if HAVE_HYBRIDEP:
 
     @internal_api
@@ -1083,6 +1108,7 @@ if HAVE_HYBRIDEP:
         num_sms_preprocessing_api=108,
         topk_idx=None,
         num_of_experts=None,
+        preserve_route_precision=False,
     ):
         '''
         Perform fused dispatch for "permute + dispatch a2a + permute" using the
@@ -1120,8 +1146,24 @@ if HAVE_HYBRIDEP:
                 Dense top-k expert indices with shape [num_tokens, topk].
             num_of_experts (int, optional):
                 Total number of experts. Required when topk_idx is provided.
+            preserve_route_precision (bool):
+                Keep each expert route separate through communication, then sum in FP32.
+                Avoids layout-dependent intermediate BF16 rounding in forward and dgrad;
+                increases token communication/metadata capacity by up to router top-k.
         '''
-        return HybridEPDispatch.apply(
+        if preserve_route_precision:
+            if topk_idx is None or not HAVE_HYBRIDEP_DENSE_ROUTING:
+                raise ValueError("Route precision requires HybridEP compact top-k indices.")
+            num_tokens, topk = topk_idx.shape
+            indices = topk_idx.long()
+            selected_probs = probs.gather(1, indices.clamp_min(0)).masked_fill(indices < 0, 0)
+            probs = probs.new_zeros(num_tokens * topk, probs.shape[1]).scatter(
+                1, indices.reshape(-1, 1).clamp_min(0), selected_probs.reshape(-1, 1)
+            )
+            x = _HybridEPRouteExpand.apply(x, topk)
+            routing_map = None
+            topk_idx = topk_idx.reshape(-1, 1)
+        result = HybridEPDispatch.apply(
             x,
             routing_map,
             probs,
@@ -1138,6 +1180,16 @@ if HAVE_HYBRIDEP:
             topk_idx,
             num_of_experts,
         )
+        if preserve_route_precision:
+            hidden, probabilities, scales, counts, handle = result
+            return (
+                hidden,
+                probabilities,
+                scales,
+                counts,
+                _HybridEPRouteHandle(handle, num_tokens, topk),
+            )
+        return result
 
     @internal_api
     def hybrid_ep_combine(x, handle, num_permuted_tokens, pad_multiple, fused=False):
@@ -1157,7 +1209,11 @@ if HAVE_HYBRIDEP:
                 The alignment multiple required for FP8 GEMM. If not provided, no padding
                 is performed.
         '''
-        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple, fused)
+        result = HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple, fused)
+        if isinstance(handle, _HybridEPRouteHandle):
+            result = result.reshape(handle.num_tokens, handle.topk, result.shape[-1])
+            result = result.sum(dim=1, dtype=torch.float32).to(result.dtype)
+        return result
 
 else:
     hybrid_ep_expert_dispatch = None
