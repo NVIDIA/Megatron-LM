@@ -274,7 +274,7 @@ def _assert_optimizer_matches_snapshot(
 
 
 def _assert_checkpoint_records_global_shapes(
-    checkpoint_dir: Path, expected_shapes: dict[str, torch.Size]
+    checkpoint_dir: Path, global_shapes: dict[str, torch.Size]
 ) -> None:
     """Assert the saved checkpoint describes every parameter by its full global shape.
 
@@ -289,7 +289,7 @@ def _assert_checkpoint_records_global_shapes(
     what actually guards it.
     """
     metadata = FileSystemReader(checkpoint_dir).read_metadata()
-    for key, shape in expected_shapes.items():
+    for key, shape in global_shapes.items():
         entry = metadata.state_dict_metadata[f"model.{key}"]
         assert tuple(entry.size) == tuple(shape), f"model.{key}: saved {entry.size}"
 
@@ -311,7 +311,7 @@ def test_checkpoint_roundtrip_default_placements(
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
 
     # Source: train one step so weights and optimizer state are non-trivial, then save.
-    model, optimizer, expected_shapes = _build_sharded(
+    model, optimizer, global_shapes = _build_sharded(
         _TinyModel(), mesh, device, param_dtype=param_dtype, zero_init=False
     )
     _train_one_step(model, optimizer, device, param_dtype=param_dtype)
@@ -319,7 +319,7 @@ def test_checkpoint_roundtrip_default_placements(
 
     with TempNamedDir(tmp_path_dist_ckpt / f"ckpt_{param_dtype}", sync=True) as checkpoint_dir:
         save_checkpoint(model, optimizer, checkpoint_dir)
-        _assert_checkpoint_records_global_shapes(checkpoint_dir, expected_shapes)
+        _assert_checkpoint_records_global_shapes(checkpoint_dir, global_shapes)
         _assert_model_matches_snapshot(model, model_snapshot)
         _assert_optimizer_matches_snapshot(optimizer, optimizer_snapshot)
 
@@ -352,7 +352,7 @@ def test_saved_chunks_match_the_stable_path(
     world_size = distributed_setup.world_size
     mesh = init_device_mesh(device.type, (world_size,))
 
-    model, optimizer, expected_shapes = _build_sharded(_PackedModel(), mesh, device)
+    model, optimizer, global_shapes = _build_sharded(_PackedModel(), mesh, device)
     _train_one_step(
         model, optimizer, device, param_dtype=torch.float32, in_features=4, out_features=16
     )
@@ -375,7 +375,7 @@ def test_saved_chunks_match_the_stable_path(
     # On a single rank nothing can be misplaced: the one shard is the whole tensor.
     if world_size > 1:
         uneven = False
-        for key, shape in expected_shapes.items():
+        for key, shape in global_shapes.items():
             saved_rows = sorted(sizes[0] for _, sizes in analytic_chunks[f"model.{key}"])
             # An empty shard writes nothing, so it has no chunk on either side to compare.
             even_rows = sorted(rows for rows in _even_shard_rows(shape[0], world_size) if rows > 0)
@@ -392,7 +392,7 @@ def test_saved_chunks_tile_every_parameter(distributed_setup, tmp_path_dist_ckpt
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
 
-    model, optimizer, expected_shapes = _build_sharded(_PackedModel(), mesh, device)
+    model, optimizer, global_shapes = _build_sharded(_PackedModel(), mesh, device)
     _train_one_step(
         model, optimizer, device, param_dtype=torch.float32, in_features=4, out_features=16
     )
@@ -401,7 +401,7 @@ def test_saved_chunks_tile_every_parameter(distributed_setup, tmp_path_dist_ckpt
         save_checkpoint(model, optimizer, checkpoint_dir)
         saved_chunks = _saved_chunks(checkpoint_dir)
 
-    for key, shape in expected_shapes.items():
+    for key, shape in global_shapes.items():
         chunks = saved_chunks[f"model.{key}"]
         covered = 0
         for offsets, sizes in chunks:
@@ -453,7 +453,7 @@ def test_metadata_attach_issues_no_collectives(
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
 
-    model, optimizer, expected_shapes = _build_sharded(_PackedModel(), mesh, device)
+    model, optimizer, global_shapes = _build_sharded(_PackedModel(), mesh, device)
     _train_one_step(
         model, optimizer, device, param_dtype=torch.float32, in_features=4, out_features=16
     )
@@ -467,7 +467,7 @@ def test_metadata_attach_issues_no_collectives(
         monkeypatch.setattr(dist, name, _fail)
     state = checkpoint.CheckpointState(model, optimizer).state_dict()
 
-    assert state["model"].keys() == expected_shapes.keys()
+    assert state["model"].keys() == global_shapes.keys()
 
 
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
