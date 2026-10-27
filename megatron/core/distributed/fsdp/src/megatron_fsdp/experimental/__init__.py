@@ -21,7 +21,7 @@ from .fully_shard import Placements, fully_shard, fully_shard_context, microbatc
 from .optimizer import fully_shard_optimizer, init_optimizer_state
 from .placement import ShardLayout
 from .runtime_policy import RuntimePolicy
-from .schedule import SchedulePolicy
+from .schedule_policy import SchedulePolicy
 
 __all__ = [
     "DBuffer",

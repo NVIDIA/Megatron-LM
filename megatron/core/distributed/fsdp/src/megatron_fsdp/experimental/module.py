@@ -41,7 +41,7 @@ from .parameter_group import (
 )
 from .phase import Phase
 from .placement import BlockAtomic, RowAtomic, ShardLayout
-from .schedule import SchedulePolicy
+from .schedule_policy import SchedulePolicy
 
 
 def _is_in_backward() -> bool:

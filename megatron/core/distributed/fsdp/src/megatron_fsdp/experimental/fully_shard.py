@@ -28,7 +28,7 @@ from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .module import FsdpModule
 from .placement import ShardLayout
-from .schedule import SchedulePolicy
+from .schedule_policy import SchedulePolicy
 
 _FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
 
