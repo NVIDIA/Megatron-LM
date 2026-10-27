@@ -1447,8 +1447,9 @@ class TestMLAClipQK:
 class TestMLADynamicInferenceLatentCache:
     """MLA layers of the hybrid inference spec under dynamic batching with cached latents.
 
-    The dynamic context is real and holds one prefill request. Only the attention kernel
-    (``flash_decode_and_prefill``) is stubbed, so FlashAttention and FlashMLA are not needed.
+    The dynamic context is real and holds one request, first in prefill and then in decode. Only
+    the attention kernel (``flash_decode_and_prefill``) is stubbed, so FlashAttention and FlashMLA
+    are not needed.
     """
 
     prompt_len = 16
@@ -1461,7 +1462,7 @@ class TestMLADynamicInferenceLatentCache:
         Utils.destroy_model_parallel()
 
     @staticmethod
-    def _config(*, dsa=False, cache_mla_latents=True, qk_layernorm=True):
+    def _config(*, dsa=False, cache_mla_latents=True, qk_layernorm=True, **overrides):
         """Small DeepSeek-V3.2-shaped config (as in test_dsa_gpt_mamba_equivalence.py)."""
         kwargs = dict(
             num_layers=1,
@@ -1492,6 +1493,7 @@ class TestMLADynamicInferenceLatentCache:
                 dsa_indexer_topk=4,
                 dsa_indexer_rotate_activation=False,
             )
+        kwargs.update(overrides)
         return MLATransformerConfig(**kwargs)
 
     @staticmethod
@@ -1535,6 +1537,34 @@ class TestMLADynamicInferenceLatentCache:
     def _hidden_states(num_tokens, config):
         return torch.randn(num_tokens, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
 
+    @staticmethod
+    def _forward(attention, context, hidden_states, kernel):
+        """One dynamic forward with ``kernel`` in place of flash_decode_and_prefill.
+
+        Returns the kernel's arguments by name and the input of linear_proj.
+        """
+        with (
+            mock.patch.object(attention, "flash_decode_and_prefill", side_effect=kernel) as stub,
+            mock.patch.object(
+                attention.linear_proj, "forward", wraps=attention.linear_proj.forward
+            ) as linear_proj,
+            torch.no_grad(),
+            InferenceMode.active(),
+        ):
+            output, _ = attention(hidden_states, attention_mask=None, inference_context=context)
+        assert output.shape == hidden_states.shape
+        assert stub.call_count == 1
+        kernel_args = (
+            signature(Attention.flash_decode_and_prefill)
+            .bind(attention, *stub.call_args.args, **stub.call_args.kwargs)
+            .arguments
+        )
+        return kernel_args, linear_proj.call_args.args[0]
+
+    @staticmethod
+    def _relative_error(actual, expected):
+        return ((actual.float() - expected.float()).norm() / expected.float().norm()).item()
+
     def test_dsa_layer_runs_dsa_core_without_inference_context(self):
         """Outside inference, the inference spec's DSA layer runs its DSAttention core, which
         runs its indexer."""
@@ -1558,9 +1588,16 @@ class TestMLADynamicInferenceLatentCache:
         assert output.shape == hidden_states.shape
         assert torch.isfinite(output).all()
 
+    def test_dsa_core_rejects_cache_mla_latents(self):
+        """A DSA core attention refuses cached latents, which would bypass it, even when the config
+        does not name the DSA variant (as for a 'D' layer of an API-built hybrid model)."""
+        config = self._config(dsa=True, experimental_attention_variant=None)
+        with pytest.raises(ValueError, match="DSA core attention"):
+            self._build_attention(config, "dsa_layer")
+
     def test_dynamic_batching_requires_cache_mla_latents(self):
-        """Dynamic batching refuses MLA without cached latents, and DSA configs refuse cached
-        latents, so a DSA layer cannot fall back to dense attention under dynamic batching."""
+        """A dynamic-batching forward without cached latents fails (here for the DSA layer), so
+        the cached-latent branch is the only dynamic MLA path."""
         context = self._prefill_context(self._config())
         config = self._config(dsa=True, cache_mla_latents=False)
         attention = self._build_attention(config, "dsa_layer")
@@ -1573,55 +1610,76 @@ class TestMLADynamicInferenceLatentCache:
             attention(hidden_states, attention_mask=None, inference_context=context)
 
     @pytest.mark.parametrize("kv_norm", ["fused", "standalone", "disabled"])
-    def test_dynamic_prefill_up_projects_cached_latents(self, kv_norm):
-        """A dynamic prefill caches the normalized KV latents and up-projects them to the K/V the
-        layer's own linear_kv_up_proj gives, whether the KV norm is fused into that projection, a
-        standalone module (as in DSA), or disabled."""
+    def test_cached_latents_prefill_and_decode(self, kv_norm):
+        """With the KV norm fused into linear_kv_up_proj, standalone (as in DSA) or disabled:
+
+        - prefill caches the normalized KV latents and up-projects them to the K/V that the
+          layer's own linear_kv_up_proj gives;
+        - decode's absorbed query scores the cached latents as the plain query scores those
+          keys, and the absorbed V up-projection maps a cached latent to that token's value.
+        """
         config = self._config(qk_layernorm=kv_norm != "disabled")
+        heads, rank = config.num_attention_heads, config.kv_lora_rank
+        qk_dim, v_dim = config.qk_head_dim, config.v_head_dim
         attention = self._build_attention(
             config, kv_layernorm=TENorm if kv_norm == "standalone" else None
         )
         is_fused = isinstance(attention.linear_kv_up_proj, TELayerNormColumnParallelLinear)
         assert is_fused == (kv_norm == "fused")
+
+        # Prefill.
         context = self._prefill_context(config)
         hidden_states = self._hidden_states(context.padded_active_token_count, config)
-
         # Reference K (without RoPE) and V of the prompt, before absorption rebuilds the layer.
         with torch.no_grad():
             kv_combined, _ = attention.linear_kv_down_proj(hidden_states[: self.prompt_len])
-            kv_compressed = kv_combined[..., : config.kv_lora_rank].contiguous()
+            kv_compressed = kv_combined[..., :rank].contiguous()
             kv, _ = attention.linear_kv_up_proj(attention.kv_layernorm(kv_compressed))
-        kv = kv.view(
-            self.prompt_len, config.num_attention_heads, config.qk_head_dim + config.v_head_dim
+        ref_key, ref_value = torch.split(
+            kv.view(self.prompt_len, heads, qk_dim + v_dim), [qk_dim, v_dim], dim=-1
         )
-        ref_key, ref_value = torch.split(kv, [config.qk_head_dim, config.v_head_dim], dim=-1)
 
         def prefill_kernel(q, *args, **kwargs):
-            return torch.zeros(*q.shape[:3], config.v_head_dim, dtype=q.dtype, device=q.device)
+            return torch.zeros(*q.shape[:3], v_dim, dtype=q.dtype, device=q.device)
 
-        with (
-            mock.patch.object(
-                attention, "flash_decode_and_prefill", side_effect=prefill_kernel
-            ) as kernel,
-            torch.no_grad(),
-            InferenceMode.active(),
-        ):
-            output, _ = attention(hidden_states, attention_mask=None, inference_context=context)
-
-        assert output.shape == hidden_states.shape
-        assert kernel.call_count == 1
-        kernel_args = (
-            signature(Attention.flash_decode_and_prefill)
-            .bind(attention, *kernel.call_args.args, **kernel.call_args.kwargs)
-            .arguments
-        )
+        kernel_args, _ = self._forward(attention, context, hidden_states, prefill_kernel)
         assert not kernel_args["is_decode_only"]
         # k, v: [num_blocks, block_size, heads, dim]; the prompt starts its first block.
         block = int(kernel_args["block_table"][0, 0])
-        key = kernel_args["k"][block, : self.prompt_len, :, : config.qk_head_dim]
+        key = kernel_args["k"][block, : self.prompt_len, :, :qk_dim]
         value = kernel_args["v"][block, : self.prompt_len]
         torch.testing.assert_close(key, ref_key, rtol=1e-2, atol=1e-2)
         torch.testing.assert_close(value, ref_value, rtol=1e-2, atol=1e-2)
+
+        # Decode one token. The FlashMLA stand-in attends only to the first prompt token: every
+        # head gets that token's cached latent.
+        context.update_requests(
+            active_requests_mask=torch.ones(1, dtype=torch.int32),
+            new_tokens=torch.tensor([self.prompt_len + 1]),
+        )
+        context.initialize_attention_state()
+        assert context.is_decode_only()
+        hidden_states = self._hidden_states(context.padded_active_token_count, config)
+
+        def decode_kernel(q, k, *args, **kwargs):
+            return k[block, 0, :rank].expand(*q.shape[:3], rank).contiguous()
+
+        kernel_args, core_attn_out = self._forward(attention, context, hidden_states, decode_kernel)
+        assert kernel_args["is_decode_only"]
+        assert int(kernel_args["block_table"][0, 0]) == block
+
+        # The absorbed query scores the cached latents as the plain query scores the prompt keys
+        # that prefill up-projected.
+        with torch.no_grad():
+            q_compressed, _ = attention.linear_q_down_proj(hidden_states[:1])
+            q, _ = attention.linear_q_up_proj(attention.q_layernorm(q_compressed))
+        q_no_pe = q.view(heads, -1)[:, :qk_dim]
+        latents = kernel_args["k"][block, : self.prompt_len, :rank]
+        absorbed_scores = kernel_args["q"][0, 0, :, :rank].float() @ latents.float().T
+        scores = torch.einsum("hd,shd->hs", q_no_pe.float(), key.float())
+        assert self._relative_error(absorbed_scores, scores) < 2e-2
+        # The absorbed V up-projection maps the first token's latent to its prefill value.
+        assert self._relative_error(core_attn_out[0, 0].view(heads, v_dim), value[0]) < 2e-2
 
 
 @pytest.mark.experimental

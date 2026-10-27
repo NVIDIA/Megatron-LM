@@ -379,6 +379,14 @@ class MultiLatentAttention(Attention):
             cp_comm_type=cp_comm_type,
             pg_collection=self.pg_collection,
         )
+        if self.cache_mla_latents and getattr(self.core_attention, "requires_dsa_inputs", False):
+            # With cached latents, forward runs dense FlashAttention / FlashMLA in place of
+            # core_attention, so a DSA core's indexer and top-k sparse attention would never run.
+            raise ValueError(
+                "cache_mla_latents (required for dynamic-batching MLA inference) is not supported "
+                "with a DSA core attention: the latent-cache attention path is dense and would "
+                "skip the DSA indexer and top-k sparse attention."
+            )
 
         # Output.
         self.linear_proj = submodules.linear_proj(
