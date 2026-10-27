@@ -308,8 +308,8 @@ class EmbeddingWithGradAccumulationFusion(torch.autograd.Function):
     """``F.embedding`` whose backward adds the weight gradient into ``weight.main_grad``.
 
     The embedding counterpart of the linear layers' ``gradient_accumulation_fusion``: the
-    backward accumulates into ``main_grad``, sets ``grad_added_to_main_grad`` and hands autograd
-    a ZeroTensor (no storage), so the DDP hook still runs but adds nothing. ``main_grad`` gets
+    backward accumulates into ``main_grad``, sets ``grad_added_to_main_grad`` and returns None
+    for the weight gradient. The DDP hook still runs and adds nothing. ``main_grad`` gets
     the values PyTorch's embedding backward followed by ``main_grad.add_`` gives it; when
     ``can_accumulate_embedding_wgrad`` allows, only the rows of the tokens that occur are
     touched instead of a dense ``[num_embeddings, hidden]`` gradient being built and added.
