@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import enum
+import functools
 import importlib
 import inspect
 import io
@@ -3999,6 +4000,9 @@ try:
     _TE_FUSED_PARALLEL_CE_RETURN_ARGMAX = (
         "return_argmax" in inspect.signature(parallel_cross_entropy).parameters
     )
+    _TE_FUSED_PARALLEL_CE_GRAD_QUANTIZER = (
+        "grad_quantizer" in inspect.signature(parallel_cross_entropy).parameters
+    )
     current_te_version = get_te_version()
 
     def te_parallel_cross_entropy(
@@ -4008,11 +4012,15 @@ try:
         is_cg_capturable: bool = False,
         overwrite_input: bool = True,
         return_argmax: bool = False,
+        grad_fp8_format: Optional[str] = None,
     ):
         """Wrapper function for TE's Cross Entropy Loss kernel
 
         With ``return_argmax``, returns ``(loss, argmax)``: the argmax of each row over the full
         vocabulary, found by the loss kernel, or None if this TE version cannot return it.
+
+        With ``grad_fp8_format`` ('e4m3' or 'e5m2'), backward returns the gradient of the logits
+        as an MXFP8 tensor in that format, for an MXFP8 LM head.
         """
         parallel_cross_entropy_kwargs = {
             "label_smoothing": 0.0,
@@ -4028,11 +4036,29 @@ try:
             parallel_cross_entropy_kwargs["is_cg_capturable"] = is_cg_capturable
             # According to TE CrossEntropyFunction, ignore_idx defaults to -100
             parallel_cross_entropy_kwargs["ignore_idx"] = -100
+        if grad_fp8_format is not None:
+            parallel_cross_entropy_kwargs["grad_quantizer"] = _mxfp8_grad_quantizer(grad_fp8_format)
         if return_argmax:
             if not _TE_FUSED_PARALLEL_CE_RETURN_ARGMAX:
                 return parallel_cross_entropy(logits, labels, **parallel_cross_entropy_kwargs), None
             parallel_cross_entropy_kwargs["return_argmax"] = True
         return parallel_cross_entropy(logits, labels, **parallel_cross_entropy_kwargs)
+
+    @functools.lru_cache(maxsize=None)
+    def _mxfp8_grad_quantizer(grad_fp8_format: str):
+        """MXFP8 quantizer (row-wise and column-wise) for the gradient of the logits."""
+        if not _TE_FUSED_PARALLEL_CE_GRAD_QUANTIZER:
+            raise RuntimeError(
+                "An MXFP8 cross entropy gradient (cross_entropy_mxfp8_grad) requires a "
+                "Transformer Engine whose parallel_cross_entropy accepts grad_quantizer."
+            )
+        import transformer_engine_torch as tex
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+        fp8_dtypes = {"e4m3": tex.DType.kFloat8E4M3, "e5m2": tex.DType.kFloat8E5M2}
+        if grad_fp8_format not in fp8_dtypes:
+            raise ValueError(f"grad_fp8_format must be 'e4m3' or 'e5m2', got {grad_fp8_format!r}")
+        return MXFP8Quantizer(fp8_dtypes[grad_fp8_format], rowwise=True, columnwise=True)
 
 except ImportError:
     te_parallel_cross_entropy = None  # type: ignore[assignment, misc]
@@ -4046,10 +4072,13 @@ def te_cross_entropy(
     cuda_graph_capturable: bool = False,
     overwrite_input: bool = True,
     return_argmax: bool = False,
+    grad_fp8_format: str | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
     """Adapt TE cross entropy to the backend target signature and required label stride.
 
     With ``return_argmax``, returns ``(loss, argmax)`` as ``te_parallel_cross_entropy`` does.
+    With ``grad_fp8_format``, backward returns an MXFP8 gradient of the logits, as
+    ``te_parallel_cross_entropy`` does.
     """
     if te_parallel_cross_entropy is None:
         raise RuntimeError("Trying to use a TE block when it's not present.")
@@ -4061,6 +4090,7 @@ def te_cross_entropy(
         cuda_graph_capturable,
         overwrite_input=overwrite_input,
         return_argmax=return_argmax,
+        grad_fp8_format=grad_fp8_format,
     )
 
 

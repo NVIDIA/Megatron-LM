@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import functools
 import inspect
 import logging
 from typing import Optional, Tuple, Union
@@ -7,6 +8,7 @@ import torch
 from torch import Tensor
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.fp8_utils import is_mxfp8_output_proj_active
 from megatron.core.models.backends import (
     backend_slot,
     get_backend_from_config,
@@ -71,6 +73,23 @@ class LanguageModule(MegatronModule):
                 cuda_graph_impl=getattr(config, "cuda_graph_impl", None),
             ),
         )
+        if getattr(config, "cross_entropy_mxfp8_grad", False) and is_mxfp8_output_proj_active(
+            config
+        ):
+            # The cross entropy returns the gradient of the logits in MXFP8, in the format the
+            # LM head's recipe uses for gradients, and the LM head uses it without quantizing.
+            if (
+                "grad_fp8_format"
+                not in inspect.signature(self.vocab_parallel_cross_entropy).parameters
+            ):
+                raise ValueError(
+                    "cross_entropy_mxfp8_grad needs Transformer Engine's fused cross entropy, "
+                    "but the backend selected a cross entropy without an MXFP8 gradient."
+                )
+            self.vocab_parallel_cross_entropy = functools.partial(
+                self.vocab_parallel_cross_entropy,
+                grad_fp8_format="e5m2" if config.fp8 == "hybrid" else "e4m3",
+            )
 
     def _setup_mtp_cuda_graphs(self):
         """Wrap `compute_mtp_single_step` with a CudaGraphManager.
