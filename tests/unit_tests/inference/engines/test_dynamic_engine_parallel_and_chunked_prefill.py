@@ -1648,15 +1648,53 @@ class TestChunkedPrefillCudaGraphs:
             ):
                 row = rows[name][step]
                 gap = (row[chosen] - row[other]).item()
-                tolerance = (
-                    2 * torch.finfo(torch.bfloat16).eps * row[[chosen, other]].abs().max().item()
-                )
+                # The logits are BF16 values, so step two representable BF16 values up.
+                upper = row[other].to(torch.bfloat16)
+                for _ in range(2):
+                    upper = torch.nextafter(upper, torch.full_like(upper, float("inf")))
+                tolerance = (upper.float() - row[other].float()).item()
                 assert gap <= tolerance, (
                     f"{label}: diverged at step {step} beyond a tie; {name} logit of its "
                     f"token {chosen} exceeds token {other} by {gap:.5f} > {tolerance:.5f}; "
                     f"baseline {baseline_tokens} != test {test_tokens}"
                 )
             return
+
+    # Each case lists the baseline row and the test row; the baseline picks token 0
+    # and the test picks token 1. Gaps count representable BF16 steps.
+    @pytest.mark.parametrize(
+        "baseline_row,test_row,should_pass",
+        [
+            ([1.75, 1.75], [1.75, 1.75], True),
+            ([1.734375, 1.7265625], [1.7265625, 1.734375], True),
+            ([1.7421875, 1.7265625], [1.7265625, 1.7421875], True),
+            ([1.75, 1.7265625], [1.7265625, 1.75], False),
+            ([1.734375, 1.7265625], [1.7265625, 1.75], False),
+            ([-1.7265625, -1.7421875], [-1.7421875, -1.7265625], True),
+            ([-1.7265625, -1.75], [-1.75, -1.7265625], False),
+            ([2.015625, 1.9921875], [1.9921875, 2.015625], True),
+        ],
+        ids=[
+            "zero_steps",
+            "one_step",
+            "two_steps",
+            "three_steps",
+            "three_steps_in_test_only",
+            "negative_two_steps",
+            "negative_three_steps",
+            "binade_crossing_two_steps",
+        ],
+    )
+    def test_tie_tolerance_counts_bf16_steps(self, baseline_row, test_row, should_pass):
+        """Ties pass within two representable BF16 steps and fail beyond them."""
+        baseline_logits = [torch.tensor(baseline_row, dtype=torch.bfloat16).float()]
+        test_logits = [torch.tensor(test_row, dtype=torch.bfloat16).float()]
+        arguments = ("tie", [0], baseline_logits, [1], test_logits)
+        if should_pass:
+            self._assert_tokens_match_up_to_ties(*arguments)
+        else:
+            with pytest.raises(AssertionError, match="beyond a tie"):
+                self._assert_tokens_match_up_to_ties(*arguments)
 
     # Paired rather than crossed: the mixer only means something for a hybrid
     # stack, so a gpt x gdp cell would just re-run the GPT case.
