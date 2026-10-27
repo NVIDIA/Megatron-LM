@@ -1831,7 +1831,6 @@ def enable_batch_invariant_mode(backend: str = "te_native", collective: str = "o
     if _batch_invariant_MODE:
         return
     assert collective in ("ordered", "multimem"), f"Unknown collective {collective!r}"
-    _BATCH_INVARIANT_COLLECTIVE = collective
     if backend not in _BATCH_INVARIANT_BACKENDS:
         raise ValueError(
             f"Unknown batch-invariant backend {backend!r}; "
@@ -1843,6 +1842,7 @@ def enable_batch_invariant_mode(backend: str = "te_native", collective: str = "o
             "bf16 bindings. Install DeepGEMM or use backend='triton'."
         )
     _BATCH_INVARIANT_BACKEND = backend
+    _BATCH_INVARIANT_COLLECTIVE = collective
     dispatch_key = getattr(torch.accelerator.current_accelerator(), "type", "cpu").upper()
     _batch_invariant_MODE = True
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
@@ -1988,14 +1988,17 @@ def set_batch_invariant_mode(enabled: bool = True, backend: Optional[str] = None
 
     When `enabled` is True, batch-invariant kernels are enabled for the duration of
     the context; when False, they are disabled for the duration. This implementation
-    is re-entrant and correctly restores the previous state even under nesting.
+    is re-entrant and correctly restores the previous state (mode, backend and
+    collective) even under nesting.
     The helper default remains "triton" for tests that exercise non-bf16 operators.
     """
-    global _batch_invariant_MODE, _batch_invariant_LIB
-    # Save the previous on/off state so we can correctly restore it, even under
-    # nested usage or when toggling from True->False inside an outer True scope.
+    global _batch_invariant_MODE, _batch_invariant_LIB, _BATCH_INVARIANT_BACKEND
+    global _BATCH_INVARIANT_COLLECTIVE
+    # Save the previous state so we can correctly restore it, even under nested
+    # usage or when toggling from True->False inside an outer True scope.
     prev_enabled = _batch_invariant_MODE
     prev_backend = _BATCH_INVARIANT_BACKEND
+    prev_collective = _BATCH_INVARIANT_COLLECTIVE
 
     # Apply the requested state only if it differs from the current one.
     if enabled and not prev_enabled:
@@ -2012,9 +2015,12 @@ def set_batch_invariant_mode(enabled: bool = True, backend: Optional[str] = None
         yield
     finally:
         # Restore the previous state. If we turned batch-invariant mode on at
-        # entry, turn it off here. If we turned it off at entry (inside an
-        # outer True scope), turn it back on.
+        # entry, turn it off here and restore the backend and collective it
+        # replaced. If we turned it off at entry (inside an outer True scope),
+        # turn it back on with the outer scope's backend and collective.
         if enabled and not prev_enabled:
             disable_batch_invariant_mode()
+            _BATCH_INVARIANT_BACKEND = prev_backend
+            _BATCH_INVARIANT_COLLECTIVE = prev_collective
         elif not enabled and prev_enabled:
-            enable_batch_invariant_mode(backend=prev_backend)
+            enable_batch_invariant_mode(backend=prev_backend, collective=prev_collective)
