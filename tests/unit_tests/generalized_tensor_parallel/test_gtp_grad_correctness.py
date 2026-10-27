@@ -476,6 +476,7 @@ def _build_ddp_distopt_and_optim(
     bucket_size=None,
     reduce_scatter_with_fp32_accumulation=False,
     grad_reduce_in_fp32=True,
+    num_distributed_optimizer_instances=1,
 ):
     """Real distributed-optimizer setup (Adam), matching the 64-GPU production path."""
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
@@ -493,6 +494,7 @@ def _build_ddp_distopt_and_optim(
         bucket_size=bucket_size,
         grad_reduce_in_fp32=grad_reduce_in_fp32,
         reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
+        num_distributed_optimizer_instances=num_distributed_optimizer_instances,
     )
     module = torch.nn.Sequential()
     for i, layer in enumerate(stack):
@@ -514,7 +516,7 @@ def _build_ddp_distopt_and_optim(
     return ddp_model, optim
 
 
-def _run_step_distopt(ddp_model, optim, rank):
+def _run_step_distopt(ddp_model, optim, rank, return_loss=False):
     """Mirror production finalize order: finish_grad_sync -> gtp_remat-finalize -> optim.step().
     Returns the optimizer-reported grad-norm (computed pre-clip from the reduced grads)."""
     optim.zero_grad()
@@ -539,6 +541,8 @@ def _run_step_distopt(ddp_model, optim, rank):
     egtp_remat_group = ps.get_expert_gtp_weight_remat_group(check_initialized=False)
     _allreduce_replicated_grads_over_gtp_remat_group([ddp_model], gtp_remat_group, egtp_remat_group)
     _, grad_norm, _ = optim.step()
+    if return_loss:
+        return float(grad_norm), float(loss)
     return float(grad_norm)
 
 
@@ -586,6 +590,37 @@ def _worker_distopt(rank, world_size, port):
             p.data.copy_(full)
     gtp_ddp, gtp_optim = _build_ddp_distopt_and_optim(gtp_stack)
     gtp_gn = _run_step_distopt(gtp_ddp, gtp_optim, rank)
+    gtp_updated = {name: param.detach().clone() for name, param in gtp_stack.named_parameters()}
+
+    ps.destroy_model_parallel()
+    GTPShardedParam._chain_state.clear()
+
+    # ---------- Phase C: same GTP2 model with two distributed-optimizer instances ----------
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        gtp_remat_size=2,
+        num_distributed_optimizer_instances=2,
+    )
+    model_parallel_cuda_manual_seed(42)
+    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
+    multi_stack = _make_stack(_make_config(), pgc)
+    for layer in multi_stack:
+        layer.cuda()
+    gtp_rank = ps.get_gtp_weight_remat_group().rank()
+    for name, param in multi_stack.named_parameters():
+        full = saved[name]
+        if isinstance(param, GTPShardedParam):
+            shard_size = param.shape[0]
+            param.data.copy_(full[gtp_rank * shard_size : (gtp_rank + 1) * shard_size])
+        else:
+            param.data.copy_(full)
+    multi_ddp, multi_optim = _build_ddp_distopt_and_optim(
+        multi_stack, num_distributed_optimizer_instances=2
+    )
+    multi_gn = _run_step_distopt(multi_ddp, multi_optim, rank)
+    for name, param in multi_stack.named_parameters():
+        torch.testing.assert_close(param.detach(), gtp_updated[name], atol=1e-4, rtol=1e-4)
 
     ps.destroy_model_parallel()
     GTPShardedParam._chain_state.clear()
@@ -600,6 +635,7 @@ def _worker_distopt(rank, world_size, port):
         # Same model, same data, gradients proven equal -> grad-norm must match (bf16 Adam
         # noise floor is ~4e-5 here).
         torch.testing.assert_close(torch.tensor(gtp_gn), torch.tensor(base_gn), atol=0, rtol=1e-4)
+        torch.testing.assert_close(torch.tensor(multi_gn), torch.tensor(gtp_gn), atol=0, rtol=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -758,6 +794,243 @@ def _worker_moe_distopt(rank, world_size, port):
         )
         # bf16 Adam noise floor is ~6e-5 here.
         torch.testing.assert_close(torch.tensor(moe_gn), torch.tensor(base_gn), atol=0, rtol=1e-4)
+
+
+def _build_moe_with_optimizer_instances(num_instances):
+    """Build the same eight-rank GTP/EGTP/EP model with a chosen DistOpt layout."""
+    from megatron.core import parallel_state as ps
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        expert_model_parallel_size=2,
+        gtp_remat_size=2,
+        expert_gtp_remat_size=2,
+        num_distributed_optimizer_instances=num_instances,
+    )
+    model_parallel_cuda_manual_seed(42)
+    pgc = ProcessGroupCollection.use_mpu_process_groups()
+    stack = _make_moe_stack(
+        _make_moe_config(expert_model_parallel_size=2, gtp_remat_size=2, expert_gtp_remat_size=2),
+        pgc,
+    )
+    for layer in stack:
+        layer.cuda()
+    return stack, pgc
+
+
+def _synchronize_moe_initial_weights(stack):
+    """Make every replica of a shard agree before DistOpt chooses shard owners."""
+    from megatron.core import parallel_state as ps
+
+    for name, param in stack.named_parameters():
+        is_sharded = isinstance(param, GTPShardedParam)
+        if _is_expert_param(name, param):
+            group = ps.get_expert_data_parallel_group(with_gtp_remat=not is_sharded)
+        else:
+            group = ps.get_data_parallel_group(
+                with_context_parallel=True, with_gtp_remat=not is_sharded
+            )
+        source = dist.get_process_group_ranks(group)[0]
+        dist.broadcast(param.data, src=source, group=group)
+
+
+def _run_moe_synchronized_step(ddp, optimizer, rank, return_loss=False):
+    norm = _run_step_distopt(ddp, optimizer, rank, return_loss=return_loss)
+    ddp.start_param_sync(force_sync=True)
+    return norm
+
+
+def _classify_moe_gtp_chains(ddp):
+    from megatron.core.tensor_parallel.gtp_api import classify_gtp_remat_chains
+
+    classify_gtp_remat_chains([ddp])
+
+
+def _test_moe_two_optimizer_instances(rank, world_size, port):
+    """Compare an actual MoE Adam step with one and two DistOpt instances."""
+    from megatron.core import parallel_state as ps
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import reset_gtp_state
+
+    try:
+        reference_stack, _ = _build_moe_with_optimizer_instances(1)
+        _synchronize_moe_initial_weights(reference_stack)
+        initial = {
+            name: param.detach().clone() for name, param in reference_stack.named_parameters()
+        }
+        expert_names = [
+            name
+            for name, param in reference_stack.named_parameters()
+            if _is_expert_param(name, param)
+        ]
+        assert expert_names
+        assert any(
+            isinstance(dict(reference_stack.named_parameters())[name], GTPShardedParam)
+            for name in expert_names
+        )
+        reference_ddp, reference_optimizer = _build_ddp_distopt_and_optim(reference_stack)
+        _classify_moe_gtp_chains(reference_ddp)
+        for name, param in reference_stack.named_parameters():
+            torch.testing.assert_close(param.detach(), initial[name], rtol=0, atol=0, msg=name)
+        reference_norm = _run_moe_synchronized_step(reference_ddp, reference_optimizer, rank)
+        reference_weights = {
+            name: param.detach().clone() for name, param in reference_stack.named_parameters()
+        }
+        assert any(
+            not torch.equal(reference_weights[name], initial[name]) for name in expert_names
+        ), "The expert optimizer step did not change any expert weight"
+
+        ps.destroy_model_parallel()
+        reset_gtp_state()
+
+        multi_stack, _ = _build_moe_with_optimizer_instances(2)
+        with torch.no_grad():
+            for name, param in multi_stack.named_parameters():
+                param.copy_(initial[name])
+        multi_ddp, multi_optimizer = _build_ddp_distopt_and_optim(
+            multi_stack, num_distributed_optimizer_instances=2
+        )
+        _classify_moe_gtp_chains(multi_ddp)
+        for name, param in multi_stack.named_parameters():
+            torch.testing.assert_close(param.detach(), initial[name], rtol=0, atol=0, msg=name)
+        multi_norm = _run_moe_synchronized_step(multi_ddp, multi_optimizer, rank)
+        torch.testing.assert_close(multi_norm, reference_norm, rtol=1e-4, atol=1e-5)
+        for name, param in multi_stack.named_parameters():
+            torch.testing.assert_close(
+                param.detach(), reference_weights[name], rtol=1e-4, atol=1e-4, msg=name
+            )
+    finally:
+        ps.destroy_model_parallel()
+        reset_gtp_state()
+
+
+def _moe_checkpoint_state(ddp, optimizer, pgc, loading=False):
+    """Use production GTP replica metadata and reshardable DistOpt state."""
+    model_state = ddp.module[0].sharded_state_dict(
+        prefix="0.", metadata={"dp_cp_group": pgc.dp_cp_gtp_remat}
+    )
+    return {
+        "model": model_state,
+        "optimizer": optimizer.sharded_state_dict(
+            model_state,
+            is_loading=loading,
+            metadata={"distrib_optim_sharding_type": "dp_reshardable", "checkpoint_version": 3.1},
+        ),
+    }
+
+
+def _optimizer_shard_snapshot(value, path=()):
+    from megatron.core.dist_checkpointing import ShardedTensor
+
+    if isinstance(value, ShardedTensor):
+        if value.data is not None:
+            return {(path, value.key, value.global_offset): value.data.detach().clone()}
+        return {}
+    if isinstance(value, dict):
+        result = {}
+        for key, child in value.items():
+            result.update(_optimizer_shard_snapshot(child, path + (str(key),)))
+        return result
+    if isinstance(value, (list, tuple)):
+        result = {}
+        for index, child in enumerate(value):
+            result.update(_optimizer_shard_snapshot(child, path + (str(index),)))
+        return result
+    return {}
+
+
+def _test_moe_optimizer_instances_checkpoint(
+    rank, world_size, port, checkpoint_base, num_instances
+):
+    """Save and resume GTP/EGTP MoE weights and Adam moments."""
+    from megatron.core import parallel_state as ps
+    from megatron.core.dist_checkpointing import load, save
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import reset_gtp_state
+    from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
+    from tests.unit_tests.dist_checkpointing import TempNamedDir
+
+    try:
+        stack, pgc = _build_moe_with_optimizer_instances(num_instances)
+        _synchronize_moe_initial_weights(stack)
+        ddp, optimizer = _build_ddp_distopt_and_optim(
+            stack, num_distributed_optimizer_instances=num_instances
+        )
+        _classify_moe_gtp_chains(ddp)
+        _run_moe_synchronized_step(ddp, optimizer, rank)
+        saved_weights = {name: param.detach().clone() for name, param in stack.named_parameters()}
+        state = _moe_checkpoint_state(ddp, optimizer, pgc)
+        saved_optimizer_shards = _optimizer_shard_snapshot(state["optimizer"])
+        assert any("exp_avg" in key for (_, key, _) in saved_optimizer_shards)
+
+        with TempNamedDir(
+            checkpoint_base / f"moe_gtp_{num_instances}_instances", sync=True
+        ) as directory:
+            save(state, directory)
+            # Production checkpoints restore the model-parallel RNG tracker separately.
+            saved_rng_tracker = {
+                name: state.clone() for name, state in get_cuda_rng_tracker().get_states().items()
+            }
+
+            expected_norm, expected_loss = _run_moe_synchronized_step(
+                ddp, optimizer, rank, return_loss=True
+            )
+            expected_weights = {
+                name: param.detach().clone() for name, param in stack.named_parameters()
+            }
+
+            ps.destroy_model_parallel()
+            reset_gtp_state()
+            restored_stack, restored_pgc = _build_moe_with_optimizer_instances(num_instances)
+            restored_ddp, restored_optimizer = _build_ddp_distopt_and_optim(
+                restored_stack, num_distributed_optimizer_instances=num_instances
+            )
+            _classify_moe_gtp_chains(restored_ddp)
+            restored = load(
+                _moe_checkpoint_state(restored_ddp, restored_optimizer, restored_pgc, loading=True),
+                directory,
+            )
+            restored_ddp.module.load_state_dict(restored["model"])
+            for name, param in restored_stack.named_parameters():
+                torch.testing.assert_close(
+                    param.detach(), saved_weights[name], rtol=0, atol=0, msg=f"model load: {name}"
+                )
+            restored_optimizer.load_state_dict(restored["optimizer"])
+            for name, param in restored_stack.named_parameters():
+                torch.testing.assert_close(
+                    param.detach(),
+                    saved_weights[name],
+                    rtol=0,
+                    atol=0,
+                    msg=f"optimizer load: {name}",
+                )
+            actual_optimizer_shards = _optimizer_shard_snapshot(
+                _moe_checkpoint_state(restored_ddp, restored_optimizer, restored_pgc)["optimizer"]
+            )
+            assert actual_optimizer_shards.keys() == saved_optimizer_shards.keys()
+            for key, expected in saved_optimizer_shards.items():
+                torch.testing.assert_close(actual_optimizer_shards[key], expected, rtol=0, atol=0)
+
+            restored_ddp.start_param_sync(force_sync=True)
+            for name, param in restored_stack.named_parameters():
+                torch.testing.assert_close(
+                    param.detach(), saved_weights[name], rtol=0, atol=0, msg=f"after sync: {name}"
+                )
+            get_cuda_rng_tracker().set_states(
+                {name: state.clone() for name, state in saved_rng_tracker.items()}
+            )
+            actual_norm, actual_loss = _run_moe_synchronized_step(
+                restored_ddp, restored_optimizer, rank, return_loss=True
+            )
+            torch.testing.assert_close(actual_loss, expected_loss, rtol=1e-4, atol=1e-5)
+            torch.testing.assert_close(actual_norm, expected_norm, rtol=1e-4, atol=1e-5)
+            for name, param in restored_stack.named_parameters():
+                torch.testing.assert_close(
+                    param.detach(), expected_weights[name], rtol=1e-4, atol=1e-4, msg=name
+                )
+    finally:
+        ps.destroy_model_parallel()
+        reset_gtp_state()
 
 
 def _worker_moe_gtp_egtp_mismatch(rank, world_size, port, gtp, egtp):
@@ -1313,6 +1586,21 @@ class TestGTPGradCorrectness:
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires 4 CUDA devices")
         _run_distributed(_worker_moe_distopt, 4)
+
+    def test_moe_gtp_egtp_two_optimizer_instances_step(self):
+        """Two DistOpt instances update dense and routed-expert GTP shards correctly."""
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires four local CUDA devices")
+        _run_distributed(_test_moe_two_optimizer_instances, 8)
+
+    @pytest.mark.parametrize("num_instances", [1, 2])
+    def test_moe_gtp_egtp_optimizer_checkpoint(self, tmp_path_dist_ckpt, num_instances):
+        """A torch_dist roundtrip restores Adam state and the next MoE update."""
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires four local CUDA devices")
+        _run_distributed(
+            _test_moe_optimizer_instances_checkpoint, 8, tmp_path_dist_ckpt, num_instances
+        )
 
     @pytest.mark.parametrize(
         "gtp,egtp",
