@@ -19,7 +19,7 @@ from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
     get_data_parallel_group,
     get_data_parallel_rank,
@@ -34,10 +34,10 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.transformer.utils import is_layer_window_attention
-from megatron.core.typed_torch import apply_module, not_none
+from megatron.core.typed_torch import apply_module, copy_signature, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
     divide,
@@ -285,7 +285,7 @@ class CrossAttentionSubmodules:
     linear_proj: LinearProjBuilder
 
 
-class Attention(MegatronModule, ABC):
+class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
     """Attention layer abstract class.
 
     This layer only contains common modules required for the "self attn" and
@@ -344,9 +344,6 @@ class Attention(MegatronModule, ABC):
                 pg_collection, 'cp'
             ), "Attention pg_collection must have cp process group"
         self.pg_collection = pg_collection
-        # Build-time CP group, kept so runtime (hybrid/dynamic) CP can restore
-        # it on microbatches that carry no per-microbatch CP group.
-        self._build_time_cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp
 
         # Per attention head and per partition values
@@ -446,6 +443,24 @@ class Attention(MegatronModule, ABC):
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
+
+    def _get_core_attention_extra_kwargs(
+        self,
+        hidden_states: Tensor,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Tensor,
+        inference_context: Optional[BaseInferenceContext],
+        rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]],
+        rotary_pos_cos: Optional[Tensor],
+        rotary_pos_sin: Optional[Tensor],
+        rotary_pos_cos_sin: Optional[Tensor],
+        attn_mask_type: AttnMaskType,
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> dict:
+        """Hook for attention variants that need extra inputs in core attention."""
+        return {}
 
     def _checkpointed_attention_forward(
         self,
@@ -569,6 +584,7 @@ class Attention(MegatronModule, ABC):
         rotary_pos_cos_sin: Optional[Tensor] = None,
         sequence_len_offset: Optional[int] = None,
         *,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
         inference_params: Optional[BaseInferenceContext] = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, AttnMaskType, Tensor]:
         """
@@ -588,12 +604,15 @@ class Attention(MegatronModule, ABC):
             Currently used exclusively for inference with dynamic batching and flashinfer RoPE.
             sequence_len_offset (Optional[int]): Sequence length offset used for
                 inference CUDA graphs.
+            cp_group (Optional[ProcessGroup]): Context-parallel group for this
+                forward. Defaults to the group configured on the module.
 
         Return:
             Tuple of: query, key, value, rotary_pos_emb, attn_mask_type, block_table.
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        cp_group = self.pg_collection.cp if cp_group is None else cp_group
 
         attn_mask_type = self.attn_mask_type
         if inference_context is None:
@@ -711,11 +730,7 @@ class Attention(MegatronModule, ABC):
             elif rotary_pos_emb is not None:
                 q_pos_emb, k_pos_emb = rotary_pos_emb
                 key = inference_context.apply_rotary_emb_key(
-                    key,
-                    k_pos_emb,
-                    self.config,
-                    self.pg_collection.cp,
-                    mscale=self._yarn_concentration_factor,
+                    key, k_pos_emb, self.config, cp_group, mscale=self._yarn_concentration_factor
                 )
 
                 rotary_pos_emb = (q_pos_emb, None)  # key rotary emb has been applied
@@ -758,6 +773,24 @@ class Attention(MegatronModule, ABC):
         This method needs to be implemented based on whether the derived class
         is "self-attn" or "cross-attn".
         """
+
+    def get_softmax_scale(
+        self, query_tensor: torch.Tensor, head_dim_index: int = -1
+    ) -> float | None:
+        """Return the softmax scaling value to use.
+
+        Tries, in order:
+        - `self.softmax_scale` (should only be assigned for MLA),
+        - `self.config.softmax_scale`, and if that is `None`, uses
+        - 1 / sqrt(Q head dim), as per `query_tensor` and `head_dim_index`.
+        """
+        if getattr(self, "softmax_scale", None) is not None:
+            softmax_scale = self.softmax_scale
+        elif getattr(self.config, "softmax_scale", None) is not None:
+            softmax_scale = self.config.softmax_scale
+        else:
+            softmax_scale = query_tensor.size(head_dim_index) ** -0.5
+        return softmax_scale
 
     def flash_decode(
         self,
@@ -805,6 +838,7 @@ class Attention(MegatronModule, ABC):
             rotary_sin=rotary_sin,
             cache_seqlens=sequence_len_offset,
             rotary_interleaved=rotary_interleaved,
+            softmax_scale=self.get_softmax_scale(q),
         )
         # This path bypasses self.core_attention and calls flash-attention directly, so the
         # configured cap has to be passed here too. Only when set, so runs without softcapping
@@ -1100,10 +1134,7 @@ class Attention(MegatronModule, ABC):
         # Flash attn kernel.
         if not is_decode_only:
             q = q.squeeze(1)
-            if getattr(self, "softmax_scale", None) is not None:
-                softmax_scale = self.softmax_scale
-            else:
-                softmax_scale = q.shape[-1] ** -0.5
+            softmax_scale = self.get_softmax_scale(q)
             softcap = self.config.attn_logit_softcapping
             softcap_kwargs = {} if softcap is None else {"softcap": softcap}
             if use_fa4:
@@ -1147,6 +1178,12 @@ class Attention(MegatronModule, ABC):
                 assert (
                     self.batch_invariant_mode is False
                 ), "Batch invariant mode is not supported for flash attention 2"
+                # FA2 treats max_seqlen_q == 1 as one query token per sequence and reshapes q
+                # accordingly under GQA, which requires total_q == num_seqs.
+                assert max_seqlen_q > 1 or q.shape[0] == cu_seqlens_q.shape[0] - 1, (
+                    f"FlashAttention-2 got max_seqlen_q={max_seqlen_q} with {q.shape[0]} query "
+                    f"rows for {cu_seqlens_q.shape[0] - 1} sequences"
+                )
                 fa2_ret = flash_attn_varlen_func(
                     q,
                     k,
@@ -1210,6 +1247,7 @@ class Attention(MegatronModule, ABC):
                     "Set config.attn_logit_softcapping = None or use a non-MLA attention layer."
                 )
                 softmax_scale = self.softmax_scale
+                assert softmax_scale is not None
 
                 num_heads_k = 1  # Only a single head for MLA Flash
                 seq_len_q = tokens_per_request
@@ -1242,10 +1280,7 @@ class Attention(MegatronModule, ABC):
                     )
             else:
                 if use_fa4:
-                    if getattr(self, "softmax_scale", None) is not None:
-                        softmax_scale = self.softmax_scale
-                    else:
-                        softmax_scale = q.shape[-1] ** -0.5
+                    softmax_scale = self.get_softmax_scale(q)
                     # Reshape q from (B, S, H, D) to (B*S, H, D) for varlen interface
                     q_varlen = q.reshape(-1, q.shape[-2], q.shape[-1])
                     decode_softcap = self.config.attn_logit_softcapping
@@ -1275,10 +1310,7 @@ class Attention(MegatronModule, ABC):
                         num_requests, tokens_per_request, *output_total.shape[1:]
                     )
                 else:
-                    if getattr(self, "softmax_scale", None) is not None:
-                        softmax_scale = self.softmax_scale
-                    else:
-                        softmax_scale = q.shape[-1] ** -0.5
+                    softmax_scale = self.get_softmax_scale(q)
                     flash_attn_args = {
                         "q": q,
                         "k_cache": k,
@@ -1334,7 +1366,30 @@ class Attention(MegatronModule, ABC):
 
         return output_total
 
-    def forward(
+    def _dynamic_core_attention_forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Tensor,
+        inference_context: BaseInferenceContext,
+        block_table: Tensor,
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        **kwargs,
+    ) -> Tensor:
+        """Hook for attention variants that need a custom dynamic-batching path."""
+        raise NotImplementedError(
+            "Dynamic batching is not supported for attention variants that require extra "
+            "core-attention kwargs."
+        )
+
+    def supports_two_stage_attention(self) -> bool:
+        """Specialized attention subclasses retain their atomic forward path."""
+        return type(self).forward is Attention.forward
+
+    def forward_pre_attn_and_core_attn(
         self,
         hidden_states: Tensor,
         attention_mask: Tensor,
@@ -1349,9 +1404,10 @@ class Attention(MegatronModule, ABC):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-    ) -> tuple[Tensor, Tensor | None]:
+        packed_sequence_cp_metadata=None,
+    ) -> Tensor:
         """
-        Perform a forward pass through the attention module.
+        Run the QKV input projection and core attention, stopping before linear_proj.
 
         Args:
             hidden_states (Tensor): Hidden states.
@@ -1371,9 +1427,14 @@ class Attention(MegatronModule, ABC):
                 inference CUDA graphs.
 
         Return:
-            (Tuple[Tensor, Tensor]) Attention output and bias.
+            Tensor consumed by the attention output projection.
 
         """
+        assert (
+            packed_sequence_cp_metadata is None
+        ), "Attention does not support packed-sequence chunkwise CP metadata."
+        runtime_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
         no_rope = (
@@ -1499,8 +1560,7 @@ class Attention(MegatronModule, ABC):
             )
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)
-            output, bias = apply_module(self.linear_proj)(context_layer)
-            return output, bias
+            return context_layer
 
         if (
             in_decode_mode
@@ -1521,6 +1581,7 @@ class Attention(MegatronModule, ABC):
                     rotary_pos_sin,
                     rotary_pos_cos_sin,
                     sequence_len_offset,
+                    cp_group=runtime_cp_group,
                 )
             )
 
@@ -1559,20 +1620,6 @@ class Attention(MegatronModule, ABC):
                 cu_seqlens_q = cu_seqlens_kv = None
                 rope_freqs_max_seqlen = None
 
-            # Hybrid/dynamic CP: bind the sub-sample's runtime CP group
-            # (packed_seq_params.cp_group) on the process-group collection so
-            # RoPE below — and any other CP consumer in this forward — uses
-            # the group this microbatch was actually sharded with. The fused
-            # THD RoPE kernel takes the full cu_seqlens plus (cp_size,
-            # cp_rank) to locate this rank's zigzag slice, and the build-time
-            # group reports cp_size=1. Restore the build-time group when no
-            # runtime group is bound (e.g. local_cp_size == 1 sub-samples):
-            # the previous microbatch may have left a larger group behind.
-            if packed_seq_params is not None and packed_seq_params.cp_group is not None:
-                self.pg_collection.cp = packed_seq_params.cp_group
-            elif self.pg_collection.cp is not self._build_time_cp_group:
-                self.pg_collection.cp = self._build_time_cp_group
-
             if split_qkv:
                 if q_pos_emb is not None:
                     # TODO VIJAY: simplify
@@ -1583,7 +1630,7 @@ class Attention(MegatronModule, ABC):
                             config=self.config,
                             cu_seqlens=cu_seqlens_q,
                             mscale=self._yarn_concentration_factor,
-                            cp_group=self.pg_collection.cp,
+                            cp_group=runtime_cp_group,
                             max_seqlen=rope_freqs_max_seqlen,
                         )
                     else:
@@ -1592,7 +1639,7 @@ class Attention(MegatronModule, ABC):
                             q_pos_emb,
                             self.config,
                             cu_seqlens_q,
-                            self.pg_collection.cp,
+                            runtime_cp_group,
                             mscale=self._yarn_concentration_factor,
                         )
                 if k_pos_emb is not None:
@@ -1602,7 +1649,7 @@ class Attention(MegatronModule, ABC):
                         config=self.config,
                         cu_seqlens=cu_seqlens_kv,
                         mscale=self._yarn_concentration_factor,
-                        cp_group=self.pg_collection.cp,
+                        cp_group=runtime_cp_group,
                         max_seqlen=rope_freqs_max_seqlen,
                     )
             else:
@@ -1621,10 +1668,27 @@ class Attention(MegatronModule, ABC):
         # ==================================
 
         nvtx_range_push(suffix="core_attention")
+        core_attention_extra_kwargs = self._get_core_attention_extra_kwargs(
+            hidden_states=hidden_states,
+            query=query,
+            key=key,
+            value=value,
+            attention_mask=attention_mask,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            rotary_pos_cos_sin=rotary_pos_cos_sin,
+            attn_mask_type=attn_mask_type,
+            packed_seq_params=packed_seq_params,
+        )
         core_attn_manager = off_interface(
             self.offload_core_attention and self.training, query, "core_attn"
         )
         if self.checkpoint_core_attention and self.training:
+            # Upstream _checkpointed_attention_forward now threads tensor-valued
+            # core-attention kwargs (e.g. DSA's x/qr) through the checkpoint, so the
+            # variant no longer has to opt out of checkpointing.
             core_attn_out = self._checkpointed_attention_forward(
                 query,
                 key,
@@ -1633,6 +1697,7 @@ class Attention(MegatronModule, ABC):
                 attn_mask_type=attn_mask_type,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
+                core_attention_extra_kwargs=core_attention_extra_kwargs,
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
@@ -1646,33 +1711,48 @@ class Attention(MegatronModule, ABC):
                         attn_mask_type=attn_mask_type,
                         attention_bias=attention_bias,
                         packed_seq_params=packed_seq_params,
+                        **core_attention_extra_kwargs,
                     )
 
             else:
-                # Dynamic batching attention kernel.
-                q, k, v = (query, key, value)
-                cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
-                cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
+                if core_attention_extra_kwargs:
+                    core_attn_out = self._dynamic_core_attention_forward(
+                        query,
+                        key,
+                        value,
+                        attention_mask,
+                        inference_context,
+                        block_table,
+                        attn_mask_type,
+                        attention_bias,
+                        packed_seq_params,
+                        **core_attention_extra_kwargs,
+                    )
+                else:
+                    # Dynamic batching attention kernel.
+                    q, k, v = (query, key, value)
+                    cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
+                    cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
 
-                core_attn_out = self.flash_decode_and_prefill(
-                    q,
-                    k,
-                    v,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    cu_query_lengths,
-                    cu_kv_lengths,
-                    kv_lengths,
-                    block_table,
-                    inference_context.is_decode_only(),
-                    softmax_offset=self._get_inference_softmax_offset(),
-                )
-                core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+                    core_attn_out = self.flash_decode_and_prefill(
+                        q,
+                        k,
+                        v,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        cu_query_lengths,
+                        cu_kv_lengths,
+                        kv_lengths,
+                        block_table,
+                        inference_context.is_decode_only(),
+                        softmax_offset=self._get_inference_softmax_offset(),
+                    )
+                    core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
-                # Clear the outputs for padding tokens when using quantization scales
-                # to avoid corrupting amax calculations
-                if is_using_quantization_scales(self.config):
-                    core_attn_out[inference_context.padding_slice] = 0.0
+                    # Clear the outputs for padding tokens when using quantization scales
+                    # to avoid corrupting amax calculations
+                    if is_using_quantization_scales(self.config):
+                        inference_context.zero_padding_tokens(core_attn_out)
 
             core_attn_out = core_attn_manager.group_offload(
                 core_attn_out, forced_released_tensors=[query, key, value]
@@ -1691,9 +1771,10 @@ class Attention(MegatronModule, ABC):
             core_attn_out = self._apply_output_gate(core_attn_out, gate)
             nvtx_range_pop(suffix="output_gate")
 
-        # =================
-        # Output. [sq, b, h]
-        # =================
+        return core_attn_out
+
+    def forward_post_core_attn(self, core_attn_out: Tensor) -> tuple[Tensor, Tensor | None]:
+        """Apply the attention output projection to a core-attention result."""
         nvtx_range_push(suffix="linear_proj")
         attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
         with attn_proj_manager as core_attn_out:
@@ -1702,6 +1783,11 @@ class Attention(MegatronModule, ABC):
         nvtx_range_pop(suffix="linear_proj")
 
         return output, bias
+
+    @copy_signature(forward_pre_attn_and_core_attn)
+    def forward(self, *args, **kwargs):
+        """Run core attention followed by the output projection."""
+        return self.forward_post_core_attn(self.forward_pre_attn_and_core_attn(*args, **kwargs))
 
     @jit_fuser
     def _apply_output_gate(self, x, gate):

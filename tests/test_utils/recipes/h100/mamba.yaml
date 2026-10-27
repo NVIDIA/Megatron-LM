@@ -9,7 +9,7 @@ spec:
   nodes: 1
   gpus: 8
   n_repeat: 5
-  platforms: dgx_a100
+  platforms: dgx_h100
   script_setup: |
     set -euo pipefail
     unset https_proxy
@@ -78,10 +78,11 @@ products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
+  # Metric validation receives only 3/50 steps: https://github.com/NVIDIA/Megatron-LM/issues/8218
   - test_case: [hybrid_llama3_proxy_mfsdp_v2_cuda_graph]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr-broken, mr-github-broken]
         platforms: [dgx_h100]
   - test_case: [hybrid_mr_mcore_te_tp1_pp1_cp1_dgx_a100_1N8G]
     products:

@@ -194,6 +194,11 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         if self.ep_size == 1:
             if self._runs_metadata_sync:
                 InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(hidden_states.shape[0])
+                # local_tokens * ep_size, with ep_size == 1; see the matching
+                # comment in NVLSAllGatherVDispatcher.token_dispatch.
+                InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = hidden_states.shape[
+                    0
+                ]
             return hidden_states, probs
 
         if self._runs_metadata_sync:
@@ -555,25 +560,40 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             (hidden_states, probs) gathered to [global_max, *] shape.
             Also updates self.routing_map to [global_max, topk] int64.
         """
-        if self.ep_size == 1:
-            if self._runs_metadata_sync:
-                InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(hidden_states.shape[0])
-            return hidden_states, probs
-
-        if self._runs_metadata_sync:
-            self.update_metadata(hidden_states.shape[0])
-
-        # Mask out CUDA-graph padding rows of the local routing map so the AGV
-        # propagates -1 into agv_r for those slots; padding tokens then route
-        # to no expert. _real_token_count_tensor is wired by the context and
-        # holds the *global* unpadded token count, so we pass self.sp_rank to
-        # shift local rows into the global frame for the comparison. When unset
-        # (standalone dispatcher use without a context) all rows are real, so
-        # skip the mask.
+        # Mask out CUDA-graph padding rows of the local routing map so padding
+        # tokens route to no expert. At ep_size > 1 this also makes the AGV
+        # propagate -1 into agv_r for those slots. _real_token_count_tensor is
+        # wired by the context and holds the *global* unpadded token count, so
+        # we pass self.sp_rank to shift local rows into the global frame for the
+        # comparison. When unset (standalone dispatcher use without a context)
+        # all rows are real, so skip the mask.
+        #
+        # Runs before the ep_size == 1 early-out: the padding rows are just as
+        # real at ep_size == 1, and leaving them unmasked sends every one of
+        # them through a full expert GEMM. That is correct -- the results are
+        # discarded downstream -- but it scales the MoE cost with the CUDA-graph
+        # bucket rather than the live batch, which is most of the bucket
+        # whenever the batch is draining.
         if self.__class__._real_token_count_tensor is not None:
             mask_routing_padding(
                 self.routing_map, self.__class__._real_token_count_tensor, self.sp_rank
             )
+
+        if self.ep_size == 1:
+            if self._runs_metadata_sync:
+                InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(hidden_states.shape[0])
+                # local_tokens * ep_size, with ep_size == 1. Set explicitly
+                # rather than left to vllm_fused_moe's `else max_tokens`
+                # fallback: that fallback sizes the launch config and grid from
+                # whatever buffer it was handed, which is the contract this hint
+                # exists to avoid relying on.
+                InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = hidden_states.shape[
+                    0
+                ]
+            return hidden_states, probs
+
+        if self._runs_metadata_sync:
+            self.update_metadata(hidden_states.shape[0])
 
         agv_h = self.__class__._symm_agv_hidden
         agv_r = self.__class__._symm_agv_routing

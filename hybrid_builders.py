@@ -1,16 +1,20 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 
-from model_provider import count_parameters_in_layer
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.spec_utils import import_module
+from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
+from model_provider import count_parameters_in_layer
 
 
 def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     print_rank_0('building Hybrid model ...')
+    if getattr(args, 'dynamic_context_parallel', False):
+        raise NotImplementedError(
+            "Dynamic context parallelism is not yet supported for HybridModel"
+        )
     if config is None:
         config = core_transformer_config_from_args(args, TransformerConfig)
 
@@ -21,6 +25,8 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         ), "inference_fuse_tp_communication is not supported for HybridModel"
     elif args.spec is not None:
         hybrid_stack_spec = import_module(args.spec)
+        if not isinstance(hybrid_stack_spec, ModuleSpec):
+            raise TypeError("--spec must refer to a static ModuleSpec for HybridModel.")
     else:
         raise ValueError("You must provide a valid hybrid layer spec via --spec")
 

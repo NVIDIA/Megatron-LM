@@ -88,7 +88,7 @@ def _run_te_pipeline_training(models, groups, pp_size, use_graph):
         batch = get_batch_on_this_tp_rank(
             batch=next(data_iterator),
             has_cu_seqlens=False,
-            is_hybrid_cp=False,
+            dynamic_cp=False,
             create_attention_mask_in_dataloader=False,
             broadcast_src_rank=torch.distributed.get_global_rank(groups.tp, 0),
             broadcast_group=groups.tp,
@@ -102,7 +102,7 @@ def _run_te_pipeline_training(models, groups, pp_size, use_graph):
             is_pipeline_last_stage=module.post_process,
         )
         if groups.cp.size() > 1:
-            batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=groups.cp)
+            batch = get_batch_on_this_cp_rank(batch, dynamic_cp=False, cp_group=groups.cp)
             if batch.get("tokens") is not None:
                 assert batch["tokens"].shape[1] == _SEQ_LENGTH // groups.cp.size()
         output = model(

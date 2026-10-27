@@ -21,8 +21,12 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     OffloadTensorPool,
     PipelineOffloadManager,
 )
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import (
+    CheckpointWithoutOutput,
+    model_parallel_cuda_manual_seed,
+)
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -44,6 +48,12 @@ def _make_chunk_handler_for_offload_checker(min_offloaded_tensor_size: int = 1):
     handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
     handler.min_offloaded_tensor_size = min_offloaded_tensor_size
     return handler
+
+
+@pytest.fixture(autouse=True)
+def reset_hybrid_ep():
+    yield
+    reset_hybrid_ep_buffer()
 
 
 def test_offload_summary_uses_explicit_process_group(monkeypatch):
@@ -116,6 +126,23 @@ def test_chunk_offload_handler_respects_tensor_opt_out_flags():
 
     tensor._TE_do_not_offload = True
     assert not handler.tensor_need_offloading_checker(tensor)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_chunk_offload_handler_skips_checkpoint_without_output_storage():
+    """Checkpoint outputs and their views must not be copied or released by offload."""
+    handler = _make_chunk_handler_for_offload_checker()
+    Utils.initialize_model_parallel()
+    try:
+        input_tensor = torch.randn(8, device="cuda", requires_grad=True)
+        checkpoint = CheckpointWithoutOutput()
+        output = checkpoint.checkpoint(lambda tensor: tensor * 2, input_tensor)
+
+        assert not handler.tensor_need_offloading_checker(output)
+        assert not handler.tensor_need_offloading_checker(output.view(2, 4))
+        assert handler.tensor_need_offloading_checker(output.clone())
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def _make_chunk_handler_for_offload_reload():

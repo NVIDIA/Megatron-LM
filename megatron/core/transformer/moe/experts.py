@@ -1,9 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
+import functools
 import inspect
 import logging
-from collections.abc import Callable
+import warnings
+import weakref
+from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
@@ -19,7 +22,13 @@ from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import (
+    HAVE_TE,
+    TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+)
+from megatron.core.extensions.transformer_engine import (
+    mark_grouped_tensor as _mark_te_grouped_tensor,
+)
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -86,13 +95,43 @@ except ImportError:
 from megatron.core.inference.moe import ActivationType as McoreActivationType
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
-    FlashInferRoutedMXFP8Weight,
     flashinfer_routed_mxfp8_moe,
     prepare_routed_mxfp8_weights,
     require_flashinfer_routed_mxfp8,
 )
+from megatron.core.inference.moe.flashinfer_nvfp4 import (
+    flashinfer_routed_nvfp4_moe,
+    prepare_routed_nvfp4_weights,
+    require_flashinfer_routed_nvfp4,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _te_supports_scaled_tanh_srelu() -> bool:
+    """Whether the installed TE provides ``ScaledTanhSReLU`` accepting ``tanh_clamp_scale``.
+
+    Checked by capability rather than version so it works against a development TE, and not
+    cached because tests swap the TE module out.
+    """
+    if not HAVE_TE:
+        return False
+    try:
+        from transformer_engine.pytorch.ops import ScaledTanhSReLU
+    except ImportError:
+        return False
+    return "tanh_clamp_scale" in inspect.signature(ScaledTanhSReLU).parameters
+
+
+def _require_te_tanh_clamp_support(config) -> None:
+    """Raise an actionable error if the op fuser is asked to clamp and the installed TE cannot."""
+    if config.activation_func_tanh_clamp_scale is None or _te_supports_scaled_tanh_srelu():
+        return
+    raise RuntimeError(
+        "activation_func_tanh_clamp_scale with use_transformer_engine_op_fuser requires a "
+        "Transformer Engine providing ops.ScaledTanhSReLU(tanh_clamp_scale=...). Upgrade "
+        "Transformer Engine, or unset use_transformer_engine_op_fuser to use the unfused path."
+    )
 
 
 class GroupedLinearFc1Interface(Protocol):
@@ -119,6 +158,7 @@ class GroupedLinearFc1Builder(Protocol):
         output_size: int,
         /,
         *,
+        num_virtual_experts: int = 0,
         config: TransformerConfig,
         init_method: Callable[[torch.Tensor], None],
         bias: bool,
@@ -156,6 +196,7 @@ class GroupedLinearFc2Builder(Protocol):
         output_size: int,
         /,
         *,
+        num_virtual_experts: int = 0,
         config: TransformerConfig,
         init_method: Callable[[torch.Tensor], None],
         bias: bool,
@@ -184,6 +225,51 @@ class GroupedMLPSubmodules:
     """
     Builder for an activation function module; only used if config.use_te_activation_func is True.
     """
+
+
+@functools.lru_cache(maxsize=1)
+def _te_grouped_tensor_supports_sharded_weights() -> bool:
+    """Whether TE threads the sharded parameters through its grouped-tensor path.
+
+    Added by https://github.com/NVIDIA/TransformerEngine/pull/3517.
+
+    TODO: replace with ``is_te_min_version`` once that fix ships in a bumped TE release. Fixed
+    and unfixed builds both report 2.20.0.dev0 today, so no version can distinguish them yet.
+    """
+    try:
+        from transformer_engine.pytorch.module.grouped_linear import _GroupedLinear
+
+        signature = inspect.signature(_GroupedLinear._forward_grouped_tensor)
+    except (ImportError, AttributeError, ValueError):
+        return False
+    return "is_dist_weight" in signature.parameters
+
+
+class _VirtualExpertFC2WgradStore:
+    """Start the FC2 virtual-expert gradient reduction when TE enqueues FC2's wgrad GEMM.
+
+    Installed on the executing FC2 GroupedLinear module or op. TE's delayed-wgrad
+    protocol hands the wgrad GEMM to ``put`` instead of launching it; this store
+    runs the GEMM at once and starts the reduction behind FC1's dgrad and wgrad GEMMs
+    instead of the dispatch-backward all-to-all. The queue stays empty, so TE's
+    ``backward_dw`` has nothing to run.
+    """
+
+    context = None
+
+    def __init__(self, load_balancer) -> None:
+        # TE's backward context retains this store; the manager holds routing tensors.
+        self._load_balancer = weakref.proxy(load_balancer)
+
+    @staticmethod
+    def delay_wgrad_compute() -> bool:
+        """TE routes the wgrad GEMM through :meth:`put` when this is true."""
+        return True
+
+    def put(self, tensors, wgrad_gemm) -> None:
+        """Run the wgrad GEMM now and start FC2's virtual-expert reduction behind it."""
+        wgrad_gemm(*tensors)
+        self._load_balancer.start_fc2_grad_reduce()
 
 
 class TEGroupedMLP(MegatronModule):
@@ -220,10 +306,14 @@ class TEGroupedMLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
+        num_virtual_experts = (
+            self.num_local_experts if self.config.moe_virtual_expert_load_balance else 0
+        )
         self.linear_fc1 = submodules.linear_fc1(
             self.num_local_experts,
             self.input_size if self.config.moe_latent_size is None else self.config.moe_latent_size,
             ffn_hidden_size,
+            num_virtual_experts=num_virtual_experts,
             config=self.config,
             init_method=not_none(self.config.init_method),
             bias=self.config.add_bias_linear,
@@ -247,6 +337,7 @@ class TEGroupedMLP(MegatronModule):
                 if self.config.moe_latent_size is None
                 else self.config.moe_latent_size
             ),
+            num_virtual_experts=num_virtual_experts,
             config=self.config,
             init_method=not_none(self.config.output_layer_init_method),
             bias=self.config.add_bias_linear,
@@ -257,20 +348,50 @@ class TEGroupedMLP(MegatronModule):
             name=(name + ".linear_fc2") if name is not None else None,
         )
 
-        self.offload_expert_fc1 = (
-            self.config.fine_grained_activation_offloading
-            and "expert_fc1" in self.config.offload_modules
+        # The fused grouped-MLP kernels are FP8/NVFP4-only and take their recipe from the global
+        # autocast state, so they would ignore a --te-precision-config-file override and quantize
+        # anyway -- silently under plain TE, fatally under GTP, whose backward then hands the
+        # kernel an unquantized weight. Fusion spans fc1 and fc2, so either one opting out ends it.
+        self._with_fused_impl: bool = (
+            self.config.use_transformer_engine_op_fuser
+            and self.linear_fc1.will_execute_quantized(is_context_quantized=True)
+            and self.linear_fc2.will_execute_quantized(is_context_quantized=True)
         )
+        # Fused implementation with Transformer Engine op fuser API
+        if self.config.use_transformer_engine_op_fuser:
+            _require_te_tanh_clamp_support(self.config)
+            assert (
+                self._is_fused_impl_supported()
+            ), "Fused GroupedMLP is not supported for this configuration."
 
-        self.offload_moe_act = (
-            self.config.fine_grained_activation_offloading
-            and "moe_act" in self.config.offload_modules
-        )
-
+        # Fine-grained activation offloading. "fused_group_mlp" and "expert_fc1" + "moe_act"
+        # describe the same thing for the two GroupedMLP paths: the fused TE op-fuser path
+        # exposes only the input of the whole fc1 -> act -> fc2 block, the unfused path exposes
+        # the fc1 input and the activation input separately. The config accepts either spelling
+        # (they are mutually exclusive there); each instance maps it onto its own path, so a
+        # model mixing fused (quantized) and unfused (e.g. bf16 MTP) experts offloads both.
+        offloading = self.config.fine_grained_activation_offloading
+        self.offload_expert_fc1 = offloading and "expert_fc1" in self.config.offload_modules
+        self.offload_moe_act = offloading and "moe_act" in self.config.offload_modules
         self.offload_fused_group_mlp = (
-            self.config.fine_grained_activation_offloading
-            and "fused_group_mlp" in self.config.offload_modules
+            offloading and "fused_group_mlp" in self.config.offload_modules
         )
+        if self._with_fused_impl:
+            if self.offload_expert_fc1 or self.offload_moe_act:
+                if not (self.offload_expert_fc1 and self.offload_moe_act):
+                    # Message text is constant so the default warning filter shows it once.
+                    warnings.warn(
+                        "Fused GroupedMLPs can only offload the input of the whole "
+                        "fc1 -> act -> fc2 block; a partial 'expert_fc1' or 'moe_act' selection "
+                        "is treated as 'fused_group_mlp' there."
+                    )
+                self.offload_fused_group_mlp = True
+            self.offload_expert_fc1 = False
+            self.offload_moe_act = False
+        elif self.offload_fused_group_mlp:
+            self.offload_fused_group_mlp = False
+            self.offload_expert_fc1 = True
+            self.offload_moe_act = True
 
         self.activation_recompute = (
             self.config.recompute_granularity == 'selective'
@@ -289,20 +410,15 @@ class TEGroupedMLP(MegatronModule):
 
             set_save_original_input(self.linear_fc1)
 
-        # Fused implementation with Transformer Engine op fuser API
-        if self.config.use_transformer_engine_op_fuser:
-            assert (
-                self._is_fused_impl_supported()
-            ), "Fused GroupedMLP is not supported for this configuration."
-        # The fused grouped-MLP kernels are FP8/NVFP4-only and take their recipe from the global
-        # autocast state, so they would ignore a --te-precision-config-file override and quantize
-        # anyway -- silently under plain TE, fatally under GTP, whose backward then hands the
-        # kernel an unquantized weight. Fusion spans fc1 and fc2, so either one opting out ends it.
-        self._with_fused_impl: bool = (
-            self.config.use_transformer_engine_op_fuser
-            and self.linear_fc1.will_execute_quantized(is_context_quantized=True)
-            and self.linear_fc2.will_execute_quantized(is_context_quantized=True)
-        )
+        # Routed expert inputs use the same alignment via get_align_size_for_quantization.
+        # Probe once here to keep signature inspection out of the first forward pass.
+        # Older TE versions select fusion through the legacy environment variable instead.
+        self._grouped_linear_kwargs = {}
+        if self._with_fused_impl:
+            if "split_alignment" in inspect.signature(te.pytorch.ops.GroupedLinear).parameters:
+                self._grouped_linear_kwargs["split_alignment"] = (
+                    TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
+                )
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
         if (
             self.config.gated_linear_unit
@@ -317,6 +433,40 @@ class TEGroupedMLP(MegatronModule):
             )
 
         self._use_grouped_tensor = self.config.moe_use_grouped_tensor
+
+        # Imported lazily: a module-scope import can silently flip HAVE_GTP to False
+        from megatron.core.tensor_parallel import gtp_api
+
+        # GTP wraps a grouped module's weight0..N as a set, so weight0 is representative -- the
+        # same assumption TE makes when it gates on weights[0].
+        fc1_weight0 = getattr(self.linear_fc1, "weight0", None)
+        has_gtp_sharded_weights = gtp_api.HAVE_GTP and gtp_api.is_gtp_param(fc1_weight0)
+        # Two independent blockers keep a sharded layer off the grouped-tensor path:
+        #   1. Older TE mishandles sharded weights there. Probed rather than version-gated:
+        #      fixed and unfixed builds currently share a version.
+        #   2. GTP's fp8 gather materializes row-wise data only, but that path needs column-wise
+        #      in forward for a trainable weight. Independent of the TE version.
+        blocked_by_te = not _te_grouped_tensor_supports_sharded_weights()
+        blocked_by_fp8_gather = getattr(fc1_weight0, "_gtp_native_fp8", False)
+        if (
+            self._use_grouped_tensor
+            and not self._with_fused_impl
+            and has_gtp_sharded_weights
+            and (blocked_by_te or blocked_by_fp8_gather)
+        ):
+            if self.config.moe_paged_stash:
+                raise RuntimeError(
+                    "moe_paged_stash requires GroupedTensor execution, but these GTP-sharded "
+                    "expert weights require the split-quantize fallback. Disable "
+                    "moe_paged_stash for this configuration."
+                )
+            # Fall back to the split-quantize path, which handles sharded weights.
+            # Both sides of the boundary have to agree, so flip both.
+            # mcore: selects the tokens_per_expert form below (CUDA tensor vs host list).
+            self._use_grouped_tensor = False
+            # TE: selects the path inside GroupedLinear.forward, which reads this per-forward.
+            self.linear_fc1.use_grouped_tensor = False
+            self.linear_fc2.use_grouped_tensor = False
         if self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
             assert HAVE_TE, "Quantized or TE grouped-tensor GroupedMLP execution requires TE."
             align_size = (
@@ -327,8 +477,27 @@ class TEGroupedMLP(MegatronModule):
                 self.num_local_experts, align_size=align_size
             )
 
-    @staticmethod
-    def _apply_packed_bias(intermediate_parallel, packed_bias, tokens_per_expert, permuted_probs):
+    def bind_virtual_experts(self, load_balancer) -> None:
+        """Bind native and virtual runtime weights after main gradients are initialized."""
+        if self._fused_ops is not None:
+            raise RuntimeError("Virtual-expert weights must be bound before fused ops are created.")
+
+        for fc_layer, linear in enumerate((self.linear_fc1, self.linear_fc2)):
+            runtime_weights = load_balancer.runtime_weights(fc_layer)
+            if len(runtime_weights) != linear.num_gemms:
+                raise ValueError("Runtime weight count must match grouped-linear GEMMs.")
+            # TE's unfused path reads weight{i} with getattr(); the fused op copies these
+            # same references below. Avoid registering virtual experts as parameters so DDP
+            # and checkpointing don't pick them up.
+            for index, weight in enumerate(runtime_weights):
+                object.__setattr__(linear, f"weight{index}", weight)
+        # For non GTP, trigger the virtual expert reduce scatter on TE's 'wgrad_store'
+        if not getattr(self.linear_fc2.weight0, "is_distributed_weight", False):
+            self.linear_fc2.wgrad_store = _VirtualExpertFC2WgradStore(load_balancer)
+
+    def _apply_packed_bias(
+        self, intermediate_parallel, packed_bias, tokens_per_expert, permuted_probs
+    ):
         """Apply a packed expert bias without reading token counts on the host."""
         # TODO: get rid of the .float() by having fused kernel compute in FP32
         shape = intermediate_parallel.shape
@@ -336,6 +505,10 @@ class TEGroupedMLP(MegatronModule):
         output_dtype = intermediate_parallel.dtype
         flat_output = intermediate_parallel.view(-1, hidden_size).float()
         flat_probs = permuted_probs.reshape(-1, 1).float()
+        if self.config.moe_paged_stash:
+            # The multiply below saves these two token-shaped operands. The additive output
+            # operand is not saved by autograd and does not need a marker.
+            _mark_te_grouped_tensor(flat_probs)
 
         if tokens_per_expert.device != packed_bias.device:
             raise ValueError("Packed MoE bias and tokens_per_expert must be on the same device.")
@@ -353,10 +526,11 @@ class TEGroupedMLP(MegatronModule):
         bias_per_token = torch.repeat_interleave(
             packed_bias.float(), tokens_per_expert, dim=0, output_size=flat_output.size(0)
         )
+        if self.config.moe_paged_stash:
+            _mark_te_grouped_tensor(bias_per_token)
         return (flat_output + bias_per_token * flat_probs).view(shape).to(output_dtype)
 
-    @staticmethod
-    def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
+    def _apply_bias(self, intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
         if bias_parallel is None:
             return intermediate_parallel
 
@@ -364,7 +538,7 @@ class TEGroupedMLP(MegatronModule):
         # GroupedTensor [num_experts, hidden_size]. The grouped-tensor backend also provides
         # tokens_per_expert as a tensor on the same device.
         if isinstance(bias_parallel, torch.Tensor) and isinstance(tokens_per_expert, torch.Tensor):
-            return TEGroupedMLP._apply_packed_bias(
+            return self._apply_packed_bias(
                 intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs
             )
 
@@ -410,13 +584,8 @@ class TEGroupedMLP(MegatronModule):
         # Check for unsupported features
         if self.tp_group.size() > 1:
             return False  # Tensor parallelism is not supported
-        if getattr(self, "offload_expert_fc1", False) or getattr(self, "offload_moe_act", False):
-            return False  # Selective expert_fc1/moe_act offload is only supported unfused.
         if self.config.moe_apply_probs_on_input:
             return False  # Pre-multiplying probs is not supported
-        if self.config.activation_func_tanh_clamp_scale is not None:
-            # TanH clamp is not supported.
-            return False
 
         # Check grouped linear modules
         if not isinstance(self.linear_fc1, te.pytorch.GroupedLinear):
@@ -443,6 +612,12 @@ class TEGroupedMLP(MegatronModule):
         )
         if not (use_glu_fusion or use_srelu_fusion):
             return False
+        if self.config.activation_func_tanh_clamp_scale is not None:
+            # Only non-gated squared ReLU can be soft-clamped on the fused path, and only when TE
+            # provides ScaledTanhSReLU. A clamped gated activation is SiTU-GLU, which the fused GLU
+            # path does not implement. Returning False selects the unfused (clamped) path.
+            if not use_srelu_fusion or not _te_supports_scaled_tanh_srelu():
+                return False
         if self.config.activation_func == F.silu:
             if self.config.activation_func_clamp_value is not None:
                 if not is_te_min_version("2.17.0.dev0"):
@@ -464,12 +639,8 @@ class TEGroupedMLP(MegatronModule):
         else:
             return False
 
-        # Check TE CuTe DSL fused kernel conditions (must match TE's
-        # fuse_grouped_mlp_ops matching logic).
-        import os
-
-        if use_glu_fusion and int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
-            return False
+        # TE can execute GroupedLinear -> activation -> GroupedLinear without a fused kernel.
+        # Leave CuTeDSL eligibility and layout checks to TE's fusion matcher.
         return True
 
     def _make_fused_ops(self) -> torch.nn.Module:
@@ -483,7 +654,7 @@ class TEGroupedMLP(MegatronModule):
             single_grouped_weight: bool,
             single_grouped_bias: bool,
         ) -> None:
-            """Register real GroupedLinear params on a meta TE op shell."""
+            """Give a fused op the weights exposed by its source GroupedLinear."""
             if single_grouped_weight:
                 op.register_parameter("weight", linear.get_parameter("weight"))
                 for idx in range(linear.num_gemms):
@@ -491,7 +662,7 @@ class TEGroupedMLP(MegatronModule):
             else:
                 op.register_parameter("weight", None)
                 for idx in range(linear.num_gemms):
-                    op.register_parameter(f"weight{idx}", linear.get_parameter(f"weight{idx}"))
+                    op.register_parameter(f"weight{idx}", getattr(linear, f"weight{idx}"))
 
             if not linear.use_bias:
                 return
@@ -543,6 +714,7 @@ class TEGroupedMLP(MegatronModule):
             single_grouped_weight=fc1_single_grouped_weight,
             single_grouped_bias=fc1_single_grouped_bias,
             delay_wgrad_compute=fc1_delay_wgrad_compute,
+            **self._grouped_linear_kwargs,
         )
 
         # In single grouped mode, clear stale per-expert meta params so TE does not reset
@@ -620,15 +792,16 @@ class TEGroupedMLP(MegatronModule):
             and self.config.use_fused_weighted_squared_relu
             and not self.config.gated_linear_unit
         ):
-            if (
-                "activation_recompute_in_mlp"
-                in inspect.signature(te.pytorch.ops.ScaledSReLU).parameters
-            ):
-                op = te.pytorch.ops.ScaledSReLU(
-                    activation_recompute_in_mlp=activation_recompute_in_mlp
-                )
+            clamp_scale = self.config.activation_func_tanh_clamp_scale
+            if clamp_scale is not None:
+                srelu_cls = te.pytorch.ops.ScaledTanhSReLU
+                kwargs = {"tanh_clamp_scale": clamp_scale}
             else:
-                op = te.pytorch.ops.ScaledSReLU()
+                srelu_cls = te.pytorch.ops.ScaledSReLU
+                kwargs = {}
+            if "activation_recompute_in_mlp" in inspect.signature(srelu_cls).parameters:
+                kwargs["activation_recompute_in_mlp"] = activation_recompute_in_mlp
+            op = srelu_cls(**kwargs)
         else:
             raise RuntimeError(
                 "_make_fused_ops expected SwiGLU, quick_gelu, or weighted squared_relu; "
@@ -651,6 +824,7 @@ class TEGroupedMLP(MegatronModule):
             delay_wgrad_compute=fc2_delay_wgrad_compute,
             # Preserve p * (FC2(x) + bias) after the scaled activation moves p before FC2.
             **fc2_bias_kwargs,
+            **self._grouped_linear_kwargs,
         )
 
         # In single grouped mode, clear stale per-expert meta params so TE does not reset
@@ -658,6 +832,7 @@ class TEGroupedMLP(MegatronModule):
         register_grouped_linear_params(
             op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
         )
+        op.wgrad_store = self.linear_fc2.wgrad_store
         # FP8 combine backward: the FC2 output grad arrives as an opaque MXFP8 carrier tensor
         # (TE EP combine backward, same packing as dispatch); tell TE to rebuild the grouped
         # view at the op boundary.
@@ -715,6 +890,26 @@ class TEGroupedMLP(MegatronModule):
         self._ensure_main_grad(self.linear_fc1)
         self._ensure_main_grad(self.linear_fc2)
 
+    def _get_paged_stash_scope(self, permuted_local_hidden_states, tokens_per_expert):
+        """Start a paged-stash group and return the input and saved-tensor context."""
+        if not self.config.moe_paged_stash:
+            return permuted_local_hidden_states, nullcontext()
+
+        permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
+        max_num_tokens = permuted_local_hidden_states.shape[0]
+        # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
+        # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
+        cap_factor = self.config.moe_expert_rank_capacity_factor
+        avg_num_tokens = (
+            int(max_num_tokens // cap_factor) if cap_factor is not None and cap_factor > 0 else None
+        )
+        return permuted_local_hidden_states, get_paged_stash_context(
+            name="grouped_mlp",
+            max_num_tokens=max_num_tokens,
+            num_tokens_tensor=tokens_per_expert.sum(),
+            avg_num_tokens=avg_num_tokens,
+        )
+
     def _fused_forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -748,8 +943,8 @@ class TEGroupedMLP(MegatronModule):
             pass
         # Regular AllToAll normally reaches this branch because its permutation does not insert
         # the padding needed by the fused grouped-MLP contract. FP8/FP4 require recipe-specific
-        # alignment, while the TE operation-fuser grouped-tensor path currently uses 256-token
-        # expert segments.
+        # alignment, while the TE operation-fuser grouped-tensor path requires expert segments
+        # aligned to TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT.
         elif self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
             tokens_per_expert = tokens_per_expert.tolist()
             unpadded_tokens_per_expert = tokens_per_expert
@@ -778,27 +973,9 @@ class TEGroupedMLP(MegatronModule):
                 "The Transformer Engine operation-fuser MoE path requires "
                 "moe_use_grouped_tensor=True."
             )
-        # if the number of tokens is 0, pad the hidden states to 256
-
-        if self.config.moe_paged_stash:
-            permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
-            max_num_tokens = permuted_local_hidden_states.shape[0]
-            # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
-            # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
-            cap_factor = self.config.moe_expert_rank_capacity_factor
-            avg_num_tokens = (
-                int(max_num_tokens // cap_factor)
-                if cap_factor is not None and cap_factor > 0
-                else None
-            )
-            stash_context = get_paged_stash_context(
-                name="grouped_mlp",
-                max_num_tokens=max_num_tokens,
-                num_tokens_tensor=tokens_per_expert.sum(),
-                avg_num_tokens=avg_num_tokens,
-            )
-        else:
-            stash_context = nullcontext()
+        permuted_local_hidden_states, stash_context = self._get_paged_stash_scope(
+            permuted_local_hidden_states, tokens_per_expert
+        )
         fine_grained_activation_offloading = getattr(self, "offload_fused_group_mlp", False)
         offload_name = "fused_group_mlp"
         fused_group_mlp_manager = off_interface(
@@ -854,110 +1031,29 @@ class TEGroupedMLP(MegatronModule):
         x = x.view(shape)
         return x
 
-    def forward(
+    def _unfused_forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
-        tokens_per_expert: torch.Tensor,
+        tokens_per_expert: torch.Tensor | list[int],
         permuted_probs: torch.Tensor,
-        output_buffer: Optional[torch.Tensor] = None,
-        grad_input_buffer: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Forward of TEGroupedMLP
-
-        Args:
-            permuted_local_hidden_states (torch.Tensor): The permuted input hidden states of the
-            local experts.
-            tokens_per_expert (torch.Tensor): The number of tokens per expert.
-            permuted_probs (torch.Tensor): The permuted probs of each token produced by the router.
-            output_buffer (torch.Tensor, optional): Preallocated buffer to write the fc2 output into
-            (NCCL-EP zero-copy fwd combine); only the fused op-fuser path supports it.
-            grad_input_buffer (torch.Tensor, optional): Preallocated buffer to write the fc1 dgrad
-            into (NCCL-EP zero-copy bwd dispatch); only the fused op-fuser path supports it.
-
-        Return:
-            output (torch.Tensor): The output of the local experts.
-        """
-
-        # Call fused impl if enabled
-        if self._with_fused_impl:
-            output = self._fused_forward(
-                permuted_local_hidden_states,
-                tokens_per_expert,
-                permuted_probs,
-                output_buffer,
-                grad_input_buffer,
-            )
-            output_bias = None
-            return output, output_bias
-        assert (
-            output_buffer is None and grad_input_buffer is None
-        ), "output_buffer/grad_input_buffer require the TE op-fuser (fused) path"
-
-        # Apply padding if needed
-        unpadded_tokens_per_expert = None
-        permuted_probs = permuted_probs.unsqueeze(-1)
-        # The token buffer may already contain per-expert padding when padding was performed
-        # before expert compute:
-        #   * router padding modified the routing map before dispatch;
-        #   * HybridEP/NCCL-EP fused padding into dispatch/permute;
-        #   * DeepEP fused padding into its post-communication local permutation.
-        # In those cases tokens_per_expert already describes the padded expert segments. Running
-        # Fp8Padding again would change the segment lengths without matching the existing token
-        # layout, so this module must leave both tensors unchanged.
-        if skip_routed_expert_padding(self.config):
-            pass
-        # Regular AllToAll normally supplies unpadded expert segments and therefore uses this
-        # explicit fallback. FP8/FP4 need their recipe-specific alignment. MCore currently also
-        # applies its common aligned-segment contract to the GroupedTensor backend so quantized
-        # grouped execution receives supported shapes
-        elif self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
-            tokens_per_expert = tokens_per_expert.tolist()
-            unpadded_tokens_per_expert = tokens_per_expert
-            permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
-                permuted_local_hidden_states, tokens_per_expert
-            )
-            permuted_probs, _ = self.quantization_padding(
-                permuted_probs, unpadded_tokens_per_expert
-            )
-
-        if self._use_grouped_tensor:
-            if not isinstance(tokens_per_expert, torch.Tensor):
-                tokens_per_expert = torch.tensor(
-                    tokens_per_expert, dtype=torch.int64, device=permuted_local_hidden_states.device
-                )
-            else:
-                tokens_per_expert = tokens_per_expert.to(
-                    device=permuted_local_hidden_states.device, dtype=torch.int64, non_blocking=True
-                )
-        elif isinstance(tokens_per_expert, torch.Tensor):
-            tokens_per_expert = tokens_per_expert.tolist()
-
+    ) -> torch.Tensor:
+        """Run FC1, activation, and FC2 without the TE operation fuser."""
         if self.config.moe_apply_probs_on_input:
             assert (
                 self.config.moe_router_topk == 1
             ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
+            # MulBackward saves both operands before GroupedLinear sees the scaled input.
+            if self.config.moe_paged_stash:
+                _mark_te_grouped_tensor(permuted_local_hidden_states, permuted_probs)
             original_dtype = permuted_local_hidden_states.dtype
             permuted_local_hidden_states = permuted_probs * permuted_local_hidden_states
             permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
-        expert_fc1_manager = off_interface(
-            self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
-        )
-        with expert_fc1_manager as permuted_local_hidden_states:
-            fc1_output, bias_parallel = apply_module(self.linear_fc1)(
-                permuted_local_hidden_states, tokens_per_expert
-            )
-        fc1_output = expert_fc1_manager.group_offload(
-            fc1_output,
-            forced_released_tensors=[permuted_local_hidden_states],
-            delay_offload=self.config.delay_offload_until_cuda_graph,
-        )
-
-        moe_act_manager = off_interface(self.offload_moe_act, fc1_output, "moe_act")
-
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
+            if self.config.moe_paged_stash:
+                _mark_te_grouped_tensor(intermediate_parallel, permuted_probs)
 
             # Whether activation function is interleaved GLU
             with_glu_interleaving = (
@@ -1050,17 +1146,66 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
-        if self.activation_recompute:
-            self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with moe_act_manager as fc1_output:
-                bias_act_output = self.activation_checkpoint.checkpoint(
-                    bias_act_func, fc1_output, bias_parallel, permuted_probs
+        # Only set up the checkpoint when a backward pass will actually follow.
+        # CheckpointWithoutOutput discards the activation and relies on a grad hook to
+        # recompute it; under torch.no_grad() the output does not require grad, so the
+        # hook is never registered and the discard is left without its counterpart.
+        # self.training is not sufficient here: when "moe" is also in recompute_modules,
+        # CheckpointFunction invokes this forward once under no_grad and again under
+        # enable_grad during backward, and self.training is True in both cases.
+        setup_activation_checkpoint = self.activation_recompute and torch.is_grad_enabled()
+
+        # With both unfused groups enabled, offload fc1 + activation as ONE group named
+        # "fused_group_mlp", like the fused path: the saved-tensor hooks catch everything saved
+        # inside (fc1 input, fc1 output), so it goes to CPU in one D2H burst after fc2 and comes
+        # back in one reload, and the offload manager sees fused and unfused
+        # experts as one stream of same-named groups (its skip/lookahead logic is per name; with
+        # distinct names a fused decoder layer followed only by unfused, e.g. bf16 MTP, experts
+        # looked like "the last fused_group_mlp group" and was never offloaded).
+        offload_group_mlp = self.offload_expert_fc1 and self.offload_moe_act
+        # TE leaves its native grouped-tensor path while CPU offloading is active, and the
+        # split-quantize fallback it takes instead cannot consume the capacity-padded inputs
+        # HybridEP / virtual experts hand grouped-tensor experts (rows > sum(tokens_per_expert)).
+        # Keep fc1 outside the offload context there and start the group at the activation.
+        group_includes_fc1 = offload_group_mlp and not self._use_grouped_tensor
+        offload_expert_fc1 = self.offload_expert_fc1 and not offload_group_mlp
+        offload_moe_act = (self.offload_moe_act and not offload_group_mlp) or (
+            offload_group_mlp and not group_includes_fc1
+        )
+        moe_act_group_name = "fused_group_mlp" if offload_group_mlp else "moe_act"
+        group_mlp_manager = off_interface(
+            group_includes_fc1, permuted_local_hidden_states, "fused_group_mlp"
+        )
+        with group_mlp_manager as permuted_local_hidden_states:
+            expert_fc1_manager = off_interface(
+                offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
+            )
+            with expert_fc1_manager as permuted_local_hidden_states:
+                fc1_output, bias_parallel = apply_module(self.linear_fc1)(
+                    permuted_local_hidden_states, tokens_per_expert
                 )
-        else:
-            with moe_act_manager as fc1_output:
-                bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
+            fc1_output = expert_fc1_manager.group_offload(
+                fc1_output,
+                forced_released_tensors=[permuted_local_hidden_states],
+                delay_offload=self.config.delay_offload_until_cuda_graph,
+            )
+
+            moe_act_manager = off_interface(offload_moe_act, fc1_output, moe_act_group_name)
+
+            if setup_activation_checkpoint:
+                self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+                with moe_act_manager as fc1_output:
+                    bias_act_output = self.activation_checkpoint.checkpoint(
+                        bias_act_func, fc1_output, bias_parallel, permuted_probs
+                    )
+            else:
+                with moe_act_manager as fc1_output:
+                    bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
+        # fc2 runs outside the group-MLP offload group's saved-tensor hooks: with moe_act
+        # recompute its saved input is discarded (storage resized to 0) right after fc2, and an
+        # offload group must not hold such a tensor. The commit still happens after fc2 (below).
         output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
-        if self.activation_recompute:
+        if setup_activation_checkpoint:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
 
         # Delay the offload of the moe act until after the linear_fc2 has been computed
@@ -1070,12 +1215,107 @@ class TEGroupedMLP(MegatronModule):
             forced_released_tensors=[fc1_output],
             delay_offload=self.config.delay_offload_until_cuda_graph,
         )
-        output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
+        # Group-MLP offload group: commit after fc2 so fc1_output is reloaded before the
+        # moe_act recompute.
+        output = group_mlp_manager.group_offload(
+            output,
+            forced_released_tensors=[permuted_local_hidden_states, fc1_output],
+            delay_offload=self.config.delay_offload_until_cuda_graph,
+        )
+        return self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
+
+    def forward(
+        self,
+        permuted_local_hidden_states: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor,
+        output_buffer: Optional[torch.Tensor] = None,
+        grad_input_buffer: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Forward of TEGroupedMLP
+
+        Args:
+            permuted_local_hidden_states (torch.Tensor): The permuted input hidden states of the
+            local experts.
+            tokens_per_expert (torch.Tensor): The number of tokens per expert.
+            permuted_probs (torch.Tensor): The permuted probs of each token produced by the router.
+            output_buffer (torch.Tensor, optional): Preallocated buffer to write the fc2 output into
+            (NCCL-EP zero-copy fwd combine); only the fused op-fuser path supports it.
+            grad_input_buffer (torch.Tensor, optional): Preallocated buffer to write the fc1 dgrad
+            into (NCCL-EP zero-copy bwd dispatch); only the fused op-fuser path supports it.
+
+        Return:
+            output (torch.Tensor): The output of the local experts.
+        """
+
+        # Call fused impl if enabled
+        if self._with_fused_impl:
+            output = self._fused_forward(
+                permuted_local_hidden_states,
+                tokens_per_expert,
+                permuted_probs,
+                output_buffer,
+                grad_input_buffer,
+            )
+            output_bias = None
+            return output, output_bias
+        assert (
+            output_buffer is None and grad_input_buffer is None
+        ), "output_buffer/grad_input_buffer require the TE op-fuser (fused) path"
+
+        # Apply padding if needed
+        unpadded_tokens_per_expert = None
+        permuted_probs = permuted_probs.unsqueeze(-1)
+        # The token buffer may already contain per-expert padding when padding was performed
+        # before expert compute:
+        #   * router padding modified the routing map before dispatch;
+        #   * HybridEP/NCCL-EP fused padding into dispatch/permute;
+        #   * DeepEP fused padding into its post-communication local permutation.
+        # In those cases tokens_per_expert already describes the padded expert segments. Running
+        # Fp8Padding again would change the segment lengths without matching the existing token
+        # layout, so this module must leave both tensors unchanged.
+        if skip_routed_expert_padding(self.config):
+            pass
+        # Regular AllToAll normally supplies unpadded expert segments and therefore uses this
+        # explicit fallback. FP8/FP4 need their recipe-specific alignment. MCore currently also
+        # applies its common aligned-segment contract to the GroupedTensor backend so quantized
+        # grouped execution receives supported shapes
+        elif self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
+            tokens_per_expert = tokens_per_expert.tolist()
+            unpadded_tokens_per_expert = tokens_per_expert
+            permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
+                permuted_local_hidden_states, tokens_per_expert
+            )
+            permuted_probs, _ = self.quantization_padding(
+                permuted_probs, unpadded_tokens_per_expert
+            )
+
+        if self._use_grouped_tensor:
+            if not isinstance(tokens_per_expert, torch.Tensor):
+                tokens_per_expert = torch.tensor(
+                    tokens_per_expert, dtype=torch.int64, device=permuted_local_hidden_states.device
+                )
+            else:
+                tokens_per_expert = tokens_per_expert.to(
+                    device=permuted_local_hidden_states.device, dtype=torch.int64, non_blocking=True
+                )
+        elif isinstance(tokens_per_expert, torch.Tensor):
+            tokens_per_expert = tokens_per_expert.tolist()
+
+        permuted_local_hidden_states, stash_context = self._get_paged_stash_scope(
+            permuted_local_hidden_states, tokens_per_expert
+        )
+        with stash_context:
+            output = self._unfused_forward(
+                permuted_local_hidden_states, tokens_per_expert, permuted_probs
+            )
 
         # upad and concat the output
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
 
+        if self.config.moe_paged_stash:
+            output = paged_stash_group_commit(output, name="grouped_mlp")
         output_bias = None
 
         return output, output_bias
@@ -1168,8 +1408,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
     Supports three forward paths:
     - Training: delegates to parent TEGroupedMLP
     - Inference + FlashInfer: CUTLASS fused MoE for BF16 or routed block-scale MoE for MXFP8
-    - Inference + eager: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets
+      and per-token NVFP4
+    - Inference + torch: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets
+    - Inference + vLLM: Triton fused MoE for BF16, MCore scaled grouped GEMM for MXFP8
     """
+
+    _EXPERT_WEIGHT_GROUPS = (("linear_fc1", "_fc1_weight"), ("linear_fc2", "_fc2_weight"))
 
     def __init__(
         self,
@@ -1191,6 +1435,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # Concatenated weights are built lazily on first forward to ensure
         # checkpoint loading has already populated the per-expert parameters.
         self._concatenated_weights_built = False
+        self._uses_mxfp8_weights: bool | None = None
+        self._nvfp4_recipe = config.inference_moe_nvfp4_recipe
+        self._nvfp4_weights = None
 
         if HAVE_FLASHINFER:
             self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
@@ -1208,7 +1455,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
         ), "flashinfer-python is required to resolve FlashInfer activation type."
         func = self.config.activation_func
         if func == F.silu:
-            return ActivationType.Silu
+            # Gated experts reach FlashInfer only with inference_moe_nvfp4_recipe: config
+            # validation rejects them for the BF16 and MXFP8 FlashInfer paths.
+            return ActivationType.Swiglu if self.config.gated_linear_unit else ActivationType.Silu
         elif func == F.gelu:
             return ActivationType.Gelu
         elif func == F.relu:
@@ -1227,6 +1476,40 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return McoreActivationType.SWIGLU
         raise ValueError(f"No mcore_fused_moe ActivationType mapping for activation_func={func}")
 
+    @staticmethod
+    def _unwrap_mxfp8_weight(weight: object) -> MXFP8Tensor | None:
+        """Return the MCore MXFP8 storage carried by a weight, if any."""
+        if isinstance(weight, MXFP8Tensor):
+            return weight
+        data = getattr(weight, "data", None)
+        return data if isinstance(data, MXFP8Tensor) else None
+
+    @staticmethod
+    def _require_uniform_weight_format(format_flags: Iterable[bool], format_name: str) -> bool:
+        """Return whether every expert projection uses a format, rejecting mixtures."""
+        flags = tuple(format_flags)
+        if any(flags) != all(flags):
+            raise TypeError(
+                "FC1 and FC2 expert weights must use one precision within an MoE layer; "
+                f"found a mixture of {format_name} and BF16 weights. Adjust the selective "
+                "TE precision recipe to select both expert projections."
+            )
+        return all(flags)
+
+    def _expert_weights_use_mxfp8(self) -> bool:
+        """Return whether all per-expert FC1 and FC2 weights use MCore MXFP8 storage."""
+        return InferenceGroupedMLP._require_uniform_weight_format(
+            (
+                InferenceGroupedMLP._unwrap_mxfp8_weight(
+                    getattr(getattr(self, linear_name), f"weight{expert_index}")
+                )
+                is not None
+                for linear_name, _ in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS
+                for expert_index in range(self.num_local_experts)
+            ),
+            "MXFP8",
+        )
+
     def _stack_mxfp8_linear_weight(self, linear_name: str, backend: str) -> MXFP8Tensor:
         """Stack one linear's per-expert MXFP8 weights in canonical layout."""
         linear = getattr(self, linear_name)
@@ -1234,11 +1517,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         source_dtype: torch.dtype | None = None
         for i in range(self.num_local_experts):
             weight = getattr(linear, f'weight{i}')
-            if isinstance(weight, MXFP8Tensor):
-                mxfp8 = weight
-            elif hasattr(weight, 'data') and isinstance(weight.data, MXFP8Tensor):
-                mxfp8 = weight.data
-            else:
+            mxfp8 = InferenceGroupedMLP._unwrap_mxfp8_weight(weight)
+            if mxfp8 is None:
                 raise RuntimeError(
                     f"Expected MXFP8Tensor for {linear_name}.weight{i}, "
                     f"got {type(weight).__name__}. Was quantize_model_to_mxfp8 called?"
@@ -1267,7 +1547,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _build_concatenated_mxfp8_weights(self):
         """Build contiguous expert stacks after checkpoint loading.
 
-        The torch backend rebinds each per-expert MXFP8Tensor to its stacked view.
+        The torch and vLLM backends rebind each per-expert MXFP8Tensor to its stacked view.
         FlashInfer keeps those canonical tensors for refit and derives a shuffled
         Major-K stack for its routed-MoE kernel.
         """
@@ -1278,7 +1558,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         backend = resolve_mxfp8_backend(self.inference_grouped_gemm_backend)
         if use_flashinfer_routed:
             require_flashinfer_routed_mxfp8()
-        for linear_name, buf_name in [('linear_fc1', '_fc1_weight'), ('linear_fc2', '_fc2_weight')]:
+        for linear_name, buf_name in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS:
             linear = getattr(self, linear_name)
             stacked_weight = self._stack_mxfp8_linear_weight(linear_name, backend)
             if use_flashinfer_routed:
@@ -1297,7 +1577,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 concatenated_weight = stacked_weight
             setattr(self, buf_name, concatenated_weight)
 
-            # The torch path can redirect per-expert storage into the stacked
+            # The torch and vLLM paths can redirect per-expert storage into the stacked
             # representation. FlashInfer keeps the canonical Triton tensors intact
             # because its shuffled Major-K weights are a derived representation.
             if not use_flashinfer_routed:
@@ -1309,6 +1589,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     elif hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor):
                         w.data.data = stacked_weight.data[i]
                         w.data.scale = stacked_weight.scale[i]
+        self._uses_mxfp8_weights = True
 
     @torch.inference_mode(False)
     @torch.no_grad()
@@ -1322,13 +1603,50 @@ class InferenceGroupedMLP(TEGroupedMLP):
             or self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER
         ):
             return False
+
+        if not self._uses_mxfp8_weights:
+            # Selective-precision recipes also build BF16 expert weights for
+            # FlashInfer. Those buffers are refit directly and have no derived
+            # routed representation to refresh.
+            return False
+
         require_flashinfer_routed_mxfp8()
-        for linear_name, buf_name in [('linear_fc1', '_fc1_weight'), ('linear_fc2', '_fc2_weight')]:
+        for linear_name, buf_name in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS:
             routed_weight = getattr(self, buf_name)
-            if not isinstance(routed_weight, FlashInferRoutedMXFP8Weight):
-                raise TypeError(f"{buf_name} is not a FlashInfer routed MXFP8 weight")
             canonical_weight = self._stack_mxfp8_linear_weight(linear_name, "triton")
             prepare_routed_mxfp8_weights(canonical_weight, out=routed_weight)
+        return True
+
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    def _build_flashinfer_nvfp4_weights(self):
+        """Quantize the BF16 expert stacks into routed per-token NVFP4 weights.
+
+        The BF16 stacks stay resident as the refit destination; the NVFP4 stacks
+        are a derived representation consumed only by the FlashInfer kernel.
+        """
+        require_flashinfer_routed_nvfp4()
+        self._nvfp4_weights = prepare_routed_nvfp4_weights(self._fc1_weight, self._fc2_weight)
+        logger.info(
+            "Prepared FlashInfer per-token NVFP4 weights: experts=%d "
+            "hidden=%d->%d intermediate=%d->%d",
+            self.num_local_experts,
+            self._nvfp4_weights.hidden_size,
+            self._nvfp4_weights.padded_hidden_size,
+            self._nvfp4_weights.intermediate_size,
+            self._nvfp4_weights.padded_intermediate_size,
+        )
+
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    def refresh_flashinfer_nvfp4_weights(self) -> bool:
+        """Requantize routed NVFP4 expert weights in place after the BF16 weights change.
+
+        Returns whether derived FlashInfer weights were refreshed.
+        """
+        if self._nvfp4_weights is None:
+            return False
+        prepare_routed_nvfp4_weights(self._fc1_weight, self._fc2_weight, out=self._nvfp4_weights)
         return True
 
     @torch.inference_mode(False)  # needed for non-colocated inference.
@@ -1374,6 +1692,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # Register big tensors as non-persistent buffers (for .to() device movement, not saved)
         self.register_buffer('_fc1_weight', _fc1_weight, persistent=False)
         self.register_buffer('_fc2_weight', _fc2_weight, persistent=False)
+        self._uses_mxfp8_weights = False
 
     def _flashinfer_forward(self, hidden_states, routing_map, probs):
         """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""
@@ -1384,15 +1703,27 @@ class InferenceGroupedMLP(TEGroupedMLP):
             "inference_grouped_gemm_backend=vllm or torch."
         )
         assert probs.dtype == torch.float32, "FlashInfer forward path requires fp32 probabilities."
-        if isinstance(self._fc1_weight, FlashInferRoutedMXFP8Weight):
-            if not isinstance(self._fc2_weight, FlashInferRoutedMXFP8Weight):
-                raise TypeError("FC1 and FC2 must use the same FlashInfer MXFP8 format")
+        if self._uses_mxfp8_weights:
             output = flashinfer_routed_mxfp8_moe(
                 hidden_states,
                 routing_map,
                 probs,
                 self._fc1_weight,
                 self._fc2_weight,
+                num_experts=self.num_local_experts * self.ep_group.size(),
+                local_expert_offset=self.ep_group.rank() * self.num_local_experts,
+                activation_type=self._flashinfer_activation_type.value,
+                out=(NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None),
+                token_capacity=self._flashinfer_mxfp8_token_capacity,
+                use_bounded_rows=InferenceMode.use_bounded_mxfp8_rows(),
+            )
+            return output, None
+        if self._nvfp4_weights is not None:
+            output = flashinfer_routed_nvfp4_moe(
+                hidden_states,
+                routing_map,
+                probs,
+                self._nvfp4_weights,
                 num_experts=self.num_local_experts * self.ep_group.size(),
                 local_expert_offset=self.ep_group.rank() * self.num_local_experts,
                 activation_type=self._flashinfer_activation_type.value,
@@ -1420,7 +1751,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         return output, None
 
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
-        """Torch grouped_mm fused MoE forward via mcore_fused_moe."""
+        """MCore grouped GEMM for Torch and the vLLM-selected MXFP8 fallback."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         output = mcore_fused_moe(
             hidden_states,
@@ -1464,12 +1795,14 @@ class InferenceGroupedMLP(TEGroupedMLP):
         permuted_probs: torch.Tensor,
         routing_map: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Forward pass with three modes:
+        """Forward pass with backend-selected inference grouped GEMMs:
 
         - Training: delegates to parent TEGroupedMLP.
         - Inference + FlashInfer: fused BF16 or routed MXFP8 MoE. tokens_per_expert
           is not used in this path; the FlashInfer kernels operate directly on routing_map.
-        - Inference + eager: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets.
+        - Inference + torch: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets.
+        - Inference + vLLM: Triton fused MoE for BF16; MXFP8 layers use MCore's
+          scaled grouped-GEMM path because the vLLM kernel is BF16-only.
 
         Args:
             permuted_local_hidden_states: [num_tokens, hidden_size] input hidden states.
@@ -1488,13 +1821,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         # Lazily build concatenated weights on first forward (after checkpoint load)
         if not self._concatenated_weights_built:
-            w = self.linear_fc1.weight0
-            if isinstance(w, MXFP8Tensor) or (
-                hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor)
-            ):
+            if InferenceGroupedMLP._expert_weights_use_mxfp8(self):
                 self._build_concatenated_mxfp8_weights()
             else:
                 self._build_concatenated_weights()
+                if self._nvfp4_recipe is not None:
+                    self._build_flashinfer_nvfp4_weights()
             self._concatenated_weights_built = True
 
         if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
@@ -1508,9 +1840,19 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 permuted_local_hidden_states, permuted_probs, routing_map=routing_map
             )
         elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM:
+            # The vLLM kernel integrated here handles BF16, not MCore's MXFP8 layout.
+            # Use MCore's scaled grouped GEMM for MXFP8 without dequantizing the weights;
+            # BF16 layers in a mixed-precision recipe still use the vLLM path below.
+            if self._uses_mxfp8_weights:
+                return self._mcore_fused_moe_forward(
+                    permuted_local_hidden_states, permuted_probs, routing_map=routing_map
+                )
             return self._vllm_forward(
                 permuted_local_hidden_states, permuted_probs, routing_map=routing_map
             )
+        raise ValueError(
+            f"Unsupported inference grouped-GEMM backend: {self.inference_grouped_gemm_backend}"
+        )
 
 
 class SequentialMLP(MegatronModule):

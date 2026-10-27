@@ -1,8 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for the minimal Megatron-FSDP path."""
+"""Unit tests for MFSDP v2.
+
+Use this file only as a last resort when no focused test file fits.
+"""
 
 import logging
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -11,7 +15,6 @@ import transformer_engine.pytorch as te
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
-from torch.profiler import ProfilerActivity, profile
 from torch.utils.checkpoint import checkpoint
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
@@ -22,6 +25,11 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
+    RowAtomic,
+    TensorAtomic,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import collect_linked_event_groups
 
@@ -55,19 +63,6 @@ class CheckpointedTinyModel(TinyModel):
         return checkpoint(self.fc2, self.relu(x), use_reentrant=self.use_reentrant)
 
 
-class NestedModel(nn.Module):
-    """Model with direct and child-owned parameters."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.bias = nn.Parameter(torch.ones(4))
-        self.inner = nn.Linear(4, 4, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run the nested model."""
-        return self.inner(x) + self.bias
-
-
 class MultiChildModel(nn.Module):
     """Model with direct parameters and multiple child FsdpModules."""
 
@@ -84,52 +79,41 @@ class MultiChildModel(nn.Module):
         return x
 
 
-class TiedLM(nn.Module):
-    """Tiny language model with shared input and output embedding weights."""
+class TinySharedMTP(nn.Module):
+    """Two MTP depths with shifted token embeddings and one shared residual block."""
 
-    def __init__(self) -> None:
+    def __init__(self, width: int, vocab_size: int) -> None:
         super().__init__()
-        self.embed_tokens = nn.Embedding(8, 4, dtype=torch.bfloat16)
-        self.lm_head = nn.Linear(4, 8, bias=False, dtype=torch.bfloat16)
-        self.lm_head.weight = self.embed_tokens.weight
+        self.embedding = nn.Embedding(vocab_size, width)
+        self.enorm = nn.LayerNorm(width, bias=False)
+        self.hnorm = nn.LayerNorm(width, bias=False)
+        self.eh_proj = nn.Linear(2 * width, width, bias=False)
+        self.shared_block = nn.Sequential(
+            nn.LayerNorm(width, bias=False),
+            nn.Linear(width, width, bias=False),
+            nn.GELU(),
+            nn.Linear(width, width, bias=False),
+        )
+        self.output = nn.Linear(width, vocab_size, bias=False)
 
-    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """Compute a scalar loss using both aliases of the shared weight."""
-        return self.lm_head(self.embed_tokens(token_ids)).float().sum()
-
-
-class SaveNonLeafWeightView(torch.autograd.Function):
-    """Autograd function that saves a non-leaf parameter view for backward."""
-
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, weight_view: torch.Tensor) -> torch.Tensor:
-        """Save the non-leaf weight view and run a simple elementwise op."""
-        ctx.save_for_backward(x, weight_view)
-        return x * weight_view
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Use the saved non-leaf weight view during backward."""
-        x, weight_view = ctx.saved_tensors
-        return grad_output * weight_view, grad_output * x
-
-
-class NonLeafViewModel(nn.Module):
-    """Model that saves a non-leaf parameter view across forward and backward."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.randn(8))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run using a non-leaf view of the parameter."""
-        weight_view = self.weight.view_as(self.weight)
-        assert self.weight.is_leaf
-        assert not weight_view.is_leaf
-        return SaveNonLeafWeightView.apply(x, weight_view)
+    def forward(self, token_ids: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Condition each depth on the previous depth and sum its next-token loss."""
+        seq_length = hidden_states.size(1)
+        losses = []
+        for depth in (1, 2):
+            # At position t, depth k consumes token t+k and predicts token t+k+1.
+            embeddings = self.embedding(token_ids[:, depth : depth + seq_length])
+            hidden_states = self.eh_proj(
+                torch.cat((self.enorm(embeddings), self.hnorm(hidden_states)), dim=-1)
+            )
+            hidden_states = hidden_states + self.shared_block(hidden_states)
+            logits = self.output(hidden_states)
+            targets = token_ids[:, depth + 1 : depth + 1 + seq_length]
+            losses.append(nn.functional.cross_entropy(logits.flatten(0, 1), targets.flatten()))
+        return torch.stack(losses).sum()
 
 
-def _flat_placements() -> Placements:
+def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
@@ -149,6 +133,19 @@ def _zero2_placements() -> Placements:
     return Placements(
         dp_axes=[0], parameter=[Replicate()], gradient=[Shard(0)], optimizer=[Shard(0)]
     )
+
+
+_TENSOR_ATOMIC_ZERO1_PLACEMENTS = Placements(
+    dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[TensorAtomic()]
+)
+
+_TENSOR_ATOMIC_ZERO2_PLACEMENTS = Placements(
+    dp_axes=[0], parameter=[Replicate()], gradient=[TensorAtomic()], optimizer=[TensorAtomic()]
+)
+
+_TENSOR_ATOMIC_ZERO3_PLACEMENTS = Placements(
+    dp_axes=[0], parameter=[TensorAtomic()], gradient=[TensorAtomic()], optimizer=[TensorAtomic()]
+)
 
 
 def _hsdp_placements() -> Placements:
@@ -184,14 +181,14 @@ _ALLREDUCE_OP_NAME_SUBSTRING = "allreduce"
 
 @pytest.mark.parametrize(
     "placements_factory",
-    [_no_shard_placements, _zero1_placements, _zero2_placements, _flat_placements],
+    [_no_shard_placements, _zero1_placements, _zero2_placements, _default_placements],
     ids=["no_shard", "zero1", "zero2", "zero3"],
 )
 @pytest.mark.parametrize("num_microbatches", [1, 3])
 def test_fully_shard_sgd_losses_match_baseline(
     distributed_setup, num_microbatches, placements_factory
 ):
-    """Every supported sharding strategy should match single-rank SGD."""
+    """Every supported sharding strategy should match gradient-averaged SGD."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -212,12 +209,14 @@ def test_fully_shard_sgd_losses_match_baseline(
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     fully_shard_optimizer(optimizer)
 
-    micro_batch_size = 2
-    x = torch.randn(num_microbatches, micro_batch_size, 8, device=device)
-    target = torch.randn(num_microbatches, micro_batch_size, 4, device=device)
+    microbatch_size = 2
+    # Keep initialization identical, but exercise reduction of distinct rank-local gradients.
+    torch.manual_seed(5678 + rank)
+    x = torch.randn(num_microbatches, microbatch_size, 8, device=device)
+    target = torch.randn(num_microbatches, microbatch_size, 4, device=device)
     microbatches = tuple(zip(x.unbind(), target.unbind()))
 
-    def train(model, optimizer, log_prefix) -> list[torch.Tensor]:
+    def train(model, optimizer, log_prefix, *, reduce_grads: bool) -> list[torch.Tensor]:
         losses = []
         for step in range(5):
             optimizer.zero_grad()
@@ -236,11 +235,17 @@ def test_fully_shard_sgd_losses_match_baseline(
                     )
                     (loss / num_microbatches).backward()
 
+            if reduce_grads:
+                # The unsharded baseline needs the same DP average as FSDP, after accumulation.
+                for parameter in model.parameters():
+                    dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
+                    parameter.grad.div_(world_size)
+
             optimizer.step()
         return losses
 
-    baseline_losses = train(baseline, baseline_optimizer, "Baseline")
-    sharded_losses = train(model, optimizer, "FSDP")
+    baseline_losses = train(baseline, baseline_optimizer, "Baseline", reduce_grads=True)
+    sharded_losses = train(model, optimizer, "FSDP", reduce_grads=False)
 
     torch.testing.assert_close(
         torch.stack(sharded_losses),
@@ -249,8 +254,53 @@ def test_fully_shard_sgd_losses_match_baseline(
     )
 
 
-def test_fully_shard_waits_for_delayed_te_weight_gradient(distributed_setup):
-    """TE's callback, not AccumulateGrad, completes MFSDP backward."""
+def test_shared_mtp_backward_matches_baseline(distributed_setup):
+    """Shared-layer MTP should match unsharded training over multiple SGD steps."""
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    width = 2 * world_size
+    vocab_size = 4 * width
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(5678 + rank)
+    seq_length = 4
+    token_ids = torch.randint(vocab_size, (2, seq_length + 3), device=device)
+    hidden_states = torch.randn(2, seq_length, width, device=device)
+    inputs = (token_ids, hidden_states)
+
+    def train(model, optimizer, inputs, *, reduce_wgrad: bool) -> list[torch.Tensor]:
+        losses = []
+        for _ in range(5):
+            optimizer.zero_grad()
+            loss = model(*inputs)
+            losses.append(loss.detach())
+            loss.backward()
+            if reduce_wgrad:
+                # The plain baseline has no DDP wrapper to average its gradients.
+                for parameter in model.parameters():
+                    dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
+            optimizer.step()
+        return losses
+
+    torch.manual_seed(1234)
+    baseline = TinySharedMTP(width, vocab_size).to(device)
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
+    baseline_losses = train(baseline, baseline_optimizer, inputs, reduce_wgrad=True)
+
+    torch.manual_seed(1234)
+    model = TinySharedMTP(width, vocab_size).to(device)
+    with fully_shard_context(device=device):
+        fully_shard(model.shared_block, mesh=mesh, placements=_default_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    fully_shard_optimizer(optimizer)
+    losses = train(model, optimizer, inputs, reduce_wgrad=False)
+
+    torch.testing.assert_close(torch.stack(losses), torch.stack(baseline_losses))
+
+
+def test_rejects_delayed_te_weight_gradient(distributed_setup):
+    """Default automatic synchronization rejects weight gradients produced after autograd."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
 
@@ -265,17 +315,15 @@ def test_fully_shard_waits_for_delayed_te_weight_gradient(distributed_setup):
         fuse_wgrad_accumulation=False,
     )
     with fully_shard_context(device=device):
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
 
     x = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
     model(x).float().square().mean().backward()
     assert model.weight.grad is None
-    assert model.phase is FsdpModule.Phase.BACKWARD
+    assert model.phase is Phase.BACKWARD
 
-    model.backward_dw()
-
-    assert model.weight.grad is not None
-    assert model.phase is FsdpModule.Phase.RESTING
+    with pytest.raises(RuntimeError, match="caller_managed_grad_sync=True"):
+        model.backward_dw()
 
 
 def test_fully_shard_rejects_tied_delayed_weight_gradients(distributed_setup):
@@ -302,7 +350,7 @@ def test_fully_shard_rejects_tied_delayed_weight_gradients(distributed_setup):
         fully_shard_context(device=device),
         pytest.raises(ValueError, match="Transformer Engine does not accumulate their gradients"),
     ):
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
 
 
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
@@ -320,9 +368,9 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
     mesh = init_device_mesh(device.type, (world_size,))
     model = CheckpointedTinyModel(use_reentrant=use_reentrant).to(device)
     with fully_shard_context(device=device):
-        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
-        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.fc1, mesh=mesh, placements=_default_placements())
+        fully_shard(model.fc2, mesh=mesh, placements=_default_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
 
     x = torch.randn(2, 8, device=device, requires_grad=True)
     model(x).sum().backward()
@@ -335,16 +383,16 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
 
     # Backward completes each module before recomputing the previous one, so
     # every module-local phase must be cleared after its matching backward.
-    assert model.phase is FsdpModule.Phase.RESTING
-    assert model.fc1.phase is FsdpModule.Phase.RESTING
-    assert model.fc2.phase is FsdpModule.Phase.RESTING
+    assert model.phase is Phase.RESTING
+    assert model.fc1.phase is Phase.RESTING
+    assert model.fc2.phase is Phase.RESTING
 
     # A second forward after backward runs in the forward phase again, so
     # forward-order prefetch resumes and the module phases return to resting.
     model(x).sum().backward()
-    assert model.phase is FsdpModule.Phase.RESTING
-    assert model.fc1.phase is FsdpModule.Phase.RESTING
-    assert model.fc2.phase is FsdpModule.Phase.RESTING
+    assert model.phase is Phase.RESTING
+    assert model.fc1.phase is Phase.RESTING
+    assert model.fc2.phase is Phase.RESTING
 
 
 @pytest.mark.parametrize("set_to_none", [True, False])
@@ -542,7 +590,7 @@ def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
     train_one_step()
     torch.cuda.synchronize(device)
 
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    with torch.profiler.profile() as prof:
         train_one_step()
         torch.cuda.synchronize(device)
 
@@ -606,7 +654,7 @@ def test_hfsdp_reduce_scatters_dp_outer_on_last_microbatch(distributed_setup):
     train_one_step()
     torch.cuda.synchronize(device)
 
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    with torch.profiler.profile() as prof:
         train_one_step()
         torch.cuda.synchronize(device)
 
@@ -623,86 +671,6 @@ def test_hfsdp_reduce_scatters_dp_outer_on_last_microbatch(distributed_setup):
     )
 
 
-def test_nested_fully_shard_excludes_child_owned_parameters(distributed_setup):
-    """An outer FsdpModule owns direct parameters but not nested child FsdpModule parameters."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    model = NestedModel().to(device)
-
-    with fully_shard_context(device=device):
-        fully_shard(model.inner, mesh=mesh, placements=_flat_placements())
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
-
-    (inner_group,) = model.inner.parameter_groups
-    (outer_group,) = model.parameter_groups
-
-    assert [parameter.fqns for parameter in inner_group.fsdp_parameters] == [("weight",)]
-    assert [parameter.fqns for parameter in outer_group.fsdp_parameters] == [("bias",)]
-
-
-def test_tied_child_parameters_allocate_one_physical_weight(distributed_setup):
-    """Tied registrations should allocate one DBuffer entry and optimizer parameter."""
-    model = TiedLM()
-    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    with fully_shard_context(device=distributed_setup.device):
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
-
-    (parameter_group,) = model.parameter_groups
-    (parameter,) = parameter_group.fsdp_parameters
-    assert parameter.fqns == ("embed_tokens.weight", "lm_head.weight")
-    assert parameter_group.main_weight.layout.size == 8 * 4
-    # Both aliases must expose the same optimizer-visible sharded parameter.
-    assert len(list(model.parameters())) == 1
-
-
-def test_parameterless_parent_with_child_modules_trains(distributed_setup):
-    """A parent with no unowned parameters should still root trainable child FsdpModules."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    torch.manual_seed(5678)
-    model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 2, bias=False)).to(device)
-
-    with fully_shard_context(device=device):
-        fully_shard(model[0], mesh=mesh, placements=_flat_placements())
-        fully_shard(model[1], mesh=mesh, placements=_flat_placements())
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
-
-    assert model.parameter_groups == ()
-
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
-    x = torch.randn(3, 4, device=device)
-
-    optimizer.zero_grad(set_to_none=True)
-    loss = model(x).sum()
-    loss.backward()
-    optimizer.step()
-
-
-def test_frozen_parameter_group_does_not_allocate_main_grad(distributed_setup):
-    """A non-trainable parameter group should not allocate persistent main gradients."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    model = nn.Linear(4, 4, bias=False).to(device)
-    model.weight.requires_grad_(False)
-
-    with fully_shard_context(device=device):
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
-
-    (group,) = model.parameter_groups
-    assert not group.requires_grad
-    assert group.main_grad is None
-
-
 def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_setup):
     """Each backward averages over DP ranks; repeated backwards accumulate by summing."""
     rank = distributed_setup.rank
@@ -716,55 +684,17 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_se
     nn.init.constant_(model.weight, 1.0)
 
     with fully_shard_context(device=device) as context:
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
 
     x = torch.full((1, 1), float(rank + 1), device=device)
     with microbatch(context, is_last=False):
         model(x).sum().backward()
-        model(x).sum().backward()
+    model(x).sum().backward()
 
     assert isinstance(model.weight.grad, DTensor)
     local_grad = model.weight.grad.to_local()
     expected = torch.full_like(local_grad, float(world_size + 1))
     torch.testing.assert_close(local_grad, expected, rtol=0, atol=0)
-
-
-def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
-    """The next forward should observe weights updated by the previous optimizer step."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    model = nn.Linear(1, world_size, bias=False, dtype=torch.bfloat16).to(device)
-    nn.init.constant_(model.weight, 1.0)
-
-    with fully_shard_context(device=device):
-        fully_shard(
-            model,
-            mesh=mesh,
-            placements=_flat_placements(),
-            mixed_precision_policy=MixedPrecisionPolicy(main_params_dtype=torch.float32),
-        )
-    # SGD's foreach/fused CUDA paths require matching parameter and gradient dtypes.
-    # Use the scalar path to exercise FP32 main weights with default BF16 main grads.
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.25, foreach=False)
-    fully_shard_optimizer(optimizer)
-    x = torch.ones(1, 1, device=device, dtype=torch.bfloat16)
-
-    def train_iteration() -> torch.Tensor:
-        optimizer.zero_grad(set_to_none=True)
-        loss = model(x).sum()
-        loss.backward()
-        optimizer.step()
-        return loss.detach().float()
-
-    first_loss = train_iteration()
-    second_loss = train_iteration()
-
-    with pytest.raises(AssertionError):
-        torch.testing.assert_close(second_loss, first_loss)
 
 
 def test_rejects_optimizer_placements_larger_than_model_weight_placements(distributed_setup):
@@ -787,49 +717,6 @@ def test_rejects_optimizer_placements_larger_than_model_weight_placements(distri
             )
 
 
-def test_optimizer_post_step_syncs_once_per_parameter_group(distributed_setup, monkeypatch):
-    """Optimizer synchronization should run once per group, not once per microbatch."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    model = TinyModel().to(device=device, dtype=torch.bfloat16)
-    with fully_shard_context(device=device):
-        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
-        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
-    parameter_groups = (*model.fc1.parameter_groups, *model.fc2.parameter_groups)
-    sync_counts = {parameter_group: 0 for parameter_group in parameter_groups}
-
-    def make_count_sync(parameter_group):
-        sync_model_weight = parameter_group.sync_model_weight_from_main_weight
-
-        def count_sync():
-            sync_counts[parameter_group] += 1
-            sync_model_weight()
-
-        return count_sync
-
-    for parameter_group in parameter_groups:
-        monkeypatch.setattr(
-            parameter_group, "sync_model_weight_from_main_weight", make_count_sync(parameter_group)
-        )
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-    fully_shard_optimizer(optimizer)
-    inputs = torch.randn(3, 2, 8, device=device, dtype=torch.bfloat16)
-
-    for step in range(3):
-        optimizer.zero_grad(set_to_none=True)
-        for microbatch_input in inputs:
-            (model(microbatch_input).sum() / len(inputs)).backward()
-
-        assert all(sync_count == step for sync_count in sync_counts.values())
-        optimizer.step()
-        assert all(sync_count == step + 1 for sync_count in sync_counts.values())
-
-
 def test_fully_shard_adam_mixed_precision_losses_match_baseline(distributed_setup):
     """Mixed-precision FSDP Adam should track an unsharded Adam baseline."""
     world_size = distributed_setup.world_size
@@ -842,8 +729,8 @@ def test_fully_shard_adam_mixed_precision_losses_match_baseline(distributed_setu
     model = TinyModel().to(device=device, dtype=torch.bfloat16)
     model.load_state_dict(baseline.state_dict())
     with fully_shard_context(device=device):
-        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
-        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.fc1, mesh=mesh, placements=_default_placements())
+        fully_shard(model.fc2, mesh=mesh, placements=_default_placements())
 
     baseline_optimizer = torch.optim.Adam(baseline.parameters(), lr=0.01)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
@@ -866,97 +753,233 @@ def test_fully_shard_adam_mixed_precision_losses_match_baseline(distributed_setu
         optimizer.step()
 
 
-def test_microbatch_scopes_context(distributed_setup):
-    """microbatch() should scope state on the supplied FSDP context."""
-    world_size = distributed_setup.world_size
+def test_fully_shard_shares_class_stream(distributed_setup):
+    """Wrapping must not turn a lazy per-class stream into a per-instance stream."""
+
+    class LinearWithStream(nn.Linear):
+        _stream = None
+
+        @classmethod
+        def get_stream(cls) -> torch.cuda.Stream:
+            if cls._stream is None:
+                cls._stream = torch.cuda.Stream()
+            return cls._stream
+
     device = distributed_setup.device
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    model = nn.Sequential(nn.Linear(1, 1, bias=False), nn.Linear(1, 1, bias=False)).to(device)
-    with fully_shard_context(device=device) as context:
-        for layer in model:
-            fully_shard(layer, mesh=mesh, placements=_flat_placements())
-
-    with microbatch(context, is_last=False):
-        assert not context.is_last_microbatch
-
-    assert context.is_last_microbatch
-
-
-def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
-    """A CPU model should support sharding a child before moving the full model to CUDA."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False))
-    nn.init.constant_(model[0].weight, 2.0)
-    nn.init.constant_(model[1].weight, 3.0)
-    x = torch.ones(1, 4)
-    expected_output = model(x).to(device)
-
-    # Shard the second layer's parameters onto the mesh device; the unwrapped
-    # first layer's parameters remain on CPU until model.to(device) below.
-    with fully_shard_context(device=device):
-        fully_shard(model[1], mesh=mesh, placements=_flat_placements())
-
-    assert model[0].weight.device.type == "cpu"
-    assert isinstance(model[1].weight, DTensor)
-    assert model[1].weight.device == device
-
-    model.to(device)
-
-    output = model(x.to(device))
-    torch.testing.assert_close(output, expected_output)
-
-
-def test_meta_parameters_shard_to_mesh_device(distributed_setup):
-    """A sharded meta model should support initialization and forward."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    model = nn.Sequential(
-        nn.Linear(4, 4, bias=False, device="meta", dtype=torch.bfloat16),
-        nn.Linear(4, 4, bias=False, device="meta", dtype=torch.bfloat16),
-    )
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    layers = [LinearWithStream(4, 4, device=device) for _ in range(2)]
 
     with fully_shard_context(device=device):
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
+        for layer in layers:
+            fully_shard(layer, mesh=mesh, placements=_default_placements())
 
-    nn.init.constant_(model[0].weight, 2.0)
-    nn.init.constant_(model[1].weight, 3.0)
-    # The exposed parameters update FP32 main weights, while forward uses separate BF16
-    # model weights. This simulates load_checkpoint() until
-    # https://github.com/NVIDIA/Megatron-LM/pull/6024 lands and syncs after loading.
-    for parameter_group in model.parameter_groups:
-        parameter_group.sync_model_weight_from_main_weight()
-
-    output = model(torch.ones(1, 4, device=device, dtype=torch.bfloat16))
-    torch.testing.assert_close(output, torch.full_like(output, 96.0))
+    assert layers[0].get_stream() is layers[1].get_stream()
 
 
-def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
-    """A non-leaf parameter view saved for backward should survive full-storage resize."""
+def test_fully_shard_keeps_instance_state_separate(distributed_setup):
+    """Reusing the class must not reuse the FSDP context or parameter groups."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    layers = [nn.Linear(4, 4, device=device) for _ in range(2)]
+    for layer in layers:
+        with fully_shard_context(device=device):
+            fully_shard(layer, mesh=mesh, placements=_default_placements())
+
+    assert type(layers[0]) is type(layers[1])
+    assert layers[0].context is not layers[1].context
+    assert layers[0].parameter_groups[0] is not layers[1].parameter_groups[0]
+    assert layers[0].weight is not layers[1].weight
+
+
+def test_fully_shard_preserves_parameter_attributes(distributed_setup):
+    """Sharded parameters should retain the original model metadata."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Linear(8, 8, bias=False, device=device)
+    attributes = {"use_muon": False, "is_wide_residual_retention_parameter": True}
+    for name, value in attributes.items():
+        setattr(model.weight, name, value)
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+
+    for name, value in attributes.items():
+        assert getattr(model.weight, name) == value, name
+
+
+def test_fully_shard_validates_tensor_atomic_owner_mapping(distributed_setup):
+    """TensorAtomic sharding accepts a complete owner mapping and rejects incomplete ones."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
 
     mesh = init_device_mesh(device.type, (world_size,))
-    model = NonLeafViewModel().to(device)
-    with fully_shard_context(device=device):
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
 
-    group = model.parameter_groups[0]
-    x = torch.randn(8, device=device, requires_grad=True)
-    loss = model(x).sum()
+    def shard(owner_mapping, placements=_TENSOR_ATOMIC_ZERO3_PLACEMENTS) -> nn.Linear:
+        linear = nn.Linear(4, 4).to(device)
+        parameter_to_owner = owner_mapping(linear) if owner_mapping is not None else None
+        with fully_shard_context(device=device, parameter_to_owner=parameter_to_owner):
+            fully_shard(linear, mesh=mesh, placements=placements)
+        return linear
 
-    assert group._unsharded_model_weight is not None
-    assert group._unsharded_model_weight.local_buffer.untyped_storage().nbytes() == 0
+    # A complete mapping shards the module; entries for unrelated parameters are ignored.
+    unrelated = nn.Parameter(torch.zeros(2, device=device))
+    linear = shard(lambda linear: {linear.weight: 1, linear.bias: 0, unrelated: 0})
+    (group,) = linear.parameter_groups
+    assert group.main_weight.placements == (TensorAtomic(),)
+    assert [tuple(p.fqns) for p in group.fsdp_parameters] == [("weight",), ("bias",)]
 
-    loss.backward()
+    mixed = Placements(
+        dp_axes=[0], parameter=[TensorAtomic()], gradient=[TensorAtomic()], optimizer=[RowAtomic()]
+    )
+    with pytest.raises(ValueError, match="cannot be mixed"):
+        shard(lambda linear: {linear.weight: 1, linear.bias: 0}, placements=mixed)
+    with pytest.raises(ValueError, match="require parameter_to_owner"):
+        shard(None)
+    with pytest.raises(ValueError, match="missing entries.*'bias'"):
+        shard(lambda linear: {linear.weight: 0})
+    with pytest.raises(ValueError, match="integer within the range"):
+        shard(lambda linear: {linear.weight: 0, linear.bias: world_size})
 
-    assert group.main_grad is not None
-    assert group._unsharded_model_weight is not None
-    assert group._unsharded_model_weight.local_buffer.untyped_storage().nbytes() == 0
+
+class _BufferShapes(NamedTuple):
+    """Local view shapes of one parameter across a group's buffers."""
+
+    main_weight: torch.Size
+    model_weight: torch.Size
+    main_grad: torch.Size
+
+
+def _tensor_atomic_buffer_shapes(distributed_setup, placements):
+    """Shard TinyModel with owners on ranks 0 to 3; yield per-parameter buffer shapes.
+
+    Each item is ``(shapes, owned, full)``: ``owned`` is the full shape on the owner rank
+    and a zero-row shape elsewhere, ``full`` is the unsharded shape.
+    """
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 4:
+        pytest.skip("This test spreads owners over 4 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = TinyModel().to(device)
+    parameter_to_owner = {
+        model.fc1.weight: 1,
+        model.fc1.bias: 3,
+        model.fc2.weight: 2,
+        model.fc2.bias: 0,
+    }
+    with fully_shard_context(device=device, parameter_to_owner=parameter_to_owner):
+        fully_shard(model.fc1, mesh=mesh, placements=placements)
+        fully_shard(model.fc2, mesh=mesh, placements=placements)
+
+    rank = mesh.get_local_rank(0)
+    for group in (*model.fc1.parameter_groups, *model.fc2.parameter_groups):
+        for index, fsdp_parameter in enumerate(group.fsdp_parameters):
+            full = group.main_weight.layout.tensor_shapes[index]
+            is_owner = parameter_to_owner[fsdp_parameter.unsharded] == rank
+            owned = full if is_owner else torch.Size((0, *full[1:]))
+            shapes = _BufferShapes(
+                main_weight=group.main_weight.get_tensor_view(index).shape,
+                model_weight=group.model_weight.get_tensor_view(index).shape,
+                main_grad=group.main_grad.get_tensor_view(index).shape,
+            )
+            yield shapes, owned, full
+
+
+def test_fully_shard_tensor_atomic_zero3_places_each_parameter_on_its_owner(distributed_setup):
+    """ZeRO-3: every weight and gradient buffer holds a parameter only on its owner rank."""
+    for shapes, owned, _ in _tensor_atomic_buffer_shapes(
+        distributed_setup, _TENSOR_ATOMIC_ZERO3_PLACEMENTS
+    ):
+        assert shapes.main_weight == owned
+        assert shapes.model_weight == owned
+        assert shapes.main_grad == owned
+
+
+def test_fully_shard_tensor_atomic_zero2_places_each_parameter_on_its_owner(distributed_setup):
+    """ZeRO-2: gradient and optimizer buffers live only on the owner rank; weights stay full."""
+    for shapes, owned, full in _tensor_atomic_buffer_shapes(
+        distributed_setup, _TENSOR_ATOMIC_ZERO2_PLACEMENTS
+    ):
+        assert shapes.main_weight == owned
+        assert shapes.main_grad == owned
+        assert shapes.model_weight == full
+
+
+def test_fully_shard_tensor_atomic_zero1_places_each_parameter_on_its_owner(distributed_setup):
+    """ZeRO-1: optimizer buffers live only on the owner rank; compute buffers stay full."""
+    for shapes, owned, full in _tensor_atomic_buffer_shapes(
+        distributed_setup, _TENSOR_ATOMIC_ZERO1_PLACEMENTS
+    ):
+        assert shapes.main_weight == owned
+        assert shapes.model_weight == full
+        assert shapes.main_grad == full
+
+
+@pytest.mark.parametrize("mixed_placements", [False, True], ids=["all_atomic", "mixed"])
+@pytest.mark.parametrize(
+    "placements",
+    [
+        _TENSOR_ATOMIC_ZERO1_PLACEMENTS,
+        _TENSOR_ATOMIC_ZERO2_PLACEMENTS,
+        _TENSOR_ATOMIC_ZERO3_PLACEMENTS,
+    ],
+    ids=["tensor_atomic_zero1", "tensor_atomic_zero2", "tensor_atomic_zero3"],
+)
+def test_fully_shard_tensor_atomic_losses_match_baseline(
+    distributed_setup, placements, mixed_placements
+):
+    """TensorAtomic sharding driven through fully_shard should match single-rank SGD."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(1234)
+    baseline = TinyModel().to(device)
+    model = TinyModel().to(device)
+    model.load_state_dict(baseline.state_dict())
+    # Every TensorAtomic group mixes ranks 0 and 1; ordinary groups need no owner entries
+    # even when their context has a mapping.
+    parameter_to_owner = {model.fc1.weight: 1, model.fc1.bias: 0}
+    if not mixed_placements:
+        parameter_to_owner |= {model.fc2.weight: 0, model.fc2.bias: 1}
+
+    with fully_shard_context(device=device, parameter_to_owner=parameter_to_owner) as context:
+        fully_shard(model.fc1, mesh=mesh, placements=placements)
+        fully_shard(
+            model.fc2,
+            mesh=mesh,
+            placements=_default_placements() if mixed_placements else placements,
+        )
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    fully_shard_optimizer(optimizer)
+
+    num_microbatches = 2
+    x = torch.randn(num_microbatches, 2, 8, device=device)
+    target = torch.randn(num_microbatches, 2, 4, device=device)
+    microbatches = tuple(zip(x.unbind(), target.unbind()))
+
+    def train(model, optimizer) -> list[torch.Tensor]:
+        losses = []
+        for _ in range(5):
+            optimizer.zero_grad()
+            for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
+                with microbatch(context, is_last=microbatch_index == num_microbatches - 1):
+                    loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
+                    losses.append(loss.detach())
+                    (loss / num_microbatches).backward()
+            optimizer.step()
+        return losses
+
+    baseline_losses = train(baseline, baseline_optimizer)
+    sharded_losses = train(model, optimizer)
+    torch.testing.assert_close(
+        torch.stack(sharded_losses),
+        torch.stack(baseline_losses),
+        msg="TensorAtomic sharded losses did not match baseline losses.",
+    )

@@ -1,4 +1,4 @@
-# Megatron Core Inference User Guide
+# Inference User Guide
 
 A practical guide to running inference with Megatron Core (MCore) using the
 dynamic inference path. This is the recommended and actively developed
@@ -124,7 +124,7 @@ workload rather than generalizing from any single comparison.
 | **MoE** | Expert model parallelism with full CUDA-graph support, expert router replay, NVLS switch-multicast token dispatcher plus an allgatherv dispatcher optimized for multi-node NVLink, and shared-expert overlap with latent MoEs. Selectable grouped-GEMM backend (vLLM, torch, or FlashInfer) |
 | **Parallelism** | Data-parallel coordinator with full multi-node support, tensor model parallelism with low-latency comm primitives, expert model parallelism, and pipeline parallelism |
 | **Model families** | GPT-style dense models, MoE models, MLA models (for example DeepSeek-style, with `cache_mla_latents`), Mamba and hybrid (SSM and attention) models, Gated Delta Net and Gated Delta Product models, and vision-language models for image inputs. Refer to [Known Limitations](#known-limitations) for the per-family feature gaps |
-| **Precision** | MXFP8 weight quantization through `--transformer-impl inference_optimized --fp8-recipe mxfp8`, using latency-optimized inference kernels. Configurable Mamba conv and SSM state dtypes |
+| **Precision** | MXFP8 weight quantization through `--transformer-impl inference_optimized --fp8-recipe mxfp8`, using latency-optimized inference kernels with FlashInfer, torch, or vLLM grouped-GEMM selection. MXFP8 can be selected per parameter while unmatched layers remain BF16. Configurable Mamba conv and SSM state dtypes |
 | **RL** | [Weight refit and resharding](#weight-refit-and-resharding-for-rl) between training and inference over five transports, supporting both colocated (shared GPUs) and non-colocated (separate resources) deployments. Batch-invariant kernels for training and inference log-prob consistency. Per-DP-rank sampling seeds so the same prompt routed to different replicas yields different samples |
 | **Sampling** | Temperature, top-k, top-p, stop words, log-probs, and top-N log-probs, with raw or post-processed log-prob semantics (`logprobs_mode`). Pluggable torch or FlashInfer sampling backend |
 | **Disaggregation** | KV and SSM state handoff between prefill and decode engines over NIXL or NCCL, with resharding across mismatched TP/PP layouts. Refer to [Disaggregated Prefill and Decode](#disaggregated-prefill-and-decode) for what is and is not turnkey today |
@@ -145,13 +145,42 @@ workload rather than generalizing from any single comparison.
 > selects the GEMM backend, and `batch_invariant_collective` (`ordered` by
 > default, or `multimem`) selects the cross-rank expert-combine reduction.
 >
-> Both dense and MoE models are supported. Batch-invariant MoE is bf16-only,
-> requires the unfused permute/unpermute path, and under
+> Both dense and MoE models are supported. Batch-invariant MoE supports BF16 and
+> MXFP8 squared-ReLU/SwiGLU experts, requires unfused permute/unpermute, and under
 > `--transformer-impl inference_optimized` requires
-> `inference_grouped_gemm_backend` of `vllm` or `torch` (plus the `nvls` token
-> dispatcher when `EP > 1`). Some backend combinations additionally need DeepGEMM
+> `inference_grouped_gemm_backend` of `vllm`, `torch`, or `flashinfer` (plus the
+> `nvls` token dispatcher when `EP > 1`). FlashInfer supports MXFP8 non-gated
+> squared-ReLU experts, including selective BF16 layers, but its batch invariance
+> does not imply bitwise parity with TE training. Use Torch/vLLM for exact
+> training-policy comparisons. Some backend combinations additionally need DeepGEMM
 > bf16 bindings: `uv pip install -e .[batch_invariant]`. Context parallelism and
-> attention dropout are not supported in either case.
+> attention dropout are not supported in either case. MXFP8 training uses
+> `batch_invariant_backend="te_native"`. Legacy TE GroupedLinear remains the
+> default. On SM100 with cuBLASLt 13.5.1, `moe_use_grouped_tensor=True` opts into
+> TE device-metadata grouped GEMM and its required 256-row expert padding.
+> This requires a TE build exposing `GroupedLinear(use_grouped_tensor=...)`;
+> the old environment switch alone is not sufficient. Other GPU/library pairs
+> are rejected: this path requires a full workspace, so its forward invariance
+> must be validated numerically rather than inferred from alignment.
+> Keep `use_transformer_engine_op_fuser=False`. Forward batch invariance does
+> not promise bitwise-identical gradients across different minibatches.
+
+> **Selective MXFP8 parameter storage.** Use the same Transformer Engine per-module
+> precision recipe for training and inference through `TransformerConfig.quant_recipe`
+> (or `--te-precision-config-file`). The recipe selects storage before TE initializes
+> each module: BF16 modules allocate ordinary BF16 parameters and load checkpoint
+> values directly, without an intermediate MXFP8 conversion or a checkpoint callback.
+> With global `fp8_param=True` and `fp8_recipe="mxfp8"`, an MXFP8 recipe that omits
+> `fp8_param` inherits the global policy, including first/last BF16 layers.
+> For routed-expert-only quantization, match `*mlp.experts.linear_fc1` and
+> `*mlp.experts.linear_fc2` to MXFP8, with an MTP BF16 rule first and a catch-all
+> BF16 rule last. See
+> [TE precision recipes](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/extensions/TransformerEngineMixedPrecision.md).
+>
+> Within one MoE layer, every local expert's FC1 and FC2 weight must use the same
+> precision. The `flashinfer`, `torch`, and `vllm` grouped-GEMM backends support
+> mixtures of BF16 and MXFP8 layers. vLLM uses its fused kernel for BF16 expert
+> layers and MCore's scaled grouped GEMM for MXFP8 expert layers.
 
 Many of these are toggled through `InferenceConfig`. Refer to the
 [Engine configuration](#engine-configuration).
@@ -359,6 +388,7 @@ asyncio.run(main())
 | `num_tokens_to_generate` | Max new tokens to generate |
 | `num_tokens_total` | Cap on prompt + generated length. Mutually exclusive with `num_tokens_to_generate` |
 | `temperature` | Softmax temperature (`1.0` = unmodified) |
+| `seed` | Optional nonnegative int64 request seed; dynamic Torch sampling only |
 | `top_k` | Keep top-k logits (`0` = disabled) |
 | `top_p` | Nucleus sampling threshold (`0.0` = disabled) |
 | `termination_id` | Token id that stops generation (commonly the EOD token) |
@@ -372,6 +402,27 @@ asyncio.run(main())
 | `add_BOS` | Prepend BOS when tokenizing |
 | `streaming`, `streaming_interval` | Emit incremental partial replies. Refer to [Streaming](#streaming) |
 | `do_kv_handoff` | Pin KV blocks and publish handoff metadata for a peer decode engine. Refer to [Disaggregated Prefill and Decode](#disaggregated-prefill-and-decode) |
+
+An explicit `seed` assigns random draws by request seed and absolute token
+position, so moving a request between dynamic batch slots does not reassign its
+random stream. `/v1/chat/completions` and `/v1/completions` accept the same field;
+chat choice `i` or completion prompt `i` uses `(seed + i) % 2**63`. Use a different
+seed for each independently sampled rollout and reuse it when retrying that
+logical request. Omitting `seed` retains the shared-generator sampling path.
+
+This requires dynamic inference with `sampling_backend="torch"` and no
+speculative decoding. Unsupported modes reject seeded requests. CUDA seeded
+draws require Triton and use one batched noise-generation launch per sampling
+bucket, keyed by request seed, absolute position, and vocabulary index. Explicit
+request seeds require CUDA logits; CPU seeded sampling is not supported.
+Unseeded rows retain the shared-generator path and seeded rows do not consume
+its random draws. Exact
+seeded CUDA token sequences can differ from the earlier per-row Torch implementation:
+the same seed identifies a different random stream, not a loss of repeatability.
+Replay requires the same implementation and runtime, not different RNG algorithms
+or CPU/CUDA backends. This feature does not make model logits
+batch invariant, freeze policy weights, or snapshot external tool execution.
+Identical generated tokens still require identical logits and sampling settings.
 
 ```python
 sp = SamplingParams(
@@ -396,9 +447,12 @@ sp = SamplingParams(
 
 `InferenceConfig.logprobs_mode` controls *which* log-probs you get:
 `'raw_logprobs'` (default) returns the unmodified model log-probs, while
-`'processed_logprobs'` returns log-probs after temperature, top-k, and top-p have
-been applied. `'processed_logprobs'` is not yet supported with speculative
-decoding.
+`'processed_logprobs'` returns log-probs of sampled tokens after temperature,
+top-k, and top-p have been applied. The mode applies to both the selected-token
+log-probs and the top-N log-probs (`top_n_logprobs`). Prompt log-probs, including
+prompt top-N log-probs, are always raw in both modes, because prompt tokens were
+not sampled from the processed distribution.
+`'processed_logprobs'` is not yet supported with speculative decoding.
 
 ### Engine Configuration
 
@@ -429,7 +483,7 @@ used fields:
 | `offset_sampling_seed_by_dp_rank` | Give each DP rank a distinct sampling seed (default `True`), so the same prompt routed to different replicas produces different samples |
 | `image_preprocessing_config` | Image preprocessing for vision-language models |
 | `use_flashinfer_fused_rope` | Use FlashInfer's fused RoPE kernel |
-| `disable_ep_consensus`, `ep_consensus_interval`, `use_synchronous_zmq_collectives` | MoE and expert-parallel coordination tuning |
+| `ep_consensus_interval`, `use_synchronous_zmq_collectives` | MoE and expert-parallel coordination tuning |
 | `track_paused_request_events`, `track_generated_token_events`, `metrics_writer`, `logging_step_interval` | Observability |
 
 ```python
@@ -448,8 +502,8 @@ than `InferenceConfig`, because they must be set when you build the model:
 `batch_invariant_mode` (and `batch_invariant_backend` /
 `batch_invariant_collective`), `inference_moe_token_dispatcher_type` (`nvls` by
 default, or `nccl`), `inference_grouped_gemm_backend` (`vllm` by default, or
-`torch` / `flashinfer`), `moe_enable_routing_replay`, and `window_size` for
-sliding-window attention.
+`torch` / `flashinfer`), `quant_recipe`, `moe_enable_routing_replay`, and
+`window_size` for sliding-window attention.
 
 ### Reading Results
 
@@ -706,7 +760,9 @@ The transport is selected by `refit_method`, exposed on the command line as
 MXFP8 targets are handled transparently: when the destination model uses
 `--transformer-impl inference_optimized` with `--fp8-recipe mxfp8`,
 `prepare_swap_model_weights` installs a quantizing transform that later
-`swap_model_weights` calls pick up. The built-in RL loop calls
+`swap_model_weights` calls pick up. The refit plan follows the TE per-module
+precision recipe: only destination weights initialized with MXFP8 storage are
+quantized, while BF16 parameters remain BF16. The built-in RL loop calls
 `swap_model_weights(model, inference_model, args.refit_method)`; refer to
 [`megatron/core/resharding/README.md`](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/resharding/README.md) for
 the plan-building and caching details.
@@ -751,27 +807,82 @@ yet covered — notably video, audio, and pipeline parallelism.
 
 ## Disaggregated Prefill and Decode
 
-The building blocks for splitting prefill and decode across separate engines are
-in tree. A prefill engine pins its KV blocks and publishes handoff metadata when
-a request sets `SamplingParams.do_kv_handoff=True`; a decode engine imports that
-state and continues generation. `DisaggDynamicInferenceEngine` is the engine
-subclass for both roles, and `setup_kv_transfer(role, backend)` — with `role` of
-`"prefill"` or `"decode"` and a `nixl` or `nccl` backend — wires up the
-transport. It must be called collectively by every model-parallel rank.
+The native HTTP server can run prefill and decode on separate GPUs; no Dynamo
+deployment or client-side handoff is needed. Enable it with role-tagged
+`--inference-shards` and prefix caching on
+`examples/inference/launch_inference_server.py`.
 
-KV state is resharded across mismatched TP and PP layouts between the two pools,
-and hybrid models additionally hand off their recurrent conv and SSM state.
-`--inference-shards` describes the partitioning, for example
-`"tp=2,role=prefill+tp=1,dp=2,role=decode"`.
+Starting from a working server launch, keep your model, checkpoint, tokenizer,
+and cache-sizing arguments (`MODEL_ARGS` below), and use two GPUs for one
+prefill engine and one decode engine:
 
-Two prerequisites: **prefix caching must be enabled on both the prefill and the
-decode engine**, and a hybrid decode engine must not set
-`prefix_caching_mamba_gb`.
+```bash
+torchrun --standalone --nproc-per-node=2 \
+    examples/inference/launch_inference_server.py \
+    "${MODEL_ARGS[@]}" \
+    --inference-shards 'tp=1,role=prefill+tp=1,role=decode' \
+    --inference-dynamic-batching-enable-prefix-caching \
+    --disagg-kv-transport-backend nccl \
+    --port 5000
+```
 
-> This is transfer plumbing plus a shard-layout spec, driven today by an external
-> control plane (for example Dynamo). Megatron-LM does not yet ship a launcher
-> that stands up a disaggregated deployment end to end, and handoff does not
-> support log-probs.
+`MODEL_ARGS` is your existing shell array of model-specific arguments, not a
+Megatron option. Each engine must have enough memory for its model and cache.
+The shard sizes must cover the entire torchrun world. For example, four GPUs
+can use `tp=2,role=prefill+tp=1,dp=2,role=decode` for one TP=2 prefill engine
+and two TP=1 decode engines. NCCL works within this shared launch; alternatively,
+select `nixl` (the default) with NIXL installed on every engine rank.
+
+Send requests to the same frontend as usual:
+
+```bash
+curl http://localhost:5000/v1/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"EMPTY","prompt":"Hello","max_tokens":32,"temperature":0}'
+```
+
+There is no disaggregation flag in the HTTP request. The native coordinator
+routes prefill, reserves a decode engine, transfers KV state (plus conv/SSM
+state for hybrid models), and returns the response through the same frontend.
+Ordinary clients use `SUBMIT_REQUEST`; the runtime sends
+`SUBMIT_REQUEST_WITH_KV` directly to the selected decode engine.
+
+Prefix caching must remain enabled on both roles. For hybrid models, leave
+`--inference-dynamic-batching-prefix-caching-mamba-gb` unset on the shared launch:
+decode imports recurrent state into live slots, not the prefix-cache state buffer. Native disaggregation
+currently accepts text/token prompts, not multimodal inputs. Generated-token
+log-probs are supported with `skip_prompt_log_probs=True`; prompt and top-N
+log-probs are not.
+
+Use the default `persist` KV-cache management mode. Disaggregated transfers
+currently reject `offload` and `recompute` because suspend/resume can invalidate
+the registered KV/SSM buffers. Under memory pressure, evicted decode requests
+recover through the engine's local recomputation path; new requests still
+route to prefill.
+Keep `--inference-cuda-graph-all-prefills` enabled for prefill workers when desired;
+it gates both full and chunked prefill admissions on compatible captured graphs.
+Shared launches can pass this flag unchanged: decode workers automatically disable
+the admission gate so eviction recovery can prefill without a matching graph.
+This does not disable CUDA-graph replay on decode workers.
+
+For RL, only the final decode completion writes to the request metadata ledger
+or payload stager. Handoffs preserve the request UID, policy/KV epoch history,
+and prefill eviction history. MoE routing replay is not supported: transfer
+setup rejects it because handoffs do not transfer the prompt's routing buffers.
+
+Shard models require a distributed checkpoint format such as `torch_dist`; legacy `torch`
+checkpoints are rejected. For native RL, configure parallelism in
+`--inference-shards`, not the global `--rl-inference-*-model-parallel-size`
+overrides. Disaggregated RL currently rejects `--rl-verify-model-weights-swap`;
+the existing verifier does not support the different shard layouts. NIXL weight
+refit also rejects multiple destination pools because it binds a single receiver
+map; use a supported refit backend such as NCCL. This is separate from NIXL
+KV/SSM handoff, which remains supported.
+
+RL generation-lag autotuning and HTTP concurrency limits still use local shard
+capacity rather than aggregate decode capacity. Set `--rl-generation-lag`
+explicitly for partial rollouts; capacity aggregation and the remaining
+limitations are tracked in [#8200](https://github.com/NVIDIA/Megatron-LM/issues/8200).
 
 ---
 
@@ -969,13 +1080,19 @@ is the opposite of the `MegatronLLM` constructor default.
   warning if FlashInfer is not installed.
 - **Async scheduling excludes MoE router replay** and does not support paused
   requests. Refer to [Async Scheduling](#async-scheduling).
-- **Batch-invariant MoE is bf16-only** and requires the unfused
-  permute/unpermute path; batch-invariant mode in general excludes context
-  parallelism and attention dropout.
-- **MXFP8 fused quantization supports squared-ReLU only, not SwiGLU**, which
-  falls back to bf16.
-- **Disaggregated handoff does not support log-probs** (`return_log_probs` or
-  `top_n_logprobs > 0` raises).
+- **Batch-invariant MoE supports BF16 and MXFP8 squared-ReLU/SwiGLU experts.**
+  MXFP8 uses TE `te_native` for training and Torch/vLLM for inference. FlashInfer
+  additionally supports batch-invariant MXFP8 squared-ReLU inference, without
+  bitwise TE training-policy parity.
+  It requires unfused permute/unpermute and excludes context parallelism and
+  attention dropout. Device-metadata training GEMM is opt-in via
+  `moe_use_grouped_tensor=True`, restricted to SM100 with cuBLASLt 13.5.1
+  and a TE build exposing that constructor argument.
+- **MXFP8 fused quantization supports squared-ReLU only.** SwiGLU uses separate
+  BF16 activation and MXFP8 quantization kernels; it does not fall back to BF16 GEMM.
+- **Disaggregated handoff supports generated-token log-probs only.** Set
+  `skip_prompt_log_probs=True` when requesting them; prompt log-probs and
+  `top_n_logprobs > 0` are not supported.
 
 **Engine and serving**
 
@@ -1020,9 +1137,6 @@ is the opposite of the `MegatronLLM` constructor default.
 
 **Models and performance:**
 
-- **Turnkey disaggregated inference** — a launcher and control plane on top of
-  the KV and SSM handoff primitives that exist today, plus log-prob support
-  across a handoff.
 - **FlashInfer integration** for attention and Mamba kernels (sampling, fused
   RoPE, and MoE grouped GEMM are already integrated).
 - **All2Allv-based token dispatcher** for MoE.

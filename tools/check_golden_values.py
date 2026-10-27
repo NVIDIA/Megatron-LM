@@ -9,6 +9,8 @@ Two checks run on every file:
   pretraining case that does not opt out via ``NON_DETERMINSTIC_RESULTS: 1``,
   ``NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1`` or ``SKIP_PYTEST: 1`` in its
   ``model_config.yaml``), every metric must be marked ``"value_precision": "full"``.
+  Cases with ``MODE: rl`` use the separate GRPO tolerance validator and are
+  exempt from this precision-marker requirement.
   ``read_tb_logs_as_list`` writes that marker for every golden value it produces;
   a metric without it (or marked ``rounded_5_decimal_places``) is a legacy golden
   that the comparison pipeline rounds to five decimals, which silently reduces
@@ -51,12 +53,16 @@ NOT_ACCEPTED_VALUES = [
 # ``run_ci_test.sh`` passes ``--allow-nondeterministic-algo`` (approximate-only
 # comparison) to pytest iff NON_DETERMINSTIC_RESULTS or
 # NVTE_ALLOW_NONDETERMINISTIC_ALGO is 1, and skips the comparison entirely when
-# SKIP_PYTEST is 1. Everything else is compared with ``DeterministicTest``.
+# SKIP_PYTEST is 1. Explicit MODE: rl uses the GRPO tolerance validator instead.
 # Matched on the raw YAML text so this script does not depend on PyYAML.
 _NONDETERMINISTIC_ENV_VAR = re.compile(
     r"^\s*(NON_DETERMINSTIC_RESULTS|NVTE_ALLOW_NONDETERMINISTIC_ALGO|SKIP_PYTEST)"
     r"\s*:\s*['\"]?1['\"]?\s*(#.*)?$",
     re.MULTILINE,
+)
+# MODE is a top-level routing key; a nested or commented MODE must not opt out.
+_RL_MODE = re.compile(
+    r"""^(?:MODE|'MODE'|"MODE")[ \t]*:[ \t]*(?:rl|'rl'|"rl")[ \t]*(?:#.*)?$""", re.MULTILINE
 )
 
 
@@ -73,7 +79,10 @@ def _find_non_finite_values(value: Any, location: str = "$") -> Iterator[tuple[s
 
 def compares_deterministically(model_config_text: str) -> bool:
     """Return True if the functional-test pipeline applies ``DeterministicTest`` to this case."""
-    return _NONDETERMINISTIC_ENV_VAR.search(model_config_text) is None
+    return (
+        _RL_MODE.search(model_config_text) is None
+        and _NONDETERMINISTIC_ENV_VAR.search(model_config_text) is None
+    )
 
 
 def _is_metric_block(block: Any) -> bool:

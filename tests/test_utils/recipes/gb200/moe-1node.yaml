@@ -46,7 +46,6 @@ spec:
     ls
     cd /opt/megatron-lm
 
-    NAME=$(echo {test_case}_{environment} | sed 's/dgx_gb200/dgx_a100/g')
     export GPUS_PER_NODE={gpus}
 
     ARGUMENTS=(
@@ -67,6 +66,12 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
+  # Per-token loss normalization with EP=2 and four accumulated microbatches.
+  - test_case: [deepseek_proxy_mfsdp_v2_ep2_mb4_per_token_loss_1node]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_gb200]
   - test_case: [deepseek_proxy_mfsdp_v1_ep2_1node]
     products:
       - environment: [dev]
@@ -138,4 +143,20 @@ products:
     products:
       - environment: [dev]
         scope: [mr-github-temp-disabled]
+        platforms: [dgx_gb200]
+
+  #######################################################################
+  # MFSDP v2 + EP2 bf16, full-iteration CUDA graph incl. optimizer.step #
+  #######################################################################
+  - test_case: [deepseek_proxy_mfsdp_v2_ep2_bf16_cg_optim_1node]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_gb200]
+
+  # MFSDP v2 + EP2 with MXFP8 compute and parameter gather.
+  - test_case: [deepseek_proxy_mfsdp_v2_ep2_mxfp8_1node]
+    products:
+      - environment: [dev]
+        scope: [mr]
         platforms: [dgx_gb200]

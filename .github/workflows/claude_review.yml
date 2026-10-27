@@ -6,132 +6,37 @@ on:
 
 jobs:
   # ──────────────────────────────────────────────────────────────────
-  # Light review: quick pass for obvious bugs, typos, and test gaps
-  # Trigger: /claude review
+  # Retired: /claude review and /claude strict-review
+  # Pull-request reviews moved to the /review command, which reads the
+  # same rubric from skills/pr-review. Reply with the equivalent
+  # /review command instead of running a review.
   # ──────────────────────────────────────────────────────────────────
-  light-review:
-    name: Claude Light Review
+  redirect-to-review:
+    name: Redirect to /review
     if: |
       github.event_name == 'issue_comment' &&
       github.event.issue.pull_request &&
-      contains(github.event.comment.body, '/claude review')
+      github.event.comment.user.type != 'Bot' &&
+      (contains(github.event.comment.body, '/claude review') ||
+       contains(github.event.comment.body, '/claude strict-review'))
     runs-on: ubuntu-latest
     permissions:
-      contents: read
       pull-requests: write
-      issues: write
-      id-token: write
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       PR_NUMBER: ${{ github.event.issue.number }}
+      RETIRED_COMMAND: ${{ contains(github.event.comment.body, '/claude strict-review') && '/claude strict-review' || '/claude review' }}
+      REVIEW_COMMAND: ${{ contains(github.event.comment.body, '/claude strict-review') && '/review mode=strict' || '/review' }}
     steps:
-      - name: Get PR head commit
-        id: get-pr-head-commit
-        run: |
-          echo "sha=$(gh pr view $PR_NUMBER --repo $REPO --json headRefOid -q .headRefOid)" | tee -a $GITHUB_OUTPUT
-
-      - name: Checkout repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          fetch-depth: 1
-          ref: ${{ steps.get-pr-head-commit.outputs.sha }}
-
-      - name: React to trigger comment
-        run: |
-          gh api repos/$REPO/issues/comments/${{ github.event.comment.id }}/reactions \
-            --method POST \
-            -f content='eyes'
-
-      - name: Run Claude Light Review
-        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+      - name: Point to /review
         env:
-          ANTHROPIC_BASE_URL: ${{ secrets.NVIDIA_INFERENCE_URL }}
-          CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
-          DISABLE_PROMPT_CACHING: "1"
-        with:
-          anthropic_api_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
-          trigger_phrase: "/claude review"
-          claude_args: |
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Read,Glob"
-            --model "${{ vars.CLAUDE_MODEL }}"
-          prompt: |
-            REPO: ${{ env.REPO }}
-            PR NUMBER: ${{ env.PR_NUMBER }}
-            REVIEW DEPTH: light
+          NOTICE: |
+            @${{ github.event.comment.user.login }} `${{ env.RETIRED_COMMAND }}` has been retired. Pull-request reviews now run through `/review`; comment this instead:
 
-            Read `skills/pr-review/SKILL.md` with the Read tool and follow it exactly.
-            It is checked out at the PR head alongside this workflow.
+            ```
+            ${{ env.REVIEW_COMMAND }}
+            ```
 
-            If the PR adds or changes a GPU kernel (Triton kernel, `jit_fuser`/`torch.compile`
-            function, CUDA extension, Transformer Engine or external-library dispatch, or a
-            scatter/index accumulation), check that a bit-exact determinism test under
-            `tests/unit_tests/determinism/kernels/` is added or updated and that the kernel is
-            registered in `tests/unit_tests/determinism/kernels/manifest.py`
-            (see docs/developer/determinism/testing.md).
-
-  # ──────────────────────────────────────────────────────────────────
-  # Strict review: comprehensive Megatron-LM focused analysis
-  # covering precision, parallelism correctness, performance,
-  # backward compatibility, and code quality
-  # Trigger: /claude strict-review
-  # ──────────────────────────────────────────────────────────────────
-  strict-review:
-    name: Claude Strict Review
-    if: |
-      github.event_name == 'issue_comment' &&
-      github.event.issue.pull_request &&
-      contains(github.event.comment.body, '/claude strict-review')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: write
-      id-token: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      REPO: ${{ github.repository }}
-      PR_NUMBER: ${{ github.event.issue.number }}
-    steps:
-      - name: Get PR info
-        id: pr-info
-        run: |
-          PR_DATA=$(gh pr view $PR_NUMBER --repo $REPO --json headRefOid,baseRefName)
-          echo "sha=$(echo $PR_DATA | jq -r .headRefOid)" >> $GITHUB_OUTPUT
-          echo "base_ref=$(echo $PR_DATA | jq -r .baseRefName)" >> $GITHUB_OUTPUT
-
-      - name: Checkout repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          fetch-depth: 1
-          ref: ${{ steps.pr-info.outputs.sha }}
-
-      - name: Fetch base branch for diff analysis
-        run: git fetch origin ${{ steps.pr-info.outputs.base_ref }}
-
-      - name: React to trigger comment
-        run: |
-          gh api repos/$REPO/issues/comments/${{ github.event.comment.id }}/reactions \
-            --method POST \
-            -f content='eyes'
-
-      - name: Run Claude Strict Review
-        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
-        env:
-          ANTHROPIC_BASE_URL: ${{ secrets.NVIDIA_INFERENCE_URL }}
-          CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
-          DISABLE_PROMPT_CACHING: "1"
-        with:
-          anthropic_api_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
-          trigger_phrase: "/claude strict-review"
-          claude_args: |
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Bash(git diff:*),Bash(git show:*),Bash(git log:*),Read,Glob,Grep"
-            --model "${{ vars.CLAUDE_MODEL }}"
-          prompt: |
-            REPO: ${{ env.REPO }}
-            PR NUMBER: ${{ env.PR_NUMBER }}
-            BASE REF: origin/${{ steps.pr-info.outputs.base_ref }}
-            REVIEW DEPTH: strict
-
-            Read `skills/pr-review/SKILL.md` with the Read tool and follow it exactly.
-            It is checked out at the PR head alongside this workflow.
+            Add `model=claude` to keep a Claude reviewer (the default is `model=codex`). `mode=light|strict` selects the review depth. Comment `/review help` for all options.
+        run: gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$NOTICE"

@@ -117,21 +117,32 @@ Captures the entire training iteration (excluding optimizer) as a single CUDA gr
 wrapper is also used for training-loop validation/eval in forward-only mode. This provides the
 largest training/validation latency reduction.
 
+With an eager optimizer, full-iteration training captures model-to-optimizer gradient conversion
+in the forward/backward graph's memory pool. The distributed optimizer and the layer-wise
+mixed-precision optimizer can reuse completed forward/backward scratch for FP32 gradients.
+Replay order must remain forward/backward, gradient conversion, then optimizer update.
+The converted values are valid until the next forward/backward replay; gradient addresses must
+remain stable. Resetting the training graph also invalidates the conversion graph.
+
+This conversion graph is disabled with `--optimizer-cuda-graph`, which captures the optimizer
+step itself. CPU-offloaded and Megatron-FSDP optimizer paths are unchanged, as is the distributed
+precision-aware optimizer path that already aliases model gradients.
+
 This implementation does not create inference CUDA graphs. For inference, use
 `--cuda-graph-impl local --inference-cuda-graph-scope layer|block`.
 
 ### Requirements
 
-- `--no-check-for-nan-in-loss-and-grad` is required: NaN checks involve CPU-GPU synchronization
-  which cannot run inside a CUDA graph.
+- Loss and gradient checks remain enabled. Values passed to the rerun state machine during
+  capture are snapshotted at their validation sites. Host-side checks run after each replay,
+  before the training loop decides whether to rerun or update the optimizer.
 - `--cuda-graph-modules` must be omitted (or left empty): per-module selection has no meaning
   when the entire iteration is captured as a single graph.
 
 ### Example
 
 ```bash
---cuda-graph-impl full_iteration \
---no-check-for-nan-in-loss-and-grad
+--cuda-graph-impl full_iteration
 ```
 
 ---
@@ -171,8 +182,8 @@ through the captured mHC prefix. Whole-layer and whole-MoE TE capture are not
 supported for mHC MoE models. Hybrid partial MoE capture requires separate attention and
 MoE layers, as provided by the standard Hybrid layer specs. TE graphs require independent
 MTP depths (`mtp_use_repeated_layer=False`); this restriction is specific to TE graphs.
-TE mHC capture/replay also requires `padding_mask=None`, since the per-layer static
-samples do not transport the MoE token padding mask.
+TE mHC capture/replay also requires `padding_mask=None`: the mHC graph boundaries do
+not yet carry the MoE token padding mask into a captured router.
 
 Full-iteration MoE capture requires fixed-capacity, padded expert inputs. The
 eager reference must use the same capacity and padding settings, since capacity
@@ -181,7 +192,6 @@ changes can change token routing:
 ```bash
 --enable-mhc-connections \
 --cuda-graph-impl full_iteration \
---no-check-for-nan-in-loss-and-grad \
 --moe-token-dispatcher-type alltoall \
 --moe-expert-capacity-factor 1.0 \
 --moe-pad-expert-input-to-capacity
@@ -228,8 +238,7 @@ All three implementations work for dense models:
 # equivalent: --cuda-graph-impl transformer_engine --cuda-graph-modules attn mlp
 
 # Full-iteration
---cuda-graph-impl full_iteration \
---no-check-for-nan-in-loss-and-grad
+--cuda-graph-impl full_iteration
 ```
 
 ### MoE Model Training
@@ -250,7 +259,6 @@ graphs to be used on MoE models as well:
 
 ```bash
 --cuda-graph-impl full_iteration \
---no-check-for-nan-in-loss-and-grad \
 --moe-flex-dispatcher-backend hybridep \
 --use-transformer-engine-op-fuser \
 --moe-expert-rank-capacity-factor <float> \

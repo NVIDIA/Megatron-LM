@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import contextlib
+import io
+import re
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import dco_gate
-from dco_gate import (
-    GateError,
-    gate_payload,
-    select_existing_gate,
-    select_latest_dco,
-    validate_trigger,
-)
+from dco_gate import GateError, gate_conclusion, select_latest_dco
 
 SHA = "a" * 40
 
@@ -26,104 +23,134 @@ def _dco(check_run_id: int, conclusion: str | None, *, app_slug: str = "dco", sh
         "conclusion": conclusion,
         "app": {"slug": app_slug},
         "html_url": f"https://example.test/checks/{check_run_id}",
-        "output": {"summary": "Commit sign-off was manually approved."},
+        "output": {"summary": "All commits are signed off!"},
     }
 
 
 class TestDcoGate(unittest.TestCase):
-    """Validate DCO event trust, mirroring, HTTP paths, and workflow topology."""
+    """Validate DCO verdict trust, the fail-closed mapping, and workflow topology."""
 
-    def test_validates_trusted_completed_dco_run(self) -> None:
-        event = {"check_run": _dco(10, "success")}
-        self.assertEqual(validate_trigger(event), SHA)
-
-    def test_rejects_untrusted_app(self) -> None:
-        event = {"check_run": _dco(10, "success", app_slug="github-actions")}
-        with self.assertRaisesRegex(GateError, "trusted DCO App"):
-            validate_trigger(event)
-
-    def test_validates_manual_reconcile_sha(self) -> None:
-        self.assertEqual(validate_trigger({}, requested_sha=SHA), SHA)
-        with self.assertRaisesRegex(GateError, "invalid head SHA"):
-            validate_trigger({}, requested_sha="not-a-sha")
-
-    def test_selects_new_manual_approval_over_old_failure(self) -> None:
+    def test_selects_the_newest_trusted_verdict(self) -> None:
         old_failure = _dco(10, "action_required")
-        manual_approval = _dco(20, "success")
-        spoofed = _dco(30, "failure", app_slug="other-app")
+        later_approval = _dco(20, "success")
+        spoofed = _dco(30, "success", app_slug="github-actions")
         self.assertIs(
-            select_latest_dco([manual_approval, spoofed, old_failure], SHA), manual_approval
+            select_latest_dco([later_approval, spoofed, old_failure], SHA), later_approval
         )
 
+    def test_ignores_a_same_named_check_from_another_app(self) -> None:
+        spoofed = _dco(30, "success", app_slug="github-actions")
+        with self.assertRaisesRegex(GateError, "no completed DCO App check"):
+            select_latest_dco([spoofed], SHA)
+
+    def test_ignores_a_verdict_for_another_head(self) -> None:
+        with self.assertRaisesRegex(GateError, "no completed DCO App check"):
+            select_latest_dco([_dco(10, "success", sha="b" * 40)], SHA)
+
+    def test_ignores_an_unfinished_verdict(self) -> None:
+        pending = {**_dco(10, None), "status": "in_progress"}
+        with self.assertRaisesRegex(GateError, "no completed DCO App check"):
+            select_latest_dco([pending], SHA)
+
     def test_all_non_success_conclusions_remain_blocking(self) -> None:
-        for source_conclusion in [
+        for conclusion in [
             "action_required",
             "cancelled",
             "failure",
             "neutral",
             "stale",
             "timed_out",
+            None,
         ]:
-            with self.subTest(source_conclusion=source_conclusion):
-                payload = gate_payload(_dco(20, source_conclusion), SHA, include_head=True)
-                self.assertEqual(payload["conclusion"], "failure")
-                self.assertIn(f"`{source_conclusion}`", payload["output"]["summary"])
+            with self.subTest(conclusion=conclusion):
+                self.assertEqual(gate_conclusion(_dco(20, conclusion)), "failure")
+        self.assertEqual(gate_conclusion(_dco(20, "success")), "success")
 
-    def test_mirrors_manual_approval_success(self) -> None:
-        payload = gate_payload(_dco(20, "success"), SHA, include_head=True)
-        self.assertEqual(payload["name"], "DCO gate")
-        self.assertEqual(payload["head_sha"], SHA)
-        self.assertEqual(payload["conclusion"], "success")
-        self.assertEqual(payload["external_id"], f"dco-gate:{SHA}")
-        self.assertIn("manually approved", payload["output"]["summary"])
-
-    def test_selects_only_gate_for_exact_sha(self) -> None:
-        own_gate = {"id": 12, "name": "DCO gate", "head_sha": SHA, "external_id": f"dco-gate:{SHA}"}
-        stale_gate = {**own_gate, "id": 13, "head_sha": "b" * 40}
-        self.assertIs(select_existing_gate([stale_gate, own_gate], SHA), own_gate)
-
-    def test_publish_gate_creates_then_updates(self) -> None:
+    def test_waits_for_a_late_verdict(self) -> None:
         source = _dco(20, "success")
-        post_result = {"id": 100}
+        clock = iter([0.0, 1.0, 2.0, 3.0, 4.0])
         with (
-            mock.patch.object(dco_gate, "_list_check_runs", side_effect=[[source], []]),
-            mock.patch.object(dco_gate, "_request_json", return_value=post_result) as request,
+            mock.patch.object(dco_gate, "_list_check_runs", side_effect=[[], [], [source]]),
+            mock.patch.object(dco_gate, "time") as patched_time,
         ):
-            self.assertEqual(
-                dco_gate.publish_gate({}, "NVIDIA/Megatron-LM", "https://api", "token", SHA),
-                post_result,
+            patched_time.monotonic.side_effect = lambda: next(clock)
+            self.assertIs(
+                dco_gate.await_dco_verdict(
+                    "https://api", "NVIDIA/Megatron-LM", SHA, "token", timeout=100, poll=0
+                ),
+                source,
             )
-            method, url, _, payload = request.call_args.args
-            self.assertEqual(
-                (method, url), ("POST", "https://api/repos/NVIDIA/Megatron-LM/check-runs")
-            )
-            self.assertEqual(payload["head_sha"], SHA)
 
-        gate = {"id": 100, "name": "DCO gate", "head_sha": SHA, "external_id": f"dco-gate:{SHA}"}
+    def test_fails_closed_when_no_verdict_arrives(self) -> None:
         with (
-            mock.patch.object(dco_gate, "_list_check_runs", side_effect=[[source], [gate]]),
-            mock.patch.object(dco_gate, "_request_json", return_value={"id": 100}) as request,
+            mock.patch.object(dco_gate, "_list_check_runs", return_value=[]),
+            mock.patch.object(dco_gate, "time") as patched_time,
         ):
-            dco_gate.publish_gate({}, "NVIDIA/Megatron-LM", "https://api", "token", SHA)
-            method, url, _, payload = request.call_args.args
-            self.assertEqual(
-                (method, url), ("PATCH", "https://api/repos/NVIDIA/Megatron-LM/check-runs/100")
-            )
-            self.assertNotIn("head_sha", payload)
+            patched_time.monotonic.side_effect = [0.0, 100.0]
+            with self.assertRaisesRegex(GateError, "no completed DCO App verdict"):
+                dco_gate.await_dco_verdict(
+                    "https://api", "NVIDIA/Megatron-LM", SHA, "token", timeout=10, poll=0
+                )
 
-    def test_workflows_isolate_merge_group_and_preserve_legacy_dco(self) -> None:
-        publisher = Path(".github/workflows/dco-gate.yml").read_text()
+    def test_verdict_becomes_the_job_exit_code(self) -> None:
+        for conclusion, expected in (("success", 0), ("action_required", 1)):
+            with self.subTest(conclusion=conclusion):
+                with (
+                    mock.patch.dict("os.environ", {"GITHUB_SHA": SHA}, clear=False),
+                    mock.patch.object(
+                        dco_gate, "await_dco_verdict", return_value=_dco(20, conclusion)
+                    ),
+                    contextlib.redirect_stdout(io.StringIO()),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    self.assertEqual(
+                        dco_gate.verify("NVIDIA/Megatron-LM", "https://api", "token"), expected
+                    )
+
+    def test_rejects_a_malformed_workflow_head(self) -> None:
+        with mock.patch.dict("os.environ", {"GITHUB_SHA": "not-a-sha"}, clear=False):
+            with self.assertRaisesRegex(GateError, "invalid head SHA"):
+                dco_gate.verify("NVIDIA/Megatron-LM", "https://api", "token")
+
+    def test_main_reports_a_failure_without_raising(self) -> None:
+        environment = {
+            "GITHUB_REPOSITORY": "NVIDIA/Megatron-LM",
+            "GITHUB_TOKEN": "token",
+            "GITHUB_SHA": "not-a-sha",
+        }
+        with (
+            mock.patch.dict("os.environ", environment, clear=False),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            self.assertEqual(dco_gate.main(), 1)
+        self.assertIn("DCO gate failed", stderr.getvalue())
+
+    def test_pull_request_gate_runs_as_a_job_on_the_mirror_push(self) -> None:
+        workflow = Path(".github/workflows/dco-gate-pull-request.yml").read_text()
+        self.assertIn("name: DCO gate", workflow)
+        self.assertIn('- "pull-request/[0-9]+"', workflow)
+        self.assertNotIn("ref: ${{ github.event.repository.default_branch }}", workflow)
+        self.assertIn("sparse-checkout: .github/scripts", workflow)
+        self.assertIn("checks: read", workflow)
+        self.assertNotIn("checks: write", workflow)
+
+    def test_merge_queue_keeps_its_own_gate_and_legacy_dco_placeholder(self) -> None:
         merge_group = Path(".github/workflows/dco-gate-merge-group.yml").read_text()
         main = Path(".github/workflows/cicd-main.yml").read_text()
-        self.assertIn("check_run:", publisher)
-        self.assertIn("workflow_dispatch:", publisher)
-        self.assertIn("github.event.check_run.app.slug == 'dco'", publisher)
-        self.assertIn("ref: ${{ github.event.repository.default_branch }}", publisher)
         self.assertIn("on:\n  merge_group:", merge_group)
         self.assertNotIn("push:", merge_group)
         self.assertIn("name: DCO gate", merge_group)
         self.assertIn("DCO_merge_group:", main)
         self.assertIn("name: DCO", main)
+
+    def test_the_checks_api_publisher_is_gone(self) -> None:
+        # A second producer of this context would race the job, and branch protection reads
+        # whichever check run is newest — so an API-published gate landing last would put the
+        # unbindable run back in front of the merge box.
+        self.assertFalse(Path(".github/workflows/dco-gate.yml").exists())
+        self.assertFalse(Path(".github/workflows/dco-gate-reconcile.yml").exists())
+        source = Path(".github/scripts/dco_gate.py").read_text()
+        self.assertEqual(re.findall(r'method="(\w+)"', source), ["GET"])
 
 
 if __name__ == "__main__":

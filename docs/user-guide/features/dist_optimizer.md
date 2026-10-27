@@ -28,6 +28,11 @@ order of the parameter and gradient buffers.
 DP-reshardable checkpoints include padding inside the unpadded bucket extent;
 padding added only to divide the buffer across DP ranks is excluded.
 
+Checkpoints written before the mixed-dtype index fix in PR #7336 may already
+associate optimizer state with the wrong parameter in a mixed-dtype group.
+The corrected mapping does not repair affected checkpoint contents; such
+checkpoints need independent validation before resuming training.
+
 The following figures show the sharding scheme and the main steps of the parameter update.
 
 ## Data Flow

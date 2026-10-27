@@ -16,13 +16,16 @@ Guides for Megatron Core training and inference features.
 
 cuda_graph
 fine_grained_activation_offloading
+low_precision_training
 moe
 megatron_fsdp
 dist_optimizer
+checkpoint-merge
 optimizer_cpu_offload
 paged_stash
 tokenizers
 megatron_energon
 megatron_rl
+offline_logits_distillation
 ../../mcore-inference-user-guide
 ```
