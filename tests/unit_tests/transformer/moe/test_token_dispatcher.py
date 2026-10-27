@@ -320,6 +320,77 @@ class MoEModelTestContainer:
             round_trip(bound + 64)
 
     @pytest.mark.internal
+    def dispatcher_thd_parity_vs_alltoall_test(self, rtol, atol):
+        """Full MoE-layer fwd+bwd on packed (THD) input with a padding mask and a different token
+        count per rank: ncclep against the alltoall dispatcher with identical weights. ncclep
+        routes the padded rows to -1 and never ships them, so the reference is alltoall run on
+        the valid rows alone (the alltoall dispatcher has no padding handling of its own). The
+        valid rows' outputs and input grads and every parameter grad must agree within
+        tolerance; ncclep's padded rows must come out exactly zero."""
+        rank = torch.distributed.get_rank()
+        torch.manual_seed(1000 + rank)
+        num_tokens = 64 + 16 * rank
+        hidden_size = self.config.hidden_size
+        x = torch.randn((num_tokens, 1, hidden_size), dtype=self.test_dtype, device="cuda")
+        padding_mask = torch.zeros((1, num_tokens), dtype=torch.bool, device="cuda")
+        padding_mask[0, num_tokens - 4 - rank :] = True
+        padding_rows = padding_mask[0]
+        valid_rows = ~padding_rows
+        packed_seq_params = PackedSeqParams(qkv_format="thd")
+
+        def run(layer, inputs, **forward_kwargs):
+            inp = inputs.clone().detach().requires_grad_(True)
+            out, _ = layer(inp, **forward_kwargs)
+            out.sum().backward()
+            param_grads = {
+                name: p.grad.detach().clone()
+                for name, p in layer.named_parameters()
+                if p.grad is not None
+            }
+            return out.detach(), inp.grad.detach(), param_grads
+
+        ref_layer = self.new_moe_layer(
+            moe_token_dispatcher_type="alltoall", moe_flex_dispatcher_backend=None
+        )
+        out_ref, grad_ref, param_grads_ref = run(ref_layer, x[valid_rows])
+        ncclep_layer = self.moe_layer
+        ncclep_layer.load_state_dict(ref_layer.state_dict())
+        # NCCL EP reads NCCL_EP_HT_EM_PULL_PUSH when its process-wide group is created, and
+        # earlier tests may already have created it: rebuild under this test's environment,
+        # and again afterwards so later tests do not inherit the mode.
+        from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_context
+
+        nccl_ep_release_context()
+        try:
+            out, grad, param_grads = run(
+                ncclep_layer, x, padding_mask=padding_mask, packed_seq_params=packed_seq_params
+            )
+        finally:
+            nccl_ep_release_context()
+
+        assert ncclep_layer.token_dispatcher._comm_manager._is_thd
+        assert not torch.isnan(out).any() and not torch.isnan(grad).any()
+        assert torch.equal(out[padding_rows], torch.zeros_like(out[padding_rows]))
+        assert torch.equal(grad[padding_rows], torch.zeros_like(grad[padding_rows]))
+        out, grad = out[valid_rows], grad[valid_rows]
+
+        def report(name, actual, expected):
+            diff = (actual.float() - expected.float()).abs()
+            rel = diff / expected.float().abs().clamp_min(1e-6)
+            if rank == 0:
+                print(
+                    f"[thd parity {self.test_dtype}] {name}: max_abs={diff.max().item():.3e} "
+                    f"max_rel={rel.max().item():.3e} ref_absmax={expected.abs().max().item():.3e}"
+                )
+            torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol, msg=name)
+
+        report("output", out, out_ref)
+        report("input_grad", grad, grad_ref)
+        assert param_grads.keys() == param_grads_ref.keys()
+        for name in sorted(param_grads):
+            report(f"grad[{name}]", param_grads[name], param_grads_ref[name])
+
+    @pytest.mark.internal
     def moe_layer_variant_parity_test(self, variant="zero_copy"):
         """Full MoE-layer fwd+bwd, reference vs IO-variant (identical weights), asserting parity.
 
@@ -1349,3 +1420,37 @@ class TestFlexDispatcher:
             seq_length=seq_length,
         )
         container.dispatcher_thd_uneven_tokens_test(seq_length)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.timeout(120)
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8)])
+    def test_ncclep_thd_parity_vs_alltoall(self, monkeypatch, tp_size, ep_size):
+        # NCCL EP carries bf16 (or MXFP8) payloads only, so the comparison runs in bf16. In
+        # eager mode the pull-push EM mode builds its expert-major slot map with the
+        # order-preserving routing-map scan, so every received row has a fixed slot and the
+        # comparison is bit-exact. The default local-permute mode builds the map in-kernel
+        # with atomic per-expert cursors, so the row order inside an expert zone depends on
+        # scheduling and the token-reduced weight grads can drift by one bf16 ulp.
+        if not is_nccl_ep_available():
+            pytest.skip("NCCL EP is not available")
+        monkeypatch.setenv("NCCL_EP_HT_EM_PULL_PUSH", "1")
+        rtol = atol = 0.0
+        test_dtype = torch.bfloat16
+        container = MoEModelTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            # The reference sees only the valid rows; an aux loss would make the router grads
+            # depend on the token count rather than on the dispatcher.
+            moe_aux_loss_coeff=0.0,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="ncclep",
+            hidden_size=1024,
+            test_dtype=test_dtype,
+            seq_length=256,
+        )
+        container.dispatcher_thd_parity_vs_alltoall_test(rtol=rtol, atol=atol)
