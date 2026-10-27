@@ -22,7 +22,6 @@ from typing import Any, List, Optional, Tuple
 import torch
 
 from gpt_builders import gpt_builder
-from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -31,7 +30,10 @@ from megatron.core.models.gpt import GPTModel
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.multi_token_prediction import get_mtp_ranks
@@ -454,24 +456,45 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
-def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
-    """Whether the dataset should be built on the current rank."""
+def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False, pg_collection=None):
+    """Whether the dataset should be built on the current rank.
+
+    Args:
+        vp_stage: Virtual pipeline stage of the model chunk the dataset feeds.
+        is_packed_sequence: Whether the dataset yields packed sequences, which every pipeline
+            stage reads.
+        pg_collection: Process groups of the run. The dataset is built on the first rank of
+            its tensor-parallel group, on the stages of its pipeline group that read data.
+            Omitting it is deprecated: the groups are built from the global parallel state,
+            with a ProcessGroupFallbackWarning.
+    """
     args = get_args()
     config = core_transformer_config_from_args(args)
-    if mpu.get_tensor_model_parallel_rank() != 0:
+    if pg_collection is None:
+        warn_global_process_group_fallback(
+            "pretrain_gpt.is_dataset_built_on_rank", deprecated_in="0.21", removed_in="0.23"
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "pp"])
+    for group_name in ("tp", "pp"):
+        if vars(pg_collection).get(group_name) is None:
+            raise ValueError(f"is_dataset_built_on_rank requires pg_collection.{group_name}")
+    if get_pg_rank(pg_collection.tp) != 0:
         return False
-    elif args.sequence_packing_scheduler is not None:
+    is_first_or_last_stage = is_first_or_last_pipeline_stage(
+        vp_stage, pp_group=pg_collection.pp, vp_size=config.virtual_pipeline_model_parallel_size
+    )
+    if args.sequence_packing_scheduler is not None:
         # The scheduler sends packing metadata to middle PP stages itself and requires that
         # only the first and last stages hold a data iterator.
-        return is_first_or_last_pipeline_stage(vp_stage)
+        return is_first_or_last_stage
     elif is_packed_sequence:
         return True
-    return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank_func(
+    return is_first_or_last_stage or mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,
         mtp_num_layers=config.mtp_num_layers,
         ignore_virtual=False,
         vp_stage=vp_stage,
-        pp_group=mpu.get_pipeline_model_parallel_group(),
+        pp_group=pg_collection.pp,
         vp_size=config.virtual_pipeline_model_parallel_size or 1,
     )
 
@@ -547,11 +570,16 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
     return GPTDatasetConfig(**data_args)
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
+def train_valid_test_datasets_provider(
+    train_val_test_num_samples, vp_stage=None, pg_collection=None
+):
     """Build the train test and validation datasets.
 
     Args:
         train_val_test_num_samples : A list containing the number of samples in train test and validation.
+        vp_stage: Virtual pipeline stage of the model chunk the datasets feed.
+        pg_collection: Process groups of the run, which decide the ranks that build the
+            datasets (see is_dataset_built_on_rank).
     """
     args = get_args()
 
@@ -586,7 +614,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 
     is_dataset_built = partial(
-        is_dataset_built_on_rank, vp_stage=vp_stage, is_packed_sequence=is_packed_sequence
+        is_dataset_built_on_rank,
+        vp_stage=vp_stage,
+        is_packed_sequence=is_packed_sequence,
+        pg_collection=pg_collection,
     )
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type, train_val_test_num_samples, is_dataset_built, config

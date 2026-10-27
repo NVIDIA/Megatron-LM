@@ -1,23 +1,28 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Training passes its process groups to the dataset provider.
+"""Dataset providers decide where datasets are built from the run's process groups.
 
-A provider that accepts a ``pg_collection`` receives the run's collection, so it can build its
-datasets on the ranks of that collection rather than on the global grid.
+Training passes its collection to a provider that accepts one, and the providers of the GPT,
+hybrid and VLM training scripts take the ranks that build their datasets from it. Callers that
+pass no groups keep the global grid, with a warning.
 
 Tests that pass groups make every global parallel_state accessor fail, or give the code groups
 whose layout differs from the global grid, so a read of the global grid cannot pass unnoticed.
 """
 
 import functools
+import warnings
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
-from megatron.core import parallel_state
-from megatron.core.process_groups_config import ProcessGroupCollection
+import pretrain_gpt
+import pretrain_hybrid
+import pretrain_vlm
+from megatron.core import parallel_state, process_groups_config
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.training import training
 from megatron.training.config import TrainingConfig, ValidationConfig
 from megatron.training.state import TrainState
@@ -27,6 +32,12 @@ from tests.unit_tests.test_utilities import Utils
 no_fallback = pytest.mark.filterwarnings(
     "error::megatron.core.process_groups_config.ProcessGroupFallbackWarning"
 )
+
+
+@pytest.fixture(autouse=True)
+def fresh_warning_registry(monkeypatch):
+    """Each test observes the first fallback warning of every owner."""
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
 
 
 class _FakeGroup:
@@ -59,10 +70,21 @@ def _forbid_global_process_groups(monkeypatch):
     )
 
 
+def _use_fake_groups(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: group.ranks)
+
+
 def _groups(tp_rank, pp_rank, pp_size):
     """Groups whose global ranks differ from any global grid of the test's world."""
     return ProcessGroupCollection(
         tp=_FakeGroup(tp_rank, [5, 7]), pp=_FakeGroup(pp_rank, range(11, 11 + pp_size))
+    )
+
+
+def _fallback_warning(owner, argument="pg_collection"):
+    return pytest.warns(
+        ProcessGroupFallbackWarning, match=f"{owner} was called without `{argument}`"
     )
 
 
@@ -122,6 +144,202 @@ def test_dataset_provider_without_a_pg_collection_parameter_is_called_with_the_s
     training.build_train_valid_test_datasets(provider, [4, 2, 1], pg_collection=_groups(0, 0, 1))
 
     assert calls == [(([4, 2, 1],), {})]
+
+
+# is_dataset_built_on_rank of the GPT and hybrid training scripts
+
+
+@pytest.fixture(params=[pretrain_gpt, pretrain_hybrid], ids=["gpt", "hybrid"])
+def dataset_script(request, monkeypatch):
+    """A training script whose dataset rank check reads stubbed arguments and config."""
+    module = request.param
+    args = SimpleNamespace(
+        sequence_packing_scheduler=None,
+        sft=False,
+        use_varlen_dataset=False,
+        mock_data=True,
+        fim_data=False,
+    )
+    config = SimpleNamespace(
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=None,
+        virtual_pipeline_model_parallel_size=None,
+    )
+    monkeypatch.setattr(module, "get_args", lambda: args)
+    monkeypatch.setattr(module, "core_transformer_config_from_args", lambda args: config)
+    return SimpleNamespace(module=module, args=args, config=config)
+
+
+@no_fallback
+@pytest.mark.parametrize(
+    "tp_rank,pp_rank,pp_size,vp_stage,vp_size,scheduler,packed,expected",
+    [
+        # Only the first rank of the tensor-parallel group builds datasets.
+        (1, 0, 2, None, None, None, False, False),
+        (1, 0, 2, None, None, None, True, False),
+        (0, 0, 4, None, None, None, False, True),
+        (0, 3, 4, None, None, None, False, True),
+        # Middle pipeline stages read data only for packed sequences.
+        (0, 1, 4, None, None, None, False, False),
+        (0, 1, 4, None, None, None, True, True),
+        # The packing scheduler sends middle stages their metadata itself.
+        (0, 1, 4, None, None, "dp_balanced", True, False),
+        (0, 3, 4, None, None, "dp_balanced", True, True),
+        # With a virtual pipeline, only the first and last model chunks read data.
+        (0, 0, 4, 0, 2, None, False, True),
+        (0, 0, 4, 1, 2, None, False, False),
+        (0, 3, 4, 1, 2, None, False, True),
+        (0, 3, 4, 0, 2, "dp_balanced", True, False),
+    ],
+)
+def test_dataset_rank_check_reads_the_supplied_groups(
+    dataset_script,
+    monkeypatch,
+    tp_rank,
+    pp_rank,
+    pp_size,
+    vp_stage,
+    vp_size,
+    scheduler,
+    packed,
+    expected,
+):
+    _forbid_global_process_groups(monkeypatch)
+    _use_fake_groups(monkeypatch)
+    dataset_script.args.sequence_packing_scheduler = scheduler
+    dataset_script.config.virtual_pipeline_model_parallel_size = vp_size
+
+    built = dataset_script.module.is_dataset_built_on_rank(
+        vp_stage=vp_stage,
+        is_packed_sequence=packed,
+        pg_collection=_groups(tp_rank, pp_rank, pp_size),
+    )
+
+    assert built is expected
+
+
+@no_fallback
+@pytest.mark.parametrize("vp_size", [None, 2])
+def test_dataset_rank_check_places_mtp_on_the_supplied_pipeline_group(
+    dataset_script, monkeypatch, vp_size
+):
+    _forbid_global_process_groups(monkeypatch)
+    _use_fake_groups(monkeypatch)
+    dataset_script.config.virtual_pipeline_model_parallel_size = vp_size
+    mtp_on_this_rank = Mock(return_value=True)
+    monkeypatch.setattr(dataset_script.module, "mtp_on_this_rank_func", mtp_on_this_rank)
+    pgs = _groups(0, 1, 4)
+
+    # A middle stage reads data when it holds MTP layers.
+    assert dataset_script.module.is_dataset_built_on_rank(vp_stage=0, pg_collection=pgs) is True
+    kwargs = mtp_on_this_rank.call_args.kwargs
+    assert kwargs["pp_group"] is pgs.pp
+    assert kwargs["vp_stage"] == 0
+    assert kwargs["vp_size"] == (vp_size or 1)
+
+
+@pytest.mark.parametrize("missing", ["tp", "pp"])
+def test_dataset_rank_check_rejects_a_collection_without_its_groups(dataset_script, missing):
+    groups = {name: _FakeGroup(0, [5]) for name in ("tp", "pp")}
+    del groups[missing]
+
+    with pytest.raises(ValueError, match=f"pg_collection.{missing}"):
+        dataset_script.module.is_dataset_built_on_rank(
+            pg_collection=ProcessGroupCollection(**groups)
+        )
+
+
+class _RecordingBuilder:
+    """BlendedMegatronDatasetBuilder stand-in that evaluates the rank check it receives."""
+
+    def __init__(self, dataset_type, sizes, is_built_on_rank, config):
+        self.is_built_on_rank = is_built_on_rank
+
+    def build(self):
+        built = self.is_built_on_rank()
+        return built, built, built
+
+
+@no_fallback
+@pytest.mark.parametrize("tp_rank,expected", [(0, True), (1, False)])
+def test_dataset_provider_builds_on_the_supplied_groups(
+    dataset_script, monkeypatch, tp_rank, expected
+):
+    _forbid_global_process_groups(monkeypatch)
+    _use_fake_groups(monkeypatch)
+    module = dataset_script.module
+    monkeypatch.setattr(module, "print_rank_0", lambda message: None)
+    monkeypatch.setattr(module, "core_gpt_dataset_config_from_args", lambda args: object())
+    monkeypatch.setattr(module, "BlendedMegatronDatasetBuilder", _RecordingBuilder)
+
+    datasets = module.train_valid_test_datasets_provider(
+        [4, 2, 1], vp_stage=None, pg_collection=_groups(tp_rank, 0, 2)
+    )
+
+    assert datasets == (expected, expected, expected)
+
+
+# The VLM training script
+
+
+def _stub_vlm_dataset_inputs(monkeypatch):
+    monkeypatch.setattr(pretrain_vlm, "print_rank_0", lambda message: None)
+    monkeypatch.setattr(pretrain_vlm, "get_run_config", lambda: SimpleNamespace(rng=Mock()))
+    monkeypatch.setattr(pretrain_vlm, "get_args", Mock)
+    monkeypatch.setattr(pretrain_vlm, "get_tokenizer", Mock)
+    monkeypatch.setattr(pretrain_vlm, "MultimodalDatasetConfig", Mock)
+    monkeypatch.setattr(pretrain_vlm, "BlendedMegatronDatasetBuilder", _RecordingBuilder)
+
+
+@no_fallback
+@pytest.mark.parametrize("tp_rank,expected", [(0, True), (1, False)])
+def test_vlm_dataset_provider_builds_on_the_supplied_tensor_parallel_group(
+    monkeypatch, tp_rank, expected
+):
+    _forbid_global_process_groups(monkeypatch)
+    _use_fake_groups(monkeypatch)
+    _stub_vlm_dataset_inputs(monkeypatch)
+
+    datasets = pretrain_vlm.train_valid_test_datasets_provider(
+        [4, 2, 1], pg_collection=ProcessGroupCollection(tp=_FakeGroup(tp_rank, [3, 7]))
+    )
+
+    assert datasets == (expected, expected, expected)
+
+
+def test_vlm_dataset_rank_check_rejects_a_collection_without_a_tensor_parallel_group():
+    with pytest.raises(ValueError, match="pg_collection.tp"):
+        pretrain_vlm.is_dataset_built_on_rank(ProcessGroupCollection(pp=_FakeGroup(0, [5])))
+
+
+# Callers that pass no groups keep the global grid and are warned
+
+
+@pytest.mark.parametrize("tp_rank,pp_rank,expected", [(0, 1, True), (1, 1, False), (0, 0, True)])
+def test_dataset_rank_check_without_groups_warns_and_uses_the_global_groups(
+    dataset_script, monkeypatch, tp_rank, pp_rank, expected
+):
+    _use_fake_groups(monkeypatch)
+    global_groups = _groups(tp_rank, pp_rank, 2)
+    use_mpu = Mock(return_value=global_groups)
+    monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", use_mpu)
+    owner = f"{dataset_script.module.__name__}.is_dataset_built_on_rank"
+
+    with _fallback_warning(owner):
+        built = dataset_script.module.is_dataset_built_on_rank()
+
+    assert built is expected
+    assert use_mpu.call_args.kwargs == {"required_pgs": ["tp", "pp"]}
+
+
+def test_vlm_dataset_rank_check_without_groups_warns_and_uses_the_global_group(monkeypatch):
+    _use_fake_groups(monkeypatch)
+    use_mpu = Mock(return_value=ProcessGroupCollection(tp=_FakeGroup(1, [3, 7])))
+    monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", use_mpu)
+
+    with _fallback_warning("pretrain_vlm.is_dataset_built_on_rank"):
+        assert pretrain_vlm.is_dataset_built_on_rank() is False
+    assert use_mpu.call_args.kwargs == {"required_pgs": ["tp"]}
 
 
 # 4-GPU tests
@@ -187,5 +405,51 @@ def test_data_loaders_build_datasets_on_the_run_tensor_parallel_group(monkeypatc
 
         # The first rank of each strided pair builds; on the global grid, ranks 0, 2, ... would.
         assert provider_calls == ([pgs] if tp_group.rank() == 0 else [])
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def _expected_dataset_rank(vp_stage, scheduler, packed):
+    """Whether this rank builds the dataset on the global grid, read from parallel_state."""
+    if parallel_state.get_tensor_model_parallel_rank() != 0:
+        return False
+    ignore_virtual = vp_stage is None
+    is_first_or_last_stage = parallel_state.is_pipeline_first_stage(
+        ignore_virtual=ignore_virtual, vp_stage=vp_stage
+    ) or parallel_state.is_pipeline_last_stage(ignore_virtual=ignore_virtual, vp_stage=vp_stage)
+    if scheduler is not None:
+        return is_first_or_last_stage
+    return packed or is_first_or_last_stage
+
+
+@pytest.mark.parametrize("vp_size", [None, 2])
+@pytest.mark.parametrize("scheduler", [None, "dp_balanced"])
+@pytest.mark.parametrize("packed", [False, True])
+def test_dataset_rank_check_matches_the_global_grid(dataset_script, vp_size, scheduler, packed):
+    if Utils.world_size % 4:
+        pytest.skip("needs a world size divisible by 4 for a 2 x 2 tensor x pipeline grid")
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=2,
+        virtual_pipeline_model_parallel_size=vp_size,
+    )
+    try:
+        dataset_script.args.sequence_packing_scheduler = scheduler
+        dataset_script.config.virtual_pipeline_model_parallel_size = vp_size
+        pgs = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "pp"])
+        for vp_stage in [None] if vp_size is None else range(vp_size):
+            expected = _expected_dataset_rank(vp_stage, scheduler, packed)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", ProcessGroupFallbackWarning)
+                built = dataset_script.module.is_dataset_built_on_rank(
+                    vp_stage=vp_stage, is_packed_sequence=packed, pg_collection=pgs
+                )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ProcessGroupFallbackWarning)
+                built_without_groups = dataset_script.module.is_dataset_built_on_rank(
+                    vp_stage=vp_stage, is_packed_sequence=packed
+                )
+            assert built == expected, f"{vp_stage=}"
+            assert built_without_groups == expected, f"{vp_stage=}"
     finally:
         Utils.destroy_model_parallel()
