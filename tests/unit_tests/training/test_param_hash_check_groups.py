@@ -61,15 +61,18 @@ def test_model_without_collection_uses_the_global_groups():
 def test_post_training_step_callbacks_check_the_model_dp_groups():
     pg_collection = ProcessGroupCollection(dp=object(), expt_dp=object())
     model = [SimpleNamespace(pg_collection=pg_collection)]
-    args = SimpleNamespace(
+    # The training settings live in args before the TrainingConfig migration (#8149) and in
+    # the run config's train section after it, so the test sets both.
+    train = dict(
         train_sync_interval=0,
-        log_straggler=False,
         check_weight_hash_across_dp_replicas_interval=2,
-        adlr_autoresume=False,
         gpu_sniff_test_interval=None,
         manual_gc=False,
+        manual_gc_interval=0,
     )
+    args = SimpleNamespace(log_straggler=False, adlr_autoresume=False, **train)
     cfg = SimpleNamespace(
+        train=SimpleNamespace(**train),
         logger=SimpleNamespace(log_interval=1),
         profiling=SimpleNamespace(use_nsys_profiler=False, use_pytorch_profiler=False),
     )
