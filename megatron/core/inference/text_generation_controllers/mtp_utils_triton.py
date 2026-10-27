@@ -279,6 +279,8 @@ def _prepare_next_forward_pass_kernel(
     """Gather final tokens and extract accepted speculative tokens per request.
 
     Grid: (active_request_count,)
+    Every program writes its row of accepted tokens and its accepted count;
+    prefill rows get -1 tokens and a count of 0.
     """
     pid = tl.program_id(0)
 
@@ -287,11 +289,13 @@ def _prepare_next_forward_pass_kernel(
     tl.store(SAMPLED_TOKENS_OUT_PTR + pid, tl.load(OUTPUT_TOKENS_PTR + idx))
     tl.store(LAST_ACCEPTED_SEQ_OUT_PTR + pid, tl.load(REQUIRED_LOGIT_INDICES_PTR + idx))
 
+    spec_offsets = tl.arange(0, SPEC_BLOCK_SIZE)
+    spec_valid = spec_offsets < NUM_SPEC_TOKENS
+    out_base = pid.to(tl.int64) * accepted_tokens_out_stride
+
     # --- For decode requests: extract accepted tokens and count ---
     if pid < num_decode_requests:
         base = pid * STRIDE
-        spec_offsets = tl.arange(0, SPEC_BLOCK_SIZE)
-        spec_valid = spec_offsets < NUM_SPEC_TOKENS
         token_positions = base + 1 + spec_offsets  # skip first (base) token
 
         tokens = tl.load(INPUT_TOKENS_PTR + token_positions, mask=spec_valid, other=0)
@@ -300,11 +304,17 @@ def _prepare_next_forward_pass_kernel(
 
         result = tl.where(accepted & spec_valid, tokens, -1)
 
-        out_base = pid.to(tl.int64) * accepted_tokens_out_stride
         tl.store(ACCEPTED_TOKENS_OUT_PTR + out_base + spec_offsets, result, mask=spec_valid)
 
         count = tl.sum((accepted & spec_valid).to(tl.int64))
         tl.store(ACCEPTED_COUNTS_OUT_PTR + pid, count)
+    else:
+        # Prefill requests proposed no drafts. The output buffers persist across
+        # steps, so clear the row: it may still hold the drafts accepted by the
+        # decode request that occupied it in an earlier step.
+        no_drafts = tl.full((SPEC_BLOCK_SIZE,), -1, dtype=tl.int64)
+        tl.store(ACCEPTED_TOKENS_OUT_PTR + out_base + spec_offsets, no_drafts, mask=spec_valid)
+        tl.store(ACCEPTED_COUNTS_OUT_PTR + pid, 0)
 
 
 def prepare_next_forward_pass(
@@ -322,7 +332,9 @@ def prepare_next_forward_pass(
 ):
     """Launch the prepare-next-forward-pass Triton kernel.
 
-    Writes results into the pre-allocated buffers provided by the caller.
+    Writes results into the pre-allocated buffers provided by the caller. Each
+    buffer needs a row for every active request: the accepted tokens and counts
+    of prefill requests are reset to -1 and 0.
     """
     active_request_count = last_one_indices.shape[0]
     if active_request_count == 0:

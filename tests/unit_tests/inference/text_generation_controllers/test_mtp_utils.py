@@ -449,7 +449,7 @@ class TestPrepareNextForwardPass:
         "num_decode,num_prefill,num_spec", [(1, 0, 2), (3, 0, 2), (3, 2, 2), (0, 3, 2), (5, 3, 4)]
     )
     def test_basic(self, num_decode, num_prefill, num_spec):
-        (output_tokens, required_logit_indices, input_tokens, accepted_mask, last_one_indices) = (
+        output_tokens, required_logit_indices, input_tokens, accepted_mask, last_one_indices = (
             self._setup(num_decode, num_prefill, num_spec)
         )
 
@@ -457,15 +457,13 @@ class TestPrepareNextForwardPass:
 
         ref_sampled = torch.zeros(active, device=DEVICE, dtype=torch.int64)
         ref_last_seq = torch.zeros(active, device=DEVICE, dtype=torch.int64)
-        ref_accepted = torch.full((num_decode, num_spec), -1, device=DEVICE, dtype=torch.int64)
-        ref_counts = torch.zeros(num_decode, device=DEVICE, dtype=torch.int64)
+        # Start from stale values: the kernel must rewrite every active row.
+        ref_accepted = torch.randint(0, 1000, (active, num_spec), device=DEVICE, dtype=torch.int64)
+        ref_counts = torch.randint(0, num_spec + 1, (active,), device=DEVICE, dtype=torch.int64)
 
-        tri_sampled = torch.zeros(active, device=DEVICE, dtype=torch.int64)
-        tri_last_seq = torch.zeros(active, device=DEVICE, dtype=torch.int64)
-        tri_accepted = torch.full(
-            (max(num_decode, 1), num_spec), -1, device=DEVICE, dtype=torch.int64
+        tri_sampled, tri_last_seq, tri_accepted, tri_counts = _clone_tensors(
+            ref_sampled, ref_last_seq, ref_accepted, ref_counts
         )
-        tri_counts = torch.zeros(max(num_decode, 1), device=DEVICE, dtype=torch.int64)
 
         prepare_next_forward_pass_pytorch(
             num_decode,
@@ -497,9 +495,54 @@ class TestPrepareNextForwardPass:
 
         torch.testing.assert_close(tri_sampled, ref_sampled)
         torch.testing.assert_close(tri_last_seq, ref_last_seq)
-        if num_decode > 0:
-            torch.testing.assert_close(tri_accepted[:num_decode], ref_accepted[:num_decode])
-            torch.testing.assert_close(tri_counts[:num_decode], ref_counts[:num_decode])
+        torch.testing.assert_close(tri_accepted, ref_accepted)
+        torch.testing.assert_close(tri_counts, ref_counts)
+
+    @pytest.mark.parametrize(
+        "prepare_fn",
+        [prepare_next_forward_pass_pytorch, prepare_next_forward_pass],
+        ids=["pytorch", "triton"],
+    )
+    def test_prefill_row_drops_previous_occupant_drafts(self, prepare_fn):
+        """A prefill row reports no accepted drafts, whatever its row held in an earlier step.
+
+        The output buffers persist across steps. When a decode request finishes, the remaining
+        decode requests move up and a newly admitted request can verify its prefill in a row
+        that still holds a decode request's accepted drafts.
+        """
+        num_spec = 2
+        accepted = torch.full((2, num_spec), -1, device=DEVICE, dtype=torch.int64)
+        counts = torch.zeros(2, device=DEVICE, dtype=torch.int64)
+        sampled = torch.zeros(2, device=DEVICE, dtype=torch.int64)
+        last_seq = torch.zeros(2, device=DEVICE, dtype=torch.int64)
+
+        def step(num_decode, input_tokens, last_one_indices):
+            # Every draft is accepted: each sampled token is its input token plus one.
+            input_tokens = torch.tensor(input_tokens, device=DEVICE, dtype=torch.int64)
+            prepare_fn(
+                num_decode,
+                input_tokens + 1,
+                torch.arange(input_tokens.numel(), device=DEVICE, dtype=torch.int64),
+                torch.tensor(last_one_indices, device=DEVICE, dtype=torch.int64),
+                torch.ones_like(input_tokens, dtype=torch.bool),
+                input_tokens,
+                sampled,
+                last_seq,
+                accepted,
+                counts,
+                num_spec,
+            )
+
+        # Requests A and B decode in rows 0 and 1 and accept both drafts.
+        step(2, [11, 12, 13, 41, 42, 43], [2, 5])
+        assert accepted.tolist() == [[12, 13], [42, 43]]
+        assert counts.tolist() == [2, 2]
+
+        # A finished. B decodes in row 0 and the new request C verifies its prefill in row 1.
+        step(1, [44, 45, 46, 70], [2, 3])
+        assert sampled.tolist() == [47, 71]
+        assert accepted.tolist() == [[45, 46], [-1, -1]]
+        assert counts.tolist() == [2, 0]
 
     def test_empty(self):
         """Zero active requests should be a no-op."""

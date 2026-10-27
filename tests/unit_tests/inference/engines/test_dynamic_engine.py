@@ -8623,6 +8623,141 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize("async_sched_mode", list(AsyncScheduleMode))
+    @pytest.mark.parametrize("num_speculative_tokens", [1, 2])
+    @pytest.mark.parametrize("reuse_decode_row", [True, False], ids=["reused_row", "fresh_row"])
+    @torch.inference_mode()
+    def test_speculative_admission_ignores_previous_row_drafts(
+        self, async_sched_mode, num_speculative_tokens, reuse_decode_row
+    ):
+        """A newly admitted request must not emit the accepted drafts of its row's previous owner.
+
+        The base model and the MTP head are a greedy +1 counter, so every draft is accepted and a
+        request whose prompt ends in p generates p+1, p+2, ... however it is batched.
+
+        reused_row: max_requests=2. A finishes after one decode step that accepts all its drafts,
+        and the queued C then verifies its prefill next to the decoding B, in a row that held a
+        decode request's accepted drafts.
+        fresh_row: max_requests=4. C is added once A and B are decoding, so it verifies its
+        prefill in a row no decode request used.
+        """
+        num_spec = num_speculative_tokens
+        prompt_last_tokens = {0: 10, 1: 40, 2: 70}
+        if reuse_decode_row:
+            num_tokens = {0: num_spec + 2, 1: 16, 2: 7}
+        else:
+            num_tokens = {0: 16, 1: 16, 2: 7}
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=16,
+            num_speculative_tokens=num_spec,
+            materialize_only_last_token_logits=False,
+            model_provider="gpt",
+            context_max_requests=2 if reuse_decode_row else 4,
+            async_sched_mode=async_sched_mode,
+        )
+        env = self._build_test_env(test_config)
+        engine = env.engine
+        context = engine.context
+        controller = engine.controller
+        unwrapped_model = controller.inference_wrapped_model.model
+        # Generated ids stay below the termination id.
+        cycle = test_config.vocab_size - 1
+
+        real_forward = unwrapped_model.forward
+
+        def counter_forward(*args, **kwargs):
+            logits = real_forward(*args, **kwargs)
+            input_ids = args[0] if args else kwargs["input_ids"]
+            logits.zero_()
+            logits.scatter_(-1, ((input_ids + 1) % cycle).unsqueeze(-1), 100.0)
+            return logits
+
+        real_mtp = unwrapped_model.compute_mtp_single_step
+
+        def counter_mtp(*args, **kwargs):
+            hidden_states, logits = real_mtp(*args, **kwargs)
+            n = logits.size(0)
+            next_token_ids = kwargs["next_token_ids"].reshape(-1)[:n]
+            logits.zero_()
+            logits.scatter_(-1, ((next_token_ids + 1) % cycle).view(n, 1, 1), 100.0)
+            return hidden_states, logits
+
+        unwrapped_model.forward = counter_forward
+        unwrapped_model.compute_mtp_single_step = counter_mtp
+
+        # Record the row layout of every verify to check that the scenario was reached.
+        verified_rows = []
+        real_prepare = controller._prepare_speculative_tokens_for_next_forward_pass
+
+        def recording_prepare(num_decode_requests, *args):
+            real_prepare(num_decode_requests, *args)
+            active_rows = context.request_ids[
+                context.paused_request_count : context.total_request_count
+            ]
+            verified_rows.append((num_decode_requests, active_rows.tolist()))
+
+        controller._prepare_speculative_tokens_for_next_forward_pass = recording_prepare
+
+        def add_request(request_id):
+            last = prompt_last_tokens[request_id]
+            engine.add_request(
+                request_id=request_id,
+                prompt=torch.arange(last - 3, last + 1, device='cuda'),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=num_tokens[request_id],
+                    termination_id=test_config.vocab_size - 1,
+                    top_k=1,
+                ),
+            )
+
+        finished_requests = {}
+
+        def step():
+            for request in engine.step_modern()["finished_requests"]:
+                finished_requests[request.request_id] = request
+
+        add_request(0)
+        add_request(1)
+        if not reuse_decode_row:
+            for _ in range(10):
+                if all(len(engine.get_request(i).generated_tokens) > 0 for i in (0, 1)):
+                    break
+                step()
+        add_request(2)
+        step_count = 0
+        while engine.has_unfinished_requests():
+            step()
+            step_count += 1
+            assert step_count < 200, "Engine did not converge"
+
+        # C's prefill was verified next to a decode request, in a reused or a fresh row.
+        rows_used_by_decode = set()
+        for num_decode, row_request_ids in verified_rows:
+            if 2 in row_request_ids:
+                c_row = row_request_ids.index(2)
+                break
+            rows_used_by_decode.update(range(num_decode))
+        else:
+            pytest.fail("Request 2 was never verified")
+        assert 0 < num_decode <= c_row, verified_rows
+        assert (c_row in rows_used_by_decode) == reuse_decode_row, verified_rows
+
+        for request_id, last in prompt_last_tokens.items():
+            request = finished_requests[request_id]
+            expected = [(last + k) % cycle for k in range(1, num_tokens[request_id] + 1)]
+            assert request.status == Status.COMPLETED
+            assert request.generated_tokens == expected, (
+                f"Request {request_id} generated {request.generated_tokens}, "
+                f"expected {expected}; verified rows: {verified_rows}"
+            )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @torch.inference_mode()
     def test_speculative_logprobs_alignment_under_length_truncation(self):
         """Test that log probs count matches generated_tokens when speculative
