@@ -41,7 +41,6 @@ integration:configure:
   script:
     - set -x
     - |
-      A100_CLUSTER=$([[ "$CLUSTER_A100" != "" ]] && echo $CLUSTER_A100 || echo $DEFAULT_A100_CLUSTER)
       H100_CLUSTER=$([[ "$CLUSTER_H100" != "" ]] && echo $CLUSTER_H100 || echo $DEFAULT_H100_CLUSTER)
       GB200_CLUSTER=$([[ "$CLUSTER_GB200" != "" ]] && echo $CLUSTER_GB200 || echo $DEFAULT_GB200_CLUSTER)
     - |
@@ -56,15 +55,8 @@ integration:configure:
         "--no-enable-warmup"
         "--dependent-job integration:configure"
         "--enable-lightweight-mode"
+        "--enable-error-extraction"
       )
-    - |
-      export PYTHONPATH=$(pwd)
-      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
-        ${ARGS[@]} \
-        --environment dev \
-        --platform dgx_a100 \
-        --cluster $A100_CLUSTER \
-        --output-path "functional-test-job-dev-A100.yaml"
     - |
       export PYTHONPATH=$(pwd)
       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
@@ -73,14 +65,6 @@ integration:configure:
         --platform dgx_h100 \
         --cluster $H100_CLUSTER \
         --output-path "functional-test-job-dev-H100.yaml"
-    - |
-      export PYTHONPATH=$(pwd)
-      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
-        ${ARGS[@]} \
-        --environment lts \
-        --platform dgx_a100 \
-        --cluster $A100_CLUSTER \
-        --output-path "functional-test-job-lts-A100.yaml"
     - |
       export PYTHONPATH=$(pwd)
       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
@@ -107,10 +91,8 @@ integration:configure:
         --output-path "functional-test-job-lts-GB200.yaml"
   artifacts:
     paths:
-      - functional-test-job-lts-A100.yaml
       - functional-test-job-lts-H100.yaml
       - functional-test-job-dev-H100.yaml
-      - functional-test-job-dev-A100.yaml
       - functional-test-job-lts-GB200.yaml
       - functional-test-job-dev-GB200.yaml
       - tests/test_utils/local_recipes
@@ -139,13 +121,6 @@ integration:configure:
   inherit:
     variables: true
 
-integration:run_lts_dgx_a100:
-  extends: [.integration_run]
-  allow_failure: true
-  variables:
-    ENVIRONMENT: lts
-    CLUSTER: A100
-
 integration:run_lts_dgx_h100:
   extends: [.integration_run]
   allow_failure: true
@@ -159,12 +134,6 @@ integration:run_lts_dgx_gb200:
   variables:
     ENVIRONMENT: lts
     CLUSTER: GB200
-
-integration:run_dev_dgx_a100:
-  extends: [.integration_run]
-  variables:
-    ENVIRONMENT: dev
-    CLUSTER: A100
 
 integration:run_dev_dgx_h100:
   extends: [.integration_run]

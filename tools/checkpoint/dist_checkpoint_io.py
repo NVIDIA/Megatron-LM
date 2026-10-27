@@ -38,10 +38,8 @@ from megatron.core.dist_checkpointing.core import (
     maybe_load_config,
     save_config,
 )
-from megatron.core.dist_checkpointing.strategies.common import (
-    load_common,
-    save_common,
-)
+from megatron.core.dist_checkpointing.serialization import load_common_state_dict
+from megatron.core.dist_checkpointing.strategies.common import save_common
 
 
 FORMAT_TORCH_DIST = 'torch_dist'
@@ -211,7 +209,7 @@ def load_dist_checkpoint_full(load_dir):
 
     common_state = {}
     try:
-        common_state = load_common(ckpt_dir)
+        common_state = load_common_state_dict(ckpt_dir)
     except Exception:
         pass
 
@@ -240,7 +238,7 @@ def save_dist_checkpoint_full(
     raw_state_dict = OrderedDict()
     for bare_key, tensor in model_state_dict.items():
         full_key = f"{model_prefix}{bare_key}" if model_prefix else bare_key
-        raw_state_dict[full_key] = tensor.contiguous() if tensor.is_contiguous() else tensor.contiguous()
+        raw_state_dict[full_key] = tensor.contiguous()
 
     writer = FileSystemWriter(save_dir)
     dcp.save(

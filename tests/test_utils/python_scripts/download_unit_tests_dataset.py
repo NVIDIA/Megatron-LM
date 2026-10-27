@@ -2,11 +2,11 @@
 
 #!/usr/bin/env python3
 """
-Script to fetch the oldest release of NVIDIA/Megatron-LM on GitHub and list its assets.
-Uses the PyGithub SDK to interact with the GitHub API.
+Populate unit-test data from staged or public NVIDIA/Megatron-LM v2.5 release assets.
 """
 
 import logging
+import os
 import tarfile
 import zipfile
 from pathlib import Path
@@ -17,6 +17,9 @@ import requests
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+DEFAULT_TEST_DATA_ROOT = Path("/home/TestData")
+TEST_DATA_ROOT_ENV = "NEMO_TEST_DATA_ROOT"
+STAGED_RELEASE_ASSET_DIR = Path("megatron-lm/release-assets/v2.5")
 ASSETS = [
     {
         "name": "datasets.zip",
@@ -29,55 +32,85 @@ ASSETS = [
 ]
 
 
-def download_and_extract_asset(assets_dir: Path) -> bool:
-    """
-    Download and extract an asset to the assets directory.
+def get_test_data_root() -> Path:
+    """Return the configured shared TestData root."""
+    return Path(os.environ.get(TEST_DATA_ROOT_ENV) or DEFAULT_TEST_DATA_ROOT)
+
+
+def extract_asset(asset_path: Path, assets_dir: Path) -> bool:
+    """Extract a release asset into the writable test data directory.
 
     Args:
-        asset_url: URL to download the asset from
-        asset_name: Name of the asset file
-        assets_dir: Directory to extract the asset to
+        asset_path: Release archive to extract.
+        assets_dir: Directory to extract the asset into.
 
     Returns:
-        bool: True if successful, False otherwise
+        True when extraction succeeds.
     """
-    for asset in ASSETS:
-        asset_name, asset_url = asset.values()
-        try:
-            # Download the asset
-            logger.info(f"  Downloading {asset_name}...")
-            response = requests.get(asset_url, stream=True)
-            response.raise_for_status()
+    try:
+        logger.info(f"  Extracting {asset_path.name} to {assets_dir}...")
 
-            # Save to temporary file
-            temp_file = assets_dir / asset_name
-            with open(temp_file, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
+        if asset_path.name.endswith('.zip'):
+            with zipfile.ZipFile(asset_path, 'r') as zip_ref:
+                zip_ref.extractall(assets_dir)
+        elif asset_path.name.endswith(('.tar.gz', '.tgz')):
+            with tarfile.open(asset_path, 'r:gz') as tar_ref:
+                tar_ref.extractall(assets_dir)
+        elif asset_path.name.endswith('.tar'):
+            with tarfile.open(asset_path, 'r') as tar_ref:
+                tar_ref.extractall(assets_dir)
+        else:
+            logger.warning(
+                f"  Warning: Unknown file type for {asset_path.name}, skipping extraction"
+            )
+            return False
 
-            logger.info(f"  Extracting {asset_name} to {assets_dir}...")
+        logger.info(f"  Successfully extracted to {assets_dir}")
+        return True
+    except Exception as e:
+        logger.error(f"  Error extracting {asset_path.name}: {e}")
+        return False
 
-            # Extract based on file type
-            if asset_name.endswith('.zip'):
-                with zipfile.ZipFile(temp_file, 'r') as zip_ref:
-                    zip_ref.extractall(assets_dir)
-            elif asset_name.endswith(('.tar.gz', '.tgz')):
-                with tarfile.open(temp_file, 'r:gz') as tar_ref:
-                    tar_ref.extractall(assets_dir)
-            elif asset_name.endswith('.tar'):
-                with tarfile.open(temp_file, 'r') as tar_ref:
-                    tar_ref.extractall(assets_dir)
-            else:
-                logger.warning(
-                    f"  Warning: Unknown file type for {asset_name}, skipping extraction"
-                )
 
-            # Clean up temporary file
+def extract_staged_release_assets(assets_dir: Path) -> bool:
+    """Extract staged Megatron-LM v2.5 assets when all of them are available."""
+    staged_dir = get_test_data_root() / STAGED_RELEASE_ASSET_DIR
+    staged_assets = tuple(staged_dir / asset["name"] for asset in ASSETS)
+    if not all(asset_path.is_file() for asset_path in staged_assets):
+        return False
+
+    logger.info(f"Using staged release assets from {staged_dir}")
+    return all(extract_asset(asset_path, assets_dir) for asset_path in staged_assets)
+
+
+def download_release_asset(asset_url: str, asset_name: str, assets_dir: Path) -> bool:
+    """Download and extract one public GitHub release asset."""
+    temp_file = assets_dir / asset_name
+    try:
+        logger.info(f"  Downloading {asset_name}...")
+        response = requests.get(asset_url, stream=True, timeout=60)
+        response.raise_for_status()
+
+        with open(temp_file, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        return extract_asset(temp_file, assets_dir)
+    except Exception as e:
+        logger.error(f"  Error downloading/extracting {asset_name}: {e}")
+        return False
+    finally:
+        if temp_file.is_file():
             temp_file.unlink()
-            logger.info(f"  Successfully extracted to {assets_dir}")
 
-        except Exception as e:
-            logger.error(f"  Error downloading/extracting {asset_name}: {e}")
+
+def download_and_extract_asset(assets_dir: Path) -> bool:
+    """Use staged v2.5 assets first, then fall back to public GitHub downloads."""
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    if extract_staged_release_assets(assets_dir):
+        return True
+
+    return all(download_release_asset(asset["url"], asset["name"], assets_dir) for asset in ASSETS)
 
 
 @click.command()
@@ -86,13 +119,12 @@ def download_and_extract_asset(assets_dir: Path) -> bool:
 )
 @click.option('--assets-dir', default='assets', help='Directory to extract assets to')
 def main(repo, assets_dir):
-    """Fetch the oldest release of a GitHub repository and download its assets."""
-    logger.info(f"Fetching oldest release of {repo}...")
+    """Populate unit-test data from staged or public release assets."""
+    logger.info(f"Preparing v2.5 release assets for {repo}...")
     logger.info("=" * 80)
 
-    Path(assets_dir).mkdir(parents=True, exist_ok=True)
-
-    download_and_extract_asset(Path(assets_dir))
+    if not download_and_extract_asset(Path(assets_dir)):
+        raise click.ClickException("Failed to download and extract release assets")
 
 
 if __name__ == "__main__":

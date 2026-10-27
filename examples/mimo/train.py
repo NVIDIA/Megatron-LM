@@ -13,6 +13,7 @@ from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 import torch
 from megatron.training import get_args, pretrain, print_rank_0
+from megatron.training.global_vars import set_run_config
 
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
@@ -50,6 +51,27 @@ _DATASET_PROVIDERS = {
     "video_llava_vlm": partial(llava_vlm_dataloader_provider, is_video_input=True),
     "llava_avlm": llava_avlm_dataloader_provider,
 }
+
+
+def _canonicalize_packed_sequence_metadata(batch: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert the legacy Energon packing dictionary to canonical MIMO batch fields."""
+    packing_kwargs = batch.pop("packing_kwargs", None)
+    if packing_kwargs is None:
+        return batch
+
+    cu_seqlens = packing_kwargs["cu_seqlens_q"].to(dtype=torch.int32)
+    batch["cu_seqlens"] = cu_seqlens.unsqueeze(0) if cu_seqlens.dim() == 1 else cu_seqlens
+
+    cu_seqlens_padded = packing_kwargs.get("cu_seqlens_q_padded")
+    if cu_seqlens_padded is not None:
+        cu_seqlens_padded = cu_seqlens_padded.to(dtype=torch.int32)
+        batch["cu_seqlens_padded"] = (
+            cu_seqlens_padded.unsqueeze(0) if cu_seqlens_padded.dim() == 1 else cu_seqlens_padded
+        )
+
+    batch["max_seqlen"] = packing_kwargs["max_seqlen_q"].to(dtype=torch.int32).reshape(1)
+    return batch
+
 
 def add_mimo_args(parser):
     """Add MIMO-specific arguments to the parser."""
@@ -129,12 +151,14 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     # loss_mask: Optional[torch.Tensor] = None,
     # labels: Optional[torch.Tensor] = None,
     # modality_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
-    # packing_kwargs: Optional[dict] = None,
+    # cu_seqlens: Optional[torch.Tensor] = None,
+    # cu_seqlens_padded: Optional[torch.Tensor] = None,
+    # max_seqlen: Optional[torch.Tensor] = None,
 
     # For the modality inputs, the keys can be arbitrary
     # so we do a broadcast of the schema followed by a broadcast of the actual data
     # check broadcast_nested_data_batch for more details
-    batch = broadcast_nested_data_batch(data)
+    batch = _canonicalize_packed_sequence_metadata(broadcast_nested_data_batch(data))
 
     return batch
 
@@ -279,10 +303,11 @@ if __name__ == "__main__":
     train_valid_test_datasets_provider.is_distributed = True
     args = parse_and_validate_args(args_defaults={}, extra_args_provider=add_mimo_args)
     full_config = pretrain_cfg_container_from_args(args)
+    set_run_config(full_config)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,
-        model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
+        model_provider,
     )

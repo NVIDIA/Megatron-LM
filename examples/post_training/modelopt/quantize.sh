@@ -21,9 +21,14 @@ if [ -z ${QUANT_CFG} ]; then
 fi
 
 # If the 2nd positional arg looks like a recipe path (contains '/' or ends in
-# '.yaml'/'.yml') pass it via --recipe; otherwise treat it as a built-in
+# '.yaml'/'.yml') pass it via --recipe; if it is the literal 'auto' sentinel
+# skip the QUANT_CFG flags entirely so --auto-quantize-bits supplied through
+# MLM_EXTRA_ARGS drives the search; otherwise treat it as a built-in
 # config name and pass it via --export-quant-cfg.
 case "${QUANT_CFG}" in
+    auto|AUTO|auto_quantize)
+        QUANT_CFG_ARGS=()
+        ;;
     */*|*.yaml|*.yml)
         QUANT_CFG_ARGS=(--recipe "${QUANT_CFG}")
         ;;

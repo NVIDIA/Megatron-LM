@@ -1,8 +1,8 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Callable, Optional
 
 import torch
@@ -17,7 +17,44 @@ from megatron.core.utils import (
     nvtx_range_push,
 )
 
+try:
+    from transformer_engine.pytorch.ep import is_symm_backed
+except ImportError:
+    is_symm_backed = None
+
 logger = logging.getLogger(__name__)
+
+
+class StageDispatchBwdGrad(torch.autograd.Function):
+    """1F1B + NCCL-EP zero-copy only: redirect the dispatch-backward grad into the persistent
+    symm buffer so the one-sided ``dispatch_bwd`` can consume it.
+
+    Under the 1F1B overlap schedule the dispatch output is consumed by the next node, which
+    detaches it into a leaf; autograd therefore hands ``dispatch_bwd`` a non-symm
+    ``AccumulateGrad`` clone. Applying this identity node to the dispatch output — while it is
+    still inside the dispatch node's own graph segment — makes it the sole consumer, moving that
+    accumulation to *our* output; the backward then does a single plain->symm copy into the
+    dispatcher's ``_zc_bwd_token_buf``. That buffer is free to stage into precisely because
+    ``get_expert_zero_copy_buffers`` withholds it from the op-fuser under overlap.
+    Forward is identity (no numeric effect).
+    """
+
+    @staticmethod
+    def forward(ctx, dispatched_tokens, token_dispatcher):  # type: ignore[override]
+        """Identity forward; stashes the dispatcher so backward can reach its symm buffer."""
+        ctx.token_dispatcher = token_dispatcher
+        return dispatched_tokens
+
+    @staticmethod
+    def backward(ctx, grad):  # type: ignore[override]
+        """Stage the incoming gradient into the symm dispatch-backward buffer."""
+        buf = ctx.token_dispatcher._comm_manager._zc_bwd_token_buf
+        assert buf is not None, "zero-copy staging buffer not allocated before dispatch-backward"
+        assert (
+            buf.shape == grad.shape
+        ), f"dispatch-bwd grad {tuple(grad.shape)} != staging buffer {tuple(buf.shape)}"
+        buf.copy_(grad)
+        return buf, None
 
 
 def is_pp_first_stage(pp_group: torch.distributed.ProcessGroup):
@@ -156,6 +193,7 @@ class ScheduleNode:
         backward_func: Optional[Callable] = None,
         free_input: bool = False,
         name: str = "schedule_node",
+        ncclep_zero_copy: bool = False,
     ):
         """Initialize a schedule node.
 
@@ -180,10 +218,12 @@ class ScheduleNode:
         self.stream = stream
         self.event = event
         self.free_input = free_input
+        self.ncclep_zero_copy = ncclep_zero_copy
         self.inputs = None
         self.outputs = None
-        self.delay_grads_release = False
-        self.manual_release_grads = False
+        # When True, the forward runs under torch.no_grad() so no autograd graph is
+        # retained; the layer-level full recompute path replays it with grad at backward.
+        self.forward_no_grad = False
 
     def default_backward_func(self, outputs, output_grad):
         """Default backward function"""
@@ -215,12 +255,26 @@ class ScheduleNode:
                     input.requires_grad = inputs[i].requires_grad
 
             data = tuple(self.inputs)
-            data = self.forward_func(*data)
+            # Full recompute: skip the graph now, rebuild it by re-running at backward.
+            grad_ctx = torch.no_grad() if self.forward_no_grad else nullcontext()
+            with grad_ctx:
+                data = self.forward_func(*data)
 
             if not isinstance(data, tuple):
                 data = make_viewless(data)
             else:
                 data = tuple([make_viewless(e) if isinstance(e, torch.Tensor) else e for e in data])
+
+            if self.forward_no_grad:
+                # no_grad does not make the output graph-free: forward_func may re-enter
+                # grad mode (TransformerLayer runs its bias-dropout-add under
+                # torch.enable_grad), and the output then carries a grad_fn that pins the
+                # tensors it was built from for as long as the output is retained, i.e.
+                # across the forward->backward gap when it becomes the next segment's input.
+                if isinstance(data, tuple):
+                    data = tuple(e.detach() if isinstance(e, torch.Tensor) else e for e in data)
+                else:
+                    data = data.detach()
 
             self.output = data
 
@@ -230,7 +284,13 @@ class ScheduleNode:
             for input in inputs:
                 if input is not None:
                     input.record_stream(self.stream)
-                    input.untyped_storage().resize_(0)
+                    # Skip symmetric-memory (zero-copy EP) buffers
+                    if not (
+                        self.ncclep_zero_copy
+                        and is_symm_backed is not None
+                        and is_symm_backed(input)
+                    ):
+                        input.untyped_storage().resize_(0)
 
         return self.output
 
@@ -263,12 +323,6 @@ class ScheduleNode:
             for g in output_grad:
                 if g is not None:
                     g.record_stream(self.stream)
-                    # Manually trigger the memory release of dgrad tensor
-                    # to avoid delayed garbage collection. If
-                    # delay_grads_release is True, dgrad is last used in
-                    # wgrad compute and skip the release here.
-                    if self.manual_release_grads and not self.delay_grads_release:
-                        g.untyped_storage().resize_(0)
 
         grads = self.get_grad()
         self._release_state()
@@ -341,14 +395,18 @@ _COMP_STREAM = None
 _COMM_STREAM = None
 
 
-def set_streams(comm_stream=None):
+def set_streams(comm_stream=None, high_priority=False):
     """Set the stream for communication operations."""
     global _COMM_STREAM
 
     # Set communication stream
     if _COMM_STREAM is None:
         if comm_stream is None:
-            comm_stream = torch.cuda.Stream(device="cuda")
+            if high_priority:
+                _, high = torch.cuda.Stream.priority_range()
+                comm_stream = torch.cuda.Stream(device="cuda", priority=high)
+            else:
+                comm_stream = torch.cuda.Stream(device="cuda")
         _COMM_STREAM = comm_stream
 
 

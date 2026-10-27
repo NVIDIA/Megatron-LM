@@ -16,10 +16,11 @@ import contextlib
 import inspect
 import logging
 import operator
+import os
 from contextlib import nullcontext
 from functools import reduce
 from importlib.metadata import version
-from typing import Callable, Optional, Sequence, Union
+from typing import Callable, Optional, Sequence, Tuple, Union
 
 try:
     import einops
@@ -44,6 +45,13 @@ try:
 except (ImportError, ModuleNotFoundError):
     # Transformer Engine not found
     HAVE_TE = False
+
+
+try:
+    _torch_version = PkgVersion(torch.__version__)
+except Exception:
+    # This is a WAR for building docs, where torch is not actually imported
+    _torch_version = PkgVersion("0.0.0")
 
 
 _MODEL_PARALLEL_RNG_TRACKER_NAME = "model-parallel-rng"
@@ -78,6 +86,13 @@ def is_te_min_version(vers, check_equality=True):
     return te_version > PkgVersion(vers)
 
 
+def is_torch_min_version(version, check_equality=True):
+    """Check if minimum version of `torch` is installed."""
+    if check_equality:
+        return _torch_version >= PkgVersion(version)
+    return _torch_version > PkgVersion(version)
+
+
 def is_submodule(module, parent_module, strict=True):
     """
     Check if a module is a submodule of another module.
@@ -89,6 +104,61 @@ def is_submodule(module, parent_module, strict=True):
         if m is module:
             return True
     return False
+
+
+def get_sharding_strategy(ddp_config, is_expert_param: bool = False) -> str:
+    """
+    Resolve the DP-Shard sharding strategy that applies to a class of parameters.
+
+    Expert parameters follow `expert_data_parallel_sharding_strategy` when it is set,
+    otherwise every parameter follows `data_parallel_sharding_strategy`.
+    """
+    experts_strategy = getattr(ddp_config, "expert_data_parallel_sharding_strategy", None)
+    if is_expert_param and experts_strategy is not None:
+        return experts_strategy
+    return ddp_config.data_parallel_sharding_strategy
+
+
+def get_sharding_strategies_in_use(ddp_config) -> Tuple[str, ...]:
+    """
+    Return every DP-Shard sharding strategy configured for this model.
+
+    Contains one entry unless expert and non-expert parameters are sharded differently.
+    Used by call sites that enable machinery for the model as a whole, which have to
+    consider both classes of parameters.
+    """
+    strategies = [get_sharding_strategy(ddp_config, is_expert_param=False)]
+    experts_strategy = get_sharding_strategy(ddp_config, is_expert_param=True)
+    if experts_strategy not in strategies:
+        strategies.append(experts_strategy)
+    return tuple(strategies)
+
+
+def any_sharding_strategy_in(ddp_config, strategies: Sequence[str]) -> bool:
+    """Whether any configured DP-Shard sharding strategy is one of `strategies`."""
+    return any(s in strategies for s in get_sharding_strategies_in_use(ddp_config))
+
+
+def all_sharding_strategies_in(ddp_config, strategies: Sequence[str]) -> bool:
+    """Whether every configured DP-Shard sharding strategy is one of `strategies`."""
+    return all(s in strategies for s in get_sharding_strategies_in_use(ddp_config))
+
+
+def find_megatron_fsdp(model):
+    """Walk the model wrapper chain to find a MegatronFSDP instance, if any."""
+    # Lazy import to avoid a circular import: megatron_fsdp.py transitively imports
+    # this module during its own initialization, so a top-level import of
+    # MegatronFSDP here would fail with a partially-initialized module error.
+    try:
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import MegatronFSDP
+    except (ImportError, ModuleNotFoundError):
+        return None
+    m = model
+    while m is not None:
+        if isinstance(m, MegatronFSDP):
+            return m
+        m = getattr(m, 'module', None)
+    return None
 
 
 def get_mesh_names(
@@ -440,11 +510,7 @@ def safe_get_rank() -> int:
         return torch.distributed.get_rank()
 
     # If torch.distributed is not initialized, try to read environment variables.
-    try:
-        return int(os.environ.get("RANK", 0))
-    except (ValueError, TypeError):
-        # Return rank 0 regardless of the actual rank.
-        return 0
+    return int(os.environ.get("RANK", 0))
 
 
 def log_single_rank(logger_: logging.Logger, level: int, msg: str, *args, rank: int = 0, **kwargs):
@@ -822,6 +888,10 @@ def get_mcore_tensor_parallel_partition_dim(param: torch.Tensor) -> Optional[int
             return 0
         elif param._tensor_parallel_mode == "row":
             return 1
+    if getattr(param, "tensor_model_parallel", False):
+        partition_dim = getattr(param, "partition_dim", None)
+        if partition_dim is not None and partition_dim >= 0:
+            return int(partition_dim)
     return None
 
 

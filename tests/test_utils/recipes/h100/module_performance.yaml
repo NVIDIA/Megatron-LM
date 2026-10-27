@@ -8,10 +8,13 @@ spec:
   build: mcore-pyt-{environment}
   nodes: 1
   gpus: 8
-  platforms: dgx_a100
+  platforms: dgx_h100
   script_setup: |
+    set -euo pipefail
     unset https_proxy
-    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+    umask 077
+    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> "$HOME/.netrc"
+    trap 'rm -f "$HOME/.netrc"; unset RO_API_TOKEN' EXIT
 
     # Checkout latest
     cd /opt
@@ -32,11 +35,17 @@ spec:
     git checkout $MCORE_BACKWARDS_COMMIT
     git rev-parse HEAD
     rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
+    rm -f "$HOME/.netrc"
+    unset RO_API_TOKEN
   script: |-
+    rm -f "${{HOME}}/.netrc"
+    unset RO_API_TOKEN
+    set -euo pipefail
     ls
 
     cd /opt/megatron-lm
 
+    export NVTE_FLASH_ATTN_V4=0
     uv run --no-sync python -m torch.distributed.run \
       --log-dir {assets_dir}/logs/1 \
       --tee "0:3,7:3" \
@@ -48,5 +57,6 @@ products:
   - test_case: [moe_perf]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        # https://github.com/NVIDIA/Megatron-LM/issues/7739
+        scope: [mr, mr-github-broken]
         platforms: [dgx_h100]

@@ -10,6 +10,7 @@ dimensions for fast unit test execution:
 - shared experts
 """
 
+import contextlib
 import gc
 
 import pytest
@@ -17,7 +18,8 @@ import torch
 
 from megatron.core.activations import squared_relu
 from megatron.core.inference.communication.torch_symm_triton import are_tensors_nvls_eligible
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.inference.utils import InferenceMode
+from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.initialize import _set_random_seed
@@ -31,6 +33,22 @@ requires_torch_grouped_mm = pytest.mark.skipif(
     not is_torch_min_version("2.10") or not hasattr(torch, '_grouped_mm'),
     reason="Requires PyTorch >= 2.10 with torch._grouped_mm",
 )
+
+
+_NVFP4_ACTIVATIONS = {
+    "squared_relu": dict(activation_func=squared_relu, gated_linear_unit=False),
+    "swiglu": dict(activation_func=torch.nn.functional.silu, gated_linear_unit=True),
+}
+
+
+def _skip_unless_flashinfer_nvfp4():
+    from megatron.core.inference.moe.flashinfer_nvfp4 import HAVE_FLASHINFER_ROUTED_NVFP4
+
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("per-token NVFP4 MoE requires Blackwell")
+    if not HAVE_FLASHINFER_ROUTED_NVFP4:
+        pytest.skip("FlashInfer >= 0.7.0 per-token NVFP4 MoE is unavailable")
+
 
 # ──────────────────────────────────────────────────────────────────────
 # NanoV3-like config (scaled down from 2688→128 hidden, 128→8 experts)
@@ -64,7 +82,7 @@ NANOV3_BASE = dict(
     use_cpu_initialization=True,
     attention_backend=AttnBackend.local,
     cuda_graph_impl="local",
-    cuda_graph_scope="full_iteration_inference",
+    inference_cuda_graph_scope=InferenceCudaGraphScope.block,
     moe_pad_experts_for_cuda_graph_inference=False,
     mamba_state_dim=128,
     mamba_head_dim=64,
@@ -77,6 +95,59 @@ def _make_base_config(**overrides):
     """Create a TransformerConfig with nanov3-like defaults."""
     params = {**NANOV3_BASE, **overrides}
     return TransformerConfig(**params)
+
+
+def test_config_accepts_vllm_mxfp8():
+    config = _make_base_config(
+        inference_grouped_gemm_backend="vllm", fp8="hybrid", fp8_recipe="mxfp8", fp8_param=True
+    )
+
+    assert config.inference_grouped_gemm_backend.value == "vllm"
+
+
+@pytest.mark.parametrize("backend", ["torch", "vllm"])
+@pytest.mark.parametrize("gated_linear_unit", [False, True])
+def test_config_accepts_mxfp8_batch_invariant_backends(backend, gated_linear_unit):
+    """Torch and MXFP8-via-vLLM support squared ReLU and SwiGLU experts."""
+    config = _make_base_config(
+        inference_grouped_gemm_backend=backend,
+        fp8="hybrid",
+        fp8_recipe="mxfp8",
+        fp8_param=True,
+        gated_linear_unit=gated_linear_unit,
+        activation_func=(torch.nn.functional.silu if gated_linear_unit else squared_relu),
+        batch_invariant_mode=True,
+        batch_invariant_backend="te_native",
+        attention_backend=AttnBackend.flash,
+        flash_attention_version=4,
+        attention_dropout=0.0,
+    )
+
+    assert config.batch_invariant_mode
+
+
+@pytest.mark.parametrize("grouped_tensor", [False, True])
+def test_config_batch_invariant_device_metadata_gemm(monkeypatch, grouped_tensor):
+    monkeypatch.setenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "0" if grouped_tensor else "1")
+    expected = (
+        contextlib.nullcontext()
+        if grouped_tensor
+        else pytest.raises(AssertionError, match="not just NVTE_GROUPED_LINEAR")
+    )
+    with expected:
+        _make_base_config(
+            transformer_impl="transformer_engine",
+            moe_token_dispatcher_type="alltoall",
+            moe_use_grouped_tensor=grouped_tensor,
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+            fp8_param=True,
+            batch_invariant_mode=True,
+            batch_invariant_backend="te_native",
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -163,7 +234,6 @@ class TestInferenceTopKRouter:
         )
 
         # Training mode: get routing_map (sparse) and extract top expert indices
-        router.train()
         _, routing_map = router(input_tensor.clone())
         # routing_map is [num_tokens, num_experts] bool
         training_experts = set()
@@ -173,8 +243,8 @@ class TestInferenceTopKRouter:
                 training_experts.add((i, e.item()))
 
         # Inference mode: get top_indices (dense)
-        router.eval()
-        _, top_indices = router(input_tensor.clone())
+        with InferenceMode.active():
+            _, top_indices = router(input_tensor.clone())
 
         inference_experts = set()
         for i in range(num_tokens):
@@ -229,6 +299,21 @@ class TestNCCLAllGatherDispatcher:
         dispatcher = self._make_dispatcher()
         assert dispatcher.topk == NANOV3_BASE["moe_router_topk"]
         assert dispatcher.ep_size == Utils.world_size
+
+    def test_init_rejects_batch_invariant_ep(self):
+        """Batch-invariant MoE on the inference EP path is NVLS-only on this branch."""
+        if Utils.world_size == 1:
+            pytest.skip("NCCL batch-invariant rejection is only relevant with expert parallelism.")
+
+        with pytest.raises(ValueError, match="requires inference_moe_token_dispatcher_type"):
+            self._make_dispatcher(
+                batch_invariant_mode=True,
+                attention_backend=AttnBackend.flash,
+                flash_attention_version=4,
+                attention_dropout=0.0,
+                inference_grouped_gemm_backend="torch",
+                inference_moe_token_dispatcher_type="nccl",
+            )
 
     @pytest.mark.parametrize("use_allgather_v", [False, True])
     def test_dispatch_combine(self, use_allgather_v):
@@ -303,6 +388,17 @@ class TestNCCLAllGatherDispatcher:
 
 _NVLS_ENGINE_MAX_TOKENS = 512
 
+_QWEN3_30B_A3B_MOE = dict(
+    hidden_size=2048,
+    moe_ffn_hidden_size=768,
+    num_moe_experts=128,
+    moe_router_topk=8,
+    moe_router_score_function="softmax",
+    moe_router_pre_softmax=False,
+    moe_router_enable_expert_bias=False,
+    moe_router_topk_scaling_factor=None,
+)
+
 
 @pytest.mark.internal
 class TestNVLSAllGatherVDispatcher:
@@ -315,7 +411,11 @@ class TestNVLSAllGatherVDispatcher:
     @classmethod
     def teardown_class(cls):
         from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
 
+        NVLSAllGatherVDispatcher._delete_buffers()
         SymmetricMemoryManager.destroy()
         Utils.destroy_model_parallel()
 
@@ -325,6 +425,9 @@ class TestNVLSAllGatherVDispatcher:
         from megatron.core.transformer.moe.token_dispatcher_inference import (
             NVLSAllGatherVDispatcher,
         )
+
+        if Utils.world_size <= 0 or Utils.world_size & (Utils.world_size - 1):
+            pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
 
         config = _make_base_config(expert_model_parallel_size=Utils.world_size)
         num_local_experts = config.num_moe_experts // Utils.world_size
@@ -336,7 +439,7 @@ class TestNVLSAllGatherVDispatcher:
             per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
             topk=NANOV3_BASE["moe_router_topk"],
             hidden_size=NANOV3_BASE["hidden_size"],
-            ep_group=ep_group,
+            tp_ep_group=ep_group,
         )
 
         return NVLSAllGatherVDispatcher(
@@ -439,3 +542,830 @@ class TestNVLSAllGatherVDispatcher:
 
         expected_combined = (global_hidden[start:end].float() * ep_size).bfloat16()
         torch.testing.assert_close(graph_combined, expected_combined, atol=0, rtol=0)
+
+    def test_cuda_graph_batch_invariant_combine_uses_ordered_symmetric_memory(self, monkeypatch):
+        """Batch-invariant mode should use ordered peer loads on NVLS dispatcher.
+
+        The graph path still writes local partials into the symmetric RSV buffer,
+        but the combine must not use multimem.ld_reduce in batch-invariant mode.
+        """
+        from megatron.core.inference.moe import batch_invariant
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+
+        if Utils.world_size < 2:
+            pytest.skip("Ordered RSV combine requires expert-parallel world_size > 1.")
+
+        torch.manual_seed(2026)
+        torch.cuda.manual_seed(2026)
+
+        dispatcher = self._make_dispatcher()
+        ep_size = dispatcher.ep_size
+        hidden_size = NANOV3_BASE["hidden_size"]
+        topk = NANOV3_BASE["moe_router_topk"]
+        num_experts = NANOV3_BASE["num_moe_experts"]
+        rank = torch.distributed.get_rank() if ep_size > 1 else 0
+
+        max_rank_tokens = 24
+        tokens_per_rank = [max(1, max_rank_tokens + r - (ep_size - 1)) for r in range(ep_size)]
+        local_tokens = tokens_per_rank[rank]
+        total_tokens = sum(tokens_per_rank)
+        global_max = _NVLS_ENGINE_MAX_TOKENS * ep_size
+
+        global_hidden = torch.randn(total_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        global_probs = torch.randn(total_tokens, topk, device="cuda", dtype=torch.float32)
+        global_routing_map = torch.randint(0, num_experts, (total_tokens, topk), device="cuda")
+        if ep_size > 1:
+            torch.distributed.broadcast(global_hidden, src=0)
+            torch.distributed.broadcast(global_probs, src=0)
+            torch.distributed.broadcast(global_routing_map, src=0)
+
+        start = sum(tokens_per_rank[:rank])
+        end = start + local_tokens
+        static_hidden = global_hidden[start:end].contiguous()
+        static_probs = global_probs[start:end].contiguous()
+        static_routing_map = global_routing_map[start:end].contiguous()
+
+        ordered_calls = {"value": 0}
+        orig_ordered_reduce_scatter_v = batch_invariant.ordered_reduce_scatter_v
+
+        def _tracked_ordered_reduce_scatter_v(*args, **kwargs):
+            ordered_calls["value"] += 1
+            return orig_ordered_reduce_scatter_v(*args, **kwargs)
+
+        monkeypatch.setattr(
+            batch_invariant, "ordered_reduce_scatter_v", _tracked_ordered_reduce_scatter_v
+        )
+
+        with torch.no_grad(), set_batch_invariant_mode(True):
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    dispatcher.routing_map = static_routing_map
+                    dispatcher._local_tokens = local_tokens
+                    d_hidden, _ = dispatcher.token_dispatch(static_hidden, static_probs)
+                    dispatcher.token_combine(d_hidden.clone())
+            torch.cuda.current_stream().wait_stream(s)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                dispatcher.routing_map = static_routing_map
+                dispatcher._local_tokens = local_tokens
+                d_hidden, _ = dispatcher.token_dispatch(static_hidden, static_probs)
+                assert d_hidden.shape[0] == global_max
+                graph_combined = dispatcher.token_combine(d_hidden.clone())
+
+            graph.replay()
+
+        assert ordered_calls["value"] > 0
+        assert graph_combined.shape == (local_tokens, hidden_size)
+        expected_combined = (global_hidden[start:end].float() * ep_size).bfloat16()
+        torch.testing.assert_close(graph_combined, expected_combined, atol=0, rtol=0)
+
+    def test_cuda_graph_batch_invariant_moe_layer_uses_ordered_rsv(self, monkeypatch):
+        """A real inference MoE layer should use ordered RSV combine in batch-invariant mode.
+
+        This catches the production branch in InferenceGroupedMLP: mcore_fused_moe
+        writes deterministic local partials into the symmetric RSV buffer, then
+        token_combine uses explicit rank-order fp32 loads.
+        """
+        from megatron.core.inference.moe import batch_invariant
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            HAVE_DEEPGEMM_BF16,
+            set_batch_invariant_mode,
+        )
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        if Utils.world_size < 2:
+            pytest.skip("NVLS RSV branch test requires expert-parallel world_size > 1.")
+        if Utils.world_size & (Utils.world_size - 1):
+            pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
+        if not HAVE_DEEPGEMM_BF16:
+            pytest.skip("Batch-invariant torch MoE path requires DeepGEMM bf16 grouped kernels.")
+
+        torch.manual_seed(2027)
+        torch.cuda.manual_seed(2027)
+
+        config = _make_base_config(
+            expert_model_parallel_size=Utils.world_size,
+            inference_grouped_gemm_backend="torch",
+            inference_moe_token_dispatcher_type="nvls",
+            batch_invariant_mode=True,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+            moe_shared_expert_intermediate_size=None,
+        )
+        ep_group = get_expert_model_parallel_group()
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+            topk=config.moe_router_topk,
+            hidden_size=config.hidden_size,
+            tp_ep_group=ep_group,
+        )
+
+        layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        assert isinstance(layer._inference_token_dispatcher, NVLSAllGatherVDispatcher)
+        layer.token_dispatcher = layer._inference_token_dispatcher
+        layer.shared_expert_overlap = layer._inference_token_dispatcher.shared_experts is not None
+        assert not hasattr(layer.experts, "_batch_invariant_global_unpermute")
+
+        used_rsv = {"value": False}
+        orig_get_rsv_tensor = NVLSAllGatherVDispatcher._get_rsv_tensor.__func__
+
+        def _tracked_get_rsv_tensor(cls):
+            tensor = orig_get_rsv_tensor(cls)
+            used_rsv["value"] = used_rsv["value"] or tensor is not None
+            return tensor
+
+        monkeypatch.setattr(
+            NVLSAllGatherVDispatcher, "_get_rsv_tensor", classmethod(_tracked_get_rsv_tensor)
+        )
+        ordered_calls = {"value": 0}
+        orig_ordered_reduce_scatter_v = batch_invariant.ordered_reduce_scatter_v
+
+        def _tracked_ordered_reduce_scatter_v(*args, **kwargs):
+            ordered_calls["value"] += 1
+            return orig_ordered_reduce_scatter_v(*args, **kwargs)
+
+        monkeypatch.setattr(
+            batch_invariant, "ordered_reduce_scatter_v", _tracked_ordered_reduce_scatter_v
+        )
+
+        local_tokens = 16
+        hidden_states = torch.randn(
+            local_tokens, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        probs = torch.randn(
+            local_tokens, config.moe_router_topk, device="cuda", dtype=torch.float32
+        )
+        routing_map = (
+            torch.arange(local_tokens * config.moe_router_topk, device="cuda")
+            .reshape(local_tokens, config.moe_router_topk)
+            .remainder(config.num_moe_experts)
+            .to(torch.int64)
+        )
+
+        def _run_expert_and_combine():
+            preprocessed_hidden, preprocessed_probs = layer.preprocess(
+                hidden_states, probs, routing_map
+            )
+            dispatched_hidden, dispatched_probs = layer.dispatch(
+                preprocessed_hidden, preprocessed_probs
+            )
+            output, _ = layer.routed_experts_compute(dispatched_hidden, dispatched_probs)
+            output = layer.combine(output)
+            return layer.postprocess(output, None)
+
+        with torch.no_grad(), InferenceMode.active(), set_batch_invariant_mode(True):
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    _run_expert_and_combine()
+            torch.cuda.current_stream().wait_stream(s)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_output = _run_expert_and_combine()
+
+            graph.replay()
+
+        assert used_rsv["value"]
+        assert ordered_calls["value"] > 0
+        assert graph_output.shape == hidden_states.shape
+        assert graph_output.dtype == torch.bfloat16
+
+    @pytest.mark.parametrize(
+        (
+            "inference_grouped_gemm_backend",
+            "activation_clamp_scale",
+            "mxfp8_swiglu",
+            "grouped_tensor",
+        ),
+        [
+            pytest.param("torch", None, False, False, id="torch"),
+            pytest.param("torch", 0.5, False, False, id="torch-clamped"),
+            pytest.param("vllm", None, False, False, id="vllm"),
+            pytest.param("vllm", 0.5, False, False, id="vllm-clamped"),
+            pytest.param("torch", None, True, False, id="torch-mxfp8-swiglu"),
+            pytest.param("vllm", None, True, False, id="vllm-mxfp8-swiglu"),
+            pytest.param("torch", None, True, True, id="torch-mxfp8-device-metadata"),
+            pytest.param("vllm", None, True, True, id="vllm-mxfp8-device-metadata"),
+        ],
+    )
+    def test_batch_invariant_moe_matches_training(
+        self,
+        inference_grouped_gemm_backend,
+        activation_clamp_scale,
+        mxfp8_swiglu,
+        grouped_tensor,
+        config_overrides=None,
+        base_local_tokens=17,
+        outlier_tokens=False,
+    ):
+        """The NVLS inference MoE path should exactly match training AllToAll.
+
+        With activation_func_tanh_clamp_scale set, this is the only check that the
+        inference clamp kernels reproduce training's ``weighted_clamped_squared_relu``
+        through a whole layer rather than one kernel in isolation. The scale is small
+        relative to this layer's pre-activations so the tanh saturates rather than
+        staying in its near-linear region, where the two paths agree more easily.
+        """
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            HAVE_DEEPGEMM_BF16,
+            set_batch_invariant_mode,
+        )
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        if Utils.world_size < 2:
+            pytest.skip("Training-to-inference MoE parity requires expert parallelism.")
+        if Utils.world_size & (Utils.world_size - 1):
+            pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
+        if (
+            inference_grouped_gemm_backend == "torch"
+            and not mxfp8_swiglu
+            and not HAVE_DEEPGEMM_BF16
+        ):
+            pytest.skip("Batch-invariant torch MoE path requires DeepGEMM bf16 grouped kernels.")
+        if mxfp8_swiglu:
+            from megatron.core.fp8_utils import get_fp8_context
+            from megatron.core.inference.moe.fused_moe import HAVE_SCALED_GMM
+            from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
+            from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
+
+            if not HAVE_SCALED_GMM or torch.cuda.get_device_capability()[0] < 10:
+                pytest.skip("MXFP8 scaled_grouped_mm requires PyTorch 2.10+ and Blackwell")
+
+        if grouped_tensor:
+            from megatron.core.extensions.transformer_engine import (
+                _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR,
+            )
+            from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+                te_supports_batch_invariant_grouped_gemm,
+            )
+
+            if (
+                not _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR
+                or not te_supports_batch_invariant_grouped_gemm()
+            ):
+                pytest.skip("Requires TE grouped-tensor API, SM100, and cuBLASLt 13.5.1")
+
+        torch.manual_seed(2028)
+        torch.cuda.manual_seed(2028)
+        config_overrides = config_overrides or {}
+
+        config = _make_base_config(
+            **config_overrides,
+            expert_model_parallel_size=Utils.world_size,
+            inference_grouped_gemm_backend=inference_grouped_gemm_backend,
+            inference_moe_token_dispatcher_type="nvls",
+            batch_invariant_mode=True,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+            moe_shared_expert_intermediate_size=None,
+            activation_func_tanh_clamp_scale=activation_clamp_scale,
+            # The inference clamp kernels target the fused weighted_clamped_squared_relu.
+            # The inference squared-ReLU kernel reproduces the fused training op, so train
+            # with it. use_fused_weighted_squared_relu defaults to False, which rounds the
+            # square to BF16 first (and, when clamped, routes through tanh_soft_clamp,
+            # which rounds the clamp to BF16): one ULP away from the kernel either way.
+            use_fused_weighted_squared_relu=True,
+            gated_linear_unit=mxfp8_swiglu,
+            activation_func=(torch.nn.functional.silu if mxfp8_swiglu else squared_relu),
+            bias_activation_fusion=mxfp8_swiglu,
+            fp8=("hybrid" if mxfp8_swiglu else None),
+            fp8_recipe=("mxfp8" if mxfp8_swiglu else "delayed"),
+            fp8_param=mxfp8_swiglu,
+            use_cpu_initialization=not mxfp8_swiglu,
+            batch_invariant_backend="te_native",
+        )
+        # Symmetric buffers are cached by name and sized on first use, so a buffer
+        # left by a smaller-hidden case cannot hold this case's tokens.
+        NVLSAllGatherVDispatcher._delete_buffers()
+        for key in ("ep_agv_h", "ep_agv_r", "ep_agv_p", "ep_rsv", "ep_meta"):
+            SymmetricMemoryManager.destroy(key)
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+            topk=config.moe_router_topk,
+            hidden_size=config.hidden_size,
+            tp_ep_group=get_expert_model_parallel_group(),
+        )
+
+        if mxfp8_swiglu:
+            training_config = _make_base_config(
+                **config_overrides,
+                moe_use_grouped_tensor=grouped_tensor,
+                expert_model_parallel_size=Utils.world_size,
+                transformer_impl="transformer_engine",
+                moe_token_dispatcher_type="alltoall",
+                batch_invariant_mode=True,
+                batch_invariant_backend="te_native",
+                attention_backend=AttnBackend.flash,
+                flash_attention_version=4,
+                attention_dropout=0.0,
+                moe_shared_expert_intermediate_size=None,
+                gated_linear_unit=True,
+                activation_func=torch.nn.functional.silu,
+                bias_activation_fusion=True,
+                fp8="hybrid",
+                fp8_recipe="mxfp8",
+                fp8_param=True,
+                use_cpu_initialization=False,
+            )
+            with get_fp8_context(training_config, 0, is_init=True):
+                training_layer = (
+                    get_moe_module_spec(
+                        use_te=True,
+                        num_experts=training_config.num_moe_experts,
+                        moe_grouped_gemm=True,
+                    )(config=training_config)
+                    .cuda()
+                    .eval()
+                )
+            with get_fp8_context(config, 0, is_init=True):
+                layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+            layer.load_state_dict(training_layer.state_dict())
+            quantize_model_to_mxfp8(layer, backend="triton")
+        else:
+            layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        local_tokens = base_local_tokens + torch.distributed.get_rank()
+        if outlier_tokens:
+            # Per-token and per-channel log-normal scales give rows the outliers real
+            # activations have; plain Gaussian rows do not reach the mismatch.
+            generator = torch.Generator(device="cuda").manual_seed(
+                4242 + torch.distributed.get_rank()
+            )
+            hidden_states = torch.randn(
+                local_tokens, 1, config.hidden_size, device="cuda", generator=generator
+            )
+            hidden_states *= torch.exp(
+                torch.randn(local_tokens, 1, 1, device="cuda", generator=generator)
+            )
+            hidden_states *= torch.exp(
+                0.5 * torch.randn(1, 1, config.hidden_size, device="cuda", generator=generator)
+            )
+            hidden_states = hidden_states.to(torch.bfloat16)
+        else:
+            hidden_states = torch.randn(
+                local_tokens, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16
+            )
+
+        backend = "te_native" if mxfp8_swiglu or inference_grouped_gemm_backend == "vllm" else None
+        with torch.no_grad(), set_batch_invariant_mode(True, backend=backend):
+            if mxfp8_swiglu:
+                with get_fp8_context(training_config, 0):
+                    training_output, _ = training_layer(hidden_states.clone())
+                with get_fp8_context(config, 0), InferenceMode.active():
+                    inference_output, _ = layer(hidden_states.clone())
+            else:
+                training_output, _ = layer(hidden_states.clone())
+                with InferenceMode.active():
+                    inference_output, _ = layer(hidden_states.clone())
+
+        torch.testing.assert_close(inference_output, training_output, atol=0, rtol=0)
+
+    @staticmethod
+    def _make_nvfp4_inference_layer(**overrides):
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        _skip_unless_flashinfer_nvfp4()
+        if Utils.world_size < 2:
+            pytest.skip("NVLS batch-invariant MoE requires expert parallelism.")
+        if Utils.world_size & (Utils.world_size - 1):
+            pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
+        config = _make_base_config(
+            expert_model_parallel_size=Utils.world_size,
+            inference_grouped_gemm_backend="flashinfer",
+            inference_moe_nvfp4_recipe="per_token",
+            inference_moe_token_dispatcher_type="nvls",
+            batch_invariant_mode=True,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+            moe_shared_expert_intermediate_size=None,
+            **overrides,
+        )
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+            topk=config.moe_router_topk,
+            hidden_size=config.hidden_size,
+            tp_ep_group=get_expert_model_parallel_group(),
+        )
+        return get_inference_optimized_moe_spec()(config=config).cuda().eval()
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize("activation", _NVFP4_ACTIVATIONS)
+    def test_cuda_graph_batch_invariant_nvfp4_moe_layer_uses_ordered_rsv(
+        self, monkeypatch, activation
+    ):
+        """A captured per-token NVFP4 MoE layer replays like eager in batch-invariant mode.
+
+        The FlashInfer kernel writes local partials into the symmetric RSV buffer and the
+        combine reduces them in rank order, as for the torch MXFP8 path.
+        """
+        from megatron.core.inference.moe import batch_invariant
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        torch.manual_seed(2027)
+        torch.cuda.manual_seed(2027)
+        layer = self._make_nvfp4_inference_layer(**_NVFP4_ACTIVATIONS[activation])
+        assert isinstance(layer._inference_token_dispatcher, NVLSAllGatherVDispatcher)
+
+        used_rsv = {"value": False}
+        orig_get_rsv_tensor = NVLSAllGatherVDispatcher._get_rsv_tensor.__func__
+
+        def _tracked_get_rsv_tensor(cls):
+            tensor = orig_get_rsv_tensor(cls)
+            used_rsv["value"] = used_rsv["value"] or tensor is not None
+            return tensor
+
+        monkeypatch.setattr(
+            NVLSAllGatherVDispatcher, "_get_rsv_tensor", classmethod(_tracked_get_rsv_tensor)
+        )
+        ordered_calls = {"value": 0}
+        orig_ordered_reduce_scatter_v = batch_invariant.ordered_reduce_scatter_v
+
+        def _tracked_ordered_reduce_scatter_v(*args, **kwargs):
+            ordered_calls["value"] += 1
+            return orig_ordered_reduce_scatter_v(*args, **kwargs)
+
+        monkeypatch.setattr(
+            batch_invariant, "ordered_reduce_scatter_v", _tracked_ordered_reduce_scatter_v
+        )
+
+        local_tokens = 16 + torch.distributed.get_rank()
+        static_hidden = torch.randn(
+            local_tokens, 1, layer.config.hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+
+        def _eager(hidden):
+            output, _ = layer(hidden.clone())
+            return output
+
+        with torch.no_grad(), InferenceMode.active(), set_batch_invariant_mode(True):
+            # The first forward builds the NVFP4 weights and kernel wrappers eagerly.
+            _eager(static_hidden)
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    layer(static_hidden)
+            torch.cuda.current_stream().wait_stream(s)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_output, _ = layer(static_hidden)
+
+            static_hidden.copy_(torch.randn_like(static_hidden))
+            graph.replay()
+            eager_output = _eager(static_hidden)
+
+        assert used_rsv["value"]
+        assert ordered_calls["value"] > 0
+        torch.testing.assert_close(graph_output, eager_output, atol=0, rtol=0)
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize("activation", _NVFP4_ACTIVATIONS)
+    def test_batch_invariant_nvfp4_moe_matches_training(self, monkeypatch, activation):
+        """Per-token NVFP4 generation against TE row-scaled NVFP4 training.
+
+        TE's NVFP4 recipe with row-scaled activations, 1D weight blocks and no random
+        Hadamard transform or stochastic rounding is the training-side form of this recipe,
+        as TE MXFP8 is for the MXFP8 inference path. Generation must be much closer to it
+        than to BF16 training. Bitwise parity is not reached yet: training applies routing
+        probabilities before the FC2-input quantization (generation applies them in the
+        finalize), the fused FC2-input quantization uses approximate reciprocals regardless
+        of FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH, and the GEMMs differ in rounding of the
+        FC1 output and accumulation order.
+        Until those are aligned the exact comparison is an expected failure.
+        """
+        from megatron.core import fp4_utils
+        from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+
+        recipe_module = pytest.importorskip("transformer_engine.common.recipe")
+        if "row_scaled_activation" not in getattr(
+            recipe_module.NVFP4BlockScaling, "__dataclass_fields__", {}
+        ):
+            pytest.skip("Requires Transformer Engine with row-scaled NVFP4 activations.")
+        # IEEE scale rounding, which the TE quantizer uses; fast math is approximate.
+        monkeypatch.setenv("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", "1")
+        recipe = recipe_module.NVFP4BlockScaling(
+            disable_rht=True,
+            disable_stochastic_rounding=True,
+            disable_2d_quantization=True,
+            row_scaled_activation=True,
+        )
+        monkeypatch.setattr(fp4_utils, "get_fp4_recipe", lambda config: recipe)
+
+        torch.manual_seed(2028)
+        torch.cuda.manual_seed(2028)
+        activation_overrides = dict(_NVFP4_ACTIVATIONS[activation])
+        if activation == "squared_relu":
+            activation_overrides["use_fused_weighted_squared_relu"] = True
+        layer = self._make_nvfp4_inference_layer(**activation_overrides)
+        # Batch-invariant MoE configs reject fp4, so training gets its own config.
+        training_config = _make_base_config(
+            expert_model_parallel_size=Utils.world_size,
+            transformer_impl="transformer_engine",
+            moe_token_dispatcher_type="alltoall",
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+            moe_shared_expert_intermediate_size=None,
+            fp4="e2m1",
+            fp4_recipe="nvfp4",
+            **activation_overrides,
+        )
+        training_layer = (
+            get_moe_module_spec(
+                use_te=True, num_experts=training_config.num_moe_experts, moe_grouped_gemm=True
+            )(config=training_config)
+            .cuda()
+            .eval()
+        )
+        layer.load_state_dict(training_layer.state_dict())
+
+        local_tokens = 17 + torch.distributed.get_rank()
+        hidden_states = torch.randn(
+            local_tokens, 1, training_config.hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        with torch.no_grad():
+            bf16_output, _ = training_layer(hidden_states.clone())
+            with fp4_utils.get_fp4_context(training_config, 0):
+                training_output, _ = training_layer(hidden_states.clone())
+            with set_batch_invariant_mode(True), InferenceMode.active():
+                inference_output, _ = layer(hidden_states.clone())
+
+        def _relative_error(output, reference):
+            diff = (output.float() - reference.float()).norm()
+            return (diff / reference.float().norm()).item()
+
+        train_gen_error = _relative_error(inference_output, training_output)
+        recipe_error = _relative_error(inference_output, bf16_output)
+        assert not torch.equal(training_output, bf16_output), "TE NVFP4 training did not run"
+        assert train_gen_error < 0.5 * recipe_error, (train_gen_error, recipe_error)
+        if not torch.equal(inference_output, training_output):
+            pytest.xfail(
+                "per-token NVFP4 generation is not bitwise equal to TE row-scaled NVFP4 "
+                f"training: relative error {train_gen_error:.3g} (vs BF16: {recipe_error:.3g}), "
+                f"max abs diff {(inference_output - training_output).abs().max().item():.3g}"
+            )
+
+    def test_batch_invariant_mxfp8_moe_matches_training_with_outlier_tokens(self):
+        """Qwen3-30B-A3B experts and router, fed tokens with outlier scales.
+
+        Gaussian tokens through the default 128-wide layer never reach the case where
+        an outlier token's largest outputs differ by one BF16 ULP between training
+        and inference.
+        """
+        self.test_batch_invariant_moe_matches_training(
+            "torch",
+            None,
+            True,
+            False,
+            config_overrides=_QWEN3_30B_A3B_MOE,
+            base_local_tokens=500,
+            outlier_tokens=True,
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# symmetric-memory collective ordering (explicit barrier-before-reuse)
+# ──────────────────────────────────────────────────────────────────────
+
+# Hidden size chosen so each bf16 row is 16-byte aligned (an NVLS requirement).
+_ORDERING_HIDDEN = 1024
+_ORDERING_LOCAL_ROWS = 4
+
+
+@pytest.mark.internal
+class TestSymmCollectiveOrdering:
+    """Explicit ``barrier_before`` buffer-reuse ordering over real NVLS collectives.
+
+    These run the real Triton multimem all-gather / reduce-scatter kernels on
+    actual symmetric memory and verify that the callers' explicit
+    ``barrier_before`` decision produces correct data:
+
+      - a reduce-scatter already synchronizes ranks, so a following all-gather is
+        correct with ``barrier_before=False``;
+      - two consecutive all-gathers reuse the buffer, so the second must pass
+        ``barrier_before=True`` (the MTP eh_proj / output-projection hazard) and
+        still gather correctly.
+
+    The barrier is requested explicitly at the call site — there is no global op
+    tracking — so these tests exercise the flag the production layers set.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=Utils.world_size)
+
+    @classmethod
+    def teardown_class(cls):
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+
+        SymmetricMemoryManager.destroy()
+        Utils.destroy_model_parallel()
+
+    def _require_nvls_buffer(self):
+        """Return (tp_group, buffer) or skip if NVLS symmetric memory is unavailable."""
+        from megatron.core import parallel_state
+        from megatron.core.inference.communication.torch_symm_triton.utils import (
+            is_device_nvls_capable,
+        )
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        if not is_device_nvls_capable(device):
+            pytest.skip("NVLS multicast requires a Hopper+ GPU (SM >= 9)")
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        if torch.distributed.get_world_size(tp_group) < 2:
+            pytest.skip("requires a tensor-model-parallel world size >= 2")
+        buf = SymmetricMemoryManager.get_buffer("tp", process_group=tp_group)
+        if buf.symm_mem_hdl is None:
+            pytest.skip(f"symmetric memory unavailable: {buf.init_failure_reason}")
+        return tp_group, buf
+
+    def _run_all_gather(self, buf, tp_group, *, barrier_before=False):
+        """Real all-gather of a rank-tagged tensor into the shared 'tp' buffer."""
+        from megatron.core.inference.communication.torch_symm_triton.collectives import (
+            multimem_all_gather,
+        )
+
+        world = torch.distributed.get_world_size(tp_group)
+        rank = torch.distributed.get_rank(tp_group)
+        # Each rank contributes rows filled with its own (1-based) rank id.
+        x = torch.full(
+            (_ORDERING_LOCAL_ROWS, _ORDERING_HIDDEN),
+            float(rank + 1),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        symm = buf.maybe_get_tensor(
+            [_ORDERING_LOCAL_ROWS * world, _ORDERING_HIDDEN], torch.bfloat16
+        )
+        assert symm["handle"] is not None, "expected symmetric buffer to be allocatable"
+        out = multimem_all_gather(symm["tensor"], x, symm["handle"], barrier_before=barrier_before)
+        return out, world
+
+    def _assert_gather_correct(self, out, world):
+        """The gathered buffer must hold each rank's block back-to-back."""
+        for i in range(world):
+            block = out[i * _ORDERING_LOCAL_ROWS : (i + 1) * _ORDERING_LOCAL_ROWS]
+            assert torch.all(block == float(i + 1)), f"rank block {i} corrupted"
+
+    def _run_reduce_scatter(self, buf, tp_group):
+        """Real reduce-scatter over the shared 'tp' buffer; every rank contributes ones."""
+        from megatron.core.inference.communication.torch_symm_triton.collectives import (
+            multimem_reduce_scatter,
+        )
+
+        world = torch.distributed.get_world_size(tp_group)
+        symm = buf.maybe_get_tensor(
+            [_ORDERING_LOCAL_ROWS * world, _ORDERING_HIDDEN], torch.bfloat16
+        )
+        assert symm["handle"] is not None
+        symm["tensor"].fill_(1.0)
+        out = torch.empty(
+            (_ORDERING_LOCAL_ROWS, _ORDERING_HIDDEN), dtype=torch.bfloat16, device="cuda"
+        )
+        multimem_reduce_scatter(out, symm["tensor"], symm["handle"])
+        return out, world
+
+    def test_all_gather_after_reduce_scatter_no_barrier(self):
+        tp_group, buf = self._require_nvls_buffer()
+
+        # A reduce-scatter already synchronizes ranks, so a following all-gather is
+        # correct without the extra barrier.
+        rs_out, world = self._run_reduce_scatter(buf, tp_group)
+        assert torch.all(rs_out == float(world)), "reduce-scatter should sum ones across ranks"
+
+        ag_out, world = self._run_all_gather(buf, tp_group, barrier_before=False)
+        self._assert_gather_correct(ag_out, world)
+
+    def test_consecutive_all_gathers_with_barrier_are_correct(self):
+        tp_group, buf = self._require_nvls_buffer()
+
+        first_out, world = self._run_all_gather(buf, tp_group, barrier_before=False)
+        self._assert_gather_correct(first_out, world)
+
+        # The second all-gather reuses the buffer immediately after the first, so it
+        # must barrier before overwriting; it must still gather correct data.
+        second_out, world = self._run_all_gather(buf, tp_group, barrier_before=True)
+        self._assert_gather_correct(second_out, world)
+
+    def test_explicit_barrier_runs_correctly(self):
+        tp_group, buf = self._require_nvls_buffer()
+
+        # An explicit barrier_before=True must always be honored and produce correct
+        # output regardless of the preceding op.
+        self._run_reduce_scatter(buf, tp_group)
+        out, world = self._run_all_gather(buf, tp_group, barrier_before=True)
+        self._assert_gather_correct(out, world)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# mask_routing_padding kernel
+# ──────────────────────────────────────────────────────────────────────
+
+from megatron.core.transformer.moe.inference_routing_mask_kernel import (  # noqa: E402
+    HAVE_TRITON,
+    mask_routing_padding,
+)
+
+requires_triton_cuda = pytest.mark.skipif(
+    not HAVE_TRITON or not torch.cuda.is_available(),
+    reason="mask_routing_padding requires triton and CUDA",
+)
+
+
+@pytest.mark.internal
+@requires_triton_cuda
+class TestMaskRoutingPadding:
+    """Unit tests for the CUDA-graph padding-row routing mask.
+
+    ``mask_routing_padding`` fills ``routing_map[real_token_count:, :]`` with -1 so
+    the NVLS dispatcher routes padding rows to no expert. ``real_token_count`` is in
+    the global (pre-SP-shard) frame; a non-zero ``tp_rank`` shifts local rows into
+    that frame before the comparison. Runs standalone — no context or NVLS hardware.
+    """
+
+    TOPK = 6
+
+    def _routing_map(self, n_rows, fill=3):
+        # All entries non-negative so masked (-1) slots are unambiguous.
+        return torch.full((n_rows, self.TOPK), fill, dtype=torch.int64, device="cuda")
+
+    def _real_token_count(self, count):
+        return torch.tensor([count], dtype=torch.int32, device="cuda")
+
+    @pytest.mark.parametrize("n_rows, real_count", [(16, 10), (128, 1), (7, 7), (64, 0)])
+    def test_masks_rows_past_real_count(self, n_rows, real_count):
+        """Rows >= real_count become -1; rows < real_count are untouched (tp_rank=0)."""
+        routing_map = self._routing_map(n_rows)
+        original = routing_map.clone()
+
+        mask_routing_padding(routing_map, self._real_token_count(real_count), tp_rank=0)
+
+        torch.testing.assert_close(routing_map[:real_count], original[:real_count])
+        assert torch.all(routing_map[real_count:] == -1)
+
+    def test_real_count_equal_rows_is_noop(self):
+        """real_count == n_rows masks nothing (the unpadded decode case)."""
+        routing_map = self._routing_map(32)
+        original = routing_map.clone()
+
+        mask_routing_padding(routing_map, self._real_token_count(32), tp_rank=0)
+
+        torch.testing.assert_close(routing_map, original)
+
+    def test_sp_rank_offset(self):
+        """Local rows are shifted by tp_rank * n_rows into the global frame.
+
+        With 8 local rows on SP rank 1, local row r is global row r + 8. A global
+        real_count of 11 keeps global rows [8, 11) real (local [0, 3)) and masks
+        global rows [11, 16) (local [3, 8)).
+        """
+        routing_map = self._routing_map(8)
+        original = routing_map.clone()
+
+        mask_routing_padding(routing_map, self._real_token_count(11), tp_rank=1)
+
+        torch.testing.assert_close(routing_map[:3], original[:3])
+        assert torch.all(routing_map[3:] == -1)
+
+    def test_sp_rank_fully_masked(self):
+        """An SP rank entirely beyond real_count is fully masked.
+
+        8 local rows on rank 1 cover global rows [8, 16); real_count=8 masks all.
+        """
+        routing_map = self._routing_map(8)
+
+        mask_routing_padding(routing_map, self._real_token_count(8), tp_rank=1)
+
+        assert torch.all(routing_map == -1)

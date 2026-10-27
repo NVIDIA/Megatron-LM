@@ -1,12 +1,15 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import inspect
+import logging
 import os
+from contextlib import nullcontext
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.nn.functional as F
 from packaging import version
 from pytest import approx
 from transformer_engine.pytorch.fp8 import check_fp8_support
@@ -17,13 +20,18 @@ from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_mlp_module_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
@@ -45,24 +53,92 @@ class TestGPTModel:
             use_cpu_initialization=True,
             embedding_init_method_std=1.0,  # Test that we can initialize the embedding weights to something else.
         )
-        self.gpt_model = GPTModel(
-            config=transformer_config,
-            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
-            vocab_size=100,
-            max_sequence_length=4,
-        )
+        with patch('megatron.core.models.gpt.gpt_model.log_single_rank') as mock_log_single_rank:
+            self.gpt_model = GPTModel(
+                config=transformer_config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=100,
+                max_sequence_length=4,
+            )
+        self.mock_log_single_rank = mock_log_single_rank
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
     def test_constructor(self):
+        self.mock_log_single_rank.assert_called_once()
+        _, level, message = self.mock_log_single_rank.call_args.args
+        assert level == logging.WARNING
+        assert message == (
+            "GPTModel IS DEPRECATED. GPTModel is only accepting critical bug fixes, no new "
+            "features. Please reference the migration guide "
+            "`docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`"
+        )
+
         assert isinstance(self.gpt_model, GPTModel)
 
         assert self.gpt_model.max_sequence_length == 4
 
         num_weights = sum([p.numel() for p in self.gpt_model.parameters()])
         assert num_weights == 6240
+
+    def test_constructor_rejects_hash_routed_moe(self):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            moe_num_hash_layers=1,
+            hash_moe_vocab_size=100,
+            use_cpu_initialization=True,
+        )
+
+        with pytest.raises(ValueError, match="supported only by HybridModel"):
+            GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=100,
+                max_sequence_length=4,
+            )
+
+    @pytest.mark.parametrize("mtp_num_layers", [None, 0, 1])
+    def test_hsm_requires_two_mtp_layers(self, mtp_num_layers):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=mtp_num_layers,
+            mtp_hsm=True,
+        )
+        with pytest.raises(ValueError, match="mtp_hsm=True requires mtp_num_layers >= 2"):
+            GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=100,
+                max_sequence_length=4,
+            )
+
+        assert config.mtp_hsm is True
+
+    def test_rejects_hybrid_mtp_override(self):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_hybrid_override_pattern="*",
+        )
+        with pytest.raises(
+            ValueError, match="mtp_hybrid_override_pattern is not supported by GPTModel"
+        ):
+            GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=100,
+                max_sequence_length=4,
+            )
 
     @pytest.mark.internal
     def test_set_input_tensor(self):
@@ -111,6 +187,133 @@ class TestGPTModel:
         assert logits.shape[0] == micro_batch_size
         assert logits.shape[1] == sequence_length
         assert logits.shape[2] == self.gpt_model.vocab_size
+
+    @pytest.mark.internal
+    def test_output_processor_forward(self):
+        config: TransformerConfig = self.gpt_model.config
+        sequence_length = self.gpt_model.max_sequence_length
+        micro_batch_size = 2
+
+        self.gpt_model.cuda()
+        self.gpt_model.eval()
+
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        labels = (input_ids + 1) % self.gpt_model.vocab_size
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+        ).cuda()
+
+        context = {"selected_token_positions": torch.tensor([0, 2], device="cuda")}
+        created = {}
+        seen = {}
+
+        def output_processor(**kwargs):
+            seen.update(kwargs)
+            logits, _ = kwargs["output_layer"](
+                kwargs["hidden_states"],
+                weight=kwargs["output_weight"],
+                runtime_gather_output=kwargs["runtime_gather_output"],
+            )
+            logits = kwargs["scale_logits"](logits).transpose(0, 1).contiguous().float()
+            token_logprobs = F.log_softmax(logits, dim=-1).gather(
+                dim=-1, index=kwargs["labels"].unsqueeze(-1)
+            )
+            token_logprobs = token_logprobs.squeeze(-1)
+            result = {
+                "payload": token_logprobs.index_select(
+                    1, kwargs["context"]["selected_token_positions"]
+                ),
+                "tag": "structured",
+            }
+            created["result"] = result
+            return result
+
+        with torch.no_grad():
+            logits = self.gpt_model.forward(
+                input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+            ).float()
+            expected = F.log_softmax(logits, dim=-1).gather(dim=-1, index=labels.unsqueeze(-1))
+            expected = expected.squeeze(-1).index_select(1, context["selected_token_positions"])
+
+            output = self.gpt_model.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                output_processor=output_processor,
+                output_processor_context=context,
+            )
+
+        assert output is created["result"]
+        assert isinstance(output, dict)
+        assert torch.allclose(output["payload"], expected)
+        assert output["tag"] == "structured"
+        assert seen["context"] is context
+        assert seen["output_layer"] is self.gpt_model.output_layer
+        assert seen["output_weight"] is None
+        assert seen["output_layer"].weight is not None
+        assert seen["labels"] is labels
+        assert seen["runtime_gather_output"] is None
+        assert seen["config"] is config
+        assert seen["compute_language_model_loss"].__self__ is self.gpt_model
+        assert seen["scale_logits"].__self__ is self.gpt_model
+
+    @pytest.mark.internal
+    def test_build_schedule_plan_threads_output_processor(self):
+        sequence_length = self.gpt_model.max_sequence_length
+        micro_batch_size = 2
+
+        self.gpt_model.cuda()
+
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        labels = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+        ).cuda()
+
+        context = {"loss_mask": torch.ones_like(labels)}
+
+        seen = {}
+
+        def output_processor(**kwargs):
+            seen.update(kwargs)
+            return kwargs["hidden_states"].sum()
+
+        schedule_plan = self.gpt_model.build_schedule_plan(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            output_processor=output_processor,
+            output_processor_context=context,
+        )
+
+        assert schedule_plan.state.output_processor is output_processor
+        assert schedule_plan.state.output_processor_context is context
+
+        schedule_plan.state.decoder_input = None
+        schedule_plan.state.rotary_pos_emb = None
+        schedule_plan.state.rotary_pos_cos = None
+        schedule_plan.state.rotary_pos_sin = None
+        schedule_plan.state.sequence_len_offset = None
+
+        hidden_states = torch.randn(
+            sequence_length,
+            micro_batch_size,
+            self.gpt_model.config.hidden_size,
+            device="cuda",
+            requires_grad=True,
+        )
+        output = schedule_plan.post_process.forward(hidden_states)
+
+        assert output.item() == pytest.approx(hidden_states.sum().item())
+        assert seen["context"] is context
+        assert seen["labels"] is labels
+        assert seen["output_layer"] is self.gpt_model.output_layer
 
 
 def test_get_mlp_module_spec_interface():
@@ -263,6 +466,7 @@ def test_gpt_with_te_activation_func(num_experts, gated_linear_unit):
 class TestGPTModelWithCustomPG:
     def setup_method(self, method):
         Utils.destroy_model_parallel()
+        Utils.initialize_distributed()
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -427,13 +631,14 @@ class TestGPTWithDynamicInference:
         input_ids, position_ids = inference_context.current_input_and_position_ids()
 
         # Run the forward pass with inference parameters.
-        logits = self.gpt_model.forward(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=None,
-            inference_context=inference_context,
-            runtime_gather_output=True,
-        )
+        with InferenceMode.active():
+            logits = self.gpt_model.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=None,
+                inference_context=inference_context,
+                runtime_gather_output=True,
+            )
 
         # Verify the output shape.
         assert logits.shape[0] == 1
@@ -446,6 +651,139 @@ class TestGPTWithDynamicInference:
         padding_logits = logits[0, padding_start_idx:padding_end_idx, :]
 
         # Assert that all padding logits are zero.
+        assert torch.all(padding_logits == 0.0), "Logits for padding tokens are not all zero."
+
+
+class TestGPTDynamicInferencePaddingWithCudaGraphs:
+    """Padding-token zeroing must hold when a forward is replayed from a CUDA graph.
+
+    The zeroing only runs for FP8/FP4 models, so these BF16 tests patch
+    `is_using_quantization_scales` to exercise it without FP8 hardware.
+    """
+
+    def setup_method(self, method):
+        os.environ.pop('NVTE_FUSED_ATTN', None)
+        os.environ.pop('NVTE_FLASH_ATTN', None)
+        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
+
+    def teardown_method(self, method):
+        delete_cuda_graphs()
+        model_parallel_cuda_manual_seed(123, force_reset_rng=True)
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        "inference_cuda_graph_scope", [InferenceCudaGraphScope.layer, InferenceCudaGraphScope.block]
+    )
+    @torch.inference_mode()
+    def test_padding_logits_are_zero_after_cuda_graph_replay(self, inference_cuda_graph_scope):
+        """Replaying a graph with fewer real tokens than it holds still zeroes the padding rows.
+
+        Graphs are captured the way the engine captures them, with dummy requests that fill
+        the graph. Prefill attention never writes the rows of padding tokens, so the test
+        poisons those rows to stand in for stale memory.
+        """
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+            cuda_graph_impl="local",
+            inference_cuda_graph_scope=inference_cuda_graph_scope,
+            inference_rng_tracker=True,
+        )
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=128,
+            max_sequence_length=DynamicInferenceContext.TOKEN_ROUNDER,
+            parallel_output=True,
+        )
+        model = Float16Module(config, model).cuda().eval()
+
+        context = DynamicInferenceContext(
+            model_config=TransformerConfig(
+                params_dtype=config.params_dtype,
+                num_layers=config.num_layers,
+                kv_channels=config.hidden_size // config.num_attention_heads,
+                num_attention_heads=config.num_attention_heads,
+            ),
+            # Prefill steps only have 64-token graphs.
+            inference_config=InferenceConfig(
+                max_sequence_length=DynamicInferenceContext.TOKEN_ROUNDER,
+                buffer_size_gb=1.0,
+                block_size_tokens=256,
+                max_tokens=DynamicInferenceContext.TOKEN_ROUNDER,
+                max_requests=4,
+                materialize_only_last_token_logits=False,
+                num_cuda_graphs=1,
+                use_cuda_graphs_for_non_decode_steps=True,
+            ),
+        )
+
+        # Rows of the attention kernel output at or past this index get a stale value.
+        stale_from = torch.zeros(1, dtype=torch.int32, device="cuda")
+        flash_decode_and_prefill = Attention.flash_decode_and_prefill
+
+        def flash_decode_and_prefill_with_stale_rows(self, *args, **kwargs):
+            output = flash_decode_and_prefill(self, *args, **kwargs)
+            rows = torch.arange(output.shape[0], dtype=torch.int32, device=output.device)
+            is_stale = (rows >= stale_from).view(-1, *([1] * (output.dim() - 1)))
+            return output.masked_fill(is_stale, 1.0e4)
+
+        def forward():
+            input_ids, position_ids = context.current_input_and_position_ids()
+            with InferenceMode.active():
+                return model.forward(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    attention_mask=None,
+                    inference_context=context,
+                    runtime_gather_output=True,
+                )
+
+        with (
+            patch.object(
+                Attention, "flash_decode_and_prefill", flash_decode_and_prefill_with_stale_rows
+            ),
+            patch(
+                "megatron.core.transformer.attention.is_using_quantization_scales",
+                return_value=True,
+            ),
+            patch(
+                "megatron.core.models.gpt.gpt_model.is_using_quantization_scales", return_value=True
+            ),
+        ):
+            for graph_batch_dimensions in context.cuda_graph_batch_dimensions_list:
+                context.initialize_attention_state(
+                    construct_graph_dimensions=graph_batch_dimensions
+                )
+                stale_from.fill_(context.padded_active_token_count)
+                forward()
+                context.reset()
+
+            active_token_count = 10
+            context.add_request(
+                DynamicInferenceRequest(
+                    request_id=0,
+                    prompt_tokens=torch.arange(active_token_count, dtype=torch.long, device='cuda'),
+                    sampling_params=SamplingParams(num_tokens_to_generate=1),
+                )
+            )
+            context.initialize_attention_state()
+            assert context.using_cuda_graph_this_step()
+            stale_from.fill_(active_token_count)
+            logits = forward()
+
+        padding_logits = logits[0, active_token_count : context.padded_active_token_count, :]
+        assert padding_logits.numel() > 0
         assert torch.all(padding_logits == 0.0), "Logits for padding tokens are not all zero."
 
 
@@ -485,3 +823,115 @@ def test_get_transformer_layer_spec_forwards_use_te_activation_func():
         assert (
             call_kwargs.get('use_te_activation_func') is True
         ), "use_te_activation_func must be forwarded from config"
+
+
+def test_gpt_builder_forwards_rope_scaling_factor():
+    """Test that gpt_builder forwards rope_scaling_factor to GPTModel.
+
+    Regression test for https://github.com/NVIDIA/Megatron-LM/issues/6305
+    The --rope-scaling-factor flag was silently ignored because gpt_builder
+    passed rope_scaling but not rope_scaling_factor, so GPTModel always fell
+    back to its default factor of 8.0.
+    """
+    mock_config = MagicMock()
+
+    mock_args = MagicMock()
+    mock_args.spec = None
+    mock_args.transformer_impl = "transformer_engine"
+    mock_args.experimental_attention_variant = None
+    mock_args.num_experts = None
+    mock_args.heterogeneous_layers_config_path = None
+    mock_args.mtp_num_layers = None
+    mock_args.use_rope_scaling = True
+    mock_args.rope_scaling_factor = 32.0
+
+    with (
+        patch('gpt_builders.GPTModel') as mock_gpt_model,
+        patch('gpt_builders._get_transformer_layer_spec'),
+    ):
+        from gpt_builders import gpt_builder
+
+        gpt_builder(mock_args, pre_process=True, post_process=True, config=mock_config)
+
+        mock_gpt_model.assert_called_once()
+        _, call_kwargs = mock_gpt_model.call_args
+        assert (
+            call_kwargs.get('rope_scaling_factor') == 32.0
+        ), "rope_scaling_factor must be forwarded from args"
+
+
+@pytest.mark.parametrize(
+    ("init_model_with_meta_device", "use_cpu_initialization", "fp8_output_proj"),
+    [
+        pytest.param(False, False, False, id="eager"),
+        pytest.param(True, False, False, id="meta"),
+        pytest.param(True, True, False, id="meta_cpu_init"),
+        pytest.param(
+            True,
+            False,
+            True,
+            id="meta_te_lm_head",
+            marks=pytest.mark.skipif(
+                not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10),
+                reason="MXFP8 output projection requires Blackwell (SM >= 10)",
+            ),
+        ),
+    ],
+)
+def test_tied_embedding_copies_match_across_pipeline_stages(
+    init_model_with_meta_device, use_cpu_initialization, fp8_output_proj
+):
+    """The last-stage copy of a tied embedding equals the first-stage embedding at construction,
+    also when the model is built on the meta device (the TE LM head is a tied copy that is meta)."""
+    Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
+    model_parallel_cuda_manual_seed(123)
+    params_dtype = torch.bfloat16 if fp8_output_proj else torch.float32
+    fp8_kwargs = (
+        dict(bf16=True, fp8="hybrid", fp8_recipe="mxfp8", fp8_output_proj=True)
+        if fp8_output_proj
+        else {}
+    )
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        pipeline_model_parallel_size=2,
+        pipeline_dtype=params_dtype,
+        params_dtype=params_dtype,
+        # Distinct init distributions, so the copies cannot already match before the sync.
+        embedding_init_method_std=1.0,
+        init_model_with_meta_device=init_model_with_meta_device,
+        use_cpu_initialization=use_cpu_initialization,
+        **fp8_kwargs,
+    )
+    # CPU initialization under meta-device initialization is the ModelOpt checkpoint-load flow,
+    # which builds with the ModelOpt spec; TE linear layers cannot be CPU-initialized on meta.
+    transformer_layer_spec = (
+        get_gpt_modelopt_spec(config)
+        if use_cpu_initialization
+        else get_gpt_layer_with_transformer_engine_spec()
+    )
+    with torch.device("meta") if init_model_with_meta_device else nullcontext():
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=transformer_layer_spec,
+            vocab_size=128,
+            max_sequence_length=8,
+            pre_process=parallel_state.is_pipeline_first_stage(),
+            post_process=parallel_state.is_pipeline_last_stage(),
+            share_embeddings_and_output_weights=True,
+        )
+
+    # The decoder keeps the production device placement (ModelOpt materializes it after
+    # construction), so the cases above exercise the real layers rather than a stand-in.
+    assert any(p.is_meta for p in model.decoder.parameters()) == init_model_with_meta_device
+    weight = model.shared_embedding_or_output_weight()
+    assert not weight.is_meta
+    embd_group = parallel_state.get_embedding_group()
+    reference = weight.detach().clone()
+    torch.distributed.broadcast(
+        reference, src=torch.distributed.get_process_group_ranks(embd_group)[0], group=embd_group
+    )
+    assert torch.equal(weight, reference)
+
+    Utils.destroy_model_parallel()

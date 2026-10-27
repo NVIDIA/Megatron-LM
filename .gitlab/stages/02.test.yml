@@ -66,7 +66,6 @@ test:unit_tests_configure:
     - env
     - set -x
     - |
-      A100_CLUSTER=$([[ "$CLUSTER_A100" != "" ]] && echo $CLUSTER_A100 || echo $DEFAULT_A100_CLUSTER)
       H100_CLUSTER=$([[ "$CLUSTER_H100" != "" ]] && echo $CLUSTER_H100 || echo $DEFAULT_H100_CLUSTER)
     - |
       ARGS=(
@@ -82,6 +81,7 @@ test:unit_tests_configure:
         "--dependent-job test:unit_tests_configure"
         "--slurm-account ${CI_SLURM_ACCOUNT}"
         "--no-enable-warmup"
+        "--enable-error-extraction"
       )
     - |
       export PYTHONPATH=$(pwd)
@@ -194,8 +194,9 @@ test:unit_tests_notify:
       fi
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
-    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" ]] && echo "1" || "0")
+    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" ]] && echo "1" || echo "0")
     - export TEAM_SLUG=$SLACK_ADMIN
+    - export PYTHONPATH=$(pwd)
     - |
       python tests/test_utils/python_scripts/notify.py \
         --pipeline-id "${CI_PIPELINE_ID}" \

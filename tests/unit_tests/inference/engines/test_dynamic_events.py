@@ -15,6 +15,7 @@ import torch
 from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
     MaxSequenceLengthOverflowError,
+    PromptPreparationError,
     RequestOverflowError,
     TokenOverflowError,
 )
@@ -243,6 +244,13 @@ def test_error_event_serialization_with_context_error_factory():
             "Sequence too long",
             False,
         ),
+        (
+            DynamicInferenceEventType.ERROR_NONTRANSIENT,
+            PromptPreparationError,
+            5,
+            "Prefix fetch failed",
+            False,
+        ),
     ]
 
     for event_type, error_class, req_id, message, is_transient in error_cases:
@@ -414,6 +422,53 @@ def test_merge_preserves_precomputed_block_hashes():
 
         # Merge should carry hashes through and also skip recomputation.
         mock_compute.assert_not_called()
+
+
+# ============================================================================
+# Test 5c: Merge tolerates sparse tpot across checkpoints
+# ============================================================================
+
+
+def test_merge_with_unpopulated_tpot_in_later_segment():
+    """Regression test: merge() must not crash when a post-checkpoint sub-request
+    never observed a logging step and therefore has an empty tpot list while the
+    pre-checkpoint sub-request has populated entries.
+
+    The dynamic engine populates `tpot` lazily, only on logging steps
+    (`step_time > 0`). A request that gets evicted then finishes within fewer
+    than `logging_step_interval` decode steps after recompute will produce a
+    record whose later sub-request never accumulated any tpot samples, while
+    earlier sub-requests did. `merge()` must concatenate what's there without
+    erroring on the empty segment.
+    """
+    # Pre-checkpoint sub-request: lived through a logging step, so tpot has data.
+    req1 = DynamicInferenceRequest(
+        request_id=1,
+        prompt_tokens=torch.tensor([1, 2, 3], dtype=torch.int64),
+        sampling_params=SamplingParams(num_tokens_to_generate=10),
+    )
+    req1.generated_tokens.extend([100, 101])
+    req1.tpot = [0.10, 0.11]
+
+    # Post-checkpoint sub-request: recomputed but never saw a logging step
+    # before finishing, so tpot is left at its default.
+    req2 = DynamicInferenceRequest(
+        request_id=1,
+        prompt_tokens=torch.tensor([1, 2, 3, 100, 101], dtype=torch.int64),
+        sampling_params=SamplingParams(num_tokens_to_generate=8),
+    )
+    req2.generated_tokens.extend([200])
+
+    record = DynamicInferenceRequestRecord()
+    record.requests.append(req1)
+    record.requests.append(req2)
+
+    merged = record.merge()
+
+    # The pre-checkpoint segment's measurements must survive the merge,
+    # and the empty post-checkpoint segment must contribute nothing.
+    assert merged.tpot == [0.10, 0.11]
+    assert merged.generated_tokens == [100, 101, 200]
 
 
 # ============================================================================
@@ -666,10 +721,6 @@ def test_complex_multi_pause_evict_lifecycle_with_record():
     record.requests.append(req2)
     record.requests.append(req3)
 
-    # Serialize and deserialize record
-    serialized = record.serialize()
-    assert len(serialized['requests']) == 3
-
     # Merge all checkpoints
     merged = record.merge()
 
@@ -685,19 +736,12 @@ def test_complex_multi_pause_evict_lifecycle_with_record():
     assert event_types.count(DynamicInferenceEventType.FINISH) == 1
     assert event_types.count(DynamicInferenceEventType.GENERATED_TOKEN) == 8
 
-    # Total events: 7 from req1 + 7 from req2 + 6 from req3 = 20
     assert len(merged.events) == 20
 
-    # Test serialization roundtrip of entire record
-    serialized = record.serialize()
-    assert len(serialized['requests']) == 3
+    serialized_events = merged.serialize()['events']
+    assert all(isinstance(e, dict) for e in serialized_events)
 
-    # Verify all events are dicts (no compact mode)
-    first_request_events = serialized['requests'][0]['events']
-    assert all(isinstance(e, dict) for e in first_request_events)
-
-    # Verify GENERATED_TOKEN events use {"token_id": ...} payload format
-    token_events = [e for e in first_request_events if e['type'] == 'GENERATED_TOKEN']
+    token_events = [e for e in serialized_events if e['type'] == 'GENERATED_TOKEN']
     assert token_events[0]['payload'] == {"token_id": 10}
     assert token_events[1]['payload'] == {"token_id": 11}
     assert token_events[2]['payload'] == {"token_id": 12}

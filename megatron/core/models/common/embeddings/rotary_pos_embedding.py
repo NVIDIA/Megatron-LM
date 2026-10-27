@@ -142,6 +142,10 @@ class RotaryEmbedding(nn.Module):
     def get_cos_sin(self, max_seq_len: int, offset: int = 0) -> (Tensor, Tensor):
         """Cosine and sine values for RoPE are precomputed for all positions up to the maximum
         sequence length"""
+        if self.inv_freq.device.type == 'cpu':
+            # Match get_emb(): CPU initialization defers this persistent tensor's
+            # device transfer until its first inference forward.
+            self.inv_freq = self.inv_freq.to(device=torch.cuda.current_device())
         freqs = self.get_freqs_non_repeated(max_seq_len, offset)
         cos = torch.cos(freqs)
         sin = torch.sin(freqs)
@@ -204,6 +208,47 @@ class RotaryEmbedding(nn.Module):
             emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
 
         return emb
+
+    def _set_cos_sin_cache(self, seq_len, offset, dtype, packed_seq=False, cp_group=None):
+        """Materialize cached cos/sin tensors for ``[seq_len, ..., dim]``."""
+        self.max_seq_len_cached = seq_len
+        self.offset_cached = offset
+        self.dtype_cached = dtype
+        self.packed_seq_cached = packed_seq
+
+        emb = self.forward(seq_len, offset, packed_seq=packed_seq, cp_group=cp_group)
+        self.register_buffer("cos_cached", emb.cos().to(dtype).contiguous(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype).contiguous(), persistent=False)
+
+    def get_cached_cos_sin(
+        self,
+        seq_len,
+        offset=0,
+        dtype=torch.get_default_dtype(),
+        packed_seq=False,
+        cp_group=None,
+        mscale=None,
+    ):
+        """Get cached cos and sin values.
+
+        The cache is rebuilt on first use or whenever ``seq_len`` grows
+        beyond the cached length, or any of ``offset`` / ``dtype`` /
+        ``packed_seq`` changes from the previous call.
+        ``YarnRotaryEmbedding`` overrides this to also bake its
+        concentration factor into the cached cos/sin (controlled by
+        ``mscale``); for the base class without a concentration
+        factor the argument is accepted-and-ignored for API uniformity.
+        """
+        del mscale  # base class has no concentration factor
+        if (
+            not hasattr(self, "max_seq_len_cached")
+            or seq_len > self.max_seq_len_cached
+            or offset != self.offset_cached
+            or dtype != self.dtype_cached
+            or packed_seq != self.packed_seq_cached
+        ):
+            self._set_cos_sin_cache(seq_len, offset, dtype, packed_seq, cp_group)
+        return (self.cos_cached[:seq_len, ...], self.sin_cached[:seq_len, ...])
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         state_dict.pop(f'{prefix}inv_freq', None)

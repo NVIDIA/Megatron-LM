@@ -6,6 +6,45 @@ from typing import Callable, ContextManager, Literal, Optional
 
 import torch
 
+from megatron.core.tensor_parallel.gtp_parallel_layout import (
+    resolve_tensor_parallel_sequence_shards,
+)
+
+
+def resolve_tensor_parallel_weight_shards(
+    tensor_model_parallel_size: int,
+    tensor_parallel_num_weight_shards: Optional[int],
+    gtp_weight_remat_size: int,
+    shards_field: str = "tensor_parallel_num_weight_shards",
+    tp_field: str = "tensor_model_parallel_size",
+) -> tuple:
+    """Reconcile ``tensor_parallel_num_weight_shards`` and ``gtp_weight_remat_size``.
+
+    ``tensor_parallel_num_weight_shards`` is the user-facing total number of shards each weight is
+    split into across the tensor-parallel + GTP axes. It is the source of truth and implies
+    ``gtp_weight_remat_size = tensor_parallel_num_weight_shards // tensor_model_parallel_size``.
+    When None it defaults to ``tensor_model_parallel_size * gtp_weight_remat_size`` (so the pair
+    stays consistent, and equals ``tensor_model_parallel_size`` in the no-GTP default). Idempotent.
+
+    Returns the reconciled ``(tensor_parallel_num_weight_shards, gtp_weight_remat_size)``.
+    """
+    tp = tensor_model_parallel_size
+    if tensor_parallel_num_weight_shards is None:
+        tensor_parallel_num_weight_shards = tp * gtp_weight_remat_size
+    else:
+        if tensor_parallel_num_weight_shards < tp:
+            raise ValueError(
+                f"{shards_field} ({tensor_parallel_num_weight_shards}) must be "
+                f">= {tp_field} ({tp})."
+            )
+        if tensor_parallel_num_weight_shards % tp != 0:
+            raise ValueError(
+                f"{shards_field} ({tensor_parallel_num_weight_shards}) must be "
+                f"divisible by {tp_field} ({tp})."
+            )
+        gtp_weight_remat_size = tensor_parallel_num_weight_shards // tp
+    return tensor_parallel_num_weight_shards, gtp_weight_remat_size
+
 
 @dataclass
 class ModelParallelConfig:
@@ -19,6 +58,51 @@ class ModelParallelConfig:
     ###################
     tensor_model_parallel_size: int = 1
     """Intra-layer model parallelism. Splits tensors across GPU ranks."""
+
+    tensor_parallel_num_weight_shards: Optional[int] = None
+    """Total number of shards each weight is split into across the tensor-parallel + GTP axes
+       (i.e. ``tensor_model_parallel_size * gtp_weight_remat_size``). This is the user-facing knob:
+       it must be ``>= tensor_model_parallel_size`` and divisible by it. When None it defaults to
+       ``tensor_model_parallel_size`` (no GTP sharding). It is the source of truth and implies
+       ``gtp_weight_remat_size = tensor_parallel_num_weight_shards // tensor_model_parallel_size``
+       (resolved in ``__post_init__``).
+    """
+
+    gtp_weight_remat_size: int = 1
+    """Generalized tensor parallelism with weight rematerialization. Shards model weights
+       across GPU ranks along ``out_features``; each weight is rematerialized independently
+       (per-weight, not per-layer) via async all-gather on every forward AND backward pass.
+       Placed right after tensor parallelism in the parallelism ordering.
+
+       INTERNAL / DERIVED — there is no CLI flag for it; do not set directly. It is computed in
+       ``__post_init__`` from ``tensor_parallel_num_weight_shards`` (= that value divided by
+       ``tensor_model_parallel_size``). Use ``tensor_parallel_num_weight_shards`` to control GTP.
+    """
+
+    tensor_parallel_num_sequence_shards: Optional[int] = None
+    """Number of sequence partitions within a TP x GTP_remat weight-sharding group.
+
+    Defaults to TP when sequence parallelism (SP) is enabled, otherwise 1.
+    By default, GTP_remat ranks process independent microbatches; no sequence
+    partitioning occurs along the GTP_remat axis.
+
+    Increasing this value partitions sequences across GTP_remat ranks, reducing
+    the number of independent batch partitions within each weight-sharding group:
+
+        sp_size = tensor_model_parallel_size if sequence_parallel else 1
+        gtp_remat_num_sequence_shards = tensor_parallel_num_sequence_shards // sp_size
+        gtp_remat_num_batch_shards = gtp_weight_remat_size // gtp_remat_num_sequence_shards
+
+    Both divisions must be exact. Sequence partitioning within GTP_remat requires SP when TP > 1.
+
+    Configured CP adds further sequence partitions across weight replicas.
+    In this config, context_parallel_size must already contain the resolved
+    runtime CP size, excluding TP/SP:
+
+        context_parallel_size = configured_cp_size * gtp_remat_num_sequence_shards
+
+    TP must be the innermost axis and PP the outermost axis in the global rank ordering.
+    """
 
     pipeline_model_parallel_comm_backend: Optional[Literal["nccl", "ucc"]] = None
     """Configuring backend option of pipeline parallel communication (e.g., nccl, ucc)
@@ -59,14 +143,35 @@ class ModelParallelConfig:
     can handle without overflowing the memory. Typically, a good starting point is to set this
     to maximum sequence length / context parallel size.
     This is used to calculate the number and length of sub-samples assigned to 
-    each rank when using hybrid_context_parallel.
+    each rank when sequence_packing_scheduler is not None.
     """
 
-    hybrid_context_parallel: bool = False
+    dynamic_context_parallel: bool = False
     """
-    If true, enables hybrid context parallel. This is used to balance the workload of 
-    each CP rank when we use packed samples with variable sequence lengths.
-    Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
+    If true, enables dynamic context parallel. This is used to balance the workload of
+    each CP rank when using packed samples with variable sequence lengths. Dynamic CP
+    forms variable-sized CP groups from the DPxCP ranks.
+    """
+
+    min_dynamic_context_parallel_size: int = 1
+    """Minimum CP group size used by dynamic context parallelism."""
+
+    hybrid_context_parallel: bool = False
+    """Deprecated alias for ``dynamic_context_parallel``."""
+
+    sequence_packing_scheduler: Optional[Literal['dp_balanced', 'default_dynamic_cp']] = None
+    """
+    Scheduler for sequence packing and dynamic context parallel.
+    dp_balanced: DP-balanced scheduler for sequence packing.
+    default_dynamic_cp: Packing-aware scheduler with per-microbatch CP group sizes.
+    """
+
+    pad_packed_seq_alignment: int | Literal['max'] | None = None
+    """Pad packed THD inputs to a CP-local multiple, or to max_seqlen_per_dp_cp_rank.
+
+    Applies before sequence-parallel sharding. MXFP8 also requires a multiple of
+    32 after SP sharding; that requirement is combined with this alignment.
+    Padding is represented as a masked dummy sequence.
     """
 
     expert_model_parallel_size: int = 1
@@ -75,6 +180,27 @@ class ModelParallelConfig:
     expert_tensor_parallel_size: Optional[int] = None
     """Intra-layer tensor model parallelism for expert layer. Splits tensors across GPU ranks.
        Default is None, which will be set to the value of tensor_model_parallel_size.
+    """
+
+    expert_tensor_parallel_num_weight_shards: Optional[int] = None
+    """Total number of shards each expert weight is split into across the expert-tensor-parallel +
+       expert-GTP axes (i.e. ``expert_tensor_parallel_size * expert_gtp_weight_remat_size``). This
+       is the user-facing knob for expert layers: it must be ``>= expert_tensor_parallel_size`` and
+       divisible by it. When None it defaults to ``expert_tensor_parallel_size`` (no expert GTP
+       sharding). It is the source of truth and implies
+       ``expert_gtp_weight_remat_size = expert_tensor_parallel_num_weight_shards //
+       expert_tensor_parallel_size`` (resolved in ``__post_init__``).
+    """
+
+    expert_gtp_weight_remat_size: int = 1
+    """Generalized tensor parallelism with weight rematerialization, for expert layers. Independent
+       from the decoder's ``gtp_weight_remat_size``.
+       Placed right after expert parallelism in the parallelism ordering.
+
+       INTERNAL / DERIVED — there is no CLI flag for it; do not set directly. It is computed in
+       ``__post_init__`` from ``expert_tensor_parallel_num_weight_shards`` (= that value divided by
+       ``expert_tensor_parallel_size``). Use ``expert_tensor_parallel_num_weight_shards`` to control
+       expert GTP.
     """
 
     ###################
@@ -121,6 +247,17 @@ class ModelParallelConfig:
        None, no function is called on the loss.
     """
 
+    moe_grad_scale_func: Optional[Callable] = None
+    """If using loss scaling for MoE auxiliary losses, this function should return the
+       scale tensor for MoE aux loss. If None, falls back to grad_scale_func.
+    """
+
+    mtp_grad_scale_func: Optional[Callable] = None
+    """If using loss scaling for MTP (Multi-Token Prediction), this function should return the
+       scalar or size-1 scale value for MTP loss. The value is converted to the output tensor
+       device. If None, falls back to grad_scale_func with torch.ones(1).
+    """
+
     no_sync_func: Optional[Callable] = None
     """Function that creates a context that suppresses asynchronous data-parallel communication. If
        the model is an instance of core.distributed.DistributedDataParallel, the default is to use
@@ -165,7 +302,8 @@ class ModelParallelConfig:
        fused_weight_gradient_mlp_cuda module. To use gradient_accumulation_fusion you must install
        APEX with --cpp_ext and --cuda_ext. For example: "pip install --global-option=\"--cpp_ext\"
        --global-option=\"--cuda_ext\" ". Note that the extension requires CUDA>=11. Otherwise, you
-       must turn off gradient accumulation fusion.
+       must turn off gradient accumulation fusion. VocabParallelEmbedding then also adds its weight
+       gradient into main_grad in its backward.
     """
 
     use_te_rng_tracker: bool = field(
@@ -407,17 +545,91 @@ class ModelParallelConfig:
        the user adds a level 1 timer that is not called by all ranks.
     """
 
+    @property
+    def gtp_remat_num_sequence_shards(self) -> int:
+        """Sequence-shard count within GTP_remat, excluding sequence parallelism across TP."""
+        return resolve_tensor_parallel_sequence_shards(
+            self.tensor_model_parallel_size,
+            self.tensor_parallel_num_sequence_shards,
+            self.gtp_weight_remat_size,
+            self.sequence_parallel,
+        )[1]
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
+        if self.hybrid_context_parallel:
+            warnings.warn(
+                "hybrid_context_parallel is deprecated; use dynamic_context_parallel instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.dynamic_context_parallel:
+                raise ValueError(
+                    "Cannot set both hybrid_context_parallel and dynamic_context_parallel"
+                )
+            self.dynamic_context_parallel = True
+            self.hybrid_context_parallel = False
+
+        if self.dynamic_context_parallel:
+            if self.sequence_packing_scheduler is None:
+                self.sequence_packing_scheduler = 'default_dynamic_cp'
+            if self.sequence_packing_scheduler != 'default_dynamic_cp':
+                raise ValueError(
+                    "Dynamic context parallelism requires "
+                    "sequence_packing_scheduler='default_dynamic_cp'"
+                )
+            if self.min_dynamic_context_parallel_size < 1:
+                raise ValueError("min_dynamic_context_parallel_size must be at least 1")
+            if self.deterministic_mode:
+                raise ValueError("Dynamic context parallelism does not support deterministic_mode")
+        elif self.sequence_packing_scheduler == 'default_dynamic_cp':
+            raise ValueError(
+                "sequence_packing_scheduler='default_dynamic_cp' requires "
+                "dynamic_context_parallel=True"
+            )
+
+        if self.pad_packed_seq_alignment is not None:
+            if self.pad_packed_seq_alignment != 'max':
+                try:
+                    self.pad_packed_seq_alignment = int(self.pad_packed_seq_alignment)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "pad_packed_seq_alignment must be 'max' or a positive integer"
+                    ) from exc
+                if self.pad_packed_seq_alignment <= 0:
+                    raise ValueError("pad_packed_seq_alignment must be 'max' or a positive integer")
+            if self.max_seqlen_per_dp_cp_rank is None:
+                raise ValueError(
+                    "max_seqlen_per_dp_cp_rank is required for packed sequence padding"
+                )
+
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:
                 raise ValueError("Cannot use sequence parallelism without tensor parallelism")
 
         if self.expert_tensor_parallel_size is None:
             self.expert_tensor_parallel_size = self.tensor_model_parallel_size
+
+        # Derive the internal gtp_weight_remat_size from the user-facing
+        # tensor_parallel_num_weight_shards:
+        #   num_weight_shards = tensor_model_parallel_size * gtp_weight_remat
+        _, self.gtp_weight_remat_size = resolve_tensor_parallel_weight_shards(
+            self.tensor_model_parallel_size,
+            self.tensor_parallel_num_weight_shards,
+            self.gtp_weight_remat_size,
+        )
+
+        # Same reconciliation for expert layers (expert_tensor_parallel_size finalized above).
+        _, self.expert_gtp_weight_remat_size = resolve_tensor_parallel_weight_shards(
+            self.expert_tensor_parallel_size,
+            self.expert_tensor_parallel_num_weight_shards,
+            self.expert_gtp_weight_remat_size,
+            shards_field="expert_tensor_parallel_num_weight_shards",
+            tp_field="expert_tensor_parallel_size",
+        )
 
         if self.pipeline_model_parallel_size > 1:
             if self.pipeline_dtype is None:
@@ -459,3 +671,21 @@ class ModelParallelConfig:
                     "Pipeline parallel communication overlapping in warmup and flush is only "
                     "compatible with overlap_p2p_comm but not batch_p2p_comm."
                 )
+
+        if self.gtp_remat_num_sequence_shards > 1 and self.sequence_packing_scheduler is not None:
+            raise ValueError("GTP sequence sharding does not support sequence_packing_scheduler")
+
+        if self.sequence_packing_scheduler is not None:
+            supported_schedulers = ['dp_balanced', 'default_dynamic_cp']
+            if self.sequence_packing_scheduler not in supported_schedulers:
+                raise ValueError(
+                    f"Unsupported scheduler: {self.sequence_packing_scheduler}. "
+                    f"Available schedulers: {supported_schedulers}"
+                )
+            if self.max_seqlen_per_dp_cp_rank is None:
+                raise ValueError(
+                    "max_seqlen_per_dp_cp_rank must be set when sequence_packing_scheduler "
+                    "is not None."
+                )
+            # Needed for passing variable sequences between pp stages.
+            self.variable_seq_lengths = True

@@ -8,7 +8,10 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import (
+    HAVE_TE,
+    TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+)
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -19,10 +22,18 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
+from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.moe.batch_invariant import (
+    build_inverse_permutation_map as build_batch_invariant_inverse_permutation_map,
+)
+from megatron.core.transformer.moe.batch_invariant import unpermute as batch_invariant_unpermute
+from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import internal_api, is_te_min_version
+from megatron.core.utils import deprecated, internal_api, is_te_min_version
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -34,6 +45,8 @@ if HAVE_TE:
         fused_sort_chunks_by_index,
         fused_sort_chunks_by_index_with_probs,
         fused_topk_with_score_function,
+        fused_topk_with_score_function_supports_qb,
+        fused_topk_with_score_function_supports_topk_indices,
         fused_unpermute,
         te_general_gemm,
     )
@@ -47,13 +60,11 @@ else:
         fused_sort_chunks_by_index,
         fused_sort_chunks_by_index_with_probs,
         fused_topk_with_score_function,
+        fused_topk_with_score_function_supports_topk_indices,
         fused_unpermute,
         te_general_gemm,
-    ) = (None, None, None, None, None, None, None, None, None, None)
-
-
-# MOE logging
-_MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
+    ) = (None, None, None, None, None, None, None, None, False, None, None)
+    fused_topk_with_score_function_supports_qb = False
 
 
 def switch_load_balancing_loss_func(
@@ -126,6 +137,14 @@ def switch_load_balancing_loss_func(
         # padding_mask: [num_tokens], probs: [num_tokens, num_experts]
         mask_expanded = padding_mask.unsqueeze(-1)
         probs = probs * mask_expanded
+
+    # An entirely padded MTP depth can have no valid tokens across the reduction
+    # group. Its masked probabilities contribute zero loss; keep normalization
+    # finite so backward does not turn that zero contribution into NaNs.
+    if isinstance(total_num_tokens, torch.Tensor):
+        total_num_tokens = total_num_tokens.clamp(min=1)
+    else:
+        total_num_tokens = max(total_num_tokens, 1)
 
     if fused:
         if not HAVE_TE or fused_moe_aux_loss is None:
@@ -203,6 +222,44 @@ def sinkhorn(cost: torch.Tensor, tol: float = 0.0001) -> torch.Tensor:
     return d1 * cost * d0.unsqueeze(1)
 
 
+def qb_dual_update(
+    scores: torch.Tensor, k: int, beta: torch.Tensor, update_beta: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dual coordinate-descent quantile-balancing routing assignment.
+
+    Picks the top-k experts per token from ``scores - beta``. When ``update_beta`` is
+    True, also returns the raw column quantile of ``scores`` that drives each expert
+    toward ``m * k / n`` tokens.
+
+    Args:
+        scores (torch.Tensor): Scores of shape ``[m, n]`` (tokens, experts).
+        k (int): Experts to select per token.
+        beta (torch.Tensor): Current per-expert bias of shape ``[n]``.
+        update_beta (bool): If False, return ``beta`` unchanged (eval/inference).
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: indices of shape ``[m, k]`` and either
+        ``beta`` (when ``update_beta`` is False) or the column quantile ``[n]``.
+    """
+    num_tokens, num_experts = scores.shape
+
+    topk_result = (scores - beta).topk(k + 1, dim=1)
+    indices = topk_result.indices[:, :-1]
+
+    if not update_beta:
+        return indices, beta
+
+    assert (num_tokens * k) % num_experts == 0, (
+        "Quantile balancing requires the number of routed assignments "
+        f"({num_tokens} tokens * top-{k}) to be divisible by "
+        f"{num_experts} experts."
+    )
+    col_target = num_tokens * k // num_experts
+    alpha = topk_result.values[:, -1:]
+    beta_local = (scores - alpha).topk(col_target + 1, dim=0).values[-1].contiguous()
+    return indices, beta_local
+
+
 def get_capacity(
     num_tokens: int, num_experts: int, capacity_factor: float, min_capacity: Optional[int] = None
 ) -> int:
@@ -226,23 +283,35 @@ def get_capacity(
 
 def get_tokens_per_expert_and_token_count(
     routing_map: torch.Tensor,
-    reduce_group: torch.distributed.ProcessGroup,
+    reduce_group: Union[torch.distributed.ProcessGroup, Tuple[torch.distributed.ProcessGroup, ...]],
     topk: int = None,
     with_padding_mask: bool = False,
 ) -> torch.Tensor:
     """
     Compute global_tokens_per_expert, local_num_tokens and total_num_tokens with padding mask.
+
+    ``reduce_group`` accepts one group or an ordered tuple of orthogonal groups
+    (for example runtime CP followed by TP). The single-group positional API is preserved.
     """
     local_tokens_per_expert = routing_map.sum(dim=0)
-    global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
-        local_tokens_per_expert, reduce_group
-    )
+    reduce_groups = reduce_group if isinstance(reduce_group, tuple) else (reduce_group,)
+
+    # The reduction all-reduces contiguous tensors in place; reduce a copy so
+    # local_tokens_per_expert keeps this rank's counts for local_num_tokens below.
+    global_tokens_per_expert = local_tokens_per_expert.clone()
+    reduce_world_size = 1
+    for group in reduce_groups:
+        global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
+            global_tokens_per_expert, group
+        )
+        reduce_world_size *= group.size()
+
     if with_padding_mask:
-        local_num_tokens = local_tokens_per_expert.sum() / topk
-        total_num_tokens = global_tokens_per_expert.sum() / topk
+        local_num_tokens = local_tokens_per_expert.sum() // topk
+        total_num_tokens = global_tokens_per_expert.sum() // topk
     else:
         local_num_tokens = routing_map.shape[0]
-        total_num_tokens = local_num_tokens * reduce_group.size()
+        total_num_tokens = local_num_tokens * reduce_world_size
     return global_tokens_per_expert, local_num_tokens, total_num_tokens
 
 
@@ -308,6 +377,7 @@ def permute(
     drop_and_pad: bool = False,
     tokens_per_expert: Optional[torch.Tensor] = None,
     align_size: int = 0,
+    return_batch_invariant_inverse_map: bool = False,
 ) -> Tuple[
     torch.Tensor,
     Optional[torch.Tensor],
@@ -340,6 +410,8 @@ def permute(
         tokens_per_expert (torch.Tensor, optional): Tensor of shape `[num_experts]` containing
                                                     actual token counts per expert.
         align_size (int, optional): The alignment size for the input tensor for fp8 or fp4.
+        return_batch_invariant_inverse_map (bool, optional): Return a fixed-shape
+            batch-invariant inverse map in the `pad_offsets` slot for graph-safe unpermute.
 
     Returns:
         Tuple[
@@ -352,6 +424,10 @@ def permute(
             The permuted tokens, (optional) permuted probs, sorted indices,
             (optional) pad_offsets, (optional) padded_tokens_per_expert.
     """
+    if return_batch_invariant_inverse_map:
+        assert not fused, "batch-invariant MoE permute requires the unfused path"
+        assert not drop_and_pad, "batch-invariant MoE supports dynamic dropless routing only"
+
     if fused and probs is None:
         if not HAVE_TE or fused_permute is None:
             raise ValueError("fused_permute is not available. Please install TE >= 2.1.0.")
@@ -386,6 +462,7 @@ def permute(
     num_tokens, hidden = tokens.shape
     num_experts = routing_map.shape[1]
     permuted_probs = None
+    batch_invariant_inverse_map = None
     if drop_and_pad and not (num_out_tokens is None):
         capacity = num_out_tokens // num_experts
         assert not routing_map.requires_grad
@@ -412,6 +489,7 @@ def permute(
         assert (
             num_out_tokens is not None
         ), "num_out_tokens is required for the argsort-based permute"
+        routing_map_for_inverse = routing_map
 
         # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
         routing_map = routing_map.bool().T.contiguous()
@@ -426,10 +504,21 @@ def permute(
         if probs is not None:
             permuted_probs = probs.T.contiguous().reshape(-1)[flat_sorted]
 
+        if return_batch_invariant_inverse_map:
+            batch_invariant_inverse_map = build_batch_invariant_inverse_permutation_map(
+                routing_map_for_inverse, flat_sorted, sorted_indices, num_out_tokens
+            )
+
     # use the mapping to permute the tokens
     permuted_input = tokens.index_select(0, sorted_indices)
 
-    return permuted_input, permuted_probs, sorted_indices, None, tokens_per_expert
+    return (
+        permuted_input,
+        permuted_probs,
+        sorted_indices,
+        batch_invariant_inverse_map,
+        tokens_per_expert,
+    )
 
 
 def unpermute(
@@ -441,6 +530,7 @@ def unpermute(
     fused: bool = False,
     drop_and_pad: bool = False,
     pad_offsets: Optional[torch.Tensor] = None,
+    batch_invariant_inverse_map: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Restore the original order of tokens after permutation. If probs are provided, it
@@ -466,10 +556,18 @@ def unpermute(
             Tensor of per-expert cumulative padding offsets used to remove padding added
             during permutation. This is the fourth output of `moe_permute_and_pad_with_probs`
             and is required when unpermuting padded outputs. Defaults to None.
+        batch_invariant_inverse_map (torch.Tensor, optional): Fixed-shape
+            `[2, num_tokens, topk]` map from token/top-k slot to permuted row and
+            global expert id. Used by batch-invariant CUDA graph paths.
 
     Returns:
         torch.Tensor: The tokens restored to their original order.
     """
+    batch_invariant_mode = is_batch_invariant_mode_enabled()
+    if batch_invariant_mode:
+        assert not fused, "batch-invariant MoE unpermute requires the unfused path"
+        assert not drop_and_pad, "batch-invariant MoE supports dynamic dropless routing only"
+
     if fused:
         if not HAVE_TE or fused_unpermute is None:
             raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
@@ -482,6 +580,19 @@ def unpermute(
             merging_probs=probs,
             restore_shape=restore_shape,
             **extra_kwargs,
+        )
+
+    if batch_invariant_mode:
+        assert routing_map is not None, "batch-invariant MoE unpermute requires routing_map"
+        assert (
+            batch_invariant_inverse_map is not None
+        ), "batch-invariant MoE unpermute requires the AllToAll inverse map"
+        return batch_invariant_unpermute(
+            permuted_tokens,
+            restore_shape,
+            probs=probs,
+            num_experts=routing_map.size(1),
+            inverse_map=batch_invariant_inverse_map,
         )
 
     _, hidden = restore_shape
@@ -520,9 +631,6 @@ def unpermute(
     if torch.are_deterministic_algorithms_enabled():
         # Use index_add which is deterministic when deterministic algorithms are enabled
         # and is CUDA graph compatible
-        output_tokens = torch.zeros(
-            restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
-        )
         # index_add is deterministic when torch.use_deterministic_algorithms(True) is set
         # and is CUDA graph compatible unlike scatter_add
         output_tokens.index_add_(0, sorted_indices, permuted_tokens)
@@ -531,7 +639,14 @@ def unpermute(
         output_tokens.scatter_add_(
             0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
         )
-    return output_tokens.to(dtype=input_dtype)
+    out = output_tokens.to(dtype=input_dtype)
+    # Explicitly release intermediate tensor references to enable CUDA
+    # caching allocator to reclaim memory immediately during full
+    # recomputation. Without this, scatter_add_/index_add_ autograd
+    # references prevent GC until the next training iteration.
+    # See: https://github.com/NVIDIA/Megatron-LM/issues/3221
+    del output_tokens, permuted_tokens, sorted_indices
+    return out
 
 
 def sort_chunks_by_idxs(
@@ -653,8 +768,10 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
     Returns:
         torch.Tensor: The padded routing map of shape [num_tokens, num_experts].
     """
-    # Transpose to [num_experts, num_tokens] for easier row-wise operations
-    routing_map = routing_map.transpose(0, 1)  # [num_experts, num_tokens]
+    # Work on a copy because fused router autograd saves the returned routing
+    # map for backward. Padding a transposed view in place would increment the
+    # saved tensor's version counter and make backward fail.
+    routing_map = routing_map.clone().transpose(0, 1)  # [num_experts, num_tokens]
 
     # Calculate how many tokens need to be padded for each expert
     num_ones = routing_map.sum(dim=1)
@@ -684,6 +801,10 @@ def topk_routing_with_score_function(
     fused: bool = False,
     router_replay: Optional['RouterReplay'] = None,
     dense_output: bool = False,
+    precomputed_indices: Optional[torch.Tensor] = None,
+    qb_histogram: Optional[torch.Tensor] = None,
+    qb_bin_bounds: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -708,6 +829,16 @@ def topk_routing_with_score_function(
                                               Defaults to None.
         dense_output (bool, optional): If True, return dense tensors [num_tokens, topk] instead of
                                        sparse tensors [num_tokens, num_experts]. Defaults to False.
+        precomputed_indices (torch.Tensor, optional): Top-k indices [num_tokens, topk]
+                                       selected by the caller. When given, the score function's
+                                       own top-k is bypassed and probs are computed at these
+                                       indices (e.g. for quantile balancing). Defaults to None.
+        qb_histogram (torch.Tensor, optional): Caller-owned int32 K3 Quantile Balancing histogram
+                                               with shape [num_experts, num_bins].
+        qb_bin_bounds (torch.Tensor, optional): FP32 CUDA tensor containing the lower and upper
+                                                K3 Quantile Balancing histogram bounds.
+        topk_indices (torch.Tensor, optional): Optional dense top-k index output buffer with shape
+                                               [num_tokens, topk]. Only used by the fused TE path.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -717,7 +848,8 @@ def topk_routing_with_score_function(
                   entries correspond to the top-k selected experts per token.
                 - routing_map (torch.Tensor): Shape [num_tokens, num_experts]. Boolean mask where
                   True indicates the token is routed to that expert (i.e. the expert was in the
-                  token's top-k selection).
+                  token's top-k selection). When topk_indices is provided, this is instead that
+                  [num_tokens, topk] dense index buffer.
             When dense_output=True:
                 - probs (torch.Tensor): Shape [num_tokens, topk]. The normalized routing
                   probabilities for each token's top-k selected experts.
@@ -726,6 +858,36 @@ def topk_routing_with_score_function(
     """
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens, num_experts = logits.shape
+    use_quantile_balancing = qb_histogram is not None or qb_bin_bounds is not None
+    if use_quantile_balancing and (qb_histogram is None or qb_bin_bounds is None):
+        raise ValueError("qb_histogram and qb_bin_bounds must be provided together.")
+    if use_quantile_balancing:
+        if expert_bias is None:
+            raise ValueError("Quantile Balancing requires an expert bias.")
+        if score_function != "sigmoid":
+            raise ValueError("Quantile Balancing currently requires score_function='sigmoid'.")
+        if use_pre_softmax:
+            raise ValueError("Quantile Balancing does not use pre-softmax routing.")
+        if topk >= num_experts:
+            raise ValueError("Quantile Balancing requires topk < num_experts.")
+        if num_groups is not None or group_topk is not None:
+            raise ValueError("Quantile Balancing does not support group-limited routing.")
+        if router_replay is not None:
+            raise ValueError("Quantile Balancing does not support router replay.")
+        if precomputed_indices is not None:
+            raise ValueError("Histogram Quantile Balancing computes its own top-(k+1).")
+        if qb_histogram.dim() != 2 or qb_histogram.shape[0] != num_experts:
+            raise ValueError(
+                "qb_histogram must have shape [num_experts, num_bins], got "
+                f"{tuple(qb_histogram.shape)}."
+            )
+        if qb_histogram.dtype != torch.int32:
+            raise ValueError("qb_histogram must have dtype torch.int32.")
+        if qb_bin_bounds.shape != (2,) or qb_bin_bounds.dtype != torch.float32:
+            raise ValueError("qb_bin_bounds must be an FP32 tensor with shape [2].")
+    assert not (
+        fused and precomputed_indices is not None
+    ), "precomputed_indices is not supported with the fused top-k score function."
     if fused:
         if not HAVE_TE or fused_topk_with_score_function is None:
             raise ValueError(
@@ -736,16 +898,31 @@ def topk_routing_with_score_function(
                 "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
                 "Please upgrade Transformer Engine or disable moe_router_fusion."
             )
-        return fused_topk_with_score_function(
-            logits=logits,
-            topk=topk,
-            use_pre_softmax=use_pre_softmax,
-            num_groups=num_groups,
-            group_topk=group_topk,
-            scaling_factor=scaling_factor,
-            score_function=score_function,
-            expert_bias=expert_bias,
-        )
+        kwargs = {
+            "logits": logits,
+            "topk": topk,
+            "use_pre_softmax": use_pre_softmax,
+            "num_groups": num_groups,
+            "group_topk": group_topk,
+            "scaling_factor": scaling_factor,
+            "score_function": score_function,
+            "expert_bias": expert_bias,
+        }
+        if use_quantile_balancing:
+            if not fused_topk_with_score_function_supports_qb:
+                raise ValueError(
+                    "The installed Transformer Engine fused router does not expose Quantile "
+                    "Balancing histogram outputs. Upgrade Transformer Engine or disable "
+                    "moe_router_fusion."
+                )
+            kwargs.update(
+                qb_histogram=qb_histogram,
+                qb_bin_bounds=qb_bin_bounds,
+                qb_histogram_mode="fused_atomic",
+            )
+        if fused_topk_with_score_function_supports_topk_indices and topk_indices is not None:
+            kwargs["topk_indices"] = topk_indices
+        return fused_topk_with_score_function(**kwargs)
 
     def _compute_topk(
         scores: torch.Tensor,
@@ -777,7 +954,12 @@ def topk_routing_with_score_function(
             )
         else:
             # Sorting top-k turned off during inference
-            return torch.topk(scores, k=topk, dim=1, sorted=torch.is_grad_enabled())
+            return torch.topk(
+                scores,
+                k=topk,
+                dim=1,
+                sorted=torch.is_grad_enabled() or is_batch_invariant_mode_enabled(),
+            )
 
     def compute_topk(scores, topk, num_groups=None, group_topk=None):
         # Default behavior if no replay is active
@@ -796,18 +978,49 @@ def topk_routing_with_score_function(
     if score_function == "softmax":
         if use_pre_softmax:
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
-            probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+            if precomputed_indices is not None:
+                top_indices = precomputed_indices
+                probs = torch.gather(scores, dim=1, index=top_indices)
+            else:
+                probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
         else:
-            scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
+            if precomputed_indices is not None:
+                top_indices = precomputed_indices
+                scores = torch.gather(logits, dim=1, index=top_indices)
+            else:
+                scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
             probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
     elif score_function in ("sigmoid", "sqrtsoftplus"):
         if score_function == "sigmoid":
             scores = torch.sigmoid(logits.float())
         else:
             scores = torch.nn.functional.softplus(logits.float()).sqrt()
-        if expert_bias is not None:
+        if precomputed_indices is not None:
+            top_indices = precomputed_indices
+            scores = torch.gather(scores, dim=1, index=top_indices)
+        elif expert_bias is not None:
             scores_for_routing = scores + expert_bias.float()
-            _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+            if use_quantile_balancing:
+                topk_result = torch.topk(scores_for_routing, topk + 1, dim=1, sorted=True)
+                cutoff = topk_result.values[:, -1:]
+                top_indices = topk_result.indices[:, :-1]
+                with torch.no_grad():
+                    num_bins = qb_histogram.shape[1]
+                    lower, upper = qb_bin_bounds.unbind()
+                    bin_indices = torch.floor(
+                        (cutoff - scores.detach() - lower) * (num_bins / (upper - lower))
+                    ).to(torch.int64)
+                    bin_indices.clamp_(0, num_bins - 1)
+                    expert_offsets = (
+                        torch.arange(num_experts, device=logits.device, dtype=torch.int64)
+                        * num_bins
+                    )
+                    flat_indices = (bin_indices + expert_offsets).reshape(-1)
+                    qb_histogram.view(-1).scatter_add_(
+                        0, flat_indices, torch.ones_like(flat_indices, dtype=torch.int32)
+                    )
+            else:
+                _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
             scores = torch.gather(scores, dim=1, index=top_indices)
         else:
             scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
@@ -842,6 +1055,31 @@ def topk_routing_with_score_function(
     return routing_probs, routing_map
 
 
+def compute_normalized_router_scores(logits: torch.Tensor, score_function: str) -> torch.Tensor:
+    """Compute the normalized score distribution over all experts.
+
+    Args:
+        logits: Router logits with experts in the final dimension.
+        score_function: Score function to use. Must be `softmax`, `sigmoid`, or
+            `sqrtsoftplus`.
+
+    Returns:
+        Float32 normalized router scores with the same shape as `logits`.
+
+    Raises:
+        ValueError: If `score_function` is unsupported.
+    """
+    if score_function == "softmax":
+        return torch.softmax(logits, dim=-1, dtype=torch.float32)
+    if score_function == "sigmoid":
+        scores = torch.sigmoid(logits.float())
+    elif score_function == "sqrtsoftplus":
+        scores = torch.nn.functional.softplus(logits.float()).sqrt()
+    else:
+        raise ValueError(f"Invalid score_function: {score_function}")
+    return scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+
+
 def compute_routing_scores_for_aux_loss(
     logits: torch.Tensor,
     topk: int,
@@ -857,9 +1095,9 @@ def compute_routing_scores_for_aux_loss(
         score_function (str): The score function to use. Can be "softmax", "sigmoid"
                               or "sqrtsoftplus".
         fused (bool, optional): Whether to use the fused version. Defaults to False.
-        padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                               Shape in [num_tokens]. True for valid tokens,
-                                               False for padding tokens. Defaults to None.
+        padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                               Shape [num_tokens]. True = padding (exclude),
+                                               False = valid (include). Defaults to None.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The routing map and the normalized routing scores.
@@ -878,16 +1116,7 @@ def compute_routing_scores_for_aux_loss(
             logits=logits, topk=topk, score_function=score_function
         )
     else:
-        if score_function == "softmax":
-            scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
-        elif score_function == "sigmoid":
-            scores = torch.sigmoid(logits.float())
-            scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
-        elif score_function == "sqrtsoftplus":
-            scores = torch.nn.functional.softplus(logits.float()).sqrt()
-            scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
-        else:
-            raise ValueError(f"Invalid score_function: {score_function}")
+        scores = compute_normalized_router_scores(logits, score_function)
 
         _, top_indices = torch.topk(scores, k=topk, dim=1)
         routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
@@ -967,6 +1196,9 @@ def apply_router_token_dropping(
     return final_probs, final_map
 
 
+@deprecated(
+    version="0.16", removal_version="0.18", alternative="get_moe_metrics_tracker().record()"
+)
 def save_to_aux_losses_tracker(
     name: str,
     loss: torch.Tensor,
@@ -983,38 +1215,36 @@ def save_to_aux_losses_tracker(
         layer_number (int): Layer index of the loss.
         num_layers (int): The number of total layers.
         reduce_group (torch.distributed.ProcessGroup, optional): The group for reducing the loss.
-                                                                 Defaults to None.
+            Defaults to None.
         avg_group (torch.distributed.ProcessGroup, optional): The group for averaging the loss.
-                                                              Defaults to None.
-        reduce_group_has_dp (bool, optional): Whether the reduce group has data parallel ranks.
-            Set this to True if the reduce group has data parallel ranks. This flag is used to
-            ensure the correct reduction in aux loss tracking. Defaults to False.
+            Defaults to None.
+        reduce_group_has_dp (bool, optional): Whether the reduce group already includes DP ranks.
+            If True, DP averaging is skipped. Defaults to False.
     """
-    # Skip aux loss logging if layer_number is None.
-    if layer_number is None:
-        return
-
-    tracker = get_moe_layer_wise_logging_tracker()
-    if name not in tracker:
-        tracker[name] = {}
-        tracker[name]["values"] = torch.zeros(num_layers, device=loss.device)
-    tracker[name]["values"][layer_number - 1] += loss.detach()  # Aggregate the loss for the layer.
-    tracker[name]["reduce_group"] = reduce_group
-    tracker[name]["avg_group"] = avg_group
-    tracker[name]["reduce_group_has_dp"] = reduce_group_has_dp
+    get_moe_metrics_tracker().record(
+        name=name,
+        value=loss,
+        layer_number=layer_number,
+        num_layers=num_layers,
+        reduce_group=reduce_group,
+        avg_group=avg_group,
+        needs_dp_avg=not reduce_group_has_dp,
+    )
 
 
+@deprecated(version="0.16", removal_version="0.18", alternative="get_moe_metrics_tracker().clear()")
 def clear_aux_losses_tracker() -> None:
     """Clear the auxiliary losses."""
-    tracker = get_moe_layer_wise_logging_tracker()
-    for name in tracker:
-        tracker[name]["values"].zero_()
+    get_moe_metrics_tracker().clear()
 
 
+@deprecated(
+    version="0.16", removal_version="0.18", alternative="get_moe_metrics_tracker()._sync_metrics()"
+)
 def reduce_aux_losses_tracker_across_ranks(
     track_names: Optional[List[str]] = None, pg_collection: Optional[ProcessGroupCollection] = None
 ) -> None:
-    """Collect and reduce the auxiliary losses across ranks.
+    """Reduce the auxiliary losses across ranks.
 
     Args:
         track_names (Optional[List[str]], optional):
@@ -1022,40 +1252,28 @@ def reduce_aux_losses_tracker_across_ranks(
         pg_collection (Optional[ProcessGroupCollection], optional):
             The process group collection. Defaults to None.
     """
-    tracker = get_moe_layer_wise_logging_tracker()
-    if track_names is None:
-        track_names = tracker.keys()
-
-    if pg_collection is None:
-        # Use parallel_state groups
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        dp_group = parallel_state.get_data_parallel_group(
-            with_context_parallel=False, partial_data_parallel=False
-        )
-    else:
-        pp_group = pg_collection.pp
-        dp_group = pg_collection.dp
-
-    for name in track_names:
-        values = tracker[name]["values"]
-        # TODO(Hepteract): delete the usage of the global parallel_state.
-        # Collect aux losses across PP.
-        torch.distributed.all_reduce(values, group=pp_group)
-        # Reduce aux losses across ranks.
-        if tracker[name].get('reduce_group') is not None:
-            torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
-            # Need to conduct reduction across data parallel ranks. When the reduce_group
-            # does not have 'dp' attribute, do it manually.
-            if not tracker[name].get('reduce_group_has_dp', False):
-                torch.distributed.all_reduce(
-                    values, group=dp_group, op=torch.distributed.ReduceOp.AVG
-                )
-        if tracker[name].get('avg_group') is not None:
-            torch.distributed.all_reduce(
-                values, group=tracker[name]['avg_group'], op=torch.distributed.ReduceOp.AVG
-            )
+    tracker = get_moe_metrics_tracker()
+    names_list = track_names if track_names is not None else list(tracker.metrics.keys())
+    tracker._sync_metrics(names_list, pg_collection)
 
 
+@deprecated(version="0.16", removal_version="0.18", alternative="get_moe_metrics_tracker().metrics")
+def get_moe_layer_wise_logging_tracker():
+    """Return the moe layer wise tracker in legacy dict format."""
+    return {
+        name: {
+            "values": entry.values,
+            "reduce_group": entry.reduce_group,
+            "avg_group": entry.avg_group,
+            "needs_dp_avg": entry.needs_dp_avg,
+        }
+        for name, entry in get_moe_metrics_tracker().metrics.items()
+    }
+
+
+@deprecated(
+    version="0.15", removal_version="0.17", alternative="get_moe_metrics_tracker().report()"
+)
 def track_moe_metrics(
     loss_scale: float,
     iteration: int,
@@ -1066,102 +1284,37 @@ def track_moe_metrics(
     force_initialize: bool = False,
     track_names: Optional[List[str]] = None,
     num_layers: Optional[int] = None,
+    num_moe_layers: Optional[int] = None,
     moe_layer_freq: Optional[Union[int, List[int]]] = None,
     mtp_num_layers: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
-) -> None:
+) -> str:
     """Track the MoE metrics for logging.
 
-    Args:
-        loss_scale (float): The loss scale.
-        iteration (int): The iteration.
-        writer (SummaryWriter, optional): The tensorboard writer. Defaults to None.
-        wandb_writer (wandb.Run, optional): The wandb writer. Defaults to None.
-        total_loss_dict (dict[str, torch.Tensor], optional): The total loss dictionary.
-                                                             Defaults to None.
-        per_layer_logging (bool, optional): Whether to log per layer. Defaults to False.
-        force_initialize (bool, optional): Whether to force initialize the tracker.
-                                           Defaults to False.
-        track_names (List[str], optional): The names of the losses to track. Defaults to None.
-        num_layers (int, optional): The number of layers. Defaults to None.
-        moe_layer_freq (Union[int, List[int]], optional): The frequency of the MoE layers.
-                                                          Defaults to None.
-        mtp_num_layers (int, optional): The number of layers in the model parallel group.
-                                        Defaults to None.
-        pg_collection (ProcessGroupCollection, optional): The process group collection.
-                                                          Defaults to None.
+    Deprecated: Use get_moe_metrics_tracker().report() directly.
     """
-    # Aux loss logging
-    tracker = get_moe_layer_wise_logging_tracker()
-    # Initialize the tracker if force_initialize is True.
-    # The values tensor size must match what the router creates in save_to_aux_losses_tracker,
-    # which uses (num_layers + mtp_num_layers). This is important for PP ranks that have no
-    # MoE layers (so the tracker is empty and force_initialize creates the entry); their tensor
-    # size must match ranks that do have MoE layers, otherwise all_reduce across PP will hang.
-    tracker_num_layers = num_layers
-    if mtp_num_layers is not None:
-        tracker_num_layers += mtp_num_layers
-    if force_initialize:
-        if track_names is not None:
-            for key in track_names:
-                if key not in tracker:
-                    tracker[key] = {}
-                    tracker[key]["values"] = torch.zeros(tracker_num_layers, device="cuda")
-                    tracker[key]["reduce_group"] = None
-                    tracker[key]["avg_group"] = None
-                    tracker[key]["reduce_group_has_dp"] = False
-    reduce_aux_losses_tracker_across_ranks(track_names, pg_collection=pg_collection)
-
-    # Get number of MoE layers
-    if moe_layer_freq is None:
-        num_moe_layers = num_layers
-    elif isinstance(moe_layer_freq, int):
-        assert isinstance(num_layers, int)
-        moe_layer_pattern = [1 if (i % moe_layer_freq == 0) else 0 for i in range(num_layers)]
-        num_moe_layers = sum(moe_layer_pattern)
-    elif isinstance(moe_layer_freq, list):
-        num_moe_layers = sum(moe_layer_freq)
-    else:
-        raise ValueError(f"Invalid moe_layer_freq: {moe_layer_freq}")
-
-    if mtp_num_layers is not None:
-        num_moe_layers += mtp_num_layers
-
-    aux_losses = {k: v['values'].float() * loss_scale for k, v in tracker.items()}
-    for name, loss_list in aux_losses.items():
-        if total_loss_dict is not None:
-            if name not in total_loss_dict:
-                total_loss_dict[name] = loss_list.sum() / num_moe_layers
-            else:
-                total_loss_dict[name] += loss_list.sum() / num_moe_layers
-        if writer is not None:
-            # currently when using add_scalars,
-            # torch.utils.add_scalars makes each timer its own run, which
-            # polutes the runs list, so we just add each as a scalar
-            writer.add_scalar(name, loss_list.sum() / num_moe_layers, iteration)
-            if per_layer_logging:
-                for i, loss in enumerate(loss_list.tolist()):
-                    writer.add_scalar(f"moe/{name}_layer_{i}", loss, iteration)
-
-            # W&B logging lacks support for logging multiple scalars simultaneously.
-            # As a workaround, we log each scalar individually first, then we can create
-            # a custom panel to manually group them to a single plot.
-            if wandb_writer:
-                wandb_writer.log({f"{name}": loss_list.sum() / num_moe_layers}, iteration)
-                if per_layer_logging:
-                    wandb_writer.log(
-                        {
-                            f"moe/{name}_layer_{i}": loss
-                            for i, loss in enumerate(loss_list.tolist())
-                        },
-                        iteration,
-                    )
-
-    clear_aux_losses_tracker()
+    return get_moe_metrics_tracker().report(
+        loss_scale=loss_scale,
+        iteration=iteration,
+        writer=writer,
+        wandb_writer=wandb_writer,
+        per_layer_logging=per_layer_logging,
+        force_initialize=force_initialize,
+        track_names=track_names,
+        num_layers=num_layers,
+        num_moe_layers=num_moe_layers,
+        moe_layer_freq=moe_layer_freq,
+        mtp_num_layers=mtp_num_layers,
+        pg_collection=pg_collection,
+        total_loss_dict=total_loss_dict,
+    )
 
 
 def get_updated_expert_bias(
-    tokens_per_expert: torch.Tensor, expert_bias: torch.Tensor, expert_bias_update_rate: float
+    tokens_per_expert: torch.Tensor,
+    expert_bias: torch.Tensor,
+    expert_bias_update_rate: float,
+    tp_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> torch.Tensor:
     """Update expert bias for biased expert routing. See https://arxiv.org/abs/2408.15664v1#
 
@@ -1169,21 +1322,86 @@ def get_updated_expert_bias(
         tokens_per_expert (torch.Tensor): The number of tokens assigned to each expert.
         expert_bias (torch.Tensor): The bias for each expert.
         expert_bias_udpate_rate (float): The update rate for the expert bias.
+        tp_dp_cp_group (torch.distributed.ProcessGroup, optional): The group spanning the tensor,
+            data, and context parallel ranks that share the router expert-bias update.
 
     Returns:
         torch.Tensor: The updated expert bias.
     """
     with torch.no_grad():
-        # All Reduce Across TPxCPxDP group
-        torch.distributed.all_reduce(
-            tokens_per_expert,
+        if tp_dp_cp_group is None:
             # TODO(Hepteract): delete the usage of the global parallel_state.
-            group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
+            tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
+                with_context_parallel=True
+            )
+
+        # All Reduce Across TPxCPxDP group
+        torch.distributed.all_reduce(tokens_per_expert, group=tp_dp_cp_group)
+        num_experts = tokens_per_expert.shape[-1]
+        total_tokens = tokens_per_expert.sum(dim=-1, keepdim=True)
+        # Compare each tokens_per_expert value with the row average without converting the integer
+        # counts to floating point: tokens_per_expert < total / num_experts iff
+        # tokens_per_expert * num_experts < total.
+        update_direction = torch.sign(total_tokens - tokens_per_expert * num_experts)
+        updated_expert_bias = (
+            expert_bias + update_direction.to(dtype=expert_bias.dtype) * expert_bias_update_rate
         )
-        average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
-        offset = average_tokens - tokens_per_expert
-        updated_expert_bias = expert_bias + torch.sign(offset) * expert_bias_update_rate
         return updated_expert_bias
+
+
+def get_updated_expert_bias_with_quantile(
+    histogram: torch.Tensor, bin_bounds: torch.Tensor, expert_bias: torch.Tensor, topk: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Recover Kimi K3 Quantile Balancing biases from a pooled global-batch histogram."""
+    if histogram.dim() < 2:
+        raise ValueError("QB histogram must have shape [..., num_experts, num_bins].")
+    num_experts, num_bins = histogram.shape[-2:]
+    if num_experts <= 0 or num_bins <= 0:
+        raise ValueError("QB histogram dimensions must be positive.")
+    if expert_bias.shape != histogram.shape[:-1]:
+        raise ValueError(
+            f"QB expert_bias shape {expert_bias.shape} does not match expected "
+            f"{histogram.shape[:-1]} for histogram shape {histogram.shape}."
+        )
+    if bin_bounds.shape != histogram.shape[:-2] + (2,):
+        raise ValueError(
+            f"QB bin_bounds shape {bin_bounds.shape} does not match expected "
+            f"{histogram.shape[:-2] + (2,)} for histogram shape {histogram.shape}."
+        )
+    if not 0 < topk < num_experts:
+        raise ValueError(f"QB topk must be in [1, {num_experts}), got {topk}.")
+
+    with torch.no_grad():
+        cumulative_counts = torch.cumsum(histogram, dim=-1, dtype=torch.int64)
+        tokens_per_expert = cumulative_counts[..., -1]
+        # Every token contributes one margin sample to every expert, so all expert totals match.
+        total_tokens = tokens_per_expert[..., 0]
+        target_quantile = total_tokens.to(torch.float32) * (topk / num_experts)
+        target_rank = torch.ceil(target_quantile).to(torch.int64).clamp_min_(1)
+        selected_bins = (
+            (cumulative_counts >= target_rank[..., None, None]).to(torch.int64).argmax(dim=-1)
+        )
+        selected_counts = torch.gather(histogram, -1, selected_bins.unsqueeze(-1)).squeeze(-1)
+        previous_bins = (selected_bins - 1).clamp_min(0)
+        counts_before = torch.gather(cumulative_counts, -1, previous_bins.unsqueeze(-1)).squeeze(-1)
+        counts_before = torch.where(
+            selected_bins == 0, torch.zeros_like(counts_before), counts_before
+        )
+        interpolation = (
+            (target_quantile[..., None] - counts_before.to(torch.float32))
+            / selected_counts.clamp_min(1).to(torch.float32)
+        ).clamp_(0.0, 1.0)
+        lower = bin_bounds[..., 0, None]
+        upper = bin_bounds[..., 1, None]
+        bin_width = (upper - lower) / num_bins
+        updated_expert_bias = lower + (selected_bins.to(torch.float32) + interpolation) * bin_width
+        updated_expert_bias -= updated_expert_bias.mean(dim=-1, keepdim=True)
+        has_tokens = total_tokens > 0
+        updated_expert_bias = torch.where(has_tokens[..., None], updated_expert_bias, expert_bias)
+        bias_min, bias_max = torch.aminmax(updated_expert_bias, dim=-1)
+        updated_bin_bounds = torch.stack((bias_min - 1.0, bias_max + 1.0), dim=-1)
+        updated_bin_bounds = torch.where(has_tokens[..., None], updated_bin_bounds, bin_bounds)
+        return updated_expert_bias, updated_bin_bounds
 
 
 def maybe_move_tensor_to_cpu(
@@ -1209,12 +1427,6 @@ def maybe_move_tensor_to_cpu(
             tensor.record_stream(torch.cuda.current_stream())
         tensor = cpu_tensor
     return tensor
-
-
-def get_moe_layer_wise_logging_tracker() -> dict:
-    """Return the moe layer wise tracker."""
-    global _MOE_LAYER_WISE_LOGGING_TRACKER
-    return _MOE_LAYER_WISE_LOGGING_TRACKER
 
 
 @internal_api
@@ -1350,8 +1562,11 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp = inp.view(-1, inp_shape[-1])
 
         if te_general_gemm is not None and router_dtype != torch.float64:
-            output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias)
-            output = output[0]
+            # cuBLASLt's non-FP8 bias epilogue expects bias and output to have the same
+            # dtype. Router parameters may be BF16 while router logits are FP32, so cast the
+            # small bias vector before passing it to TE.
+            gemm_bias = bias.to(router_dtype) if bias is not None else None
+            output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=gemm_bias)[0]
         elif bias is None:
             output = torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())
         else:
@@ -1429,12 +1644,44 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
     Returns:
         int: The alignment size for quantization.
     """
+    # TE's grouped-tensor and fused grouped-MLP kernels share an expert-token alignment.
+    if config.use_transformer_engine_op_fuser or config.moe_use_grouped_tensor:
+        return TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
     if config.fp8:
         return get_fp8_align_size(config.fp8_recipe)
-    elif config.fp4:
+    if config.fp4:
         return get_fp4_align_size(config.fp4_recipe)
-    # Only FP8 or FP4 requires padding. Defaults to 0.
+    # Legacy high-precision grouped GEMM does not require padding. Defaults to 0.
     return 0
+
+
+def _deepep_permute_pads_grouped_tensor_input(config: TransformerConfig) -> bool:
+    """Whether DeepEP v1/v2 fused permutation pads input for TE grouped-tensor GEMM."""
+    return (
+        config.moe_use_grouped_tensor
+        and config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend in ("deepep", "deepepv2")
+        and config.moe_permute_fusion
+        and fused_permute_and_pad_with_probs is not None
+    )
+
+
+def skip_routed_expert_padding(config: TransformerConfig) -> bool:
+    """Whether the expert module should skip quantization padding.
+
+    Returns True when padding is already applied by the router, the HybridEP / NCCL-EP
+    dispatcher, or DeepEP's fused permutation kernel.
+    """
+    if config.moe_router_padding_for_quantization:
+        return True
+    if config.moe_token_dispatcher_type == "flex" and config.moe_flex_dispatcher_backend in (
+        "hybridep",
+        "ncclep",
+    ):
+        return True
+    if _deepep_permute_pads_grouped_tensor_input(config):
+        return True
+    return False
 
 
 # TODO(Hepteract): delete the usage of the global parallel_state.
@@ -1450,7 +1697,10 @@ def get_default_pg_collection() -> ProcessGroupCollection:
     pg_collection.tp = parallel_state.get_tensor_model_parallel_group()
     pg_collection.cp = parallel_state.get_context_parallel_group()
     pg_collection.expt_tp = parallel_state.get_expert_tensor_parallel_group()
-    pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
+    pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group(with_gtp_remat=False)
+    pg_collection.expt_dp_gtp_remat = parallel_state.get_expert_data_parallel_group(
+        check_initialized=False
+    )
     pg_collection.tp_ep = parallel_state.get_expert_tensor_and_model_parallel_group()
     pg_collection.tp_cp = parallel_state.get_tensor_and_context_parallel_group()
     pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
@@ -1605,13 +1855,13 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
         ):
             if (
                 step_condition == "route"
-                and CudaGraphScope.moe_router in moe_layer.config.cuda_graph_scope
-                and CudaGraphScope.moe_preprocess not in moe_layer.config.cuda_graph_scope
+                and CudaGraphModule.moe_router in moe_layer.config.cuda_graph_modules
+                and CudaGraphModule.moe_preprocess not in moe_layer.config.cuda_graph_modules
             ):
                 raise MoECudaGraphPartialCaptureSignal(moe_layer, "route", **kwargs)
             elif (
                 step_condition == "preprocess"
-                and CudaGraphScope.moe_preprocess in moe_layer.config.cuda_graph_scope
+                and CudaGraphModule.moe_preprocess in moe_layer.config.cuda_graph_modules
             ):
                 raise MoECudaGraphPartialCaptureSignal(moe_layer, "preprocess", **kwargs)
 

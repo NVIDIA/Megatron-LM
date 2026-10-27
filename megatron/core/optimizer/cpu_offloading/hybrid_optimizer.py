@@ -93,6 +93,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     fp32_param.grad = grad.to(fp32_param.dtype)
                     fp32_param.requires_grad = True
                 else:
+                    fp32_param.grad = None
                     fp32_param.requires_grad = False
 
         # Sync the grads from GPU to CPU.
@@ -101,6 +102,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 gpu_param = self.cpu_copys_map_gpu_param[param]
                 grad = getattr(gpu_param, "decoupled_grad", gpu_param.grad)
                 if grad is None:
+                    param.grad = None
                     param.requires_grad = False
                     continue
 
@@ -109,8 +111,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     self.cpu_copy_map_grad[param] = torch.empty(
                         param.shape, dtype=param.dtype, pin_memory=self.pin_cpu_grads, device="cpu"
                     )
-                    param.grad = self.cpu_copy_map_grad[param]
 
+                param.grad = self.cpu_copy_map_grad[param]
                 self.cpu_copy_map_grad[param].data.copy_(grad, non_blocking=True)
             self._cpu_optimizer_map_data_event[optimizer] = self._d2h_stream.record_event()
 
@@ -276,6 +278,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     cpu_copy = True
                 if self.param_update_in_fp32 and param.dtype != torch.float32:
                     param = param.detach().clone().float()
+                    if cpu_copy and self.pin_cpu_params:
+                        param = param.pin_memory()
                     param_to_fp32_param[orig_param] = param
 
                 if cpu_copy:
@@ -370,8 +374,11 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         if not self.param_update_in_fp32:
             return
         for param, v in self.state.items():
-            fp32_param = self.param_to_fp32_param[param]
-            fp32_param.data.copy_(v["master_param"])
+            # Native FP32 params do not need a separate master parameter and are
+            # intentionally absent from param_to_fp32_param.
+            fp32_param = self.param_to_fp32_param.get(param)
+            if fp32_param is not None:
+                fp32_param.data.copy_(v["master_param"])
 
     def update_fp32_param_by_new_param(self):
         """

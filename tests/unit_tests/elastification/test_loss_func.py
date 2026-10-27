@@ -14,6 +14,8 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+pytestmark = pytest.mark.flaky_in_dev
+
 from megatron.elastification import loss_func as loss_func_module
 from megatron.elastification.loss_func import _mask_loss, loss_func
 

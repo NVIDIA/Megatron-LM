@@ -17,6 +17,20 @@ except:
     from torch.optim import Adam as GPUAdam
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+from megatron.core.transformer.module import (
+    convert_module_to_dtype_except_fp32_marked,
+    mark_keep_in_fp32,
+)
+
+
+class Fp32MarkedToyNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(4, 4, bias=False)
+        self.scale = mark_keep_in_fp32(nn.Parameter(torch.ones(4)))
+
+    def forward(self, x):
+        return self.proj(x) * self.scale
 
 
 class Net(nn.Module):
@@ -61,6 +75,19 @@ class BigNet(nn.Module):
         return x
 
 
+class ConditionalParameterModel(nn.Module):
+    def __init__(self, dtype):
+        super().__init__()
+        self.always = nn.Parameter(torch.tensor(1.0, device="cuda", dtype=dtype))
+        self.optional = nn.Parameter(torch.tensor(1.0, device="cuda", dtype=dtype))
+
+    def forward(self, use_optional):
+        output = self.always
+        if use_optional:
+            output = output + self.optional
+        return output
+
+
 def setup_seed(seed):
     random.seed(seed)  # Set Python's built-in random seed
     np.random.seed(seed)  # Set NumPy's random seed
@@ -69,6 +96,89 @@ def setup_seed(seed):
     torch.cuda.manual_seed_all(seed)  # Set seed for all GPUs
     torch.backends.cudnn.deterministic = True  # Ensure deterministic behavior
     torch.backends.cudnn.benchmark = False  # Disable auto-tuner for reproducibility
+
+
+def test_load_state_dict_with_native_fp32_param():
+    """Round-trip state for a BF16 toy net with a parameter marked to stay in FP32."""
+    model = Fp32MarkedToyNet().cuda()
+    convert_module_to_dtype_except_fp32_marked(model, torch.bfloat16)
+    assert model.proj.weight.dtype == torch.bfloat16
+    assert model.scale.dtype == torch.float32
+
+    optimizer = HybridDeviceOptimizer(
+        model.parameters(),
+        offload_fraction=1.0,
+        cpu_optimizer_cls=Adam,
+        gpu_optimizer_cls=GPUAdam,
+        param_update_in_fp32=True,
+        overlap_cpu_optimizer_d2h_h2d=False,
+        lr=1e-3,
+    )
+    inputs = torch.ones(2, 4, device="cuda", dtype=torch.bfloat16)
+    model(inputs).sum().backward()
+    optimizer.step()
+
+    restored_model = Fp32MarkedToyNet().cuda()
+    convert_module_to_dtype_except_fp32_marked(restored_model, torch.bfloat16)
+    restored_model.load_state_dict(model.state_dict())
+    restored_optimizer = HybridDeviceOptimizer(
+        restored_model.parameters(),
+        offload_fraction=1.0,
+        cpu_optimizer_cls=Adam,
+        gpu_optimizer_cls=GPUAdam,
+        param_update_in_fp32=True,
+        overlap_cpu_optimizer_d2h_h2d=False,
+        lr=1e-3,
+    )
+    restored_optimizer.load_state_dict(optimizer.state_dict())
+
+    assert set(restored_optimizer.state) == set(restored_model.parameters())
+    assert restored_model.proj.weight in restored_optimizer.param_to_fp32_param
+    assert restored_model.scale not in restored_optimizer.param_to_fp32_param
+    assert torch.equal(
+        restored_optimizer.param_to_fp32_param[restored_model.proj.weight],
+        optimizer.param_to_fp32_param[model.proj.weight],
+    )
+
+    restored_model(inputs).sum().backward()
+    restored_optimizer.step()
+
+
+@pytest.mark.parametrize(
+    "dtype,offload_fraction,param_update_in_fp32",
+    [(torch.float32, 1.0, False), (torch.bfloat16, 0.0, True)],
+    ids=["cpu-offloaded-param", "gpu-fp32-master-param"],
+)
+def test_conditional_parameter_matches_torch_sgd_reference(
+    dtype, offload_fraction, param_update_in_fp32
+):
+    """HybridDeviceOptimizer must not reuse a previous grad when a param is inactive."""
+    model = ConditionalParameterModel(dtype)
+    reference_model = ConditionalParameterModel(dtype)
+    optimizer = HybridDeviceOptimizer(
+        model.parameters(),
+        offload_fraction=offload_fraction,
+        cpu_optimizer_cls=SGD,
+        gpu_optimizer_cls=SGD,
+        param_update_in_fp32=param_update_in_fp32,
+        overlap_cpu_optimizer_d2h_h2d=False,
+        lr=0.25,
+    )
+    reference_optimizer = SGD(reference_model.parameters(), lr=0.25)
+
+    for use_optional in (True, False, True):
+        optimizer.zero_grad(set_to_none=True)
+        reference_optimizer.zero_grad(set_to_none=True)
+        model(use_optional).backward()
+        reference_model(use_optional).backward()
+        assert (model.optional.grad is None) == (reference_model.optional.grad is None)
+
+        optimizer.step()
+        reference_optimizer.step()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(model.always, reference_model.always)
+        torch.testing.assert_close(model.optional, reference_model.optional)
 
 
 @pytest.mark.skipif(
@@ -253,3 +363,53 @@ def test_overlap_cpu_optimizer_d2h_h2d_sync_correctness(
         assert torch.allclose(
             v, ref_params[k], atol=1e-03
         ), f"Weight {k} value mismatch, max error: {(v - ref_params[k]).abs().max()}"
+
+
+def test_distributed_optimizer_with_cpu_offload_and_fp32_marked_param():
+    """Test that DistributedOptimizer works with HybridDeviceOptimizer (CPU offloading)
+    when the model has mark_keep_in_fp32 parameters without raising non-leaf Tensor ValueError.
+    """
+    import os
+
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+    from megatron.core.transformer import TransformerConfig
+    from tests.unit_tests.test_utilities import Utils
+    from tests.unit_tests.test_utils import _init_distributed
+
+    world = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+
+    _init_distributed(world, rank)
+    Utils.initialize_model_parallel()
+
+    try:
+        model = Fp32MarkedToyNet().cuda()
+        convert_module_to_dtype_except_fp32_marked(model, torch.bfloat16)
+        assert model.proj.weight.dtype == torch.bfloat16
+        assert model.scale.dtype == torch.float32
+
+        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+        transformer_config = TransformerConfig(num_attention_heads=1, num_layers=1)
+        ddp_model = DistributedDataParallel(transformer_config, ddp_config, model)
+
+        optimizer_config = OptimizerConfig(
+            optimizer='adam',
+            lr=1e-3,
+            bf16=True,
+            use_distributed_optimizer=True,
+            optimizer_cpu_offload=True,
+            optimizer_offload_fraction=1.0,
+        )
+
+        optimizer = get_megatron_optimizer(optimizer_config, [ddp_model])
+
+        inputs = torch.ones(2, 4, device="cuda", dtype=torch.bfloat16)
+        output = ddp_model(inputs)
+        loss = output.sum()
+        loss.backward()
+
+        update_successful, grad_norm, _ = optimizer.step()
+        assert update_successful
+    finally:
+        Utils.destroy_model_parallel()

@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 [build-system]
-requires = ["setuptools<80.0.0", "pybind11"]
+requires = ["setuptools>=80", "pybind11"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -56,6 +56,9 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
     "Topic :: Utilities",
 ]
+
+[project.optional-dependencies]
+emerging-optimizers = ["emerging-optimizers>=0.2"]
 
 [project.urls]
 Download = "https://github.com/NVIDIA/Megatron-LM/releases"

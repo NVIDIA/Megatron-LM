@@ -1,0 +1,207 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Minimal Megatron-FSDP fully_shard entrypoint."""
+
+import dataclasses
+import functools
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+
+from torch import nn
+from torch.distributed import DeviceMesh
+from torch.distributed.tensor.placement_types import Placement
+
+from ..mixed_precision import MixedPrecisionPolicy
+from .context import FsdpContext, current_fully_shard_context
+from .module import FsdpModule
+from .schedule import SchedulePolicy
+
+# TODO(wujingyue): Separate fully_shard_context from FsdpContext in a follow-up PR.
+# Scope management and shared runtime state are separate responsibilities (SRP):
+# https://blog.cleancoder.com/uncle-bob/2014/05/08/SingleReponsibilityPrinciple.html
+# Keep this alias for now to avoid changing callers and limit this PR's scope.
+fully_shard_context = FsdpContext
+
+MeshAxis = int | str
+
+
+@dataclasses.dataclass(frozen=True)
+class Placements:
+    """Per-data-parallel-axis placements for MFSDP buffers.
+
+    ``dp_axes`` identifies the parent-mesh axes that form MFSDP's data-parallel
+    mesh. Placement sequences are ordered to match those axes. Use Torch's
+    ``Shard(0)`` for public parameter, gradient, and optimizer sharding.
+    """
+
+    dp_axes: Sequence[MeshAxis]
+    parameter: Sequence[Placement]
+    gradient: Sequence[Placement]
+    optimizer: Sequence[Placement]
+
+    def __post_init__(self) -> None:
+        """Validate placement sequence lengths."""
+        axis_count = len(self.dp_axes)
+        for name, placements in (
+            ("parameter", self.parameter),
+            ("gradient", self.gradient),
+            ("optimizer", self.optimizer),
+        ):
+            if len(placements) != axis_count:
+                raise ValueError(f"Expected {axis_count} {name} placements, got {len(placements)}.")
+
+
+def fully_shard(
+    module: nn.Module,
+    mesh: DeviceMesh,
+    placements: Placements,
+    mixed_precision_policy: MixedPrecisionPolicy | None = None,
+    grad_scale: float = 1.0,
+    schedule_policy: SchedulePolicy = SchedulePolicy(),
+    register_hooks: bool = True,
+    grad_accumulation_count: int | None = None,
+) -> None:
+    """Apply FSDP to a module in place.
+
+    This attaches the FSDP mixin to the original module instance, so parent
+    modules do not need to replace existing child-module references.
+
+    Args:
+        module: Module whose currently unowned parameters are managed by FSDP.
+        mesh: Parent device mesh containing the data-parallel axes.
+        placements: Parameter, gradient, and optimizer placements.
+        mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
+            and parameter-dtype main gradients.
+        grad_scale: Multiplier applied after mesh averaging. Defaults to 1, which is correct when
+            each mesh rank contributes exactly one term to the gradient.
+
+            Expert parallelism is the motivating case. A rank's experts process tokens
+            routed to them from every rank in the expert-parallel group, and the backward
+            pass routes those tokens' gradients back, so a rank's expert gradient already
+            sums over ``ep_size`` ranks' data before any reduction happens. Averaging over
+            the expert-data-parallel mesh alone therefore divides by too little, and
+            ``grad_scale=1 / ep_size`` makes up the difference. Dense parameters see only
+            their own rank's tokens and need no additional scaling.
+
+            For per-token loss, ``grad_scale=mesh.size()`` cancels mesh averaging
+            so gradients are summed. Normalize once by the global token count after
+            accumulating all microbatches and before clipping or updating weights.
+        schedule_policy: Communication scheduling policy for this FSDP module.
+        register_hooks: Whether to register the automatic forward and backward execution
+            hooks on ``module``. Disable this when an external scheduler invokes the
+            corresponding FSDP lifecycle methods explicitly. The state-dict safety hook
+            is registered independently.
+        grad_accumulation_count: Total parameter-gradient callbacks per reduction
+            window, including contributions from separate GraphTasks and delayed
+            weight gradients. Defaults to one per owned trainable parameter.
+            The scheduler must declare the complete count before sharding the unit.
+    """
+    if isinstance(module, FsdpModule):
+        raise ValueError("This module is already managed by FSDP.")
+    context = current_fully_shard_context()
+    if context is None:
+        raise RuntimeError("fully_shard must run inside fully_shard_context.")
+    for submodule in module.modules():
+        if isinstance(submodule, FsdpModule) and submodule.context is not context:
+            raise ValueError(
+                "Cannot fully_shard a module containing an FSDP child from another "
+                "fully_shard_context."
+            )
+
+    _validate_dp_axes(mesh, placements.dp_axes)
+    mixed_precision_policy = mixed_precision_policy or MixedPrecisionPolicy()
+    original_cls = module.__class__
+    _attach_mixin(module)
+    try:
+        assert isinstance(module, FsdpModule)
+        FsdpModule.__init__(
+            module,
+            context=context,
+            mesh=mesh,
+            model_weight_placements=tuple(placements.parameter),
+            main_grad_placements=tuple(placements.gradient),
+            main_weight_placements=tuple(placements.optimizer),
+            mixed_precision_policy=mixed_precision_policy,
+            grad_scale=grad_scale,
+            schedule_policy=schedule_policy,
+            use_symmetric_memory=context.use_symmetric_memory,
+            register_hooks=register_hooks,
+            grad_accumulation_count=grad_accumulation_count,
+        )
+    except Exception:
+        module.__class__ = original_cls
+        raise
+
+
+def _validate_dp_axes(mesh: DeviceMesh, dp_axes: Sequence[MeshAxis]) -> None:
+    """Validate the parent mesh's data-parallel axes."""
+    normalized_dp_axes = tuple(_axis_index(mesh, axis) for axis in dp_axes)
+    if len(set(normalized_dp_axes)) != len(normalized_dp_axes):
+        raise ValueError(f"Data-parallel axes must be distinct, got {dp_axes!r}.")
+    if normalized_dp_axes != tuple(sorted(normalized_dp_axes)):
+        raise ValueError(f"Data-parallel axes must be in mesh-axis order, got {dp_axes!r}.")
+    if normalized_dp_axes != tuple(range(mesh.ndim)):
+        raise NotImplementedError(
+            "MFSDP currently requires dp_axes to match every mesh axis in mesh order."
+        )
+
+
+def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
+    if isinstance(axis, int):
+        axis_index = axis
+        if axis_index < 0:
+            axis_index += mesh.ndim
+        if axis_index < 0 or axis_index >= mesh.ndim:
+            raise ValueError(f"Mesh axis {axis} is out of bounds for mesh ndim {mesh.ndim}.")
+        return axis_index
+
+    dim_names = mesh.mesh_dim_names
+    if dim_names is None or axis not in dim_names:
+        raise ValueError(f"Mesh axis {axis!r} is not present in mesh dim names {dim_names}.")
+    return dim_names.index(axis)
+
+
+@contextmanager
+def microbatch(context: FsdpContext, is_last: bool) -> Iterator[None]:
+    """Mark an FSDP microbatch as the last accumulation microbatch.
+
+    Non-final microbatches still release unsharded weights, but defer automatic
+    gradient synchronization. HSDP/HFSDP also defer DP-outer gradient reduction
+    until the last microbatch. Wrap both forward and backward in this scope.
+
+    Args:
+        context: FSDP context whose roots should use this microbatch state.
+        is_last: Whether this scope contains the last accumulation microbatch.
+    """
+    context.ensure_finalized()
+    previous_state = context.is_last_microbatch
+    context.is_last_microbatch = is_last
+
+    try:
+        yield
+    finally:
+        context.is_last_microbatch = previous_state
+
+
+def _attach_mixin(module: nn.Module) -> None:
+    if isinstance(module, FsdpModule):
+        return
+    module.__class__ = _get_fsdp_class(module.__class__)
+
+
+@functools.cache
+def _get_fsdp_class(module_cls: type[nn.Module]) -> type[nn.Module]:
+    """Reuse the subclass so classmethods share lazy state, such as CUDA streams."""
+    return type(f"Fsdp{module_cls.__name__}", (FsdpModule, module_cls), {})

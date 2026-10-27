@@ -11,6 +11,14 @@
 
 Megatron Core supports multiple parallelism strategies that can be combined to efficiently train models from billions to trillions of parameters across thousands of GPUs.
 
+```{toctree}
+:hidden:
+
+features/context_parallel
+features/pipeline_parallel_layout
+../api-guide/core/generalized_tensor_parallel
+```
+
 ## Overview
 
 The following table summarizes supported parallelism strategies.
@@ -116,7 +124,7 @@ Split long sequences across GPUs for efficient long-context training.
 - Reduces activation memory
 - Can combine with TP, PP, DP
 
-Refer to [Context Parallelism Deep Dive](features/context_parallel.md) for a detailed guide with performance analysis.
+Refer to the [Context Parallel Overview](features/context_parallel.md) for a detailed guide with performance analysis.
 
 ## Expert Parallelism (EP)
 
