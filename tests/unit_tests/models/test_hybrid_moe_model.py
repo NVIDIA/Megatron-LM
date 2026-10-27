@@ -7,6 +7,7 @@ import os
 import sys
 from typing import Any, Dict, Mapping, Tuple
 
+from megatron.training.config.training_config import TokenizerConfig
 import pytest  # type: ignore[import]
 import torch
 
@@ -22,6 +23,7 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    get_run_config,
     set_args,
     set_global_variables,
 )
@@ -566,10 +568,6 @@ class TestHybridMoEModel:
         args.mamba_head_dim = 64
         args.mamba_num_groups = 8
         args.mamba_num_heads = 64
-        args.tokenizer_type = "TikTokenizer"
-        args.tiktoken_pattern = "v2"
-        args.tokenizer_model = "/mnt/artifacts/model/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
-        args.padded_vocab_size = 131072
 
         # The following args would be set in the user's nano v3 config.
         args.attention_backend = AttnBackend.flash
@@ -601,10 +599,17 @@ class TestHybridMoEModel:
         args.sequence_parallel = True
         args.te_rng_tracker = True
         args.tensor_model_parallel_size = 2
-        args.vocab_size = 131072
 
         validate_args(args)
-        set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
+        cfg = pretrain_cfg_container_from_args(args)
+        cfg.tokenizer = TokenizerConfig(
+            vocab_size=131072,
+            padded_vocab_size=131072,
+            tokenizer_type="TikTokenizer",
+            tokenizer_model="/mnt/artifacts/model/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json",
+            tiktoken_pattern="v2",
+        )
+        set_global_variables(args, cfg, build_tokenizer=False)
         return args
 
     def setup_method(self, method):
@@ -612,6 +617,7 @@ class TestHybridMoEModel:
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
         destroy_moe_metrics_tracker()
         args = self.create_test_args()
+        cfg = get_run_config()
         set_args(args)
 
         Utils.initialize_model_parallel(
@@ -627,7 +633,7 @@ class TestHybridMoEModel:
         self.model = HybridModel(
             config=model_config,
             hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=args.vocab_size,
+            vocab_size=cfg.tokenizer.vocab_size,
             max_sequence_length=args.seq_length,
             hybrid_layer_pattern=args.hybrid_layer_pattern,
             position_embedding_type=args.position_embedding_type,

@@ -40,7 +40,7 @@ from megatron.training.checkpointing import (
     set_checkpoint_version,
 )
 from megatron.training.config import ProfilingConfig
-from megatron.training.global_vars import set_args
+from megatron.training.global_vars import get_run_config, set_args
 from megatron.training.state import TrainState
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -672,7 +672,6 @@ def create_ckpt_load_args(create_args):
     args.hidden_size = 2
     args.num_attention_heads = 1
     args.add_position_embedding = False
-    args.vocab_file = None
     args.tensor_model_parallel_size = 1
     args.pipeline_model_parallel_size = 1
     args.ckpt_assume_constant_structure = False
@@ -683,6 +682,9 @@ def create_ckpt_load_args(create_args):
     args.use_megatron_fsdp = False
     args.strict_fsdp_dtensor_load = True
     args.phase_transition_iterations = None
+
+    cfg = get_run_config()
+    cfg.tokenizer.vocab_file = None
 
     yield args
 

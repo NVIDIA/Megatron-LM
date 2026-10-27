@@ -5,6 +5,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from megatron.training.config.training_config import TokenizerConfig
 import pytest
 import torch
 
@@ -67,8 +68,6 @@ def initialize_test_environment(
     args.create_attention_mask_in_dataloader = create_attention_mask
     args.global_batch_size = global_batch_size
     args.calculate_per_token_loss = True
-    args.vocab_size = 1024
-    args.tokenizer_type = "NullTokenizer"
     args.num_layers = 4
     args.hidden_size = 512
     args.num_attention_heads = 8
@@ -78,7 +77,9 @@ def initialize_test_environment(
     os.environ['NCCL_NVLS_ENABLE'] = '0'  # NOTE(asolergi-nv): Without this, NCCL crashes
 
     validate_args(args)
-    set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=True)
+    cfg = pretrain_cfg_container_from_args(args)
+    cfg.tokenizer = TokenizerConfig(vocab_size=1024, tokenizer_type="NullTokenizer")
+    set_global_variables(args, cfg, build_tokenizer=True)
 
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tp_size,

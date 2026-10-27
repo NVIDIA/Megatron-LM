@@ -3,6 +3,7 @@ import gc
 import os
 import sys
 
+from megatron.training.config.training_config import TokenizerConfig
 import pytest
 import torch
 
@@ -23,6 +24,7 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    get_run_config,
     set_args,
     set_global_variables,
 )
@@ -82,6 +84,7 @@ class TestPartialCudaGraphedA2AOverlap:
     ):
         model_parallel_cuda_manual_seed(123)
         args = get_args()
+        cfg_container = get_run_config()
         config = core_transformer_config_from_args(args)
         transformer_layer_spec = layer_spec_fn(
             config,
@@ -98,7 +101,7 @@ class TestPartialCudaGraphedA2AOverlap:
         return GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.vocab_size,
+            vocab_size=cfg_container.tokenizer.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -120,7 +123,6 @@ class TestPartialCudaGraphedA2AOverlap:
         args = parse_args()
         args.num_layers = 1
         args.mtp_num_layers = None
-        args.vocab_size = 1024
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.max_position_embeddings = 512
@@ -165,7 +167,9 @@ class TestPartialCudaGraphedA2AOverlap:
             setattr(args, key, value)
 
         validate_args(args)
-        set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
+        cfg = pretrain_cfg_container_from_args(args)
+        cfg.tokenizer = TokenizerConfig(vocab_size=1024)
+        set_global_variables(args, cfg, build_tokenizer=False)
         return args
 
     def get_batch(self, seq_length, micro_batch_size):

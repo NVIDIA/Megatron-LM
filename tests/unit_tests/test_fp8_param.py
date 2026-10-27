@@ -27,6 +27,7 @@ from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    get_run_config,
     initialize_runtime_services,
     set_args,
     set_run_config,
@@ -107,6 +108,7 @@ class TestFP8Param:
     ):
         model_parallel_cuda_manual_seed(_SEED)
         args = get_args()
+        cfg_container = get_run_config()
         config = core_transformer_config_from_args(args)
         transformer_layer_spec = layer_spec_fn(
             num_experts=args.num_experts, moe_grouped_gemm=args.moe_grouped_gemm
@@ -114,7 +116,7 @@ class TestFP8Param:
         return GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.padded_vocab_size,
+            vocab_size=cfg_container.tokenizer.padded_vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -148,7 +150,6 @@ class TestFP8Param:
         sys.argv = ['test_fp8_param.py']
         args = parse_args()
         args.num_layers = 4
-        args.padded_vocab_size = 128800
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.max_position_embeddings = 512
@@ -187,6 +188,7 @@ class TestFP8Param:
         # Temporary args/config duplication during the training-loop refactor:
         # migrated settings use config; remaining settings still use legacy args.
         cfg = pretrain_cfg_container_from_args(args)
+        cfg.tokenizer.padded_vocab_size = 128800
         cfg.finalize()
         set_run_config(cfg)
         initialize_runtime_services(args, build_tokenizer=False, training=True)

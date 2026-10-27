@@ -10,6 +10,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
+from megatron.training.config.training_config import TokenizerConfig
 import numpy as np
 import pytest
 import torch
@@ -344,7 +345,6 @@ class TestRLUtils:
         args = parse_args(ignore_unknown_args=True)
         args.num_layers = 8
         args.num_attention_heads = 8
-        args.vocab_size = VOCAB
         args.hidden_size = 128
         args.max_position_embeddings = 256
         args.seq_length = 256
@@ -357,7 +357,9 @@ class TestRLUtils:
             setattr(args, key, value)
 
         args = validate_args(args)
-        set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
+        cfg = pretrain_cfg_container_from_args(args)
+        cfg.tokenizer = TokenizerConfig(vocab_size=VOCAB)
+        set_global_variables(args, cfg, build_tokenizer=False)
         return args
 
     @pytest.mark.parametrize(

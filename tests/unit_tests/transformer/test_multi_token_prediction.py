@@ -70,6 +70,7 @@ from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    get_run_config,
     initialize_runtime_services,
     set_args,
     set_run_config,
@@ -2508,6 +2509,7 @@ class TestMultiTokenPrediction:
     ):
         model_parallel_cuda_manual_seed(_SEED)
         args = get_args()
+        cfg_container = get_run_config()
         config = core_transformer_config_from_args(args)
         transformer_layer_spec = layer_spec_fn(
             args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
@@ -2521,7 +2523,7 @@ class TestMultiTokenPrediction:
             mtp_block_spec=mtp_block_spec,
             # create_test_args builds args without a tokenizer, so args.vocab_size stays
             # None; padded_vocab_size is what the training entrypoint passes anyway.
-            vocab_size=args.padded_vocab_size,
+            vocab_size=cfg_container.tokenizer.padded_vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -2555,7 +2557,6 @@ class TestMultiTokenPrediction:
         args.mtp_hsm = mtp_hsm
         args.freeze_base_model_for_mtp = freeze_base_model_for_mtp
         args.mtp_loss_scaling_factor = 0.1
-        args.padded_vocab_size = 128800
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.max_position_embeddings = 256
@@ -2600,6 +2601,7 @@ class TestMultiTokenPrediction:
         # Temporary args/config duplication during the training-loop refactor:
         # migrated settings use config; remaining settings still use legacy args.
         cfg = pretrain_cfg_container_from_args(args)
+        cfg.tokenizer.padded_vocab_size = 128800
         cfg.finalize()
         set_run_config(cfg)
         initialize_runtime_services(args, build_tokenizer=False, training=True)
@@ -4252,6 +4254,7 @@ class TestMultiTokenPredictionHybrid:
         """
         model_parallel_cuda_manual_seed(_SEED)
         args = get_args()
+        cfg_container = get_run_config()
         config = core_transformer_config_from_args(args)
 
         # MTP is configured via unified pattern in hybrid_layer_pattern
@@ -4259,7 +4262,7 @@ class TestMultiTokenPredictionHybrid:
         model = HybridModel(
             config=config,
             hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=args.vocab_size,
+            vocab_size=cfg_container.tokenizer.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -4282,7 +4285,6 @@ class TestMultiTokenPredictionHybrid:
         args = parse_args()
         args.mtp_num_layers = 2
         args.mtp_loss_scaling_factor = 0.1
-        args.padded_vocab_size = 128800
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.num_query_groups = 8
@@ -4324,6 +4326,7 @@ class TestMultiTokenPredictionHybrid:
         # Temporary args/config duplication during the training-loop refactor:
         # migrated settings use config; remaining settings still use legacy args.
         cfg = pretrain_cfg_container_from_args(args)
+        cfg.tokenizer.padded_vocab_size = 128800
         cfg.finalize()
         set_run_config(cfg)
         initialize_runtime_services(args, build_tokenizer=False, training=True)
