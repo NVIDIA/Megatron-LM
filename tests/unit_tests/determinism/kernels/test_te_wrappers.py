@@ -31,7 +31,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     set_batch_invariant_mode,
     te_supports_batch_invariant_grouped_gemm,
 )
-from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     _compute_index_scores,
     _dsa_weights_proj_forward_gemm,
@@ -1052,3 +1052,54 @@ def test_te_fused_topk_dense_indices_replays(indices_dtype):
     assert_replays_bit_exact(
         fn, (logits,), replays=3, what=f"TE fused topk dense indices[{indices_dtype}]"
     )
+
+
+@pytest.mark.parametrize(
+    "tp,shards",
+    [(1, 4), (2, 4), (4, None), (4, 4)],
+    ids=["tp1-4shards", "tp2-4shards", "tp4-ordered", "tp4-4shards"],
+)
+@pytest.mark.parametrize("sequence_parallel", [False, True], ids=["no-sp", "sp"])
+def test_te_row_parallel_linear_batch_invariant_replays(tp, shards, sequence_parallel):
+    """Batch-invariant row-parallel forward: ordered TP reduction (TP >= 3) and fixed shards.
+
+    With several shards per rank the forward computes the shard partials itself and the
+    backward is the stock row-parallel one; both must replay bit-exactly.
+    """
+    if Utils.world_size < tp or Utils.world_size % tp != 0:
+        pytest.skip(f"needs a multiple of {tp} GPUs")
+    Utils.initialize_model_parallel(tp, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        seeded()
+        module = TERowParallelLinear(
+            FFN,
+            HIDDEN,
+            config=_config(
+                tensor_model_parallel_size=tp,
+                sequence_parallel=sequence_parallel and tp > 1,
+                batch_invariant_mode=True,
+                batch_invariant_tp_shards=shards,
+                add_bias_linear=False,
+                attention_backend=AttnBackend.flash,
+                flash_attention_version=4 if _IS_BLACKWELL else 3,
+            ),
+            init_method=init_method_normal(0.02),
+            bias=False,
+            input_is_parallel=True,
+            skip_bias_add=False,
+            is_expert=False,
+        ).cuda()
+        x = torch.randn(
+            TOKENS // 2, 2, FFN // tp, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        with set_batch_invariant_mode(True):
+            assert_module_replays_bit_exact(
+                module,
+                (x,),
+                replays=3,
+                contention=True,
+                what=f"TERowParallelLinear batch-invariant tp={tp} shards={shards}",
+            )
+    finally:
+        Utils.destroy_model_parallel()

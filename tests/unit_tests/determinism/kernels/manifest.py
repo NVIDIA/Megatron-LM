@@ -304,9 +304,21 @@ KERNELS: Tuple[KernelEntry, ...] = (
             C + "test_transformer_layer.py",
             C + "test_gpt_model.py",
             K + "test_csa_packed_kernels.py",
+            K + "test_ordered_reduce_kernels.py",
         ),
         kind="external-lib",
-        notes="NCCL floating-point reductions pinned by NCCL_ALGO=Ring; covered by the TP/EP/FSDP cells of the model-level suite.",
+        notes="NCCL floating-point reductions pinned by NCCL_ALGO=Ring; covered by the TP/EP/FSDP cells of the model-level suite. "
+        "Under batch-invariant mode at TP >= 3 the forward reductions use ordered_reduce (replayed in test_ordered_reduce_kernels.py).",
+    ),
+    KernelEntry(
+        name="tensor_parallel_ordered_reduce",
+        sources=("megatron/core/tensor_parallel/ordered_reduce.py",),
+        tests=(K + "test_ordered_reduce_kernels.py",),
+        kind="triton",
+        notes="Batch-invariant TP reductions: Triton rank-order fold, symmetric-memory push (learner) and "
+        "pull (inference) kernels, NCCL all-to-all fallback, and the batch_invariant_tp_shards shard GEMM / "
+        "shard-order fold. Fixed fold order by construction; replays cover every path, one and several "
+        "partials per rank, and the shard path's stock backward.",
     ),
     KernelEntry(
         name="tensor_parallel_random_share_storage",
