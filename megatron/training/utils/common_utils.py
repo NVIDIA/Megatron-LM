@@ -129,12 +129,8 @@ def calc_params_l2_norm(
                     local_param = param
                 params_by_sharding[(mesh, placements, local_param.dtype)].append(local_param)
 
-        return _calc_sharded_params_l2_norm(
-            (
-                (mesh, placements, tensors)
-                for (mesh, placements, _), tensors in params_by_sharding.items()
-            ),
-            return_squared_tensor=return_squared_tensor,
+        return _calculate_sharded_params_l2_norm(
+            params_by_sharding, return_squared_tensor=return_squared_tensor
         )
 
     # 8 buckets: 4 categories × (non-sharded, sharded optimizer main_param).
@@ -318,12 +314,12 @@ def _calc_mimo_params_l2_norm(
     return total_norm_sq if return_squared_tensor else total_norm_sq.sqrt().item()
 
 
-def _calc_sharded_params_l2_norm(params_data, return_squared_tensor=False):
-    """Calculate a norm from entries of (mesh, placements, local tensors)."""
+def _calculate_sharded_params_l2_norm(params_by_sharding, return_squared_tensor=False):
+    """Calculate a norm from local parameters grouped by (mesh, placements, dtype)."""
 
     total_norm_2 = torch.zeros((1,), dtype=torch.float32, device='cuda')
     dummy_overflow_buf = torch.zeros((1,), dtype=torch.int, device='cuda')
-    for mesh, placements, local_tensors in params_data:
+    for (mesh, placements, _dtype), local_tensors in params_by_sharding.items():
         local_tensors = [t for t in local_tensors if t.numel() > 0]
         if len(local_tensors) == 0:
             norm = torch.zeros((1,), dtype=torch.float32, device='cuda')
