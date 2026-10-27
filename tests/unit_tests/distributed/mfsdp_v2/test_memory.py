@@ -75,6 +75,38 @@ def _mb(num_bytes: int) -> str:
     return f"{num_bytes / 1024**2:.2f} MB"
 
 
+def test_shared_layer_releases_storage(distributed_setup):
+    """Release weights per invocation while accumulating gradients from both uses."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    layer = nn.Linear(4, 4, bias=False, device=device)
+    nn.init.ones_(layer.weight)
+    model = nn.Sequential(layer, layer)
+    with fully_shard_context(device=device):
+        fully_shard(layer, mesh, _default_placements())
+
+    completions = []
+
+    def check_data_and_grad(module, _grad_input, _grad_output):
+        # Each invocation releases its weight storage when its backward finishes.
+        assert module.weight.untyped_storage().nbytes() == 0
+        if not completions:
+            # The shared weight's gradient still awaits the other use's contribution.
+            assert module.weight.grad is None
+        completions.append(module)
+
+    # Observe PyTorch's completion independently of MFSDP's hook wrapper.
+    layer.register_full_backward_hook(check_data_and_grad)
+    x = torch.ones(2, 4, device=device, requires_grad=True)
+    model(x).sum().backward()
+    assert len(completions) == 2
+    # Each use contributes 8 to every weight gradient.
+    torch.testing.assert_close(
+        layer.weight.grad.full_tensor(), torch.full((4, 4), 16.0, device=device)
+    )
+    torch.testing.assert_close(x.grad, torch.full_like(x, 16.0))
+
+
 @pytest.mark.parametrize("main_params_dtype", [torch.bfloat16, torch.float32])
 def test_persistent_sharded_storage(distributed_setup, main_params_dtype):
     """FSDP should retain only its sharded weights and gradients at rest."""
@@ -172,14 +204,13 @@ def test_training_step_peak_memory_bounds_full_size_buffers(
     train_step()
     peak_delta = torch.cuda.max_memory_allocated(device) - resting_allocated
 
-    # Backward keeps the current child and one prefetched child unsharded. The current
-    # child also has a full wgrad until it is copied into a full reduce-scatter input.
-    # With separate streams, their allocation cannot reuse the released full-weight
-    # storage, for a four-buffer peak. With a unified stream, the release precedes the
-    # allocation on that stream, reducing the peak to three. The slack on top covers
+    # Backward keeps the current child and one prefetched child unsharded. Gradient
+    # readiness can precede module completion, so the full wgrad and packed reduce-scatter
+    # input may also coexist before resharding. Both stream configurations therefore
+    # allow four full buffers. The slack on top covers
     # allocator granularity and small temporaries, measured at ~169 KiB.
     child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
-    full_buffer_bound = 3 if unify_communication_stream else 4
+    full_buffer_bound = 4
     bound_nbytes = full_buffer_bound * child_weight_nbytes + 1024**2
 
     assert peak_delta < bound_nbytes, (

@@ -204,12 +204,21 @@ class FsdpContext:
         )
 
     def finish_grad_sync(self) -> None:
-        """Wait on submitted gradient reductions.
+        """Reshard remaining weights and wait on submitted gradient reductions.
 
         Call after all backward work, including delayed weight-gradient computation,
         and before reading or modifying gradients. This enqueues a stream dependency;
         it does not block the CPU or wait for reductions that have not yet been launched.
         """
+        # Construction-order backward prefetch can gather a frozen module that
+        # never runs backward, leaving no post-backward callback to release it.
+        # Reshard fully: restoring bindings alone would leave gather events set
+        # and make the next forward skip materializing its sharded parameters.
+        # All backward work, including delayed wgrad, must be complete here.
+        # Recorded backward order can avoid such unused prefetches (see #8478):
+        # https://github.com/NVIDIA/Megatron-LM/pull/8478
+        for module in self.forward_order:
+            module.reshard()
         self.current_stream().wait_stream(self.reduce_scatter_stream)
 
     def post_backward(self) -> None:

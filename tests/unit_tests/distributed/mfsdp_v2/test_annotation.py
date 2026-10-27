@@ -93,8 +93,8 @@ def _forward_backward_events(events: list[NvtxEvent]) -> list[NvtxEvent]:
     return [event for event in events if event.operation in ("forward", "backward")]
 
 
-def test_fsdp_training_hooks_emit_operation_nvtx_ranges(distributed_setup, monkeypatch):
-    """A training step should annotate each FSDP lifecycle operation."""
+def test_training_operation_ranges(distributed_setup, monkeypatch):
+    """A training step should annotate compute, communication, and weight storage release."""
     events: list[NvtxEvent] = []
     _setup_nvtx_recording(monkeypatch, events)
     model = nn.Linear(4, 4, bias=False).to(distributed_setup.device)
@@ -109,22 +109,29 @@ def test_fsdp_training_hooks_emit_operation_nvtx_ranges(distributed_setup, monke
         NvtxEvent("push", "<root>", "unshard"),
         NvtxEvent("pop", "<root>", "unshard"),
         NvtxEvent("push", "<root>", "reshard"),
+        NvtxEvent("push", "<root>", "release_unsharded_storage"),
+        NvtxEvent("pop", "<root>", "release_unsharded_storage"),
         NvtxEvent("pop", "<root>", "reshard"),
         NvtxEvent("pop", "<root>", "forward"),
         NvtxEvent("push", "<root>", "backward"),
         NvtxEvent("push", "<root>", "unshard"),
         NvtxEvent("pop", "<root>", "unshard"),
-        NvtxEvent("push", "<root>", "reshard"),
-        NvtxEvent("pop", "<root>", "reshard"),
         NvtxEvent("push", "<root>", "reduce_gradients"),
         NvtxEvent("pop", "<root>", "reduce_gradients"),
+        # post_backward() releases storage without reshard(): full parameter bindings
+        # stay available for delayed wgrad. finish_grad_sync() restores sharded bindings.
+        NvtxEvent("push", "<root>", "release_unsharded_storage"),
+        NvtxEvent("pop", "<root>", "release_unsharded_storage"),
         NvtxEvent("pop", "<root>", "backward"),
+        # Final synchronization also cleans up prefetched-but-unused weights.
+        NvtxEvent("push", "<root>", "reshard"),
+        NvtxEvent("push", "<root>", "release_unsharded_storage"),
+        NvtxEvent("pop", "<root>", "release_unsharded_storage"),
+        NvtxEvent("pop", "<root>", "reshard"),
     ]
 
 
-def test_fsdp_sibling_roots_emit_root_nvtx_ranges_after_training_step(
-    distributed_setup, monkeypatch
-):
+def test_sibling_root_ranges(distributed_setup, monkeypatch):
     """Independent FSDP roots should each emit root-labeled NVTX ranges."""
     events: list[NvtxEvent] = []
     _setup_nvtx_recording(monkeypatch, events)
@@ -148,7 +155,7 @@ def test_fsdp_sibling_roots_emit_root_nvtx_ranges_after_training_step(
     ]
 
 
-def test_fsdp_training_hooks_emit_stacked_nvtx_ranges(distributed_setup, monkeypatch):
+def test_nested_training_ranges(distributed_setup, monkeypatch):
     """Nested training hooks should emit concise NVTX ranges."""
     events: list[NvtxEvent] = []
     _setup_nvtx_recording(monkeypatch, events)
@@ -177,7 +184,7 @@ def test_fsdp_training_hooks_emit_stacked_nvtx_ranges(distributed_setup, monkeyp
     ]
 
 
-def test_fsdp_frozen_parameters_emit_balanced_backward_nvtx_range(distributed_setup, monkeypatch):
+def test_frozen_parameters_backward_range(distributed_setup, monkeypatch):
     """Frozen FSDP units should still balance backward NVTX ranges."""
     events: list[NvtxEvent] = []
     _setup_nvtx_recording(monkeypatch, events)
@@ -199,9 +206,7 @@ def test_fsdp_frozen_parameters_emit_balanced_backward_nvtx_range(distributed_se
     ]
 
 
-def test_fsdp_frozen_child_without_grad_inputs_skips_backward_nvtx_range(
-    distributed_setup, monkeypatch
-):
+def test_frozen_child_without_grad_inputs_skips_backward_range(distributed_setup, monkeypatch):
     """Frozen FSDP children outside the backward graph should not emit backward ranges."""
     events: list[NvtxEvent] = []
     _setup_nvtx_recording(monkeypatch, events)
@@ -214,23 +219,35 @@ def test_fsdp_frozen_child_without_grad_inputs_skips_backward_nvtx_range(
         fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
-    model(torch.ones(2, 4, device=distributed_setup.device)).sum().backward()
+    # Backward may prefetch the frozen child even though it has no backward
+    # callback. The next iteration must not reuse stale materialization state.
+    for _ in range(2):
+        model.zero_grad(set_to_none=True)
+        model(torch.ones(2, 4, device=distributed_setup.device)).sum().backward()
+        frozen_layer = model.layers[0]
+        assert not frozen_layer._unshard_events
+        for group in frozen_layer.parameter_groups:
+            assert group._unsharded_model_weight.local_buffer.untyped_storage().nbytes() == 0
 
-    assert _forward_backward_events(events) == [
-        ("push", "<root>", "forward"),
-        ("push", "layers.0", "forward"),
-        ("pop", "layers.0", "forward"),
-        ("push", "layers.1", "forward"),
-        ("pop", "layers.1", "forward"),
-        ("pop", "<root>", "forward"),
-        ("push", "<root>", "backward"),
-        ("push", "layers.1", "backward"),
-        ("pop", "layers.1", "backward"),
-        ("pop", "<root>", "backward"),
-    ]
+    assert (
+        _forward_backward_events(events)
+        == [
+            ("push", "<root>", "forward"),
+            ("push", "layers.0", "forward"),
+            ("pop", "layers.0", "forward"),
+            ("push", "layers.1", "forward"),
+            ("pop", "layers.1", "forward"),
+            ("pop", "<root>", "forward"),
+            ("push", "<root>", "backward"),
+            ("push", "layers.1", "backward"),
+            ("pop", "layers.1", "backward"),
+            ("pop", "<root>", "backward"),
+        ]
+        * 2
+    )
 
 
-def test_tied_child_parameters_complete_backward_once_per_cycle(distributed_setup, monkeypatch):
+def test_tied_parameters_backward_once_per_cycle(distributed_setup, monkeypatch):
     """Tied parameters should complete balanced backward ranges across training cycles."""
     events: list[NvtxEvent] = []
     _setup_nvtx_recording(monkeypatch, events)
