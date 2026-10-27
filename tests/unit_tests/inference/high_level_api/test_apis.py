@@ -63,6 +63,33 @@ def _make_worker_instance(cls):
     return obj
 
 
+class _ShutdownLoopManager:
+    """Runtime-loop stand-in whose shutdown work finishes when ``teardown`` does.
+
+    ``run_async`` serves the shutdown path without the fix; reusing it after ``stop()`` fails.
+    """
+
+    def __init__(self, teardown):
+        self.teardown = teardown
+        self.stops = 0
+
+    def stop_when_complete(self, future):
+        return base_mod._EventLoopManager.stop_when_complete(self, future)
+
+    def submit(self, coro):
+        coro.close()
+        return self.teardown
+
+    async def run_async(self, coro):
+        coro.close()
+        if self.stops:
+            raise AssertionError("stopped runtime loop was reused")
+        await asyncio.wrap_future(self.teardown)
+
+    def stop(self):
+        self.stops += 1
+
+
 class TestConstructorValidation:
     """Constructor-time validation for both ``MegatronLLM`` and ``MegatronAsyncLLM``."""
 
@@ -202,24 +229,7 @@ class TestLifecycleGuards:
         llm = _make_worker_instance(MegatronAsyncLLM)
         teardown = concurrent.futures.Future()
 
-        class LoopManager:
-            stops = 0
-            stop_when_complete = base_mod._EventLoopManager.stop_when_complete
-
-            @staticmethod
-            def submit(coro):
-                coro.close()
-                return teardown
-
-            @staticmethod
-            async def run_async(coro):
-                coro.close()
-                await asyncio.wrap_future(teardown)
-
-            def stop(self):
-                self.stops += 1
-
-        llm._loop_manager = LoopManager()
+        llm._loop_manager = _ShutdownLoopManager(teardown)
         first = asyncio.create_task(llm.shutdown())
         await asyncio.sleep(0)
         second = asyncio.create_task(llm.shutdown())
@@ -239,18 +249,6 @@ class TestLifecycleGuards:
         release_frontend = concurrent.futures.Future()
         second_started = concurrent.futures.Future()
 
-        class LoopManager:
-            stops = 0
-            stop_when_complete = base_mod._EventLoopManager.stop_when_complete
-
-            @staticmethod
-            def submit(coro):
-                coro.close()
-                return teardown
-
-            def stop(self):
-                self.stops += 1
-
         def hold_first_caller():
             frontend_entered.set_result(None)
             release_frontend.result(timeout=10)
@@ -259,7 +257,7 @@ class TestLifecycleGuards:
             second_started.set_result(None)
             return asyncio.run(llm.shutdown())
 
-        llm._loop_manager = LoopManager()
+        llm._loop_manager = _ShutdownLoopManager(teardown)
         llm._stop_frontend_if_started = hold_first_caller
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             try:
@@ -283,24 +281,7 @@ class TestLifecycleGuards:
         llm = _make_worker_instance(MegatronAsyncLLM)
         teardown = concurrent.futures.Future()
 
-        class LoopManager:
-            stops = 0
-            stop_when_complete = base_mod._EventLoopManager.stop_when_complete
-
-            @staticmethod
-            def submit(coro):
-                coro.close()
-                return teardown
-
-            @staticmethod
-            async def run_async(coro):
-                coro.close()
-                await asyncio.wrap_future(teardown)
-
-            def stop(self):
-                self.stops += 1
-
-        llm._loop_manager = LoopManager()
+        llm._loop_manager = _ShutdownLoopManager(teardown)
         caller = asyncio.create_task(llm.shutdown())
         await asyncio.sleep(0)
         caller.cancel()
@@ -317,24 +298,7 @@ class TestLifecycleGuards:
         llm = _make_worker_instance(MegatronAsyncLLM)
         teardown = concurrent.futures.Future()
 
-        class LoopManager:
-            stops = 0
-            stop_when_complete = base_mod._EventLoopManager.stop_when_complete
-
-            @staticmethod
-            def submit(coro):
-                coro.close()
-                return teardown
-
-            @staticmethod
-            async def run_async(coro):
-                coro.close()
-                await asyncio.wrap_future(teardown)
-
-            def stop(self):
-                self.stops += 1
-
-        llm._loop_manager = LoopManager()
+        llm._loop_manager = _ShutdownLoopManager(teardown)
         teardown.set_exception(RuntimeError("teardown failed"))
 
         with pytest.raises(RuntimeError, match="teardown failed"):
@@ -347,25 +311,7 @@ class TestLifecycleGuards:
         teardown = concurrent.futures.Future()
         teardown.set_result(None)
 
-        class LoopManager:
-            stopped = False
-            stop_when_complete = base_mod._EventLoopManager.stop_when_complete
-
-            @staticmethod
-            def submit(coro):
-                coro.close()
-                return teardown
-
-            async def run_async(self, coro):
-                coro.close()
-                if self.stopped:
-                    raise AssertionError("stopped runtime loop was reused")
-                await asyncio.wrap_future(teardown)
-
-            def stop(self):
-                self.stopped = True
-
-        llm._loop_manager = LoopManager()
+        llm._loop_manager = _ShutdownLoopManager(teardown)
         await llm.shutdown()
         await llm.wait_for_shutdown()
 
@@ -380,23 +326,11 @@ class TestLifecycleGuards:
 
     @pytest.mark.asyncio
     async def test_generate_after_shutdown_is_rejected(self):
-        class AcceptingLoopManager:
-            """Accepts and discards work, so only the shutdown check can reject a call."""
-
-            @staticmethod
-            def run_sync(coro):
-                coro.close()
-
-            submit = run_sync
-
-            @staticmethod
-            async def run_async(coro):
-                coro.close()
-
         sync_llm = _make_worker_instance(MegatronLLM)
         sync_llm._is_primary_rank = True
         sync_llm._shutdown_called = True
-        sync_llm._loop_manager = AcceptingLoopManager()
+        # A runtime loop that would accept work, so only the shutdown check can reject calls.
+        sync_llm._loop_manager = MagicMock()
         with pytest.raises(RuntimeError, match="shut down"):
             sync_llm.generate("late")
         for method in ("pause", "unpause", "suspend", "resume"):
@@ -411,7 +345,7 @@ class TestLifecycleGuards:
         async_llm = _make_worker_instance(MegatronAsyncLLM)
         async_llm._is_primary_rank = True
         async_llm._shutdown_called = True
-        async_llm._loop_manager = AcceptingLoopManager()
+        async_llm._loop_manager = MagicMock()
         with pytest.raises(RuntimeError, match="shut down"):
             await async_llm.generate("late")
         for method in ("pause", "unpause", "suspend", "resume"):
