@@ -56,6 +56,15 @@ class SinglePassMHCState:
         )
 
 
+def get_mhc_aggregate(config: TransformerConfig) -> Callable[[Tensor, Tensor], Tensor] | None:
+    """Bind the configured fused aggregation for the stack's final contraction."""
+    if not config.use_fused_mhc:
+        return None
+    from megatron.core.fusions.fused_mhc_kernels import fused_h_aggregate
+
+    return partial(fused_h_aggregate, backend=config.mhc_fused_backend)
+
+
 def build_mhc_recompute_layer_plan(
     num_layers: int, mhc_recompute_layer_num: Optional[int], use_mhc_recompute: bool
 ) -> Tuple[list[Optional[CheckpointWithoutOutputManager]], list[bool]]:

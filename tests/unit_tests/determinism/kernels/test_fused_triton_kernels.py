@@ -37,6 +37,7 @@ from megatron.core.transformer.moe.moe_utils import pad_routing_map
 from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
     bytes_equal,
+    deterministic_algorithms,
     seeded,
 )
 
@@ -497,18 +498,44 @@ def test_mhc_sinkhorn_replays_fwd_bwd(backend):
 
 
 @pytest.mark.parametrize("backend", _MHC_BACKENDS)
-def test_mhc_h_aggregate_replays_fwd_bwd(backend):
+@pytest.mark.parametrize("mix_dtype", [torch.bfloat16, torch.float32])
+def test_mhc_h_aggregate_replays_fwd_bwd(backend, mix_dtype):
     if backend == "triton" and not fused_mhc_kernels.is_triton_available():
         pytest.skip("Triton mHC backend unavailable")
     seeded()
     x = _mhc_rand(S, B, N, C)
-    h_pre = _mhc_rand(S, B, N)
+    h_pre = _mhc_rand(S, B, N, dtype=mix_dtype)
     assert_replays_bit_exact(
         lambda x, h: fused_mhc_kernels.fused_h_aggregate(x, h, backend=backend),
         (x, h_pre),
         replays=3,
         what=f"mhc h_aggregate[{backend}]",
     )
+
+
+@pytest.mark.launch_on_gb200
+def test_csa2_cudnn_r2_pool_replays_fwd_bwd():
+    """Unused atomic dAPE must not affect pooled values or projection gradients."""
+    from megatron.core.ops.attention.csa.cudnn_pooling import get_cudnn_r2_pool
+
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("cuDNN compressor requires SM100 or newer")
+    pytest.importorskip("cudnn.csa.compressor")
+    pool = get_cudnn_r2_pool()
+    assert pool is not None
+    seeded()
+    kv = torch.randn(1026, 1, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    gate = torch.randn_like(kv, requires_grad=True)
+    with deterministic_algorithms(False):
+        assert_replays_bit_exact(
+            lambda kv, gate: pool(kv, gate, kv.dtype),
+            (kv, gate),
+            replays=3,
+            contention=True,
+            what="CSA2 cuDNN ratio-2 pooling",
+        )
+    with deterministic_algorithms(True):
+        assert pool(kv, gate, kv.dtype) is None
 
 
 @pytest.mark.parametrize("backend", _MHC_BACKENDS)

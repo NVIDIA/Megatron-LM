@@ -110,6 +110,18 @@ def _checkpoint_contexts():
     return forward(), replay()
 
 
+class _GraphInputGrad(torch.autograd.Function):
+    """Give shared producers gradients independent of a graph's reusable buffers."""
+
+    @staticmethod
+    def forward(ctx, tensor):
+        return tensor.view_as(tensor)
+
+    @staticmethod
+    def backward(ctx, gradient):
+        return gradient.clone()
+
+
 class _GraphOutputs(torch.autograd.Function):
     """Protect captured buffers and reject unsupported dynamic gradient activity."""
 
@@ -166,6 +178,7 @@ class StatefulGraphs:
         num_warmup_iters: int = 3,
         debug_checks: bool = False,
         capture_kwargs: Mapping | None = None,
+        make_forward_pre_hook=None,
     ) -> None:
         if not hidden.is_cuda or slots < 1:
             raise ValueError("Stateful CUDA graphs require a CUDA sample and positive slot count")
@@ -203,6 +216,13 @@ class StatefulGraphs:
         self._recorded = [False] * slots
         self._callables = []
         self._wrappers = []
+        self._manual_forward_hooks = []
+        if make_forward_pre_hook is not None:
+            self.setup_manual_hooks(make_forward_pre_hook)
+            # Lazy capture may follow an asynchronous parameter gather. Drain it
+            # before capture suppresses the ordinary DDP parameter-owner hooks.
+            for hook, module in self._manual_forward_hooks:
+                hook(module)
         for _ in range(slots):
             wrapper = StatefulModule(region.module, region.inputs.fields, region.outputs.fields)
             wrapper.training = region.training
@@ -239,6 +259,9 @@ class StatefulGraphs:
             for p in self.region.parameters()
         ]
         backups = [None if main is None else main.clone() for _, _, main, _ in saved]
+        # Router statistics and other registered state must count real invocations,
+        # not the extra forward/backward calls used to build each graph slot.
+        buffers = [(buffer, buffer.clone()) for buffer in self.region.buffers()]
         was_capturing = cuda_graphs.is_graph_capturing()
         # DDP retains AccumulateGrad nodes created before the capture stream.
         # Match MCore's full-graph setup, but restore this process-global switch.
@@ -257,6 +280,9 @@ class StatefulGraphs:
             fused.extend(p for p, _, _, _ in saved if getattr(p, "grad_added_to_main_grad", False))
         finally:
             try:
+                with torch.no_grad():
+                    for buffer, value in buffers:
+                        buffer.copy_(value)
                 for (p, grad, main, flag), backup in zip(saved, backups):
                     if main is not None:
                         main.copy_(backup)
@@ -303,7 +329,10 @@ class StatefulGraphs:
             tuple(tensor.shape),
             tensor.dtype,
             tensor.device,
-            tensor.stride(),
+            # Singleton dimensions do not advance the storage offset.
+            tuple(
+                stride if size != 1 else 0 for size, stride in zip(tensor.shape, tensor.stride())
+            ),
             tensor.requires_grad,
         )
 
@@ -333,7 +362,16 @@ class StatefulGraphs:
             wrapper.forward = StatefulModule.forward.__get__(wrapper, StatefulModule)
         self._callables.clear()
         self._wrappers.clear()
+        self._manual_forward_hooks.clear()
         gc.collect()
+
+    def setup_manual_hooks(self, make_hook_func):
+        """Run parameter-gather pre-hooks for the captured parameter owners."""
+        self._manual_forward_hooks = [
+            (make_hook_func(), module)
+            for module in self.region.module.modules()
+            if next(module.parameters(recurse=False), None) is not None
+        ]
 
     def run(
         self, hidden: Tensor, state: Mapping[str, Tensor | None], *, slot: int = 0
@@ -348,6 +386,9 @@ class StatefulGraphs:
             raise ValueError("Stateful graph input profile differs from capture")
         if self._recorded[slot]:
             torch.cuda.current_stream(self.device).wait_event(self._events[slot])
+        for hook, module in self._manual_forward_hooks:
+            hook(module)
+        args = (args[0], *(_GraphInputGrad.apply(t) if t.requires_grad else t for t in args[1:]))
         outputs = self._callables[slot](*args)
         if torch.is_grad_enabled() and any(t.requires_grad for t in outputs):
             self._busy[slot] = True

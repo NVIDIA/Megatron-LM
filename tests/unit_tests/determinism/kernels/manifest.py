@@ -365,6 +365,26 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "router gating GEMM, TE fused permutation/router kernels.",
     ),
     KernelEntry(
+        name="mok_route_adapter",
+        sources=("megatron/core/transformer/moe/megakernel/mok/route_adapter.py",),
+        tests=(K + "test_mok_kernels.py",),
+        kind="triton",
+        notes="Dense routing-map compaction and router-gradient scatter use one CTA per token "
+        "and unique expert indices; replayed with missing routes and side-stream contention.",
+    ),
+    KernelEntry(
+        name="mok_runtime",
+        sources=(
+            "megatron/core/transformer/moe/megakernel/mok/backend.py",
+            "megatron/core/transformer/moe/megakernel/mok/runtime.py",
+            "megatron/core/transformer/moe/megakernel/mok/weights.py",
+        ),
+        kind="dispatch",
+        exempt_reason="MOK forward/backward, schedule, and weight-descriptor kernels require "
+        "Blackwell GPUs and the optional qizhang/mcore-integration MOK build, which are not "
+        "available in the H100 determinism bucket. Routing conversion is replayed separately.",
+    ),
+    KernelEntry(
         name="moe_router",
         sources=("megatron/core/transformer/moe/router.py",),
         tests=(
@@ -853,6 +873,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "GEMM path; the SYRK paths are exercised only where the stack supports them.",
     ),
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
+    KernelEntry(
+        name="csa2_cudnn_r2_pool",
+        sources=("megatron/core/ops/attention/csa/cudnn_pooling.py",),
+        tests=(
+            K + "test_fused_triton_kernels.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",
+        ),
+        kind="dispatch",
+        notes="cuDNN ratio-2 forward/dKV/dGate replay with unused dAPE; native fallback under "
+        "strict determinism. BF16 padding and warmed CUDA Graph gradients are checked separately.",
+    ),
     KernelEntry(
         name="csa2_shared_attention",
         sources=(

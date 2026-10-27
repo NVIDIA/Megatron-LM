@@ -2285,6 +2285,7 @@ class TECudaGraphHelper:
         self.callables_per_chunk_is_mtp = []
         self.flattened_callables = []
         self.flattened_callables_is_mtp = []
+        self.stateful_graph_adapters = []
         for chunk_number, model_chunk in enumerate(self.model):
             try:
                 chunk_with_decoder = get_attr_wrapped_model(
@@ -2301,6 +2302,9 @@ class TECudaGraphHelper:
                     f'No valid layer in model chunk {chunk_number}.',
                 )
             else:
+                adapter = getattr(chunk_with_decoder.decoder, 'forward_adapter', None)
+                if callable(getattr(adapter, 'prepare_cuda_graphs', None)):
+                    self.stateful_graph_adapters.append((chunk_number, adapter))
                 num_decoder_layers = len(chunk_with_decoder.decoder.layers)
                 if hasattr(chunk_with_decoder, 'mtp'):
                     num_mtp_layers = len(chunk_with_decoder.mtp.layers)
@@ -2369,7 +2373,41 @@ class TECudaGraphHelper:
         This returns False if create_cudagraphs() was called but no graphable layers
         were found, and True if at least one graph was successfully created.
         """
-        return self._graphs_created
+        return self._graphs_created or any(
+            adapter.has_cuda_graphs() for _, adapter in self.stateful_graph_adapters
+        )
+
+    def _prepare_stateful_graphs(self):
+        """Reserve each chunk's peak live microbatches for model-owned tensor regions."""
+        if not self.stateful_graph_adapters:
+            return
+        from megatron.core.pipeline_parallel.schedules import (
+            get_pp_rank_microbatches,
+            get_schedule_table,
+        )
+
+        microbatches = get_num_microbatches() if self.pp_group.size() > 1 else 1
+        _, _, warmup, _ = get_pp_rank_microbatches(
+            microbatches,
+            self.num_model_chunks,
+            self.config.microbatch_group_size_per_vp_stage,
+            forward_only=False,
+            p2p_communicator=self.p2p_communicator,
+        )
+        order = convert_schedule_table_to_order(
+            warmup,
+            self.num_model_chunks,
+            get_schedule_table(
+                microbatches, self.num_model_chunks, self.config.microbatch_group_size_per_vp_stage
+            ),
+        )
+        live, peak = [0] * self.num_model_chunks, [0] * self.num_model_chunks
+        for operation in order:
+            chunk = abs(operation) - 1
+            live[chunk] += 1 if operation > 0 else -1
+            peak[chunk] = max(peak[chunk], live[chunk])
+        for chunk, adapter in self.stateful_graph_adapters:
+            adapter.prepare_cuda_graphs(slots=peak[chunk], backend='transformer_engine')
 
     def _get_sample_arguments(self, order, chunk_id_list=None):
         """
@@ -2860,15 +2898,17 @@ class TECudaGraphHelper:
         """
         Capture CUDA Graphs per TransformerLayer per microbatch.
         """
+        self._prepare_stateful_graphs()
+
         start_time = self._start_capturing()
 
-        if not self.flattened_callables:
+        if not self.flattened_callables and not self.stateful_graph_adapters:
             # Check if there are any graphable layers. If not, log a warning and skip capture,
             # but still call _finish_capturing to ensure all ranks complete the capture phase.
             logger.warning(
                 'TECudaGraphHelper: No graphable layers found. Skipping CUDA graph capture.'
             )
-        else:
+        elif self.flattened_callables:
             # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
             sample_args, kwargs = self._get_cuda_graph_input_data()
             if self.config.sequence_parallel:
@@ -2908,6 +2948,8 @@ class TECudaGraphHelper:
         Set CUDA Graph manual hooks for the modules that contain direct parameters and
         are covered by cudagraphs.
         """
+        for chunk_number, adapter in self.stateful_graph_adapters:
+            adapter.setup_cuda_graph_hooks(self.model[chunk_number]._make_forward_pre_hook)
         for chunk_number, layers in enumerate(self.callables_per_chunk):
             model_chunk = self.model[chunk_number]
             for layer in layers:
@@ -2917,7 +2959,9 @@ class TECudaGraphHelper:
         """
         Delete all CUDA graphs.
         """
-        assert self._graphs_created, "No CUDA Graphs were created to delete."
+        assert self.graphs_created(), "No CUDA Graphs were created to delete."
+        for _, adapter in self.stateful_graph_adapters:
+            adapter.reset_cuda_graphs()
 
         graph_resettable = is_te_min_version("2.10.0")
         graphs_reset, graphs_not_reset = 0, 0

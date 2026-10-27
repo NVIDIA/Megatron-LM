@@ -57,11 +57,18 @@ queries contiguously. Dynamic hybrid-CP remains unsupported.
 
 Full recomputation uses `--recompute-granularity full --recompute-method uniform
 --recompute-num-layers 1`. Selective mHC recomputation keeps main's existing
-interface. Graph capture is an explicit model API (`capture_layers`,
-`graph_slots`, `graph_backend`), not automatic CLI warmup. It excludes Engram
-layers and full-recompute profiles. Reserve a slot for every in-flight
-microbatch. Variable-token MoE execution remains eager; capture attention layers
-without Engram attached.
+interface. Partial graphs use the common `StatefulModule`/`StatefulGraphs`
+interfaces. With `--cuda-graph-impl transformer_engine --cuda-graph-modules attn
+moe_router`, the existing warmup boundary arms capture on the next real batch;
+the pipeline schedule determines each chunk's required graph slots. The explicit
+model API (`capture_layers`, `graph_slots`, `graph_backend`) remains available.
+Physical V layers capture attention and shared CSA2 outputs; E layers capture
+router probabilities and maps. Normalization on E layers, dispatch and experts
+remain eager. Engram and mHC aggregation/post-mixing run outside the consumer
+graphs, preserving selective mHC checkpoints. Full recompute uses a separate
+execution profile. Explicit capture callers must reserve a slot for every
+in-flight microbatch. Capture profiles fix geometry, dtype and gradient activity;
+packed prefix contents and tokens may change at that geometry.
 
 Local checks use real CPU PyTorch/Gloo. HybridStack parity tests substitute CPU
 projections and RoPE storage for TE/CUDA, and compare eager, checkpoint and split

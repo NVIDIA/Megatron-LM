@@ -191,7 +191,7 @@ class V41StateCodec:
             result.prepare_fused_kv()
         return result, SinglePassMHCState(state.get('mhc')), packed
 
-    def snapshot(self, csa, mhc, state, boundary, *, loss=False):
+    def snapshot(self, csa, mhc, state, boundary, *, loss=False, schema=None):
         """Publish live fields and discard consumed owners without detaching their uses."""
         values = dict(state)
         values.update(
@@ -205,7 +205,7 @@ class V41StateCodec:
             values.update(
                 candidate_ids=csa.candidates.indices, candidate_counts=csa.candidates.lengths
             )
-        schema = self.schema(boundary, loss=loss)
+        schema = self.schema(boundary, loss=loss) if schema is None else schema
         values = {f.key: values[f.key] for f in schema.fields}
         for field in schema.fields:
             if not field.differentiable:
