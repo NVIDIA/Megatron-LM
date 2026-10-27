@@ -1,16 +1,29 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import subprocess
+import sys
 import unittest
+from pathlib import Path
 
+import pytest
 import torch
 import torch.nn.functional as F
 
 try:
-    from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen_fn
+    from megatron.core.ssm.ops.mamba2.ssd_combined import (
+        causal_conv1d_cpp_available,
+        mamba_chunk_scan_combined_varlen_fn,
+        mamba_split_conv1d_scan_combined_varlen,
+    )
 
     HAVE_SSD_OPS = True
 except (ImportError, Exception):
     HAVE_SSD_OPS = False
+
+try:
+    from causal_conv1d import causal_conv1d_fn
+except ImportError:
+    causal_conv1d_fn = None
 
 
 def _chunk_metadata(lens, chunk_size, device):
@@ -190,6 +203,124 @@ class TestMambaChunkScanCombinedVarlenFn(unittest.TestCase):
         self.assertTrue(torch.equal(out_a, out_b))
         for name, a, b in zip(["dx", "ddt", "dz"], grads_a, grads_b):
             self.assertTrue(torch.equal(a, b), name)
+
+
+@unittest.skipIf(not HAVE_SSD_OPS, "SSD ops (Triton 3+) not available")
+@unittest.skipIf(
+    not HAVE_SSD_OPS or not causal_conv1d_cpp_available(), "causal_conv1d >= 1.5.1 not available"
+)
+@unittest.skipIf(not torch.cuda.is_available(), "CUDA required for SSD ops")
+class TestMambaSplitConv1dScanCombinedVarlen(unittest.TestCase):
+    """The fused split + conv1d + varlen SSD against the same steps run one by one."""
+
+    def setUp(self):
+        self.device = torch.device("cuda")
+        # zxbcdt is 2 * 64 + 2 * 2 * 16 + 4 = 196 wide, so its token stride is not a multiple of 8.
+        self.nheads, self.headdim, self.ngroups, self.dstate, self.width = 4, 16, 2, 16, 4
+
+    def _inputs(self, seqlen, d_has_hdim, seed):
+        g = torch.Generator(device=self.device).manual_seed(seed)
+        H, P, G, N = self.nheads, self.headdim, self.ngroups, self.dstate
+        conv_dim = H * P + 2 * G * N
+        rand = lambda *s, scale=1.0: torch.randn(*s, device=self.device, generator=g) * scale
+        zxbcdt = rand(seqlen, H * P + conv_dim + H).bfloat16()
+        conv1d_weight = rand(conv_dim, self.width, scale=0.5).bfloat16()
+        conv1d_bias = rand(conv_dim, scale=0.5).bfloat16()
+        dt_bias = rand(H, scale=0.5)
+        A = -torch.rand(H, device=self.device, generator=g) * 2 - 0.1
+        D = rand(H, P) if d_has_hdim else rand(H)
+        return [zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D]
+
+    def _unfused(
+        self, zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, metadata, state_dtype
+    ):
+        H, P, G, N = self.nheads, self.headdim, self.ngroups, self.dstate
+        cu_chunk_seqlens, last_chunk, chunk_seq = metadata
+        z, xBC, dt = torch.split(zxbcdt, [H * P, H * P + 2 * G * N, H], dim=-1)
+        token_seq_idx = torch.repeat_interleave(chunk_seq, cu_chunk_seqlens.diff().long())[None]
+        xBC = causal_conv1d_fn(
+            xBC.contiguous().t().unsqueeze(0),
+            conv1d_weight,
+            conv1d_bias,
+            seq_idx=token_seq_idx,
+            activation="silu",
+        )[0].t()
+        x, B, C = torch.split(xBC, [H * P, G * N, G * N], dim=-1)
+        return mamba_chunk_scan_combined_varlen_fn(
+            x.unflatten(-1, (H, P)),
+            dt,
+            A,
+            B.unflatten(-1, (G, N)),
+            C.unflatten(-1, (G, N)),
+            chunk_size,
+            cu_chunk_seqlens,
+            last_chunk,
+            chunk_seq,
+            D=D,
+            z=z.unflatten(-1, (H, P)),
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            state_dtype=state_dtype,
+        ).flatten(-2)
+
+    def _fused(
+        self, zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, metadata, state_dtype
+    ):
+        return mamba_split_conv1d_scan_combined_varlen(
+            zxbcdt,
+            conv1d_weight,
+            conv1d_bias,
+            dt_bias,
+            A,
+            D,
+            chunk_size,
+            *metadata,
+            headdim=self.headdim,
+            ngroups=self.ngroups,
+            state_dtype=state_dtype,
+        )
+
+    def test_matches_unfused(self):
+        chunk_size, lens = 16, [1, 15, 16, 17, 40, 5, 33]
+        metadata = _chunk_metadata(lens, chunk_size, self.device)
+        for d_has_hdim, state_dtype in ((False, None), (True, None), (False, torch.float32)):
+            with self.subTest(d_has_hdim=d_has_hdim, state_dtype=state_dtype):
+                inputs = self._inputs(sum(lens), d_has_hdim, seed=3)
+                g = torch.Generator(device=self.device).manual_seed(4)
+                dout = torch.randn(
+                    sum(lens), self.nheads * self.headdim, device=self.device, generator=g
+                ).bfloat16()
+                results = []
+                for fn in (self._unfused, self._fused):
+                    leaves = [t.detach().clone().requires_grad_() for t in inputs]
+                    out = fn(*leaves, chunk_size, metadata, state_dtype)
+                    out.backward(dout)
+                    results.append([out.detach()] + [t.grad for t in leaves])
+                # The output and the per-token gradients are bitwise equal. The parameter gradients
+                # are reductions over tokens: dA and ddt_bias use atomic adds, causal_conv1d's
+                # weight and bias gradients too. dD can differ in the last bit: the fused path
+                # writes dz into dzxbcdt, whose token stride selects another Triton
+                # specialization of the dz kernel, with a different FMA contraction.
+                self.assertTrue(torch.equal(results[1][0], results[0][0]), "out")
+                self.assertTrue(torch.equal(results[1][1], results[0][1]), "dzxbcdt")
+                names = ["dconv1d_weight", "dconv1d_bias", "ddt_bias", "dA", "dD"]
+                for name, unfused, fused in zip(names, results[0][2:], results[1][2:]):
+                    # bf16 conv1d gradients, fp32 SSD parameter gradients.
+                    tol = 1e-2 if name.startswith("dconv1d") else 1e-5
+                    torch.testing.assert_close(fused, unfused, atol=tol, rtol=tol, msg=name)
+
+
+@pytest.mark.skipif(not HAVE_SSD_OPS, reason="SSD ops (Triton 3+) not available")
+def test_import_does_not_load_causal_conv1d():
+    """`import megatron.core` imports the varlen ops, so they must import causal_conv1d lazily."""
+    code = (
+        "import sys, megatron.core.ssm.ops.mamba2.ssd_combined; "
+        "assert 'causal_conv1d' not in sys.modules"
+    )
+    # From the repo root, so that the child imports this tree's megatron.
+    subprocess.run(
+        [sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[5], check=True
+    )
 
 
 if __name__ == "__main__":

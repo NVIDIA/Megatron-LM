@@ -496,9 +496,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_ssm_kernels.py",),
         kind="triton",
         notes="mamba_chunk_scan_combined_varlen, the differentiable mamba_chunk_scan_combined_varlen_fn "
-        "(forward and backward) and selective_state_update under the pinned autotune / ordered "
-        "workspace. The backward accumulates ddt, dD, ddA_cumsum, dA and dt_bias with atomics "
-        "unless deterministic mode selects the ordered workspaces.",
+        "and mamba_split_conv1d_scan_combined_varlen (forward and backward) and "
+        "selective_state_update under the pinned autotune / ordered workspace. The backward "
+        "accumulates ddt, dD, ddA_cumsum, dA and dt_bias with atomics unless deterministic mode "
+        "selects the ordered workspaces; the fused Function's causal_conv1d backward needs "
+        "CAUSAL_CONV1D_DETERMINISTIC.",
     ),
     KernelEntry(
         name="ssm_mamba2_batch_invariant_decode",

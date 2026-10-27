@@ -2,7 +2,8 @@
 # Adapted from:
 #   https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/ssd_combined.py
 # Adapted from vLLM project (Apache-2.0).
-# The varlen backward is adapted from (Apache-2.0):
+# The varlen backward and the fused split + conv1d + SSD Function (from
+# MambaSplitConv1dScanCombinedFn) are adapted from (Apache-2.0):
 # https://github.com/state-spaces/mamba/blob/v2.3.2.post1/mamba_ssm/ops/triton/ssd_combined.py
 # with the backward's state_dtype handling from state-spaces/mamba#972:
 # https://github.com/state-spaces/mamba/commit/0048fbf2e7b2f214dcbe703ea3dec2b9647595e1
@@ -1053,5 +1054,275 @@ def mamba_chunk_scan_combined_varlen_fn(
         dt_bias,
         dt_softplus,
         dt_limit,
+        state_dtype,
+    )
+
+
+def _conv1d_input(xBC):
+    """(seqlen, dim) -> (1, dim, seqlen) channel-last view, the layout in which causal_conv1d
+    accepts seq_idx. As mamba_ssm's ``ensure_stride``, the token stride must be a multiple of 8."""
+    if xBC.stride(0) % 8 != 0:
+        xBC = xBC.contiguous()
+    return xBC.t().unsqueeze(0)
+
+
+def _causal_conv1d_cpp():
+    """causal_conv1d's C++ forward and backward. Imported on first use: this module is imported by
+    every `import megatron.core`, which must not load causal_conv1d."""
+    from causal_conv1d.cpp_functions import causal_conv1d_bwd_function, causal_conv1d_fwd_function
+
+    return causal_conv1d_fwd_function, causal_conv1d_bwd_function
+
+
+def causal_conv1d_cpp_available():
+    """Whether `mamba_split_conv1d_scan_combined_varlen` can run: it needs
+    causal_conv1d.cpp_functions (causal_conv1d >= 1.5.1)."""
+    try:
+        _causal_conv1d_cpp()
+    except ImportError:
+        return False
+    return True
+
+
+class MambaSplitConv1dScanCombinedVarlenFn(torch.autograd.Function):
+    """Varlen counterpart of mamba_ssm's ``MambaSplitConv1dScanCombinedFn``: split, causal conv1d
+    and varlen SSD in one Function. Saves the input, the conv1d weights, the ungated SSD output
+    and the per-token sequence index, and recomputes the conv1d in the backward."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        zxbcdt,
+        conv1d_weight,
+        conv1d_bias,
+        dt_bias,
+        A,
+        D,
+        chunk_size,
+        cu_chunk_seqlens,
+        last_chunk_indices,
+        seq_idx,
+        dt_limit=(0.0, float("inf")),
+        activation="silu",
+        headdim=None,
+        ngroups=1,
+        state_dtype=None,
+    ):
+        """Run conv1d and the varlen SSD forward, keeping the ungated output for the backward."""
+        assert activation in [None, "silu", "swish"]
+        if D.dim() == 1:
+            assert headdim is not None
+            (nheads,) = D.shape
+        else:
+            nheads, headdim = D.shape
+        seqlen, _ = zxbcdt.shape
+        dim = nheads * headdim
+        assert nheads % ngroups == 0
+        dstate = (conv1d_weight.shape[0] - dim) // ngroups // 2
+        assert zxbcdt.shape == (seqlen, 2 * dim + 2 * ngroups * dstate + nheads)
+        assert dt_bias.shape == (nheads,)
+        assert A.shape == (nheads,)
+        z, xBC, dt = torch.split(zxbcdt, [dim, dim + 2 * ngroups * dstate, nheads], dim=-1)
+        # causal_conv1d resets at every change of the per-token sequence index.
+        token_seq_idx = torch.repeat_interleave(
+            seq_idx, cu_chunk_seqlens.diff().long(), output_size=seqlen
+        )[None]
+        silu = activation in ["silu", "swish"]
+        causal_conv1d_fwd_function, _ = _causal_conv1d_cpp()
+        xBC_conv = causal_conv1d_fwd_function(
+            _conv1d_input(xBC), conv1d_weight, conv1d_bias, token_seq_idx, None, None, silu
+        )[0].t()
+        x, B, C = torch.split(xBC_conv, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
+        x = x.unflatten(-1, (nheads, headdim))
+        out = torch.empty_like(x, memory_format=torch.contiguous_format)
+        out_x = torch.empty_like(out)
+        _mamba_chunk_scan_combined_fwd(
+            x,
+            dt,
+            A,
+            B.unflatten(-1, (ngroups, dstate)),
+            C.unflatten(-1, (ngroups, dstate)),
+            chunk_size,
+            out,
+            D=D,
+            z=z.unflatten(-1, (nheads, headdim)),
+            dt_bias=dt_bias,
+            seq_idx=seq_idx,
+            cu_chunk_seqlens=cu_chunk_seqlens,
+            last_chunk_indices=last_chunk_indices,
+            dt_softplus=True,
+            dt_limit=dt_limit,
+            state_dtype=state_dtype,
+            out_x=out_x,
+        )
+        ctx.save_for_backward(
+            zxbcdt,
+            conv1d_weight,
+            conv1d_bias,
+            out_x,
+            A,
+            D,
+            dt_bias,
+            cu_chunk_seqlens,
+            seq_idx,
+            token_seq_idx,
+        )
+        ctx.chunk_size = chunk_size
+        ctx.dt_limit = dt_limit
+        ctx.silu = silu
+        ctx.ngroups = ngroups
+        ctx.state_dtype = state_dtype
+        return out.flatten(-2)
+
+    @staticmethod
+    def backward(ctx, dout):
+        """Gradients for zxbcdt, the conv1d weight and bias, dt_bias, A and D."""
+        (
+            zxbcdt,
+            conv1d_weight,
+            conv1d_bias,
+            out_x,
+            A,
+            D,
+            dt_bias,
+            cu_chunk_seqlens,
+            seq_idx,
+            token_seq_idx,
+        ) = ctx.saved_tensors
+        _, nheads, headdim = out_x.shape
+        dim = nheads * headdim
+        ngroups = ctx.ngroups
+        dstate = (conv1d_weight.shape[0] - dim) // ngroups // 2
+        split = [dim, dim + 2 * ngroups * dstate, nheads]
+        z, xBC, dt = torch.split(zxbcdt, split, dim=-1)
+        # Recompute x, B, C.
+        causal_conv1d_fwd_function, causal_conv1d_bwd_function = _causal_conv1d_cpp()
+        xBC_conv = causal_conv1d_fwd_function(
+            _conv1d_input(xBC), conv1d_weight, conv1d_bias, token_seq_idx, None, None, ctx.silu
+        )[0].t()
+        x, B, C = torch.split(xBC_conv, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
+
+        # The SSD writes dz and ddt straight into dzxbcdt and dx, dB, dC into the conv1d output
+        # gradient, which the conv1d backward then turns into dzxbcdt's xBC slice.
+        dzxbcdt = torch.empty_like(zxbcdt)
+        dz, dxBC_given, ddt = torch.split(dzxbcdt, split, dim=-1)
+        dxBC = torch.empty_like(xBC, memory_format=torch.contiguous_format)
+        dx, dB, dC = torch.split(dxBC, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
+        _, _, dA, _, _, dD, _, ddt_bias = _mamba_chunk_scan_combined_varlen_bwd(
+            dout.reshape(-1, nheads, headdim),
+            x.unflatten(-1, (nheads, headdim)),
+            dt,
+            A,
+            B.unflatten(-1, (ngroups, dstate)),
+            C.unflatten(-1, (ngroups, dstate)),
+            out_x,
+            ctx.chunk_size,
+            cu_chunk_seqlens,
+            seq_idx,
+            D=D,
+            z=z.unflatten(-1, (nheads, headdim)),
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            dt_limit=ctx.dt_limit,
+            dx=dx.unflatten(-1, (nheads, headdim)),
+            ddt=ddt,
+            dB=dB.unflatten(-1, (ngroups, dstate)),
+            dC=dC.unflatten(-1, (ngroups, dstate)),
+            dz=dz.unflatten(-1, (nheads, headdim)),
+            state_dtype=ctx.state_dtype,
+        )
+        dxBC_given_update, dweight, dbias, _ = causal_conv1d_bwd_function(
+            _conv1d_input(xBC),
+            conv1d_weight,
+            conv1d_bias,
+            _conv1d_input(dxBC),
+            token_seq_idx,
+            None,
+            None,
+            _conv1d_input(dxBC_given),
+            False,
+            ctx.silu,
+        )
+        dxBC_given_update = dxBC_given_update[0].t()
+        if dxBC_given_update.data_ptr() != dxBC_given.data_ptr():
+            dxBC_given.copy_(dxBC_given_update)
+        return (
+            dzxbcdt,
+            dweight,
+            dbias,
+            ddt_bias,
+            dA,
+            dD,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def mamba_split_conv1d_scan_combined_varlen(
+    zxbcdt,
+    conv1d_weight,
+    conv1d_bias,
+    dt_bias,
+    A,
+    D,
+    chunk_size,
+    cu_chunk_seqlens,
+    last_chunk_indices,
+    seq_idx,
+    dt_limit=(0.0, float("inf")),
+    activation="silu",
+    headdim=None,
+    ngroups=1,
+    state_dtype=None,
+):
+    """Differentiable split + causal conv1d + varlen SSD for training on packed sequences.
+
+    The varlen counterpart of mamba_ssm's ``mamba_split_conv1d_scan_combined`` (without its
+    rmsnorm and out_proj options): chunks restart at every sequence start, so the output of a
+    sequence does not depend on what else is packed with it. The conv1d resets at sequence starts
+    too, and is recomputed in the backward instead of being saved.
+
+    Argument:
+        zxbcdt: (seqlen, 2 * dim + 2 * ngroups * dstate + nheads), z, x, B, C and dt concatenated
+        conv1d_weight: (dim + 2 * ngroups * dstate, width)
+        conv1d_bias: (dim + 2 * ngroups * dstate,)
+        dt_bias: (nheads,)
+        A: (nheads,)
+        D: (nheads, headdim) or (nheads,)
+        chunk_size: int
+        cu_chunk_seqlens: (nchunks + 1,)
+        last_chunk_indices: (batch,)
+        seq_idx: (nchunks,) int32 sequence index of every chunk (causal_conv1d needs int32)
+        headdim: required if D has no headdim
+        state_dtype: dtype of the materialized inter-chunk states, as in
+            ``mamba_chunk_scan_combined_varlen_fn``
+    Return:
+        out: (seqlen, dim), gated by z
+    """
+    assert (
+        causal_conv1d_cpp_available()
+    ), "mamba_split_conv1d_scan_combined_varlen requires causal_conv1d >= 1.5.1"
+    return MambaSplitConv1dScanCombinedVarlenFn.apply(
+        zxbcdt,
+        conv1d_weight,
+        conv1d_bias,
+        dt_bias,
+        A,
+        D,
+        chunk_size,
+        cu_chunk_seqlens,
+        last_chunk_indices,
+        seq_idx,
+        dt_limit,
+        activation,
+        headdim,
+        ngroups,
         state_dtype,
     )

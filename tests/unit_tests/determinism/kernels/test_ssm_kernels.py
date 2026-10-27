@@ -234,6 +234,52 @@ def test_mamba_chunk_scan_combined_varlen_fn_replays_fwd_bwd(state_dtype):
     )
 
 
+@requires_deterministic_conv1d
+def test_mamba_split_conv1d_scan_combined_varlen_replays_fwd_bwd():
+    """The fused split + causal_conv1d + varlen SSD; the conv1d is recomputed in the backward."""
+    from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_split_conv1d_scan_combined_varlen
+
+    seeded()
+    lens, nheads, headdim, ngroups, dstate, chunk = [1500, 1, 1283, 1312], 32, 64, 2, 128, 128
+    seqlen, dim = sum(lens), nheads * headdim
+    conv_dim = dim + 2 * ngroups * dstate
+    metadata = _varlen_chunk_metadata(lens, chunk)
+    zxbcdt = torch.randn(
+        seqlen, dim + conv_dim + nheads, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    conv1d_weight = (
+        torch.randn(conv_dim, 4, device="cuda", dtype=torch.bfloat16) * 0.5
+    ).requires_grad_()
+    conv1d_bias = (
+        torch.randn(conv_dim, device="cuda", dtype=torch.bfloat16) * 0.5
+    ).requires_grad_()
+    dt_bias = torch.rand(nheads, device="cuda", requires_grad=True)
+    A = (-torch.rand(nheads, device="cuda") - 1.0).requires_grad_()
+    D = torch.randn(nheads, device="cuda", requires_grad=True)
+
+    def fn(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D):
+        return mamba_split_conv1d_scan_combined_varlen(
+            zxbcdt,
+            conv1d_weight,
+            conv1d_bias,
+            dt_bias,
+            A,
+            D,
+            chunk,
+            *metadata,
+            headdim=headdim,
+            ngroups=ngroups,
+        )
+
+    assert_replays_bit_exact(
+        fn,
+        (zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D),
+        replays=3,
+        contention=True,
+        what="mamba_split_conv1d_scan_combined_varlen",
+    )
+
+
 def test_batch_invariant_decode_step_replays():
     """One buffered batch-invariant decode step (chunk scan in target-rows mode, gated by the
     current token's z) replays bit-exact, including a slot that crosses a chunk boundary."""
