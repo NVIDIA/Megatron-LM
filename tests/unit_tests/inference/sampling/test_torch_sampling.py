@@ -296,3 +296,67 @@ class TestFilterLogitsDoesNotMutateInput:
         assert torch.equal(
             logits, logits_snapshot
         ), "sample_from_logits mutated the caller's logits tensor"
+
+
+class TestSamplerMatchesFP32Reference:
+    """Sampler-level regressions for the two symptoms issue #7857 reports.
+
+    The filter-level tests pin the intermediate values; these pin what the
+    engine actually emits, which is what a user observes.
+    """
+
+    def test_bf16_sampler_never_emits_outside_the_fp32_nucleus(self):
+        """REGRESSION (issue #7857): with the BF16 divisor the nucleus kept a
+        second candidate (softmax mass 0.119 vs the FP32 reference's 0.076),
+        so the engine emitted token 2136 where the FP32 reference emitted
+        1317 with the same prefix and RNG state.
+
+        The FP32 nucleus holds the leading token only, so every draw must land
+        on it. Pre-fix the runner-up survived the filter and was drawn in
+        roughly one draw in eight.
+        """
+        # The issue's step-29 reproducer: two candidates whose scaled logits
+        # land 2.0 apart in BF16 but 2.5 apart in FP32.
+        logits = torch.tensor([[26.625, 26.375] + [-100.0] * 126], dtype=torch.bfloat16)
+
+        for seed in range(64):
+            sampled = TorchSampling.sample_from_logits(
+                logits,
+                temperature=0.1,
+                top_k=0,
+                top_p=0.9,
+                generator=torch.Generator().manual_seed(seed),
+            )
+            assert sampled.item() == 0, (
+                f"seed {seed} emitted token {sampled.item()}, which the FP32 "
+                "reference nucleus (leading token only) excludes (issue #7857)."
+            )
+
+    def test_fp16_zero_temperature_emits_the_argmax(self):
+        """REGRESSION (issue #7857, FP16 column): at temperature=0 the divisor
+        is floored to 1e-6, so FP16 scaling overflowed to ``inf`` and the
+        softmax produced NaN. The engine then emitted token 0 instead of the
+        greedy token (1124 in the issue's report).
+
+        Scaling in FP32 keeps the distribution finite and one-hot on the
+        argmax, so the sampler must agree with greedy.
+        """
+        logits = torch.tensor([[0.0, 1.0, 2.0, -1.0]], dtype=torch.float16)
+
+        filtered = TorchSampling.filter_logits(logits, temperature=0.0, top_k=0, top_p=0.0)
+        probabilities = filtered.softmax(dim=-1, dtype=torch.float32)
+        assert torch.isfinite(probabilities).all(), (
+            "FP16 scaling at temperature=0 produced non-finite probabilities " "(issue #7857)."
+        )
+
+        sampled = TorchSampling.sample_from_logits(
+            logits,
+            temperature=0.0,
+            top_k=0,
+            top_p=0.0,
+            generator=torch.Generator().manual_seed(123),
+        )
+        assert sampled.item() == int(logits.argmax()), (
+            f"zero-temperature sampling emitted token {sampled.item()} instead "
+            f"of the greedy token {int(logits.argmax())} (issue #7857)."
+        )

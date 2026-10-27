@@ -64,6 +64,12 @@ class TorchSampling(Sampling):
 
         Returns a new tensor (input unmodified). Shared by `sample_from_logits` and
         `log_probs_kernel` so sampling and processed log-probs apply the same filter.
+
+        The result is FP32 when `temperature != 1.0`: the divisor must not run in
+        the input's low precision, or BF16/FP16 rounding moves the top-p nucleus
+        boundary and FP16 scaling overflows to inf at low temperatures (issue
+        #7857). At `temperature == 1.0` there is no division, so the input dtype
+        is preserved.
         """
         top_p_active = not is_no_op_top_p(top_p)
         assert not (top_k > 0 and top_p_active), "Cannot have top-p and top-k both active"
