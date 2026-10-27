@@ -6,7 +6,8 @@ from unittest import mock
 import pytest
 import torch
 
-from megatron.core import recompute as recompute_module
+from megatron.core import tensor_parallel
+from megatron.core.context_parallel.utils import ContextParallelBatch
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import PipelineSplit
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
@@ -228,7 +229,7 @@ def test_hybrid_stack_omits_input_ids_keyword_when_not_provided():
 
 def test_hybrid_stack_full_recompute_preserves_ids_and_non_transformer_signature(monkeypatch):
     monkeypatch.setattr(
-        recompute_module.tensor_parallel,
+        tensor_parallel,
         "checkpoint",
         lambda function, _distribute_saved_activations, *args: function(*args),
     )
@@ -392,6 +393,142 @@ def test_hybrid_model_sequence_shards_hash_ids_with_decoder_input(monkeypatch, p
     else:
         assert decoder.kwargs["input_ids"] is None
     assert torch.equal(decoder.kwargs["padding_mask"], padding_mask[:, :2])
+
+
+def test_hybrid_model_scatters_embedding_for_sequence_parallel(monkeypatch):
+    decoder = RecordingDecoder()
+    tp_group = object()
+    embeddings = torch.randn(4, 2, 8)
+    local_embeddings = embeddings[:2].contiguous()
+    embedding = mock.Mock(return_value=embeddings)
+    embedding.scatter_to_sequence_parallel = False
+    inference_context = SimpleNamespace(
+        is_dynamic_batching=mock.Mock(return_value=True),
+        num_speculative_tokens=0,
+        zero_padding_tokens=mock.Mock(),
+    )
+
+    def fake_scatter(tensor, group):
+        assert tensor is embeddings
+        assert group is tp_group
+        return local_embeddings
+
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_model.tensor_parallel."
+        "scatter_to_sequence_parallel_region",
+        fake_scatter,
+    )
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_model.InferenceMode.is_active", lambda: True
+    )
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_model.is_using_quantization_scales",
+        lambda _config: True,
+    )
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_model.get_pg_rank",
+        lambda group: 3 if group is tp_group else None,
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            fine_grained_activation_offloading=False,
+            moe_paged_stash=False,
+            moe_num_hash_layers=0,
+            sequence_parallel=True,
+            freeze_base_model_for_mtp=False,
+        ),
+        decoder=decoder,
+        embedding=embedding,
+        position_embedding_type="none",
+        pre_process=True,
+        post_process=False,
+        share_embeddings_and_output_weights=False,
+        mtp_process=False,
+        vocab_size=128,
+        pg_collection=SimpleNamespace(tp=tp_group),
+    )
+    input_ids = torch.arange(8).reshape(2, 4)
+    position_ids = torch.arange(4).repeat(2, 1)
+
+    output = HybridModel.forward(
+        model,
+        input_ids=input_ids,
+        position_ids=position_ids,
+        attention_mask=None,
+        inference_context=inference_context,
+        runtime_gather_output=True,
+    )
+
+    embedding.assert_called_once_with(input_ids=input_ids, position_ids=position_ids)
+    inference_context.zero_padding_tokens.assert_called_once_with(
+        local_embeddings, sequence_parallel_rank=3
+    )
+    assert output is decoder.kwargs["hidden_states"]
+    assert output.unwrap() is local_embeddings
+
+
+@pytest.mark.parametrize("pre_process", [True, False])
+@pytest.mark.parametrize("tp_rank", [0, 1])
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+def test_hybrid_model_shards_each_layout_padding_mask(
+    monkeypatch, pre_process, tp_rank, sequence_parallel
+):
+    decoder = RecordingDecoder()
+    tp_group = object()
+
+    def scatter(tensor, group):
+        assert group is tp_group
+        return tensor.chunk(2, dim=0)[tp_rank].contiguous()
+
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_model.tensor_parallel."
+        "scatter_to_sequence_parallel_region",
+        scatter,
+    )
+    masks = {
+        "contiguous": torch.tensor([[False, True, False, False, True, True, False, True]]),
+        # A padded zigzag view may be longer than the contiguous view.
+        "zigzag": torch.tensor(
+            [[True, False, True, True, False, False, True, False, True, True, True, True]]
+        ),
+    }
+    cp_batch = ContextParallelBatch(
+        boundary_layout="contiguous",
+        batches_by_layout={layout: {"padding_mask": mask} for layout, mask in masks.items()},
+        packed_seq_params_by_layout={layout: None for layout in masks},
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            fine_grained_activation_offloading=False,
+            moe_paged_stash=False,
+            moe_num_hash_layers=0,
+            sequence_parallel=sequence_parallel,
+            freeze_base_model_for_mtp=False,
+        ),
+        decoder=decoder,
+        position_embedding_type="none",
+        pre_process=pre_process,
+        post_process=False,
+        share_embeddings_and_output_weights=False,
+        mtp_process=False,
+        pg_collection=SimpleNamespace(tp=tp_group),
+    )
+    hidden_states = torch.randn(4 if sequence_parallel else 8, 1, 8)
+    decoder.input_tensor = hidden_states
+    HybridModel.forward(
+        model,
+        input_ids=None,
+        position_ids=None,
+        attention_mask=None,
+        decoder_input=hidden_states if pre_process else None,
+        padding_mask=masks["contiguous"],
+        cp_batch=cp_batch,
+    )
+    for layout, mask in masks.items():
+        expected = mask.chunk(2, dim=1)[tp_rank] if sequence_parallel else mask
+        torch.testing.assert_close(decoder.kwargs["padding_mask_by_layout"][layout], expected)
+        # MTP and other consumers still need the original CP-only views.
+        assert cp_batch.get_batch(layout)["padding_mask"] is mask
 
 
 def test_chunked_hash_moe_keeps_ids_and_padding_aligned():

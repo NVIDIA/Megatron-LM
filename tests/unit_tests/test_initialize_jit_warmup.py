@@ -17,9 +17,15 @@ bias_swiglu/bias_gelu/bias_geglu kernel calls may be skipped.
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 
 from megatron.training.initialize import _warmup_jit_function
+
+
+@pytest.fixture(autouse=True)
+def warmup_config(run_config):
+    run_config.train.micro_batch_size = 2
 
 
 def _args(**overrides):
@@ -169,5 +175,6 @@ def test_dropout_warmup_and_geglu_cat(mock_get_args, mock_dropout, mock_rand, _c
     bias_arg, input_arg = mock_geglu.call_args[0]
     assert bias_arg.shape[-1] == 128  # 2 * (ffn_hidden_size // tp) = 2 * 64
     assert input_arg.shape[-1] == 128
+    assert input_arg.shape[1] == 2  # Batch size comes from cfg.train, not the legacy args.
     assert mock_dropout.call_count == 10  # unconditional for RNG parity
     assert mock_rand.call_count == 5

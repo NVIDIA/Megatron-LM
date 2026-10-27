@@ -224,6 +224,8 @@ def test_config_list_preserves_explicit_indexer_scale_hook(
 @pytest.mark.parametrize("tp_size,cp_size,pp_size", [(2, 1, 4), (1, 1, 8), (8, 1, 1)])
 def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_size):
     """Test HybridModel with custom process groups."""
+    if Utils.world_size != 8:
+        pytest.skip(f"requires 8 ranks, got {Utils.world_size}")
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tp_size,
         context_parallel_size=cp_size,
@@ -608,6 +610,7 @@ class TestHybridModel:
             # Exercise both layout boundaries without requiring a multi-rank CP group.
             layout_state = SimpleNamespace(
                 prepare_layer=lambda index, tensor: (tensor.roll(1, dims=0), None),
+                get_layer_padding_mask=lambda index, default, masks: default,
                 finalize_layer=lambda index, tensor: tensor.roll(-1, dims=0),
             )
             monkeypatch.setattr(
