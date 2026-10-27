@@ -471,7 +471,8 @@ class ProcessGroupCollection:
         and fallbacks.
 
         Args:
-            pg_collection: Optional process group collection. If None, uses parallel_state groups.
+            pg_collection: Optional process group collection. If None, uses parallel_state groups;
+                that fallback is deprecated and emits a ``ProcessGroupFallbackWarning``.
             model_chunks: List of model chunks to extract configuration from.
             use_gloo_process_groups: Whether to set up gloo process groups. With a
                 pg_collection, they come from its intra_dp_cp_gloo and intra_expt_dp_gloo fields
@@ -497,6 +498,11 @@ class ProcessGroupCollection:
         from megatron.core.utils import get_model_config
 
         if pg_collection is None:
+            warn_global_process_group_fallback(
+                "ProcessGroupCollection.setup_process_groups_for_optimizer",
+                deprecated_in="0.21",
+                removed_in="0.23",
+            )
             # Use parallel_state groups
             dp_group = parallel_state.get_data_parallel_group(
                 with_context_parallel=False, with_gtp_remat=False, partial_data_parallel=False
