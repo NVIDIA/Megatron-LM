@@ -11,6 +11,7 @@ import torch.distributed as dist
 from megatron.core.inference.disaggregation.engine import StateHandoffDynamicInferenceEngine
 from megatron.core.inference.sampling_params import SamplingParams
 from tests.unit_tests.inference.engines import batch_invariant_test_utils as fixture
+from tests.unit_tests.inference.engines.disagg_test_utils import requires_nixl
 
 
 def _params(count, **changes):
@@ -93,6 +94,7 @@ def _assert_pages(engine, blocks, expected):
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
+@requires_nixl
 @pytest.mark.parametrize("length", [17, 256, 257], ids=["64-to-128", "full-page", "partial-tail"])
 @torch.inference_mode()
 def test_batch_invariant_real_nixl_handoff(length):

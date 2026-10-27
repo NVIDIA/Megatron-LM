@@ -336,7 +336,9 @@ class TestMtpDecodeBookkeeping:
         assert context._using_cuda_graph_this_step is True
         assert context.padded_active_token_count == 4
         mha = context.graph_attn_metadata["mha_metadata"]
-        assert mha.state_data["max_seqlen_k"] == mha.max_seqlen == MAX_SEQUENCE_LENGTH
+        # The fixed bound also covers the speculative lookahead past the sequence limit.
+        bound = MAX_SEQUENCE_LENGTH + context.num_speculative_tokens
+        assert mha.state_data["max_seqlen_k"] == mha.max_seqlen == bound
         assert mha.state_data["max_seqlen_q"] == 1
         # The metadata is sized by the PADDED count so the graph's launch bounds stay stable.
         assert mha.state_data["query_lengths"].shape[0] == 4
@@ -390,7 +392,8 @@ class TestMtpDecodeBookkeeping:
         context._mtp_setup_decode_step()
         bound_at_high_position = mha.state_data["max_seqlen_k"]
 
-        assert bound_at_low_position == bound_at_high_position == MAX_SEQUENCE_LENGTH
+        bound = MAX_SEQUENCE_LENGTH + context.num_speculative_tokens
+        assert bound_at_low_position == bound_at_high_position == bound
         # The real per-request lengths still come from the GPU cu_kv tensors.
         assert int(context.gpu_view.mha_kv_seq_lengths[0].item()) == 21
 

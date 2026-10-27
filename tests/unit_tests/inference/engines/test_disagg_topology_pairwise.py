@@ -25,6 +25,7 @@ from tests.unit_tests.inference.engines.disagg_test_utils import (
     prompt,
     push_handoff,
     real_engine,
+    requires_nixl,
     run_to_completion,
     sampling,
 )
@@ -177,12 +178,12 @@ def admit_model_group(engine, failed=False):
         ("nccl", 1, 1, 2, 1),
         ("nccl", 1, 2, 1, 1),
         ("nccl", 2, 2, 1, 2),
-        ("nixl", 2, 1, 1, 1),
-        ("nixl", 1, 2, 1, 1),
+        pytest.param(("nixl", 2, 1, 1, 1), marks=requires_nixl),
+        pytest.param(("nixl", 1, 2, 1, 1), marks=requires_nixl),
         ("nccl", 2, 1, 2, 1, "local"),
         ("nccl", 2, 1, 2, 1, "inference_optimized"),
         ("nccl", 2, 1, 1, 1, "transformer_engine", "hybrid"),
-        ("nixl", 2, 1, 2, 1, "transformer_engine", "gpt", True),
+        pytest.param(("nixl", 2, 1, 2, 1, "transformer_engine", "gpt", True), marks=requires_nixl),
     ],
     ids=[
         "tp2-to-tp1",

@@ -32,6 +32,8 @@ from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngin
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
+    OffloadedRequestPayload,
+    RequestPayloadStageResult,
     Status,
     compute_block_hashes_batched,
 )
@@ -1983,7 +1985,11 @@ def test_hybrid_cached_continuation_preserves_recurrent_position(
         if mamba_boundaries is None
         else SimpleNamespace(hash_to_block_id={h: h for h in mamba_boundaries})
     )
-    req = SimpleNamespace(finished_chunk_token_count=0, precomputed_block_hashes=hashes)
+    req = SimpleNamespace(
+        finished_chunk_token_count=0,
+        precomputed_block_hashes=hashes,
+        sampling_params=SamplingParams(),
+    )
     bs = ctx.block_size_tokens
     recurrent_position = 0
 
@@ -2020,7 +2026,9 @@ def test_attention_only_cached_continuation_still_skips():
     hashes = list(range(1, 11))
     ctx.kv_block_allocator = SimpleNamespace(kv_hash_to_block_id={h: h for h in hashes})
     req = SimpleNamespace(
-        finished_chunk_token_count=4 * ctx.block_size_tokens, precomputed_block_hashes=hashes
+        finished_chunk_token_count=4 * ctx.block_size_tokens,
+        precomputed_block_hashes=hashes,
+        sampling_params=SamplingParams(),
     )
 
     match = ctx._compute_prefix_match(req, 6 * ctx.block_size_tokens + 2)
@@ -2052,7 +2060,11 @@ def test_attention_only_stage_of_hybrid_pipeline_skips_like_recurrent_stages(
     ctx.mamba_slot_allocator = None
     hashes = list(range(1, 11))
     ctx.kv_block_allocator = SimpleNamespace(kv_hash_to_block_id={h: h for h in hashes})
-    req = SimpleNamespace(finished_chunk_token_count=0, precomputed_block_hashes=hashes)
+    req = SimpleNamespace(
+        finished_chunk_token_count=0,
+        precomputed_block_hashes=hashes,
+        sampling_params=SamplingParams(),
+    )
     chunk_length = 4 * ctx.block_size_tokens
 
     match = ctx._compute_prefix_match(req, chunk_length)
@@ -3628,9 +3640,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
     )
     @pytest.mark.parametrize("async_sched_mode", list(AsyncScheduleMode))
     @torch.inference_mode()
-    def test_prompt_logprob_reuse(
-        self, monkeypatch, model_provider, chunked_donor, async_sched_mode
-    ):
+    def test_prompt_logprob_reuse(self, model_provider, chunked_donor, async_sched_mode):
         """Cached prompt scores match a cache-off run while skipping the cached prefill."""
         if model_provider == "hybrid":
             skip_if_sequence_packing_not_available("mamba")
@@ -3698,18 +3708,13 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             self._assert_prompt_logprob_parity(exact, oracle_top5)
             assert (exact.num_cached_tokens, exact_cost) == (expected_skipped, 1)
 
-            staged = []
-
-            def stage(uid, payload, **kwargs):
-                staged.append(payload)
-                return SimpleNamespace(response_metadata={"prompt_logprob_test": True})
-
-            with monkeypatch.context() as staging:
-                staging.setattr(engine, "payload_stager", SimpleNamespace(stage=stage))
-                reply = engine._serialize_finished_request(exact, None)
-            assert len(staged) == 1
-            assert staged[0].prompt_log_probs == exact.prompt_log_probs
-            assert len(staged[0].prompt_log_probs) == prompt_length - 1
+            # Stage as the engine does: the payload keeps every prompt score, and the
+            # offloaded reply omits them.
+            payload = OffloadedRequestPayload.from_request(exact)
+            assert payload.prompt_log_probs == exact.prompt_log_probs
+            assert len(payload.prompt_log_probs) == prompt_length - 1
+            stage_result = RequestPayloadStageResult({"prompt_logprob_test": True})
+            reply = engine._serialize_finished_request(exact, stage_result)
             assert reply["payload_offloaded"] and reply["prompt_log_probs"] is None
 
             # A narrower top-N reuses the cached rows.

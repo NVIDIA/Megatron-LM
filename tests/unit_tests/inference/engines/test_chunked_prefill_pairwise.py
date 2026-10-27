@@ -75,7 +75,7 @@ _PROMPT_LENGTH = 3 * _CHUNK_BUDGET + 17
 _PREFIX_LENGTH = 2 * _BLOCK_SIZE
 _PREFIX_FOLLOWER_LENGTH = _PREFIX_LENGTH + 300
 _MAX_SEQUENCE_LENGTH = 896
-_BATCH_INVARIANT_FA_VERSION = 4 if HAVE_FA4 else (3 if HAVE_FA3 else None)
+_FLASH_ATTENTION_VERSION = 4 if HAVE_FA4 else (3 if HAVE_FA3 else None)
 _TARGET_ID = 1
 _DONOR_ID = 10
 
@@ -186,7 +186,7 @@ _CASES = (
             config={
                 "batch_invariant_mode": True,
                 "batch_invariant_backend": "triton",
-                "flash_attention_version": _BATCH_INVARIANT_FA_VERSION,
+                "flash_attention_version": _FLASH_ATTENTION_VERSION,
             },
             signals=("chunked", "hybrid"),
             prerequisite="mamba",
@@ -616,7 +616,9 @@ def _tokens(length: int, offset: int = 0) -> torch.Tensor:
 def _config(case: _ChunkCase, chunked: bool) -> _DynamicEngineTestConfig:
     config = {
         "return_log_probs": True,
-        "flash_attention_version": 3,
+        # FA4 paged KV needs head dims divisible by 16.
+        "flash_attention_version": _FLASH_ATTENTION_VERSION,
+        "hidden_size": 64,
         "materialize_only_last_token_logits": False,
         **case.scenario.config,
     }
@@ -661,7 +663,7 @@ def _build_env(case: _ChunkCase, chunked: bool):
         assert context.batch_invariant_mode
         assert not context.enable_prefix_caching
         assert context.mamba_ssm_states_dtype == torch.float32
-        assert model_config.flash_attention_version == _BATCH_INVARIANT_FA_VERSION
+        assert model_config.flash_attention_version == _FLASH_ATTENTION_VERSION
         assert model_config.attention_backend.name == "flash"
         assert model_config.batch_invariant_backend == "triton"
     return env
@@ -674,7 +676,7 @@ def _case_prerequisites(case: _ChunkCase) -> None:
     if case.name == "gdp-prefix-state":
         skip_if_mamba_sequence_packing_not_available("hybrid", "gdp")
     elif case.name == "mamba-batch-invariant":
-        if not te_supports_batch_invariant_attention() or _BATCH_INVARIANT_FA_VERSION is None:
+        if not te_supports_batch_invariant_attention() or _FLASH_ATTENTION_VERSION is None:
             pytest.skip("batch-invariant Mamba needs TE support and FlashAttention 3 or 4")
     elif case.name == "te-fp8-fused-rope":
         pytest.importorskip("flashinfer")

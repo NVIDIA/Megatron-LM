@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
 from tests.unit_tests.inference.engines import batch_invariant_test_utils as bi
 
 
@@ -6,10 +7,12 @@ def test_mla_split_device_first_prefill():
     with bi.invariant_runtime(bi.MLA_CASE) as (backend, version):
         engine = bi.build_engine(bi.MLA_CASE, backend, version)
         model = engine.controller.inference_wrapped_model.model
-        assert version == 3 and model.config.use_cpu_initialization
+        assert model.config.use_cpu_initialization
         layers = [layer for layer in model.modules() if isinstance(layer, bi.MLASelfAttention)]
         sources = [layer.linear_kv_up_proj for layer in layers]
         assert len(sources) == 2 and all(source.weight.is_cuda for source in sources)
+        # The TE fused LayerNorm+Linear is what the latent cache splits.
+        assert all(isinstance(source, TELayerNormColumnParallelLinear) for source in sources)
         params = bi.SamplingParams(num_tokens_to_generate=1, top_k=1, termination_id=-1)
         engine.add_request(bi.TARGET, bi.target_prompt(bi.MLA_CASE.prompt_length), params)
         requests = engine.step_modern()["finished_requests"]

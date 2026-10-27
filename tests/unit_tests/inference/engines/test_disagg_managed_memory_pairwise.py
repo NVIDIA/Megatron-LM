@@ -14,7 +14,7 @@ from tests.unit_tests.inference.engines import test_disagg_pairwise as core
 transport_world = core.transport_world
 
 
-@pytest.mark.parametrize("backend", ["nccl", "nixl"])
+@pytest.mark.parametrize("backend", ["nccl", pytest.param("nixl", marks=core.requires_nixl)])
 def test_managed_memory_handoff(monkeypatch, transport_world, backend):
     initialize = DynamicInferenceContext.__init__
 

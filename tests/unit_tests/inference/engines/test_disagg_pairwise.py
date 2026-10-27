@@ -23,6 +23,7 @@ from tests.unit_tests.inference.engines.disagg_test_utils import (
     exchange,
     prompt,
     real_engine,
+    requires_nixl,
     run_to_completion,
     sampling,
     snapshot_source,
@@ -47,7 +48,7 @@ def transport_world():
     [
         pytest.param("nccl", 32, {}, 7, id="nccl-boundary"),
         pytest.param("nccl", 33, {}, 7, id="nccl-partial-tail"),
-        pytest.param("nixl", 33, {}, 7, id="nixl-partial-tail"),
+        pytest.param("nixl", 33, {}, 7, id="nixl-partial-tail", marks=requires_nixl),
         pytest.param(
             "nccl", 33, dict(context_block_size_tokens=256, flash_attention_version=2), 7, id="fa2"
         ),

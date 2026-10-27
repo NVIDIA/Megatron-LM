@@ -9,8 +9,8 @@ LOG_DIR=$4
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
 case "$BUCKET" in
-    tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py) RANKS=4 ;;
-    tests/unit_tests/inference/test_disagg_transfer_pairwise.py) RANKS=6 ;;
+    tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py) RANKS=4 NIXL=1 ;;
+    tests/unit_tests/inference/test_disagg_transfer_pairwise.py) RANKS=6 NIXL=0 ;;
     *) echo "Unsupported disaggregation bucket: $BUCKET" >&2; exit 1 ;;
 esac
 case "$ENVIRONMENT" in
@@ -19,6 +19,11 @@ case "$ENVIRONMENT" in
     *) echo "Unsupported test environment: $ENVIRONMENT" >&2; exit 1 ;;
 esac
 [[ "$REPEAT" =~ ^[1-9][0-9]*$ ]]
+# The coordinator handoff is NIXL-only; an image without NIXL has nothing to run.
+if ((NIXL)) && ! uv run --no-sync python -c "from nixl import _api" 2>/dev/null; then
+    echo "NIXL is not installed; skipping $BUCKET"
+    exit 0
+fi
 mkdir -p "$LOG_DIR"
 LOG_DIR=$(cd "$LOG_DIR" && pwd)
 

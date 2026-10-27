@@ -9,11 +9,13 @@ from dataclasses import dataclass, replace
 from functools import partial
 from unittest import mock
 
+import pytest
 import torch
 import torch.distributed as dist
 
 from megatron.core.inference.config import AsyncScheduleMode
 from megatron.core.inference.disaggregation.engine import StateHandoffDynamicInferenceEngine
+from megatron.core.inference.disaggregation.transfer_backends.nixl import _HAVE_NIXL
 from megatron.core.inference.inference_request import Status
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer import attention
@@ -23,6 +25,11 @@ from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicEngineTestConfig,
     DynamicInferenceEngineTestBase,
 )
+
+# The newest installed FlashAttention; FA4 paged KV needs head dims divisible by 16.
+FLASH_ATTENTION_VERSION = 4 if attention.HAVE_FA4 else 3
+# Skip NIXL rows at collection, identically on every rank, when the package is absent.
+requires_nixl = pytest.mark.skipif(not _HAVE_NIXL, reason="NIXL is not installed")
 
 
 @dataclass
@@ -40,6 +47,7 @@ def disagg_config(**changes):
                 context_block_size_tokens=16,
                 context_max_requests=8,
                 context_max_tokens=256,
+                hidden_size=64,
                 num_cuda_graphs=None,
                 enable_prefix_caching=True,
                 transformer_impl="transformer_engine",

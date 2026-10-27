@@ -62,10 +62,13 @@ def _install_factory(monkeypatch):
 
         monkeypatch.setattr(owner, name, traced)
 
-    fa3 = attention._flash_attn_forward
     trace(te_linear, "general_gemm", 1)
-    trace(type(fa3), "__call__", 2, fa3)
-    trace(attention, "flash_attn3_with_kvcache", 2)
+    if du.FLASH_ATTENTION_VERSION == 4:
+        trace(attention, "flash_attn4_varlen_func", 2)
+    else:
+        fa3 = attention._flash_attn_forward
+        trace(type(fa3), "__call__", 2, fa3)
+        trace(attention, "flash_attn3_with_kvcache", 2)
     monkeypatch.setattr(dynamic_tests, "set_rounder", lambda _: rounder(64))
     monkeypatch.setattr(
         dynamic_tests,
@@ -89,7 +92,9 @@ def _assert_target_equal(left, right):
 @torch.inference_mode()
 def test_disaggregated_prefill_is_batch_invariant(transport_world, monkeypatch):
     active = _install_factory(monkeypatch)
-    config = du.disagg_config(flash_attention_version=3, context_max_requests=128)
+    config = du.disagg_config(
+        flash_attention_version=du.FLASH_ATTENTION_VERSION, context_max_requests=128
+    )
     tokens, neighbor_tokens, params = du.prompt(33), du.prompt(66)[1:], du.sampling(2)
     source = dist.get_rank() % 2 == 0
     try:

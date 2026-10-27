@@ -21,6 +21,7 @@ from tests.unit_tests.inference.engines.disagg_test_utils import (
     disagg_config,
     prompt,
     real_engine,
+    requires_nixl,
     sampling,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -105,6 +106,7 @@ async def _stop_services(engine, control, clients):
         assert not process.is_alive()
 
 
+@requires_nixl
 @pytest.mark.parametrize(
     "mode,streaming,abort_deferred,native_failure",
     [

@@ -74,7 +74,7 @@ _VOCAB_SIZE = 100
 _BLOCK_SIZE = 256
 _BASE_TOKEN = 7
 _REJECT_TOKEN = 8
-_BATCH_INVARIANT_FA_VERSION = 4 if HAVE_FA4 else (3 if HAVE_FA3 else None)
+_FLASH_ATTENTION_VERSION = 4 if HAVE_FA4 else (3 if HAVE_FA3 else None)
 
 
 @dataclass(frozen=True)
@@ -152,7 +152,9 @@ def _config(case: _Case, *, mtp_active: bool) -> _DynamicEngineTestConfig:
         "use_flashinfer_fused_rope": False,
         "async_sched_mode": AsyncScheduleMode.LEGACY,
         "sampling_backend": "torch",
-        "flash_attention_version": 3,
+        # FA4 paged KV needs head dims divisible by 16.
+        "flash_attention_version": _FLASH_ATTENTION_VERSION,
+        "hidden_size": 64,
         "top_k": 1,
     }
     values.update(case.config)
@@ -1187,7 +1189,7 @@ class TestMTPPairwise(_DynamicEngineTestBase):
     @torch.inference_mode()
     def test_dense_batch_invariant_mtp_is_exact_across_batch_composition(self):
         """A natural MTP request is bitwise invariant to neighbors and row order."""
-        if _BATCH_INVARIANT_FA_VERSION is None or not te_supports_batch_invariant_attention():
+        if _FLASH_ATTENTION_VERSION is None or not te_supports_batch_invariant_attention():
             pytest.skip("batch-invariant attention needs TE support and FlashAttention 3 or 4")
         case_alone = _Case(
             name="dense-batch-invariant-alone",
@@ -1198,7 +1200,7 @@ class TestMTPPairwise(_DynamicEngineTestBase):
             config={
                 "batch_invariant_mode": True,
                 "batch_invariant_backend": "triton",
-                "flash_attention_version": _BATCH_INVARIANT_FA_VERSION,
+                "flash_attention_version": _FLASH_ATTENTION_VERSION,
                 "context_max_tokens": 256,
             },
         )

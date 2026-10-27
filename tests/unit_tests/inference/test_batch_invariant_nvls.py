@@ -19,6 +19,11 @@ from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGath
 from tests.unit_tests.inference.test_moe_dispatching_and_routing import _make_base_config
 from tests.unit_tests.test_utilities import Utils
 
+# A dedicated four-rank launch runs this manifest; other world sizes skip on every rank.
+pytestmark = pytest.mark.skipif(
+    Utils.world_size != 4, reason="this manifest requires four real NVLink EP ranks"
+)
+
 
 @pytest.fixture
 def nvls_runtime():

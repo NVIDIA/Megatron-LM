@@ -3,11 +3,16 @@
 from functools import partial
 
 import pytest
+from transformer_engine.pytorch.fp8 import check_mxfp8_support, check_nvfp4_support
 
 from megatron.core.transformer import attention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from tests.unit_tests.inference import coordinator_pairwise_utils as utils
 from tests.unit_tests.inference import test_coordinator_features_pairwise as features
 from tests.unit_tests.inference.engines import test_dynamic_engine as engines
+
+# Decide hardware support at collection so every rank skips the same rows.
+MXFP8, NVFP4 = check_mxfp8_support(), check_nvfp4_support()
 
 
 @pytest.mark.internal
@@ -40,7 +45,7 @@ async def test_routed_dense_backends_match_direct(monkeypatch, backend, version,
             monkeypatch.setattr(attention, symbol, observed)
 
     monkeypatch.setattr(features, "_instrument_scenario_runtime", instrument_native)
-    options = dict(flash_attention_version=version or 3)
+    options = dict(flash_attention_version=version or utils.FLASH_ATTENTION_VERSION)
     options["transformer_impl"] = "inference_optimized" if version is None else "local"
     if version == 2:
         options.update(context_block_size_tokens=256, context_max_tokens=256)
@@ -57,12 +62,21 @@ async def test_routed_dense_backends_match_direct(monkeypatch, backend, version,
 
 @pytest.mark.internal
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["mla", "mxfp8", "nvfp4"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "mla",
+        pytest.param("mxfp8", marks=pytest.mark.skipif(not MXFP8[0], reason=MXFP8[1])),
+        pytest.param("nvfp4", marks=pytest.mark.skipif(not NVFP4[0], reason=NVFP4[1])),
+    ],
+)
 async def test_routed_native_model_modes_match_direct(monkeypatch, mode):
     """One-request physical batches preserve ordinary, non-BI precision semantics."""
     constructor = MLATransformerConfig if mode == "mla" else engines.TransformerConfig
     overrides = dict(
-        flash_attention_version=3 if mode == "mla" else 4, num_layers=2, add_bias_linear=False
+        flash_attention_version=utils.FLASH_ATTENTION_VERSION if mode == "mla" else 4,
+        num_layers=2,
+        add_bias_linear=False,
     )
     options = dict(hidden_size=256, context_max_requests=128, context_max_tokens=128)
     if mode == "mla":

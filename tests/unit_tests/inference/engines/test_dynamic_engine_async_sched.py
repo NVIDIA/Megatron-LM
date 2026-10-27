@@ -34,6 +34,7 @@ from megatron.core.inference.engines.dynamic_engine import EngineState, _get_dec
 from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
+    DynamicInferenceRequestRecord,
     Status,
 )
 from megatron.core.inference.sampling_params import SamplingParams
@@ -2230,7 +2231,10 @@ def test_post_process_enforces_per_request_logprob_policy():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.context = SimpleNamespace(kv_block_allocator=SimpleNamespace())
     engine.requests = {
-        request.request_id: SimpleNamespace(record=[request]) for request in requests
+        request.request_id: SimpleNamespace(
+            record=DynamicInferenceRequestRecord.from_request(request)
+        )
+        for request in requests
     }
     engine.finished_request_count = 0
     engine.evicted_request_count = 0

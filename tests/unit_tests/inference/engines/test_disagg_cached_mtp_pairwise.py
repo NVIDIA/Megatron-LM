@@ -20,6 +20,7 @@ from tests.unit_tests.inference.engines.disagg_test_utils import (
     exchange,
     prompt,
     real_engine,
+    requires_nixl,
     run_to_completion,
     sampling,
     snapshot_source,
@@ -27,7 +28,10 @@ from tests.unit_tests.inference.engines.disagg_test_utils import (
 from tests.unit_tests.inference.engines.test_disagg_pairwise import transport_world  # noqa: F401
 
 
-@pytest.mark.parametrize("mode", ["cached-prefix", "mtp-depth-two", "mtp-kv-depth-two"])
+@pytest.mark.parametrize(
+    "mode",
+    [pytest.param("cached-prefix", marks=requires_nixl), "mtp-depth-two", "mtp-kv-depth-two"],
+)
 @torch.inference_mode()
 def test_cached_prefix_and_mtp_handoff(transport_world, mode):
     cached = mode == "cached-prefix"

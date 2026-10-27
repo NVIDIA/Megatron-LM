@@ -21,12 +21,16 @@ from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.transformer.attention import HAVE_FA4
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from tests.unit_tests.inference.engines import test_dynamic_engine as engine_tests
 from tests.unit_tests.inference.test_data_parallel_inference_coordinator import DummyTokenizer
 from tests.unit_tests.test_utilities import Utils
+
+# The newest installed FlashAttention; FA4 paged KV needs head dims divisible by 16.
+FLASH_ATTENTION_VERSION = 4 if HAVE_FA4 else 3
 
 
 async def until(predicate, timeout=30):
@@ -293,7 +297,8 @@ async def routed_model(monkeypatch, *, coordinator_options=None, engine_factory=
         context_block_size_tokens=16,
         context_buffer_size_gb=0.02,
         transformer_impl="transformer_engine",
-        flash_attention_version=3,
+        flash_attention_version=FLASH_ATTENTION_VERSION,
+        hidden_size=64,
     )
     settings.update(overrides)
     config = engine_tests.DynamicEngineTestConfig(**settings)
@@ -336,7 +341,7 @@ def batch_invariant_engine(config):
         attention_dropout=0.0,
         batch_invariant_mode=True,
         batch_invariant_backend="te_native",
-        flash_attention_version=3,
+        flash_attention_version=FLASH_ATTENTION_VERSION,
         normalization="RMSNorm",
         params_dtype=torch.bfloat16,
         bf16=True,

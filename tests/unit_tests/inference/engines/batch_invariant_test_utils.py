@@ -93,7 +93,8 @@ MLA_CASE = Case(
 def invariant_runtime(case):
     """Pin process-global mode; launch each selected backend in a fresh process."""
     backend = os.environ.get("MCORE_BI_TEST_BACKEND", "triton")
-    fa_version = int(os.environ.get("MCORE_BI_TEST_FA_VERSION", "3"))
+    # Default to the newest installed FlashAttention; the variable pins one explicitly.
+    fa_version = int(os.environ.get("MCORE_BI_TEST_FA_VERSION") or (4 if attention.HAVE_FA4 else 3))
     assert backend in ("triton", "te_native", "deepgemm")
     assert not bik.is_batch_invariant_mode_enabled(), "inherited a live backend from another test"
     if backend == "te_native":
