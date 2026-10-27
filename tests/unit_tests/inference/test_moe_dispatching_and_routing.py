@@ -1211,6 +1211,26 @@ def _build_gpt_with_moe_in_decoder_and_mtp(dispatcher_type, ep_size):
     return model.cuda().eval()
 
 
+def _build_synced_model(dispatcher_type, ep_size):
+    """The model above with its metadata-sync flags set, and the NVLS buffers it dispatches into."""
+    from megatron.core.inference.utils import set_moe_metadata_sync
+    from megatron.core.parallel_state import get_expert_model_parallel_group
+    from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
+
+    if dispatcher_type == "nvls" and ep_size & (ep_size - 1):
+        pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
+    model = _build_gpt_with_moe_in_decoder_and_mtp(dispatcher_type, ep_size)
+    set_moe_metadata_sync(model)
+    if dispatcher_type == "nvls" and ep_size > 1:
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_MTP_MOE_PER_RANK_MAX_TOKENS,
+            topk=_MTP_MOE_TOPK,
+            hidden_size=_MTP_MOE_HIDDEN,
+            ep_group=get_expert_model_parallel_group(),
+        )
+    return model
+
+
 def _inference_dispatchers(model):
     """Inference dispatchers of the decoder's MoE layers and of each MTP layer's MoE layers."""
     from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -1330,29 +1350,11 @@ class TestMTPDispatcherMetadata:
     def test_mtp_forwards_see_their_own_metadata(self, dispatcher_type, expert_parallel):
         """Main forward, then two MTP-layer forwards with fewer rows: every MoE layer sees the
         valid-token count and EP layout of its own forward, and gets back exactly its rows."""
-        from megatron.core.inference.utils import set_moe_metadata_sync
-        from megatron.core.parallel_state import (
-            get_expert_model_parallel_group,
-            get_expert_model_parallel_rank,
-        )
-        from megatron.core.transformer.moe.token_dispatcher_inference import (
-            NVLSAllGatherVDispatcher,
-        )
+        from megatron.core.parallel_state import get_expert_model_parallel_rank
 
         ep_size = expert_parallel
-        if dispatcher_type == "nvls" and ep_size & (ep_size - 1):
-            pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
         ep_rank = get_expert_model_parallel_rank()
-        model = _build_gpt_with_moe_in_decoder_and_mtp(dispatcher_type, ep_size)
-        set_moe_metadata_sync(model)
-        decoder, mtp_layers = _inference_dispatchers(model)
-        if dispatcher_type == "nvls" and ep_size > 1:
-            NVLSAllGatherVDispatcher.allocate_buffers(
-                per_rank_worst_case_token_count=_MTP_MOE_PER_RANK_MAX_TOKENS,
-                topk=_MTP_MOE_TOPK,
-                hidden_size=_MTP_MOE_HIDDEN,
-                ep_group=get_expert_model_parallel_group(),
-            )
+        decoder, mtp_layers = _inference_dispatchers(_build_synced_model(dispatcher_type, ep_size))
 
         # Per-rank token counts (alternating over EP ranks): the main forward, the MTP layer-0
         # forward (e.g. the draft-KV commit pass), and the MTP layer-1 forward (a draft depth).
@@ -1380,6 +1382,99 @@ class TestMTPDispatcherMetadata:
             assert torch.equal(gathered[:total], global_rows[0])
             expected = (local_rows[0].float() * ep_size).to(torch.bfloat16).unsqueeze(1)
             assert torch.equal(combined, expected)
+
+    @pytest.mark.parametrize("expert_parallel", [1, None], indirect=True, ids=["ep1", "ep_world"])
+    @pytest.mark.parametrize("dispatcher_type", ["nccl", "nvls"])
+    def test_mtp_forward_refreshes_metadata_eager_and_graphed(
+        self, dispatcher_type, expert_parallel, monkeypatch
+    ):
+        """Real `compute_mtp_single_step` forwards, eager and replayed from a CUDA graph captured
+        like the MTP graphs: each MTP layer's experts read its own forward's valid-token count,
+        never the one the main forward left behind."""
+        from megatron.core.inference.utils import InferenceMode
+        from megatron.core.transformer.moe.moe_layer import MoELayer
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            InferenceAllGatherDispatcherBase,
+            NCCLAllGatherDispatcher,
+        )
+
+        ep_size = expert_parallel
+        model = _build_synced_model(dispatcher_type, ep_size)
+        # Equal per-rank counts, so NCCL takes the fixed-count path a CUDA graph captures.
+        monkeypatch.setattr(NCCLAllGatherDispatcher, "_use_allgather_v", False)
+        main_tokens, mtp_rows = 16, 4
+
+        def moe_layers(module):
+            return [m for m in module.modules() if isinstance(m, MoELayer)]
+
+        # Each MoE layer's experts record, on device so that a graph replay records too, the
+        # count InferenceGroupedMLP passes to the fused MoE, and return zeros.
+        seen = {}
+
+        def record_valid_tokens(moe_layer):
+            seen[moe_layer] = torch.zeros(1, dtype=torch.int32, device="cuda")
+
+            def forward(dispatched_input, tokens_per_expert, permuted_probs, routing_map=None):
+                seen[moe_layer].copy_(InferenceAllGatherDispatcherBase._valid_tokens())
+                return torch.zeros_like(dispatched_input, dtype=torch.float32), None
+
+            monkeypatch.setattr(moe_layer.experts, "forward", forward)
+
+        decoder_moe = moe_layers(model.decoder)
+        mtp_moe = [moe_layers(layer) for layer in model.mtp.layers]
+        for moe_layer in decoder_moe + [m for layer in mtp_moe for m in layer]:
+            record_valid_tokens(moe_layer)
+
+        hidden = torch.randn(mtp_rows, 1, _MTP_MOE_HIDDEN, device="cuda", dtype=torch.bfloat16)
+        token_ids = torch.randint(0, 128, (1, mtp_rows), device="cuda")
+        position_ids = torch.arange(mtp_rows, device="cuda").unsqueeze(0)
+
+        def main_forward():
+            main_hidden = torch.randn(
+                main_tokens, 1, _MTP_MOE_HIDDEN, device="cuda", dtype=torch.bfloat16
+            )
+            for moe_layer in decoder_moe:
+                moe_layer(main_hidden)
+
+        def mtp_forward(depth):
+            return model.compute_mtp_single_step(
+                hidden_states=hidden,
+                next_token_ids=token_ids,
+                position_ids=position_ids,
+                depth=depth,
+                eager=True,
+            )
+
+        with InferenceMode.active(), torch.inference_mode():
+            main_forward()
+            eager_counts = []
+            for depth, layer_moe in enumerate(mtp_moe):
+                mtp_forward(depth)
+                eager_counts.append(
+                    (
+                        [int(seen[m].item()) for m in layer_moe],
+                        InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
+                    )
+                )
+
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(2):
+                    mtp_forward(0)
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                mtp_forward(0)
+            # Replay after a main forward, as each step does.
+            main_forward()
+            seen[mtp_moe[0][0]].fill_(-1)
+            graph.replay()
+            torch.cuda.synchronize()
+
+        assert [int(seen[m].item()) for m in decoder_moe] == [main_tokens * ep_size] * 2
+        assert eager_counts == [([mtp_rows * ep_size], mtp_rows * ep_size)] * 2
+        assert int(seen[mtp_moe[0][0]].item()) == mtp_rows * ep_size
 
 
 # ──────────────────────────────────────────────────────────────────────

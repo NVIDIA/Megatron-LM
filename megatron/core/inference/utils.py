@@ -221,8 +221,8 @@ def set_moe_metadata_sync(model) -> None:
 
     The dispatcher metadata (the valid-token count the experts read and, at EP > 1, the
     per-rank token layout) describes the rows of one forward pass, so exactly one dispatcher
-    per forward fires update_metadata: the first MoE layer of the main model forward, and the
-    first MoE layer of each MTP layer. Speculative decoding runs every MTP layer as a forward
+    per forward fires update_metadata: that of the first inference MoE layer of the main model
+    forward, and of each MTP layer. Speculative decoding runs every MTP layer as a forward
     of its own (`forward_single_position`) on request-shaped rows, without the decoder's MoE
     layers. All other layers skip it to avoid redundant collective calls.
     Must be called once after the model is built and put into eval mode.
@@ -246,7 +246,7 @@ def set_moe_metadata_sync(model) -> None:
         dispatcher = getattr(moe_layer, '_inference_token_dispatcher', None)
         if dispatcher is not None:
             dispatcher._runs_metadata_sync = forward not in synced_forwards
-        synced_forwards.add(forward)
+            synced_forwards.add(forward)
     _moe_metadata_sync_initialized = True
 
 

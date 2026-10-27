@@ -1821,6 +1821,18 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         """Returns True if cuda graphs are being used for this step."""
         return self._using_cuda_graph_this_step
 
+    def _select_nccl_ep_dispatch_path(self) -> None:
+        """Point the NCCL EP dispatcher at the path the active forward can take.
+
+        A graphed forward has the same EP-synced token count on every rank, so it takes the
+        fixed-count all-gather that a CUDA graph can capture. An eager forward may have a
+        different count per rank, so it takes the variable-count path. Called wherever the
+        active forward's CUDA-graph flag is published: the main step and each MTP forward.
+        """
+        # _nccl_ep_dispatcher already implies ep_size > 1, so no extra EP guard.
+        if self._nccl_ep_dispatcher:
+            NCCLAllGatherDispatcher._use_allgather_v = not self._using_cuda_graph_this_step
+
     def zero_padding_tokens(self, tensor: Tensor, sequence_parallel_rank: int = 0) -> None:
         """Zero, in place, the rows of a token-major activation that belong to padding tokens.
 
@@ -2839,10 +2851,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             else:
                 self.moe_routing_metadata.disable_static_buffer_recording()
 
-        # Flip NCCLAllGather dispatcher's path selector to not use allgathers.
-        # _nccl_ep_dispatcher already implies ep_size > 1, so no extra EP guard.
-        if self._nccl_ep_dispatcher:
-            NCCLAllGatherDispatcher._use_allgather_v = not self.using_cuda_graph_this_step()
+        self._select_nccl_ep_dispatch_path()
 
         # Flush any Mamba ops queued by add_dummy_requests_for_cudagraph_capture
         # (warmup) or add_dummy_requests_for_expert_parallel_step (EP dummy step).

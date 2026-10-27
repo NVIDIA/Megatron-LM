@@ -357,7 +357,7 @@ def _init_sorted_ids_kernel(
         tl.store(pre_initialized_output_buffer_ptr + offs, 0, mask=offs < num_local_experts)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["max_pairs"])
 def _scatter_token_indices_kernel(
     routing_map_ptr,
     sorted_token_ids_ptr,
@@ -573,7 +573,7 @@ def _invoke_fused_moe_kernel(
 # ---------------------------------------------------------------------------
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["max_tokens"])
 def _moe_sum_kernel(
     input_ptr,
     output_ptr,

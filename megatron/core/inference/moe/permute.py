@@ -50,7 +50,7 @@ def _ceil_div(a, b):
     return (a + b - 1) // b
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["max_pairs"])
 def _count_local_tokens_kernel(
     routing_map_ptr,  # [max_tokens, topk] flattened expert assignments
     tokens_per_expert_ptr,  # [num_local_experts] output counters (zeroed by caller)
@@ -81,7 +81,7 @@ def _count_local_tokens_kernel(
     tl.atomic_add(tokens_per_expert_ptr + local_ids, 1, mask=is_local)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["max_pairs"])
 def _count_local_tokens_kernel_persistent(
     routing_map_ptr,  # [max_tokens, topk] flattened expert assignments
     tokens_per_expert_ptr,  # [num_local_experts] output counters (zeroed by caller)
