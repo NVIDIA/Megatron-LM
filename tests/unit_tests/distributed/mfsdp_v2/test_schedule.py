@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for experimental Megatron-FSDP annotations."""
+"""FSDP execution scheduling and lifecycle ordering observed through NVTX ranges."""
 
 import re
 from typing import Literal, NamedTuple
