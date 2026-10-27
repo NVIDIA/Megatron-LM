@@ -43,29 +43,31 @@ from tests.unit_tests.test_utilities import Utils
 )
 @pytest.mark.parametrize("tp,pp", [(1, 1), (2, 1), (1, 2)], ids=["tp1", "tp2-sp", "pp2"])
 @pytest.mark.parametrize(
-    "variant,fused,recompute_norm,whole_layer,delay,fraction,precision",
+    "variant,fused,recompute_norm,whole_layer,delay,fraction,precision,gradient_accumulation_fusion",
     [
-        ("gdn", False, False, False, False, 1.0, "bf16"),
-        ("gdn", True, True, False, True, 1.0, "bf16"),
-        ("gdn", True, False, True, False, 1.0, "bf16"),
-        ("gdn", False, True, True, True, 1.0, "bf16"),
-        ("gdn2", False, False, True, False, 1.0, "bf16"),
-        ("gdn2", False, True, False, True, 1.0, "bf16"),
-        ("gdn2", False, False, True, False, 0.0, "bf16"),
-        ("gdn", False, False, False, False, 1.0, "fp8-delayed"),
-        ("gdn", False, True, True, True, 1.0, "fp8-tensorwise"),
-        ("gdn2", False, True, True, True, 1.0, "fp8-delayed"),
-        ("gdn2", False, False, False, False, 1.0, "fp8-tensorwise"),
-        ("gdn2", False, True, True, False, 0.0, "fp8-tensorwise"),
-        ("gdn2", False, True, False, False, 0.5, "fp8-tensorwise"),
-        ("gdn", True, False, True, False, 1.0, "fp8-tensorwise"),
-        ("gdn", False, False, False, False, 1.0, "fp4"),
-        ("gdn", False, True, True, True, 1.0, "fp4"),
-        ("gdn2", False, True, True, True, 1.0, "fp4"),
-        ("gdn2", False, False, False, False, 1.0, "fp4"),
-        ("gdn2", False, True, True, False, 0.0, "fp4"),
-        ("gdn2", False, True, False, False, 0.5, "fp4"),
-        ("gdn", True, False, True, False, 1.0, "fp4"),
+        ("gdn", False, False, False, False, 1.0, "bf16", False),
+        ("gdn", True, True, False, True, 1.0, "bf16", False),
+        ("gdn", True, False, True, False, 1.0, "bf16", False),
+        ("gdn", False, True, True, True, 1.0, "bf16", False),
+        ("gdn2", False, False, True, False, 1.0, "bf16", False),
+        ("gdn2", False, True, False, True, 1.0, "bf16", False),
+        ("gdn2", False, False, True, False, 0.0, "bf16", False),
+        ("gdn", False, False, False, False, 1.0, "fp8-delayed", False),
+        ("gdn", False, True, True, True, 1.0, "fp8-tensorwise", False),
+        ("gdn2", False, True, True, True, 1.0, "fp8-delayed", False),
+        ("gdn2", False, False, False, False, 1.0, "fp8-tensorwise", False),
+        ("gdn2", False, True, True, False, 0.0, "fp8-tensorwise", False),
+        ("gdn2", False, True, False, False, 0.5, "fp8-tensorwise", False),
+        ("gdn", True, False, True, False, 1.0, "fp8-tensorwise", False),
+        ("gdn", False, False, False, False, 1.0, "fp4", False),
+        ("gdn", False, True, True, True, 1.0, "fp4", False),
+        ("gdn2", False, True, True, True, 1.0, "fp4", False),
+        ("gdn2", False, False, False, False, 1.0, "fp4", False),
+        ("gdn2", False, True, True, False, 0.0, "fp4", False),
+        ("gdn2", False, True, False, False, 0.5, "fp4", False),
+        ("gdn", True, False, True, False, 1.0, "fp4", False),
+        ("gdn", False, False, False, False, 1.0, "fp4", True),
+        ("gdn2", False, True, True, True, 1.0, "fp4", True),
     ],
 )
 def test_gdn_offload_with_te_graphs(
@@ -76,6 +78,7 @@ def test_gdn_offload_with_te_graphs(
     delay: bool,
     fraction: float,
     precision: str,
+    gradient_accumulation_fusion: bool,
     tp: int,
     pp: int,
     monkeypatch: pytest.MonkeyPatch,
@@ -84,6 +87,8 @@ def test_gdn_offload_with_te_graphs(
     if Utils.world_size % (tp * pp):
         pytest.skip("This topology requires two GPUs.")
     _require_precision(precision)
+    if gradient_accumulation_fusion:
+        pytest.importorskip("fused_weight_gradient_mlp_cuda")
     if variant == "gdn2":
         pytest.importorskip("fla.ops.gdn2")
     if fused:
@@ -136,6 +141,7 @@ def test_gdn_offload_with_te_graphs(
                 use_te_rng_tracker=True,
                 delay_offload_until_cuda_graph=delay,
                 disable_parameter_transpose_cache=precision == "fp4",
+                gradient_accumulation_fusion=gradient_accumulation_fusion,
             )
             # Match native training: DDP's retained AccumulateGrad nodes must use a side stream.
             current_stream = torch.cuda.current_stream()
