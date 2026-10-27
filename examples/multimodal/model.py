@@ -50,7 +50,7 @@ def model_provider(
         model: A multimodal model.
     """
     args = get_args()
-    cfg = get_run_config()
+    cfg_container = get_run_config()
     use_te = args.use_te
 
     print_rank_0('building a multimodal model ...')
@@ -267,7 +267,7 @@ def model_provider(
     model = LLaVAModel(
         language_transformer_config=language_config,
         language_transformer_layer_spec=language_transformer_layer_spec,
-        language_vocab_size=args.padded_vocab_size,
+        language_vocab_size=cfg_container.tokenizer.padded_vocab_size,
         language_max_sequence_length=args.decoder_seq_length,
         vision_transformer_config=vision_config,
         vision_transformer_layer_spec=vision_transformer_layer_spec,

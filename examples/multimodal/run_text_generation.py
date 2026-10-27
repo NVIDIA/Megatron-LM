@@ -201,7 +201,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
             inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
             fp32_residual_connection=args.fp32_residual_connection,
             params_dtype=args.params_dtype,
-            padded_vocab_size=args.padded_vocab_size,
+            padded_vocab_size=cfg.tokenizer.padded_vocab_size,
         )
         inference_wrapped_model = VLMInferenceWrapper(model, inference_wrapper_config)
         tokenizer = get_tokenizer()
