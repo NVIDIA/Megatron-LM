@@ -36,7 +36,7 @@ from megatron.core.enums import ModelType
 from megatron.core.utils import unwrap_model
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
-from megatron.training.global_vars import initialize_runtime_services, set_args, set_run_config
+from megatron.training.global_vars import set_args, set_run_config
 from megatron.training.training import pretrain
 from megatron.training.vocab_utils import calculate_padded_vocab_size
 
@@ -94,7 +94,6 @@ def main() -> None:
     model_cfg = MimoBuildConfig()
     cfg = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(cfg)
-    initialize_runtime_services(args, build_tokenizer=False)
     provider = resolve_provider(args)
 
     prefetch_loader = None
@@ -103,7 +102,7 @@ def main() -> None:
     # generic over any number of encoder grids in the topology.
     encoder_name = provider.encoder_module_names[0] if provider.encoder_module_names else None
     specs = build_module_grid_specs(args, args.world_size, encoder_name)
-    topology = create_topology(specs, args.high_priority_stream_groups)
+    topology = create_topology(specs, cfg.dist.high_priority_stream_groups)
 
     communicator = provider.build_communicator(args, topology)
 
@@ -159,6 +158,7 @@ def main() -> None:
         skip_model_parallel_init=True,
         p2p_communicator=communicator,
         pg_collection=topology.schedule_pg_collection,
+        build_tokenizer=False,
     )
 
     if prefetch_loader is not None:

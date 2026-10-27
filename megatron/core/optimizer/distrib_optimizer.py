@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron distributed optimizer."""
 
@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional
 
-from megatron.core.utils import log_single_rank
+from megatron.core.utils import get_model_config, log_single_rank
 
 from ..dist_checkpointing.optimizer import KEEP_VARS_HINT
 
@@ -61,6 +61,7 @@ from ..fp8_utils import (
     is_grouped_tensor_with_quantized_storage,
     quantize_param_shard,
 )
+from ..full_cuda_graph import FullIterationGradCopy
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
@@ -431,10 +432,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         group_index = world_param_group_map[param]
                         group_range = group_ranges[group_index]
                         group_range["params"].append(param)
-                        local_param_group_map[param] = (group_index, len(group_range["params"]) - 1)
 
-        # Squeeze zero-size group ranges.
+        # Finalize group ranges and checkpoint indices.
         for group_index, group_range in enumerate(group_ranges):
+            # Optimizer parameter groups put shards of FP32 model parameters before
+            # those derived from FP16/BF16 model parameters. Checkpoint lookups use this order,
+            # even when gradient buffers encountered the low-precision dtype first.
+            # Keep this partition in sync with both orig_group["params"] branches
+            # in _build_model_and_main_param_groups.
+            main_param_order = [
+                param for param in group_range["params"] if param.dtype == torch.float32
+            ] + [param for param in group_range["params"] if param.dtype != torch.float32]
+            for group_order, param in enumerate(main_param_order):
+                local_param_group_map[param] = (group_index, group_order)
             group_range["orig_group"] = param_groups[group_index]
             group_range["orig_group_idx"] = param_groups[group_index]
 
@@ -591,6 +601,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     )
 
             # Update optimizer's params.
+            # _build_optimizer_group_ranges assigns checkpoint indices in this order.
             if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                 group_range["orig_group"]["params"] = [
                     *shard_fp32_params_this_group,
@@ -814,6 +825,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.ddp_config.use_megatron_fsdp:
             # Megatron-FSDP will manage optimizer weights and gradients.
             return
+
+        self._cudagraphed_grad_copy = None
+        if (
+            getattr(get_model_config(self.model_chunks[0]), "cuda_graph_impl", "none")
+            == "full_iteration"
+            and not config.optimizer_cuda_graph
+            and not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+            and not config.optimizer_cpu_offload
+        ):
+            self._cudagraphed_grad_copy = FullIterationGradCopy()
 
         # Model grad buffer ranges.
         assert per_model_buffers is not None, "per_model_buffers must be provided"
@@ -2042,8 +2063,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     all_pad_tensors = {}
                     for i in range(-1, len(bucket_state)):
                         if i == len(bucket_state) - 1:
-                            # Potential padding at the end
-                            next_param_start = gbuf_local_numel
+                            # Include intra-bucket padding, but exclude the tail
+                            # used only to divide the buffer across DP ranks.
+                            next_param_start = max(
+                                0,
+                                min(
+                                    gbuf_local_numel,
+                                    gbuf_world_numel_unpadded
+                                    - data_parallel_rank * gbuf_local_numel,
+                                ),
+                            )
                         else:
                             next_param_start = bucket_state[i + 1]['gbuf_local_start']
                         if i == -1:
@@ -2902,6 +2931,26 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # (with zero-copy if using NCCL UB and wgrad accum fusion)
             # during the backward pass.
             return
+
+        if self._cudagraphed_grad_copy is None:
+            return self._copy_model_grads_to_main_grads_eager()
+
+        self._cudagraphed_grad_copy.copy(
+            self._copy_model_grads_to_main_grads_eager,
+            itertools.chain(
+                zip(self.model_float16_groups, self.shard_fp32_from_float16_groups),
+                zip(self.model_fp32_groups, self.shard_fp32_groups),
+            ),
+            source_fn=self._model_grad_shard,
+        )
+
+    def _model_grad_shard(self, model_param: torch.nn.Parameter) -> torch.Tensor:
+        """This rank's shard of ``model_param.main_grad``, as read by the conversion."""
+        span = self._get_model_param_range_map(model_param)["param"]
+        return model_param.main_grad.view(-1)[span.start : span.end]
+
+    def _copy_model_grads_to_main_grads_eager(self):
+        """Convert model gradient shards without graph capture or replay."""
 
         # Utility method for copying group grads.
         def copy_group_grads(model_groups, shard_main_groups):

@@ -107,7 +107,7 @@ def test_suspend_clears_only_recomputed_cache(cache_mode, expect_clear):
     engine = object.__new__(DynamicInferenceEngine)
     engine.state = EngineState.RUNNING
     engine.context = context
-    engine.controller = SimpleNamespace(_async_sched_logits=Mock())
+    engine.controller = SimpleNamespace(_async_sched_forward=Mock())
     engine.unified_memory_level = 0
     engine.requests = {}
     engine.waiting_request_ids = deque()
@@ -124,7 +124,7 @@ def test_suspend_clears_only_recomputed_cache(cache_mode, expect_clear):
 
     expected_order = ["deallocate", "cleared"] if expect_clear else ["deallocate"]
     assert order == expected_order
-    assert engine.controller._async_sched_logits.clear.call_count == int(expect_clear)
+    assert engine.controller._async_sched_forward.clear.call_count == int(expect_clear)
 
 
 def test_reset_metadata_can_preserve_prefix_allocator():
@@ -182,9 +182,9 @@ async def test_async_forward_discards_before_scheduling_and_publishes_after_forw
         order.append("schedule")
         context.dynamo_helper.queue_kv_stored_event(payload)
 
-    async def forward(**kwargs):
+    async def forward(*, finalize_requests):
         order.append("forward")
-        assert kwargs == {}
+        assert finalize_requests.func == engine._finalize_finished_requests
         listener.assert_not_called()
         return SimpleNamespace(decode_only=False, output={"output": True})
 
@@ -211,6 +211,6 @@ async def test_async_forward_discards_before_scheduling_and_publishes_after_forw
 
     result, _, _ = await DynamicInferenceEngine.async_forward(engine)
 
-    assert result == {"output": True}
+    assert result == {"output": True, "completed_requests": {}}
     assert order == ["discard", "schedule", "forward", "publish"]
     listener.assert_called_once_with("stored", payload)

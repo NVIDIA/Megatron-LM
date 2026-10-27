@@ -33,6 +33,10 @@ from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphS
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.residual_connection import (
+    ResidualConnection,
+    ResidualConnectionOperation,
+)
 from megatron.core.transformer.residual_recompute import (
     ResidualStreamRecomputeContext,
     checkpoint_residual_read,
@@ -41,6 +45,7 @@ from megatron.core.transformer.residual_recompute import (
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import precision_aware_checkpoint
 from megatron.core.typed_torch import apply_module, copy_signature
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -917,13 +922,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             residual_stream_recompute_context=residual_stream_recompute_context,
         )
 
-    def _get_self_attention_residual_connection(self):
-        """Return an optional architecture-owned self-attention connection."""
+    def _get_self_attention_residual_connection(
+        self, operation: ResidualConnectionOperation
+    ) -> ResidualConnection | None:
+        """Return the optional architecture-owned self-attention reader or writer."""
 
         return None
 
-    def _get_mlp_residual_connection(self):
-        """Return an optional architecture-owned MLP connection."""
+    def _get_mlp_residual_connection(
+        self, operation: ResidualConnectionOperation
+    ) -> ResidualConnection | None:
+        """Return the optional architecture-owned MLP reader or writer."""
 
         return None
 
@@ -947,7 +956,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             ``_apply_self_attn_bda_step``. A configured residual connection uses
             it for the corresponding write state; otherwise base returns ``()``.
         """
-        residual_connection = self._get_self_attention_residual_connection()
+        residual_connection = self._get_self_attention_residual_connection(operation="read")
         recompute_context = (
             residual_stream_recompute_context if residual_connection is not None else None
         )
@@ -956,7 +965,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             if recompute_context is None:
                 hidden_states, connection_state = apply_module(residual_connection)(
                     hidden_states,
-                    operation="read",
                     fp32_residual_connection=self.config.fp32_residual_connection,
                     branch_input_dtype=self.config.params_dtype,
                 )
@@ -1032,7 +1040,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         using_fused_tp_inference_kernel = (
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
-        residual_connection = self._get_self_attention_residual_connection()
+        residual_connection = self._get_self_attention_residual_connection(operation="write")
         recompute_context = (
             residual_stream_recompute_context if residual_connection is not None else None
         )
@@ -1050,7 +1058,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             is_terminal_write = bool(
                 recompute_context is not None
                 and recompute_context.is_block_end
-                and self._get_mlp_residual_connection() is None
+                and self._get_mlp_residual_connection(operation="write") is None
             )
             if recompute_context is not None and not is_terminal_write:
                 hidden_states = checkpoint_residual_write(
@@ -1065,7 +1073,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 with self.bias_dropout_add_exec_handler():
                     hidden_states = apply_module(residual_connection)(
                         attention_output_with_bias,
-                        operation="write",
                         state=attn_state,
                         dropout_probability=self.hidden_dropout,
                         training=self.training,
@@ -1253,7 +1260,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             through to ``_apply_mlp_bda_step``. A configured residual connection
             uses it for the corresponding write state; otherwise base returns ``()``.
         """
-        residual_connection = self._get_mlp_residual_connection()
+        residual_connection = self._get_mlp_residual_connection(operation="read")
         recompute_context = (
             residual_stream_recompute_context if residual_connection is not None else None
         )
@@ -1262,7 +1269,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             if recompute_context is None:
                 hidden_states, connection_state = apply_module(residual_connection)(
                     hidden_states,
-                    operation="read",
                     fp32_residual_connection=self.config.fp32_residual_connection,
                     branch_input_dtype=self.config.params_dtype,
                 )
@@ -1468,27 +1474,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             moe_kwargs["packed_seq_params"] = packed_seq_params
 
         if self.recompute_mlp:
-            if self.config.fp8 or self.config.fp4:
-                # import here to avoid circular import
-                from megatron.core.extensions.transformer_engine import te_checkpoint
-
-                mlp_output_with_bias = te_checkpoint(
-                    apply_module(self.mlp),
-                    False,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    self.pg_collection.tp,
-                    pre_mlp_layernorm_output,
-                    padding_mask=padding_mask,
-                    **moe_kwargs,
-                )
-            else:
-                mlp_output_with_bias = tensor_parallel.checkpoint(
-                    functools.partial(
-                        apply_module(self.mlp), padding_mask=padding_mask, **moe_kwargs
-                    ),
-                    False,
-                    pre_mlp_layernorm_output,
-                )
+            mlp_output_with_bias = precision_aware_checkpoint(
+                apply_module(self.mlp),
+                self.config,
+                self.pg_collection.tp,
+                pre_mlp_layernorm_output,
+                padding_mask=padding_mask,
+                **moe_kwargs,
+            )
         elif should_chunk_mlp_for_prefill or should_chunk_mlp_for_training:
             # Chunk input along sequence dimension
             num_chunks = min(
@@ -1590,7 +1583,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
 
-        residual_connection = self._get_mlp_residual_connection()
+        residual_connection = self._get_mlp_residual_connection(operation="write")
         recompute_context = (
             residual_stream_recompute_context if residual_connection is not None else None
         )
@@ -1625,7 +1618,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 with self.bias_dropout_add_exec_handler():
                     hidden_states = apply_module(residual_connection)(
                         mlp_output_with_bias,
-                        operation="write",
                         state=mlp_state,
                         dropout_probability=self.hidden_dropout,
                         training=self.training,
@@ -2854,28 +2846,14 @@ class MoETransformerLayer(TransformerLayer):
             )
 
             if self.moe_layer_recompute:
-                if self.config.fp8 or self.config.fp4:
-                    from megatron.core.extensions.transformer_engine import te_checkpoint
-
-                    result = te_checkpoint(
-                        _forward_mlp_partial_cudagraphs,
-                        False,
-                        tensor_parallel.random.get_cuda_rng_tracker,
-                        self.pg_collection.tp,
-                        hidden_states,
-                        padding_mask=padding_mask,
-                        input_ids=input_ids,
-                    )
-                else:
-                    result = tensor_parallel.checkpoint(
-                        functools.partial(
-                            _forward_mlp_partial_cudagraphs,
-                            padding_mask=padding_mask,
-                            input_ids=input_ids,
-                        ),
-                        False,
-                        hidden_states,
-                    )
+                result = precision_aware_checkpoint(
+                    _forward_mlp_partial_cudagraphs,
+                    self.config,
+                    self.pg_collection.tp,
+                    hidden_states,
+                    padding_mask=padding_mask,
+                    input_ids=input_ids,
+                )
             else:
                 result = _forward_mlp_partial_cudagraphs(
                     hidden_states, padding_mask=padding_mask, input_ids=input_ids

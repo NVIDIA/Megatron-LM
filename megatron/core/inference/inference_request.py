@@ -562,6 +562,8 @@ class InferenceRequest:
     prompt_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_length: Optional[int] = None
+    # Set by the engine at termination, preserved across serialization/merging.
+    finish_reason: Optional[str] = None
     tpot: List[float] = field(default_factory=list)
 
     def __post_init__(self):
@@ -1014,7 +1016,10 @@ class DynamicInferenceRequest(InferenceRequest):
                     "in its sampling_params. Defaulting to -1."
                 )
             sp.termination_id = -1
-        return [getattr(sp, field) for field, _ in self.get_metadata_types()]
+        return [
+            -1 if field == "seed" and sp.seed is None else getattr(sp, field)
+            for field, _ in self.get_metadata_types()
+        ]
 
     @staticmethod
     def get_metadata_types() -> List[Tuple[str, torch.dtype]]:
@@ -1033,6 +1038,7 @@ class DynamicInferenceRequest(InferenceRequest):
             ("return_log_probs", torch.bool),
             ("skip_prompt_log_probs", torch.bool),
             ("top_n_logprobs", torch.int32),
+            ("seed", torch.int64),
         ]
 
     def add_event(
@@ -1231,6 +1237,7 @@ class DynamicInferenceRequestRecord:
                 decoder_seq_length=old_request.decoder_seq_length,
                 image_embeddings=old_request.image_embeddings,
                 image_token_mask=old_request.image_token_mask,
+                deferred_image_embedding_count=old_request.deferred_image_embedding_count,
             )
         else:
             new_request = DynamicInferenceRequest(**common_kwargs)
@@ -1322,6 +1329,7 @@ class DynamicInferenceRequestRecord:
             ttft=ttft,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,
+            finish_reason=self.requests[-1].finish_reason,
             latency=self.latency,
             events=merge_lists("events"),
             routing_indices=routing_indices,
@@ -1391,9 +1399,10 @@ class OffloadedRequestPayload:
     def from_request(cls, request: "DynamicInferenceRequest") -> "OffloadedRequestPayload":
         """Copy the payload off a finished (merged) request as plain host-side values.
 
-        Side effect: replaces ``request.prompt_tokens`` with its host copy when it is a
-        tensor, so one device-to-host copy serves both this payload and every later
-        host-side read of the finished request (its reply and the caller's result).
+        Side effect: replaces ``request.prompt_tokens`` and ``request.media_tensors`` with
+        their host copies, so one device-to-host copy serves both this payload and every
+        later host-side read of the finished request (its reply and the caller's result),
+        and a finished request kept alive while its payload is staged holds no device memory.
         """
 
         def to_plain_list(value):
@@ -1406,21 +1415,20 @@ class OffloadedRequestPayload:
         if isinstance(request.prompt_tokens, torch.Tensor):
             # One device-to-host copy serves both the payload and the wire reply.
             request.prompt_tokens = request.prompt_tokens.cpu()
+        if request.media_tensors is not None:
+            # VLM media (e.g. ``imgs``) stays on the device after the vision encoder ran.
+            request.media_tensors = {
+                name: tensor.detach().cpu()
+                for name, tensor in request.media_tensors.items()
+                if tensor is not None
+            }
         return cls(
             prompt_token_ids=to_plain_list(request.prompt_tokens),
             generated_token_ids=list(request.generated_tokens),
             generated_log_probs=to_plain_list(request.generated_log_probs),
             prompt_log_probs=to_plain_list(request.prompt_log_probs),
             routing_indices=request.routing_indices,
-            media_tensors=(
-                None
-                if request.media_tensors is None
-                else {
-                    name: tensor.detach().cpu()
-                    for name, tensor in request.media_tensors.items()
-                    if tensor is not None
-                }
-            ),
+            media_tensors=(None if request.media_tensors is None else dict(request.media_tensors)),
         )
 
 
@@ -1432,7 +1440,19 @@ class RequestPayloadStageResult:
 
 
 class RequestPayloadStager(Protocol):
-    """Protocol to handle offloading of request payloads to a storage backend."""
+    """Protocol to handle offloading of request payloads to a storage backend.
+
+    The engine calls ``stage()`` on a worker thread (``asyncio.to_thread``), one call
+    per completed request, so implementations must follow these rules:
+
+    * Calls run concurrently with each other, so ``stage()`` must be thread-safe.
+    * Calls share the event loop's default thread pool. A write that blocks for a long
+      time holds a pool thread, so many slow writes can use up the pool and delay other
+      ``to_thread`` work.
+    * ``stage()`` must use only its arguments and the stager's own state. It must not
+      touch engine state, the engine's ZMQ sockets, or anything else owned by the engine
+      loop's thread.
+    """
 
     def stage(
         self,
@@ -1521,3 +1541,6 @@ class DynamicVLMInferenceRequest(DynamicInferenceRequest, VLMInferenceRequest):
     video_fps: Optional[List[float]] = None
     media_tokens_preexpanded: bool = False
     media_cache_key: Optional[str] = None
+    deferred_image_embedding_count: Optional[int] = None
+    """Embedding count of an image request admitted without encoding; the engine encodes it
+    together with the other waiting requests right before prefill and clears this afterwards."""

@@ -13,6 +13,7 @@ import torch
 
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 
+from .tensor_parallel.gtp_parallel_layout import GTPParallelLayout
 from .utils import GlobalMemoryBuffer, is_torch_min_version
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,8 @@ _TENSOR_MODEL_PARALLEL_GROUP = None
 # Generalized tensor parallelism group that the current rank belongs to.
 _GTP_WEIGHT_REMAT_GROUP = None
 _GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
+# All dense replica rank lists, also used to construct a separate optimizer AG communicator.
+_WEIGHT_REPLICA_RANK_SETS = None
 # Inter-layer model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
 # Model parallel group (both intra- and pipeline) that the current rank belongs to.
@@ -128,6 +131,8 @@ _CONTEXT_PARALLEL_GLOBAL_RANKS = None
 _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
 # Dynamic context parallel groups, indexed by the runtime CP group size.
 _DYNAMIC_DP_CP_GROUPS = {}
+# Cartesian TP x dynamic-DP-CP groups used for sequence-parallel CP layout conversion.
+_DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS = {}
 
 # Full data-parallel groups: span every distinct-data rank
 # (size = replicate_DP x gtp_remat). Used for data distribution (batch split, num-microbatches,
@@ -463,18 +468,14 @@ def create_hierarchical_groups(
 
 
 def get_valid_dynamic_context_parallel_group_sizes(total_size: int) -> List[int]:
-    """Return runtime CP sizes that can partition a DPxCP rank list exactly."""
-    if total_size < 1:
-        raise ValueError(f"Dynamic CP group size must be positive, got {total_size}")
+    """Compatibility alias for the pure dynamic-CP topology helper."""
+    # Import lazily because context_parallel's layouts depend on tensor_parallel,
+    # which imports parallel_state during its own initialization.
+    from megatron.core.context_parallel.groups import (
+        get_valid_dynamic_context_parallel_group_sizes as get_group_sizes,
+    )
 
-    group_sizes = []
-    group_size = 1
-    while group_size < total_size:
-        if total_size % group_size == 0:
-            group_sizes.append(group_size)
-        group_size *= 2
-    group_sizes.append(total_size)
-    return group_sizes
+    return get_group_sizes(total_size)
 
 
 def create_dynamic_dp_cp_groups(
@@ -482,11 +483,13 @@ def create_dynamic_dp_cp_groups(
     ranks: Sequence[int],
     pg_options: object,
     min_cp_size: int = 1,
+    timeout: Optional[timedelta] = None,
     use_local_synchronization: bool = False,
 ) -> Dict[int, torch.distributed.ProcessGroup]:
     """
     Creates groups required for dynamic DPxCP.
-    Creates a group for every valid runtime size below the full DPxCP size.
+    Creates a new group for every power of 2 from min_cp_size up to the full
+    DPxCP group. The full group reuses the existing DPxCP communicator.
     Returns a dictionary indexed by group size.
     """
     dynamic_dp_cp_groups = {}
@@ -505,6 +508,7 @@ def create_dynamic_dp_cp_groups(
             if not use_local_synchronization or rank in sub_ranks:
                 group = create_group(
                     sub_ranks,
+                    timeout=timeout,
                     pg_options=pg_options,
                     use_local_synchronization=use_local_synchronization,
                     group_desc=f"DYNAMIC_DP_CP_GROUP_{group_size}",
@@ -678,6 +682,7 @@ def initialize_model_parallel(
     local_world_size: Optional[int] = None,
     dynamic_context_parallel: bool = False,
     min_dynamic_context_parallel_size: int = 1,
+    gtp_remat_num_sequence_shards: int = 1,
     use_local_synchronization: bool = False,
 ) -> None:
     """Initialize model data parallel groups.
@@ -719,6 +724,11 @@ def initialize_model_parallel(
             the SHARP application target groups.
 
         context_parallel_size (int, default = 1):
+            Runtime context-parallel group size, excluding TP/SP. When sequence sharding
+            within GTP_remat is enabled, this includes those additional sequence partitions:
+            runtime_CP = configured_CP * gtp_remat_num_sequence_shards.
+            Python callers must supply runtime_CP.
+
             The number of tensor parallel GPU groups to split the
             network input sequence length across. Compute of attention
             module requires tokens of full sequence length, so GPUs
@@ -765,6 +775,10 @@ def initialize_model_parallel(
             first-class orthogonal axis (world_size = TP*CP*GTP*DP). Maps to the
             dataclass field ``ModelParallelConfig.gtp_weight_remat_size``.
             NOTE: "remat" here is NOT activation recomputation/checkpointing.
+
+        gtp_remat_num_sequence_shards (int, default = 1):
+            Sequence-shard count within GTP_remat, excluding TP/SP. Must divide gtp_remat_size
+            and context_parallel_size, which is the total runtime CP group size.
 
         expert_gtp_remat_size (int, default = 1):
             Expert-side counterpart of ``gtp_remat_size`` — shards routed-expert
@@ -883,14 +897,33 @@ def initialize_model_parallel(
         and num_distributed_optimizer_instances > 1
     ), "GTP_remat with num_distributed_optimizer_instances > 1 is not yet supported."
 
-    # gtp_remat counts toward model_size (it consumes its own ranks and carries distinct data),
-    # so data_parallel_size becomes the replicate degree.
+    # Resolve weight placement separately from token ownership. Only bootstrap sees
+    # the shared CP/GTP factors; downstream consumers receive concrete groups.
+    layout = None
+    if gtp_remat_num_sequence_shards != 1:
+        if context_parallel_size % gtp_remat_num_sequence_shards:
+            raise ValueError(
+                f"Runtime context_parallel_size ({context_parallel_size}) must be divisible by "
+                f"gtp_remat_num_sequence_shards ({gtp_remat_num_sequence_shards})"
+            )
+        layout = GTPParallelLayout(
+            world_size,
+            tensor_model_parallel_size,
+            pipeline_model_parallel_size,
+            context_parallel_size // gtp_remat_num_sequence_shards,
+            gtp_remat_size,
+            num_sequence_shards=gtp_remat_num_sequence_shards,
+            rank_offset=rank_offset,
+        )
+
     model_size = (
         tensor_model_parallel_size
         * pipeline_model_parallel_size
         * context_parallel_size
         * gtp_remat_size
     )
+    if layout is not None:
+        model_size = layout.minimum_world_size
 
     if world_size % model_size != 0:
         raise RuntimeError(f"world_size ({world_size}) is not divisible by {model_size}")
@@ -932,15 +965,25 @@ def initialize_model_parallel(
 
     decoder_order = _inject_gtp_remat_axis(order, after="cp")
 
-    decoder_rank_generator = RankGenerator(
-        tp=tensor_model_parallel_size,
-        ep=1,
-        dp=data_parallel_size,
-        pp=pipeline_model_parallel_size,
-        cp=context_parallel_size,
-        order=decoder_order,
-        rank_offset=rank_offset,
-        gtp_remat=gtp_remat_size,
+    if layout is not None:
+        token_rank_generator = layout.data
+        weight_rank_generator = layout.weights
+    else:
+        token_rank_generator = RankGenerator(
+            tp=tensor_model_parallel_size,
+            ep=1,
+            dp=data_parallel_size,
+            pp=pipeline_model_parallel_size,
+            cp=context_parallel_size,
+            order=decoder_order,
+            rank_offset=rank_offset,
+            gtp_remat=gtp_remat_size,
+        )
+        weight_rank_generator = token_rank_generator
+    weight_replica_rank_sets = (
+        layout.weights.get_ranks("dp")
+        if layout is not None
+        else token_rank_generator.get_ranks("dp-cp")
     )
 
     # Build expert rank generator
@@ -977,10 +1020,11 @@ def initialize_model_parallel(
         or expert_data_parallel_size == data_parallel_size
     ), "When not using pp-last rank ordering, the data parallel size of the attention and moe layers must be the same"
 
-    assert decoder_rank_generator.get_ranks("pp") == expert_decoder_rank_generator.get_ranks(
-        "pp"
-    ), f"Pipeline parallel groups are expected to be the same for Non-Expert and Expert part, \
-    but got {decoder_rank_generator.get_ranks('pp')} and {expert_decoder_rank_generator.get_ranks('pp')}"
+    assert token_rank_generator.get_ranks("pp") == expert_decoder_rank_generator.get_ranks("pp"), (
+        "Pipeline parallel groups must match for dense and expert layers, "
+        f"but got {token_rank_generator.get_ranks('pp')} "
+        f"and {expert_decoder_rank_generator.get_ranks('pp')}"
+    )
 
     timeout = timedelta(minutes=distributed_timeout_minutes)
 
@@ -995,24 +1039,19 @@ def initialize_model_parallel(
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
     assert _DATA_PARALLEL_GROUP is None, "data parallel group is already initialized"
 
+    num_weight_replicas = len(weight_replica_rank_sets[0])
     assert (
-        data_parallel_size * context_parallel_size
-    ) % num_distributed_optimizer_instances == 0, (
-        "Data parallel size should be divisible by partial DistOpt shard factor"
-    )
-    intra_partial_data_parallel_size = (
-        data_parallel_size * context_parallel_size
-    ) // num_distributed_optimizer_instances
+        num_weight_replicas % num_distributed_optimizer_instances == 0
+    ), "Data parallel size should be divisible by partial DistOpt shard factor"
+    intra_partial_data_parallel_size = num_weight_replicas // num_distributed_optimizer_instances
 
-    # Build the generalized tensor parallel groups.
-    # GTP_remat overlaps with the CP-DP domain because GTP_remat only shards weights
-    # while CP only shards activations — they are independent and can share ranks.
+    # Build the actual weight-shard group, independently of the token layout.
     global _GTP_WEIGHT_REMAT_GROUP
     global _GTP_WEIGHT_REMAT_GLOBAL_RANKS
     assert (
         _GTP_WEIGHT_REMAT_GROUP is None
     ), "generalized tensor parallel group is already initialized"
-    for gtp_ranks in decoder_rank_generator.get_gtp_ranks(gtp_remat_size):
+    for gtp_ranks in weight_rank_generator.get_ranks("gtp_remat"):
         group = create_group(
             gtp_ranks,
             timeout=timeout,
@@ -1036,7 +1075,9 @@ def initialize_model_parallel(
     # is eligible for using the NCCL COLLNET feature.
     # Therefore, dp-cp group, which potentially requires SHARP-enablement,
     # need to be created before all the other groups
-    for ranks_with_cp in decoder_rank_generator.get_ranks("dp-cp"):
+    global _WEIGHT_REPLICA_RANK_SETS
+    _WEIGHT_REPLICA_RANK_SETS = weight_replica_rank_sets
+    for ranks_with_cp in weight_replica_rank_sets:
         if not use_local_synchronization or rank in ranks_with_cp:
             group_with_cp = create_group(
                 ranks_with_cp,
@@ -1109,7 +1150,7 @@ def initialize_model_parallel(
         # PyTorch is performing lazy initialization of the communicator group.
         # Therefore, we need to perform a nccl call to ensure that the communicator group is created.
         torch.distributed.barrier(
-            group=get_data_parallel_group(with_context_parallel=True),
+            group=get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False),
             device_ids=[torch.cuda.current_device()],
         )
         torch.cuda.synchronize()
@@ -1129,16 +1170,60 @@ def initialize_model_parallel(
 
     if dynamic_context_parallel:
         global _DYNAMIC_DP_CP_GROUPS
-        for ranks_with_cp in decoder_rank_generator.get_ranks('dp-cp'):
+        global _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS
+        dp_cp_rank_groups = token_rank_generator.get_ranks("dp-cp")
+        for ranks_with_cp in dp_cp_rank_groups:
             _DYNAMIC_DP_CP_GROUPS.update(
                 create_dynamic_dp_cp_groups(
                     rank,
                     ranks_with_cp,
                     get_nccl_options("dp_cp", nccl_comm_cfgs),
                     min_cp_size=min_dynamic_context_parallel_size,
+                    timeout=timeout,
                     use_local_synchronization=use_local_synchronization,
                 )
             )
+
+        # Include the full domain in the snapshot even when min_cp_size selects
+        # only this group. The communicator already exists; no new group is needed.
+        _DYNAMIC_DP_CP_GROUPS[data_parallel_size * context_parallel_size] = (
+            _DATA_PARALLEL_GROUP_WITH_CP
+        )
+
+        # A layout conversion after TP sequence scattering must communicate
+        # over the Cartesian product of TP and the runtime DPxCP subgroup.
+        # Build those products from matching DPxCP lanes while keeping the
+        # GTP-remat and PP coordinates fixed.
+        if tensor_model_parallel_size > 1:
+            valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(
+                data_parallel_size * context_parallel_size
+            )
+            for tp_dp_cp_ranks in token_rank_generator.get_ranks('tp-dp-cp'):
+                parent_ranks = set(tp_dp_cp_ranks)
+                dp_cp_lanes = [
+                    lane for lane in dp_cp_rank_groups if set(lane).issubset(parent_ranks)
+                ]
+                assert len(dp_cp_lanes) == tensor_model_parallel_size
+                for group_size in valid_group_sizes:
+                    if group_size < min_dynamic_context_parallel_size:
+                        continue
+                    for start in range(0, len(dp_cp_lanes[0]), group_size):
+                        subgroup_ranks = [
+                            lane[dp_cp_index]
+                            for dp_cp_index in range(start, start + group_size)
+                            for lane in dp_cp_lanes
+                        ]
+                        if not use_local_synchronization or rank in subgroup_ranks:
+                            group = create_group(
+                                subgroup_ranks,
+                                timeout=timeout,
+                                pg_options=get_nccl_options("tp_cp", nccl_comm_cfgs),
+                                use_local_synchronization=use_local_synchronization,
+                                group_desc=f"DYNAMIC_TENSOR_DATA_CONTEXT_GROUP_{group_size}",
+                            )
+                        if rank in subgroup_ranks:
+                            assert group_size not in _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS
+                            _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS[group_size] = group
 
         # NCCL initializes communicators lazily. Touch every local runtime
         # group, including the singleton CP-off group, in a deterministic order.
@@ -1158,8 +1243,17 @@ def initialize_model_parallel(
             group = get_dynamic_data_context_parallel_groups(group_size=group_size)
             torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
             torch.cuda.synchronize()
+            if tensor_model_parallel_size > 1:
+                # TP groups are initialized later in this function, so do not
+                # route this eager communicator touch through the public
+                # accessor (which consults TP parallel state).
+                tp_cp_group = _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS[group_size]
+                torch.distributed.barrier(
+                    group=tp_cp_group, device_ids=[torch.cuda.current_device()]
+                )
+                torch.cuda.synchronize()
 
-    for ranks in decoder_rank_generator.get_ranks("dp"):
+    for ranks in token_rank_generator.get_ranks("dp"):
         if not use_local_synchronization or rank in ranks:
             group = create_group(
                 ranks,
@@ -1188,7 +1282,7 @@ def initialize_model_parallel(
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT
     if gtp_remat_size > 1:
         # Every rank iterates all groups so each create_group collective is entered by all ranks.
-        for dp_ranks in decoder_rank_generator.get_ranks("gtp_remat-dp"):
+        for dp_ranks in token_rank_generator.get_ranks("gtp_remat-dp"):
             group = create_group(
                 dp_ranks,
                 timeout=timeout,
@@ -1198,7 +1292,7 @@ def initialize_model_parallel(
             if rank in dp_ranks:
                 _DATA_PARALLEL_GROUP_WITH_GTP_REMAT = group
 
-        for dp_cp_ranks in decoder_rank_generator.get_ranks("gtp_remat-dp-cp"):
+        for dp_cp_ranks in token_rank_generator.get_ranks("gtp_remat-dp-cp"):
             group = create_group(
                 dp_cp_ranks,
                 timeout=timeout,
@@ -1225,7 +1319,7 @@ def initialize_model_parallel(
     global _CONTEXT_PARALLEL_GROUP
     global _CONTEXT_PARALLEL_GLOBAL_RANKS
     assert _CONTEXT_PARALLEL_GROUP is None, 'context parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('cp'):
+    for ranks in token_rank_generator.get_ranks("cp"):
         if not use_local_synchronization or rank in ranks:
             group = create_group(
                 ranks,
@@ -1259,7 +1353,7 @@ def initialize_model_parallel(
     global _MODEL_PARALLEL_GROUP
     global _MODEL_PARALLEL_GLOBAL_RANKS
     assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp-gtp_remat-pp'):
+    for ranks in weight_rank_generator.get_ranks("tp-gtp_remat-pp"):
         if not use_local_synchronization or rank in ranks:
             group = create_group(
                 ranks,
@@ -1278,7 +1372,7 @@ def initialize_model_parallel(
     assert (
         _TENSOR_MODEL_PARALLEL_GROUP is None
     ), 'tensor model parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp'):
+    for ranks in token_rank_generator.get_ranks("tp"):
         if not use_local_synchronization or rank in ranks:
             group = create_group(
                 ranks,
@@ -1356,7 +1450,7 @@ def initialize_model_parallel(
         os.environ["UCX_NET_DEVICES"] = "all"
         os.environ["UCC_CL_BASIC_TLS"] = "^sharp,nccl"
 
-    pipeline_rank_groups = decoder_rank_generator.get_ranks('pp')
+    pipeline_rank_groups = token_rank_generator.get_ranks("pp")
     for ranks in pipeline_rank_groups:
         assert (
             pipeline_model_parallel_comm_backend == None
@@ -1447,7 +1541,7 @@ def initialize_model_parallel(
     # Spans gtp_remat (like dp): gtp_remat peers are distinct-data ranks, so this group serves both
     # FP8 amax reduction and the MoE router's expert-bias / load-balancing token reduction. The
     # gtp_remat axis is a no-op when its size is 1.
-    for ranks in decoder_rank_generator.get_ranks('tp-gtp_remat-dp-cp'):
+    for ranks in token_rank_generator.get_ranks("tp-gtp_remat-dp-cp"):
         if not use_local_synchronization or rank in ranks:
             group = create_group(
                 ranks,
@@ -1458,7 +1552,7 @@ def initialize_model_parallel(
             )
         if rank in ranks:
             _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
-    for ranks in decoder_rank_generator.get_ranks('tp-gtp_remat-dp'):
+    for ranks in token_rank_generator.get_ranks("tp-gtp_remat-dp"):
         if not use_local_synchronization or rank in ranks:
             group = create_group(
                 ranks,
@@ -1474,7 +1568,7 @@ def initialize_model_parallel(
     assert (
         _TENSOR_AND_CONTEXT_PARALLEL_GROUP is None
     ), 'Tensor + context parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp-cp'):
+    for ranks in token_rank_generator.get_ranks("tp-cp"):
         if not use_local_synchronization or rank in ranks:
             group = create_group(
                 ranks,
@@ -1522,7 +1616,7 @@ def initialize_model_parallel(
         if rank in ranks:
             _EXPERT_MODEL_PARALLEL_GROUP = group
             _EXPERT_MODEL_PARALLEL_RANKS = ranks
-    # These expert group families overlap differently.  With local synchronization,
+    # These expert group families overlap differently. With local synchronization,
     # keep all ranks on the same family before constructing the next one.
     if use_local_synchronization:
         torch.distributed.barrier()
@@ -1637,7 +1731,7 @@ def initialize_model_parallel(
             )
         if create_gloo_process_groups:
             group_gloo = create_group(
-                ranks, backend="gloo", group_desc="EXPERT_DATA_PARALLEL_GROUP_GLOO"
+                ranks, timeout=timeout, backend="gloo", group_desc="EXPERT_DATA_PARALLEL_GROUP_GLOO"
             )
         else:
             group_gloo = None
@@ -1804,26 +1898,12 @@ def create_all_gather_groups(
     if use_local_synchronization and torch.distributed.get_backend() == "mpi":
         raise ValueError("MPI backend doesn't support use_local_synchronization=True")
     pp_size = get_pipeline_model_parallel_world_size()
-    cp_size = get_context_parallel_world_size()
-    tp_size = get_tensor_model_parallel_world_size()
     ep_size = get_expert_model_parallel_world_size()
-    dp_size = get_data_parallel_world_size()
-    gtp_remat_size = get_gtp_weight_remat_world_size() or 1
-
-    # Create regular DP all-gather group
+    # Reuse the resolved weight layout, including rank offsets and CP overlap.
+    # Reconstructing it from CP and GTP sizes would count shared ranks twice.
     dp_cp_ag_group = None
-    decoder_rank_gen = RankGenerator(
-        tp=tp_size,
-        ep=1,
-        dp=dp_size,
-        pp=pp_size,
-        cp=cp_size,
-        gtp_remat=gtp_remat_size,
-        order=_inject_gtp_remat_axis('tp-cp-ep-dp-pp', after='cp'),
-        rank_offset=0,
-    )
-
-    for ranks_with_cp in decoder_rank_gen.get_ranks('dp-cp'):
+    assert _WEIGHT_REPLICA_RANK_SETS is not None
+    for ranks_with_cp in _WEIGHT_REPLICA_RANK_SETS:
         if not use_local_synchronization or rank in ranks_with_cp:
             group_with_cp_ag = create_group(
                 ranks_with_cp,
@@ -2038,6 +2118,30 @@ def get_hierarchical_context_parallel_groups(check_initialized=True):
     return _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
 
 
+def get_dynamic_data_context_parallel_group_map() -> Dict[int, torch.distributed.ProcessGroup]:
+    """Snapshot local runtime CP groups keyed by CP size.
+
+    The map includes the full DPxCP domain and, when initialized, the singleton
+    CP-off group. It is empty before initialization and when dynamic CP is disabled.
+    """
+    return dict(_DYNAMIC_DP_CP_GROUPS)
+
+
+def get_dynamic_tensor_data_context_parallel_group_map() -> (
+    Dict[int, torch.distributed.ProcessGroup]
+):
+    """Snapshot TP x runtime-CP groups, keyed by the runtime CP size.
+
+    With TP1 these are the runtime CP groups themselves. The returned maps keep
+    the original process-group handles without exposing the global dictionaries.
+    """
+    if not _DYNAMIC_DP_CP_GROUPS:
+        return {}
+    if get_tensor_model_parallel_world_size() == 1:
+        return dict(_DYNAMIC_DP_CP_GROUPS)
+    return dict(_DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS)
+
+
 def get_dynamic_data_context_parallel_groups(
     check_initialized: bool = True, group_size: Optional[int] = None
 ) -> torch.distributed.ProcessGroup:
@@ -2064,6 +2168,24 @@ def get_hybrid_data_context_parallel_groups(
         stacklevel=2,
     )
     return get_dynamic_data_context_parallel_groups(check_initialized, group_size)
+
+
+def get_dynamic_tensor_data_context_parallel_group(
+    check_initialized: bool = True, group_size: Optional[int] = None
+) -> torch.distributed.ProcessGroup:
+    """Get the TP x runtime-DPxCP group containing the caller rank.
+
+    ``group_size`` is the runtime CP size; the returned process group has
+    ``tensor_model_parallel_size * group_size`` ranks. With TP1 the dynamic
+    DPxCP group itself is already the required Cartesian product.
+    """
+    if get_tensor_model_parallel_world_size() == 1:
+        return get_dynamic_data_context_parallel_groups(check_initialized, group_size)
+    if check_initialized:
+        assert (
+            group_size in _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS
+        ), f"Dynamic TPxDPxCP group of CP size {group_size} is not initialized"
+    return _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS[group_size]
 
 
 def get_embedding_group(check_initialized=True):
@@ -2711,6 +2833,17 @@ def get_all_ranks():
 
 def destroy_model_parallel():
     """Set the groups to none."""
+    # MoonEP's symmetric-memory windows must be released while their expert process group
+    # is still alive. Idempotent and a no-op when virtual experts were never initialized.
+    try:
+        from megatron.core.transformer.moe.virtual_expert_load_balancer import (
+            VirtualExpertLoadBalancer,
+        )
+
+        VirtualExpertLoadBalancer.finalize()
+    except Exception:
+        logger.warning("Failed to finalize MoonEP resources during teardown", exc_info=True)
+
     # Release the NCCL EP context (if the 'ncclep' flex dispatcher bootstrapped one) before the
     # process group's communicator is torn down. TE registers an atexit ep_finalize that would
     # otherwise run after dist.destroy_process_group() and hit a "corrupted comm object" at exit.
@@ -2733,6 +2866,8 @@ def destroy_model_parallel():
 
     global _GTP_WEIGHT_REMAT_GLOBAL_RANKS
     _GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
+    global _WEIGHT_REPLICA_RANK_SETS
+    _WEIGHT_REPLICA_RANK_SETS = None
 
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None
@@ -2760,6 +2895,9 @@ def destroy_model_parallel():
 
     global _DYNAMIC_DP_CP_GROUPS
     _DYNAMIC_DP_CP_GROUPS = {}
+
+    global _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS
+    _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS = {}
 
     global _EMBEDDING_GROUP
     _EMBEDDING_GROUP = None
