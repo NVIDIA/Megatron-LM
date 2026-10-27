@@ -2455,6 +2455,10 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     else:
         setattr(args, 'moe_ffn_hidden_size', None)
     _set_arg('moe_router_topk', force=True)
+    _set_arg('moe_router_load_balancing_type', force=True)
+    _set_arg('moe_aux_loss_coeff', force=True)
+    _set_arg('moe_router_quantile_balancing_estimation_scope', force=True)
+    _set_arg('moe_router_qb_num_bins', force=True)
     _set_arg('moe_token_dispatcher_type', force=False)
     _set_arg('moe_router_pre_softmax', force=True)
     _set_arg('moe_grouped_gemm', force=True)
@@ -3340,7 +3344,7 @@ def load_checkpoint(
             # Optimizer state dict can overwrite per-group max_lr/min_lr values.
             # If scheduler override is requested, re-apply runtime lr bounds from
             # args so scheduler math does not stay pinned to checkpoint lr settings.
-            if getattr(args, "override_opt_param_scheduler", False):
+            if getattr(cfg.scheduler, "override_opt_param_scheduler", False):
                 if (
                     optimizer is None
                     or getattr(optimizer, "is_stub_optimizer", False)

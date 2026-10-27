@@ -1,11 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-name: Unit-test bucket
+name: Unit tests
 
 on:
   workflow_call:
     inputs:
-      bucket:
+      buckets:
+        description: JSON-encoded recipe bucket list
         type: string
         required: true
       platform:
@@ -21,9 +22,6 @@ on:
       sha:
         type: string
         required: true
-      timeout:
-        type: number
-        default: 30
       unit_testmon_mode:
         type: string
         default: full
@@ -40,15 +38,14 @@ permissions:
 
 jobs:
   select:
-    name: Select tests on CPU
+    name: unit tests selection
     if: inputs.unit_testmon_mode == 'enforce'
     runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
-      mode: ${{ steps.result.outputs.mode }}
-      has_tests: ${{ steps.result.outputs.has_tests }}
-      plan_artifact: ${{ steps.result.outputs.plan_artifact }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      has_tests: ${{ steps.plan.outputs.has_tests }}
     steps:
       # All selection runs here. GPU jobs only execute the resulting plan.
       - name: Checkout
@@ -65,47 +62,22 @@ jobs:
 
       - name: Install selection dependencies
         id: dependencies
-        run: python -m pip install 'pytest-testmon==2.2.0' PyYAML
-
-      - name: Compute unit Testmon cache identity
-        id: identity
-        shell: bash -e -u -o pipefail {0}
-        env:
-          BUCKET: ${{ inputs.bucket }}
-          RECIPE_PLATFORM: ${{ inputs.platform }}
-          TARGET_BRANCH: ${{ inputs.unit_testmon_target_branch }}
         run: |
-          [[ "$TARGET_BRANCH" == "main" ]]
-          python tests/unit_tests/testmon_cache.py identity \
-            --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" \
-            --output "$RUNNER_TEMP/unit-testmon-identity.json" | tee -a "$GITHUB_OUTPUT"
-          BUCKET_HASH=$(printf '%s' "$BUCKET" | sha256sum | cut -c 1-16)
-          echo "artifact=unit-test-plan-${RECIPE_PLATFORM}-${BUCKET_HASH}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          python -m pip install 'pytest-testmon==2.2.0' PyYAML
+          npm install --prefix "$RUNNER_TEMP/testmon" --no-package-lock --ignore-scripts --no-audit --no-fund \
+            @actions/cache@4.0.3 @actions/artifact@5.0.0
 
       - name: Match the baseline cache compression
         id: cache-compression
-        if: steps.identity.outcome == 'success'
         shell: bash -e -u -o pipefail {0}
         run: |
           # GPU runners publish gzip caches. actions/cache includes compression
           # in its version and otherwise chooses ubuntu-latest's installed zstd.
-          # Make its zstd probe unavailable only for this restore step.
+          # Make its zstd probe unavailable during selection.
           TESTMON_CACHE_BIN=$(mktemp -d "$RUNNER_TEMP/unit-testmon-gzip.XXXXXX")
           printf '#!/bin/sh\nexit 1\n' > "$TESTMON_CACHE_BIN/zstd"
           chmod +x "$TESTMON_CACHE_BIN/zstd"
           printf 'path=%s:%s\n' "$TESTMON_CACHE_BIN" "$PATH" >> "$GITHUB_OUTPUT"
-
-      - name: Restore unit Testmon baseline
-        id: baseline
-        if: steps.cache-compression.outcome == 'success'
-        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
-        continue-on-error: true
-        env:
-          PATH: ${{ steps.cache-compression.outputs.path }}
-        with:
-          path: assets_dir/testmon
-          key: ${{ steps.identity.outputs.cache_prefix }}lookup-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: ${{ steps.identity.outputs.cache_prefix }}
 
       - name: Prepare PR file download
         id: pr-files-directory
@@ -124,80 +96,47 @@ jobs:
           path: ${{ steps.pr-files-directory.outputs.path }}
           merge-multiple: true
 
-      - name: Select affected tests without importing the GPU suite
+      - name: Select affected tests for all buckets
         id: plan
-        shell: bash -e -u -o pipefail {0}
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
-          BUCKET: ${{ inputs.bucket }}
+          BUCKETS: ${{ inputs.buckets }}
           RECIPE_PLATFORM: ${{ inputs.platform }}
           SOURCE_SHA: ${{ inputs.sha }}
-          MATCHED_KEY: ${{ steps.baseline.outputs.cache-matched-key }}
+          TARGET_BRANCH: ${{ inputs.unit_testmon_target_branch }}
           PR_FILES_DIR: ${{ steps.pr-files-directory.outputs.path }}
-        run: |
-          mkdir -p assets_dir/testmon-plan
-          python tests/unit_tests/testmon_selector.py select \
-            --cache-dir assets_dir/testmon --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" \
-            --source-sha "$SOURCE_SHA" --matched-key "$MATCHED_KEY" \
-            --pr-files-dir "$PR_FILES_DIR" \
-            --output assets_dir/testmon-plan/plan.json | tee -a "$GITHUB_OUTPUT"
-
-      # Keep empty plans as evidence for the no-tests result and coverage gate.
-      - name: Upload unit Testmon plan
-        id: upload
-        if: steps.plan.outcome == 'success' && steps.plan.outputs.mode == 'selected'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+          PATH: ${{ steps.cache-compression.outputs.path }}
         with:
-          name: ${{ steps.identity.outputs.artifact }}
-          path: assets_dir/testmon-plan/plan.json
-          if-no-files-found: error
-
-      - name: Resolve GPU execution
-        id: result
-        shell: bash -e -u -o pipefail {0}
-        env:
-          PLAN_OUTCOME: ${{ steps.plan.outcome }}
-          PLAN_MODE: ${{ steps.plan.outputs.mode }}
-          HAS_TESTS: ${{ steps.plan.outputs.has_tests }}
-          UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
-          PLAN_ARTIFACT: ${{ steps.identity.outputs.artifact }}
-          BUCKET: ${{ inputs.bucket }}
-        run: |
-          [[ "$PLAN_OUTCOME" == "success" ]]
-          [[ "$HAS_TESTS" == "true" || "$HAS_TESTS" == "false" ]]
-          MODE=$PLAN_MODE
-          ARTIFACT=""
-          case "$MODE" in
-            selected)
-              [[ "$UPLOAD_OUTCOME" == "success" && -n "$PLAN_ARTIFACT" ]]
-              ARTIFACT=$PLAN_ARTIFACT
-              ;;
-            full)
-              [[ "$HAS_TESTS" == "true" ]]
-              ;;
-            *) exit 1 ;;
-          esac
-          {
-            echo "mode=$MODE"
-            echo "has_tests=$HAS_TESTS"
-            echo "plan_artifact=$ARTIFACT"
-          } >> "$GITHUB_OUTPUT"
-          {
-            echo "### Unit Testmon CPU selection"
-            echo
-            echo "- Bucket: \`$BUCKET\`"
-            echo "- Mode: \`$MODE\`"
-            echo "- GPU runner required: \`$HAS_TESTS\`"
-            if [[ "$MODE" == "full" ]]; then
-              echo "- CPU cache validation or selection requires the full bucket."
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          script: |
+            // Only SDK transport lives here; Python owns selection and the matrix.
+            const client = `
+              (async () => {
+                const [operation, ...args] = process.argv.slice(1);
+                const modules = process.env.RUNNER_TEMP + '/testmon/node_modules/';
+                if (operation === 'restore') {
+                  const key = await require(modules + '@actions/cache').restoreCache(
+                    [args[0]], args[1], [args[2]]);
+                  require('node:fs').writeFileSync(args[3], key || '');
+                } else {
+                  const {DefaultArtifactClient} = require(modules + '@actions/artifact');
+                  await new DefaultArtifactClient().uploadArtifact(args[0], [args[1]], args[2]);
+                }
+              })().catch(error => { console.error(error); process.exitCode = 1; });
+            `;
+            await exec.exec('python', ['.github/scripts/select_unit_tests.py'], {
+              env: {...process.env, TESTMON_NODE: process.execPath, TESTMON_ACTIONS: client},
+            });
 
   run:
-    name: Run tests on GPU
+    name: ${{ matrix.bucket }}
     needs: select
-    # CPU failures stop the bucket; empty selections never allocate a GPU.
+    # CPU failures stop GPU dispatch; empty selections never allocate a GPU.
     # Explicit full-suite requests bypass selective planning.
     if: ${{ !cancelled() && (inputs.unit_testmon_mode != 'enforce' || (needs.select.result == 'success' && needs.select.outputs.has_tests == 'true')) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.select.outputs.matrix || inputs.buckets) }}
     runs-on: ${{ fromJSON(inputs.runner) }}
     timeout-minutes: 60
     env:
@@ -215,14 +154,14 @@ jobs:
         uses: ./.github/actions
         with:
           script: ""
-          test_case: ${{ inputs.bucket }}
+          test_case: ${{ matrix.bucket }}
           tag: latest
-          timeout: ${{ inputs.timeout }}
+          timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
           container-image: ${{ inputs.container-image }}
           platform: ${{ inputs.platform }}
           sha: ${{ inputs.sha }}
-          unit_testmon_mode: ${{ needs.select.outputs.mode == 'selected' && 'preselected' || 'full' }}
+          unit_testmon_mode: ${{ matrix.mode || 'full' }}
           unit_testmon_target_branch: ${{ inputs.unit_testmon_target_branch }}
-          unit_testmon_plan_artifact: ${{ needs.select.outputs.plan_artifact }}
+          unit_testmon_plan_artifact: ${{ matrix.plan_artifact }}
           unit_test_pr_files_artifact_id: ${{ inputs.unit_test_pr_files_artifact_id }}

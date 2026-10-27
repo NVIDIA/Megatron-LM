@@ -258,7 +258,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_padding_for_fp8": False,
     "moe_router_padding_for_quantization": False,
     "moe_router_pre_softmax": False,
+    "moe_router_qb_num_bins": 1000,
     "moe_router_quantile_balancing_ema": 0.0,
+    "moe_router_quantile_balancing_estimation_scope": "micro_batch",
     "moe_router_score_function": "sigmoid",
     "moe_router_skip_muon": True,
     "moe_router_topk": 6,
@@ -288,6 +290,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mtp_detach_heads": False,
     "mtp_hsm": False,
     "mtp_hybrid_override_pattern": None,
+    "mtp_loss_early_backward": False,
     "mtp_loss_scaling_factor": 0.1,
     "mtp_num_layers": None,
     "mtp_standalone": False,
@@ -382,6 +385,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "activation_offload_fraction": 1.0,
     "fine_grained_offloading_max_inflight_offloads": None,
     "hybrid_context_parallel": False,
+    "dynamic_context_parallel": False,
+    "min_dynamic_context_parallel_size": 1,
     "max_seqlen_per_dp_cp_rank": None,
     "inference_cuda_graph_scope": {
         "__objclass__": "megatron.core.transformer.enums.InferenceCudaGraphScope",
@@ -393,6 +398,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_force_biased": None,
     "inference_grouped_gemm_backend": "vllm",
     "inference_flashinfer_mxfp8_token_capacity": None,
+    "inference_moe_nvfp4_recipe": None,
     "inference_moe_disable_fused_quant_kernels": False,
     "inference_moe_token_dispatcher_type": "nvls",
     "moe_mlp_glu_interleave_size": None,
@@ -407,7 +413,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
 # Fields that are allowed to appear in the live config even if not yet in the golden.
-ALLOW_ADDED_FIELDS = set()
+ALLOW_ADDED_FIELDS = {"pad_packed_seq_alignment"}
 
 
 def serialize_config(cfg: Any) -> Dict[str, Any]:
