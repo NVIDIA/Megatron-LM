@@ -219,19 +219,34 @@ def _init_moe_expert_cache(model):
 def set_moe_metadata_sync(model) -> None:
     """Set _runs_metadata_sync on inference dispatchers.
 
-    Exactly one dispatcher per model — the first MoE layer — fires update_metadata
-    each step. All subsequent layers skip it to avoid redundant collective calls.
+    The dispatcher metadata (the valid-token count the experts read and, at EP > 1, the
+    per-rank token layout) describes the rows of one forward pass, so exactly one dispatcher
+    per forward fires update_metadata: the first MoE layer of the main model forward, and the
+    first MoE layer of each MTP layer. Speculative decoding runs every MTP layer as a forward
+    of its own (`forward_single_position`) on request-shaped rows, without the decoder's MoE
+    layers. All other layers skip it to avoid redundant collective calls.
     Must be called once after the model is built and put into eval mode.
     """
+    from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+
     global moe_layer_cache, _moe_metadata_sync_initialized
     if _moe_metadata_sync_initialized:
         return
     if moe_layer_cache is None:
         _init_moe_expert_cache(model)
-    for i, moe_layer in enumerate(moe_layer_cache):
+    # The forward each MoE layer runs in: its MTP layer, or None for the main forward.
+    forward_of = {}
+    for module in model.modules():
+        if isinstance(module, MultiTokenPredictionLayer):
+            for submodule in module.modules():
+                forward_of[id(submodule)] = id(module)
+    synced_forwards = set()
+    for moe_layer in moe_layer_cache:
+        forward = forward_of.get(id(moe_layer))
         dispatcher = getattr(moe_layer, '_inference_token_dispatcher', None)
         if dispatcher is not None:
-            dispatcher._runs_metadata_sync = i == 0
+            dispatcher._runs_metadata_sync = forward not in synced_forwards
+        synced_forwards.add(forward)
     _moe_metadata_sync_initialized = True
 
 

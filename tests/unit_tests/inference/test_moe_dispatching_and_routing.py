@@ -23,7 +23,7 @@ from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.initialize import _set_random_seed
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 # Reusable skip decorators
 requires_te = pytest.mark.skipif(
@@ -1152,6 +1152,234 @@ class TestNVLSAllGatherVDispatcher:
             base_local_tokens=500,
             outlier_tokens=True,
         )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Dispatcher metadata of MTP forwards
+# ──────────────────────────────────────────────────────────────────────
+
+_MTP_MOE_HIDDEN = 64
+_MTP_MOE_LOCAL_EXPERTS = 4
+_MTP_MOE_TOPK = 2
+_MTP_MOE_PER_RANK_MAX_TOKENS = 32
+
+
+def _build_gpt_with_moe_in_decoder_and_mtp(dispatcher_type, ep_size):
+    """Smallest GPTModel with inference MoE layers in both its decoder and its MTP block."""
+    from megatron.core.models.gpt.gpt_layer_specs import (
+        get_gpt_layer_with_inference_spec,
+        get_gpt_mtp_block_spec,
+    )
+    from megatron.core.models.gpt.gpt_model import GPTModel
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
+    num_experts = _MTP_MOE_LOCAL_EXPERTS * ep_size
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=_MTP_MOE_HIDDEN,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        transformer_impl="inference_optimized",
+        normalization="RMSNorm",
+        add_bias_linear=False,
+        activation_func=squared_relu,
+        num_moe_experts=num_experts,
+        moe_router_topk=_MTP_MOE_TOPK,
+        moe_router_dtype="fp32",
+        expert_model_parallel_size=ep_size,
+        inference_moe_token_dispatcher_type=dispatcher_type,
+        mtp_num_layers=2,
+    )
+    layer_spec = get_gpt_layer_with_inference_spec(num_experts=num_experts)
+    mtp_block_spec = get_gpt_mtp_block_spec(
+        config=config, spec=layer_spec, use_transformer_engine=False
+    )
+    model = GPTModel(
+        config=config,
+        transformer_layer_spec=layer_spec,
+        vocab_size=128,
+        max_sequence_length=64,
+        parallel_output=True,
+        pre_process=True,
+        post_process=True,
+        mtp_block_spec=mtp_block_spec,
+        position_embedding_type="none",
+    )
+    return model.cuda().eval()
+
+
+def _inference_dispatchers(model):
+    """Inference dispatchers of the decoder's MoE layers and of each MTP layer's MoE layers."""
+    from megatron.core.transformer.moe.moe_layer import MoELayer
+
+    def dispatchers(module):
+        return [m._inference_token_dispatcher for m in module.modules() if isinstance(m, MoELayer)]
+
+    return dispatchers(model.decoder), [dispatchers(layer) for layer in model.mtp.layers]
+
+
+def _forward_rows(seed, counts, ep_rank):
+    """Rank-major rows of one forward (identical on every rank) and this rank's own rows."""
+    generator = torch.Generator().manual_seed(seed)
+    total = sum(counts)
+    global_rows = (
+        torch.randn(total, _MTP_MOE_HIDDEN, generator=generator).to(torch.bfloat16).cuda(),
+        torch.randint(
+            0, _MTP_MOE_LOCAL_EXPERTS, (total, _MTP_MOE_TOPK), generator=generator
+        ).cuda(),
+        torch.rand(total, _MTP_MOE_TOPK, generator=generator).cuda(),
+    )
+    start = sum(counts[:ep_rank])
+    local_rows = tuple(t[start : start + counts[ep_rank]].clone() for t in global_rows)
+    return global_rows, local_rows
+
+
+def _moe_round_trip(dispatcher, hidden, routing_map, probs):
+    """One inference MoE layer through `dispatcher`, with identity experts.
+
+    The experts produce rows only inside the valid-token window they read from the shared
+    count, as InferenceGroupedMLP does. Rows past it are NaN, so a combine that returns a row
+    the experts never produced is caught.
+    """
+    from megatron.core.transformer.moe.token_dispatcher_inference import (
+        InferenceAllGatherDispatcherBase,
+        NVLSAllGatherVDispatcher,
+    )
+
+    h, p = dispatcher.dispatch_preprocess(hidden.unsqueeze(1), routing_map, probs)
+    h, p = dispatcher.token_dispatch(h, p)
+    h, _, p = dispatcher.dispatch_postprocess(h, p)
+    valid = int(InferenceAllGatherDispatcherBase._valid_tokens().item())
+    step_metadata = None
+    if isinstance(dispatcher, NVLSAllGatherVDispatcher) and dispatcher.ep_size > 1:
+        step_metadata = NVLSAllGatherVDispatcher._step_metadata.tolist()
+    gathered = h.clone()
+    expert_output = torch.full(h.shape, float("nan"), dtype=torch.float32, device=h.device)
+    expert_output[:valid] = h[:valid].float()
+    combined = dispatcher.token_combine(dispatcher.combine_preprocess(expert_output))
+    return valid, step_metadata, gathered, dispatcher.combine_postprocess(combined)
+
+
+@pytest.mark.internal
+@requires_te
+class TestMTPDispatcherMetadata:
+    """Each MTP layer's MoE refreshes the dispatcher metadata for its own forward.
+
+    A speculative-decoding step runs the main forward over V tokens per EP rank, then each MTP
+    layer as a forward of its own over R <= V request-shaped rows. The MTP layer's MoE must not
+    reuse the main forward's metadata: neither the valid-token count that bounds the fused-MoE
+    kernels nor, at EP > 1, the per-rank token layout of the all-gather and reduce-scatter.
+    """
+
+    @pytest.fixture
+    def expert_parallel(self, request, monkeypatch):
+        """EP process groups and fresh process-global inference MoE state for one test."""
+        from megatron.core.inference import utils as inference_utils
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            InferenceAllGatherDispatcherBase,
+            NCCLAllGatherDispatcher,
+            NVLSAllGatherVDispatcher,
+        )
+
+        # 1, or None for EP = world size (as in the dispatcher tests above).
+        param = getattr(request, "param", 1)
+        ep_size = param or Utils.world_size
+        if param is None and ep_size == 1:
+            pytest.skip("Expert parallelism requires world_size > 1.")
+        Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=ep_size)
+        # The MoE layer cache and the metadata-sync flags are set once per process, from the
+        # first model; every test here builds a new one.
+        monkeypatch.setattr(inference_utils, "moe_layer_cache", None)
+        monkeypatch.setattr(inference_utils, "_moe_metadata_sync_initialized", False)
+        monkeypatch.setattr(InferenceAllGatherDispatcherBase, "_valid_tokens_tensor", None)
+        monkeypatch.setattr(InferenceAllGatherDispatcherBase, "_host_valid_tokens_estimate", None)
+        # Uneven per-rank counts take the NCCL dispatcher's eager (variable-count) path.
+        monkeypatch.setattr(NCCLAllGatherDispatcher, "_use_allgather_v", True)
+        monkeypatch.setattr(NCCLAllGatherDispatcher, "_local_tokens_per_rank", None)
+        # No inference context binds the routing-mask count, so every row is real.
+        monkeypatch.setattr(NVLSAllGatherVDispatcher, "_real_token_count_tensor", None)
+        InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
+        # The model build pins the NVTE attention backend variables the conftest presets.
+        clear_nvte_env_vars()
+        SymmetricMemoryManager.destroy()
+        try:
+            yield ep_size
+        finally:
+            torch.cuda.synchronize()
+            NVLSAllGatherVDispatcher._delete_buffers()
+            SymmetricMemoryManager.destroy()
+            Utils.destroy_model_parallel()
+
+    def test_first_moe_layer_of_each_forward_syncs_metadata(self, expert_parallel):
+        """One dispatcher per forward refreshes: the decoder's first and each MTP layer's."""
+        from megatron.core.inference.utils import set_moe_metadata_sync
+
+        model = _build_gpt_with_moe_in_decoder_and_mtp("nvls", expert_parallel)
+        set_moe_metadata_sync(model)
+
+        decoder, mtp_layers = _inference_dispatchers(model)
+        assert [d._runs_metadata_sync for d in decoder] == [True, False]
+        assert [[d._runs_metadata_sync for d in layer] for layer in mtp_layers] == [[True], [True]]
+
+    @pytest.mark.parametrize("expert_parallel", [1, None], indirect=True, ids=["ep1", "ep_world"])
+    @pytest.mark.parametrize("dispatcher_type", ["nccl", "nvls"])
+    def test_mtp_forwards_see_their_own_metadata(self, dispatcher_type, expert_parallel):
+        """Main forward, then two MTP-layer forwards with fewer rows: every MoE layer sees the
+        valid-token count and EP layout of its own forward, and gets back exactly its rows."""
+        from megatron.core.inference.utils import set_moe_metadata_sync
+        from megatron.core.parallel_state import (
+            get_expert_model_parallel_group,
+            get_expert_model_parallel_rank,
+        )
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        ep_size = expert_parallel
+        if dispatcher_type == "nvls" and ep_size & (ep_size - 1):
+            pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
+        ep_rank = get_expert_model_parallel_rank()
+        model = _build_gpt_with_moe_in_decoder_and_mtp(dispatcher_type, ep_size)
+        set_moe_metadata_sync(model)
+        decoder, mtp_layers = _inference_dispatchers(model)
+        if dispatcher_type == "nvls" and ep_size > 1:
+            NVLSAllGatherVDispatcher.allocate_buffers(
+                per_rank_worst_case_token_count=_MTP_MOE_PER_RANK_MAX_TOKENS,
+                topk=_MTP_MOE_TOPK,
+                hidden_size=_MTP_MOE_HIDDEN,
+                ep_group=get_expert_model_parallel_group(),
+            )
+
+        # Per-rank token counts (alternating over EP ranks): the main forward, the MTP layer-0
+        # forward (e.g. the draft-KV commit pass), and the MTP layer-1 forward (a draft depth).
+        forwards = [
+            (decoder, [(8, 6)[r % 2] for r in range(ep_size)]),
+            (mtp_layers[0], [(5, 4)[r % 2] for r in range(ep_size)]),
+            (mtp_layers[1], [(3, 2)[r % 2] for r in range(ep_size)]),
+        ]
+        observed = []
+        for seed, (dispatchers, counts) in enumerate(forwards):
+            global_rows, local_rows = _forward_rows(seed, counts, ep_rank)
+            for dispatcher in dispatchers:
+                round_trip = _moe_round_trip(dispatcher, *local_rows)
+                observed.append((counts, global_rows, local_rows, round_trip))
+        torch.cuda.synchronize()
+
+        for counts, global_rows, local_rows, round_trip in observed:
+            valid, step_metadata, gathered, combined = round_trip
+            total = sum(counts)
+            assert (
+                valid == total
+            ), f"MoE layer of a forward with per-rank counts {counts} read valid_tokens={valid}"
+            if step_metadata is not None:
+                assert step_metadata == [total, sum(counts[:ep_rank]), max(counts)]
+            assert torch.equal(gathered[:total], global_rows[0])
+            expected = (local_rows[0].float() * ep_size).to(torch.bfloat16).unsqueeze(1)
+            assert torch.equal(combined, expected)
 
 
 # ──────────────────────────────────────────────────────────────────────

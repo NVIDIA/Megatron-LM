@@ -17,8 +17,9 @@ Two dispatchers are provided, selected via config.inference_moe_token_dispatcher
 InferenceAllGatherDispatcherBase is a minimal base used solely for isinstance checks
 and to hold _valid_tokens_tensor — the shared interface that mcore_fused_moe reads to
 gate kernel work to the valid token prefix. Each dispatcher defines its own
-update_metadata method, invoked from the first instance's token_dispatch so the
-per-step metadata kernel is captured inside the CUDA graph.
+update_metadata method, invoked from token_dispatch of the first MoE layer of each
+forward pass (the main forward and each MTP layer; see set_moe_metadata_sync) so the
+metadata kernel is captured inside that forward's CUDA graph.
 """
 
 import operator
@@ -95,10 +96,10 @@ class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
         cls._valid_tokens_tensor = torch.zeros(1, dtype=torch.int32, device=device)
 
     def update_metadata(self, local_tokens: int) -> None:
-        """Per-step metadata refresh fired from the first instance's token_dispatch.
+        """Per-forward metadata refresh fired from the first MoE layer's token_dispatch.
 
-        Must be idempotent across a step (only called once) and safe to capture
-        into a CUDA graph on the decode path.
+        Called once per forward pass (the main forward and each MTP layer's forward)
+        and must be safe to capture into a CUDA graph on the decode path.
         """
         raise NotImplementedError
 
@@ -151,7 +152,7 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         )
 
     def update_metadata(self, local_tokens: int) -> None:
-        """Per-step metadata update; invoked from the first instance's token_dispatch.
+        """Per-forward metadata update; invoked from the first MoE layer's token_dispatch.
 
         CG path (_use_allgather_v=False): ranks have equal counts by construction, so
         we only refresh _valid_tokens_tensor — a single .fill_ that is safe to capture.
@@ -472,7 +473,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         InferenceAllGatherDispatcherBase._valid_tokens_tensor = cls._step_metadata[0:1]
 
     def update_metadata(self, local_tokens: int) -> None:
-        """Per-step metadata update; invoked from the first instance's token_dispatch.
+        """Per-forward metadata update; invoked from the first MoE layer's token_dispatch.
 
         For FlashInfer, first masks the routing buffer with -1 so rows beyond
         valid_tokens are ignored by the GEMM. The fused NVLS metadata update then

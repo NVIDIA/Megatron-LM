@@ -49,6 +49,19 @@ def _make_inputs(num_tokens, hidden_dim, topk, num_experts, seed=42):
     return hidden, probs, routing_map
 
 
+def _routing_map_with_tail(num_tokens, topk, num_experts, seed=42):
+    """A [num_tokens, topk] routing map viewing the head of a larger buffer.
+
+    The real rows route to experts [0, num_experts - 1). Each tail row routes one slot to the
+    last expert and one nowhere, so any pair read past the view lands in that expert.
+    """
+    torch.manual_seed(seed)
+    buffer = torch.full((4 * num_tokens, topk), -1, dtype=torch.int64, device="cuda")
+    buffer[:, 0] = num_experts - 1
+    buffer[:num_tokens] = torch.randint(0, num_experts - 1, (num_tokens, topk), device="cuda")
+    return buffer[:num_tokens]
+
+
 def test_batch_invariant_squared_relu_applies_probs_before_fc2():
     """Match training's probability placement and BF16 rounding before FC2."""
     from megatron.core.activations import squared_relu
@@ -217,6 +230,20 @@ class TestComputeLocalTokensPerExpert:
         )
         assert result is counts
         expected = _ref_tokens_per_expert(routing_map, 8, 8)
+        torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("persistent", [False, True])
+    @pytest.mark.parametrize("start,num_local", [(0, 8), (4, 4)])
+    def test_valid_tokens_past_routing_map_rows(self, start, num_local, persistent):
+        """A valid-token count above the routing-map rows counts only those rows."""
+        from megatron.core.inference.moe.permute import compute_local_tokens_per_expert
+
+        num_tokens = 6
+        routing_map = _routing_map_with_tail(num_tokens, topk=2, num_experts=8)
+        result = compute_local_tokens_per_expert(
+            routing_map, start, num_local, _vt(num_tokens + 4), persistent=persistent
+        )
+        expected = _ref_tokens_per_expert(routing_map, start, num_local)
         torch.testing.assert_close(result, expected, atol=0, rtol=0)
 
     @pytest.mark.parametrize("invalid", ["shape", "dtype", "stride"])
@@ -461,6 +488,26 @@ class TestPermuteTokens:
         local_mask = (routing_map >= local_start) & (routing_map < local_start + num_local)
         expected_count = local_mask.sum().item()
         assert real_count == expected_count
+
+    @pytest.mark.parametrize("alignment", [1, 16])
+    def test_valid_tokens_past_routing_map_rows(self, alignment):
+        """A valid-token count above the input rows permutes only those rows."""
+        from megatron.core.inference.moe.permute import permute_tokens
+
+        num_tokens, topk, num_experts = 6, 2, 8
+        hidden, probs, _ = _make_inputs(num_tokens, 64, topk, num_experts)
+        routing_map = _routing_map_with_tail(num_tokens, topk, num_experts)
+        perm_h, _, perm_map, offs = permute_tokens(
+            hidden, probs, routing_map, 0, num_experts, _vt(num_tokens + 4), alignment=alignment
+        )
+
+        tokens_per_expert = _ref_tokens_per_expert(routing_map, 0, num_experts)
+        _, expected_offs = _ref_expert_offsets(tokens_per_expert, alignment)
+        torch.testing.assert_close(offs, expected_offs, atol=0, rtol=0)
+        n_used = offs[-1].item()
+        real = perm_map[:n_used] >= 0
+        assert real.sum().item() == num_tokens * topk
+        torch.testing.assert_close(perm_h[:n_used][real], hidden[perm_map[:n_used][real].long()])
 
     @pytest.mark.parametrize("hidden_dim", [32, 64, 128, 256, 512, 1024, 2688])
     def test_various_hidden_dims(self, hidden_dim):
