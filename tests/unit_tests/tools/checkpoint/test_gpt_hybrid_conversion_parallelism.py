@@ -36,6 +36,8 @@ sys.path.insert(0, _THIS_DIR)
 
 from gpt_hybrid_conversion import main as conversion_main
 
+from tests.unit_tests.test_utilities import Utils
+
 
 # These scenarios are SYNTHETIC and single-rank by design: each one writes a
 # tiny synthetic DCP checkpoint and round-trips it through the converter on
@@ -53,7 +55,7 @@ from gpt_hybrid_conversion import main as conversion_main
 # default PG is already multi-rank.
 @pytest.fixture(autouse=True)
 def _skip_when_multi_rank_pg():
-    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+    if Utils.world_size > 1:
         pytest.skip(
             "Synthetic single-rank tests skipped under a multi-rank default "
             "process group; multi-rank coverage is in "

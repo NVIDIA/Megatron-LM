@@ -153,8 +153,11 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
         def close(self):
             captured["socket_closed"] = True
 
+    class FakeProcessContext:
+        Process = FakeProcess
+
     monkeypatch.setattr(server, "_SERVER_PROCESSES", [])
-    monkeypatch.setattr(server.mp, "Process", FakeProcess)
+    monkeypatch.setattr(server, "_SERVER_PROCESS_CONTEXT", FakeProcessContext())
     monkeypatch.setattr(server, "_run_text_gen_server", fake_run_text_gen_server)
     monkeypatch.setattr(server.asyncio, "set_event_loop", lambda loop: None)
 

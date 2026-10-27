@@ -8,11 +8,15 @@ import torch
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
-from megatron.core.models.hybrid import HybridLayerConfigListEntry
+from megatron.core.models.hybrid import HybridLayerEntry
 from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_layer_config_list
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
+)
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    wide_residual_hybrid_inference_stack_spec,
+    wide_residual_hybrid_stack_spec,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
@@ -59,7 +63,7 @@ class HybridModelConfig(ModelConfig):
     hybrid_mlp_ratio: float = 0.0
     hybrid_override_pattern: str | None = None
     hybrid_layer_pattern: str | None = None
-    hybrid_layer_config_list: Sequence[HybridLayerConfigListEntry] | None = None
+    hybrid_layer_config_list: Sequence[HybridLayerEntry] | None = None
     seq_length: int = 8192
     # HybridModel with no attention has no need for position embeddings, so none is default
     position_embedding_type: Literal["learned_absolute", "rope", "none"] = "none"
@@ -70,6 +74,9 @@ class HybridModelConfig(ModelConfig):
     hybrid_stack_spec: ModuleSpec | None = None
     vocab_size: int | None = None
     should_pad_vocab: bool = False
+
+    tp_comm_overlap_cfg: str | dict[str, Any] | None = None
+    """User-buffer settings, or their YAML path, when TP communication overlap is enabled."""
 
     @property
     def mamba_stack_spec(self):
@@ -90,7 +97,9 @@ class HybridModelConfig(ModelConfig):
             raise AttributeError(f"HybridModelConfig has no attribute '{name}'")
         if hasattr(transformer, name):
             return getattr(transformer, name)
-        raise AttributeError(f"Neither HybridModelConfig nor TransformerConfig has any attribute '{name}'.")
+        raise AttributeError(
+            f"Neither HybridModelConfig nor TransformerConfig has any attribute '{name}'."
+        )
 
     @override
     def __setattr__(self, name: str, value: Any, /) -> None:
@@ -112,6 +121,39 @@ class HybridModelConfig(ModelConfig):
 
         if hasattr(self.transformer, "finalize") and callable(self.transformer.finalize):
             self.transformer.finalize()
+
+    @override
+    def as_dict(self) -> dict[str, Any]:
+        """Serialize scalar model metadata without the Python-defined architecture list.
+
+        Config-list architectures are reconstructed from their supplied Python definition on
+        resume. Keeping the list out of run-config metadata also avoids converting its config
+        objects and split sentinels into an intermediate serialized representation.
+        """
+        result = super().as_dict()
+        result.pop("hybrid_layer_config_list", None)
+        return result
+
+
+def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
+    """Return the configured stack spec, or the default one for the transformer config."""
+    if model_config.hybrid_stack_spec is not None:
+        return model_config.hybrid_stack_spec
+    use_wide_residual = model_config.transformer.wide_residual is not None
+    if model_config.transformer.transformer_impl == "inference_optimized":
+        return (
+            wide_residual_hybrid_inference_stack_spec
+            if use_wide_residual
+            else hybrid_inference_stack_spec
+        )
+    if model_config.restore_modelopt_state:
+        if use_wide_residual:
+            raise NotImplementedError(
+                "wide_residual does not support ModelOpt HybridStack specs because they "
+                "do not statically construct wide-residual layer classes."
+            )
+        return get_hybrid_stack_modelopt_spec(local_core_attention=False, remap_te_layernorm=False)
+    return wide_residual_hybrid_stack_spec if use_wide_residual else default_hybrid_stack_spec
 
 
 class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
@@ -193,9 +235,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             # The stack-level config is normally separate from layer entries. If a caller reuses
             # the same supported config object for both roles, detach the stack-level copy before
             # synchronizing inferred runtime state so the list entry remains read-only.
-            if any(
-                entry is self._model_config.transformer for entry in hybrid_layer_config_list
-            ):
+            if any(entry is self._model_config.transformer for entry in hybrid_layer_config_list):
                 transformer = self._model_config.transformer
                 self._model_config.transformer = type(transformer).from_config(transformer)
             if (
@@ -215,19 +255,11 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
                         f"mtp_num_layers is {args_mtp_num_layers}"
                     )
 
-        hybrid_stack_spec = self._model_config.hybrid_stack_spec
-        if hybrid_stack_spec is None:
-            if self._model_config.transformer.transformer_impl == "inference_optimized":
-                hybrid_stack_spec = hybrid_inference_stack_spec
-            elif self._model_config.restore_modelopt_state:
-                hybrid_stack_spec = get_hybrid_stack_modelopt_spec(
-                    local_core_attention=False,
-                    remap_te_layernorm=False,
-                )
-            else:
-                hybrid_stack_spec = default_hybrid_stack_spec
+        hybrid_stack_spec = resolve_hybrid_stack_spec(self._model_config)
 
-        assert self._model_config.vocab_size is not None, "vocab_size must be configured before calling build_model()"
+        assert (
+            self._model_config.vocab_size is not None
+        ), "vocab_size must be configured before calling build_model()"
         if self._model_config.should_pad_vocab:
             padded_vocab_size = calculate_padded_vocab_size(
                 self._model_config.vocab_size,
@@ -237,8 +269,12 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         else:
             padded_vocab_size = self._model_config.vocab_size
 
-        pre_process = pre_process if pre_process is not None else is_pp_first_stage(pg_collection.pp)
-        post_process = post_process if post_process is not None else is_pp_last_stage(pg_collection.pp)
+        pre_process = (
+            pre_process if pre_process is not None else is_pp_first_stage(pg_collection.pp)
+        )
+        post_process = (
+            post_process if post_process is not None else is_pp_last_stage(pg_collection.pp)
+        )
         model = HybridModel(
             config=self._model_config.transformer,
             hybrid_stack_spec=hybrid_stack_spec,
@@ -278,7 +314,9 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         use_torch_fsdp2: bool = False,
         wrap_with_ddp: bool = True,
         data_parallel_random_init: bool = False,
-        mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
+        mixed_precision_wrapper: (
+            Callable[[Any, MegatronModule], MegatronModule] | None
+        ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,

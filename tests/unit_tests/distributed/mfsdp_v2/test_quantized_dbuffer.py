@@ -10,13 +10,15 @@ from torch.distributed.tensor import Replicate
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
     BlockAtomic,
-    Flat,
+    RowAtomic,
 )
 
-QuantizedDBuffer = pytest.importorskip(
+quantized_dbuffer = pytest.importorskip(
     "megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantized_dbuffer",
     reason="Transformer Engine MXFP8 support is required.",
-).QuantizedDBuffer
+)
+QuantizedDBuffer = quantized_dbuffer.QuantizedDBuffer
+update_mxfp8_tensor = quantized_dbuffer.update_mxfp8_tensor
 
 import transformer_engine_torch as tex
 from transformer_engine.pytorch import is_mxfp8_available
@@ -25,76 +27,105 @@ from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
 pytestmark = pytest.mark.launch_on_gb200
 
-if not is_mxfp8_available():
-    pytest.skip("MXFP8 quantization is not available.", allow_module_level=True)
+requires_mxfp8 = pytest.mark.skipif(
+    not is_mxfp8_available(), reason="MXFP8 quantization is not available."
+)
 
 
-def test_quantized_dbuffer_quantization_matches_te(distributed_setup):
-    """Multiple tensors retain their data and scale ownership after quantization."""
-    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    shapes = [(128, 128), (128, 128), (64, 64), (32, 64)]
-    grouped = QuantizedDBuffer(mesh, [BlockAtomic(32)], shapes, distributed_setup.device)
-    main_weight = DBuffer.empty(
-        mesh, [BlockAtomic(32)], shapes, torch.float32, distributed_setup.device, block_size=32
-    )
+@requires_mxfp8
+@pytest.mark.parametrize(
+    "placements",
+    [
+        pytest.param((BlockAtomic(32),), id="shard"),
+        pytest.param((Replicate(), BlockAtomic(32)), id="replicate_shard"),
+        pytest.param((BlockAtomic(32), BlockAtomic(32)), id="shard_shard"),
+    ],
+)
+@pytest.mark.parametrize(
+    "make_shapes",
+    [
+        pytest.param(lambda num_ranks: [(128, 128), (128, 128), (64, 64), (32, 64)], id="mixed"),
+        # One 32-row tensor per layout chunk, so every shard ends with a 32-row tensor.
+        # TE's quantize kernel writes scales for whole 64-row chunks, so compact scale
+        # views would be written beyond: https://github.com/NVIDIA/TransformerEngine/issues/3689
+        pytest.param(lambda num_ranks: [(32, 128)] * num_ranks, id="short_tensors"),
+    ],
+)
+def test_quantized_dbuffer_quantization_matches_te(distributed_setup, placements, make_shapes):
+    """Quantizing a sharded view matches TE and writes only this rank's shard.
+
+    The view is taken from a replicated buffer filled with a canary, so any write
+    outside this rank's shard lands in memory the test owns and is detected.
+    """
+    device = distributed_setup.device
+    world_size = distributed_setup.world_size
+    if len(placements) == 1:
+        mesh = init_device_mesh(device.type, (world_size,))
+    else:
+        if world_size < 4 or world_size % 2:
+            pytest.skip("Two-dimensional placements require an even world size of at least 4.")
+        mesh = init_device_mesh(device.type, (2, world_size // 2))
+    shapes = make_shapes(mesh.size())
+    canary = 0xAA
+    replicated = QuantizedDBuffer.empty(mesh, [Replicate()] * mesh.ndim, shapes, device)
+    for plane in replicated.planes:
+        plane.local_buffer.fill_(canary)
+    quantized = replicated.view(placements)
+    main_weight = DBuffer(mesh, placements, quantized.rowwise_data.layout, torch.float32, device)
     torch.manual_seed(1234 + distributed_setup.rank)
     main_weight.local_buffer.normal_()
-    views = [grouped.get_tensor_view(index) for index in range(len(shapes))]
-    grouped.quantize_(main_weight)
+    quantized.quantize_(main_weight)
 
     for index in range(len(shapes)):
-        data = grouped.rowwise_data.get_tensor_view(index)
-        assert grouped.rowwise_scale.get_tensor_view(index).shape == (
-            data.shape[0],
-            data.shape[1] // 32,
-        )
-        assert grouped.columnwise_scale.get_tensor_view(index).shape == (
-            data.shape[0] // 32,
-            data.shape[1],
-        )
+        view = quantized.get_tensor_view(index)
+        assert view._rowwise_scale_inv.shape == (view.shape[0], view.shape[1] // 32)
+        assert view._columnwise_scale_inv.shape == (view.shape[0] // 32, view.shape[1])
         reference = MXFP8Quantizer(tex.DType.kFloat8E4M3)(main_weight.get_tensor_view(index))
-        for plane, view, expected in zip(
-            grouped.planes,
-            (
-                views[index]._rowwise_data,
-                views[index]._columnwise_data,
-                views[index]._rowwise_scale_inv,
-                views[index]._columnwise_scale_inv,
-            ),
-            (
-                reference._rowwise_data,
-                reference._columnwise_data,
-                reference._rowwise_scale_inv,
-                reference._columnwise_scale_inv,
-            ),
+        assert view.shape == reference.shape
+        for attribute in (
+            "_rowwise_data",
+            "_columnwise_data",
+            "_rowwise_scale_inv",
+            "_columnwise_scale_inv",
         ):
-            actual = plane.get_tensor_view(index)
-            assert view.shape == actual.shape
-            assert view.data_ptr() == actual.data_ptr()
+            actual = getattr(view, attribute)
+            expected = getattr(reference, attribute)
+            # TE's allocating quantizer pads scales; our views keep them compact.
+            # Ignore the padding. GEMM support for compact scales is tracked in:
+            # https://github.com/NVIDIA/TransformerEngine/issues/3518
             torch.testing.assert_close(
                 actual, expected[: actual.shape[0], : actual.shape[1]], rtol=0, atol=0
             )
 
+    # Restore the canary in this rank's shard; anything else that changed was written outside it.
+    for plane in quantized.planes:
+        plane.local_buffer.fill_(canary)
+    assert all(plane.local_buffer.eq(canary).all() for plane in replicated.planes)
 
-def test_quantized_dbuffer_get_tensor_supports_gemm(distributed_setup):
+
+@requires_mxfp8
+def test_quantized_dbuffer_updated_tensor_supports_gemm(distributed_setup):
     """Compute tensors prepare gathered scales for rowwise and columnwise GEMMs."""
-    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     shapes = [(128, 128), (128, 128), (64, 64), (32, 64)]
-    grouped = QuantizedDBuffer(mesh, [BlockAtomic(32)], shapes, distributed_setup.device)
-    main_weight = DBuffer.empty(
-        mesh, [BlockAtomic(32)], shapes, torch.float32, distributed_setup.device, block_size=32
+    quantized = QuantizedDBuffer.empty(mesh, [BlockAtomic(32)], shapes, device)
+    main_weight = DBuffer(
+        mesh, [BlockAtomic(32)], quantized.rowwise_data.layout, torch.float32, device
     )
     torch.manual_seed(1234 + distributed_setup.rank)
     main_weight.local_buffer.normal_()
-    grouped.quantize_(main_weight)
-    gathered = grouped.redistribute([Replicate()])
+    quantized.quantize_(main_weight)
+    gathered = quantized.redistribute([Replicate()])
     gathered_main = main_weight.redistribute([Replicate()])
     quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3)
     for index, shape in enumerate(shapes):
-        compute_tensor = gathered.get_tensor(index)
+        tensor_view = gathered.get_tensor_view(index)
+        compute_tensor = tensor_view.detach()
+        update_mxfp8_tensor(tensor_view, compute_tensor)
         reference = quantizer(gathered_main.get_tensor_view(index))
         for layout, inner_dim in (("TN", shape[1]), ("NN", shape[0])):
-            activation = quantizer(torch.randn((64, inner_dim), device=distributed_setup.device))
+            activation = quantizer(torch.randn((64, inner_dim), device=device))
             actual = general_gemm(
                 compute_tensor, activation, out_dtype=torch.bfloat16, layout=layout
             )[0]
@@ -110,13 +141,14 @@ def test_quantized_dbuffer_redistributes_every_plane(distributed_setup):
         pytest.skip("QuantizedDBuffer redistribution requires at least two ranks.")
 
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    source = QuantizedDBuffer(mesh, [Replicate()], [(64, 64)], distributed_setup.device)
+    shapes = [(64, 64)]
+    source = QuantizedDBuffer.empty(mesh, [Replicate()], shapes, distributed_setup.device)
     for plane in source.planes:
         shard_size = plane.local_buffer.numel() // mesh.size()
         plane.local_buffer.copy_(
             torch.arange(plane.local_buffer.numel(), device=plane.device) // shard_size
         )
-    destination = QuantizedDBuffer(mesh, [BlockAtomic(32)], [(64, 64)], distributed_setup.device)
+    destination = QuantizedDBuffer.empty(mesh, [BlockAtomic(32)], shapes, distributed_setup.device)
     result = source.redistribute([BlockAtomic(32)], out=destination)
     assert result is destination
 
@@ -126,10 +158,108 @@ def test_quantized_dbuffer_redistributes_every_plane(distributed_setup):
         torch.testing.assert_close(actual.local_buffer, expected.local_buffer)
 
 
+@pytest.mark.parametrize("rowwise", [True, False], ids=["rowwise", "columnwise"])
+def test_quantized_dbuffer_redistributes_selected_planes(distributed_setup, rowwise):
+    """Selecting rowwise or columnwise planes gathers only those planes.
+
+    Compute tensors carry only allocated planes, with a quantizer advertising the
+    same usages.
+    """
+    columnwise = not rowwise
+    if distributed_setup.world_size < 2:
+        pytest.skip("QuantizedDBuffer redistribution requires at least two ranks.")
+
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    shapes = [(128, 64), (32, 128)]
+    source = QuantizedDBuffer.empty(mesh, [BlockAtomic(32)], shapes, device)
+    for index, plane in enumerate(source.planes):
+        plane.local_buffer.fill_(index * mesh.size() + mesh.get_local_rank())
+    expected = source.redistribute([Replicate()])
+    destination = QuantizedDBuffer.empty(mesh, [Replicate()], shapes, device)
+    sentinel = 255
+    for plane in destination.planes:
+        plane.local_buffer.fill_(sentinel)
+
+    result = source.redistribute(
+        [Replicate()], out=destination, rowwise=rowwise, columnwise=columnwise
+    )
+    assert result is destination
+    selected = destination.planes_for(rowwise=rowwise, columnwise=columnwise)
+    for actual, reference in zip(destination.planes, expected.planes):
+        if any(actual is plane for plane in selected):
+            torch.testing.assert_close(actual.local_buffer, reference.local_buffer)
+        else:
+            assert actual.local_buffer.eq(sentinel).all()
+
+    # Release the unselected planes, as unsharding does, so compute tensors omit them.
+    for plane in destination.planes_for(rowwise=not rowwise, columnwise=not columnwise):
+        plane.release_storage()
+    assert destination.is_rowwise_allocated == rowwise
+    assert destination.is_columnwise_allocated == columnwise
+    for index in range(len(shapes)):
+        tensor = destination.get_tensor_view(index)
+        assert tensor.shape == shapes[index]
+        assert (tensor._rowwise_data is not None) == rowwise
+        assert (tensor._rowwise_scale_inv is not None) == rowwise
+        assert (tensor._columnwise_data is not None) == columnwise
+        assert (tensor._columnwise_scale_inv is not None) == columnwise
+        # TE's primary-weight path requests the quantizer's usages from the tensor.
+        assert tensor._quantizer.rowwise_usage == rowwise
+        assert tensor._quantizer.columnwise_usage == columnwise
+
+    with pytest.raises(NotImplementedError, match="requires every plane"):
+        source.redistribute([Replicate()], rowwise=rowwise, columnwise=columnwise)
+    destination.release_storage()
+    with pytest.raises(RuntimeError, match="no allocated"):
+        destination.get_tensor_view(0)
+
+
+@requires_mxfp8
+@pytest.mark.parametrize("rowwise", [True, False], ids=["rowwise", "columnwise"])
+def test_quantized_dbuffer_partial_updated_tensor_supports_gemm(distributed_setup, rowwise):
+    """Compute tensors carrying only gathered rowwise or columnwise planes support their GEMMs.
+
+    Forward GEMMs (TN) read rowwise planes and backward data-gradient GEMMs (NN)
+    read columnwise planes. The (64, 64) and (32, 64) shapes need padded scales.
+    """
+    columnwise = not rowwise
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    shapes = [(128, 128), (64, 64), (32, 64)]
+    quantized = QuantizedDBuffer.empty(mesh, [BlockAtomic(32)], shapes, device)
+    main_weight = DBuffer(
+        mesh, [BlockAtomic(32)], quantized.rowwise_data.layout, torch.float32, device
+    )
+    torch.manual_seed(1234 + distributed_setup.rank)
+    main_weight.local_buffer.normal_()
+    quantized.quantize_(main_weight)
+    gathered = QuantizedDBuffer.empty(mesh, [Replicate()], shapes, device)
+    quantized.redistribute([Replicate()], out=gathered, rowwise=rowwise, columnwise=columnwise)
+    # Release the unselected planes, as unsharding does, so compute tensors omit them.
+    for plane in gathered.planes_for(rowwise=not rowwise, columnwise=not columnwise):
+        plane.release_storage()
+    gathered_main = main_weight.redistribute([Replicate()])
+
+    quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3)
+    for index, shape in enumerate(shapes):
+        tensor_view = gathered.get_tensor_view(index)
+        compute_tensor = tensor_view.detach()
+        update_mxfp8_tensor(tensor_view, compute_tensor)
+        reference = quantizer(gathered_main.get_tensor_view(index))
+        layout, inner_dim = ("TN", shape[1]) if rowwise else ("NN", shape[0])
+        activation = quantizer(torch.randn((64, inner_dim), device=device))
+        actual = general_gemm(compute_tensor, activation, out_dtype=torch.bfloat16, layout=layout)
+        expected = general_gemm(reference, activation, out_dtype=torch.bfloat16, layout=layout)
+        torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+
+
 def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
     """A sharded view aliases exactly this rank's slice of each replicated plane."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    source = QuantizedDBuffer(mesh, [Replicate()], [(128, 64), (32, 128)], distributed_setup.device)
+    source = QuantizedDBuffer.empty(
+        mesh, [Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+    )
     for plane in source.planes:
         plane.local_buffer.zero_()
     assert source.view([Replicate()]) is source
@@ -137,7 +267,7 @@ def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
     view = source.view([BlockAtomic(32)])
     assert view.view([BlockAtomic(32)]) is view
     for index, (actual, original) in enumerate(zip(view.planes, source.planes)):
-        assert actual.placements == ((Flat(),) if index == 3 else (BlockAtomic(32),))
+        assert actual.placements == ((RowAtomic(),) if index == 3 else (BlockAtomic(32),))
         chunks = original.local_buffer.view(mesh.size(), -1)
         expected = chunks[mesh.get_local_rank()]
         assert actual.local_buffer.shape == expected.shape
@@ -157,11 +287,11 @@ def test_quantized_dbuffer_allgathers_every_plane(distributed_setup, use_out):
         pytest.skip("QuantizedDBuffer all-gather requires at least two ranks.")
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     shapes = [(128, 64), (32, 128)]
-    source = QuantizedDBuffer(mesh, [BlockAtomic(32)], shapes, distributed_setup.device)
+    source = QuantizedDBuffer.empty(mesh, [BlockAtomic(32)], shapes, distributed_setup.device)
     for index, plane in enumerate(source.planes):
         plane.local_buffer.fill_(index * mesh.size() + mesh.get_local_rank())
     if use_out:
-        destination = QuantizedDBuffer(mesh, [Replicate()], shapes, distributed_setup.device)
+        destination = QuantizedDBuffer.empty(mesh, [Replicate()], shapes, distributed_setup.device)
         result = source.allgather(0, out=destination)
         assert result is destination
     else:
@@ -171,3 +301,35 @@ def test_quantized_dbuffer_allgathers_every_plane(distributed_setup, use_out):
         chunks = plane.local_buffer.view(mesh.size(), -1)
         for rank in range(mesh.size()):
             assert chunks[rank].eq(index * mesh.size() + rank).all()
+
+
+@pytest.mark.parametrize("use_out", [False, True])
+def test_quantized_dbuffer_allgathers_every_plane_on_2d_mesh(distributed_setup, use_out):
+    """Gather an axis iterator in every plane, allocating or reusing output."""
+    world_size = distributed_setup.world_size
+    if world_size < 2 or world_size % 2:
+        pytest.skip("Requires an even world size of at least two.")
+    mesh = init_device_mesh(distributed_setup.device.type, (2, world_size // 2))
+    source = QuantizedDBuffer.empty(
+        mesh, [BlockAtomic(32), BlockAtomic(32)], [(128, 64), (32, 128)], distributed_setup.device
+    )
+    for index, plane in enumerate(source.planes):
+        values = (
+            torch.arange(plane.local_buffer.numel(), device=plane.device) + plane.offset + index
+        )
+        plane.local_buffer.copy_(values % 251)
+    # A one-shot iterator must be reusable across all four planes.
+    if use_out:
+        out = QuantizedDBuffer.empty(
+            mesh, [Replicate(), Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+        )
+        result = source.allgather(iter((0, 1)), out=out)
+        assert result is out
+    else:
+        out = source.allgather(iter((0, 1)))
+    for index, plane in enumerate(out.planes):
+        assert plane.placements == (Replicate(), Replicate())
+        expected = (
+            (torch.arange(plane.local_buffer.numel(), device=plane.device) + index) % 251
+        ).to(plane.dtype)
+        torch.testing.assert_close(plane.local_buffer, expected, rtol=0, atol=0)

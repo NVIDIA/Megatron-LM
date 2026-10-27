@@ -21,6 +21,11 @@ class PipelineSplit:
     Add ``PipelineSplit`` itself to the list. Instances of this class are not valid entries.
     """
 
+    def __init__(self) -> None:
+        raise TypeError(
+            "PipelineSplit must not be instantiated. Use the bare PipelineSplit class instead."
+        )
+
 
 class MTPSplit:
     """Bare class sentinel that begins an MTP depth in a hybrid config list.
@@ -28,9 +33,13 @@ class MTPSplit:
     Add ``MTPSplit`` itself to the list. Instances of this class are not valid entries.
     """
 
+    def __init__(self) -> None:
+        raise TypeError("MTPSplit must not be instantiated. Use the bare MTPSplit class instead.")
 
-HybridLayerConfigListEntry: TypeAlias = TransformerConfig | type[PipelineSplit] | type[MTPSplit]
-MainLayerConfigListEntry: TypeAlias = TransformerConfig | type[PipelineSplit]
+
+# A hybrid architecture entry is a layer config instance or a bare PipelineSplit/MTPSplit class.
+# Parsing enforces the supported config types and marker placement within each section.
+HybridLayerEntry: TypeAlias = TransformerConfig | type[PipelineSplit] | type[MTPSplit]
 
 
 @dataclass
@@ -79,7 +88,7 @@ class ParsedHybridConfigList:
         mtp_num_depths: Number of ``MTPSplit`` sections in the source list.
     """
 
-    main_layer_config_list: tuple[MainLayerConfigListEntry, ...]
+    main_layer_config_list: tuple[HybridLayerEntry, ...]
     mtp_layer_config_list: tuple[TransformerConfig, ...] | None
     mtp_num_depths: int
 
@@ -92,11 +101,6 @@ def _validate_layer_config_sequence(
     supported_types = set(Symbols.LAYER_CONFIG_MAP.values())
     for index, layer_config in enumerate(layer_configs):
         if type(layer_config) not in supported_types:
-            if isinstance(layer_config, (PipelineSplit, MTPSplit)):
-                raise ValueError(
-                    f"{section_name} entry {index} is a sentinel instance. "
-                    "Use the bare PipelineSplit or MTPSplit class instead."
-                )
             raise ValueError(
                 f"{section_name} entry {index} has unsupported hybrid layer config type "
                 f"{type(layer_config).__name__}. Exact built-in layer config types are required."
@@ -112,7 +116,7 @@ def _validate_layer_config_sequence(
 
 
 def parse_hybrid_layer_config_list(
-    hybrid_layer_config_list: Sequence[HybridLayerConfigListEntry],
+    hybrid_layer_config_list: Sequence[HybridLayerEntry],
     expected_num_layers: int | None = None,
     expected_mtp_num_layers: int | None = None,
 ) -> ParsedHybridConfigList:
@@ -134,7 +138,7 @@ def parse_hybrid_layer_config_list(
         ValueError: If an entry, marker placement, layer count, or MTP template is invalid.
     """
     source_entries = tuple(hybrid_layer_config_list)
-    main_entries: list[MainLayerConfigListEntry] = []
+    main_entries: list[HybridLayerEntry] = []
     mtp_sections: list[list[TransformerConfig]] = []
     current_mtp_section: list[TransformerConfig] | None = None
 
@@ -144,8 +148,6 @@ def parse_hybrid_layer_config_list(
                 raise ValueError(
                     f"PipelineSplit at index {index} is not allowed after the first MTPSplit"
                 )
-            main_entries.append(PipelineSplit)
-            continue
 
         if entry is MTPSplit:
             if current_mtp_section is not None:
@@ -643,7 +645,7 @@ def select_pipeline_segment(
 
 
 def select_pipeline_segment_from_config_list(
-    main_layer_config_list: Sequence[MainLayerConfigListEntry],
+    parsed_config_list: ParsedHybridConfigList,
     pp_group: torch.distributed.ProcessGroup | None,
     vp_stage: int | None,
     virtual_pipeline_model_parallel_size: int | None = None,
@@ -652,7 +654,7 @@ def select_pipeline_segment_from_config_list(
     tp_group: torch.distributed.ProcessGroup | None = None,
     dp_cp_group: torch.distributed.ProcessGroup | None = None,
 ) -> Tuple[List[TransformerConfig], int]:
-    """Select and clone this rank's decoder configs from a first-class config list.
+    """Select and clone this rank's decoder configs from a parsed hybrid config list.
 
     The PP/VPP segment ordering is VPP-major, matching ``select_pipeline_segment`` and
     ``PipelineParallelLayerLayout``. Without ``PipelineSplit``, PP uses the existing contiguous
@@ -660,7 +662,7 @@ def select_pipeline_segment_from_config_list(
     segments must exactly equal the configured PP x VPP topology.
 
     Args:
-        main_layer_config_list: Parsed main-decoder configs and optional ``PipelineSplit`` classes.
+        parsed_config_list: Validated architecture returned by ``parse_hybrid_layer_config_list``.
         pp_group: Pipeline-parallel process group, or ``None`` for one PP rank.
         vp_stage: Current virtual-pipeline stage, or ``None`` without VPP.
         virtual_pipeline_model_parallel_size: Configured VPP size, or ``None`` without VPP.
@@ -672,14 +674,8 @@ def select_pipeline_segment_from_config_list(
     Returns:
         Independent physical config clones for this segment and its global decoder-layer offset.
     """
-    source_entries = tuple(main_layer_config_list)
-    for index, entry in enumerate(source_entries):
-        if entry is MTPSplit:
-            raise ValueError(
-                f"MTPSplit at index {index} is not valid in a parsed main layer config list"
-            )
+    source_entries = parsed_config_list.main_layer_config_list
     source_configs = [entry for entry in source_entries if entry is not PipelineSplit]
-    _validate_layer_config_sequence(source_configs, "main decoder")
 
     pp_rank = torch.distributed.get_rank(pp_group) if pp_group is not None else 0
     pp_size = torch.distributed.get_world_size(pp_group) if pp_group is not None else 1

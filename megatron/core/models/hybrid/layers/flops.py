@@ -5,7 +5,7 @@
 from typing import Sequence
 
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
-    HybridLayerConfigListEntry,
+    HybridLayerEntry,
     MTPSplit,
     PipelineSplit,
 )
@@ -237,7 +237,7 @@ def _moe_layer_flops(config: MoELayerConfig, total_tokens: float) -> float:
 
 
 def estimate_hybrid_config_list_flops(
-    layer_config_list: Sequence[HybridLayerConfigListEntry],
+    layer_config_list: Sequence[HybridLayerEntry],
     hybrid_stack_spec: ModuleSpec,
     config: TransformerConfig,
     vocab_size: int,

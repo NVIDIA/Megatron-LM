@@ -5,6 +5,7 @@
 import os
 import signal
 import sys
+from argparse import Namespace
 from datetime import timedelta
 
 import torch
@@ -17,11 +18,13 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
+from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 from megatron.training.state import TrainState
 
 _GLOBAL_ARGS = None
+_GLOBAL_RUN_CONFIG = None
 _GLOBAL_TRAIN_STATE = None
 _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
@@ -39,9 +42,25 @@ def get_args():
     return _GLOBAL_ARGS
 
 
+def get_run_config():
+    """Return the full pretrain config container."""
+    _ensure_var_is_initialized(_GLOBAL_RUN_CONFIG, 'run config')
+    return _GLOBAL_RUN_CONFIG
+
+
+def is_run_config_initialized() -> bool:
+    """Whether argument adapters have a run-owned config available yet."""
+    return _GLOBAL_RUN_CONFIG is not None
+
+
 def get_train_state():
-    """Return the mutable state for the current training run."""
-    _ensure_var_is_initialized(_GLOBAL_TRAIN_STATE, 'train state')
+    """Return the mutable state for the current training run.
+
+    Returns ``None`` if ``set_global_variables`` was never called (e.g. tests that
+    build args via ``parse_args`` and invoke ``save_checkpoint`` directly without
+    going through full Megatron initialization). Checkpointing skips saving the
+    train state in that case; training code always has one.
+    """
     return _GLOBAL_TRAIN_STATE
 
 
@@ -145,53 +164,86 @@ def _graceful_shutdown(signum, frame):
     sys.exit(0)
 
 
-def set_global_variables(args, build_tokenizer=True):
-    """Set args, tokenizer, tensorboard-writer, adlr-autoresume, and timers."""
+def set_global_variables(args, cfg_container, build_tokenizer=True):
+    """Register caller-provided args/config and construct their runtime services."""
+
+    from megatron.training.config import PretrainConfigContainer
 
     assert args is not None
+    assert cfg_container is not None
 
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
+    training = isinstance(cfg_container, PretrainConfigContainer)
+    cfg_container.validate()
+    set_run_config(cfg_container)
     set_args(args)
-
-    if args.step_batch_size_schedule is not None:
-        # Imported here, as elsewhere in this module: megatron.training.utils imports back
-        # into megatron.training, which imports this module.
-        from megatron.training.utils import print_rank_0
-        print_rank_0(f'> using step batch size schedule: {args.step_batch_size_schedule}')
-
-    init_num_microbatches_calculator(
-        rank=args.rank,
-        global_batch_size=args.global_batch_size,
-        micro_batch_size=args.micro_batch_size,
-        # Full DP x gtp_remat degree (args.data_parallel_size is the gtp_remat-excluded replicate).
-        data_parallel_size=args.data_parallel_size * args.gtp_weight_remat_size,
-        decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
-        step_batch_size_schedule=args.step_batch_size_schedule,
-        seq_length=args.seq_length,
+    if training:
+        cfg_container.finalize()
+    initialize_runtime_services(
+        args,
+        build_tokenizer=build_tokenizer,
+        training=training,
     )
+    if not training:
+        # Legacy checkpoint converters preserve progress without training services.
+        _set_train_state()
+
+
+def initialize_runtime_services(
+    args: Namespace, *, build_tokenizer: bool = True, training: bool = False
+) -> None:
+    """Build services from validated config; normally called by initialize_megatron."""
+    from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+
+    cfg = get_run_config()
     if build_tokenizer:
-        _ = _build_tokenizer(args)
-    _set_tensorboard_writer(args)
+        _build_tokenizer(args)
+    resolve_tokenizer_vocab_size(cfg, getattr(args, "padded_vocab_size", None))
     _set_wandb_writer(args)
-    _set_one_logger(args)
-    _set_adlr_autoresume(args)
-    _set_timers(args)
-    _set_energy_monitor(args)
-    _set_telemetry(args)
-    _set_train_state()
+    _set_telemetry(args, include_training=training)
 
     if args.enable_experimental:
         set_experimental_flag(True)
 
-    if args.exit_signal_handler:
-        _set_signal_handler(args.exit_signal)
+    if cfg.dist.disable_jit_fuser:
+        disable_jit_fuser()
 
-    if args.exit_signal_handler_for_training:
+    if training:
+        initialize_training_runtime_services(args)
+
+
+def initialize_training_runtime_services(args: Namespace) -> None:
+    """Initialize training-only services after the shared runtime services."""
+    cfg = get_run_config()
+    if cfg.train.step_batch_size_schedule is not None:
+        # Imported here, as elsewhere in this module: megatron.training.utils imports back
+        # into megatron.training, which imports this module.
+        from megatron.training.utils import print_rank_0
+        print_rank_0(f'> using step batch size schedule: {cfg.train.step_batch_size_schedule}')
+
+    init_num_microbatches_calculator(
+        rank=args.rank,
+        global_batch_size=cfg.train.global_batch_size,
+        micro_batch_size=cfg.train.micro_batch_size,
+        # Independent sequences, including when CP and weight sharding share ranks.
+        data_parallel_size=get_batch_parallel_size(args),
+        decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
+        step_batch_size_schedule=cfg.train.step_batch_size_schedule,
+        seq_length=args.seq_length,
+    )
+    _set_tensorboard_writer(args)
+    _set_one_logger(args)
+    _set_adlr_autoresume(args)
+    _set_timers(args)
+    _set_energy_monitor(args)
+    _set_train_state()
+
+    if cfg.train.exit_signal_handler:
+        _set_signal_handler(cfg.train.exit_signal)
+
+    if cfg.train.exit_signal_handler_for_training:
         signal.signal(signal.SIGINT, _graceful_shutdown)
         signal.signal(signal.SIGTERM, _graceful_shutdown)
-
-    if args.disable_jit_fuser:
-        disable_jit_fuser()
 
 
 def unset_global_variables():
@@ -201,6 +253,7 @@ def unset_global_variables():
     """
 
     global _GLOBAL_ARGS
+    global _GLOBAL_RUN_CONFIG
     global _GLOBAL_TRAIN_STATE
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
     global _GLOBAL_TOKENIZER
@@ -214,6 +267,7 @@ def unset_global_variables():
     global _GLOBAL_TELEMETRY_HANDLE
 
     _GLOBAL_ARGS = None
+    _GLOBAL_RUN_CONFIG = None
     _GLOBAL_TRAIN_STATE = None
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
     _GLOBAL_TOKENIZER = None
@@ -234,6 +288,12 @@ def set_args(args):
     _GLOBAL_ARGS = args
 
 
+def set_run_config(cfg_container):
+    global _GLOBAL_RUN_CONFIG
+    _ensure_var_is_not_initialized(_GLOBAL_RUN_CONFIG, 'run config')
+    _GLOBAL_RUN_CONFIG = cfg_container
+
+
 def _set_train_state():
     """Create the train state for the current training run."""
     global _GLOBAL_TRAIN_STATE
@@ -246,6 +306,15 @@ def _build_tokenizer(args):
     global _GLOBAL_TOKENIZER
     _ensure_var_is_not_initialized(_GLOBAL_TOKENIZER, 'tokenizer')
     _GLOBAL_TOKENIZER = build_tokenizer(args)
+    # Resolve the declared model field once, before any args-to-config conversion.
+    # The tokenizer includes added tokens; padded_vocab_size also includes TP padding.
+    if (
+        getattr(args, 'moe_num_hash_layers', 0) > 0
+        and getattr(args, 'hash_moe_vocab_size', None) is None
+    ):
+        args.hash_moe_vocab_size = _GLOBAL_TOKENIZER.vocab_size
+        if getattr(args, 'yaml_cfg', None) is not None:
+            args.language_model.hash_moe_vocab_size = args.hash_moe_vocab_size
     return _GLOBAL_TOKENIZER
 
 
@@ -257,18 +326,18 @@ def rebuild_tokenizer(args):
 
 def _set_tensorboard_writer(args):
     """Set tensorboard writer."""
+    cfg = get_run_config()
     global _GLOBAL_TENSORBOARD_WRITER
     _ensure_var_is_not_initialized(_GLOBAL_TENSORBOARD_WRITER,
                                    'tensorboard writer')
 
-    if hasattr(args, 'tensorboard_dir') and \
-       args.tensorboard_dir and args.rank == (args.world_size - 1):
+    if cfg.logger.tensorboard_dir and args.rank == (args.world_size - 1):
         try:
             from torch.utils.tensorboard import SummaryWriter
             print('> setting tensorboard ...')
             _GLOBAL_TENSORBOARD_WRITER = SummaryWriter(
-                log_dir=args.tensorboard_dir,
-                max_queue=args.tensorboard_queue_size)
+                log_dir=cfg.logger.tensorboard_dir,
+                max_queue=cfg.logger.tensorboard_queue_size)
         except ModuleNotFoundError:
             print('WARNING: TensorBoard writing requested but is not '
                   'available (are you using PyTorch 1.1.0 or later?), '
@@ -276,20 +345,23 @@ def _set_tensorboard_writer(args):
 
 
 def _set_wandb_writer(args):
+    cfg = get_run_config()
     global _GLOBAL_WANDB_WRITER
     _ensure_var_is_not_initialized(_GLOBAL_WANDB_WRITER,
                                    'wandb writer')
-    if getattr(args, 'wandb_project', '') and args.rank == (args.world_size - 1):
-        if args.wandb_exp_name == '':
+    if cfg.logger.wandb_project and args.rank == (args.world_size - 1):
+        if cfg.logger.wandb_exp_name == '':
             raise ValueError("Please specify the wandb experiment name!")
 
         import wandb
-        if args.wandb_save_dir:
-            save_dir = args.wandb_save_dir
+        if cfg.logger.wandb_save_dir:
+            save_dir = cfg.logger.wandb_save_dir
         else:
             # Defaults to the save dir.
             save_dir = os.path.join(args.save, 'wandb')
-        wandb_config = vars(args)
+        # Private attributes are runtime state rather than configuration and can be large; keep
+        # them out of the wandb config. Copy so the kitchen contents added below stay off args.
+        wandb_config = {k: v for k, v in vars(args).items() if not k.startswith('_')}
         if 'kitchen_config_file' in wandb_config and wandb_config['kitchen_config_file'] is not None:
             # Log the contents of the config for discovery of what the quantization
             # settings were.
@@ -297,30 +369,31 @@ def _set_wandb_writer(args):
                 wandb_config['kitchen_config_file_contents'] = f.read()
         wandb_kwargs = {
             'dir': save_dir,
-            'name': args.wandb_exp_name,
-            'project': args.wandb_project,
+            'name': cfg.logger.wandb_exp_name,
+            'project': cfg.logger.wandb_project,
             'config': wandb_config}
-        if args.wandb_entity:
-            wandb_kwargs['entity'] = args.wandb_entity
+        if cfg.logger.wandb_entity:
+            wandb_kwargs['entity'] = cfg.logger.wandb_entity
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)
         wandb.init(**wandb_kwargs)
         _GLOBAL_WANDB_WRITER = wandb
 
 
 def _set_one_logger(args):
+    cfg = get_run_config()
     global _GLOBAL_ONE_LOGGER
     _ensure_var_is_not_initialized(_GLOBAL_ONE_LOGGER, 'one logger')
 
-    if args.enable_one_logger and args.rank == (args.world_size - 1):
-        if args.one_logger_async or getattr(args, 'wandb_project', ''):
+    if cfg.logger.enable_one_logger and args.rank == (args.world_size - 1):
+        if cfg.logger.one_logger_async or cfg.logger.wandb_project:
             one_logger_async = True
         else:
             one_logger_async = False
         try:
             from one_logger import OneLogger
             config = {
-               'project': args.one_logger_project,
-               'name': args.one_logger_run_name,
+               'project': cfg.logger.one_logger_project,
+               'name': cfg.logger.one_logger_run_name,
                'async': one_logger_async,
             }
             one_logger = OneLogger(config=config)
@@ -351,9 +424,10 @@ def _set_adlr_autoresume(args):
 
 def _set_timers(args):
     """Initialize timers."""
+    cfg = get_run_config()
     global _GLOBAL_TIMERS
     _ensure_var_is_not_initialized(_GLOBAL_TIMERS, 'timers')
-    _GLOBAL_TIMERS = Timers(args.timing_log_level, args.timing_log_option)
+    _GLOBAL_TIMERS = Timers(cfg.logger.timing_log_level, cfg.logger.timing_log_option)
 
 def _set_energy_monitor(args):
     """Initialize energy monitor."""
@@ -376,7 +450,7 @@ def _detect_gpu_identity(local_rank):
 
     Uses ``local_rank`` directly (not ``torch.cuda.current_device()``) because
     this runs from ``set_global_variables`` during arg parsing, before
-    ``torch.cuda.set_device(args.local_rank)`` happens in
+    ``torch.cuda.set_device(cfg.dist.local_rank)`` happens in
     ``_initialize_distributed`` -- ``current_device()`` would still read back
     the default (always 0) at this point. ``local_rank`` is resolved against
     ``CUDA_VISIBLE_DEVICES`` the same way ``set_device`` will later resolve it,
@@ -423,7 +497,7 @@ def _detect_gpu_identity(local_rank):
         return {}
 
 
-def build_telemetry_resource_attrs(args):
+def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     """Build the OTel resource-attribute dict from training config.
 
     Shared by _set_telemetry() (the main process) and
@@ -434,21 +508,25 @@ def build_telemetry_resource_attrs(args):
     """
     # Attach training config as resource attributes so they appear as
     # Process tags in Jaeger, making it easy to identify and compare runs.
-    resource_attrs = {}
-    for attr, arg_name in [
-        ('dl.local_rank', 'local_rank'),
+    cfg = get_run_config()
+    resource_attrs = {'dl.local_rank': cfg.dist.local_rank}
+    fields = [
         ('dl.tensor_parallel.size', 'tensor_model_parallel_size'),
         ('dl.pipeline_parallel.size', 'pipeline_model_parallel_size'),
         ('dl.data_parallel.size', 'data_parallel_size'),
-        ('dl.batch_size', 'global_batch_size'),
         ('dl.sequence_length', 'seq_length'),
         ('megatron.num_layers', 'num_layers'),
         ('megatron.hidden_size', 'hidden_size'),
         ('megatron.num_attention_heads', 'num_attention_heads'),
-        ('megatron.train_iters', 'train_iters'),
-        ('megatron.micro_batch_size', 'micro_batch_size'),
         ('megatron.ckpt_format', 'ckpt_format'),
-    ]:
+    ]
+    if include_training:
+        fields.extend([
+            ('dl.batch_size', 'global_batch_size'),
+            ('megatron.train_iters', 'train_iters'),
+            ('megatron.micro_batch_size', 'micro_batch_size'),
+        ])
+    for attr, arg_name in fields:
         val = getattr(args, arg_name, None)
         if val is not None:
             resource_attrs[attr] = val
@@ -461,7 +539,7 @@ def build_telemetry_resource_attrs(args):
     else:
         resource_attrs['megatron.precision'] = 'fp32'
 
-    resource_attrs.update(_detect_gpu_identity(getattr(args, 'local_rank', None) or 0))
+    resource_attrs.update(_detect_gpu_identity(cfg.dist.local_rank))
 
     # SLURM identity, so EVERY span can be correlated with the out-of-band reckoner (which keys
     # on SLUID). SLUID is not in the job env, so the launch script fetches it from sacct (it's
@@ -513,8 +591,9 @@ def build_telemetry_resource_attrs(args):
     return resource_attrs
 
 
-def _set_telemetry(args):
+def _set_telemetry(args, *, include_training: bool = True):
     """Initialise OTel telemetry handle following the wandb/tensorboard pattern."""
+    cfg = get_run_config()
     global _GLOBAL_TELEMETRY_HANDLE
     try:
         from nemo.lens import NemoLensConfig, setup_telemetry
@@ -531,18 +610,21 @@ def _set_telemetry(args):
     )
     if not os.environ.get('OTEL_SERVICE_NAME', '').strip():
         config.service_name = 'megatron-lm'
-    if getattr(args, 'otel_enabled', False):
+    if cfg.logger.otel_enabled:
         config.enabled = True
-    if getattr(args, 'otel_service_name', None):
-        config.service_name = args.otel_service_name
-    if getattr(args, 'otel_span_groups', None):
-        config.span_groups = args.otel_span_groups
+    if cfg.logger.otel_service_name:
+        config.service_name = cfg.logger.otel_service_name
+    if cfg.logger.otel_span_groups:
+        config.span_groups = cfg.logger.otel_span_groups
 
     # Only pay for the resource-attribute build on the enabled path. It is not free:
     # _detect_gpu_identity() does an nvmlInit()/nvmlShutdown() round trip, and a run with
     # telemetry off must not touch NVML (or anything else) just because nemo-lens is importable.
     # setup_telemetry() ignores resource_attributes for a disabled config, so {} is equivalent.
-    resource_attrs = build_telemetry_resource_attrs(args) if config.enabled else {}
+    resource_attrs = (
+        build_telemetry_resource_attrs(args, include_training=include_training)
+        if config.enabled else {}
+    )
 
     _GLOBAL_TELEMETRY_HANDLE = setup_telemetry(
         config, rank=args.rank, world_size=args.world_size,
@@ -558,6 +640,9 @@ def _set_telemetry(args):
 def destroy_global_vars():
     global _GLOBAL_ARGS
     _GLOBAL_ARGS = None
+
+    global _GLOBAL_RUN_CONFIG
+    _GLOBAL_RUN_CONFIG = None
 
     global _GLOBAL_TRAIN_STATE
     _GLOBAL_TRAIN_STATE = None

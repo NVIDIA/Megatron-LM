@@ -6,7 +6,9 @@ import pytest
 import torch
 
 from megatron.core.transformer import ModuleSpec
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
 
 # ---------------------------------------------------------------------------
@@ -77,6 +79,29 @@ class TestHybridModelConfigInitialization:
     def test_hybrid_stack_spec_default_is_none(self):
         config = _make_hybrid_config()
         assert config.hybrid_stack_spec is None
+
+    def test_config_list_is_omitted_from_parent_run_config_serialization(
+        self, run_config, tmp_path
+    ):
+        transformer = _make_transformer()
+        transformer.is_hybrid_model = True
+        layer_config = AttentionLayerConfig.from_config(transformer)
+        source_config_list = [layer_config, layer_config]
+        config = _make_hybrid_config(
+            transformer=transformer, hybrid_layer_config_list=source_config_list
+        )
+        run_config.model = config
+
+        serialized = run_config.to_dict()
+        assert "hybrid_layer_config_list" not in serialized["model"]
+        assert serialized["model"]["transformer"]["is_hybrid_model"] is True
+
+        yaml_path = tmp_path / "run_config.yaml"
+        run_config.to_yaml(yaml_path)
+        assert "hybrid_layer_config_list" not in yaml_path.read_text()
+        assert config.hybrid_layer_config_list is source_config_list
+        assert source_config_list[0] is layer_config
+        assert source_config_list[1] is layer_config
 
 
 class TestHybridModelConfigGetAttr:
@@ -226,6 +251,17 @@ class TestHybridModelBuilderBuildModel:
     @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
     @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
     @patch("megatron.training.models.hybrid.HybridModel")
+    def test_spec_none_with_wide_residual_uses_explicit_wide_spec(self, mock_model, *_):
+        self.config.transformer.wide_residual = WideResidualConfig(num_streams=2)
+        with patch("megatron.training.models.hybrid.wide_residual_hybrid_stack_spec") as mock_wide:
+            self.builder.build_model(self.pg, pre_process=True, post_process=True)
+        call_kwargs = mock_model.call_args.kwargs
+        assert call_kwargs["hybrid_stack_spec"] is mock_wide
+
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
     def test_spec_none_with_inference_optimized_uses_inference_spec(self, mock_model, *_):
         self.config.transformer.transformer_impl = "inference_optimized"
         with patch("megatron.training.models.hybrid.hybrid_inference_stack_spec") as mock_inf:
@@ -248,6 +284,16 @@ class TestHybridModelBuilderBuildModel:
         mock_fn.assert_called_once_with(local_core_attention=False, remap_te_layernorm=False)
         call_kwargs = mock_model.call_args.kwargs
         assert call_kwargs["hybrid_stack_spec"] is modelopt_spec
+
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
+    def test_wide_residual_rejects_modelopt_spec_generation(self, _mock_model, *_):
+        self.config.transformer.wide_residual = WideResidualConfig(num_streams=2)
+        self.config.restore_modelopt_state = True
+        with pytest.raises(NotImplementedError, match="ModelOpt HybridStack"):
+            self.builder.build_model(self.pg, pre_process=True, post_process=True)
 
     @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
     @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
@@ -359,6 +405,25 @@ class TestHybridModelBuilderBuildModel:
         assert kw["seq_len_interpolation_factor"] is None
         assert kw["pg_collection"] is pg
         assert kw["vp_stage"] is None
+
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
+    def test_config_list_is_forwarded_without_conversion(self, mock_model, *_):
+        transformer = _make_transformer()
+        layer_config = AttentionLayerConfig.from_config(transformer)
+        source_config_list = [layer_config, layer_config]
+        config = _make_hybrid_config(
+            transformer=transformer, hybrid_layer_config_list=source_config_list
+        )
+
+        HybridModelBuilder(config).build_model(self.pg, pre_process=True, post_process=True)
+
+        forwarded = mock_model.call_args.kwargs["hybrid_layer_config_list"]
+        assert forwarded is source_config_list
+        assert forwarded[0] is layer_config
+        assert forwarded[1] is layer_config
 
 
 class TestHybridModelBuilderBuildDistributedModels:

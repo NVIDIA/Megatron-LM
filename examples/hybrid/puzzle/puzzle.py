@@ -16,7 +16,7 @@ import time
 from argparse import ArgumentParser, Namespace
 from functools import partial
 
-from megatron.core.models.hybrid import HybridLayerConfigListEntry, MTPSplit
+from megatron.core.models.hybrid import HybridLayerEntry, MTPSplit
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
@@ -80,7 +80,7 @@ def add_puzzle_args(parser: ArgumentParser) -> ArgumentParser:
     return parser
 
 
-def build_puzzle_layer_config_list(config: TransformerConfig) -> list[HybridLayerConfigListEntry]:
+def build_puzzle_layer_config_list(config: TransformerConfig) -> list[HybridLayerEntry]:
     """Create the published layer sequence without modifying the common config.
 
     Each entry is a fresh config inheriting runtime settings from ``config``.
@@ -206,6 +206,7 @@ def main() -> None:
     from megatron.training import inprocess_restart, pretrain, set_startup_timestamps
     from megatron.training.argument_utils import pretrain_cfg_container_from_args
     from megatron.training.arguments import parse_and_validate_args
+    from megatron.training.global_vars import set_run_config
     from pretrain_hybrid import forward_step, train_valid_test_datasets_provider
 
     set_startup_timestamps(program_start=program_start, main_entry=time.time())
@@ -214,6 +215,7 @@ def main() -> None:
     args = parse_and_validate_args(extra_args_provider=add_puzzle_args)
     model_config = build_puzzle_model_config(args)
     full_config = pretrain_cfg_container_from_args(args, model_config)
+    set_run_config(full_config)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,
