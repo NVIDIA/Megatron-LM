@@ -1283,6 +1283,84 @@ def test_gdp_gtp_padding_save_load_preprocessing(device, dtype, gtp_rank, valid_
     assert rank_common == {}, "Padding must not leak into common checkpoint state"
 
 
+@pytest.mark.parametrize("algo", ["atomic", "fully_parallel"])
+@pytest.mark.parametrize(
+    "gtp_rank, valid_rows",
+    [(61, 992), (62, 256), (63, 0)],
+    ids=["full", "partial_padding", "all_padding"],
+)
+def test_gdp_gtp_padding_tensor_aware_state_dict_round_trip(algo, gtp_rank, valid_rows):
+    """Restore real rows and zero padding through the local-checkpoint load path."""
+    pytest.importorskip("nvidia_resiliency_ext")
+    from megatron.core.dist_checkpointing.dict_utils import nested_values
+    from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject
+    from megatron.core.dist_checkpointing.tensor_aware_state_dict import MCoreTensorAwareStateDict
+    from megatron.core.ssm.gated_delta_product import (
+        _get_in_proj_checkpoint_split_layout,
+        _gtp_split_tensor_factory,
+        _split_tensor_factory,
+    )
+
+    if not dist.is_initialized() or not torch.cuda.is_available():
+        pytest.skip("Requires torch.distributed and CUDA")
+
+    # Same layout as test_gdp_gtp_padding_save_load_preprocessing: 992 rows per GTP rank.
+    sections, names = _get_in_proj_checkpoint_split_layout(80 * 64, 80 * 128, 80, 3)
+    local_rows = 992
+    key = "mixer.in_proj.weight"
+    split_key = "mixer.out_proj.weight"
+    device = torch.device("cuda", torch.cuda.current_device())
+    # Every process holds the same tensors; only global rank 0 owns the main replica.
+    replica_id = dist.get_rank()
+
+    def state_dict(gtp_data, split_data):
+        gtp_tensor = ShardedTensor.from_rank_offsets(
+            key, gtp_data, (0, gtp_rank, 64), replica_id=replica_id
+        )
+        split_tensor = ShardedTensor.from_rank_offsets(split_key, split_data, replica_id=replica_id)
+        return {
+            "model": {
+                key: _gtp_split_tensor_factory(gtp_tensor, sections, names, gtp_rank, 0, 1),
+                split_key: _split_tensor_factory(split_tensor, [3, 5], ["first", "second"], 0),
+                "iteration": 7,
+                "local_value": LocalNonpersistentObject("kept"),
+            }
+        }
+
+    gtp_data = (
+        torch.arange(1, local_rows * 2 + 1, dtype=torch.float32, device=device)
+        .reshape(local_rows, 2)
+        .to(torch.bfloat16)
+    )
+    split_data = torch.arange(16, dtype=torch.float32, device=device).reshape(8, 2)
+    expected_gtp = gtp_data.clone()
+    expected_gtp[valid_rows:].zero_()
+    expected_split = split_data.clone()
+
+    saved, _ = MCoreTensorAwareStateDict.from_state_dict(
+        state_dict(gtp_data, split_data), algo=algo
+    )
+    saved_gtp_rows = sum(
+        sharded_tensor.local_shape[0]
+        for sharded_tensor in nested_values(saved.sharded_state_dict)
+        if sharded_tensor.key.startswith(key + ".")
+    )
+    assert saved_gtp_rows == valid_rows, "Padding and placeholders must not be saved"
+    assert saved.common == {"model": {"iteration": 7}}, saved.common
+
+    gtp_data.fill_(-999)
+    split_data.fill_(-999)
+    loaded = saved.to_state_dict(state_dict(gtp_data, split_data), algo=algo)["model"]
+
+    assert loaded[key].shape == (local_rows, 2)
+    assert loaded[key].dtype == torch.bfloat16
+    assert loaded[key].device == device
+    torch.testing.assert_close(loaded[key], expected_gtp, rtol=0, atol=0)
+    torch.testing.assert_close(loaded[split_key], expected_split, rtol=0, atol=0)
+    assert loaded["iteration"] == 7
+    assert loaded["local_value"] == "kept"
+
+
 def _worker_gdp_inproj_shard_split(rank, world_size, port):
     """GatedDeltaProductMixer.sharded_state_dict under GTP_remat, without a gather.
 
@@ -1443,7 +1521,7 @@ def _worker_gdp_inproj_cross_gtp_load(rank, world_size, ckpt_base):
     from megatron.core.dist_checkpointing import load, save
     from tests.unit_tests.dist_checkpointing import TempNamedDir
 
-    key = 'mixer.in_proj.weight'
+    key = "mixer.in_proj.weight"
 
     def _init(gtp_remat_size):
         ps.destroy_model_parallel()
@@ -1455,16 +1533,16 @@ def _worker_gdp_inproj_cross_gtp_load(rank, world_size, ckpt_base):
         model_parallel_cuda_manual_seed(42)
         if gtp_remat_size > 1:
             mixer, pg, in_proj_dim = _build_gdp_mixer(
-                ['tp', 'cp', 'gtp_remat', 'dp_cp', 'dp_cp_gtp_remat']
+                ["tp", "cp", "gtp_remat", "dp_cp", "dp_cp_gtp_remat"]
             )
-            metadata = {'dp_cp_group': pg.dp_cp_gtp_remat}
+            metadata = {"dp_cp_group": pg.dp_cp_gtp_remat}
         else:
-            mixer, pg, in_proj_dim = _build_gdp_mixer(['tp', 'cp', 'dp_cp'], expect_gtp=False)
-            metadata = {'dp_cp_group': pg.dp_cp}
+            mixer, pg, in_proj_dim = _build_gdp_mixer(["tp", "cp", "dp_cp"], expect_gtp=False)
+            metadata = {"dp_cp_group": pg.dp_cp}
         return mixer, metadata, in_proj_dim
 
     def _in_proj_only(mixer, metadata):
-        sd = mixer.sharded_state_dict(prefix='mixer.', metadata=metadata)
+        sd = mixer.sharded_state_dict(prefix="mixer.", metadata=metadata)
         return {key: sd[key]}
 
     try:
@@ -1476,7 +1554,7 @@ def _worker_gdp_inproj_cross_gtp_load(rank, world_size, ckpt_base):
         shards = [torch.empty_like(in_proj_w.data) for _ in range(in_proj_w.group.size())]
         dist.all_gather(shards, in_proj_w.data.contiguous(), group=in_proj_w.group)
         golden = torch.cat(shards)[:in_proj_dim].clone()
-        with TempNamedDir(ckpt_base / 'gdp_gtp_to_non_gtp', sync=True) as ckpt_dir:
+        with TempNamedDir(ckpt_base / "gdp_gtp_to_non_gtp", sync=True) as ckpt_dir:
             save(_in_proj_only(mixer, metadata), ckpt_dir)
             mixer, metadata, _ = _init(gtp_remat_size=1)
             with torch.no_grad():
@@ -1487,7 +1565,7 @@ def _worker_gdp_inproj_cross_gtp_load(rank, world_size, ckpt_base):
         # Non-GTP save -> GTP load.
         mixer, metadata, in_proj_dim = _init(gtp_remat_size=1)
         golden = mixer.in_proj.weight.data.clone()
-        with TempNamedDir(ckpt_base / 'gdp_non_gtp_to_gtp', sync=True) as ckpt_dir:
+        with TempNamedDir(ckpt_base / "gdp_non_gtp_to_gtp", sync=True) as ckpt_dir:
             save(_in_proj_only(mixer, metadata), ckpt_dir)
             mixer, metadata, _ = _init(gtp_remat_size=2)
             in_proj_w = mixer.in_proj.weight
