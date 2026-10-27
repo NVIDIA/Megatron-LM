@@ -552,6 +552,16 @@ class MoELayer(BaseMoELayer):
         producing routing probabilities and a mapping. The input padding mask is batch-first;
         routing consumes it sequence-first to align with ``hidden_states``.
         """
+        return self.compute_routing(hidden_states, padding_mask, input_ids, packed_seq_params)
+
+    def compute_routing(
+        self, hidden_states, padding_mask=None, input_ids=None, packed_seq_params=None
+    ):
+        """Compute routing independently of the legacy graph early-return protocol.
+
+        Tensor-state graph regions may capture this operation and pass its outputs
+        to ``forward(router_output=...)``. Dispatch and experts then remain eager.
+        """
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
         if self.token_dispatcher is not None:
@@ -733,6 +743,7 @@ class MoELayer(BaseMoELayer):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        router_output: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass for the MoE layer.
 
@@ -749,6 +760,8 @@ class MoELayer(BaseMoELayer):
                                                    False = valid. Defaults to None.
             input_ids (torch.Tensor, optional): Token IDs with shape
                 [batch_size, seq_length]. Required by hash routing.
+            router_output (tuple, optional): Explicit routing probabilities and map from
+                ``compute_routing``. Dispatch, experts and combine still execute normally.
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
@@ -759,6 +772,11 @@ class MoELayer(BaseMoELayer):
             )
         self.select_token_dispatcher()
 
+        if router_output is not None and intermediate_tensors is not None:
+            raise ValueError(
+                'Explicit routing and legacy MoE graph intermediates cannot be combined'
+            )
+
         if self.config.moe_megakernel_backend is not None:
             if intermediate_tensors is not None:
                 raise RuntimeError(
@@ -766,22 +784,37 @@ class MoELayer(BaseMoELayer):
                     "CUDA-graph capture; remove moe_router/moe_preprocess from cuda_graph_modules"
                 )
 
-            def megakernel_forward(hidden_states, padding_mask):
-                probs, routing_map = self.route(
-                    hidden_states, padding_mask, input_ids, packed_seq_params=packed_seq_params
-                )
+            def megakernel_forward(hidden_states, padding_mask, route_probs, route_map):
+                if route_probs is None:
+                    probs, routing_map = self.route(
+                        hidden_states, padding_mask, input_ids, packed_seq_params=packed_seq_params
+                    )
+                else:
+                    probs, routing_map = route_probs, route_map
                 return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
 
+            routing_args = (None, None) if router_output is None else router_output
             if self.moe_layer_recompute and self.training:
                 output = precision_aware_checkpoint(
-                    megakernel_forward, self.config, self.tp_group, hidden_states, padding_mask
+                    megakernel_forward,
+                    self.config,
+                    self.tp_group,
+                    hidden_states,
+                    padding_mask,
+                    *routing_args,
                 )
             else:
-                output = megakernel_forward(hidden_states, padding_mask)
+                output = megakernel_forward(hidden_states, padding_mask, *routing_args)
             return output, None
 
         # MoE forward: route -> dispatch -> compute -> combine
-        def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
+        def custom_forward(
+            hidden_states,
+            intermediate_tensors=None,
+            padding_mask=None,
+            route_probs=None,
+            route_map=None,
+        ):
             shared_expert_output = None
             try:
                 if "route" in self.fwd_execution_map:
@@ -791,9 +824,15 @@ class MoELayer(BaseMoELayer):
                     if not self.run_shared_experts_after_router:
                         shared_expert_output = self.shared_experts_compute(layer_input)
 
-                    probs, routing_map = self.route(
-                        layer_input, padding_mask, input_ids, packed_seq_params=packed_seq_params
-                    )
+                    if route_probs is None:
+                        probs, routing_map = self.route(
+                            layer_input,
+                            padding_mask,
+                            input_ids,
+                            packed_seq_params=packed_seq_params,
+                        )
+                    else:
+                        probs, routing_map = route_probs, route_map
                     hidden_states, probs = self.preprocess(
                         layer_input, probs, routing_map, padding_mask
                     )
@@ -836,6 +875,7 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias
 
+        routing_args = (None, None) if router_output is None else router_output
         if self.moe_layer_recompute and self.training:
             outputs = precision_aware_checkpoint(
                 custom_forward,
@@ -844,9 +884,12 @@ class MoELayer(BaseMoELayer):
                 hidden_states,
                 intermediate_tensors,
                 padding_mask,
+                *routing_args,
             )
         else:
-            outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
+            outputs = custom_forward(
+                hidden_states, intermediate_tensors, padding_mask, *routing_args
+            )
 
         return outputs
 

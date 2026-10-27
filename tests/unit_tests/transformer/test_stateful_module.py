@@ -432,3 +432,36 @@ def test_capture_failure_restores_process_settings(backend):
     assert te_graph.is_graph_capturing() == before_te
     if get_override is not None:
         assert get_override() == before_override
+
+
+@pytest.mark.usefixtures('te_rng_tracker')
+@pytest.mark.parametrize('backend', ['torch', 'transformer_engine'])
+def test_graph_capture_preserves_registered_statistics(backend):
+    """Graph warmup must not inflate router-like counters, including across slots."""
+
+    class Counter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(8, device='cuda'))
+            self.register_buffer('calls', torch.tensor(17, device='cuda'))
+
+        def forward(self, hidden, state):
+            self.calls.add_(1)
+            return hidden * self.weight, {}
+
+    module = Counter()
+    region = StatefulModule(module)
+    sample = torch.ones(4, 1, 8, device='cuda', requires_grad=True)
+    graphs = StatefulGraphs(region, sample, {}, slots=2, backend=backend)
+    pre_hooks = []
+    graphs.setup_manual_hooks(lambda: lambda owner: pre_hooks.append(owner))
+    try:
+        assert module.calls.item() == 17
+        outputs = [graphs.run(sample.clone(), {}, slot=i)[0] for i in range(2)]
+        for output in outputs:
+            output.sum().backward()
+        assert module.calls.item() == 19
+        assert pre_hooks == [module, module]
+    finally:
+        graphs.abort()
+        graphs.close()

@@ -22,7 +22,10 @@ from tests.unit_tests.transformer.test_stateful_module import (  # pylint: disab
 
 @pytest.mark.usefixtures("te_rng_tracker")
 @pytest.mark.parametrize("backend", ["torch", "transformer_engine"])
-def test_fused_te_graph_preserves_ddp_gradients_and_distributed_optimizer(backend):
+@pytest.mark.parametrize("overlap_param_gather", [False, True])
+def test_fused_te_graph_preserves_ddp_gradients_and_distributed_optimizer(
+    backend, overlap_param_gather
+):
     te = pytest.importorskip("transformer_engine.pytorch")
     if Utils.world_size < 2:
         pytest.skip("Requires at least two data-parallel ranks")
@@ -40,7 +43,7 @@ def test_fused_te_graph_preserves_ddp_gradients_and_distributed_optimizer(backen
         ddp_config = DistributedDataParallelConfig(
             use_distributed_optimizer=True,
             overlap_grad_reduce=True,
-            overlap_param_gather=False,
+            overlap_param_gather=overlap_param_gather,
             grad_reduce_in_fp32=True,
         )
 
@@ -88,10 +91,21 @@ def test_fused_te_graph_preserves_ddp_gradients_and_distributed_optimizer(backen
         for p in models[0].parameters():
             p.main_grad.fill_(3)
         before = [p.main_grad.clone() for p in models[0].parameters()]
-        graphs = StatefulGraphs(models[0].module, sample, {}, slots=2, backend=backend)
+        if overlap_param_gather:
+            models[0].start_param_sync()
+        graphs = StatefulGraphs(
+            models[0].module,
+            sample,
+            {},
+            slots=2,
+            backend=backend,
+            make_forward_pre_hook=(
+                models[0]._make_forward_pre_hook if overlap_param_gather else None
+            ),
+        )
         for p, saved in zip(models[0].parameters(), before):
             torch.testing.assert_close(p.main_grad, saved, rtol=0, atol=0)
-        for _ in range(2):
+        for step in range(2):
             for model, optimizer in zip(models, optimizers):
                 optimizer.zero_grad()
                 model.zero_grad_buffer()
@@ -122,7 +136,14 @@ def test_fused_te_graph_preserves_ddp_gradients_and_distributed_optimizer(backen
                 )
             for model, optimizer in zip(models, optimizers):
                 assert optimizer.step()[0]
-                model.start_param_sync(force_sync=True)
+                model.start_param_sync(force_sync=not overlap_param_gather)
+            if overlap_param_gather:
+                # The next iteration's graph/ordinary module pre-hooks drain the
+                # pending gather. Only drain explicitly after the final update.
+                if step != 1:
+                    continue
+                for model in models:
+                    model.start_param_sync(force_sync=True)
             for actual, expected in zip(models[0].parameters(), models[1].parameters()):
                 torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
         del hidden, state
