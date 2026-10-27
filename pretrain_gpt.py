@@ -113,7 +113,8 @@ def get_batch(
         vp_stage: Virtual pipeline stage of the model chunk.
         pg_collection: Process groups of the model. The batch is read on the first rank of
             its tensor-parallel group, broadcast over that group and sharded over its
-            context-parallel group. None builds the groups from the global parallel state.
+            context-parallel group. Omitting it is deprecated: the groups are built from the
+            global parallel state, with a ProcessGroupFallbackWarning.
     """
 
     args = get_args()
@@ -121,6 +122,9 @@ def get_batch(
 
     if pg_collection is None:
         # Compatibility for direct entrypoint callers; forward_step passes the model's groups.
+        warn_global_process_group_fallback(
+            "pretrain_gpt.get_batch", deprecated_in="0.21", removed_in="0.23"
+        )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(
             required_pgs=["tp", "pp", "cp", "tp_cp", "dynamic_cp", "dynamic_tp_cp"]
         )
