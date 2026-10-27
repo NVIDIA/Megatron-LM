@@ -548,6 +548,10 @@ class PretrainConfigContainer(ConfigContainerBase):
             # The world size is known here: data_parallel_size gets the agreement check the other
             # fields got at validation, before anything is written.
             data_parallel_size = self.get_data_parallel_size(safe_get_world_size())
+            # Dataset alignment follows independent sample owners, not weight replicas.
+            data_parallel_size *= (getattr(transformer, "gtp_weight_remat_size", 1) or 1) // (
+                getattr(transformer, "gtp_remat_num_sequence_shards", 1) or 1
+            )
             if dataset.data_parallel_size not in (1, data_parallel_size):
                 raise ValueError(
                     f"data.dataset.data_parallel_size={dataset.data_parallel_size} disagrees with "
