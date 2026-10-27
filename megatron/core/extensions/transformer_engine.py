@@ -349,6 +349,24 @@ class TEQuantizationParams:
             raise NotImplementedError(f"Unhandled configuration type {config_type}")
 
 
+def _fp4_dense_mxfp8_quant_params(
+    config: TransformerConfig, is_expert: bool, current: Optional[TEQuantizationParams]
+) -> Optional[TEQuantizationParams]:
+    """MXFP8 quantization override for a non-expert linear of an FP4 model.
+
+    With ``config.fp4_dense_mxfp8`` the non-expert linears run in MXFP8 while the routed experts
+    keep the FP4 recipe. An explicit per-module override from ``config.quant_recipe`` wins.
+    """
+    if current is not None or is_expert or not getattr(config, "fp4_dense_mxfp8", False):
+        return current
+    return TEQuantizationParams(
+        training_recipe=TEQuantizationRecipe(
+            fp8_quantization_recipe=Fp8Recipe.mxfp8, fp8_param=config.fp4_dense_mxfp8_param
+        ),
+        evaluation_recipe=None,
+    )
+
+
 def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
     if qrecipe.inherit_model_init_context:
         # Preserve both the enclosing recipe and whether storage is enabled. In
@@ -1426,6 +1444,7 @@ class TELinear(te.pytorch.Linear):
                 tp_group_for_te = None
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
+        self._is_expert_linear = is_expert
         quant_config = get_quant_config_or_none(name, config.quant_recipe)
         self.finish_init(quant_config)
         init_quant_context = _get_fp8_model_init_for_quant_params(
@@ -1484,6 +1503,9 @@ class TELinear(te.pytorch.Linear):
             self.te_quant_params = TEQuantizationParams.parse_from_config(
                 quantization_config, model_config=self.config
             )
+        self.te_quant_params = _fp4_dense_mxfp8_quant_params(
+            self.config, self._is_expert_linear, self.te_quant_params
+        )
 
     def will_execute_quantized(self, is_context_quantized: bool) -> bool:
         """Returns whether the module is configured to execute quantized."""
@@ -1653,6 +1675,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         self.stride = stride
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
+        self._is_expert_linear = is_expert
         quant_config = get_quant_config_or_none(name, config.quant_recipe)
         self.finish_init(quant_config)
         init_quant_context = _get_fp8_model_init_for_quant_params(
@@ -1733,6 +1756,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             self.te_quant_params = TEQuantizationParams.parse_from_config(
                 quantization_config, model_config=self.config
             )
+        self.te_quant_params = _fp4_dense_mxfp8_quant_params(
+            self.config, self._is_expert_linear, self.te_quant_params
+        )
 
     def will_execute_quantized(self, is_context_quantized: bool) -> bool:
         """Returns whether the module is configured to execute quantized."""

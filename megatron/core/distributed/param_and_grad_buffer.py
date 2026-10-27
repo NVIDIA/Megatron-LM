@@ -358,11 +358,19 @@ class _ParamAndGradBucketGroup:
                     param.data.copy_(gathered_param)
 
         if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+            persistent_quantized_params = []
             for bucket in self.buckets:
                 if bucket.param_data is None:
                     # LayerWise variable-size gather path: params are already updated via
                     # unflatten + copy_ in finish_param_sync, and there is no param_data
                     # buffer to copy back from.
+                    continue
+                if not bucket.uses_mxfp8_grad_buf_ag:
+                    # Persistent param_data (NVFP4 or high precision): the all-gather wrote in
+                    # place, so only the regular post-processing is needed.
+                    persistent_quantized_params.extend(
+                        param for param in bucket.params if _param_uses_quantized_storage(param)
+                    )
                     continue
                 has_non_quantized_weight = False
                 quantized_params = []
@@ -389,6 +397,8 @@ class _ParamAndGradBucketGroup:
                 # correspond to multiple param buffers. If we zero out the entire grad buffer,
                 # it would clear the data of those param buffers that have not yet completed AG.
                 bucket.param_data.zero_()
+            if persistent_quantized_params:
+                post_all_gather_processing(persistent_quantized_params)
             return
 
         quantized_params = []
@@ -1209,9 +1219,21 @@ class _ParamAndGradBuffer:
         self.nccl_mem_pool: Optional["torch.cuda.MemPool"] = None
         self.param_nccl_mem_pool: Optional["torch.cuda.MemPool"] = None
         self.nccl_grad_pool_is_separate: bool = self.nccl_ub and self.ddp_config.grad_buffer_offload
-        uses_shared_param_grad_buffer = self.ddp_config.use_distributed_optimizer and any(
-            is_mxfp8tensor(p) or is_grouped_mxfp8tensor(p) for p in self.params
+        has_mxfp8_params = any(is_mxfp8tensor(p) or is_grouped_mxfp8tensor(p) for p in self.params)
+        uses_shared_param_grad_buffer = (
+            self.ddp_config.use_distributed_optimizer and has_mxfp8_params
         )
+        # Whether the param all-gather of this buffer reuses grad_data. In an FP4 model with MXFP8
+        # non-expert params (fp4_param_gather), only the buffers holding MXFP8 params do; NVFP4
+        # and high-precision buffers keep their persistent param_data.
+        self.uses_mxfp8_grad_buf_ag = self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag and (
+            not self.ddp_config.fp4_param_gather or has_mxfp8_params
+        )
+        if self.uses_mxfp8_grad_buf_ag and self.has_nvfp4_params:
+            raise ValueError(
+                "A buffer cannot hold both MXFP8 and NVFP4 params with "
+                "reuse_grad_buf_for_mxfp8_param_ag."
+            )
         if self.ddp_config.grad_buffer_offload and uses_shared_param_grad_buffer:
             raise ValueError(
                 "Gradient-buffer offload is incompatible with MXFP8 parameters because "
@@ -1374,10 +1396,7 @@ class _ParamAndGradBuffer:
             #   TE GroupedTensor + NVFP4      -> remap packed rowwise bytes
             #   TE GroupedTensor + MXFP8      -> unsupported here; require grad-buffer AG reuse
             #   TE GroupedTensor + BF16/FP16  -> remap grouped rowwise_data
-            if (
-                not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-                or not _param_uses_quantized_storage(param)
-            ):
+            if not self.uses_mxfp8_grad_buf_ag or not _param_uses_quantized_storage(param):
                 if self.param_data is not None:
                     if not is_grouped_tensor(param):
                         # Plain NVFP4: remap packed rowwise bytes only.
@@ -1714,6 +1733,7 @@ class _ParamAndGradBuffer:
             param_index_map=self.param_index_map,
             params_with_extra_main_grads=bucket_params_with_extra_main_grads,
         )
+        bucket.uses_mxfp8_grad_buf_ag = self.uses_mxfp8_grad_buf_ag
         for bucket_param in bucket_params:
             assert bucket_param not in self.param_to_bucket
             self.param_to_bucket[bucket_param] = bucket
