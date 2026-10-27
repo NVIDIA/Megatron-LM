@@ -1,8 +1,8 @@
 # yaml-language-server: $schema=https://schema.buildwithfern.dev/docs-yml.json
 
 instances:
-  - url: megatron-core.docs.buildwithfern.com/megatron-core/developer-guide
-    custom-domain: docs.nvidia.com/megatron-core/developer-guide
+  - url: megatron.docs.buildwithfern.com/megatron/developer-guide
+    custom-domain: docs.nvidia.com/megatron/developer-guide
     multi-source: true
 
 title: Megatron Core
@@ -18,10 +18,10 @@ logo:
 
 versions:
   - display-name: "0.20.0 (latest)"
-    path: versions/v0.20.0.yml
+    path: ../index.yml
     slug: latest
   - display-name: "nightly"
-    path: versions/nightly.yml
+    ref: <branch name>
     slug: nightly
   - display-name: "Archives"
     path: versions/archives.yml

@@ -1,10 +1,6 @@
 ---
 title: Build and Preview the Documentation with Fern
 description: Describes how to install the Fern CLI, preview and validate the documentation locally, manage documentation versions, and publish the site.
-nav:
-  parent: developer-guide
-  order: 50
-  slug: documentation
 ---
 
 {/*
@@ -143,10 +139,12 @@ versions:
     slug: archives
 ```
 
+Page paths in the version files are relative to `docs/fern/versions/`.
+
 The site has the following kinds of versions:
 
-- **Nightly**: `versions/nightly.yml` points at the current MDX files under `docs/`. The `fern_nav.py` script generates it from page frontmatter, as described in [Add a Page](#add-a-page).
-- **Released versions**: Each `versions/v<X.Y.Z>.yml` file is a frozen copy of the nightly navigation at the `core_v<X.Y.Z>` release tag. Its paths point at `versions/v<X.Y.Z>-content/`, which holds the `docs/` tree from that tag.
+- **Nightly**: `versions/nightly.yml` points at the current MDX files under `docs/`, with paths such as `../../get-started/overview.mdx`. The `fern_nav.py` script generates it from page frontmatter, as described in [Add a Page](#add-a-page).
+- **Released versions**: Each `versions/v<X.Y.Z>.yml` file is a frozen copy of the nightly navigation at the `core_v<X.Y.Z>` release tag. Its paths, such as `./v<X.Y.Z>-content/get-started/overview.mdx`, point at `versions/v<X.Y.Z>-content/`, which holds the `docs/` tree from that tag.
 - **Archives**: `versions/archives.yml` contains a single page, `docs/archives.mdx`.
 
 ### Prepare Released Version Content

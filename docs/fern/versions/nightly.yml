@@ -5,258 +5,177 @@ navigation:
     path: ../../index.mdx
     slug: /
   - section: About Megatron Core
-    skip-slug: true
     contents:
       - page: Overview
         path: ../../get-started/overview.mdx
-        slug: overview
       - page: Release Notes and Roadmaps
         path: ../../get-started/releasenotes.mdx
-        slug: releasenotes
   - section: Get Started
-    skip-slug: true
     contents:
       - page: Installation
         path: ../../get-started/install.mdx
-        slug: install
       - page: Your First Training Run
         path: ../../get-started/quickstart.mdx
-        slug: quickstart
   - section: Basic Usage
-    skip-slug: true
     contents:
       - page: Data Preparation
         path: ../../user-guide/data-preparation.mdx
-        slug: data-preparation
       - page: Training Examples
         path: ../../user-guide/training-examples.mdx
-        slug: training-examples
       - section: Parallelism Strategies Guide
         path: ../../user-guide/parallelism-guide.mdx
-        slug: parallelism-guide
         contents:
           - page: Context Parallel Overview
             path: ../../user-guide/features/context_parallel.mdx
-            slug: context-parallel
           - page: Custom Pipeline Model Parallel Layout
             path: ../../user-guide/features/pipeline_parallel_layout.mdx
-            slug: pipeline-parallel-layout
           - page: Generalized Tensor Parallelism (GTP)
             path: ../../api-guide/core/generalized_tensor_parallel.mdx
-            slug: generalized-tensor-parallel
   - section: Supported Models
-    skip-slug: true
     contents:
       - section: Supported Models
         path: ../../models/index.mdx
-        slug: models
         contents:
           - page: Language Models
             path: ../../models/llms.mdx
-            slug: llms
           - page: Multimodal Models
             path: ../../models/multimodal.mdx
-            slug: multimodal
           - page: Llama, Mistral and other Llama-like model support in Megatron-LM
             path: ../../llama_mistral.mdx
-            slug: llama-mistral
   - section: Advanced Features
-    skip-slug: true
     contents:
       - page: Deterministic Training
         path: ../../user-guide/deterministic-training.mdx
-        slug: deterministic-training
       - page: Low-Precision Training Guide
         path: ../../user-guide/features/low_precision_training.mdx
-        slug: low-precision-training
       - section: Mixture of Experts
         path: ../../user-guide/features/moe.mdx
-        slug: moe
         contents:
           - page: Multi-Token Prediction (MTP)
             path: ../../user-guide/features/multi_token_prediction.mdx
-            slug: multi-token-prediction
           - page: Multi-Latent Attention
             path: ../../user-guide/features/multi_latent_attention.mdx
-            slug: multi-latent-attention
           - page: "Design Document: MoE Router Replay Feature"
             path: ../../api-guide/router_replay.mdx
-            slug: router-replay
           - page: MoE Paged Stash
             path: ../../user-guide/features/paged_stash.mdx
-            slug: paged-stash
       - page: Megatron-FSDP
         path: ../../user-guide/features/megatron_fsdp.mdx
-        slug: megatron-fsdp
       - page: Distributed Optimizer
         path: ../../user-guide/features/dist_optimizer.mdx
-        slug: dist-optimizer
       - page: Weighted Checkpoint Merge
         path: ../../user-guide/features/checkpoint-merge.mdx
-        slug: checkpoint-merge
       - page: Optimizer CPU Offload
         path: ../../user-guide/features/optimizer_cpu_offload.mdx
-        slug: optimizer-cpu-offload
       - page: Fine-Grained Activation Offloading
         path: ../../user-guide/features/fine_grained_activation_offloading.mdx
-        slug: fine-grained-activation-offloading
       - page: CUDA Graph
         path: ../../user-guide/features/cuda_graph.mdx
-        slug: cuda-graph
       - page: Data Loading at Scale
         path: ../../user-guide/data-loading.mdx
-        slug: data-loading
       - page: Multi-Storage Client (MSC) Integration
         path: ../../user-guide/msc_integration.mdx
-        slug: msc-integration
       - page: Megatron Energon
         path: ../../user-guide/features/megatron_energon.mdx
-        slug: megatron-energon
       - page: Megatron RL
         path: ../../user-guide/features/megatron_rl.mdx
-        slug: megatron-rl
       - page: Offline Logits Knowledge Distillation
         path: ../../user-guide/features/offline_logits_distillation.mdx
-        slug: offline-logits-distillation
       - page: Tokenizers
         path: ../../user-guide/features/tokenizers.mdx
-        slug: tokenizers
       - page: GDN Elementwise Fusion
         path: ../../developer/gdn_ew_fusion.mdx
-        slug: gdn-ew-fusion
   - section: Inference
-    skip-slug: true
     contents:
       - page: Inference User Guide
         path: ../../mcore-inference-user-guide.mdx
-        slug: inference
   - section: Observability
     path: ../../user-guide/observability/index.mdx
-    slug: observability
     contents:
       - page: Configuration
         path: ../../user-guide/observability/configuration.mdx
-        slug: configuration
       - page: Span Groups
         path: ../../user-guide/observability/span-groups.mdx
-        slug: span-groups
       - page: Metrics
         path: ../../user-guide/observability/metrics.mdx
-        slug: metrics
       - page: Pipeline-Parallel Trace Correlation
         path: ../../user-guide/observability/pipeline-parallel.mdx
-        slug: pipeline-parallel
       - page: Extending Instrumentation
         path: ../../user-guide/observability/extending.mdx
-        slug: extending
   - section: Developer Guide
-    skip-slug: true
     contents:
       - page: Contributing to Megatron-LM
         path: ../../developer/contribute.mdx
-        slug: contribute
       - page: How to Submit a PR
         path: ../../developer/submit.mdx
-        slug: submit
       - page: Oncall Overview
         path: ../../developer/oncall.mdx
-        slug: oncall
       - page: Generating Docs Locally
         path: ../../developer/generate_docs.mdx
-        slug: generate-docs
       - page: Build and Preview the Documentation with Fern
         path: ../../documentation.mdx
-        slug: documentation
       - page: API Backward Compatibility Checking
         path: ../../api-backwards-compatibility-check.mdx
-        slug: api-backwards-compatibility-check
       - section: Determinism Developer Reference
         path: ../../developer/determinism/README.mdx
-        slug: determinism
         contents:
           - page: Determinism Status
             path: ../../developer/determinism/status.mdx
-            slug: status
           - page: Determinism Operation Catalog
             path: ../../developer/determinism/op-catalog.mdx
-            slug: op-catalog
           - page: Kernel Determinism Testing
             path: ../../developer/determinism/testing.mdx
-            slug: testing
           - page: Determinism Glossary
-            path: ../../developer/determinism/glossary.mdx
-            slug: glossary
+            path: ../../developer/determinism/glossary.mdx          
   - section: API Reference
-    skip-slug: true
     contents:
       - section: API Guide
         path: ../../api-guide/index.mdx
-        slug: api-guide
         contents:
           - section: Model APIs
             path: ../../api-guide/models/index.mdx
-            slug: models
             contents:
               - section: models package
                 path: ../../api-guide/models/models.mdx
-                slug: models-package
                 contents:
                   - page: models.gpt package
                     path: ../../api-guide/models/models.gpt.mdx
-                    slug: models-gpt
                   - page: models.t5 package
                     path: ../../api-guide/models/models.t5.mdx
-                    slug: models-t5
                   - page: models.bert package
                     path: ../../api-guide/models/models.bert.mdx
-                    slug: models-bert
           - section: Core APIs
             path: ../../api-guide/core/index.mdx
-            slug: core
             contents:
               - page: transformer package
                 path: ../../api-guide/core/transformer.mdx
-                slug: transformer
               - page: tensor_parallel package
                 path: ../../api-guide/core/tensor_parallel.mdx
-                slug: tensor-parallel
               - page: pipeline_parallel package
                 path: ../../api-guide/core/pipeline_parallel.mdx
-                slug: pipeline-parallel
               - page: fusions package
                 path: ../../api-guide/core/fusions.mdx
-                slug: fusions
               - page: distributed package
                 path: ../../api-guide/core/distributed.mdx
-                slug: distributed
               - page: datasets package
                 path: ../../api-guide/core/datasets.mdx
-                slug: datasets
               - section: dist_checkpointing package
                 path: ../../api-guide/core/dist_checkpointing.mdx
-                slug: dist-checkpointing
                 contents:
                   - page: dist_checkpointing.strategies package
                     path: ../../api-guide/core/dist_checkpointing.strategies.mdx
-                    slug: strategies
           - section: Internal Utilities
             path: ../../api-guide/internal/index.mdx
-            slug: internal
             contents:
               - page: Microbatches Calculator
                 path: ../../api-guide/internal/num_microbatches_calculator.mdx
-                slug: num-microbatches-calculator
               - page: Optimizer Parameters Scheduler
                 path: ../../api-guide/internal/optimizer_param_scheduler.mdx
-                slug: optimizer-param-scheduler
       - link: Python API Reference
         href: https://docs.nvidia.com/megatron-core/developer-guide/nightly/apidocs/index.html
   - section: Resources
-    skip-slug: true
     contents:
       - page: Migrate from GPTModel to HybridModel
         path: ../../user-guide/hybrid-model-migration.mdx
-        slug: hybrid-model-migration
       - page: Discussions
         path: ../../advanced/index.mdx
-        slug: discussions
