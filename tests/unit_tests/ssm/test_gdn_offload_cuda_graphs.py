@@ -29,6 +29,7 @@ from megatron.core.utils import is_te_min_version, is_torch_min_version, unwrap_
 from tests.unit_tests.ssm.test_gdn_offload_training import (
     _build_training_model,
     _forward_step,
+    _require_precision,
     _snapshot_leaf,
     _training_config,
 )
@@ -42,15 +43,24 @@ from tests.unit_tests.test_utilities import Utils
 )
 @pytest.mark.parametrize("tp,pp", [(1, 1), (2, 1), (1, 2)], ids=["tp1", "tp2-sp", "pp2"])
 @pytest.mark.parametrize(
-    "variant,fused,recompute_norm,whole_layer,delay,fraction",
+    "variant,fused,recompute_norm,whole_layer,delay,fraction,precision",
     [
-        ("gdn", False, False, False, False, 1.0),
-        ("gdn", True, True, False, True, 1.0),
-        ("gdn", True, False, True, False, 1.0),
-        ("gdn", False, True, True, True, 1.0),
-        ("gdn2", False, False, True, False, 1.0),
-        ("gdn2", False, True, False, True, 1.0),
-        ("gdn2", False, False, True, False, 0.0),
+        ("gdn", False, False, False, False, 1.0, "bf16"),
+        ("gdn", True, True, False, True, 1.0, "bf16"),
+        ("gdn", True, False, True, False, 1.0, "bf16"),
+        ("gdn", False, True, True, True, 1.0, "bf16"),
+        ("gdn2", False, False, True, False, 1.0, "bf16"),
+        ("gdn2", False, True, False, True, 1.0, "bf16"),
+        ("gdn2", False, False, True, False, 0.0, "bf16"),
+        ("gdn", False, False, False, False, 1.0, "fp8-delayed"),
+        ("gdn", False, True, True, True, 1.0, "fp8-tensorwise"),
+        ("gdn", False, False, True, False, 1.0, "fp4"),
+        ("gdn2", False, True, True, True, 1.0, "fp8-delayed"),
+        ("gdn2", False, False, False, False, 1.0, "fp8-tensorwise"),
+        ("gdn2", False, True, True, True, 1.0, "fp4"),
+        ("gdn2", False, True, True, False, 0.0, "fp8-tensorwise"),
+        ("gdn2", False, True, False, False, 0.5, "fp4"),
+        ("gdn", True, False, True, False, 1.0, "fp8-tensorwise"),
     ],
 )
 def test_gdn_offload_with_te_graphs(
@@ -60,6 +70,7 @@ def test_gdn_offload_with_te_graphs(
     whole_layer: bool,
     delay: bool,
     fraction: float,
+    precision: str,
     tp: int,
     pp: int,
     monkeypatch: pytest.MonkeyPatch,
@@ -67,6 +78,7 @@ def test_gdn_offload_with_te_graphs(
     """Compare complete optimizer states after captured backward on changing inputs."""
     if Utils.world_size % (tp * pp):
         pytest.skip("This topology requires two GPUs.")
+    _require_precision(precision)
     if variant == "gdn2":
         pytest.importorskip("fla.ops.gdn2")
     if fused:
@@ -99,6 +111,7 @@ def test_gdn_offload_with_te_graphs(
                     recompute_norm,
                     fused_pre_gdr=fused,
                     variant=variant,
+                    precision=precision,
                 ),
                 fine_grained_activation_offloading=enabled,
                 offload_modules=["gdn_core_attn"] if enabled else [],

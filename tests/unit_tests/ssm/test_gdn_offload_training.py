@@ -17,6 +17,7 @@ import torch
 from megatron.core.dist_checkpointing.dict_utils import dict_list_map_outplace, diff
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+from megatron.core.enums import Fp8Recipe
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_layer_with_experimental_attention_variant_spec,
 )
@@ -61,6 +62,7 @@ def _training_config(
     *,
     fused_pre_gdr: bool = False,
     variant: str = "gdn",
+    precision: str = "bf16",
 ) -> TransformerConfig:
     """Configure the reduced-size complete decoder and its parallel topology."""
     return TransformerConfig(
@@ -81,6 +83,9 @@ def _training_config(
         attention_dropout=0.0,
         hidden_dropout=0.0,
         bf16=True,
+        fp8="hybrid" if precision.startswith("fp8") else None,
+        fp8_recipe=Fp8Recipe.tensorwise if precision == "fp8-tensorwise" else Fp8Recipe.delayed,
+        fp4="e2m1" if precision == "fp4" else None,
         pipeline_dtype=torch.bfloat16,
         use_cpu_initialization=True,
         gradient_accumulation_fusion=False,
@@ -189,6 +194,25 @@ def _snapshot_leaf(value: Any) -> Any:
     return value.detach().clone() if isinstance(value, torch.Tensor) else value
 
 
+def _require_precision(precision: str) -> None:
+    """Skip recipes unavailable on this device or unsuitable for exact replay."""
+    if precision == "bf16":
+        return
+    from transformer_engine.common.recipe import NVFP4BlockScaling
+    from transformer_engine.pytorch.fp8 import check_fp8_support, check_nvfp4_support
+
+    supported, reason = check_nvfp4_support() if precision == "fp4" else check_fp8_support()
+    if not supported:
+        pytest.skip(reason)
+    if precision == "fp4":
+        recipe = NVFP4BlockScaling()
+        if not recipe.disable_rht or not recipe.disable_stochastic_rounding:
+            pytest.skip(
+                "Exact replay requires NVTE_NVFP4_DISABLE_RHT=1 and "
+                "NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING=1 before Python starts."
+            )
+
+
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.parametrize("fraction", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize("recompute_norm", [False, True])
@@ -198,18 +222,33 @@ def _snapshot_leaf(value: Any) -> Any:
     ids=["gdn-unfused", "gdn-fused", "gdn2"],
 )
 @pytest.mark.parametrize(
-    "tp,sp,cp,pp,vp",
+    "tp,sp,cp,pp,vp,precision",
     [
-        (1, False, 1, 1, None),
-        (2, False, 1, 1, None),
-        (2, True, 1, 1, None),
-        (1, False, 2, 1, None),
-        (1, False, 1, 2, None),
-        (1, False, 1, 2, 2),
-        (2, True, 2, 1, None),
-        (2, True, 1, 2, None),
+        (1, False, 1, 1, None, "bf16"),
+        (2, False, 1, 1, None, "bf16"),
+        (2, True, 1, 1, None, "bf16"),
+        (1, False, 2, 1, None, "bf16"),
+        (1, False, 1, 2, None, "bf16"),
+        (1, False, 1, 2, 2, "bf16"),
+        (2, True, 2, 1, None, "bf16"),
+        (2, True, 1, 2, None, "bf16"),
+        (1, False, 1, 1, None, "fp8-delayed"),
+        (1, False, 1, 1, None, "fp8-tensorwise"),
+        (1, False, 1, 1, None, "fp4"),
     ],
-    ids=["dp", "tp", "tp_sp", "cp", "pp", "pp_vpp", "tp_sp_cp", "tp_sp_pp"],
+    ids=[
+        "dp",
+        "tp",
+        "tp_sp",
+        "cp",
+        "pp",
+        "pp_vpp",
+        "tp_sp_cp",
+        "tp_sp_pp",
+        "fp8_delayed",
+        "fp8_tensorwise",
+        "fp4",
+    ],
 )
 def test_gdn_offload_training(
     tp: int,
@@ -217,6 +256,7 @@ def test_gdn_offload_training(
     cp: int,
     pp: int,
     vp: int | None,
+    precision: str,
     fraction: float,
     recompute_norm: bool,
     fused_pre_gdr: bool,
@@ -226,6 +266,7 @@ def test_gdn_offload_training(
     """Match losses, accumulated gradients, updated weights and Adam states on every rank."""
     if Utils.world_size % (tp * cp * pp):
         pytest.skip("This topology requires a world size divisible by TP * CP * PP.")
+    _require_precision(precision)
     if variant == "gdn2":
         pytest.importorskip("fla.ops.gdn2")
     if fused_pre_gdr:
@@ -248,6 +289,7 @@ def test_gdn_offload_training(
             recompute_norm,
             fused_pre_gdr=fused_pre_gdr,
             variant=variant,
+            precision=precision,
         )
         baseline_config = replace(
             config, fine_grained_activation_offloading=False, offload_modules=[]
@@ -281,8 +323,7 @@ def test_gdn_offload_training(
                     "position_ids": torch.arange(128, device="cuda").unsqueeze(0),
                 }
                 batches.append(get_batch_on_this_cp_rank(batch, False, cp_group=groups.cp))
-            # Fixed weights and zero dropout must reproduce each repeated example.
-            # This also catches VPP payload mixups in the disabled baseline.
+            # Delayed FP8 scaling can change between repeated microbatches.
             batches = batches * 2
             snapshots = []
             for models, optimizer in (
@@ -307,7 +348,7 @@ def test_gdn_offload_training(
                 # Reject a bad baseline on every rank before the next collective.
                 step_valid = torch.tensor(
                     len(losses) == (4 if is_pp_last_stage(groups.pp) else 0)
-                    and not any(diff(losses[:2], losses[2:]))
+                    and (precision == "fp8-delayed" or not any(diff(losses[:2], losses[2:])))
                     and pool_before_reset == ([0] if models is offloaded else []),
                     dtype=torch.int32,
                     device="cuda",

@@ -2877,8 +2877,8 @@ class TransformerConfig(ModelParallelConfig):
             if "gdn_core_attn" in self.offload_modules:
                 if self.experimental_attention_variant not in ("gdn", "gdn2"):
                     raise ValueError("gdn_core_attn offloading only supports GDN (gdn or gdn2).")
-                if not self.bf16 or self.fp8 or self.fp4:
-                    raise ValueError("gdn_core_attn offloading requires BF16 without FP8 or FP4.")
+                if not self.bf16:
+                    raise ValueError("gdn_core_attn offloading requires BF16 activations.")
                 if self.gdn_kernel_backend != "fla":
                     raise ValueError("gdn_core_attn offloading requires the FLA recurrence.")
                 if self.recompute_granularity == "full":

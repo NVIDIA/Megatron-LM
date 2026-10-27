@@ -1,13 +1,17 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Validate Qwen training inputs before checkpoint loading or distributed setup."""
+"""Validate Qwen training inputs and precision selection."""
 
+import os
 import sys
 from pathlib import Path
 
 import pytest
+import torch
 
-from tools.ssm.qwen_gdn_offload_training import _arguments
+from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.transformer_config import TransformerConfig
+from tools.ssm.qwen_gdn_offload_training import _arguments, _forward_step
 
 
 @pytest.mark.parametrize(
@@ -74,3 +78,40 @@ def test_checkpoint_path_boundaries(
         else:
             args = _arguments()
             assert getattr(args, flag[2:].replace("-", "_")) == path
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for NVFP4.")
+def test_forward_step_activates_nvfp4() -> None:
+    """Exercise real TE GEMMs when a custom decoder leaves precision to its caller."""
+    te = pytest.importorskip("transformer_engine.pytorch")
+    from transformer_engine.pytorch.fp8 import check_nvfp4_support
+
+    supported, reason = check_nvfp4_support()
+    if not supported:
+        pytest.skip(reason)
+    if torch.cuda.get_device_capability()[0] == 12 and any(
+        os.environ.get(name) != "1"
+        for name in ("NVTE_NVFP4_DISABLE_RHT", "NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING")
+    ):
+        pytest.skip("SM120 validation requires the constrained NVFP4 recipe before startup.")
+    config = TransformerConfig(
+        num_layers=1, hidden_size=32, num_attention_heads=1, bf16=True, fp4="e2m1"
+    )
+
+    class LanguageModel(MegatronModule):
+        def __init__(self) -> None:
+            super().__init__(config=config)
+            self.projection = te.Linear(32, 32, params_dtype=torch.bfloat16, device="cuda")
+
+        def forward(
+            self, tokens: torch.Tensor, position_ids: None, attention_mask: None, labels: None
+        ) -> torch.Tensor:
+            return self.projection(tokens)
+
+    model = LanguageModel()
+    inputs = torch.randn(128, 32, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    output, _ = _forward_step(iter([dict(tokens=inputs, position_ids=None, labels=None)]), model)
+    assert model.projection.fp8 and model.projection.fp8_meta["recipe"].nvfp4()
+    output.float().square().mean().backward()
+    assert torch.isfinite(inputs.grad).all()
+    assert torch.isfinite(model.projection.weight.grad).all()

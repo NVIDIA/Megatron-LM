@@ -22,8 +22,8 @@ or newer. Programmatic configurations set `fine_grained_activation_offloading=Tr
 `offload_modules=["gdn_core_attn"]` and `gdn_kernel_backend="fla"`.
 Selective `gdn_norm_out` recomputation and the existing opt-in pre-GDR fusion are
 supported for GDN. GDN2 supports `gdn_norm_out` recomputation and requires FLA's
-`fla.ops.gdn2` kernel. Configuration rejects FP8/FP4, non-BF16 execution, other
-recurrence backends and full-layer recomputation. CUDA graphs require
+`fla.ops.gdn2` kernel. Configuration requires BF16 recurrence activations and
+rejects other recurrence backends and full-layer recomputation. CUDA graphs require
 `cuda_graph_impl="transformer_engine"`; attention or whole-layer capture uses the
 existing transfer stream/event callbacks. Replay stays on the caller's autograd
 stream to preserve the order of layer graphs sharing a memory pool. Local and
@@ -38,6 +38,21 @@ covers fixed-length training initialized by a training step; evaluation-first
 initialization and tensor-size changes after warmup are not qualified. Use multiple GDN
 layers when measuring steady-state savings: one GDN group is kept resident after
 warmup. Evaluation, no-grad and fully frozen recurrence execution bypass the scope.
+
+## TE projection and MLP precision
+
+The recurrence and its offloaded tensors remain BF16/FP32 when Transformer Engine
+projections and MLPs use FP8 or NVFP4. Select these through the existing FP8/FP4
+training options. The local Qwen tool accepts `--precision fp8-delayed`,
+`--precision fp8-tensorwise` or `--precision fp4`; its default remains BF16.
+GDN2 and TE attention/whole-layer graphs reuse the same precision contexts and
+recipes as native Megatron training.
+
+On RTX PRO 6000 (SM120), exact NVFP4 replay tests require
+`NVTE_NVFP4_DISABLE_RHT=1` and `NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING=1`
+before Python starts. These tests cover a constrained recipe, not full NVFP4
+or convergence. Hardware and recipe support remain Transformer Engine's
+responsibility.
 
 ## Saved tensors and integration boundary
 
@@ -106,26 +121,28 @@ It requires a Bridge environment with Qwen3.5 VL mappings; the historical runs
 used revision `c860f8a5bc5fddd78690f32baa0b8696774308b4` and the compatibility
 overlay recorded in the evidence. Bridge is not a core runtime dependency.
 
-Give each rank its own persistent Triton cache before starting the training
-interpreter. Concurrent ranks can select different autotuned configurations for
-the same key; sharing a cache can overwrite those choices and make even repeated
+Give each rank its own persistent Triton and TorchInductor caches before starting
+the training interpreter. Inductor stores tuning choices for captured FLA
+L2-normalization kernels separately from Triton. Concurrent ranks can select
+different autotuned configurations for the same key; sharing a cache can overwrite those choices and make even repeated
 offload-disabled baselines differ. Create the root once for a fixed
 topology/fusion/norm-recomputation setting and reuse it for both comparison arms:
 
 ```bash
 # Run once for this comparison; preserve this exported root between arms.
 export TRITON_CACHE_DIR="$(mktemp -d /tmp/qwen-offload-triton.XXXXXX)"
+export TORCHINDUCTOR_CACHE_DIR="$(mktemp -d /tmp/qwen-offload-inductor.XXXXXX)"
 python -m torch.distributed.run --standalone --nproc-per-node=4 \
   --log-dir /tmp/qwen-disabled-ranks --redirects 3 --tee 3 --no-python \
-  bash -c 'export TRITON_CACHE_DIR="${TRITON_CACHE_DIR}/rank-${RANK}"; exec python "$@"' \
+  bash -c 'export TRITON_CACHE_DIR="${TRITON_CACHE_DIR}/rank-${RANK}"; export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR}/rank-${RANK}"; exec python "$@"' \
   qwen-training tools/ssm/qwen_gdn_offload_training.py \
   --weights /path/to/Qwen3.5-0.8B --data /path/to/messages.jsonl \
   --tp 2 --sp --pp 2 --seq-length 128 --min-offloaded-tensor-size 1024 \
   --warmup 1 --iterations 2 --check-state --output /tmp/qwen-disabled.json
 ```
 
-Run a fresh enabled process with the same exported cache root and arguments plus
-`--fraction 1` and a distinct output/log directory. Do not recreate the cache root
+Run a fresh enabled process with the same exported cache roots and arguments plus
+`--fraction 1` and a distinct output/log directory. Do not recreate either cache root
 or clear its rank subdirectories between matched runs. Repeat with
 `--recompute-norm` off/on and `--fused-pre-gdr` off/on, using a new root and a
 separate disabled baseline for each fusion/recomputation pair. Keep topology,
