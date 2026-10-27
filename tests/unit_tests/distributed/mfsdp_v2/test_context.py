@@ -19,6 +19,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
     RuntimePolicy,
+    SchedulePolicy,
     fully_shard,
     fully_shard_context,
     microbatch,
@@ -245,7 +246,12 @@ def test_register_post_backward_hook_handles_parameterless_module(distributed_se
     model = nn.Identity().to(device)
 
     with fully_shard_context(FsdpContext(device=device)):
-        fully_shard(model, mesh=mesh, placements=_default_placements(), register_hooks=False)
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=_default_placements(),
+            schedule_policy=SchedulePolicy(register_hooks=False),
+        )
 
     callback_modules = []
     model.register_post_backward_hook(callback_modules.append)

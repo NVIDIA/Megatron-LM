@@ -19,14 +19,27 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class SchedulePolicy:
-    """Control communication scheduling for one FSDP module.
+    """Control prefetching and execution scheduling for one FSDP module.
 
-    ``None`` prefetches one successor, preserving the default behavior. ``0``
-    disables prefetching. Positive values specify parameter-element budgets.
+    For prefetch sizes, ``None`` prefetches one successor and ``0`` disables
+    prefetching. Positive values specify parameter-element budgets.
     """
 
     forward_prefetch_size: int | None = None
     backward_prefetch_size: int | None = None
+    register_hooks: bool = True
+    """Register automatic forward/backward execution hooks.
+
+    Disable when an external scheduler drives the FSDP lifecycle explicitly.
+    The state-dict safety hook remains registered independently.
+    """
+    grad_accumulation_count: int | None = None
+    """Total parameter-gradient callbacks per reduction window.
+
+    Includes contributions from separate GraphTasks and delayed weight gradients.
+    None defaults to one callback per owned trainable parameter. The scheduler
+    must declare the complete count before sharding the unit.
+    """
 
     def __post_init__(self) -> None:
         """Validate non-negative prefetch budgets."""

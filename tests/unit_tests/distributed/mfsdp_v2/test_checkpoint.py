@@ -24,6 +24,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataPa
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
+    SchedulePolicy,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
@@ -114,13 +115,19 @@ def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
-def test_post_wrap_assign_true_load_raises(distributed_setup):
+@pytest.mark.parametrize("register_hooks", [True, False])
+def test_post_wrap_assign_true_load_raises(distributed_setup, register_hooks):
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     checkpoint = nn.Linear(4, 4, bias=False, device=device).state_dict()
     model = nn.Linear(4, 4, bias=False, device=device)
     with fully_shard_context(FsdpContext(device=device)):
-        fully_shard(model, mesh=mesh, placements=_default_placements())
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=_default_placements(),
+            schedule_policy=SchedulePolicy(register_hooks=register_hooks),
+        )
 
     with pytest.raises(RuntimeError, match=r"load_state_dict\(assign=True\)"):
         model.load_state_dict(checkpoint, assign=True)
