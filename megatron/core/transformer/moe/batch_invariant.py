@@ -10,6 +10,21 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     get_batch_invariant_collective,
 )
 
+try:
+    import triton
+    import triton.language as tl
+
+    HAVE_TRITON = True
+except ImportError:
+    from unittest.mock import MagicMock
+
+    from megatron.core.utils import null_decorator
+
+    triton = MagicMock()
+    triton.jit = null_decorator
+    tl = MagicMock()
+    HAVE_TRITON = False
+
 
 def build_inverse_permutation_map(
     routing_map: torch.Tensor,
@@ -49,20 +64,104 @@ def build_inverse_permutation_map(
     return torch.stack((inverse_rows, inverse_experts), dim=0)
 
 
-def unpermute(
+@triton.jit
+def _rank_tree_unpermute_kernel(
+    rows_ptr,
+    inverse_rows_ptr,
+    inverse_experts_ptr,
+    out_ptr,
+    hidden,
+    EP_SIZE: tl.constexpr,
+    EXPERTS_PER_RANK: tl.constexpr,
+    TOPK: tl.constexpr,
+    CROSS_RANK_FP64: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """One program per (token, hidden block): the rank-ordered combine tree of ``unpermute``."""
+    token = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    in_hidden = offsets < hidden
+    if CROSS_RANK_FP64:
+        acc = tl.zeros([BLOCK_H], dtype=tl.float64)
+    else:
+        acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    for ep_rank in tl.static_range(EP_SIZE):
+        rank_partial = tl.zeros([BLOCK_H], dtype=tl.float64)
+        for k in tl.static_range(TOPK):
+            row = tl.load(inverse_rows_ptr + token * TOPK + k)
+            expert = tl.load(inverse_experts_ptr + token * TOPK + k)
+            valid = (
+                (row >= 0)
+                & (expert >= ep_rank * EXPERTS_PER_RANK)
+                & (expert < (ep_rank + 1) * EXPERTS_PER_RANK)
+            )
+            safe_row = tl.where(row >= 0, row, 0).to(tl.int64)
+            values = tl.load(
+                rows_ptr + safe_row * hidden + offsets, mask=in_hidden & valid, other=0.0
+            )
+            rank_partial += values.to(tl.float64)
+        if CROSS_RANK_FP64:
+            acc += rank_partial.to(tl.float32).to(tl.float64)
+        else:
+            acc += rank_partial.to(tl.float32)
+    out = acc.to(tl.float32).to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + token.to(tl.int64) * hidden + offsets, out, mask=in_hidden)
+
+
+class _RankTreeUnpermute(torch.autograd.Function):
+    """Fused ``unpermute`` for ``probs=None``: same arithmetic tree as the loop, one launch."""
+
+    @staticmethod
+    def forward(ctx, permuted_tokens, inverse_rows, inverse_experts, ep_size, num_experts):
+        # pylint: disable=missing-function-docstring
+        num_tokens, topk = inverse_rows.shape
+        hidden = permuted_tokens.shape[-1]
+        rows = permuted_tokens.contiguous()
+        inverse_rows = inverse_rows.contiguous()
+        inverse_experts = inverse_experts.contiguous()
+        out = torch.empty(num_tokens, hidden, dtype=rows.dtype, device=rows.device)
+        if num_tokens > 0:
+            block_h = min(triton.next_power_of_2(hidden), 512)
+            _rank_tree_unpermute_kernel[(num_tokens, triton.cdiv(hidden, block_h))](
+                rows,
+                inverse_rows,
+                inverse_experts,
+                out,
+                hidden,
+                EP_SIZE=ep_size,
+                EXPERTS_PER_RANK=num_experts // ep_size,
+                TOPK=topk,
+                CROSS_RANK_FP64=get_batch_invariant_collective() == "multimem",
+                BLOCK_H=block_h,
+                num_warps=4,
+            )
+        valid = (inverse_rows >= 0) & (inverse_experts >= 0) & (inverse_experts < num_experts)
+        ctx.save_for_backward(inverse_rows, valid)
+        ctx.num_rows = rows.shape[0]
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # pylint: disable=missing-function-docstring
+        inverse_rows, valid = ctx.saved_tensors
+        tokens = torch.arange(inverse_rows.shape[0], device=grad_output.device)
+        tokens = tokens.unsqueeze(1).expand_as(inverse_rows)[valid]
+        grad_rows = grad_output.new_zeros(ctx.num_rows, grad_output.shape[-1])
+        # Each permuted row belongs to one (token, slot). Adding +0.0 maps -0.0 to +0.0,
+        # as the loop's accumulation into zeros does.
+        grad_rows.index_copy_(0, inverse_rows[valid], grad_output.index_select(0, tokens) + 0.0)
+        return grad_rows, None, None, None, None
+
+
+def _unpermute_loop(
     permuted_tokens: torch.Tensor,
     restore_shape: torch.Size,
-    *,
     probs: Optional[torch.Tensor],
     num_experts: int,
     inverse_map: torch.Tensor,
+    ep_size: int,
 ) -> torch.Tensor:
-    """Batch-invariant MoE unpermute.
-
-    Accumulation is token-owned. The AllToAll inverse map avoids data-dependent
-    shapes and adds contributions by EP rank then top-k slot, matching the
-    inference NVLS rank-ordered combine.
-    """
+    """Reference form of ``unpermute``: a loop over EP ranks and top-k slots."""
     input_dtype = permuted_tokens.dtype
     # Mirror the inference engine's summation tree exactly:
     # - When probs is None the activations were probability-weighted upstream
@@ -78,8 +177,6 @@ def unpermute(
     cross_rank_fp64 = get_batch_invariant_collective() == "multimem"
     acc_dtype = torch.float64 if cross_rank_fp64 else torch.float32
     output_tokens = torch.zeros(restore_shape, dtype=acc_dtype, device=permuted_tokens.device)
-    ep_size = parallel_state.get_expert_model_parallel_world_size() or 1
-    assert num_experts % ep_size == 0, "batch-invariant MoE expects contiguous EP shards"
     experts_per_rank = num_experts // ep_size
     inverse_rows = inverse_map[0]
     inverse_experts = inverse_map[1]
@@ -111,3 +208,28 @@ def unpermute(
         output_tokens += rank_partial.to(torch.float32).to(acc_dtype)
 
     return output_tokens.to(torch.float32).to(dtype=input_dtype)
+
+
+def unpermute(
+    permuted_tokens: torch.Tensor,
+    restore_shape: torch.Size,
+    *,
+    probs: Optional[torch.Tensor],
+    num_experts: int,
+    inverse_map: torch.Tensor,
+) -> torch.Tensor:
+    """Batch-invariant MoE unpermute.
+
+    Accumulation is token-owned. The AllToAll inverse map avoids data-dependent
+    shapes and adds contributions by EP rank then top-k slot, matching the
+    inference NVLS rank-ordered combine. Without ``probs`` the tree runs as one
+    Triton kernel; with ``probs`` it runs as a loop over EP ranks and top-k slots.
+    """
+    ep_size = parallel_state.get_expert_model_parallel_world_size() or 1
+    assert num_experts % ep_size == 0, "batch-invariant MoE expects contiguous EP shards"
+    if probs is None and HAVE_TRITON and permuted_tokens.is_cuda:
+        out = _RankTreeUnpermute.apply(
+            permuted_tokens, inverse_map[0], inverse_map[1], ep_size, num_experts
+        )
+        return out.view(restore_shape)
+    return _unpermute_loop(permuted_tokens, restore_shape, probs, num_experts, inverse_map, ep_size)
