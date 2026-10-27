@@ -25,7 +25,7 @@ from megatron.core.utils import (
     log_single_rank,
 )
 
-from .optimizer_config import ParamKey, ParamPredicate
+from .optimizer_config import OptimizerConfig, ParamKey, ParamPredicate
 
 try:
     from emerging_optimizers import registry
@@ -137,6 +137,19 @@ def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg
     )
     optimizer = optimizer_cls(param_groups, **eopt_kwargs)
     return optimizer, entry.init_state_fn
+
+
+def _create_fsdp_emerging_optimizer(
+    config: OptimizerConfig, param_groups: list[dict[str, Any]]
+) -> torch.optim.Optimizer:
+    """Build FsdpMuon."""
+    from emerging_optimizers.orthogonalized_optimizers.muon import Muon
+
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.muon import FsdpMuon
+
+    kwargs = _kwargs_from_config(Muon, "muon", config)
+    kwargs["weight_decay_method"] = "decoupled" if config.decoupled_weight_decay else "l2"
+    return FsdpMuon(param_groups, **kwargs)
 
 
 # ===========================================================================
