@@ -47,7 +47,11 @@ from megatron.training.argument_utils import (
     core_transformer_config_from_args,
 )
 from megatron.training.async_utils import init_persistent_async_worker
-from megatron.training.global_vars import get_run_config, get_train_state, initialize_runtime_services
+from megatron.training.global_vars import (
+    get_run_config,
+    get_train_state,
+    initialize_runtime_services,
+)
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
 logger = logging.getLogger(__name__)
@@ -490,6 +494,15 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 f"> initialized pipeline model parallel with size "
                 f"{mpu.get_pipeline_model_parallel_world_size()}"
             )
+
+    if getattr(args, 'site_id', None) is not None:
+        mpu.initialize_site_parallel(
+            args.site_id,
+            require_complete_optimizer_instances=(
+                args.use_distributed_optimizer
+                or getattr(args, 'use_layer_wise_distributed_optimizer', False)
+            ),
+        )
 
 
 def _init_autoresume():

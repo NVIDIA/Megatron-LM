@@ -117,6 +117,10 @@ def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False,
     else:
         validate_args(args, args_defaults)
 
+    if getattr(args, 'site_id', None) is not None:
+        if type(args.site_id) is not int or args.site_id < 0:
+            raise ValueError('--site-id must be a nonnegative integer')
+
     global_vars._ensure_var_is_not_initialized(global_vars._GLOBAL_ARGS, 'args')
     global_vars.set_args(args)
     # Model config construction can use experimental features. Enabling the
@@ -148,6 +152,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
 
     # Experimental yaml
     if args.yaml_cfg is not None:
+        cli_site_id = args.site_id
         cli_policy = _default_config_from_args(AutotunePolicy, args, prefix='triton_autotune')
         if cli_policy != AutotunePolicy():
             raise ValueError(
@@ -162,6 +167,11 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         from .yaml_arguments import load_yaml
 
         args = load_yaml(args.yaml_cfg)
+        # Placement comes from the launcher even when model settings come from YAML.
+        if cli_site_id is not None:
+            args.site_id = cli_site_id
+        elif not hasattr(args, 'site_id'):
+            args.site_id = None
 
 
     # Args from environment
@@ -3154,6 +3164,11 @@ def _add_distributed_args(parser):
                        help='If set, enable full sharding in megatron-fsdp Hybrid Sharded Data Parallel (HSDP) mode.')
     group.add_argument('--num-distributed-optimizer-instances', type=int, default=1,
                        help='Number of Distributed Optimizer copies across Data Parallel domain.')
+    group.add_argument('--site-id', type=int, default=None,
+                       help='Physical-site ID supplied by the launcher. All ranks at a site '
+                            'must share an ID, and each site must occupy one contiguous rank '
+                            'block containing complete model replicas. Distributed optimizer '
+                            'instances must also stay within sites when used.')
     group.add_argument('--torch-fsdp2-no-reshard-after-forward', action='store_false', dest='torch_fsdp2_reshard_after_forward',
                        help='Whether to reshard weights after forward pass when using PyTorch FSDP2. '
                        'Set to enable FSDP ZeRO-2.')

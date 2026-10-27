@@ -157,6 +157,14 @@ _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
 # Paralel group of all GPUs in a distributed optimizer instance
 _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 
+# Physical-site placement supplied by the launcher.
+_SITE_ID = None
+_SITE_GROUP = None
+_SITE_GLOBAL_RANKS = None
+_SITE_DATA_PARALLEL_GROUP = None
+_SITE_DATA_PARALLEL_GROUP_WITH_CP = None
+_SITE_EXPERT_DATA_PARALLEL_GROUP = None
+
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
 
@@ -2607,6 +2615,147 @@ def get_intra_distributed_optimizer_instance_group(check_initialized=True):
     return _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
 
 
+def initialize_site_parallel(
+    site_id: Optional[int], *, require_complete_optimizer_instances: bool = False
+) -> None:
+    """Register site-local ranks after model-parallel groups have been created.
+
+    A site is a contiguous global-rank block containing whole model-parallel replicas.
+    When a distributed optimizer is used, it must also contain whole optimizer instances.
+    These placement rules avoid remapping ranks within Megatron's parallel grids. All ranks
+    must call this function with a non-None site ID when site placement is enabled.
+    """
+    global _SITE_ID, _SITE_GROUP, _SITE_GLOBAL_RANKS
+    global _SITE_DATA_PARALLEL_GROUP, _SITE_DATA_PARALLEL_GROUP_WITH_CP
+    global _SITE_EXPERT_DATA_PARALLEL_GROUP
+    if site_id is None:
+        return
+    if _SITE_GROUP is not None:
+        raise RuntimeError("Site process groups are already initialized")
+    if not torch.distributed.is_initialized() or not model_parallel_is_initialized():
+        raise RuntimeError("Site groups require initialized distributed and model-parallel groups")
+
+    world_size = torch.distributed.get_world_size()
+    site_rows = [None] * world_size
+    torch.distributed.all_gather_object(
+        site_rows, (site_id, require_complete_optimizer_instances)
+    )
+    site_ids = [row[0] for row in site_rows]
+    if any(type(value) is not int or value < 0 for value in site_ids):
+        raise ValueError("site_id must be a nonnegative integer on every rank")
+    if any(row[1] != require_complete_optimizer_instances for row in site_rows):
+        raise ValueError("Distributed-optimizer placement requirements must match on every rank")
+
+    site_ranks = {
+        value: tuple(index for index, rank_site in enumerate(site_ids) if rank_site == value)
+        for value in sorted(set(site_ids))
+    }
+    for value, ranks in site_ranks.items():
+        if ranks != tuple(range(ranks[0], ranks[-1] + 1)):
+            raise ValueError(f"Site {value} must occupy one contiguous global-rank block")
+
+    if require_complete_optimizer_instances:
+        instance_ranks = torch.distributed.get_process_group_ranks(
+            get_intra_distributed_optimizer_instance_group()
+        )
+        instances_by_rank = [None] * world_size
+        torch.distributed.all_gather_object(instances_by_rank, instance_ranks)
+    else:
+        instances_by_rank = []
+    for rank, peers in enumerate(instances_by_rank):
+        if any(site_ids[peer] != site_ids[rank] for peer in peers):
+            raise ValueError(
+                "Each site must contain complete distributed-optimizer instances; "
+                "choose a compatible rank order and align site boundaries with instance boundaries"
+            )
+
+    model_ranks = torch.distributed.get_process_group_ranks(get_model_parallel_group())
+    models_by_rank = [None] * world_size
+    torch.distributed.all_gather_object(models_by_rank, model_ranks)
+    for rank, peers in enumerate(models_by_rank):
+        if any(site_ids[peer] != site_ids[rank] for peer in peers):
+            raise ValueError(
+                "Each site must contain complete model-parallel replicas; "
+                "choose a compatible rank order and align site boundaries with replica boundaries"
+            )
+
+    rank = torch.distributed.get_rank()
+    local = {
+        "dp": torch.distributed.get_process_group_ranks(get_data_parallel_group()),
+        "dp_cp": torch.distributed.get_process_group_ranks(
+            get_data_parallel_group(with_context_parallel=True)
+        ),
+        "ep_dp": torch.distributed.get_process_group_ranks(get_expert_data_parallel_group()),
+    }
+    parallel_ranks_by_rank = [None] * world_size
+    torch.distributed.all_gather_object(parallel_ranks_by_rank, local)
+
+    groups = {}
+    for value, ranks in site_ranks.items():
+        group = create_group(list(ranks), group_desc="SITE_GROUP")
+        groups[ranks] = group
+        if rank in ranks:
+            _SITE_ID = value
+            _SITE_GROUP = group
+            _SITE_GLOBAL_RANKS = ranks
+
+    local_parallel_rank_sets = set()
+    for peer, peer_groups in enumerate(parallel_ranks_by_rank):
+        for ranks in peer_groups.values():
+            local_parallel_rank_sets.add(
+                tuple(sorted(member for member in ranks if site_ids[member] == site_ids[peer]))
+            )
+    for ranks in sorted(local_parallel_rank_sets):
+        if ranks not in groups:
+            groups[ranks] = create_group(list(ranks), group_desc="SITE_PARALLEL_GROUP")
+
+    def local_group(kind):
+        ranks = tuple(sorted(peer for peer in local[kind] if site_ids[peer] == site_id))
+        return groups[ranks]
+
+    _SITE_DATA_PARALLEL_GROUP = local_group("dp")
+    _SITE_DATA_PARALLEL_GROUP_WITH_CP = local_group("dp_cp")
+    _SITE_EXPERT_DATA_PARALLEL_GROUP = local_group("ep_dp")
+
+
+def get_site_id() -> Optional[int]:
+    """Return this rank's site ID, or None if no site placement was provided."""
+    return _SITE_ID
+
+
+def get_site_group(check_initialized: bool = True):
+    """Return the process group containing this rank's physical site."""
+    if check_initialized:
+        assert _SITE_GROUP is not None, "Site group is not initialized"
+    return _SITE_GROUP
+
+
+def get_site_global_ranks() -> Optional[tuple[int, ...]]:
+    """Return the ordered global ranks at this site, if configured."""
+    return _SITE_GLOBAL_RANKS
+
+
+def get_site_data_parallel_group(with_context_parallel: bool = False, check_initialized: bool = True):
+    """Return the intersection of this site and the dense DP or DP+CP group."""
+    group = (
+        _SITE_DATA_PARALLEL_GROUP_WITH_CP
+        if with_context_parallel
+        else _SITE_DATA_PARALLEL_GROUP
+    )
+    if check_initialized:
+        assert group is not None, "Site data-parallel group is not initialized"
+    return group
+
+
+def get_site_expert_data_parallel_group(check_initialized: bool = True):
+    """Return the intersection of this site and the expert-DP group."""
+    if check_initialized:
+        assert _SITE_EXPERT_DATA_PARALLEL_GROUP is not None, (
+            "Site expert data-parallel group is not initialized"
+        )
+    return _SITE_EXPERT_DATA_PARALLEL_GROUP
+
+
 def get_inter_distributed_optimizer_instance_group(check_initialized=True):
     """Get the group spanning the different distributed optimizer instances.
     Attention and MLP/Expert share same inter-instance group, so only built
@@ -2682,6 +2831,16 @@ def destroy_model_parallel():
 
     global _MODEL_PARALLEL_GROUP
     _MODEL_PARALLEL_GROUP = None
+
+    global _SITE_ID, _SITE_GROUP, _SITE_GLOBAL_RANKS
+    global _SITE_DATA_PARALLEL_GROUP, _SITE_DATA_PARALLEL_GROUP_WITH_CP
+    global _SITE_EXPERT_DATA_PARALLEL_GROUP
+    _SITE_ID = None
+    _SITE_GROUP = None
+    _SITE_GLOBAL_RANKS = None
+    _SITE_DATA_PARALLEL_GROUP = None
+    _SITE_DATA_PARALLEL_GROUP_WITH_CP = None
+    _SITE_EXPERT_DATA_PARALLEL_GROUP = None
 
     global _TENSOR_MODEL_PARALLEL_GROUP
     _TENSOR_MODEL_PARALLEL_GROUP = None
