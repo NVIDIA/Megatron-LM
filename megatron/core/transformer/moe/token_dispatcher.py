@@ -1191,18 +1191,7 @@ class _HybridEPManager(_DispatchManager):
         self.token_probs = probs
 
         if self.moe_expert_rank_capacity_factor is not None:
-            pad_multiple = get_align_size_for_quantization(self.config)
-            # Static upper bound on permuted tokens passed to HybridEP (dropless EP rank
-            # budget). Tokens above this budget are dropped inside HybridEP; dispatch then
-            # sets overflow_flag on the handle (accumulated in over_budget in dispatch()).
-            budget = int(
-                padded_num_tokens
-                * self.config.moe_router_topk
-                * self.moe_expert_rank_capacity_factor
-            )
-            # Round budget up to pad_multiple (FP8/FP4/CUTLASS alignment for permute buffers).
-            budget += -budget % pad_multiple
-            self.num_permuted_tokens = budget
+            self.num_permuted_tokens = self._rank_capacity_budget(padded_num_tokens)
         # else: num_permuted_tokens stays None; HybridEP sizes buffers dynamically (CPU sync
         # in dispatch) and does not drop tokens or report overflow.
         # Compute the capacity for each expert at the drop_and_pad mode
@@ -1220,6 +1209,20 @@ class _HybridEPManager(_DispatchManager):
             self.tokens_per_expert = torch.full(
                 (self.num_local_experts,), self.capacity * self.group.size(), dtype=torch.long
             )
+
+    def _rank_capacity_budget(self, num_tokens: int) -> int:
+        """Static upper bound on permuted tokens passed to HybridEP (dropless EP rank budget).
+
+        Tokens above this budget are dropped inside HybridEP; dispatch then sets overflow_flag
+        on the handle (accumulated in over_budget in dispatch()).
+        """
+        budget = int(
+            num_tokens * self.config.moe_router_topk * self.moe_expert_rank_capacity_factor
+        )
+        # Round budget up to pad_multiple (FP8/FP4/CUTLASS alignment for permute buffers).
+        pad_multiple = get_align_size_for_quantization(self.config)
+        budget += -budget % pad_multiple
+        return budget
 
     def dispatch(
         self,
@@ -1243,6 +1246,12 @@ class _HybridEPManager(_DispatchManager):
         )
         if rank_capacity is not None:
             self.num_permuted_tokens = rank_capacity
+        elif self.num_permuted_tokens is None and self.moe_expert_rank_capacity_factor is not None:
+            # setup_metadata did not run for this call: when moe_preprocess is CUDA-graphed,
+            # replay restores only the tensor attributes in cudagraph_attrs, and combine() has
+            # cleared the budget. Without it HybridEP takes its dynamic path, which blocks the
+            # CPU on a stream synchronize in every dispatch.
+            self.num_permuted_tokens = self._rank_capacity_budget(hidden_states.shape[0])
         align_size = get_align_size_for_quantization(self.config)
         if align_size > 0:
             self.pad_multiple = align_size
