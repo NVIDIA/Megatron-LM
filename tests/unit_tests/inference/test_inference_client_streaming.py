@@ -126,7 +126,7 @@ async def test_streaming_partial_for_unknown_request_is_dropped():
 
 
 async def test_client_stop_terminates_open_streams():
-    """stop() finishes open streams so awaiters can exit."""
+    """stop() fails open streams and releases every local bookkeeping entry."""
     client, fake_socket = _make_client()
 
     recv_queue = [[msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]]
@@ -140,10 +140,17 @@ async def test_client_stop_terminates_open_streams():
     client.start()
 
     iterator = client.add_request_streaming("hi", SamplingParams())
+    request_id = iterator.request_id
+    assert client.request_submission_times == {
+        request_id: client.request_submission_times[request_id]
+    }
+    assert client._pending_source_requests == {request_id}
     client.stop()
 
-    items = [item async for item in iterator]
-    assert items == []
+    with pytest.raises(InferenceRequestAborted, match="client stopped"):
+        await anext(iterator)
+    assert client.request_submission_times == {}
+    assert client._pending_source_requests == set()
 
 
 async def test_stream_close_sends_abort_and_reports_cancellation():

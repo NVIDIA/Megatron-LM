@@ -3,7 +3,8 @@
 """Unit tests for the high-level inference APIs."""
 
 import asyncio
-from unittest.mock import MagicMock
+import concurrent.futures
+from unittest.mock import AsyncMock, MagicMock, PropertyMock
 
 import pytest
 
@@ -55,6 +56,9 @@ def _make_worker_instance(cls):
     obj._loop_manager = None
     obj._coord_runtime = None
     obj._shutdown_called = False
+    obj._async_shutdown_lock = base_mod.threading.Lock()
+    obj._shutdown_future = None
+    obj._shutdown_complete_future = None
     obj._serve_started = False
     return obj
 
@@ -147,6 +151,247 @@ class TestLifecycleGuards:
         llm._coord_runtime.client.add_request.return_value = future
         assert await llm._generate_impl(["hello"], MagicMock()) == [request]
         request.finalize_text.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_runtime_teardown_stops_client_when_shutdown_signal_fails(self):
+        runtime = base_mod._CoordinatorRuntime.__new__(base_mod._CoordinatorRuntime)
+        runtime._is_primary = True
+        runtime._engine = MagicMock()
+        runtime._client = MagicMock()
+        runtime._client.shutdown_coordinator.side_effect = RuntimeError("coordinator gone")
+        runtime._client.stop.side_effect = RuntimeError("client stop failed")
+        client = runtime._client
+
+        with pytest.raises(RuntimeError, match="coordinator gone"):
+            await runtime.teardown()
+
+        client.stop.assert_called_once_with()
+        assert runtime._client is None
+
+    @pytest.mark.asyncio
+    async def test_engine_transition_failure_still_tears_down_runtime(self):
+        llm = _make_worker_instance(MegatronAsyncLLM)
+        llm._is_primary_rank = True
+        llm._coord_runtime = MagicMock()
+        llm._coord_runtime.teardown = AsyncMock()
+        llm._engine.state = base_mod.EngineState.RUNNING
+        llm._engine.wait_until = AsyncMock(side_effect=RuntimeError("transition failed"))
+
+        with pytest.raises(RuntimeError, match="transition failed"):
+            await llm._shutdown_impl()
+        llm._coord_runtime.teardown.assert_awaited_once_with()
+
+    @pytest.mark.parametrize("cls", [MegatronLLM, MegatronAsyncLLM])
+    def test_shutdown_setup_failure_is_stable_and_cleans_up(self, cls):
+        llm = _make_worker_instance(cls)
+        llm._coord_runtime = MagicMock()
+        llm._loop_manager = MagicMock()
+        llm._stop_frontend_if_started = MagicMock(side_effect=RuntimeError("frontend failed"))
+        llm._loop_manager.submit.side_effect = RuntimeError("submit failed")
+        shutdown = llm.shutdown if cls is MegatronLLM else lambda: asyncio.run(llm.shutdown())
+
+        with pytest.raises(RuntimeError, match="frontend failed"):
+            shutdown()
+        type(llm._loop_manager).loop = PropertyMock(
+            side_effect=AssertionError("stopped loop reused")
+        )
+        with pytest.raises(RuntimeError, match="frontend failed"):
+            shutdown()
+        llm._coord_runtime.teardown_now.assert_called_once_with()
+        llm._loop_manager.stop.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_async_shutdown_callers_wait_for_same_teardown(self):
+        llm = _make_worker_instance(MegatronAsyncLLM)
+        teardown = concurrent.futures.Future()
+
+        class LoopManager:
+            stops = 0
+            stop_when_complete = base_mod._EventLoopManager.stop_when_complete
+
+            @staticmethod
+            def submit(coro):
+                coro.close()
+                return teardown
+
+            @staticmethod
+            async def run_async(coro):
+                coro.close()
+                await asyncio.wrap_future(teardown)
+
+            def stop(self):
+                self.stops += 1
+
+        llm._loop_manager = LoopManager()
+        first = asyncio.create_task(llm.shutdown())
+        await asyncio.sleep(0)
+        second = asyncio.create_task(llm.shutdown())
+        await asyncio.sleep(0)
+
+        assert not first.done()
+        assert not second.done()
+        teardown.set_result(None)
+        await asyncio.gather(first, second)
+        assert llm._loop_manager.stops == 1
+
+    def test_async_shutdown_is_atomic_across_caller_threads(self):
+        """A caller cannot observe shutdown-started before its shared future exists."""
+        llm = _make_worker_instance(MegatronAsyncLLM)
+        teardown = concurrent.futures.Future()
+        frontend_entered = concurrent.futures.Future()
+        release_frontend = concurrent.futures.Future()
+        second_started = concurrent.futures.Future()
+
+        class LoopManager:
+            stops = 0
+            stop_when_complete = base_mod._EventLoopManager.stop_when_complete
+
+            @staticmethod
+            def submit(coro):
+                coro.close()
+                return teardown
+
+            def stop(self):
+                self.stops += 1
+
+        def hold_first_caller():
+            frontend_entered.set_result(None)
+            release_frontend.result()
+
+        def run_second_caller():
+            second_started.set_result(None)
+            return asyncio.run(llm.shutdown())
+
+        llm._loop_manager = LoopManager()
+        llm._stop_frontend_if_started = hold_first_caller
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(asyncio.run, llm.shutdown())
+            frontend_entered.result(timeout=2)
+            second = executor.submit(run_second_caller)
+            second_started.result(timeout=2)
+            with pytest.raises(concurrent.futures.TimeoutError):
+                second.result(timeout=0.5)
+            release_frontend.set_result(None)
+            teardown.set_result(None)
+            first.result(timeout=2)
+            second.result(timeout=2)
+        assert llm._loop_manager.stops == 1
+
+    @pytest.mark.asyncio
+    async def test_cancelled_async_shutdown_caller_does_not_leak_runtime(self):
+        llm = _make_worker_instance(MegatronAsyncLLM)
+        teardown = concurrent.futures.Future()
+
+        class LoopManager:
+            stops = 0
+            stop_when_complete = base_mod._EventLoopManager.stop_when_complete
+
+            @staticmethod
+            def submit(coro):
+                coro.close()
+                return teardown
+
+            def stop(self):
+                self.stops += 1
+
+        llm._loop_manager = LoopManager()
+        caller = asyncio.create_task(llm.shutdown())
+        await asyncio.sleep(0)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+
+        assert llm._loop_manager.stops == 0
+        teardown.set_result(None)
+        await llm.shutdown()
+        assert llm._loop_manager.stops == 1
+
+    @pytest.mark.asyncio
+    async def test_async_shutdown_propagates_teardown_error_after_runtime_join(self):
+        llm = _make_worker_instance(MegatronAsyncLLM)
+        teardown = concurrent.futures.Future()
+
+        class LoopManager:
+            stops = 0
+            stop_when_complete = base_mod._EventLoopManager.stop_when_complete
+
+            @staticmethod
+            def submit(coro):
+                coro.close()
+                return teardown
+
+            def stop(self):
+                self.stops += 1
+
+        llm._loop_manager = LoopManager()
+        teardown.set_exception(RuntimeError("teardown failed"))
+
+        with pytest.raises(RuntimeError, match="teardown failed"):
+            await llm.shutdown()
+        assert llm._loop_manager.stops == 1
+
+    @pytest.mark.asyncio
+    async def test_wait_after_async_shutdown_does_not_reuse_stopped_loop(self):
+        llm = _make_worker_instance(MegatronAsyncLLM)
+        teardown = concurrent.futures.Future()
+        teardown.set_result(None)
+
+        class LoopManager:
+            stop_when_complete = base_mod._EventLoopManager.stop_when_complete
+
+            @staticmethod
+            def submit(coro):
+                coro.close()
+                return teardown
+
+            @staticmethod
+            async def run_async(coro):
+                coro.close()
+                raise AssertionError("stopped runtime loop was reused")
+
+            def stop(self):
+                pass
+
+        llm._loop_manager = LoopManager()
+        await llm.shutdown()
+        await llm.wait_for_shutdown()
+
+        sync_llm = _make_worker_instance(MegatronLLM)
+        sync_llm._shutdown_called = True
+        sync_llm._shutdown_complete_future = concurrent.futures.Future()
+        sync_llm._shutdown_complete_future.set_result(None)
+        sync_llm._loop_manager = MagicMock()
+        type(sync_llm._loop_manager).loop = PropertyMock(
+            side_effect=AssertionError("stopped loop reused")
+        )
+        sync_llm.shutdown()
+        sync_llm.wait_for_shutdown()
+        sync_llm._loop_manager.run_sync.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_generate_after_shutdown_is_rejected(self):
+        sync_llm = _make_worker_instance(MegatronLLM)
+        sync_llm._is_primary_rank = True
+        sync_llm._shutdown_called = True
+        with pytest.raises(RuntimeError, match="shut down"):
+            sync_llm.generate("late")
+        for method in ("pause", "unpause", "suspend", "resume"):
+            with pytest.raises(RuntimeError, match="shut down"):
+                getattr(sync_llm, method)()
+        for method in (sync_llm.submit, sync_llm.run_sync):
+            coro = asyncio.sleep(0)
+            with pytest.raises(RuntimeError, match="shut down"):
+                method(coro)
+            coro.close()
+
+        async_llm = _make_worker_instance(MegatronAsyncLLM)
+        async_llm._is_primary_rank = True
+        async_llm._shutdown_called = True
+        with pytest.raises(RuntimeError, match="shut down"):
+            await async_llm.generate("late")
+        for method in ("pause", "unpause", "suspend", "resume"):
+            with pytest.raises(RuntimeError, match="shut down"):
+                await getattr(async_llm, method)()
 
     def test_bridge_and_serve_raise_in_direct_mode(self, mock_pipeline, fake_model_and_tokenizer):
         model, tok = fake_model_and_tokenizer

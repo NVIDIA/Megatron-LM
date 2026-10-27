@@ -765,14 +765,18 @@ class InferenceClient:
             if not future.done():
                 future.cancel()
         self.completion_futures.clear()
-        # Terminate any open streaming iterators.
+        # A local transport shutdown is not a successful request completion.
+        # Surface it to consumers rather than letting public streaming layers
+        # fabricate an empty successful terminal response.
         for stream in self.streams.values():
-            stream.finish()
+            stream.finish(exception=InferenceRequestAborted("Inference client stopped"))
         self.streams.clear()
         for future in self.abort_futures.values():
             if not future.done():
                 future.cancel()
         self.abort_futures.clear()
         self.aborted_request_ids.clear()
+        self.request_submission_times.clear()
+        self._pending_source_requests.clear()
         self.socket.close(linger=0)
         self.context.term()
