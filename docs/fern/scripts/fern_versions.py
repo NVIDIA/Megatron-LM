@@ -67,6 +67,7 @@ def content_dir_name(version):
 
 def freeze_nav(nav_text, version):
     """Point a navigation file at the frozen content directory for `version`."""
+    nav_text = re.sub(r"\A(?:#[^\n]*\n)+", "", nav_text)
     nav_text = nav_text.replace("path: ../../", f"path: ./{content_dir_name(version)}/")
     return nav_text.replace("/developer-guide/nightly/", f"/developer-guide/{version}/")
 
@@ -218,8 +219,7 @@ def main():
     bump = subparsers.add_parser("bump", help="Add a released version to the docs site.")
     bump.add_argument("version", help="Release version, for example 0.21.0 or core_v0.21.0.")
     bump.add_argument(
-        "--ref",
-        help="Git ref to read nightly.yml from. Defaults to the core_vVERSION tag.",
+        "--ref", help="Git ref to read nightly.yml from. Defaults to the core_vVERSION tag."
     )
     bump.set_defaults(func=cmd_bump)
 

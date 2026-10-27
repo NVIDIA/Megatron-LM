@@ -37,6 +37,16 @@ jobs:
           fetch-tags: true
           persist-credentials: false
 
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Check nightly navigation is up to date
+        run: |
+          python -m pip install --no-cache-dir PyYAML
+          python docs/fern/scripts/fern_nav.py generate --check
+
       - name: Checkout frozen version content
         run: python3 docs/fern/scripts/fern_versions.py extract-content
 

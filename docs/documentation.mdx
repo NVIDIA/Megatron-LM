@@ -1,6 +1,10 @@
 ---
 title: Build and Preview the Documentation with Fern
 description: Describes how to install the Fern CLI, preview and validate the documentation locally, manage documentation versions, and publish the site.
+nav:
+  parent: developer-guide
+  order: 50
+  slug: documentation
 ---
 
 {/*
@@ -17,6 +21,7 @@ description: Describes how to install the Fern CLI, preview and validate the doc
 - `docs/fern/fern.config.json` pins the Fern CLI version and names the `nvidia` Fern organization.
 - `docs/fern/docs.yml` defines the site settings and the version switcher.
 - `docs/fern/versions/nightly.yml` and `docs/fern/versions/v0.20.0.yml` define the navigation for each documentation version.
+  `docs/fern/scripts/fern_nav.py` generates `nightly.yml` from the `nav` frontmatter of each page and from `docs/fern/nav-skeleton.yml`. Do not edit `nightly.yml` by hand.
 
 ## Prerequisites
 
@@ -80,31 +85,45 @@ To validate the documentation, complete the following steps:
    fern docs dev --broken-links
    ```
 
-The **Fern docs (check)** workflow runs `fern check` on every pull request that changes files under `docs/`.
+The **Fern docs (check)** workflow runs on every pull request that changes files under `docs/`. It fails if `nightly.yml` is out of date with the page frontmatter, and then runs `fern check`.
 
 ## Add a Page
 
 To add a page, complete the following steps:
 
-1. Create an MDX file under `docs/` that starts with `title` and `description` frontmatter:
+1. Create an MDX file under `docs/` that starts with `title`, `description`, and `nav` frontmatter:
 
    ```mdx
    ---
    title: Page Title
    description: One sentence that describes the page.
+   nav:
+     parent: advanced-features
+     order: 140
+     slug: page-title
    ---
    ```
 
    Do not add a `#` heading to the page body. Fern renders `title` as the page heading.
-2. Add the page to the navigation in `docs/fern/versions/nightly.yml`:
 
-   ```yaml
-   - page: Page Title
-     path: ../../<section>/<file-name>.mdx
-     slug: <file-name>
+   The `nav` key places the page in the nightly navigation:
+
+   - `parent`: Required. The `id` of the section that contains the page. Use `root` for the top level, an `id` from `docs/fern/nav-skeleton.yml` for a top-level section, or the `nav.id` of another page.
+   - `order`: Required. An integer that sorts the page among the other pages in its section. Existing pages use steps of 10, so you can insert a page between two others.
+   - `slug`: The URL segment for the page.
+   - `label`: The navigation label. Defaults to `title`.
+   - `id`: An identifier that other pages can use as their `parent`. A page with child pages appears as a section, and the page itself is the section overview.
+
+   To leave a page out of the navigation, set `nav: false`.
+2. From the repository root, regenerate the navigation:
+
+   ```bash
+   python3 docs/fern/scripts/fern_nav.py generate
    ```
 
-   Paths in the version files are relative to `docs/fern/versions/`. To include the page in a released version, also add it to that version's file, such as `docs/fern/versions/v0.20.0.yml`.
+   The script requires PyYAML. It reports pages that have no `nav` key, unknown `parent` values, duplicate `id` values, and duplicate slugs. To check that `nightly.yml` is up to date without writing it, add the `--check` option.
+
+   New pages appear in the next released version automatically, because the release copies the nightly navigation. Existing released versions do not change.
 3. Run `fern check` to confirm that the new path resolves.
 
 ## Manage Documentation Versions
@@ -116,17 +135,68 @@ versions:
   - display-name: "0.20.0 (latest)"
     path: versions/v0.20.0.yml
     slug: latest
-  - display-name: nightly
+  - display-name: "nightly"
     path: versions/nightly.yml
     slug: nightly
+  - display-name: "Archives"
+    path: versions/archives.yml
+    slug: archives
 ```
 
-To add a version for a new release, complete the following steps:
+The site has the following kinds of versions:
 
-1. Copy `docs/fern/versions/nightly.yml` to a file named for the release, such as `docs/fern/versions/v0.21.0.yml`.
-2. Add an entry for the new file to the `versions` list in `docs/fern/docs.yml`.
-3. Move the `latest` slug and the `(latest)` label to the new entry, and give the previous release its own slug, such as `v0.20.0`.
-4. Run `fern check` to confirm the new version file.
+- **Nightly**: `versions/nightly.yml` points at the current MDX files under `docs/`. The `fern_nav.py` script generates it from page frontmatter, as described in [Add a Page](#add-a-page).
+- **Released versions**: Each `versions/v<X.Y.Z>.yml` file is a frozen copy of the nightly navigation at the `core_v<X.Y.Z>` release tag. Its paths point at `versions/v<X.Y.Z>-content/`, which holds the `docs/` tree from that tag.
+- **Archives**: `versions/archives.yml` contains a single page, `docs/archives.mdx`.
+
+### Prepare Released Version Content
+
+The `v<X.Y.Z>-content/` directories are not committed to the repository. Released version files do not resolve until you create them.
+
+To create the content directories, complete the following steps:
+
+1. From the repository root, fetch the release tags:
+
+   ```bash
+   git fetch --tags
+   ```
+
+2. Extract the documentation for every released version:
+
+   ```bash
+   python3 docs/fern/scripts/fern_versions.py extract-content
+   ```
+
+   The command extracts the `docs/` directory from the `core_v<X.Y.Z>` tag for each `versions/v<X.Y.Z>.yml` file. If a tag is missing, the command prints a warning and copies the current `docs/` tree instead.
+3. Run `fern check` or `fern docs dev` from the `docs/fern` directory.
+
+The **Fern docs (check)** and **Publish Fern Docs** workflows run `extract-content` before they call Fern.
+
+### Add a Released Version
+
+The **Fern docs (version bump)** workflow (`.github/workflows/fern-docs-version-bump.yml`) adds a version after a `core_v<X.Y.Z>` GitHub release is published. The workflow skips prereleases. It opens a draft pull request that adds `docs/fern/versions/v<X.Y.Z>.yml` and updates `docs/fern/docs.yml`. To make the new version live, merge the pull request and then [publish the documentation](#publish-the-documentation).
+
+To run the workflow for a specific release, on the **Actions** tab, select **Fern docs (version bump)**, select **Run workflow**, and then enter the version, such as **0.21.0**.
+
+To add a version manually, complete the following steps:
+
+1. From the repository root, run the `bump` command with the release version:
+
+   ```bash
+   python3 docs/fern/scripts/fern_versions.py bump 0.21.0
+   ```
+
+   The command reads `nightly.yml` from the `core_v0.21.0` tag. To read it from a different Git ref, add the `--ref <ref>` option. If the command cannot read `nightly.yml` from the ref, it prints a warning and uses the working tree copy.
+
+   The command writes `docs/fern/versions/v0.21.0.yml` with paths that point at `v0.21.0-content/` and an API reference link for 0.21.0. If the file already exists, the command leaves it unchanged.
+2. Review the `versions` list in `docs/fern/docs.yml`. The command orders the entries as follows:
+   - The newest release, with the `(latest)` label and the `latest` slug
+   - The nightly version
+   - Older releases from newest to oldest, with slugs such as `0-20-0`
+   - Other entries, such as Archives
+3. Prepare the released version content and run `fern check`, as described in [Prepare Released Version Content](#prepare-released-version-content).
+
+Released version files are not regenerated. Later changes to the page frontmatter or to `nightly.yml` do not change them.
 
 ## Publish the Documentation
 
