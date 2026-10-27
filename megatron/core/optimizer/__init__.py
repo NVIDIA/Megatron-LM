@@ -681,6 +681,7 @@ def _get_megatron_optimizer_based_on_param_groups(
             data_parallel_group_gloo=data_parallel_group_gloo,
             data_parallel_group_idx=data_parallel_group_idx,
             distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+            pg_collection=pg_collection,
         )
         # This is needed for case where num_distributed_optimizer_instances > 1. In this case,
         # weight gradients are all-reduced across optimizer instances, so each instance has
@@ -688,7 +689,12 @@ def _get_megatron_optimizer_based_on_param_groups(
         setattr(optimizer, 'grad_stats_parallel_group', intra_dist_opt_group)
     elif isinstance(model_chunks[0], FullyShardedDataParallelV2):
         optimizer = FullyShardedOptimizer(
-            optimizer, config, grad_scaler, init_state_fn, model_chunks=model_chunks
+            optimizer,
+            config,
+            grad_scaler,
+            init_state_fn,
+            model_chunks=model_chunks,
+            pg_collection=pg_collection,
         )
         # get_grad_norm divides each rank's contribution by that gradient's replication
         # factor, so summing it over every rank is correct by construction.
@@ -701,7 +707,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     else:
         # FP32 optimizer.
         assert grad_scaler is None
-        optimizer = FP32Optimizer(optimizer, config, init_state_fn)
+        optimizer = FP32Optimizer(optimizer, config, init_state_fn, pg_collection=pg_collection)
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
     if pg_collection is None:
@@ -932,7 +938,9 @@ def _get_megatron_emerging_optimizer(
                     optimizer, config, None, init_state_fn, pg_collection=pg_collection
                 )
             else:
-                optimizer = FP32Optimizer(optimizer, config, init_state_fn)
+                optimizer = FP32Optimizer(
+                    optimizer, config, init_state_fn, pg_collection=pg_collection
+                )
             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
             set_duplicate_filter_groups(optimizer, pg_collection)
             results.append(optimizer)

@@ -14,6 +14,7 @@ from ..distributed.fsdp.src.megatron_fsdp.experimental import init_optimizer_sta
 from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     sync_model_weights_from_main_weights,
 )
+from ..process_groups_config import ProcessGroupCollection
 from ..transformer.fsdp_dtensor_checkpoint import (
     get_global_unique_param_name,
     get_model_ep_rank_and_size,
@@ -65,6 +66,8 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         grad_scaler: Optional[MegatronGradScaler],
         init_state_fn: Callable,
         model_chunks: List[MegatronModule],
+        *,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ) -> None:
         """Initialize the MFSDP optimizer wrapper.
 
@@ -75,14 +78,19 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 but accepted to match the MCore optimizer construction contract.
             init_state_fn: Function used to initialize optimizer state.
             model_chunks: MFSDP v2 model chunks optimized by this wrapper.
+            pg_collection: Process groups of the model whose parameters this optimizer updates.
+                They name the config-logger file; without them the file name falls back, with a
+                warning, to the global parallel state.
         """
         FullyShardedOptimizer._validate_config(config, model_chunks)
         if has_config_logger_enabled(config):
-            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+            log_config_to_disk(
+                config, locals(), prefix=type(self).__name__, pg_collection=pg_collection
+            )
         if grad_scaler is not None:
             raise ValueError("MFSDP v2 does not currently support loss scaling.")
 
-        super().__init__(optimizer, config, grad_scaler, init_state_fn)
+        super().__init__(optimizer, config, grad_scaler, init_state_fn, pg_collection=pg_collection)
         self.model_chunks = model_chunks
         self.ddp_config = self.model_chunks[0].ddp_config
         for model_chunk in self.model_chunks:
