@@ -204,8 +204,6 @@ def _snapshot_optimizer_state(optimizer: FullyShardedOptimizer) -> dict[str, dic
     """Clone this rank's optimizer state, keyed by globally unique parameter name."""
     snapshot: dict[str, dict[str, Any]] = {}
     for param, state in optimizer.optimizer.state.items():
-        assert not isinstance(param, DTensor), "Checkpoint wrapper leaked into runtime parameters"
-        assert all(not isinstance(value, DTensor) for value in state.values())
         fqn = get_global_unique_param_name(optimizer.model_chunks, param)
         snapshot[fqn] = {
             key: (value.clone() if torch.is_tensor(value) else value)

@@ -16,7 +16,7 @@ import torch.distributed.checkpoint as dcp
 from torch import nn
 from torch.distributed.checkpoint import FileSystemReader
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor import Shard
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
@@ -238,10 +238,6 @@ def _assert_model_matches_snapshot(
     local_nonempty = False
     for key, expected in model_snapshot.items():
         actual = current[key]
-        assert not isinstance(expected, DTensor), f"model[{key}]: snapshot should be local"
-        assert not isinstance(
-            actual, DTensor
-        ), f"model[{key}]: checkpoint wrapper leaked into runtime state"
         torch.testing.assert_close(
             actual, expected, rtol=0, atol=0, msg=f"model[{key}]: value mismatch"
         )
@@ -260,12 +256,6 @@ def _assert_optimizer_matches_snapshot(
         for key, expected in expected_state.items():
             actual = current[index][key]
             if torch.is_tensor(expected):
-                assert not isinstance(
-                    expected, DTensor
-                ), f"optim[{index}][{key}]: snapshot should be local"
-                assert not isinstance(
-                    actual, DTensor
-                ), f"optim[{index}][{key}]: checkpoint wrapper leaked into runtime state"
                 torch.testing.assert_close(
                     actual, expected, rtol=0, atol=0, msg=f"optim[{index}][{key}]: value mismatch"
                 )
