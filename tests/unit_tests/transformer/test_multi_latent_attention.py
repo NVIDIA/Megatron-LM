@@ -8,10 +8,16 @@ from unittest import mock
 import pytest
 import torch
 
+import megatron.core.transformer.attention as attention_module
 import megatron.core.transformer.multi_latent_attention as mla_module
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
@@ -20,10 +26,12 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.multi_latent_attention import (
     FusedMLASelfAttention,
@@ -31,6 +39,7 @@ from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttentionSubmodules,
     MultiLatentAttention,
 )
+from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.typed_torch import apply_module
@@ -220,11 +229,48 @@ class TestParallelMLAAttention:
         missing_params = attn_params - mla_params
         assert not missing_params, f"Missing parameters in MultiLatentAttention: {missing_params}"
 
+    @pytest.mark.parametrize("batch_invariant_mode", [False, True])
     @pytest.mark.parametrize("is_decode_only", [False, True])
-    def test_dynamic_inference_forwards_decode_only_to_flash_attention(self, is_decode_only):
-        """Test that MLA forwards the dynamic context's decode-only state."""
-        flash_call = _dynamic_flash_attention_call(self.parallel_attention, is_decode_only)
-        assert flash_call.arguments["is_decode_only"] is is_decode_only
+    def test_dynamic_inference_forwards_decode_only_to_flash_attention(
+        self, is_decode_only, batch_invariant_mode
+    ):
+        """Test that MLA runs the absorbed decode kernel for decode-only steps, except in
+        batch-invariant mode, where every step runs the varlen kernel."""
+        attention = self.parallel_attention
+        attention.batch_invariant_mode = batch_invariant_mode
+        flash_call = _dynamic_flash_attention_call(attention, is_decode_only)
+        absorbed = is_decode_only and not batch_invariant_mode
+        assert flash_call.arguments["is_decode_only"] is absorbed
+
+    @pytest.mark.parametrize("batch_invariant_mode", [False, True])
+    @pytest.mark.parametrize("is_decode_only", [False, True])
+    def test_dynamic_inference_up_projects_cached_latents_unless_absorbed(
+        self, is_decode_only, batch_invariant_mode
+    ):
+        """Test that the cached latents are up-projected to keys and values for every step that
+        does not run absorbed attention."""
+        attention = self.parallel_attention
+        attention.eval()
+        attention.config.cache_mla_latents = True
+        attention.cache_mla_latents = True
+        attention.batch_invariant_mode = batch_invariant_mode
+
+        latents = torch.empty((1, 1, 1))
+        block_table = torch.zeros((1, 1), dtype=torch.int32)
+        inference_context = mock.Mock()
+        inference_context.is_static_batching.return_value = False
+        inference_context.is_decode_only.return_value = is_decode_only
+        inference_context.use_flashinfer_fused_rope = False
+        inference_context.key_value_cache.return_value = (latents, None, block_table)
+
+        with mock.patch.object(
+            attention, "uncompress_kv_from_cache", return_value=(latents, latents)
+        ) as uncompress_kv_from_cache:
+            attention._adjust_key_value_for_inference(
+                inference_context, latents, latents, None, rotary_pos_emb=None
+            )
+        absorbed = is_decode_only and not batch_invariant_mode
+        assert uncompress_kv_from_cache.called is not absorbed
 
     @pytest.mark.skipif(not is_te_min_version("2.8.0"), reason="softmax_type requires TE >= 2.8.0")
     @pytest.mark.parametrize("softmax_type", ["off-by-one", "learnable"])
@@ -2469,37 +2515,220 @@ class TestFusedMLAQUpProjIntegration:
                 assert torch.count_nonzero(grad) > 0
 
 
-def _batch_invariant_mla_config(**overrides):
-    kwargs = dict(
-        num_layers=1,
-        hidden_size=64,
-        num_attention_heads=4,
-        q_lora_rank=32,
-        kv_lora_rank=32,
-        qk_head_dim=32,
-        qk_pos_emb_head_dim=16,
-        v_head_dim=32,
-        bf16=True,
-        params_dtype=torch.bfloat16,
-        attention_dropout=0.0,
-        batch_invariant_mode=True,
-        attention_backend=AttnBackend.flash,
-        flash_attention_version=3,
-    )
-    kwargs.update(overrides)
-    return MLATransformerConfig(**kwargs)
+# The unabsorbed latent-cache path pages 64-token KV blocks, which FlashAttention 2 cannot read,
+# and batch-invariant mode pins FlashAttention 3 or 4 to one KV split.
+_LATENT_CACHE_FLASH_ATTENTION_VERSION = (
+    4 if attention_module.HAVE_FA4 else 3 if attention_module.HAVE_FA3 else None
+)
 
 
-def test_batch_invariant_mode_accepts_mla_without_latent_cache():
-    assert _batch_invariant_mla_config().batch_invariant_mode
+def _flash_mla_decode_runs() -> bool:
+    """Whether FlashMLA's dense decode kernel runs here: it needs SM90 and a FlashMLA build that
+    includes its SM90 kernels."""
+    if not (attention_module.HAVE_FMLA and torch.cuda.get_device_capability() == (9, 0)):
+        return False
+    q = torch.zeros(1, 1, 16, 576, device="cuda", dtype=torch.bfloat16)
+    kv_cache = torch.zeros(1, 64, 1, 576, device="cuda", dtype=torch.bfloat16)
+    cache_seqlens = torch.ones(1, device="cuda", dtype=torch.int32)
+    block_table = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
+    try:
+        metadata, num_splits = attention_module.get_mla_metadata(cache_seqlens, 16, 1)
+        attention_module.flash_mla_with_kvcache(
+            q, kv_cache, block_table, cache_seqlens, 512, metadata, num_splits, causal=True
+        )
+        torch.cuda.synchronize()
+    except RuntimeError:
+        return False
+    return True
 
 
-def test_batch_invariant_mode_rejects_mla_latent_cache():
-    """Dynamic MLA decodes with absorbed FlashMLA attention, whose split-KV schedule depends on
-    the whole batch, and runs mixed steps unabsorbed, so a request's output depends on its
-    co-batch."""
-    with pytest.raises(ValueError, match="not supported with cache_mla_latents"):
-        _batch_invariant_mla_config(cache_mla_latents=True)
+@pytest.mark.skipif(
+    _LATENT_CACHE_FLASH_ATTENTION_VERSION is None, reason="requires FlashAttention 3 or 4"
+)
+class TestMLALatentCacheDecode:
+    """Decode steps of an MLA layer of the hybrid inference spec that caches latents, run with a
+    real dynamic context and real attention kernels."""
+
+    prompt_len = 100
+
+    @pytest.fixture(autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _attention(**overrides):
+        """An MLA layer with FlashMLA's latent sizes (512 + 64 RoPE, 16 heads)."""
+        kwargs = dict(
+            num_layers=1,
+            hidden_size=512,
+            num_attention_heads=16,
+            q_lora_rank=128,
+            kv_lora_rank=512,
+            qk_head_dim=64,
+            qk_pos_emb_head_dim=64,
+            v_head_dim=128,
+            qk_layernorm=True,
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            transformer_impl="inference_optimized",
+            rope_type="rope",
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            # prepare_for_absorption builds TE modules mid-forward on the init device.
+            use_cpu_initialization=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            cache_mla_latents=True,
+            flash_attention_version=_LATENT_CACHE_FLASH_ATTENTION_VERSION,
+        )
+        kwargs.update(overrides)
+        config = MLATransformerConfig(**kwargs)
+        spec = hybrid_inference_stack_spec.submodules.mla_layer.submodules.self_attention
+        attention = build_module(spec, config=config, layer_number=1, pp_layer_offset=0)
+        return attention.cuda().eval()
+
+    @staticmethod
+    def _context(config):
+        return DynamicInferenceContext(
+            model_config=config,
+            inference_config=InferenceConfig(
+                max_sequence_length=256,
+                buffer_size_gb=0.02,
+                paused_buffer_size_gb=0.002,
+                block_size_tokens=64,  # required with cache_mla_latents
+                max_tokens=1024,
+                max_requests=40,
+                num_cuda_graphs=None,
+                use_flashinfer_fused_rope=False,
+                unified_memory_level=0,
+            ),
+        )
+
+    @staticmethod
+    def _add_request(context, request_id, prompt_len):
+        context.add_request(
+            DynamicInferenceRequest(
+                request_id=request_id,
+                prompt_tokens=torch.arange(1, prompt_len + 1, device="cpu"),
+                sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
+            )
+        )
+
+    @staticmethod
+    def _step(attention, context, inputs):
+        """Run one step. Each request in ``inputs`` feeds those hidden states, the others random
+        ones. Returns each request's output rows and whether the step was decode-only."""
+        context.initialize_attention_state()
+        hidden_size = attention.config.hidden_size
+        hidden_states = torch.zeros(
+            context.padded_active_token_count, 1, hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        rows, start = {}, 0
+        for index in range(context.paused_request_count, context.total_request_count):
+            request_id = int(context.request_ids[index])
+            length = int(context.request_query_lengths[index])
+            offset = int(context.request_kv_length_offsets[index])
+            rows[request_id] = slice(start, start + length)
+            # Tokens are laid out request by request, in request order.
+            positions = context.token_to_position_in_request[start : start + length]
+            assert positions.tolist() == list(range(offset, offset + length)), "token layout"
+            if request_id in inputs:
+                hidden_states[rows[request_id], 0] = inputs[request_id]
+            else:
+                hidden_states[rows[request_id], 0] = torch.randn(
+                    length, hidden_size, device="cuda", dtype=torch.bfloat16
+                )
+            start += length
+        with torch.no_grad(), InferenceMode.active():
+            output, _ = attention(hidden_states, attention_mask=None, inference_context=context)
+        outputs = {request_id: output[span, 0].clone() for request_id, span in rows.items()}
+        return outputs, context.is_decode_only()
+
+    def _inputs(self, hidden_size):
+        """Request 0's prompt and first decode token hidden states."""
+        generator = torch.Generator(device="cuda").manual_seed(7)
+        hidden_states = torch.randn(
+            self.prompt_len + 1, hidden_size, device="cuda", generator=generator
+        ).to(torch.bfloat16)
+        return {"prompt": hidden_states[:-1], "token": hidden_states[-1:]}
+
+    def _decode(self, attention, inputs, num_cobatched=0, cobatched_prefill=False):
+        """Request 0's output for its first decode token. The request is prefilled, then decoded
+        alone, next to ``num_cobatched`` other decoding requests, or in one step with the prefill
+        of another request."""
+        context = self._context(attention.config)
+        self._add_request(context, 0, self.prompt_len)
+        for request_id in range(1, num_cobatched + 1):
+            self._add_request(context, request_id, 8 + request_id)
+        self._step(attention, context, {0: inputs["prompt"]})
+        num_active = context.total_request_count - context.paused_request_count
+        context.update_requests(
+            active_requests_mask=torch.ones(num_active, dtype=torch.int32),
+            new_tokens=torch.zeros(num_active, dtype=torch.int64),
+        )
+        if cobatched_prefill:
+            self._add_request(context, num_cobatched + 1, 40)
+        outputs, decode_only = self._step(attention, context, {0: inputs["token"]})
+        assert decode_only is not cobatched_prefill
+        return outputs[0]
+
+    def _prefill(self, attention, inputs):
+        """Request 0's output for its decode token when that token ends its prompt instead."""
+        context = self._context(attention.config)
+        self._add_request(context, 0, self.prompt_len + 1)
+        prompt = torch.cat((inputs["prompt"], inputs["token"]))
+        outputs, decode_only = self._step(attention, context, {0: prompt})
+        assert not decode_only
+        return outputs[0][-1:]
+
+    def test_batch_invariant_decode_is_independent_of_cobatch(self):
+        """In batch-invariant mode a request's decode output is bitwise the same alone, next to
+        31 other decoding requests, and in a step that also prefills another request."""
+        attention = self._attention(batch_invariant_mode=True, attention_backend=AttnBackend.flash)
+        inputs = self._inputs(attention.config.hidden_size)
+        with set_batch_invariant_mode(True):
+            alone = self._decode(attention, inputs)
+            cobatched = self._decode(attention, inputs, num_cobatched=31)
+            beside_prefill = self._decode(attention, inputs, cobatched_prefill=True)
+        assert torch.isfinite(alone).all()
+        assert torch.equal(alone, cobatched)
+        assert torch.equal(alone, beside_prefill)
+
+    def test_batch_invariant_decode_matches_unabsorbed_prefill(self):
+        """In batch-invariant mode a decode step runs the unabsorbed attention of a prefill: its
+        output is bitwise the prefill's output for the same token."""
+        attention = self._attention(batch_invariant_mode=True, attention_backend=AttnBackend.flash)
+        inputs = self._inputs(attention.config.hidden_size)
+        with set_batch_invariant_mode(True):
+            decoded = self._decode(attention, inputs)
+            prefilled = self._prefill(attention, inputs)
+        assert torch.equal(decoded, prefilled)
+
+    @pytest.mark.skipif(not is_te_min_version("2.8.0"), reason="softmax_type requires TE >= 2.8.0")
+    def test_flash_mla_decode_applies_sink(self):
+        """Absorbed FlashMLA decode with a learnable sink matches the unabsorbed attention of a
+        prefill with the same sink, and does not without the sink correction."""
+        if not _flash_mla_decode_runs():
+            pytest.skip("requires FlashMLA's dense decode kernel (SM90)")
+        attention = self._attention(softmax_type="learnable")
+        heads = attention.num_attention_heads_per_partition
+        with torch.no_grad():
+            attention.core_attention.softmax_offset.copy_(torch.linspace(0.0, 8.0, heads))
+        inputs = self._inputs(attention.config.hidden_size)
+
+        absorbed = self._decode(attention, inputs)
+        with mock.patch.object(attention, "_get_inference_softmax_offset", return_value=None):
+            absorbed_without_sink = self._decode(attention, inputs)
+        reference = self._prefill(attention, inputs)
+
+        def relative_error(output):
+            return ((output.float() - reference.float()).norm() / reference.float().norm()).item()
+
+        assert relative_error(absorbed) < 0.05
+        assert relative_error(absorbed_without_sink) > 0.2
 
 
 def _fused_kv_rope_quant_config(**overrides):
