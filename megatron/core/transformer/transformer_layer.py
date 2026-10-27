@@ -1852,14 +1852,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
         # and overlaps with the H2D transfer on reload stream.
         if self.offload_module_in_cuda_graph:
-            if len(args) > 0:
-                hidden_states = args[0]
-                hidden_states = self.off_interface.backward_record(hidden_states)
-                args = (hidden_states,) + args[1:]
-            else:
-                hidden_states = kwargs.pop("hidden_states")
-                hidden_states = self.off_interface.backward_record(hidden_states)
-                kwargs["hidden_states"] = hidden_states
+            hidden_states = self.off_interface.backward_record(args[0])
+            args = (hidden_states, *args[1:])
         context = None
         if (
             not self.config.cuda_graph_modules
@@ -1867,10 +1861,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         ):
             hidden_states, context = self._forward_attention(*args, **kwargs)
         else:
-            if len(args) > 0:
-                hidden_states = args[0]
-            else:
-                hidden_states = kwargs.pop("hidden_states")
+            hidden_states = args[0]
 
         if (
             not self.config.cuda_graph_modules
@@ -1946,7 +1937,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         # The graph only takes padding_mask when it was captured with that input; the eager MoE
         # steps after the graph keep using the caller's mask from `kwargs`.
         graph_kwargs = {k: v for k, v in kwargs.items() if k != "padding_mask"}
-        hidden_states = args[0] if args else kwargs["hidden_states"]
+        hidden_states = args[0]
         graph_padding_mask = self._te_cuda_graph_padding_mask(
             kwargs.get("padding_mask"), hidden_states.device
         )

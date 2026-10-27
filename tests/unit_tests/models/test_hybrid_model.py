@@ -497,7 +497,7 @@ class TestHybridModel:
         expected_residuals = {}
 
         def record_layer_residuals(layer, args, kwargs, output):
-            accumulator = (args[0] if args else kwargs["hidden_states"]).detach().clone()
+            accumulator = args[0].detach().clone()
             output = output[0] if isinstance(output, tuple) else output
             # Keep the original forward values; backward recomputation must not be observed.
             expected_residuals.setdefault((layer, "residual_accumulator"), accumulator)
