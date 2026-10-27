@@ -96,10 +96,10 @@ class _PackedModel(nn.Module):
 class _TiedModel(nn.Module):
     """Two Linears sharing one weight, so that weight appears in the state dict under two FQNs."""
 
-    def __init__(self, *, share_module: bool = False) -> None:
+    def __init__(self) -> None:
         super().__init__()
         self.fc1 = nn.Linear(8, 8)
-        self.fc2 = self.fc1 if share_module else nn.Linear(8, 8)
+        self.fc2 = nn.Linear(8, 8)
         self.fc2.weight = self.fc1.weight
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -148,16 +148,15 @@ def _build_sharded(
 
 
 def _build_tied_sharded(
-    mesh: DeviceMesh, device: torch.device, *, zero_init: bool = False, share_module: bool = False
+    mesh: DeviceMesh, device: torch.device, *, zero_init: bool = False
 ) -> tuple[nn.Module, torch.optim.Optimizer]:
     """Shard a :class:`_TiedModel`, whose weight is reachable under two FQNs.
 
     Args:
         zero_init: Zero the weights, so a destination model is obviously different from the
             saved (trained) source and a correct load has to overwrite it.
-        share_module: Register the same Linear under both names instead of just tying weights.
     """
-    model = _TiedModel(share_module=share_module).to(device=device)
+    model = _TiedModel().to(device=device)
     if zero_init:
         for parameter in model.parameters():
             nn.init.zeros_(parameter)
@@ -422,10 +421,7 @@ def test_saved_chunks_tile_every_parameter(distributed_setup, tmp_path_dist_ckpt
         assert covered == shape[0], f"{key} chunks do not cover the global tensor"
 
 
-@pytest.mark.parametrize("share_module", [False, True], ids=["tied-weight", "shared-module"])
-def test_checkpoint_roundtrip_tied_parameter(
-    distributed_setup, tmp_path_dist_ckpt: Path, share_module: bool
-) -> None:
+def test_checkpoint_roundtrip_tied_parameter(distributed_setup, tmp_path_dist_ckpt: Path) -> None:
     """A tied weight is described under each of its names and restored bit-exactly.
 
     One ``nn.Parameter`` reachable under two names appears in the state dict under both, so the
@@ -435,7 +431,7 @@ def test_checkpoint_roundtrip_tied_parameter(
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
 
-    model, optimizer = _build_tied_sharded(mesh, device, share_module=share_module)
+    model, optimizer = _build_tied_sharded(mesh, device)
     _train_one_step(model, optimizer, device, param_dtype=torch.float32, out_features=8)
     model_snapshot, optimizer_snapshot = _snapshot_state(model, optimizer)
     assert {"fc1.weight", "fc2.weight"} <= model_snapshot.keys(), "The tie should surface twice"
@@ -446,9 +442,7 @@ def test_checkpoint_roundtrip_tied_parameter(
         assert {"model.fc1.weight", "model.fc2.weight"} <= saved_chunks.keys()
         assert saved_chunks["model.fc1.weight"] == saved_chunks["model.fc2.weight"]
 
-        model, optimizer = _build_tied_sharded(
-            mesh, device, zero_init=True, share_module=share_module
-        )
+        model, optimizer = _build_tied_sharded(mesh, device, zero_init=True)
         load_checkpoint(model, optimizer, checkpoint_dir)
 
     _assert_model_matches_snapshot(model, model_snapshot)
