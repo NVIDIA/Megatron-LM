@@ -233,7 +233,10 @@ def test_dispatcher_config_preserves_defaulted_linear_cp_inputs(layout, mode):
     from tests.unit_tests.transformer.moe.test_echo_moe_scheduler import _scheduler_config
 
     config = _scheduler_config(
-        experimental_attention_variant="gdn", linear_cp_layout=layout, linear_cp_mode=mode
+        experimental_attention_variant="gdn",
+        linear_attention_freq=1,
+        linear_cp_layout=layout,
+        linear_cp_mode=mode,
     )
     before = dict(vars(config))
     layer = SimpleNamespace(config=config, num_physical_experts=8)
