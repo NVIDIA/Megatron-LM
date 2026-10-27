@@ -230,18 +230,8 @@ def test_packed_attention_runtime_cp_replays(build_cp_size, fused_rope, monkeypa
         Utils.destroy_model_parallel()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and flash-attn")
-@pytest.mark.parametrize("path", ["prefill", "decode"])
-def test_flash_decode_dispatch_config_softmax_scale_replays(path):
-    """The dynamic-inference attention dispatch honors config.softmax_scale deterministically."""
-    from megatron.core.transformer import attention as attention_module
-
-    if (
-        attention_module.flash_attn_varlen_func is None
-        or attention_module.flash_attn_with_kvcache is None
-    ):
-        pytest.skip("requires flash-attn")
-
+def _replay_flash_dispatch(path, flash_version, sink):
+    """Replay dynamic flash attention with a config-driven scale and an optional sink."""
     from megatron.core.models.gpt.gpt_layer_specs import (
         get_gpt_layer_with_transformer_engine_submodules,
     )
@@ -266,7 +256,7 @@ def test_flash_decode_dispatch_config_softmax_scale_replays(path):
             hidden_dropout=0.0,
             add_bias_linear=False,
             softmax_scale=0.25,  # Not 1/sqrt(head_dim): the choice must be observable.
-            flash_attention_version=2,  # Pin FA2 so every environment replays the same kernel.
+            flash_attention_version=flash_version,  # Pin it so every environment replays the same kernel.
         )
         submodules = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
         module = SelfAttention(
@@ -294,6 +284,11 @@ def test_flash_decode_dispatch_config_softmax_scale_replays(path):
             block_table=torch.tensor([[0], [1]], device="cuda", dtype=torch.int32),
             max_seqlen_k=max(lengths_k),
         )
+        if sink:
+            inputs["softmax_offset"] = torch.linspace(
+                -0.25, 0.25, heads, device="cuda", dtype=torch.bfloat16
+            )
+        label = f"{path}, FA{flash_version} sink" if sink else path
         if path == "prefill":
             tokens_per_request = 8
             inputs.update(
@@ -327,7 +322,7 @@ def test_flash_decode_dispatch_config_softmax_scale_replays(path):
             replays=3,
             backward=False,
             contention=True,
-            what=f"flash_decode_and_prefill[{path}, config softmax_scale]",
+            what=f"flash_decode_and_prefill[{label}, config softmax_scale]",
         )
         assert torch.isfinite(scaled[0]["out"]).all()
 
@@ -340,8 +335,37 @@ def test_flash_decode_dispatch_config_softmax_scale_replays(path):
             inputs,
             replays=2,
             backward=False,
-            what=f"flash_decode_and_prefill[{path}, default softmax_scale]",
+            what=f"flash_decode_and_prefill[{label}, default softmax_scale]",
         )
         assert not bytes_equal(scaled[0]["out"], default[0]["out"])
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and flash-attn")
+@pytest.mark.parametrize("path", ["prefill", "decode"])
+def test_flash_decode_dispatch_config_softmax_scale_replays(path):
+    """The dynamic-inference attention dispatch honors config.softmax_scale deterministically."""
+    from megatron.core.transformer import attention as attention_module
+
+    if (
+        attention_module.flash_attn_varlen_func is None
+        or attention_module.flash_attn_with_kvcache is None
+    ):
+        pytest.skip("requires flash-attn")
+    _replay_flash_dispatch(path, flash_version=2, sink=False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and flash-attn")
+@pytest.mark.parametrize("path", ["prefill", "decode"])
+@pytest.mark.parametrize("flash_version", [2])
+def test_flash_decode_dispatch_learnable_sink_replays(path, flash_version):
+    """The dynamic-inference attention dispatch applies a per-head sink deterministically."""
+    from megatron.core.transformer import attention as attention_module
+
+    if flash_version == 2 and (
+        attention_module.flash_attn_varlen_func is None
+        or attention_module.flash_attn_with_kvcache is None
+    ):
+        pytest.skip("requires flash-attn")
+    _replay_flash_dispatch(path, flash_version, sink=True)
