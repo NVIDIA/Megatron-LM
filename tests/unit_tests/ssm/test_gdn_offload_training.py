@@ -117,7 +117,10 @@ def _training_config(
 
 
 def _build_training_model(
-    config: TransformerConfig, groups: ProcessGroupCollection
+    config: TransformerConfig,
+    groups: ProcessGroupCollection,
+    *,
+    distributed_optimizer: bool = False,
 ) -> tuple[list[DistributedDataParallel], MegatronOptimizer]:
     """Construct full decoder blocks, DDP gradient buffers and the BF16 Adam optimizer."""
     # Both recipes include MLPs, so this fixture exercises complete decoder blocks.
@@ -159,14 +162,18 @@ def _build_training_model(
         models.append(
             DistributedDataParallel(
                 config,
-                DistributedDataParallelConfig(grad_reduce_in_fp32=True),
+                DistributedDataParallelConfig(
+                    grad_reduce_in_fp32=True, use_distributed_optimizer=distributed_optimizer
+                ),
                 Float16Module(config, model),
                 pg_collection=groups,
             )
         )
         models[-1].broadcast_params()
     optimizer = get_megatron_optimizer(
-        OptimizerConfig(bf16=True, lr=1e-3, clip_grad=1.0),
+        OptimizerConfig(
+            bf16=True, lr=1e-3, clip_grad=1.0, use_distributed_optimizer=distributed_optimizer
+        ),
         models,
         use_gloo_process_groups=False,
         pg_collection=groups,

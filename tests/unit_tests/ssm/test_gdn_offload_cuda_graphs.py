@@ -148,7 +148,10 @@ def test_gdn_offload_with_te_graphs(
             init_stream = torch.cuda.Stream()
             init_stream.wait_stream(current_stream)
             with torch.cuda.stream(init_stream):
-                models, optimizer = _build_training_model(config, groups)
+                # Distributed optimizer aligns main_grad for TP2 NVFP4 fused GEMMs.
+                models, optimizer = _build_training_model(
+                    config, groups, distributed_optimizer=gradient_accumulation_fusion and tp > 1
+                )
             current_stream.wait_stream(init_stream)
             manager = PipelineOffloadManager.get_instance()
             pool_checks = []
