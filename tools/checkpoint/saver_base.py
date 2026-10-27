@@ -151,8 +151,8 @@ class MegatronCheckpointSaverBase:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
 
-        cfg = inference_cfg_container_from_args(self.margs, build_model_config=False)
-        set_global_variables(self.margs, cfg, build_tokenizer=self.build_tokenizer)
+        self.cfg = inference_cfg_container_from_args(self.margs, build_model_config=False)
+        set_global_variables(self.margs, self.cfg, build_tokenizer=self.build_tokenizer)
 
         # Megatron args. (i.e., 'margs')
         self.margs = get_args()
@@ -393,15 +393,15 @@ class MegatronCheckpointSaverBase:
             if true_vocab_size is not None:
                 # figure out what our padded vocab size is
                 orig_vocab_size = orig_word_embed.shape[0]
-                self.margs.padded_vocab_size = vocab_size_with_padding(true_vocab_size, self.margs.make_vocab_size_divisible_by, self.margs.tensor_model_parallel_size)
+                self.cfg.tokenizer.padded_vocab_size = vocab_size_with_padding(true_vocab_size, self.margs.make_vocab_size_divisible_by, self.margs.tensor_model_parallel_size)
 
                 # Cut out extra padding we don't need
-                if orig_vocab_size > self.margs.padded_vocab_size:
-                    full_word_embed = orig_word_embed[0:self.margs.padded_vocab_size,:]
+                if orig_vocab_size > self.cfg.tokenizer.padded_vocab_size:
+                    full_word_embed = orig_word_embed[0:self.cfg.tokenizer.padded_vocab_size,:]
 
                 # Expanding embedding to larger size by replicating final entry
-                elif orig_vocab_size < self.margs.padded_vocab_size:
-                    padding_size = self.margs.padded_vocab_size - orig_vocab_size
+                elif orig_vocab_size < self.cfg.tokenizer.padded_vocab_size:
+                    padding_size = self.cfg.tokenizer.padded_vocab_size - orig_vocab_size
 
                     full_word_embed = torch.cat((
                         orig_word_embed,
@@ -413,7 +413,7 @@ class MegatronCheckpointSaverBase:
             else:
                 print("Original vocab size not specified, leaving embedding table as-is. "
                     "If you've changed the tensor parallel size this could cause problems.")
-                self.margs.padded_vocab_size = orig_word_embed.shape[0]
+                self.cfg.tokenizer.padded_vocab_size = orig_word_embed.shape[0]
                 full_word_embed = orig_word_embed
             return full_word_embed
 
