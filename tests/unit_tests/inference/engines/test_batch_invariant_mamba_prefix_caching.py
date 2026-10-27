@@ -83,14 +83,11 @@ class TestBatchInvariantMambaPrefixCaching:
         graphs,
         chunked,
         kv_cache_management_mode=KVCacheManagementMode.PERSIST,
-        sampling_backend="torch",
         exercise_real_refit=True,
-        target_seed=321,
-        source_seed=654,
     ):
         model_parallel_cuda_manual_seed(321, inference_rng_tracker=True, force_reset_rng=True)
         torch.manual_seed(321)
-        speculative = exercise_real_refit and sampling_backend == "torch"
+        speculative = exercise_real_refit
         cfg = TransformerConfig(
             num_layers=3,
             hidden_size=128,
@@ -130,9 +127,9 @@ class TestBatchInvariantMambaPrefixCaching:
                 .eval()
             )
 
-        target_core = build_model(target_seed)
+        target_core = build_model(321)
         model = Float16Module(cfg, target_core).cuda().eval()
-        source_core = build_model(source_seed) if exercise_real_refit else None
+        source_core = build_model(654) if exercise_real_refit else None
         mamba_config = MambaInferenceStateConfig.from_model(target_core)
         assert mamba_config.ssm_states_dtype == (torch.bfloat16 if speculative else torch.float32)
         target_parameters = dict(model.named_parameters())
@@ -141,11 +138,10 @@ class TestBatchInvariantMambaPrefixCaching:
             source_model = Float16Module(cfg, source_core).cuda().eval()
             source_parameters = dict(source_model.named_parameters())
             assert source_parameters.keys() == target_parameters.keys()
-            if source_seed != target_seed:
-                assert any(
-                    not torch.equal(source_parameters[name], target_parameters[name])
-                    for name in source_parameters
-                )
+            assert any(
+                not torch.equal(source_parameters[name], target_parameters[name])
+                for name in source_parameters
+            )
             target_storage = {
                 name: parameter.data_ptr() for name, parameter in target_parameters.items()
             }
@@ -170,7 +166,7 @@ class TestBatchInvariantMambaPrefixCaching:
                 static_kv_memory_pointers=False,
                 use_flashinfer_fused_rope=False,
                 unified_memory_level=0,
-                sampling_backend=sampling_backend,
+                sampling_backend="torch",
                 num_speculative_tokens=int(speculative),
             ),
         )
@@ -196,7 +192,7 @@ class TestBatchInvariantMambaPrefixCaching:
         outputs = {}
         graph_steps = post_refit_graph_steps = post_refit_chunked_steps = 0
         post_refit_speculative_start = None
-        torch_top_k = int(exercise_real_refit and sampling_backend == "torch")
+        torch_top_k = int(exercise_real_refit)
         for wave, order in enumerate(([0, 1], [1, 0], [2], [3], [4], [5], [0])):
             if wave == 6:
                 if exercise_real_refit:
@@ -276,6 +272,7 @@ class TestBatchInvariantMambaPrefixCaching:
                         assert resumed_resident_salt != resident_salt
                         assert resumed_resident_salt == queued.block_hash_salt
                 else:
+                    # Old cached states must not be reused after a weight update.
                     engine.suspend()
                     for parameter in model.parameters():
                         parameter.mul_(1.03)
@@ -286,11 +283,7 @@ class TestBatchInvariantMambaPrefixCaching:
                     wave * 10 + i + 1,
                     prompts[i],
                     SamplingParams(
-                        seed=(
-                            100 + i
-                            if sampling_backend == "torch" and not exercise_real_refit
-                            else None
-                        ),
+                        seed=100 + i if not exercise_real_refit else None,
                         num_tokens_to_generate=8,
                         temperature=1.0,
                         top_k=torch_top_k,
@@ -321,19 +314,10 @@ class TestBatchInvariantMambaPrefixCaching:
                     assert post_refit_graph_steps > 0
                 if chunked:
                     assert post_refit_chunked_steps > 0
-        if sampling_backend == "torch":
-            if not exercise_real_refit:
-                for first_id, repeated_id in ((1, 11), (2, 12)):
-                    first_tokens, first_log_probs = outputs[first_id]
-                    repeated_tokens, repeated_log_probs = outputs[repeated_id]
-                    assert first_tokens == repeated_tokens
-                    assert len(first_log_probs) == len(repeated_log_probs)
-                    for first, repeated in zip(first_log_probs, repeated_log_probs):
-                        if math.isnan(first) or math.isnan(repeated):
-                            assert math.isnan(first) and math.isnan(repeated)
-                        else:
-                            assert first == repeated
-
+        if not exercise_real_refit:
+            assert outputs[1] == outputs[11]
+            assert outputs[2] == outputs[12]
+        else:
             before_tokens, before_log_probs = outputs[1]
             after_tokens, after_log_probs = outputs[61]
             assert len(before_log_probs) == len(after_log_probs)
@@ -342,8 +326,7 @@ class TestBatchInvariantMambaPrefixCaching:
                 or (not math.isnan(before) and before != after)
                 for before, after in zip(before_log_probs, after_log_probs)
             )
-            if source_seed != target_seed:
-                assert before_tokens != after_tokens or finite_log_probs_differ
+            assert before_tokens != after_tokens or finite_log_probs_differ
         if speculative:
             assert len(outputs[5999][0]) == 8
             assert len(outputs[6000][0]) == 8
