@@ -14,6 +14,7 @@
 
 """Shared runtime state for Megatron-FSDP modules."""
 
+from collections.abc import Callable
 from contextvars import ContextVar, Token
 from weakref import WeakKeyDictionary
 
@@ -44,7 +45,7 @@ class FsdpContext:
     """
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
-    # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
+    # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_events``.
     forward_order: ExecutionOrder[nn.Module]
     backward_order: ExecutionOrder[nn.Module]
     # Topology metadata must not keep modules alive after construction.
@@ -79,8 +80,8 @@ class FsdpContext:
                 ranks in each parameter group's 1-D data-parallel mesh and must agree across
                 that mesh. Every TensorAtomic parameter needs an entry; other entries are
                 ignored. Tensors are packed by owner without changing logical parameter order.
-            caller_managed_grad_sync: Disable the automatic autograd completion callback,
-                allowing delayed weight gradients or custom backward schedules. The caller must
+            caller_managed_grad_sync: Leave gradient synchronization to the caller while
+                retaining automatic weight cleanup. The caller must
                 call ``finish_grad_sync()`` after all backward work and before reading or
                 modifying gradients.
         """
@@ -98,6 +99,9 @@ class FsdpContext:
         self.forward_order = ExecutionOrder()
         self.backward_order = ExecutionOrder()
         self._post_backward_hook_registered = False
+        self._delayed_post_backward_callbacks: list[
+            tuple[nn.Module, Callable[[nn.Module], None]]
+        ] = []
         # Construction-only; empty after finalization.
         self._registered_modules: list[nn.Module] = []
         self._roots = WeakKeyDictionary()
@@ -200,7 +204,7 @@ class FsdpContext:
         )
 
     def finish_grad_sync(self) -> None:
-        """Order current-stream consumers after all gradient reductions submitted so far.
+        """Wait on submitted gradient reductions.
 
         Call after all backward work, including delayed weight-gradient computation,
         and before reading or modifying gradients. This enqueues a stream dependency;
@@ -209,12 +213,25 @@ class FsdpContext:
         self.current_stream().wait_stream(self.reduce_scatter_stream)
 
     def post_backward(self) -> None:
-        """Order current-stream consumers after this backward's gradient reductions."""
-        self.finish_grad_sync()
+        """Finish backward cleanup and automatically synchronize the last microbatch."""
+        self._run_delayed_post_backward_callbacks()
+        # Standalone training can call optimizer.step() immediately after backward.
+        # Wait for reductions on the last microbatch; earlier microbatches keep
+        # overlapping reduction with compute. MCore calls finish_grad_sync() itself
+        # after its schedule completes, including delayed weight gradients.
+        if not self.caller_managed_grad_sync and self.is_last_microbatch:
+            self.finish_grad_sync()
         self._post_backward_hook_registered = False
 
+    def _run_delayed_post_backward_callbacks(self) -> None:
+        """Run deferred module completion callbacks once."""
+        # Finish children before parents to close nested backward NVTX ranges.
+        while self._delayed_post_backward_callbacks:
+            module, callback = self._delayed_post_backward_callbacks.pop()
+            callback(module)
+
     def register_post_backward_hook(self) -> None:
-        """Register one final callback unless the caller manages gradient synchronization.
+        """Register one final callback for deferred cleanup and optional gradient sync.
 
         Multiple FSDP roots can share this context. Waiting for the
         reduce-scatter stream in each root's ``post_backward()`` would prevent
@@ -222,10 +239,6 @@ class FsdpContext:
         reductions. Wait once at context-level autograd completion instead.
         """
 
-        if self.caller_managed_grad_sync:
-            # Leave the wait to the caller's finish_grad_sync(), after all backward work,
-            # including delayed weight-gradient computation, has been launched.
-            return
         if self._post_backward_hook_registered:
             # Another root sharing this context already queued the completion wait.
             return

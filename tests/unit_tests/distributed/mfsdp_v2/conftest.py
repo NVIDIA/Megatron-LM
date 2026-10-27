@@ -9,6 +9,9 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.distributed_c10d import _world
+from torch.distributed.tensor.debug import _clear_sharding_prop_cache
+
+from megatron.core.utils import is_torch_min_version
 
 
 @dataclasses.dataclass(frozen=True)
@@ -27,6 +30,14 @@ def select_symmetric_memory_backend() -> None:
     # locks in the current backend and prevents switching it later.
     if torch.cuda.is_available():
         symm_mem.set_backend("NCCL")
+
+
+def _release_symmetric_memory_pools() -> None:
+    """Drop the cached symmetric-memory pools so the next test starts from an empty pool."""
+    # symm_mem.get_mem_pool() and its process-wide pool cache are new in PyTorch 2.10.
+    if is_torch_min_version("2.10.0a0"):
+        # Drops the pools' last references, freeing their segments and rendezvous state.
+        symm_mem._symm_mem_pools.clear()
 
 
 @pytest.fixture(scope="function")
@@ -59,6 +70,9 @@ def distributed_setup() -> Iterator[DistributedSetup]:
         if device.type == "cuda":
             # Pass the device explicitly to suppress PyTorch's NCCL barrier warning.
             dist.barrier(device_ids=[device.index])
+            # Release while the test's communicators still exist, so NCCL can
+            # deregister the pools' windows before their groups are destroyed.
+            _release_symmetric_memory_pools()
         else:
             dist.barrier()
 
@@ -76,6 +90,11 @@ def distributed_setup() -> Iterator[DistributedSetup]:
         # reinitialization. Later test teardown also uses WORLD, so leave its destruction
         # to session cleanup.
         # https://docs.pytorch.org/docs/stable/distributed.html#reinitialization
+        #
+        # TODO(#7322): Remove this workaround when runtime parameters become local tensors.
+        # DeviceMesh equality ignores process groups, so DTensor's sharding-propagation cache
+        # can hand a later test this test's meshes, whose groups are destroyed below.
+        _clear_sharding_prop_cache()
         for group in list(_world.pg_map):
             if group is not dist.group.WORLD:
                 dist.destroy_process_group(group)

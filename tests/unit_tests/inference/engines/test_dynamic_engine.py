@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import random
+import threading
 import types
 from collections import OrderedDict, deque
 from contextlib import nullcontext
@@ -53,6 +54,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     DynamicVLMInferenceRequest,
     FinishedRequestRecord,
+    OffloadedRequestPayload,
     RequestPayloadStageResult,
     RequestPromptPreparationResult,
     Status,
@@ -150,6 +152,8 @@ def _build_mock_vlm_engine(image_embeddings):
     engine._vision_embedding_cache = OrderedDict()
     engine._get_cached_vision_embedding = mock.Mock(return_value=None)
     engine._cache_vision_embedding = mock.Mock()
+    engine._has_deferred_image_encodes = False
+    engine.waiting_request_ids = deque()
     return engine, wrapper
 
 
@@ -253,16 +257,33 @@ def test_build_vlm_request_preserves_preexpanded_tokens_and_derives_mask():
     wrapper.build_preexpanded_media_token_mask.assert_called_once_with(tokens, "image")
 
 
-def test_build_vlm_request_rejects_preexpanded_embedding_count_mismatch():
+def _run_deferred_encode(engine, request):
+    """Run the encode admission deferred, as schedule_waiting_requests does before prefill."""
+    engine.waiting_request_ids.append(request.request_id)
+    engine.get_request = lambda request_id: request
+    engine.context.max_tokens = 4096
+    engine._handle_failed_request = mock.Mock()
+    with mock.patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")):
+        engine._encode_waiting_images()
+
+
+def test_build_vlm_request_fails_preexpanded_embedding_count_mismatch_at_encode():
     engine, wrapper = _build_mock_vlm_engine(torch.ones(1, 4))
     wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
         [-1, 0, 1, -1], dtype=torch.int64
     )
 
-    with pytest.raises(ValueError, match="2 media-token position.*1 embedding"):
-        _call_build_vlm_request(
-            engine, torch.tensor([10, 99, 99, 20], dtype=torch.int64), media_tokens_preexpanded=True
-        )
+    request = _call_build_vlm_request(
+        engine, torch.tensor([10, 99, 99, 20], dtype=torch.int64), media_tokens_preexpanded=True
+    )
+    request.add_event_error_nontransient = mock.Mock()
+    _run_deferred_encode(engine, request)
+
+    (error,), _ = request.add_event_error_nontransient.call_args
+    assert "2 media-token position" in str(error) and "1 embedding" in str(error)
+    engine._handle_failed_request.assert_called_once_with(
+        request.request_id, stage="encode its images before prefill"
+    )
 
 
 def test_build_vlm_request_validates_cached_embedding_count_once():
@@ -288,12 +309,18 @@ def test_build_vlm_request_keeps_compact_expansion_path():
     request = _call_build_vlm_request(engine, compact_tokens, media_tokens_preexpanded=False)
 
     wrapper.expand_image_tokens.assert_called_once()
+    wrapper._forward_vision_encoder.assert_not_called()  # deferred to prefill scheduling
+    assert request.prompt_tokens.tolist() == [10, 99, 99, 20]
+    assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
+
+    _run_deferred_encode(engine, request)
+
     encoder_args, encoder_kwargs = wrapper._forward_vision_encoder.call_args
     assert torch.equal(encoder_args[0], torch.ones(1, 2, 4))
     assert encoder_kwargs["num_image_tiles"] is None
     assert torch.equal(encoder_kwargs["imgs_sizes"], torch.tensor([[2, 2]]))
-    assert request.prompt_tokens.tolist() == [10, 99, 99, 20]
-    assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
+    assert request.image_embeddings is not None
+    engine._handle_failed_request.assert_not_called()
 
 
 def test_build_vlm_request_stitches_expanded_multimodal_prefix():
@@ -834,6 +861,434 @@ def test_schedule_requests_skips_cached_media_payload_and_preprocessing():
         "media_cache_key": "shared-image",
         "media_tokens_preexpanded": True,
     }
+
+
+def _patch_count(imgs_sizes):
+    """Embeddings per image for the mock encoder below: a 2x2-pixel patch grid, no merging."""
+    return [(h // 2) * (w // 2) for h, w in imgs_sizes.tolist()]
+
+
+def _arange_encoder(imgs, num_image_tiles=None, imgs_sizes=None):
+    total = sum(_patch_count(imgs_sizes))
+    return torch.arange(total, dtype=torch.float32).view(total, 1, 1)
+
+
+def _waiting_image_request(request_id, imgs_sizes, *, media_cache_key=None):
+    sizes = torch.tensor(imgs_sizes)
+    count = sum(_patch_count(sizes))
+    request = mock.Mock(spec=DynamicVLMInferenceRequest)
+    request.request_id = request_id
+    request.image_embeddings = None
+    request.imgs = torch.full((1, count, 3), float(request_id))
+    request.imgs_sizes = sizes
+    request.image_token_mask = torch.tensor([-1] + list(range(count)) + [-1])
+    request.deferred_image_embedding_count = count
+    request.media_cache_key = media_cache_key
+    request.num_img_embeddings_per_tile = 0
+    request.video_frame_indices = None
+    request.video_fps = None
+    return request
+
+
+def _build_waiting_engine(requests, *, max_tokens=4096):
+    """An engine whose waiting queue holds ``requests`` and whose wrapper encodes arange()."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    wrapper = mock.Mock()
+    wrapper._forward_vision_encoder.side_effect = _arange_encoder
+    engine.controller = mock.Mock(inference_wrapped_model=wrapper)
+    engine.context = mock.Mock(max_tokens=max_tokens)
+    by_id = {request.request_id: request for request in requests}
+    engine.get_request = lambda request_id: by_id[request_id]
+    engine.waiting_request_ids = deque(by_id)
+    engine._has_deferred_image_encodes = True
+    engine.vision_embedding_cache_max_bytes = 0
+    engine._get_cached_vision_embedding = mock.Mock(return_value=None)
+    engine._cache_vision_embedding = mock.Mock()
+    engine._handle_failed_request = mock.Mock()
+    return engine, wrapper
+
+
+def _encode_waiting(engine):
+    with mock.patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")):
+        engine._encode_waiting_images()
+
+
+def test_build_vlm_request_defers_encode_with_the_expected_embedding_count():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
+
+    request = _call_build_vlm_request(
+        engine, torch.tensor([10, 42, 20], dtype=torch.int64), media_tokens_preexpanded=False
+    )
+
+    wrapper._forward_vision_encoder.assert_not_called()
+    engine._cache_vision_embedding.assert_not_called()
+    assert request.image_embeddings is None
+    assert request.deferred_image_embedding_count == 2
+    assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
+    assert torch.equal(request.imgs, torch.ones(1, 2, 4))
+    assert engine._has_deferred_image_encodes is True
+    _, kwargs = engine.context.add_vlm_request_data.call_args
+    assert kwargs["image_embeddings"] is None
+
+
+def test_encode_waiting_images_does_not_recache_a_cache_hit():
+    hit = _waiting_image_request(1, [[4, 4]], media_cache_key="hit")
+    fresh = _waiting_image_request(2, [[4, 4]])
+    other = _waiting_image_request(3, [[2, 4]])
+    engine, _ = _build_waiting_engine([hit, fresh, other])
+    engine._get_cached_vision_embedding.side_effect = lambda key: (
+        torch.full((4, 1, 1), 7.0) if key == "hit" else None
+    )
+
+    _encode_waiting(engine)
+
+    cached_ids = [c.args[0] for c in engine.context.add_vlm_request_data.call_args_list]
+    assert cached_ids == [1, 2, 3]
+    assert engine._cache_vision_embedding.call_count == 2  # the two freshly encoded ones
+    assert hit.image_embeddings.flatten().tolist() == [7.0] * 4
+    assert hit.deferred_image_embedding_count is None
+
+
+def test_encode_waiting_images_handles_out_of_memory_per_request():
+    requests = [_waiting_image_request(1, [[4, 4]]), _waiting_image_request(2, [[4, 4]])]
+    engine, wrapper = _build_waiting_engine(requests)
+    wrapper._forward_vision_encoder.side_effect = torch.cuda.OutOfMemoryError("CUDA OOM")
+
+    _encode_waiting(engine)  # must not raise: the engine loop stays up
+
+    # One shared attempt, then one per-request attempt each; both requests fail on their own.
+    assert wrapper._forward_vision_encoder.call_count == 3
+    assert sorted(c.args[0] for c in engine._handle_failed_request.call_args_list) == [1, 2]
+    assert list(engine.waiting_request_ids) == []
+    assert engine._has_deferred_image_encodes is False
+
+
+def test_encode_waiting_images_keeps_the_flag_when_a_pass_is_interrupted():
+    requests = [_waiting_image_request(1, [[4, 4]]), _waiting_image_request(2, [[4, 4]])]
+    engine, wrapper = _build_waiting_engine(requests)
+    engine._get_cached_vision_embedding.side_effect = RuntimeError("cache lookup broke")
+
+    with pytest.raises(RuntimeError):
+        _encode_waiting(engine)
+
+    wrapper._forward_vision_encoder.assert_not_called()
+    assert engine._has_deferred_image_encodes is True  # the next pass retries them
+
+
+def test_encode_waiting_images_falls_back_per_request_after_a_count_mismatch(caplog):
+    requests = [_waiting_image_request(1, [[4, 4]]), _waiting_image_request(2, [[2, 4]])]
+    engine, wrapper = _build_waiting_engine(requests)
+    wrapper._forward_vision_encoder.side_effect = (
+        lambda imgs, num_image_tiles=None, imgs_sizes=None: (
+            torch.zeros(1, 1, 1)
+            if len(imgs_sizes) > 1
+            else _arange_encoder(imgs, imgs_sizes=imgs_sizes)
+        )
+    )
+
+    with caplog.at_level(logging.WARNING, logger=dynamic_engine.logger.name):
+        _encode_waiting(engine)
+
+    assert "shared vision encoding of 2 requests failed" in caplog.text
+    assert all(request.image_embeddings is not None for request in requests)
+    engine._handle_failed_request.assert_not_called()
+    # Only this group fell back: later image requests are still deferred and batched.
+    assert engine._can_defer_image_encode(
+        imgs=torch.ones(1, 4, 3), num_tiles=None, imgs_sizes=torch.tensor([[4, 4]]), num_frames=None
+    )
+
+
+def test_refresh_leaves_a_waiting_deferred_request_to_the_shared_encode():
+    request = _waiting_image_request(7, [[4, 4]])
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.waiting_request_ids = deque([7])
+    engine._has_deferred_image_encodes = False
+    wrapper = mock.Mock()
+    engine.controller = mock.Mock(inference_wrapped_model=wrapper)
+
+    engine._refresh_vlm_request_data(request)
+
+    wrapper._forward_vision_encoder.assert_not_called()
+    assert request.image_embeddings is None
+    assert engine._has_deferred_image_encodes is True
+
+
+def test_build_vlm_request_encodes_at_admission_for_non_concatenable_layout():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
+    params = SamplingParams(num_tokens_to_generate=1, termination_id=0)
+
+    with mock.patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")):
+        request = engine._build_vlm_request(
+            request_id=1,
+            prompt_str=None,
+            tokens=torch.tensor([10, 42, 20], dtype=torch.int64),
+            sampling_params=params,
+            imgs=torch.ones(2, 3, 4, 4),  # [N, C, H, W]: not a patch layout the engine can concat
+            num_tiles=None,
+            num_img_embeddings_per_tile=0,
+            imgs_sizes=torch.tensor([[2, 2]]),
+            media_tokens_preexpanded=False,
+        )
+
+    wrapper._forward_vision_encoder.assert_called_once()
+    assert request.deferred_image_embedding_count is None
+
+
+def test_schedule_waiting_requests_encodes_deferred_images_first():
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    order = []
+    engine._encode_waiting_images = mock.Mock(side_effect=lambda: order.append("encode"))
+    engine.schedule_non_chunked_prefill = mock.Mock(side_effect=lambda: order.append("prefill"))
+    engine.enable_chunked_prefill = False
+    engine.waiting_request_ids = deque()
+    engine._generation_epoch = None
+
+    engine.schedule_waiting_requests()
+
+    assert order == ["encode", "prefill"]
+
+
+def test_encode_waiting_images_shares_one_encoder_call():
+    text_request = mock.Mock(spec=DynamicInferenceRequest)
+    text_request.request_id = 2
+    requests = [
+        _waiting_image_request(1, [[4, 4]]),  # 4 embeddings
+        text_request,
+        _waiting_image_request(3, [[2, 4], [4, 4]]),  # 2 + 4 embeddings
+    ]
+    engine, wrapper = _build_waiting_engine(requests)
+
+    _encode_waiting(engine)
+
+    wrapper._forward_vision_encoder.assert_called_once()
+    encoder_args, encoder_kwargs = wrapper._forward_vision_encoder.call_args
+    assert encoder_args[0].shape == (1, 10, 3)
+    assert encoder_args[0][0, :4, 0].tolist() == [1.0] * 4
+    assert encoder_args[0][0, 4:, 0].tolist() == [3.0] * 6
+    assert encoder_kwargs["imgs_sizes"].tolist() == [[4, 4], [2, 4], [4, 4]]
+    assert requests[0].image_embeddings.flatten().tolist() == [0.0, 1.0, 2.0, 3.0]
+    assert requests[2].image_embeddings.flatten().tolist() == [4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
+    assert [c.args[0] for c in engine.context.add_vlm_request_data.call_args_list] == [1, 3]
+    assert engine._cache_vision_embedding.call_count == 2
+    assert list(engine.waiting_request_ids) == [1, 2, 3]
+    engine._handle_failed_request.assert_not_called()
+
+
+def test_encode_waiting_images_copies_shared_slices_that_go_into_the_cache():
+    keyed_request = _waiting_image_request(1, [[4, 4]], media_cache_key="a")
+    unkeyed_request = _waiting_image_request(2, [[4, 4]])
+    engine, wrapper = _build_waiting_engine([keyed_request, unkeyed_request])
+    engine.vision_embedding_cache_max_bytes = 1 << 20
+
+    _encode_waiting(engine)
+
+    wrapper._forward_vision_encoder.assert_called_once()
+    # The cache sizes an entry by its storage, so a cached slice must own its memory.
+    (cached,) = [c.args[1] for c in engine._cache_vision_embedding.call_args_list if c.args[0]]
+    assert cached.untyped_storage().nbytes() == cached.numel() * cached.element_size()
+    assert keyed_request.image_embeddings is cached
+    shared = unkeyed_request.image_embeddings
+    assert shared.untyped_storage().nbytes() > shared.numel() * shared.element_size()
+    assert keyed_request.image_embeddings.flatten().tolist() == [0.0, 1.0, 2.0, 3.0]
+    assert unkeyed_request.image_embeddings.flatten().tolist() == [4.0, 5.0, 6.0, 7.0]
+
+
+def test_encode_waiting_images_skips_requests_already_encoded_or_cached():
+    encoded_request = _waiting_image_request(1, [[4, 4]])
+    encoded_request.image_embeddings = torch.zeros(4, 1, 1)
+    cached_request = _waiting_image_request(2, [[4, 4]], media_cache_key="hit")
+    fresh_request = _waiting_image_request(3, [[4, 4]])
+    engine, wrapper = _build_waiting_engine([encoded_request, cached_request, fresh_request])
+    engine._get_cached_vision_embedding.side_effect = lambda key: (
+        torch.full((4, 1, 1), 7.0) if key == "hit" else None
+    )
+
+    _encode_waiting(engine)
+
+    # Only the fresh request needs the encoder, and alone it takes the per-request path.
+    wrapper._forward_vision_encoder.assert_called_once()
+    assert wrapper._forward_vision_encoder.call_args.kwargs["imgs_sizes"].tolist() == [[4, 4]]
+    assert cached_request.image_embeddings.flatten().tolist() == [7.0] * 4
+    assert fresh_request.image_embeddings.flatten().tolist() == [0.0, 1.0, 2.0, 3.0]
+    assert encoded_request.image_embeddings.flatten().tolist() == [0.0] * 4
+
+
+def test_encode_waiting_images_encodes_shared_media_key_once():
+    requests = [
+        _waiting_image_request(1, [[4, 4]], media_cache_key="same"),
+        _waiting_image_request(2, [[4, 4]], media_cache_key="same"),
+        _waiting_image_request(3, [[2, 4]], media_cache_key="other"),
+    ]
+    engine, wrapper = _build_waiting_engine(requests)
+
+    _encode_waiting(engine)
+
+    wrapper._forward_vision_encoder.assert_called_once()
+    assert wrapper._forward_vision_encoder.call_args.kwargs["imgs_sizes"].tolist() == [
+        [4, 4],
+        [2, 4],
+    ]
+    assert requests[0].image_embeddings.flatten().tolist() == [0.0, 1.0, 2.0, 3.0]
+    assert torch.equal(requests[1].image_embeddings, requests[0].image_embeddings)
+    assert requests[2].image_embeddings.flatten().tolist() == [4.0, 5.0]
+
+
+def test_encode_waiting_images_caps_each_shared_call_at_max_tokens():
+    requests = [_waiting_image_request(i, [[4, 4]]) for i in (1, 2, 3)]  # 4 embeddings each
+    engine, wrapper = _build_waiting_engine(requests, max_tokens=8)
+
+    _encode_waiting(engine)
+
+    # 4 + 4 fits the budget; the third request is alone and takes the per-request path.
+    sizes = [
+        c.kwargs["imgs_sizes"].tolist() for c in wrapper._forward_vision_encoder.call_args_list
+    ]
+    assert sizes == [[[4, 4], [4, 4]], [[4, 4]]]
+    for request in requests:
+        assert request.image_embeddings.flatten().tolist() == [0.0, 1.0, 2.0, 3.0] or (
+            request.image_embeddings.flatten().tolist() == [4.0, 5.0, 6.0, 7.0]
+        )
+    assert all(request.image_embeddings is not None for request in requests)
+
+
+def test_encode_waiting_images_falls_back_per_request_when_shared_call_fails(caplog):
+    requests = [_waiting_image_request(1, [[4, 4]]), _waiting_image_request(2, [[4, 4]])]
+    engine, wrapper = _build_waiting_engine(requests)
+
+    def _encode(imgs, num_image_tiles=None, imgs_sizes=None):
+        if len(imgs_sizes) > 1:
+            raise RuntimeError("encoder exploded")
+        return _arange_encoder(imgs, imgs_sizes=imgs_sizes)
+
+    wrapper._forward_vision_encoder.side_effect = _encode
+
+    with caplog.at_level(logging.WARNING, logger=dynamic_engine.logger.name):
+        _encode_waiting(engine)
+
+    assert "shared vision encoding of 2 requests failed" in caplog.text
+    assert wrapper._forward_vision_encoder.call_count == 3
+    for request in requests:
+        assert request.image_embeddings.flatten().tolist() == [0.0, 1.0, 2.0, 3.0]
+    engine._handle_failed_request.assert_not_called()
+
+
+def test_encode_waiting_images_fails_only_the_request_whose_encode_is_wrong():
+    bad_request = _waiting_image_request(1, [[4, 4]])
+    good_request = _waiting_image_request(2, [[2, 4]])
+    engine, wrapper = _build_waiting_engine([bad_request, good_request])
+
+    def _encode(imgs, num_image_tiles=None, imgs_sizes=None):
+        total = sum(_patch_count(imgs_sizes))
+        if total == 6:  # the shared call: wrong total forces the per-request fallback
+            return torch.zeros(5, 1, 1)
+        if total == 4:  # bad_request alone: still one embedding short
+            return torch.zeros(3, 1, 1)
+        return _arange_encoder(imgs, imgs_sizes=imgs_sizes)
+
+    wrapper._forward_vision_encoder.side_effect = _encode
+
+    _encode_waiting(engine)
+
+    engine._handle_failed_request.assert_called_once_with(
+        1, stage="encode its images before prefill"
+    )
+    bad_request.add_event_error_nontransient.assert_called_once()
+    assert list(engine.waiting_request_ids) == [2]
+    assert bad_request.image_embeddings is None
+    assert good_request.image_embeddings.flatten().tolist() == [0.0, 1.0]
+    assert [c.args[0] for c in engine.context.add_vlm_request_data.call_args_list] == [2]
+
+
+def test_encode_waiting_images_returns_at_once_without_deferred_admissions():
+    engine, wrapper = _build_waiting_engine([_waiting_image_request(1, [[4, 4]])])
+    engine._has_deferred_image_encodes = False
+    engine.get_request = mock.Mock(side_effect=AssertionError("queue must not be scanned"))
+
+    _encode_waiting(engine)
+
+    wrapper._forward_vision_encoder.assert_not_called()
+
+
+def test_encode_waiting_images_clears_the_flag_once_the_queue_is_encoded():
+    request = _waiting_image_request(1, [[4, 4]])
+    engine, _ = _build_waiting_engine([request, _waiting_image_request(2, [[4, 4]])])
+
+    _encode_waiting(engine)
+
+    assert engine._has_deferred_image_encodes is False
+    assert request.deferred_image_embedding_count is None
+
+
+def test_encode_waiting_images_concatenates_two_dimensional_patch_tensors():
+    requests = [_waiting_image_request(1, [[4, 4]]), _waiting_image_request(2, [[2, 4]])]
+    for request in requests:
+        request.imgs = request.imgs[0]  # [P, F]
+    engine, wrapper = _build_waiting_engine(requests)
+
+    _encode_waiting(engine)
+
+    wrapper._forward_vision_encoder.assert_called_once()
+    assert wrapper._forward_vision_encoder.call_args.args[0].shape == (6, 3)
+    assert requests[0].image_embeddings.flatten().tolist() == [0.0, 1.0, 2.0, 3.0]
+    assert requests[1].image_embeddings.flatten().tolist() == [4.0, 5.0]
+
+
+def test_encode_waiting_images_falls_back_per_request_on_mixed_layouts(caplog):
+    requests = [_waiting_image_request(1, [[4, 4]]), _waiting_image_request(2, [[2, 4]])]
+    requests[1].imgs = requests[1].imgs[0]  # one [P, F] among [1, P, F]
+    engine, wrapper = _build_waiting_engine(requests)
+
+    with caplog.at_level(logging.WARNING, logger=dynamic_engine.logger.name):
+        _encode_waiting(engine)
+
+    assert "cannot concatenate image tensors" in caplog.text
+    assert wrapper._forward_vision_encoder.call_count == 2
+    assert all(request.image_embeddings is not None for request in requests)
+
+
+def test_encode_waiting_images_fails_duplicates_of_a_failed_primary():
+    primary = _waiting_image_request(1, [[4, 4]], media_cache_key="same")
+    duplicate = _waiting_image_request(2, [[4, 4]], media_cache_key="same")
+    engine, wrapper = _build_waiting_engine([primary, duplicate])
+    wrapper._forward_vision_encoder.side_effect = RuntimeError("encoder exploded")
+
+    _encode_waiting(engine)
+
+    assert sorted(c.args[0] for c in engine._handle_failed_request.call_args_list) == [1, 2]
+    assert list(engine.waiting_request_ids) == []
+    engine._cache_vision_embedding.assert_not_called()
+
+
+def test_encode_waiting_images_duplicates_share_the_primary_without_recaching():
+    primary = _waiting_image_request(1, [[4, 4]], media_cache_key="same")
+    duplicate = _waiting_image_request(2, [[4, 4]], media_cache_key="same")
+    engine, _ = _build_waiting_engine([primary, duplicate])
+
+    _encode_waiting(engine)
+
+    assert engine._cache_vision_embedding.call_count == 1
+    assert torch.equal(duplicate.image_embeddings, primary.image_embeddings)
+    assert [c.args[0] for c in engine.context.add_vlm_request_data.call_args_list] == [1, 2]
+
+
+def test_encode_waiting_images_fails_only_the_member_whose_count_disagrees():
+    short_request = _waiting_image_request(1, [[4, 4]])
+    short_request.deferred_image_embedding_count = 3  # admission count disagrees with its mask
+    other_request = _waiting_image_request(2, [[2, 4]])
+    engine, wrapper = _build_waiting_engine([short_request, other_request])
+
+    _encode_waiting(engine)
+
+    # The shared call returns 4 + 2 = 6 rows against the 3 + 2 = 5 the counts expect, so the
+    # group is encoded per request: the first request's 4 rows disagree with its count of 3 and
+    # only it fails.
+    engine._handle_failed_request.assert_called_once_with(
+        1, stage="encode its images before prefill"
+    )
+    assert list(engine.waiting_request_ids) == [2]
+    assert other_request.image_embeddings is not None
 
 
 def teardown_module(module):
@@ -1986,6 +2441,9 @@ def test_drained_reset_preserves_coordinator_runtime_state():
     engine.resume_request_ids = []
     engine._vision_embedding_cache = {"cached": _make_vision_cache_entry(torch.ones(1))}
     engine._vision_embedding_cache_bytes = 4
+    # Drained, so the staging backlog peak is a stale per-run statistic.
+    engine._staging_tasks = set()
+    engine._staging_tasks_peak = 3
 
     loop = engine._loop
     condition = engine._cond
@@ -2014,6 +2472,7 @@ def test_drained_reset_preserves_coordinator_runtime_state():
     assert engine.resume_request_ids is None
     assert not engine._vision_embedding_cache
     assert engine._vision_embedding_cache_bytes == 0
+    assert engine._staging_tasks_peak == 0
     engine.context.reset.assert_called_once_with()
     engine.controller._async_sched_forward.clear.assert_called_once_with()
 
@@ -2035,22 +2494,32 @@ def test_drained_reset_rejects_suspended_state_before_context_mutation():
     engine.controller._async_sched_forward.clear.assert_not_called()
 
 
-def test_drained_reset_rejects_outstanding_requests_before_mutation():
-    """Reset rejects a nonempty request table before clearing engine state."""
+@pytest.mark.parametrize(
+    ("requests", "staging_tasks", "match"),
+    [
+        ({7: object()}, set(), "must drain all requests before reset"),
+        # A staged reply outlives its request, so an empty request table is not enough.
+        ({}, {object()}, "must drain all payload staging before reset"),
+    ],
+    ids=["outstanding-requests", "in-flight-staging"],
+)
+def test_drained_reset_rejects_undrained_work_before_mutation(requests, staging_tasks, match):
+    """Reset rejects outstanding requests or payload staging before clearing engine state."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._state_events = {}
     engine.state = EngineState.RUNNING
-    requests = {7: object()}
     engine.requests = requests
+    engine._staging_tasks = staging_tasks
     engine.context = types.SimpleNamespace(reset=mock.Mock())
     engine.controller = types.SimpleNamespace(
         _async_sched_forward=types.SimpleNamespace(clear=mock.Mock())
     )
 
-    with pytest.raises(RuntimeError, match="must drain all requests before reset"):
+    with pytest.raises(RuntimeError, match=match):
         engine.reset()
 
     assert engine.requests is requests
+    assert engine._staging_tasks is staging_tasks
     engine.context.reset.assert_not_called()
     engine.controller._async_sched_forward.clear.assert_not_called()
 
@@ -2201,7 +2670,7 @@ def test_finished_vlm_reply_omits_input_only_tensors():
     engine.payload_stager = None
 
     engine.local_metadata_ledger_enabled = False
-    serialized = engine._serialize_finished_request(request)
+    serialized = engine._serialize_finished_request(request, None)
 
     assert serialized["generated_tokens"] == [7]
     for key in (
@@ -2440,16 +2909,21 @@ def test_streaming_partials_are_sent():
 
 
 class _RecordingStager:
-    """RequestPayloadStager test double: keeps every staged (uid, payload)."""
+    """RequestPayloadStager test double: keeps every staged (uid, payload) and returns
+    ``response_metadata``, or raises ``error`` without staging anything."""
 
-    def __init__(self):
+    def __init__(self, error=None, response_metadata=None):
         self.staged = []
+        self.error = error
+        self.response_metadata = response_metadata or {}
 
     def stage(self, uid, payload, *, finished_metadata, offload_params=None):
+        if self.error is not None:
+            raise self.error
         self.staged.append((uid, payload))
         self.finished_metadata = finished_metadata
         self.offload_params = offload_params
-        return RequestPayloadStageResult()
+        return RequestPayloadStageResult(response_metadata=self.response_metadata)
 
 
 def _reply_request(uid, status, log_probs, *, streaming=False, return_prompt_tokens=False):
@@ -2471,26 +2945,61 @@ def _reply_request(uid, status, log_probs, *, streaming=False, return_prompt_tok
     return request
 
 
+def _sent_replies(engine):
+    """Decode every ENGINE_REPLY the engine sent, in send order."""
+    replies = []
+    for call in engine.socket_for_receiving_requests.send_multipart.call_args_list:
+        frames = call.args[0]
+        header, _ = msgpack.unpackb(frames[0], raw=False)
+        assert header == Headers.ENGINE_REPLY.value
+        replies.extend(msgpack.unpackb(frame, raw=False) for frame in frames[1:])
+    return replies
+
+
+def _reply_engine(stager):
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.local_metadata_ledger_enabled = False
+    engine.local_metadata_ledger = {}
+    engine.payload_stager = stager
+    engine._staging_tasks = set()
+    engine.socket_for_receiving_requests = mock.Mock()
+    return engine
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("with_stager", "streaming", "expected_offloaded"),
-    [(False, False, False), (True, False, True), (True, True, False)],
+    ("stager", "streaming", "expected_offloaded"),
+    [
+        (None, False, False),
+        ("records", False, True),
+        ("records", True, False),
+        ("raises", False, False),
+        # Metadata that cannot be serialized breaks the reply after a successful write.
+        ("unsendable", False, "failed_reply"),
+        # A reply that cannot be built even without the metadata.
+        ("unserializable", False, "exit"),
+    ],
 )
-def test_payload_offload_stages_only_eligible_completed_replies(
-    with_stager, streaming, expected_offloaded
+async def test_payload_offload_stages_only_eligible_completed_replies(
+    stager, streaming, expected_offloaded
 ):
     """A stager offloads completed non-streaming replies only.
 
     Failed and streaming requests are neither staged nor stripped, and replies are untouched
-    without a stager. An offloaded reply never carries the prompt tensors, even when the
-    request opted into return_prompt_tokens (the stager holds the prompt ids); a reply that
-    is not offloaded still honours the opt-in. The ledger is a separate mechanism and stays
-    off here.
+    without a stager or when its write raises. A staged reply that cannot be sent is
+    replaced by a FAILED reply, or exits the process if even that fails, so the client is
+    never left waiting. An offloaded reply never carries the prompt
+    tensors, even when the request opted into return_prompt_tokens (the stager holds the
+    prompt ids); a reply that is not offloaded still honours the opt-in. The ledger is a
+    separate mechanism and stays off here.
     """
-    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
-    engine.local_metadata_ledger_enabled = False
-    engine.local_metadata_ledger = {}
-    engine.payload_stager = _RecordingStager() if with_stager else None
-    engine.socket_for_receiving_requests = mock.Mock()
+    stager_kind = stager
+    if stager is not None:
+        stager = _RecordingStager(
+            error=RuntimeError("write failed") if stager == "raises" else None,
+            response_metadata={"coords": object()} if stager == "unsendable" else None,
+        )
+    engine = _reply_engine(stager)
     completed = _reply_request(
         "chatcmpl-ok",
         Status.COMPLETED,
@@ -2500,14 +3009,27 @@ def test_payload_offload_stages_only_eligible_completed_replies(
     )
     failed = _reply_request("chatcmpl-failed", Status.FAILED, None)
 
-    engine._send_requests_to_coordinator([completed, failed])
+    if stager_kind == "unserializable":
+        engine._serialize_finished_request = mock.Mock(side_effect=RuntimeError("bad request"))
 
-    engine.socket_for_receiving_requests.send_multipart.assert_called_once()
-    frames = engine.socket_for_receiving_requests.send_multipart.call_args.args[0]
-    header, _ = msgpack.unpackb(frames[0], raw=False)
-    ok_wire, failed_wire = [msgpack.unpackb(frame, raw=False) for frame in frames[1:]]
-    assert header == Headers.ENGINE_REPLY.value
-    assert failed_wire["payload_offloaded"] is False
+    with mock.patch("megatron.core.utils.sys.exit") as exit_process:
+        engine._send_requests_to_coordinator([completed, failed])
+        await engine._drain_staging_tasks()
+
+    wires = {wire["uid"]: wire for wire in _sent_replies(engine)}
+    assert wires["chatcmpl-failed"]["payload_offloaded"] is False
+    if expected_offloaded == "exit":
+        exit_process.assert_called_once_with(1)
+        assert "chatcmpl-ok" not in wires
+        return
+    exit_process.assert_not_called()
+    if expected_offloaded == "failed_reply":
+        ok_wire = wires["chatcmpl-ok"]
+        assert ok_wire["status"] == Status.FAILED.name
+        assert ok_wire["payload_offloaded"] is False
+        assert ok_wire["payload_stage_metadata"] == {}
+        return
+    ok_wire = wires["chatcmpl-ok"]
     assert engine.local_metadata_ledger == {}
     assert ok_wire["payload_offloaded"] is expected_offloaded
     if expected_offloaded:
@@ -2532,16 +3054,16 @@ def test_payload_offload_stages_only_eligible_completed_replies(
     assert ok_wire["generated_tokens"] == [10, 11]
     assert completed.generated_log_probs == [-0.5, -0.25]
     assert completed.prompt_tokens.tolist() == [1, 2, 3]
+    if stager is None:
+        assert engine._staging_log_suffix() == ""
 
 
-def test_finished_request_record_is_built_once_for_ledger_and_stager():
+@pytest.mark.asyncio
+async def test_finished_request_record_is_built_once_for_ledger_and_stager():
     """With both the ledger and a stager on, one FinishedRequestRecord per completed request
     is shared by both; failed requests build none."""
-    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine = _reply_engine(_RecordingStager())
     engine.local_metadata_ledger_enabled = True
-    engine.local_metadata_ledger = {}
-    engine.payload_stager = _RecordingStager()
-    engine.socket_for_receiving_requests = mock.Mock()
     completed = _reply_request("chatcmpl-ok", Status.COMPLETED, [-0.5, -0.25])
     failed = _reply_request("chatcmpl-failed", Status.FAILED, None)
 
@@ -2549,6 +3071,7 @@ def test_finished_request_record_is_built_once_for_ledger_and_stager():
         FinishedRequestRecord, "from_request", wraps=FinishedRequestRecord.from_request
     ) as from_request:
         engine._send_requests_to_coordinator([completed, failed])
+        await engine._drain_staging_tasks()
 
     from_request.assert_called_once_with(completed)
     record = engine.local_metadata_ledger["chatcmpl-ok"]
@@ -2556,6 +3079,82 @@ def test_finished_request_record_is_built_once_for_ledger_and_stager():
     assert record.num_evictions == 0
     ((uid, _),) = engine.payload_stager.staged
     assert uid == "chatcmpl-ok"
+
+
+class _BlockingStager:
+    """RequestPayloadStager test double whose write sets ``started``, then blocks until
+    ``release`` is set."""
+
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.threads = []
+
+    def stage(self, uid, payload, *, finished_metadata, offload_params=None):
+        self.threads.append(threading.current_thread())
+        self.started.set()
+        assert self.release.wait(timeout=10)
+        return RequestPayloadStageResult(response_metadata={"ng_commit_coords": {"uid": uid}})
+
+
+@pytest.mark.asyncio
+async def test_slow_stager_does_not_block_the_engine_loop(caplog):
+    """stage() runs off the engine loop.
+
+    _send_requests_to_coordinator returns while the writes are still running and other
+    replies go out at once. The step log reports the backlog and its peak since the last
+    log line. Shutdown waits for in-flight writes, logs how many it waited for (and is
+    silent when there are none), and each staged reply carries the stager's metadata.
+    """
+    stager = _BlockingStager()
+    engine = _reply_engine(stager)
+    drain_logger = "megatron.core.inference.engines.dynamic_engine"
+
+    def drain_messages():
+        return [
+            r.getMessage() for r in caplog.records if "in-flight payload staging" in r.getMessage()
+        ]
+
+    with caplog.at_level(logging.INFO, logger=drain_logger):
+        await engine._drain_staging_tasks()
+    assert drain_messages() == []
+
+    with mock.patch.object(
+        OffloadedRequestPayload, "from_request", wraps=OffloadedRequestPayload.from_request
+    ) as from_request:
+        engine._send_requests_to_coordinator(
+            [
+                _reply_request("chatcmpl-a", Status.COMPLETED, [-0.5, -0.25]),
+                _reply_request("chatcmpl-failed", Status.FAILED, None),
+                _reply_request("chatcmpl-b", Status.COMPLETED, [-0.5, -0.25]),
+            ]
+        )
+        # Payloads are copied to host during bookkeeping, before any staging task runs.
+        assert from_request.call_count == 2
+    assert await asyncio.to_thread(stager.started.wait, 10)
+
+    # A write is still blocked, yet the engine already moved on.
+    assert [wire["uid"] for wire in _sent_replies(engine)] == ["chatcmpl-failed"]
+    assert stager.threads[0] is not threading.current_thread()
+    assert engine._staging_log_suffix() == " ... payload staging: in-flight 2, peak 2"
+
+    # Release only once draining is underway, so the drain has to wait for both writes.
+    asyncio.get_running_loop().call_soon(stager.release.set)
+    with caplog.at_level(logging.INFO, logger=drain_logger):
+        await engine._drain_staging_tasks()
+
+    (message,) = drain_messages()
+    assert message.startswith("Waiting for 2 in-flight payload staging task(s) before shutdown")
+    assert not engine._staging_tasks
+    staged = {wire["uid"]: wire for wire in _sent_replies(engine)[1:]}
+    assert sorted(staged) == ["chatcmpl-a", "chatcmpl-b"]
+    for uid, wire in staged.items():
+        assert wire["payload_offloaded"] is True
+        assert wire["generated_log_probs"] is None
+        assert wire["payload_stage_metadata"] == {"ng_commit_coords": {"uid": uid}}
+    # The peak resets at each log line, to the backlog at that moment.
+    assert engine._staging_log_suffix() == " ... payload staging: in-flight 0, peak 2"
+    assert engine._staging_log_suffix() == " ... payload staging: in-flight 0, peak 0"
 
 
 def _submit_request_message(request_id, sampling_params, prompt, offload_params):
@@ -5857,6 +6456,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         finished_requests = []
         while engine.has_unfinished_requests():
             finished_requests.extend(engine.step_modern()["finished_requests"])
+        # Staging runs in a task off the engine loop; step_modern() only runs the loop
+        # during a step, so wait for the staged reply as shutdown() would.
+        engine._run_coroutine_sync(engine._drain_staging_tasks())
         finished = finished_requests[0]
 
         # The staged payload is the exact per-token data of the request, keyed by its uid.
@@ -8266,7 +8868,7 @@ class TestGDNDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             num_gap_steps=0,
             top_k=1,
             context_max_requests=32,
-            use_cuda_graphs_for_non_decode_steps=False,
+            use_cuda_graphs_for_non_decode_steps=True,
         )
         eager = self._run_test(**common, num_cuda_graphs=None)
         graphed = self._run_test(

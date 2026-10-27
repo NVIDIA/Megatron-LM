@@ -15,6 +15,9 @@ include = [
     "megatron.training.*",
 ]
 
+[tool.setuptools.package-data]
+"megatron.core.allocator" = ["csrc/*.cpp"]
+
 [tool.setuptools.dynamic]
 version = { attr = "megatron.core.package_info.__version__" }
 readme = { file = "README.md", content-type = "text/markdown" }
@@ -102,7 +105,7 @@ dev = [
     "nemo-lens",
     "megatron-energon[av_decode]~=7.0",
     "av",
-    "Pillow",
+    "Pillow>=13.0.0",
     "flashinfer-python>=0.7.2,<0.8.0",
     "nvidia-cudnn-frontend[cutedsl]==1.32.0",
     "wget",

@@ -6,8 +6,9 @@ Inference kernels do not feed the training loss, but RL rollouts and batch-invar
 inference depend on them replaying bit-exactly. Covered here: KV-cache tensor ops and the
 fused KV append, the inference MoE activations and MXFP8 quantisation, the inference MoE
 permute/unpermute (batch-invariant path bit-exact; the atomic default path is the negative
-control), the vLLM-derived fused MoE GEMM and top-k sum, the batch-invariant GEMM /
-log-softmax / mean kernels, and the CUDA-graph routing-map padding mask. Multi-rank NVLS
+control), the FlashInfer per-token NVFP4 quantizer and MoE, the vLLM-derived fused MoE GEMM
+and top-k sum, the batch-invariant GEMM / log-softmax / mean kernels, the CUDA-graph
+routing-map padding mask, and the zeroing of padding-token rows. Multi-rank NVLS
 symmetric-memory collectives are exempted in the manifest (they need NVLink peers).
 """
 
@@ -373,6 +374,31 @@ def test_mxfp8_quantize_replays():
     assert_replays_bit_exact(fn, (x,), backward=False, what="mxfp8_quantize")
 
 
+@pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
+def test_mxfp8_quantize_rows_replays():
+    """Live-row MXFP8 quantization replays and matches the whole-buffer kernel on live rows."""
+    from megatron.core.inference.quantization.mxfp8_quantize import (
+        mxfp8_quantize,
+        mxfp8_quantize_rows,
+    )
+
+    seeded()
+    rows, K, n_rows = 16384, 2688, 4992  # 39 full 128-row scale tiles
+    x = torch.randn(rows, K, device="cuda", dtype=torch.bfloat16)
+    n_rows_t = _dev_scalar(n_rows)
+    n_scale_bytes = n_rows // 128 * ((K // 32 + 3) // 4) * 512
+
+    def fn(x):
+        data, scale = mxfp8_quantize_rows(x, n_rows_t)
+        return data[:n_rows].view(torch.uint8), scale.view(torch.uint8)[:n_scale_bytes]
+
+    assert_replays_bit_exact(fn, (x,), backward=False, what="mxfp8_quantize_rows")
+    data, scale = fn(x)
+    ref_data, ref_scale = mxfp8_quantize(x)
+    assert torch.equal(data, ref_data[:n_rows].view(torch.uint8))
+    assert torch.equal(scale, ref_scale.view(torch.uint8)[:n_scale_bytes])
+
+
 @pytest.mark.skipif(
     not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
     reason="MXFP8 parameter storage needs Blackwell",
@@ -550,6 +576,9 @@ def test_batch_invariant_mxfp8_permute_replays():
         backward=False,
         what="batch_invariant permute_and_quantize_mxfp8",
     )
+    # Padding rows are zeroed by a kernel over the live rows, not a whole-buffer memset.
+    _, _, _, padding_data, padding_scales = logical_rows(hidden_states, probs)
+    assert not padding_data.any() and not padding_scales.any()
 
 
 def _unpermute_case():
@@ -585,6 +614,37 @@ def test_inference_unpermute_batch_invariant_path_replays():
     assert_replays_bit_exact(
         bi, (expert_output,), replays=4, backward=False, what="unpermute_tokens_in_expert_order"
     )
+
+
+def test_inference_unpermute_batch_invariant_live_tokens_replay():
+    """The fixed grid strides over only the live tokens; tokens past the count stay untouched."""
+    from megatron.core.inference.moe import batch_invariant
+
+    seeded()
+    num_tokens, hidden, num_local, topk = 8192, 1024, 16, 4
+    valid = 3000  # more live tokens than the 1024-program grid, so programs stride
+    rows = valid * topk + 128 * num_local
+    expert_output = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    inverse_map = torch.full((num_tokens, num_local), -1, device="cuda", dtype=torch.int32)
+    positions = torch.randperm(rows, device="cuda")[: valid * topk].view(valid, topk).int()
+    experts = torch.stack([torch.randperm(num_local, device="cuda")[:topk] for _ in range(valid)])
+    inverse_map[torch.arange(valid, device="cuda")[:, None], experts] = positions
+    valid_t = _dev_scalar(valid)
+
+    def bi(expert_output):
+        out = torch.full((num_tokens, hidden), 7.0, device="cuda", dtype=torch.float32)
+        return batch_invariant.unpermute_tokens_in_expert_order(
+            expert_output, inverse_map, valid_t, out
+        )
+
+    assert_replays_bit_exact(
+        bi,
+        (expert_output,),
+        replays=4,
+        backward=False,
+        what="unpermute_tokens_in_expert_order (live tokens)",
+    )
+    assert torch.all(bi(expert_output)[valid:] == 7.0)
 
 
 def test_inference_unpermute_batch_invariant_path_accumulates_in_fp64():
@@ -656,6 +716,8 @@ def test_vllm_fused_moe_and_moe_sum_replay():
     fc2 = torch.randn(experts, hidden, ffn, device="cuda", dtype=torch.bfloat16) * 0.02
     valid = _dev_scalar(max_tokens - 100)
 
+    # Ordinary inference applies the routing probabilities in the FC2 GEMM epilogue (fp32
+    # accumulator, before the bf16 store) and then reduces over top-k without weights.
     def fn(h, p):
         out = vllm_fused_moe(
             h, p, fc1, fc2, ActivationType.SQUARED_RELU, experts, 0, valid, routing_map
@@ -668,11 +730,32 @@ def test_vllm_fused_moe_and_moe_sum_replay():
 
     inp = torch.randn(max_tokens * topk, 2688, device="cuda", dtype=torch.bfloat16)
 
-    def moe_sum(inp, p):
-        out = _moe_sum(inp, p, max_tokens, topk, 2688, valid, routing_map, 0, experts)
-        return out[: max_tokens - 100]
+    # The top-k sum both ways: weighted (apply_weights=True) and the unweighted sum that
+    # vllm_fused_moe now uses after the FC2 epilogue has applied the weights.
+    for apply_weights in (True, False):
 
-    assert_replays_bit_exact(moe_sum, (inp, probs), replays=4, backward=False, what="_moe_sum")
+        def moe_sum(inp, p, apply_weights=apply_weights):
+            out = _moe_sum(
+                inp,
+                p,
+                max_tokens,
+                topk,
+                2688,
+                valid,
+                routing_map,
+                0,
+                experts,
+                apply_weights=apply_weights,
+            )
+            return out[: max_tokens - 100]
+
+        assert_replays_bit_exact(
+            moe_sum,
+            (inp, probs),
+            replays=4,
+            backward=False,
+            what=f"_moe_sum(apply_weights={apply_weights})",
+        )
 
 
 def test_vllm_moe_align_block_size_replays():
@@ -798,6 +881,20 @@ def test_mask_routing_padding_replays():
     assert_replays_bit_exact(fn, (routing_map,), backward=False, what="mask_routing_padding")
 
 
+def test_zero_padding_rows_replays():
+    from megatron.core.inference.contexts.zero_padding_rows_kernel import zero_padding_rows
+
+    seeded()
+    activations = torch.randn(2048, 1, 1024, device="cuda", dtype=torch.bfloat16)
+    real = _dev_scalar(37 + 2048)
+
+    def fn(activations):
+        zero_padding_rows(activations, real, first_token_idx=2048)
+        return activations
+
+    assert_replays_bit_exact(fn, (activations,), backward=False, what="zero_padding_rows")
+
+
 @pytest.mark.launch_on_gb200
 def test_mxfp8_swiglu_moe_replays():
     """SwiGLU must select separate MXFP8 quantization without a caller override."""
@@ -908,3 +1005,130 @@ def test_torch_mxfp8_moe_is_batch_invariant():
         "Torch MXFP8 MoE output changed with the batch; max abs diff: "
         f"{(output_alone - output_batched).abs().max().item()}"
     )
+
+
+# --- FlashInfer per-token NVFP4 MoE ----------------------------------------------------------
+
+
+def _require_flashinfer_nvfp4():
+    from megatron.core.inference.moe.flashinfer_nvfp4 import HAVE_FLASHINFER_ROUTED_NVFP4
+
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("per-token NVFP4 MoE requires Blackwell")
+    if not HAVE_FLASHINFER_ROUTED_NVFP4:
+        pytest.skip("FlashInfer >= 0.7.0 per-token NVFP4 MoE is unavailable")
+
+
+def _nvfp4_expert_weights(num_experts, hidden_size, intermediate_size, gated):
+    from megatron.core.inference.moe.flashinfer_nvfp4 import prepare_routed_nvfp4_weights
+
+    fc1_rows = 2 * intermediate_size if gated else intermediate_size
+    fc1 = torch.randn(num_experts, fc1_rows, hidden_size, device="cuda") * 0.05
+    fc2 = torch.randn(num_experts, hidden_size, intermediate_size, device="cuda") * 0.05
+    return prepare_routed_nvfp4_weights(fc1.bfloat16(), fc2.bfloat16())
+
+
+def test_per_token_nvfp4_quantize_replays():
+    from megatron.core.inference.moe.flashinfer_nvfp4 import quantize_routed_nvfp4_input
+
+    _require_flashinfer_nvfp4()
+    seeded()
+    x = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+    x *= torch.logspace(-2, 2, x.shape[0], device="cuda", dtype=torch.bfloat16).unsqueeze(1)
+
+    def fn(x):
+        data, scale, per_token_scale = quantize_routed_nvfp4_input(x, x.shape[-1])
+        return data.view(torch.uint8), scale.view(torch.uint8), per_token_scale
+
+    assert_replays_bit_exact(fn, (x,), backward=False, what="per-token nvfp4_quantize")
+
+
+def _nvfp4_activation_type(gated):
+    from flashinfer import ActivationType
+
+    return (ActivationType.Swiglu if gated else ActivationType.Relu2).value
+
+
+@pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
+def test_flashinfer_nvfp4_moe_replays(gated):
+    """Batch-invariant mode selects an order-fixed top-k combine, so replays are exact."""
+    from megatron.core.inference.moe.flashinfer_nvfp4 import flashinfer_routed_nvfp4_moe
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        set_batch_invariant_mode,
+    )
+
+    _require_flashinfer_nvfp4()
+    seeded()
+    num_experts, tokens, topk = 8, 384, 4
+    weights = _nvfp4_expert_weights(num_experts, 512, 512, gated)
+    x = torch.randn(tokens, 512, device="cuda", dtype=torch.bfloat16)
+    routes = torch.stack(
+        [torch.randperm(num_experts, device="cuda")[:topk] for _ in range(tokens)]
+    ).to(torch.int32)
+    probs = torch.rand(tokens, topk, device="cuda")
+
+    def run(x):
+        return flashinfer_routed_nvfp4_moe(
+            x,
+            routes,
+            probs,
+            weights,
+            num_experts=num_experts,
+            local_expert_offset=0,
+            activation_type=_nvfp4_activation_type(gated),
+        )
+
+    with torch.no_grad(), set_batch_invariant_mode(True):
+        assert_replays_bit_exact(run, (x,), replays=3, backward=False, what="FlashInfer NVFP4 MoE")
+
+
+@pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
+def test_flashinfer_nvfp4_moe_is_batch_invariant(gated):
+    """A routed token must be bitwise stable as the batch and its expert loads change.
+
+    Unlike a fixed-size buffer with inactive rows, the batch size itself changes here, so
+    kernel tactic and tile selection see a different M.
+    """
+    from megatron.core.inference.moe.flashinfer_nvfp4 import flashinfer_routed_nvfp4_moe
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        set_batch_invariant_mode,
+    )
+
+    _require_flashinfer_nvfp4()
+    torch.manual_seed(1234)
+    num_experts, hidden_size, topk = 4, 512, 2
+    weights = _nvfp4_expert_weights(num_experts, hidden_size, hidden_size, gated)
+    target = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
+    target_experts = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    target_probs = torch.tensor([0.625, 0.375], device="cuda", dtype=torch.float32)
+
+    def _run(num_tokens: int, target_row: int) -> torch.Tensor:
+        # 100x larger co-batch rows would dominate a tensor-wide activation scale.
+        hidden_states = (
+            torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16) * 100
+        )
+        routing_map = torch.empty(num_tokens, topk, device="cuda", dtype=torch.int32)
+        routing_map.copy_(target_experts)
+        probs = torch.full((num_tokens, topk), 0.5, device="cuda", dtype=torch.float32)
+        hidden_states[target_row].copy_(target)
+        probs[target_row].copy_(target_probs)
+        return flashinfer_routed_nvfp4_moe(
+            hidden_states,
+            routing_map,
+            probs,
+            weights,
+            num_experts=num_experts,
+            local_expert_offset=0,
+            activation_type=_nvfp4_activation_type(gated),
+        )[target_row]
+
+    with torch.no_grad(), set_batch_invariant_mode(True):
+        output_alone = _run(1, 0)
+        output_batched = _run(193, 73)
+        output_large = _run(1024, 517)
+
+    for name, output in (("193", output_batched), ("1024", output_large)):
+        assert torch.equal(output_alone, output), (
+            f"FlashInfer NVFP4 MoE output changed at batch {name}; max abs diff: "
+            f"{(output_alone.float() - output.float()).abs().max().item()}"
+        )
