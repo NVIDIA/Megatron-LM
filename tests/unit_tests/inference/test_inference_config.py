@@ -298,6 +298,27 @@ class TestInferenceConfig:
 
         assert inference_config.async_sched_mode == expected
 
+    def test_gc_mode_flag_reaches_runtime_config(self):
+        """Ensure --inference-gc-mode is opt-in, maps onto InferenceConfig and is validated."""
+        assert InferenceConfig().gc_mode == "default"
+        with pytest.raises(ValueError, match="Unsupported gc_mode"):
+            InferenceConfig(gc_mode="disable")
+        parser = _add_inference_args(ArgumentParser())
+        assert parser.parse_args([]).inference_gc_mode == "default"
+        args = parser.parse_args(["--inference-gc-mode", "freeze_overlap"])
+        model = SimpleNamespace(
+            position_embedding_type="rope",
+            max_sequence_length=4096,
+            pg_collection="pg",
+            decoder=SimpleNamespace(layer_type_list=None),
+            config=SimpleNamespace(inference_cuda_graph_scope=InferenceCudaGraphScope.none),
+        )
+        setup_config = InferenceSetupConfig(inference_gc_mode=args.inference_gc_mode)
+
+        inference_config = setup_config.to_inference_config(model=model, verbose=False)
+
+        assert inference_config.gc_mode == "freeze_overlap"
+
     def test_inference_setup_config_maps_disaggregation_fields(self):
         """Ensure declarative inference config maps disaggregation fields."""
         model = SimpleNamespace(
