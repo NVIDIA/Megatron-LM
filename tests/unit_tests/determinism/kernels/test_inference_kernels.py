@@ -261,7 +261,8 @@ def test_mxfp8_quantize_replays():
 
 @pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
 def test_mxfp8_quantize_rows_replays():
-    """Live-row MXFP8 quantization replays and matches the whole-buffer kernel on live rows."""
+    """Live-row MXFP8 quantization replays and matches the whole-buffer kernel on live rows,
+    and on every row when the count exceeds the buffer height."""
     from megatron.core.inference.quantization.mxfp8_quantize import (
         mxfp8_quantize,
         mxfp8_quantize_rows,
@@ -282,6 +283,20 @@ def test_mxfp8_quantize_rows_replays():
     ref_data, ref_scale = mxfp8_quantize(x)
     assert torch.equal(data, ref_data[:n_rows].view(torch.uint8))
     assert torch.equal(scale, ref_scale.view(torch.uint8)[:n_scale_bytes])
+
+    # A count past the buffer height is clamped to it: every row is quantized.
+    past_height_t = _dev_scalar(2 * rows)
+
+    def fn_past_height(x):
+        data, scale = mxfp8_quantize_rows(x, past_height_t)
+        return data.view(torch.uint8), scale.view(torch.uint8)
+
+    assert_replays_bit_exact(
+        fn_past_height, (x,), backward=False, what="mxfp8_quantize_rows (count past height)"
+    )
+    data, scale = fn_past_height(x)
+    assert torch.equal(data, ref_data.view(torch.uint8))
+    assert torch.equal(scale, ref_scale.view(torch.uint8))
 
 
 @pytest.mark.skipif(

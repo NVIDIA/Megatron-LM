@@ -47,6 +47,30 @@ class TestMxfp8QuantizeRows:
         # Rows past n are never quantized: their scales stay zero.
         assert not scale.view(torch.uint8)[_scale_bytes(n, K) :].any()
 
+    @pytest.mark.parametrize(
+        "M,K,n", [(120, 32, 60), (120, 32, 120), (120, 32, 128), (124, 64, 124), (124, 64, 128)]
+    )
+    def test_count_clamped_to_height(self, M, K, n):
+        """Rows [0, min(n, M)) are quantized: a count past M gives exactly mxfp8_quantize(x).
+
+        x is the head of a larger buffer of ones and n ends inside the last 128-row scale tile,
+        so a kernel that ran past M would read those ones and write their nonzero scales into
+        the tile's padding, where the comparison sees them. The shapes keep such an overrun
+        contained: its (128 - M) * K <= 256 data bytes fit the allocator's 512-byte rounding.
+        """
+        torch.manual_seed(3)
+        base = torch.ones(MXFP8_SCALE_ROW_BLOCK + 128, K, device="cuda", dtype=torch.bfloat16)
+        base[:M] = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 4
+        x = base[:M]
+        data, scale = mxfp8_quantize_rows(x, torch.tensor([n], device="cuda", dtype=torch.int32))
+        live = min(n, M)
+        # The swizzled scales of x[:live] are a prefix of x's; every later byte stays zero.
+        ref_data, ref_scale = mxfp8_quantize(x[:live])
+        expected_scale = torch.zeros_like(scale.view(torch.uint8))
+        expected_scale[: ref_scale.numel()] = ref_scale.view(torch.uint8)
+        assert torch.equal(data[:live].view(torch.uint8), ref_data.view(torch.uint8))
+        assert torch.equal(scale.view(torch.uint8), expected_scale)
+
     def test_cuda_graph_replay_with_changing_count(self):
         torch.manual_seed(1)
         x = torch.randn(4096, 2688, device="cuda", dtype=torch.bfloat16)
