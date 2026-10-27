@@ -5,6 +5,7 @@ These kernels skip padding rows (where permutation_map == -1) to avoid
 wasted computation on aligned-but-empty expert slots.
 """
 
+from dataclasses import dataclass
 from typing import Optional
 from unittest.mock import MagicMock
 
@@ -35,6 +36,69 @@ if not HAVE_TRITON:
 
 def _ceil_div(a, b):
     return (a + b - 1) // b
+
+
+@dataclass(frozen=True)
+class GLUOptions:
+    """Options of the gated (GLU) expert activation, applied as in training's TEGroupedMLP.
+
+    Attributes:
+        clamp_value: activation_func_clamp_value. Caps the gate at this value and limits the
+            linear half to [-clamp_value, clamp_value] before the activation.
+        linear_offset: glu_linear_offset. The activation is act(gate) * (linear + offset).
+        interleave_size: moe_mlp_glu_interleave_size. FC1 rows alternate gate and linear
+            blocks of this width instead of holding [gate | linear] halves.
+    """
+
+    clamp_value: Optional[float] = None
+    linear_offset: float = 0.0
+    interleave_size: Optional[int] = None
+
+    def kernel_args(self, width: int) -> dict:
+        """Arguments of the GLU Triton kernels for an activation output ``width`` wide."""
+        assert (
+            self.interleave_size is None or width % self.interleave_size == 0
+        ), f"GLU output width {width} is not a multiple of interleave size {self.interleave_size}"
+        return dict(
+            clamp_value=0.0 if self.clamp_value is None else self.clamp_value,
+            linear_offset=self.linear_offset,
+            CLAMP=self.clamp_value is not None,
+            OFFSET=self.linear_offset != 0.0,
+            INTERLEAVE=self.interleave_size or 0,
+        )
+
+
+@triton.jit
+def _glu_columns(cols, N, INTERLEAVE: tl.constexpr):
+    """FC1-output columns of the gate and linear inputs to GLU output columns ``cols``.
+
+    FC1 rows hold [gate | linear] halves of width N or, when INTERLEAVE > 0
+    (moe_mlp_glu_interleave_size), alternating INTERLEAVE-wide gate and linear blocks.
+    """
+    if INTERLEAVE > 0:
+        gate_cols = (cols // INTERLEAVE) * (2 * INTERLEAVE) + cols % INTERLEAVE
+        linear_cols = gate_cols + INTERLEAVE
+    else:
+        gate_cols = cols
+        linear_cols = cols + N
+    return gate_cols, linear_cols
+
+
+@triton.jit
+def _glu_inputs(
+    gate, linear, clamp_value, linear_offset, CLAMP: tl.constexpr, OFFSET: tl.constexpr
+):
+    """Apply training's GLU input options to FP32 gate and linear values.
+
+    CLAMP (activation_func_clamp_value) caps the gate at clamp_value and limits the linear
+    half to [-clamp_value, clamp_value]. OFFSET adds glu_linear_offset to the linear half.
+    """
+    if CLAMP:
+        gate = tl.minimum(gate, clamp_value)
+        linear = tl.minimum(tl.maximum(linear, -clamp_value), clamp_value)
+    if OFFSET:
+        linear = linear + linear_offset
+    return gate, linear
 
 
 @triton.jit
@@ -143,13 +207,19 @@ def _swiglu_kernel(
     n_used_ptr,
     N,  # output width = ffn_hidden (input row width is 2N)
     max_rows,
+    clamp_value,
+    linear_offset,
+    CLAMP: tl.constexpr,
+    OFFSET: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
     ZERO_PADDING: tl.constexpr,
 ):
     """SwiGLU: SiLU(gate) * up, skipping rows beyond n_used and padding rows (perm_map == -1).
 
-    Input row width is 2N: gate = first N cols, up = last N cols (megatron chunk convention).
+    Input row width is 2N: gate = first N cols, up = last N cols (megatron chunk convention),
+    or interleaved blocks (see _glu_columns). CLAMP / OFFSET apply training's GLU options.
     Output row width is N. Fixed NUM_BLOCKS CTAs iterating rows -> CUDA-graph compatible.
     MXFP8 quantization and grouped GEMM do not receive ``perm_map``. ZERO_PADDING
     therefore materializes neutral values for dummy rows inside each expert segment.
@@ -165,10 +235,11 @@ def _swiglu_kernel(
                 for n in tl.range(0, N, BLOCK_N):
                     o = n + tl.arange(0, BLOCK_N)
                     m = o < N
-                    gate = tl.load(input_ptr + row.to(tl.int64) * two_N + o, mask=m).to(tl.float32)
-                    up = tl.load(input_ptr + row.to(tl.int64) * two_N + N + o, mask=m).to(
-                        tl.float32
-                    )
+                    gate_cols, up_cols = _glu_columns(o, N, INTERLEAVE)
+                    row_ptr = input_ptr + row.to(tl.int64) * two_N
+                    gate = tl.load(row_ptr + gate_cols, mask=m).to(tl.float32)
+                    up = tl.load(row_ptr + up_cols, mask=m).to(tl.float32)
+                    gate, up = _glu_inputs(gate, up, clamp_value, linear_offset, CLAMP, OFFSET)
                     silu = gate * tl.sigmoid(gate)
                     tl.store(
                         output_ptr + row.to(tl.int64) * N + o, (silu * up).to(tl.bfloat16), mask=m
@@ -180,7 +251,11 @@ def _swiglu_kernel(
 
 
 def padded_swiglu(
-    x: torch.Tensor, permutation_map: torch.Tensor, n_used: torch.Tensor, zero_padding: bool = False
+    x: torch.Tensor,
+    permutation_map: torch.Tensor,
+    n_used: torch.Tensor,
+    zero_padding: bool = False,
+    glu_options: GLUOptions = GLUOptions(),
 ) -> torch.Tensor:
     """SwiGLU activation (SiLU(gate) * up); skips rows beyond n_used and alignment-padding rows.
 
@@ -194,6 +269,7 @@ def padded_swiglu(
         zero_padding: write zeros to alignment-padding rows instead of leaving them
             undefined. MXFP8 quantization and grouped GEMM cannot skip dummy rows through
             ``permutation_map``. Rows beyond n_used remain undefined.
+        glu_options: clamp, linear offset and FC1 interleaving of the gated activation.
     Returns:
         [output_size, ffn_hidden] BF16.
     """
@@ -210,6 +286,7 @@ def padded_swiglu(
         n_used,
         N,
         M,
+        **glu_options.kernel_args(N),
         BLOCK_N=BLOCK_N,
         NUM_BLOCKS=NUM_BLOCKS,
         ZERO_PADDING=zero_padding,
@@ -224,6 +301,11 @@ def _silu_mul_bounded_kernel(
     n_rows_ptr,
     N,  # output width (input row width is 2N)
     max_rows,
+    clamp_value,
+    linear_offset,
+    CLAMP: tl.constexpr,
+    OFFSET: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
 ):
@@ -231,6 +313,7 @@ def _silu_mul_bounded_kernel(
 
     For the flat token-major FC1 layout (no permutation map): rows [0, n_rows) are
     live. n_rows is a device scalar, so the fixed grid stays CUDA-graph compatible.
+    CLAMP / OFFSET / INTERLEAVE apply training's GLU options, as in _swiglu_kernel.
     """
     pid = tl.program_id(0)
     n_rows = tl.load(n_rows_ptr)
@@ -242,19 +325,25 @@ def _silu_mul_bounded_kernel(
             for n in tl.range(0, N, BLOCK_N):
                 o = n + tl.arange(0, BLOCK_N)
                 m = o < N
-                gate = tl.load(input_ptr + row.to(tl.int64) * two_N + o, mask=m).to(tl.float32)
-                up = tl.load(input_ptr + row.to(tl.int64) * two_N + N + o, mask=m).to(tl.float32)
+                gate_cols, up_cols = _glu_columns(o, N, INTERLEAVE)
+                row_ptr = input_ptr + row.to(tl.int64) * two_N
+                gate = tl.load(row_ptr + gate_cols, mask=m).to(tl.float32)
+                up = tl.load(row_ptr + up_cols, mask=m).to(tl.float32)
+                gate, up = _glu_inputs(gate, up, clamp_value, linear_offset, CLAMP, OFFSET)
                 silu = gate * tl.sigmoid(gate)
                 tl.store(output_ptr + row.to(tl.int64) * N + o, (silu * up).to(tl.bfloat16), mask=m)
 
 
-def bounded_silu_mul(x: torch.Tensor, n_rows: torch.Tensor) -> torch.Tensor:
+def bounded_silu_mul(
+    x: torch.Tensor, n_rows: torch.Tensor, glu_options: GLUOptions = GLUOptions()
+) -> torch.Tensor:
     """SwiGLU (SiLU(gate) * up) over the first n_rows rows of a flat [M, 2N] tensor.
 
     Args:
         x: [M, 2 * ffn_hidden] BF16 FC1 output (gate = first half, up = second half).
         n_rows: scalar int32/int64 CUDA tensor with the number of live rows
             (e.g. valid_tokens * topk). Rows >= n_rows are skipped, not zeroed.
+        glu_options: clamp, linear offset and FC1 interleaving of the gated activation.
     Returns:
         [M, ffn_hidden] BF16 (rows >= n_rows undefined).
     """
@@ -265,7 +354,7 @@ def bounded_silu_mul(x: torch.Tensor, n_rows: torch.Tensor) -> torch.Tensor:
     BLOCK_N = min(triton.next_power_of_2(N), 1024)
     NUM_BLOCKS = min(M, 512)
     _silu_mul_bounded_kernel[(NUM_BLOCKS,)](
-        x, out, n_rows, N, M, BLOCK_N=BLOCK_N, NUM_BLOCKS=NUM_BLOCKS
+        x, out, n_rows, N, M, **glu_options.kernel_args(N), BLOCK_N=BLOCK_N, NUM_BLOCKS=NUM_BLOCKS
     )
     return out
 

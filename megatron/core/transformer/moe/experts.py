@@ -94,6 +94,7 @@ except ImportError:
 
 from megatron.core.inference.moe import ActivationType as McoreActivationType
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
+from megatron.core.inference.moe.activations import GLUOptions
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
     flashinfer_routed_mxfp8_moe,
     prepare_routed_mxfp8_weights,
@@ -1444,6 +1445,17 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         self._mcore_activation_type = self._resolve_mcore_activation_type()
         self._activation_clamp_scale = config.activation_func_tanh_clamp_scale
+        # Gated-activation options of the training path (TEGroupedMLP), which ignores them
+        # for non-gated activations.
+        self._glu_options = (
+            GLUOptions(
+                clamp_value=config.activation_func_clamp_value,
+                linear_offset=config.glu_linear_offset,
+                interleave_size=config.moe_mlp_glu_interleave_size,
+            )
+            if config.gated_linear_unit
+            else GLUOptions()
+        )
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
         self._flashinfer_mxfp8_token_capacity = config.inference_flashinfer_mxfp8_token_capacity
@@ -1766,6 +1778,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
             disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             activation_clamp_scale=self._activation_clamp_scale,
+            glu_options=self._glu_options,
+            apply_probs_on_input=self.config.moe_apply_probs_on_input,
         )
         return output, None
 
@@ -1785,6 +1799,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
             activation_clamp_scale=self._activation_clamp_scale,
+            glu_options=self._glu_options,
+            apply_probs_on_input=self.config.moe_apply_probs_on_input,
         )
         return output, None
 

@@ -116,6 +116,13 @@ def _padded_layout(rows, ffn, n_used):
     return perm, _dev_scalar(n_used)
 
 
+def _all_glu_options():
+    """Every SwiGLU option at once (config validation keeps clamp and offset apart)."""
+    from megatron.core.inference.moe.activations import GLUOptions
+
+    return GLUOptions(clamp_value=0.5, linear_offset=1.0, interleave_size=64)
+
+
 def test_inference_moe_activations_replay():
     from megatron.core.inference.moe import activations
 
@@ -146,6 +153,19 @@ def test_inference_moe_activations_replay():
         (x2,),
         backward=False,
         what="bounded_silu_mul",
+    )
+    glu = _all_glu_options()
+    assert_replays_bit_exact(
+        lambda x: live(activations.padded_swiglu(x, perm, n_used_t, glu_options=glu)),
+        (x2,),
+        backward=False,
+        what="padded_swiglu (GLU options)",
+    )
+    assert_replays_bit_exact(
+        lambda x: activations.bounded_silu_mul(x, n_used_t, glu_options=glu)[:n_used],
+        (x2,),
+        backward=False,
+        what="bounded_silu_mul (GLU options)",
     )
     if hasattr(torch, "float8_e8m0fnu"):
 
@@ -178,6 +198,31 @@ def test_batch_invariant_swiglu_matches_training():
     used = _dev_scalar(4)
     expected = weighted_swiglu(x, probs[:, None])
     actual = swiglu_with_probs(x, perm, used, probs, zero_padding=True)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_batch_invariant_clamped_swiglu_matches_training():
+    """activation_func_clamp_value keeps both batch-invariant SwiGLU kernels bit-identical to
+    training's fused clamped weighted-swiglu, which clamps the FP32 inputs first."""
+    from megatron.core.fusions.fused_bias_swiglu import clamped_weighted_swiglu
+    from megatron.core.inference.moe.activations import GLUOptions
+    from megatron.core.inference.moe.batch_invariant import (
+        swiglu_with_probs,
+        weighted_silu_mul_bounded,
+    )
+
+    seeded()
+    rows, ffn, clamp_value = 512, 768, 0.5
+    # Wide enough that the clamp bites on both halves and on both signs of the linear half.
+    x = (torch.randn(rows, 2 * ffn, device="cuda") * 2).to(torch.bfloat16)
+    probs = torch.rand(rows, device="cuda")
+    perm = torch.arange(rows, device="cuda", dtype=torch.int32)
+    glu = GLUOptions(clamp_value=clamp_value)
+
+    expected = clamped_weighted_swiglu(x, probs[:, None], clamp_value)
+    actual = swiglu_with_probs(x, perm, _dev_scalar(rows), probs, glu_options=glu)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    actual = weighted_silu_mul_bounded(x, probs, _dev_scalar(rows * ffn), glu_options=glu)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
@@ -242,6 +287,30 @@ def test_batch_invariant_inference_activations_replay():
         (x2,),
         backward=False,
         what="weighted_silu_mul_bounded (larger block)",
+    )
+    glu = _all_glu_options()
+    assert_replays_bit_exact(
+        lambda x: live(
+            batch_invariant.swiglu_with_probs(x, perm, n_used_t, probs, glu_options=glu)
+        ),
+        (x2,),
+        backward=False,
+        what="swiglu_with_probs (GLU options)",
+    )
+    # Unweighted variants: moe_apply_probs_on_input applied the probabilities to the input.
+    assert_replays_bit_exact(
+        lambda x: batch_invariant.weighted_silu_mul_bounded(x, None, bound_elems, glu_options=glu)[
+            :n_used
+        ],
+        (x2,),
+        backward=False,
+        what="weighted_silu_mul_bounded (GLU options, no weights)",
+    )
+    assert_replays_bit_exact(
+        lambda x: live(batch_invariant.squared_relu_with_probs(x, perm, n_used_t, None)),
+        (x1,),
+        backward=False,
+        what="squared_relu_with_probs (no probabilities)",
     )
 
 
@@ -618,6 +687,46 @@ def test_vllm_fused_moe_and_moe_sum_replay():
         return out[: max_tokens - 100]
 
     assert_replays_bit_exact(moe_sum, (inp, probs), replays=4, backward=False, what="_moe_sum")
+
+
+def test_vllm_fused_moe_glu_options_replay():
+    """SwiGLU options and input-side routing weights (moe_apply_probs_on_input, top-1)."""
+    from megatron.core.inference.moe.fused_moe import ActivationType
+    from megatron.core.inference.moe.vllm_fused_moe import vllm_fused_moe
+
+    seeded()
+    max_tokens, hidden, ffn, experts = 2048, 2048, 1024, 16
+    hidden_states = torch.randn(max_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    probs = torch.rand(max_tokens, 1, device="cuda")
+    routing_map = torch.randint(0, experts, (max_tokens, 1), device="cuda")
+    fc1 = torch.randn(experts, 2 * ffn, hidden, device="cuda", dtype=torch.bfloat16) * 0.02
+    fc2 = torch.randn(experts, hidden, ffn, device="cuda", dtype=torch.bfloat16) * 0.02
+    valid = _dev_scalar(max_tokens - 100)
+    glu = _all_glu_options()
+
+    def fn(h, p):
+        out = vllm_fused_moe(
+            h,
+            p,
+            fc1,
+            fc2,
+            ActivationType.SWIGLU,
+            experts,
+            0,
+            valid,
+            routing_map,
+            glu_options=glu,
+            apply_probs_on_input=True,
+        )
+        return out[: max_tokens - 100]
+
+    assert_replays_bit_exact(
+        fn,
+        (hidden_states, probs),
+        replays=4,
+        backward=False,
+        what="vllm_fused_moe (GLU options, probabilities on input)",
+    )
 
 
 def test_vllm_moe_align_block_size_replays():

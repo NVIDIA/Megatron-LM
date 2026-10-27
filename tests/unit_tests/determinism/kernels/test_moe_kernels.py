@@ -1182,6 +1182,79 @@ class TestMoEModules:
             )
         assert layer.experts._nvfp4_weights is not None
 
+    @pytest.mark.skipif(not HAVE_TE, reason="InferenceGroupedMLP builds TE grouped linears")
+    @pytest.mark.parametrize("backend", ["vllm", "torch"])
+    @pytest.mark.parametrize(
+        "options",
+        [
+            dict(activation_func_clamp_value=0.5, moe_mlp_glu_interleave_size=64),
+            dict(
+                glu_linear_offset=1.0,
+                moe_apply_probs_on_input=True,
+                moe_router_topk=1,
+                moe_router_pre_softmax=True,
+            ),
+        ],
+        ids=["clamp+interleave", "offset+probs-on-input"],
+    )
+    def test_inference_grouped_mlp_glu_options_replay(self, backend, options):
+        """Inference experts with SwiGLU options and input-side routing probabilities."""
+        from megatron.core.inference.moe.fused_moe import HAVE_GROUPED_MM
+        from megatron.core.inference.utils import InferenceMode
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            InferenceAllGatherDispatcherBase,
+        )
+
+        if backend == "torch" and (
+            not HAVE_GROUPED_MM or torch.cuda.get_device_capability()[0] < 9
+        ):
+            pytest.skip("The torch grouped-GEMM backend needs torch grouped_mm and SM90+")
+
+        class _InInferenceMode(torch.nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def forward(self, hidden, probs, routing_map):
+                with InferenceMode.active():
+                    return self.module(hidden, None, probs, routing_map=routing_map)
+
+        self._init(ep=1)
+        seeded()
+        config = _moe_config(
+            bias_activation_fusion=False,
+            normalization="RMSNorm",
+            transformer_impl="inference_optimized",
+            inference_grouped_gemm_backend=backend,
+            inference_moe_token_dispatcher_type="nccl",
+            **options,
+        )
+        experts = get_inference_optimized_moe_spec()(config=config).cuda().eval().experts
+        num_tokens, topk = 512, config.moe_router_topk
+        hidden = torch.randn(num_tokens, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        probs = torch.rand(num_tokens, topk, device="cuda")
+        routing_map = torch.rand(num_tokens, config.num_moe_experts, device="cuda").argsort(dim=1)
+        routing_map = routing_map[:, :topk].contiguous()
+
+        dispatcher = InferenceAllGatherDispatcherBase
+        saved = (dispatcher._valid_tokens_tensor, dispatcher._host_valid_tokens_estimate)
+        dispatcher.allocate_valid_tokens_tensor()
+        dispatcher._valid_tokens_tensor.fill_(num_tokens)
+        dispatcher._host_valid_tokens_estimate = num_tokens
+        try:
+            with torch.no_grad():
+                assert_module_replays_bit_exact(
+                    _InInferenceMode(experts),
+                    (hidden, probs, routing_map),
+                    replays=3,
+                    backward=False,
+                    contention=True,
+                    what=f"InferenceGroupedMLP[{backend}, {sorted(options)}]",
+                )
+        finally:
+            dispatcher._valid_tokens_tensor, dispatcher._host_valid_tokens_estimate = saved
+
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     @pytest.mark.parametrize(
         "offload_modules,offloaded_group",

@@ -2212,6 +2212,17 @@ class TransformerConfig(ModelParallelConfig):
                         "cannot be combined with FP8 inference or fp4_param."
                     )
 
+            if (
+                self.moe_apply_probs_on_input
+                and self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+            ):
+                raise ValueError(
+                    "moe_apply_probs_on_input is not supported with "
+                    "inference_grouped_gemm_backend='flashinfer': the FlashInfer MoE kernels "
+                    "apply routing probabilities only to the expert output. Select "
+                    "inference_grouped_gemm_backend 'torch' or 'vllm'."
+                )
+
             # Gated linear units (SwiGLU/GeGLU) are supported by the torch and vLLM
             # grouped-GEMM backends, and SwiGLU by FlashInfer per-token NVFP4.
             if (
