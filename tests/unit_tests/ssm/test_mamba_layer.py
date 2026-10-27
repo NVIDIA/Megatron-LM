@@ -45,6 +45,10 @@ class TestMambaLayer:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    def test_activation_must_be_positional(self):
+        with pytest.raises(TypeError, match="hidden_states"):
+            self.layer(hidden_states=torch.empty(0), attention_mask=None)
+
     def test_configured_layernorm_epsilon(self):
         assert self.layer.norm.eps == self.layer.config.layernorm_epsilon
 

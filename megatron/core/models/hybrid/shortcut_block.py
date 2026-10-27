@@ -414,13 +414,13 @@ class ShortcutMoEBlock(MegatronModule):
         """
         if isinstance(self.compute_layer, MambaLayer):
             return self.compute_layer(
-                hidden_states=hidden_states,
+                hidden_states,
                 attention_mask=attention_mask,
                 inference_context=inference_context,
                 packed_seq_params=packed_seq_params,
             )
         hidden_states, _ = self.compute_layer(
-            hidden_states=hidden_states,
+            hidden_states,
             attention_mask=attention_mask,
             inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,

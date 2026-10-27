@@ -109,7 +109,7 @@ def test_branchwise_wide_moe_keeps_all_moe_paths_at_backbone_width():
             16, 2, wide_hidden_size, device=torch.cuda.current_device(), requires_grad=True
         )
 
-        output, context = layer(hidden_states=residual_stream, attention_mask=None)
+        output, context = layer(residual_stream, attention_mask=None)
 
         assert context is None
         assert output.shape == residual_stream.shape
@@ -155,7 +155,7 @@ def test_branchwise_wide_moe_runs_with_tensor_and_expert_parallelism():
             16, 2, wide_hidden_size, device=torch.cuda.current_device(), requires_grad=True
         )
 
-        output, context = layer(hidden_states=residual_stream, attention_mask=None)
+        output, context = layer(residual_stream, attention_mask=None)
 
         assert context is None
         assert output.shape == residual_stream.shape

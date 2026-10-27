@@ -773,6 +773,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         # Supporting keyword inputs would require a custom autograd hook,
         # adding complexity to MFSDP.
         hidden_states: Tensor,
+        /,
         attention_mask: Optional[Tensor] = None,
         context: Optional[Tensor] = None,
         context_mask: Optional[Tensor] = None,
@@ -1128,7 +1129,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         return hidden_states, context
 
     @copy_signature(_forward_attention)
-    def forward(self, *args, **kwargs):
+    def forward(self, hidden_states: Tensor, /, *args, **kwargs):
         """
         Perform a forward pass through the transformer layer.
 
@@ -1138,7 +1139,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         with _otel_managed_span(
             'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
         ):
-            hidden_states, context = self._forward_attention(*args, **kwargs)
+            hidden_states, context = self._forward_attention(hidden_states, *args, **kwargs)
             with _otel_managed_span('layer', 'megatron.layer.mlp'):
                 residual_stream_recompute_context = kwargs.get(
                     "residual_stream_recompute_context", None

@@ -62,7 +62,7 @@ class HyperConnectionHybridLayer(MegatronModule):
     ) -> Tuple[Tensor, Optional[Tensor]]:
         if isinstance(self.inner_layer, TransformerLayer):
             output = self.inner_layer(
-                hidden_states=hidden_states,
+                hidden_states,
                 attention_mask=attention_mask,
                 inference_context=inference_context,
                 rotary_pos_emb=rotary_pos_emb,
@@ -77,7 +77,7 @@ class HyperConnectionHybridLayer(MegatronModule):
             if packed_sequence_cp_metadata is not None:
                 extra_kwargs["packed_sequence_cp_metadata"] = packed_sequence_cp_metadata
             output = self.inner_layer(
-                hidden_states=hidden_states,
+                hidden_states,
                 attention_mask=attention_mask,
                 inference_context=inference_context,
                 packed_seq_params=packed_seq_params,
