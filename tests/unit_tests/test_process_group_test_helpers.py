@@ -29,7 +29,12 @@ _NOT_BUILT = {"hcp", "gtp_remat", "expt_gtp_remat", "inter_dist_opt", "dp_cp_ag"
 
 
 def _ranks(group):
-    return None if group is None else torch.distributed.get_process_group_ranks(group)
+    """Global ranks of a group, of each group of a dict, or None."""
+    if group is None:
+        return None
+    if isinstance(group, dict):
+        return {key: _ranks(value) for key, value in group.items()}
+    return torch.distributed.get_process_group_ranks(group)
 
 
 class TestForbidGlobalProcessGroups:

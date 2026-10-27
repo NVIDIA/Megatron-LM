@@ -483,7 +483,8 @@ def build_test_pg_collection(*, tp=1, pp=1, cp=1, ep=1, expt_tp=None, order="tp-
     groups, so they reuse them: dp_gtp_remat, dp_cp_gtp_remat, intra_dp_cp, expt_dp_gtp_remat,
     intra_expt_dp and tp_ep_pp_with_egtp_remat. The fields it does not build are set to None
     explicitly, so no resolver falls back to the global grid for an absent field: hcp, gtp_remat,
-    expt_gtp_remat, inter_dist_opt, dp_cp_ag and expt_dp_ag.
+    expt_gtp_remat, inter_dist_opt, dp_cp_ag and expt_dp_ag. dynamic_cp and dynamic_tp_cp are
+    empty, as they are without dynamic context parallelism.
 
     Creating groups is collective: call this on every rank, and release the groups with
     destroy_test_pg_collection.
@@ -536,6 +537,8 @@ def build_test_pg_collection(*, tp=1, pp=1, cp=1, ep=1, expt_tp=None, order="tp-
     return ProcessGroupCollection(
         tp=grid.create_pg("tp"),
         cp=grid.create_pg("cp"),
+        dynamic_cp={},
+        dynamic_tp_cp={},
         pp=grid.create_pg("pp"),
         mp=grid.create_pg(["tp", "pp"]),
         tp_cp=grid.create_pg(["tp", "cp"]),
@@ -570,6 +573,10 @@ def destroy_test_pg_collection(pg_collection):
     # Every rank finishes its collectives before any communicator goes away.
     torch.cuda.synchronize()
     torch.distributed.barrier()
-    groups = {id(group): group for group in vars(pg_collection).values() if group is not None}
+    groups = {
+        id(group): group
+        for group in vars(pg_collection).values()
+        if isinstance(group, torch.distributed.ProcessGroup)
+    }
     for group in groups.values():
         torch.distributed.destroy_process_group(group)
