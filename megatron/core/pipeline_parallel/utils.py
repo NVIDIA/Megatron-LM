@@ -1,0 +1,421 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import logging
+from abc import ABC, abstractmethod
+from contextlib import contextmanager, nullcontext
+from typing import Callable, Optional
+
+import torch
+from torch.autograd import Variable
+
+from megatron.core.utils import (
+    get_pg_rank,
+    get_pg_size,
+    log_single_rank,
+    make_viewless_tensor,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
+
+try:
+    from transformer_engine.pytorch.ep import is_symm_backed
+except ImportError:
+    is_symm_backed = None
+
+logger = logging.getLogger(__name__)
+
+
+class StageDispatchBwdGrad(torch.autograd.Function):
+    """1F1B + NCCL-EP zero-copy only: redirect the dispatch-backward grad into the persistent
+    symm buffer so the one-sided ``dispatch_bwd`` can consume it.
+
+    Under the 1F1B overlap schedule the dispatch output is consumed by the next node, which
+    detaches it into a leaf; autograd therefore hands ``dispatch_bwd`` a non-symm
+    ``AccumulateGrad`` clone. Applying this identity node to the dispatch output — while it is
+    still inside the dispatch node's own graph segment — makes it the sole consumer, moving that
+    accumulation to *our* output; the backward then does a single plain->symm copy into the
+    dispatcher's ``_zc_bwd_token_buf``. That buffer is free to stage into precisely because
+    ``get_expert_zero_copy_buffers`` withholds it from the op-fuser under overlap.
+    Forward is identity (no numeric effect).
+    """
+
+    @staticmethod
+    def forward(ctx, dispatched_tokens, token_dispatcher):  # type: ignore[override]
+        """Identity forward; stashes the dispatcher so backward can reach its symm buffer."""
+        ctx.token_dispatcher = token_dispatcher
+        return dispatched_tokens
+
+    @staticmethod
+    def backward(ctx, grad):  # type: ignore[override]
+        """Stage the incoming gradient into the symm dispatch-backward buffer."""
+        buf = ctx.token_dispatcher._comm_manager._zc_bwd_token_buf
+        assert buf is not None, "zero-copy staging buffer not allocated before dispatch-backward"
+        assert (
+            buf.shape == grad.shape
+        ), f"dispatch-bwd grad {tuple(grad.shape)} != staging buffer {tuple(buf.shape)}"
+        buf.copy_(grad)
+        return buf, None
+
+
+def is_pp_first_stage(pp_group: torch.distributed.ProcessGroup):
+    """Return True if in the first pipeline model-parallel stage, False otherwise."""
+    return get_pg_rank(pp_group) == 0
+
+
+def is_pp_last_stage(pp_group: torch.distributed.ProcessGroup):
+    """Return True if in the last pipeline-model-parallel stage, False otherwise."""
+    return get_pg_rank(pp_group) == (get_pg_size(pp_group) - 1)
+
+
+def is_vp_first_stage(vp_stage: int, vp_size: int | None):
+    """Return True if in the first virtual pipeline model-parallel stage, False otherwise."""
+    if vp_size is None or vp_size <= 1:
+        assert vp_stage is None or vp_stage == 0, (
+            f"Expected vp_stage to be 0 or None when vp_size is <= 1 or None, "
+            f"but got vp_stage={vp_stage} and vp_size={vp_size}"
+        )
+        return True
+    return vp_stage == 0
+
+
+def is_vp_last_stage(vp_stage: int, vp_size: int | None):
+    """Return True if in the last virtual pipeline model-parallel stage, False otherwise."""
+    if vp_size is None or vp_size <= 1:
+        assert vp_stage is None or vp_stage == 0, (
+            f"Expected vp_stage to be 0 or None when vp_size is <= 1 or None, "
+            f"but got vp_stage={vp_stage} and vp_size={vp_size}"
+        )
+        return True
+    return vp_stage == (vp_size - 1)
+
+
+def get_pp_first_rank(pp_group: torch.distributed.ProcessGroup):
+    """Return the global rank of the first rank in the pipeline parallel group."""
+    pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
+    return pp_ranks[0]
+
+
+def get_pp_last_rank(pp_group: torch.distributed.ProcessGroup):
+    """Return the global rank of the last rank in the pipeline parallel group."""
+    pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
+    return pp_ranks[-1]
+
+
+def get_pp_next_rank(pp_group: torch.distributed.ProcessGroup):
+    """Return the global rank of the next rank in the pipeline parallel group, or None if last
+    stage."""
+    if is_pp_last_stage(pp_group):
+        return None
+    current_rank_in_group = get_pg_rank(pp_group)
+    pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
+    return pp_ranks[current_rank_in_group + 1]
+
+
+def get_pp_prev_rank(pp_group: torch.distributed.ProcessGroup):
+    """Return the global rank of the previous rank in the pipeline parallel group, or None if
+    first stage."""
+    if is_pp_first_stage(pp_group):
+        return None
+    current_rank_in_group = get_pg_rank(pp_group)
+    pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
+    return pp_ranks[current_rank_in_group - 1]
+
+
+def make_viewless(e):
+    """Make_viewless util func"""
+    e = make_viewless_tensor(inp=e, requires_grad=e.requires_grad, keep_graph=True)
+    return e
+
+
+def set_ideal_affinity_for_current_gpu():
+    """Set CPU affinity for the current GPU to optimize host-device transfers."""
+    import uuid
+
+    try:
+        import cuda.bindings.driver as cuda_driver
+        import cuda.bindings.runtime as cuda_runtime
+    except:
+        try:
+            import cuda.cuda as cuda_driver
+            import cuda.cudart as cuda_runtime
+        except:
+            raise RuntimeError("Please install cuda-python to enable GPU affinity setting")
+    import pynvml
+
+    # Get current CUDA device ID
+    err, device_id = cuda_runtime.cudaGetDevice()
+    assert err == cuda_runtime.cudaError_t.cudaSuccess
+    # Get device UUID
+    err, device_uuid = cuda_driver.cuDeviceGetUuid(device_id)
+    assert err == cuda_driver.CUresult.CUDA_SUCCESS
+    # Set CPU affinity based on GPU's NUMA node
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByUUID("GPU-" + str(uuid.UUID(bytes=device_uuid.bytes)))
+    pynvml.nvmlDeviceSetCpuAffinity(handle)
+
+    log_single_rank(
+        logger,
+        logging.WARNING,
+        f"Set CPU affinity for all GPUs for optimal host-device transfer performance",
+    )
+
+
+class NoopScheduleNode:
+    """A placeholder node in the computation graph that simply passes through inputs and outputs.
+
+    This class is used as a no-op node in the scheduling system when a real computation node
+    is not needed but the interface must be maintained (e.g., dense layer doesn't need
+    moe_dispatch and moe_combine). It simply returns its inputs unchanged
+    in both forward and backward passes.
+    """
+
+    def forward(self, inputs):
+        """Passes through inputs unchanged in the forward pass."""
+        return inputs
+
+    def backward(self, outgrads):
+        """Passes through gradients unchanged in the backward pass."""
+        return outgrads
+
+
+class ScheduleNode:
+    """Base node for fine-grained scheduling.
+
+    This class represents a computational node in the pipeline schedule.
+    It handles the execution of forward and backward operations on a stream.
+    """
+
+    def __init__(
+        self,
+        forward_func: Callable,
+        stream: torch.cuda.Stream,
+        event: torch.cuda.Event,
+        backward_func: Optional[Callable] = None,
+        free_input: bool = False,
+        name: str = "schedule_node",
+        ncclep_zero_copy: bool = False,
+    ):
+        """Initialize a schedule node.
+
+        Args:
+            forward_func (callable): Function to execute during the forward pass.
+            stream (Callable): Func that returns CUDA stream for computation.
+                This can be either a 'compute' stream or a 'communicate' stream.
+                - 'compute' stream: Used for computational nodes like attention and experts.
+                - 'communicate' stream: Used for nodes that handle token communication,
+                  such as token dispatch and combine operations in MoE layers.
+            event (torch.cuda.Event): The CUDA event used for synchronization. Each
+                microbatch within a model chunk shares the same event, which is used
+                to manage dependencies between nodes operating on different streams.
+            backward_func (callable, optional): Function for the backward pass.
+            free_input (bool): Flag to indicate if the input should be freed after the
+                forward pass.
+            name (str): Name of the node for debugging purposes.
+        """
+        self.name = name
+        self.forward_func = forward_func
+        self.backward_func = backward_func if backward_func else self.default_backward_func
+        self.stream = stream
+        self.event = event
+        self.free_input = free_input
+        self.ncclep_zero_copy = ncclep_zero_copy
+        self.inputs = None
+        self.outputs = None
+        # When True, the forward runs under torch.no_grad() so no autograd graph is
+        # retained; the layer-level full recompute path replays it with grad at backward.
+        self.forward_no_grad = False
+
+    def default_backward_func(self, outputs, output_grad):
+        """Default backward function"""
+        Variable._execution_engine.run_backward(
+            tensors=outputs,
+            grad_tensors=output_grad,
+            keep_graph=False,
+            create_graph=False,
+            inputs=tuple(),
+            allow_unreachable=True,
+            accumulate_grad=True,
+        )
+        return output_grad
+
+    def forward(self, inputs=()):
+        """Schedule node forward"""
+        if not isinstance(inputs, tuple):
+            inputs = (inputs,)
+        return self._forward(*inputs)
+
+    def _forward(self, *inputs):
+        # Lazy initialization of stream
+        if isinstance(self.stream, Callable):
+            self.stream = self.stream()
+        with self.stream_acquire_context(f"{self.name} forward"):
+            self.inputs = [make_viewless(e).detach() if e is not None else None for e in inputs]
+            for i, input in enumerate(self.inputs):
+                if input is not None:
+                    input.requires_grad = inputs[i].requires_grad
+
+            data = tuple(self.inputs)
+            # Full recompute: skip the graph now, rebuild it by re-running at backward.
+            grad_ctx = torch.no_grad() if self.forward_no_grad else nullcontext()
+            with grad_ctx:
+                data = self.forward_func(*data)
+
+            if not isinstance(data, tuple):
+                data = make_viewless(data)
+            else:
+                data = tuple([make_viewless(e) if isinstance(e, torch.Tensor) else e for e in data])
+
+            if self.forward_no_grad:
+                # no_grad does not make the output graph-free: forward_func may re-enter
+                # grad mode (TransformerLayer runs its bias-dropout-add under
+                # torch.enable_grad), and the output then carries a grad_fn that pins the
+                # tensors it was built from for as long as the output is retained, i.e.
+                # across the forward->backward gap when it becomes the next segment's input.
+                if isinstance(data, tuple):
+                    data = tuple(e.detach() if isinstance(e, torch.Tensor) else e for e in data)
+                else:
+                    data = data.detach()
+
+            self.output = data
+
+        # Immediately frees input tensors after they are used for nodes
+        # where inputs are no longer needed after computation.
+        if self.free_input:
+            for input in inputs:
+                if input is not None:
+                    input.record_stream(self.stream)
+                    # Skip symmetric-memory (zero-copy EP) buffers
+                    if not (
+                        self.ncclep_zero_copy
+                        and is_symm_backed is not None
+                        and is_symm_backed(input)
+                    ):
+                        input.untyped_storage().resize_(0)
+
+        return self.output
+
+    def get_output(self):
+        """Get the forward output"""
+        return self.output
+
+    def backward(self, output_grad):
+        """Schedule node backward"""
+        if not isinstance(output_grad, tuple):
+            output_grad = (output_grad,)
+        return self._backward(*output_grad)
+
+    def _backward(self, *output_grad):
+        # Lazy initialization of stream
+        if isinstance(self.stream, Callable):
+            self.stream = self.stream()
+        with self.stream_acquire_context(f"{self.name} backward"):
+            outputs = self.output
+            if not isinstance(outputs, tuple):
+                outputs = (outputs,)
+            assert len(outputs) == len(output_grad), (
+                f"{len(outputs)} of {type(outputs[0])} is not equal to "
+                f"{len(output_grad)} of {type(output_grad[0])}"
+            )
+            output_grad = self.backward_func(outputs, output_grad)
+
+        # output_grad maybe from another stream
+        if output_grad:
+            for g in output_grad:
+                if g is not None:
+                    g.record_stream(self.stream)
+
+        grads = self.get_grad()
+        self._release_state()
+
+        return grads
+
+    def get_grad(self):
+        """Get the grad of inputs"""
+        grad = tuple([e.grad if e is not None else None for e in self.inputs])
+        # multiple in, multiple out
+        if len(grad) == 1:
+            grad = grad[0]
+        return grad
+
+    @contextmanager
+    def stream_acquire_context(self, name=None):
+        """Stream acquire context that handles event synchronization,
+            NVTX profiling, and stream context.
+
+        This context manager consolidates:
+        1. Event wait/record for synchronization between streams
+        2. NVTX range for profiling (if name is provided)
+        3. torch.cuda.stream context for execution on the specified stream
+
+        Args:
+            name: Optional name for NVTX range profiling
+        """
+        self.event.wait(self.stream)
+        if name:
+            nvtx_range_push(name)
+        try:
+            with torch.cuda.stream(self.stream):
+                yield
+        finally:
+            if name:
+                nvtx_range_pop(name)
+            self.event.record(self.stream)
+
+    def _release_state(self):
+        """Clear the state of the node"""
+        self.inputs = None
+        self.output = None
+        del self.forward_func
+        del self.backward_func
+
+
+class AbstractSchedulePlan(ABC):
+    """To use combined 1f1b, model must implement build_schedule_plan while take the same
+    signature as model forward but return an instance of AbstractSchedulePlan"""
+
+    @staticmethod
+    @abstractmethod
+    def run(
+        f_schedule_plan,
+        b_schedule_plan,
+        grad=None,
+        pre_forward=None,
+        pre_backward=None,
+        post_forward=None,
+        post_backward=None,
+    ):
+        """run() is the protocol between our schedule logic and model, which is used to schedule
+        the forward and backward schedule plans for the models.
+        """
+        ...
+
+
+_USE_DYNAMIC_COMP_STREAM = None
+_COMP_STREAM = None
+_COMM_STREAM = None
+
+
+def set_streams(comm_stream=None, high_priority=False):
+    """Set the stream for communication operations."""
+    global _COMM_STREAM
+
+    # Set communication stream
+    if _COMM_STREAM is None:
+        if comm_stream is None:
+            if high_priority:
+                _, high = torch.cuda.Stream.priority_range()
+                comm_stream = torch.cuda.Stream(device="cuda", priority=high)
+            else:
+                comm_stream = torch.cuda.Stream(device="cuda")
+        _COMM_STREAM = comm_stream
+
+
+def get_comp_stream():
+    """Get the stream for computation"""
+    return torch.cuda.current_stream()
+
+
+def get_comm_stream():
+    """Get the stream for communication"""
+    global _COMM_STREAM
+    return _COMM_STREAM

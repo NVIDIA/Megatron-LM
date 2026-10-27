@@ -1,0 +1,36 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+name: Force Draft PR
+
+on:
+  pull_request_target:
+    types: [opened]
+    branches:
+      - main
+
+permissions:
+  pull-requests: write
+
+jobs:
+  force-draft:
+    runs-on: ubuntu-latest
+    if: ${{ !github.event.pull_request.draft && github.repository == 'NVIDIA/Megatron-LM' }}
+    steps:
+      - name: Convert PR to draft
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          gh pr ready --undo ${{ github.event.pull_request.number }} --repo ${{ github.repository }}
+
+      - name: Add comment explaining draft policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --body \
+            "This PR has been automatically converted to **draft** because all PRs must start as drafts.
+
+          When you are ready for review, click **Ready for Review** to begin the review process. This will:
+          1. Add the oncall reviewer (optional reviewer)
+          2. Add required review teams based on your changes
+
+          See the [contribution guide](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/developer/submit.md) for more details."

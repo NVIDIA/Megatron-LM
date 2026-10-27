@@ -1,0 +1,9 @@
+- agent_type: DAPOAgent
+  agent_args:
+    format_reward: 0.0
+  weight: 1.0
+- agent_type: AIMEAgent
+  agent_args:
+    format_reward: 0.0
+  weight: 0.0
+  evaluation_only: true

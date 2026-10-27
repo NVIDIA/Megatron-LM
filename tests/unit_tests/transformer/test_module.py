@@ -1,0 +1,180 @@
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+
+import pytest
+import torch
+
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.module import Float16Module, MegatronModule, mark_keep_in_fp32
+from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.test_utilities import Utils
+
+# Seed for the GB200 unit-test lane: launch this module on GB200 hardware
+# (4 GPUs/node) in CI. Extend coverage by adding this marker to other tests.
+pytestmark = pytest.mark.launch_on_gb200
+
+DEVICE_CAPABILITY = None
+if torch.cuda.is_available():
+    DEVICE_CAPABILITY = torch.cuda.get_device_capability()
+
+
+class DummyModule(MegatronModule):
+    # def __init__(self, config: TransformerConfig, share_embeddings_and_output_weights=True):
+    def __init__(self, config: TransformerConfig):
+        super().__init__(config)
+
+        self.linear = torch.nn.modules.Linear(in_features=2, out_features=1)
+
+    def forward(self, x):
+        return self.linear(x)
+
+
+class TestMegatronModule:
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        transformer_config = TransformerConfig(
+            num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
+        )
+        self.megatron_module = DummyModule(config=transformer_config).cuda()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_megatron_module(self):
+        megatron_module = self.megatron_module
+        assert megatron_module
+        assert megatron_module.config.hidden_size == 12
+        assert megatron_module.config.ffn_hidden_size == 48
+        assert megatron_module.linear.weight.dtype == torch.float32
+
+        x = torch.ones((2, 2)).cuda()
+        assert megatron_module(x).dtype == torch.float32
+
+        # TODO: test bad configs actually fail
+        # failed_module = megatron_module
+        # failed_module.fp16 = True
+        # failed_module.bf16 = True
+
+
+class _FirstMicrobatchModule(torch.nn.Module):
+    """Stand-in for a TE module that exposes the is_first_microbatch flag."""
+
+    def __init__(self):
+        super().__init__()
+        self.is_first_microbatch = False
+
+
+class DummyQuantModule(MegatronModule):
+    def __init__(self, config: TransformerConfig):
+        super().__init__(config)
+        self.child = _FirstMicrobatchModule()
+
+    def forward(self, x):
+        return x
+
+
+class TestSetIsFirstMicrobatch:
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _build_module(self, **overrides):
+        config = TransformerConfig(
+            num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
+        )
+        for key, value in overrides.items():
+            setattr(config, key, value)
+        return DummyQuantModule(config=config)
+
+    def test_quant_recipe_sets_flag(self):
+        # quant_recipe alone must enable the flag, even with fp8/fp4/kitchen off.
+        module = self._build_module(quant_recipe=object())
+        assert module.config.fp8 is None
+        assert module.config.fp4 is None
+        assert getattr(module.config, 'use_kitchen', False) is False
+        assert module.config.quant_recipe is not None
+        assert module.child.is_first_microbatch is False
+
+        module.set_is_first_microbatch()
+        assert module.child.is_first_microbatch is True
+
+    def test_no_quant_leaves_flag_untouched(self):
+        # With no quantization mode configured the flag must not be touched.
+        module = self._build_module()
+        assert module.config.fp8 is None
+        assert module.config.fp4 is None
+        assert getattr(module.config, 'use_kitchen', False) is False
+        assert module.config.quant_recipe is None
+        assert module.child.is_first_microbatch is False
+
+        module.set_is_first_microbatch()
+        assert module.child.is_first_microbatch is False
+
+
+class TestFloat16Module:
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        self.transformer_config = TransformerConfig(
+            num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
+        )
+        self.megatron_module = DummyModule(config=self.transformer_config).cuda()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_fp16_module(self):
+        transformer_config = self.transformer_config
+        megatron_module = self.megatron_module
+        transformer_config.fp16 = True
+        fp16_module = Float16Module(config=transformer_config, module=megatron_module)
+
+        assert fp16_module
+        assert fp16_module.config.hidden_size == 12
+        assert fp16_module.config.ffn_hidden_size == 48
+        assert fp16_module.module.linear.weight.dtype == torch.float16
+
+        x = torch.ones((2, 2)).cuda()
+        # inputs are converted to fp16 then outputs are converted to fp32
+        assert fp16_module(x).dtype == torch.float32
+
+    pytest.mark.skipif(
+        not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8,
+        reason='bfloat16 is not supported on this device',
+    )
+
+    def test_bf16_module(self):
+        transformer_config = self.transformer_config
+        megatron_module = self.megatron_module
+        transformer_config.bf16 = True
+        bf16_module = Float16Module(config=transformer_config, module=megatron_module)
+
+        assert bf16_module
+        assert bf16_module.config.hidden_size == 12
+        assert bf16_module.config.ffn_hidden_size == 48
+        assert bf16_module.module.linear.weight.dtype == torch.bfloat16
+
+        x = torch.ones((2, 2)).cuda()
+        # inputs are converted to bf16 then outputs are converted to fp32
+        assert bf16_module(x).dtype == torch.float32
+
+    @pytest.mark.parametrize(
+        ('precision', 'dtype'), [('fp16', torch.float16), ('bf16', torch.bfloat16)]
+    )
+    def test_keep_in_fp32_params(self, precision, dtype):
+        transformer_config = self.transformer_config
+        megatron_module = self.megatron_module
+        megatron_module.fp32_param = mark_keep_in_fp32(
+            torch.nn.Parameter(torch.zeros(4, dtype=torch.float32, device='cuda'))
+        )
+        setattr(transformer_config, precision, True)
+        float16_module = Float16Module(config=transformer_config, module=megatron_module)
+
+        assert float16_module.module.linear.weight.dtype == dtype
+        assert float16_module.module.fp32_param.dtype == torch.float32

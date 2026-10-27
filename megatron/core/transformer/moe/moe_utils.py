@@ -1,0 +1,1939 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import functools
+import math
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, Union
+
+import torch
+
+from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import (
+    HAVE_TE,
+    TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+)
+from megatron.core.fp4_utils import get_fp4_align_size
+from megatron.core.fp8_utils import get_fp8_align_size
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel import (
+    get_cuda_rng_tracker,
+    get_data_parallel_rng_tracker_name,
+    get_expert_parallel_rng_tracker_name,
+)
+from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
+from megatron.core.transformer.cuda_graphs import is_graph_capturing
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
+from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.moe.batch_invariant import (
+    build_inverse_permutation_map as build_batch_invariant_inverse_permutation_map,
+)
+from megatron.core.transformer.moe.batch_invariant import unpermute as batch_invariant_unpermute
+from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+from megatron.core.transformer.moe.router_replay import RouterReplay
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import deprecated, internal_api, is_te_min_version
+
+if HAVE_TE:
+    from megatron.core.extensions.transformer_engine import (
+        fused_compute_score_for_moe_aux_loss,
+        fused_moe_aux_loss,
+        fused_permute,
+        fused_permute_and_pad_with_probs,
+        fused_permute_with_probs,
+        fused_sort_chunks_by_index,
+        fused_sort_chunks_by_index_with_probs,
+        fused_topk_with_score_function,
+        fused_topk_with_score_function_supports_qb,
+        fused_topk_with_score_function_supports_topk_indices,
+        fused_unpermute,
+        te_general_gemm,
+    )
+else:
+    (
+        fused_compute_score_for_moe_aux_loss,
+        fused_moe_aux_loss,
+        fused_permute,
+        fused_permute_and_pad_with_probs,
+        fused_permute_with_probs,
+        fused_sort_chunks_by_index,
+        fused_sort_chunks_by_index_with_probs,
+        fused_topk_with_score_function,
+        fused_topk_with_score_function_supports_topk_indices,
+        fused_unpermute,
+        te_general_gemm,
+    ) = (None, None, None, None, None, None, None, None, False, None, None)
+    fused_topk_with_score_function_supports_qb = False
+
+
+def switch_load_balancing_loss_func(
+    probs: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    total_num_tokens: int,
+    topk: int,
+    num_experts: int,
+    moe_aux_loss_coeff: float,
+    fused: bool = False,
+    padding_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Calculate the auxiliary loss for load balancing.
+    Refer to the Switch Transformer (https://arxiv.org/abs/2101.03961)
+    and Global Load Balancing Loss(https://arxiv.org/abs/2501.11873) for details.
+
+    Detailed explanation of the auxiliary loss:
+
+    The formula for the auxiliary loss is:
+        loss = E * Σ_{i=1}^{E} (f_i * P_i)
+    where:
+        f_i = 1 / (T * topk) * Σ_{x∈B} routing_map(x, i)
+             (fraction of tokens dispatched to expert i)
+        P_i = 1 / T * Σ_{x∈B} probs(x, i)
+             (averaged router probability allocated for expert i)
+        E is the number of experts
+        T is the total number of tokens in the batch B
+
+    For distributed training with sequence or context parallelism, each rank can
+    process a subset of the batch.
+        loss = E * Σ_{i=1}^{E} (f_i * Σ_{j=1}^{N} P_ij)
+             = E * Σ_{i=1}^{E} Σ_{j=1}^{N} (f_i * P_ij)
+             = Σ_{j=1}^{N} E * (Σ_{i=1}^{E} f_i * P_ij)
+
+    where:
+        f_i = 1 / (T * topk) * Σ_{x∈B} routing_map(x, i)
+             (fraction of tokens dispatched to expert i in the global batch)
+        P_ij = 1 / T * Σ_{x∈B_j} probs(x, i)
+              (averaged router probability allocated for expert i in local batch of the j-th rank)
+        N is the number of ranks
+        B_j is the batch of tokens in the j-th rank
+        T is the total number of tokens in the global batch B
+
+    Note:
+    To calculate the auxiliary loss at different levels (micro-batch or global batch):
+    - probs: Should always be from the local batch being processed
+    - tokens_per_expert: Should represent token counts at the desired level
+      (either micro-batch or global batch)
+    - total_num_tokens: Should match the total token count at the same level as tokens_per_expert
+
+    Args:
+        probs (torch.Tensor): Softmax probabilities output by the router for each token.
+                              Shape in [num_tokens, num_experts].
+        tokens_per_expert (torch.Tensor): Number of tokens assigned to each expert in the batch.
+                                          Shape in [num_experts]
+        total_num_tokens (int): Total number of tokens in the batch.
+        topk (int): The number of experts selected for each token.
+        num_experts (int): The number of experts.
+        moe_aux_loss_coeff (float): The coefficient for the auxiliary loss.
+        fused (bool): Whether to use the fused version of the auxiliary loss.
+        padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
+                                               Shape in [num_tokens]. True for valid tokens,
+                                               False for padding tokens. Defaults to None.
+
+    Returns:
+        torch.Tensor: The auxiliary loss for load balancing.
+    """
+    # Apply padding mask to probs if provided
+    if padding_mask is not None:
+        # padding_mask: [num_tokens], probs: [num_tokens, num_experts]
+        mask_expanded = padding_mask.unsqueeze(-1)
+        probs = probs * mask_expanded
+
+    # An entirely padded MTP depth can have no valid tokens across the reduction
+    # group. Its masked probabilities contribute zero loss; keep normalization
+    # finite so backward does not turn that zero contribution into NaNs.
+    if isinstance(total_num_tokens, torch.Tensor):
+        total_num_tokens = total_num_tokens.clamp(min=1)
+    else:
+        total_num_tokens = max(total_num_tokens, 1)
+
+    if fused:
+        if not HAVE_TE or fused_moe_aux_loss is None:
+            raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.7.0.")
+        return fused_moe_aux_loss(
+            probs=probs,
+            tokens_per_expert=tokens_per_expert,
+            total_num_tokens=total_num_tokens,
+            topk=topk,
+            num_experts=num_experts,
+            coeff=moe_aux_loss_coeff,
+        )
+
+    aggregated_probs_per_expert = probs.sum(dim=0)
+    aux_loss = torch.sum(aggregated_probs_per_expert * tokens_per_expert) * (
+        num_experts * moe_aux_loss_coeff / (topk * total_num_tokens * total_num_tokens)
+    )
+    return aux_loss
+
+
+def z_loss_func(
+    logits: torch.Tensor, z_loss_coeff: float, padding_mask: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """Encourages the router's logits to remain small to enhance stability.
+    Please refer to the ST-MoE paper (https://arxiv.org/pdf/2202.08906.pdf) for details.
+
+    Args:
+        logits (torch.Tensor): The logits of the router.
+        z_loss_coeff (float): The coefficient for the z-loss.
+        padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                               Shape [num_tokens]. True = padding (exclude),
+                                               False = valid (include). Defaults to None.
+
+    Returns:
+        torch.Tensor: The logits after applying the z-loss.
+    """
+    logsum = torch.logsumexp(logits, dim=-1)
+    z_loss_values = torch.square(logsum)
+
+    if padding_mask is not None:
+        # Invert padding_mask: True (padding) -> 0, False (valid) -> 1
+        valid_mask = ~padding_mask
+        # Only compute z_loss for valid (non-padding) tokens
+        z_loss_values = z_loss_values * valid_mask
+        # Compute mean over valid tokens only
+        num_valid_tokens = valid_mask.sum()
+        z_loss = z_loss_values.sum() / torch.clamp(num_valid_tokens, min=1.0) * z_loss_coeff
+    else:
+        z_loss = torch.mean(z_loss_values) * z_loss_coeff
+    return z_loss
+
+
+def sinkhorn(cost: torch.Tensor, tol: float = 0.0001) -> torch.Tensor:
+    """Sinkhorn based MoE routing function.
+
+    Args:
+        cost (torch.Tensor): The cost tensor.
+        tol (float): The tolerance for the Sinkhorn algorithm.
+
+    Returns:
+        torch.Tensor: The routing probabilities.
+    """
+    cost = torch.exp(cost)
+    d0 = torch.ones(cost.size(0), device=cost.device, dtype=cost.dtype)
+    d1 = torch.ones(cost.size(1), device=cost.device, dtype=cost.dtype)
+
+    eps = 0.00000001
+    error = 1e9
+    d1_old = d1
+    while error > tol:
+        d0 = (1 / d0.size(0)) * 1 / (torch.sum(d1 * cost, 1) + eps)
+        d1 = (1 / d1.size(0)) * 1 / (torch.sum(d0.unsqueeze(1) * cost, 0) + eps)
+        error = torch.mean(torch.abs(d1_old - d1))
+        d1_old = d1
+    return d1 * cost * d0.unsqueeze(1)
+
+
+def qb_dual_update(
+    scores: torch.Tensor, k: int, beta: torch.Tensor, update_beta: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dual coordinate-descent quantile-balancing routing assignment.
+
+    Picks the top-k experts per token from ``scores - beta``. When ``update_beta`` is
+    True, also returns the raw column quantile of ``scores`` that drives each expert
+    toward ``m * k / n`` tokens.
+
+    Args:
+        scores (torch.Tensor): Scores of shape ``[m, n]`` (tokens, experts).
+        k (int): Experts to select per token.
+        beta (torch.Tensor): Current per-expert bias of shape ``[n]``.
+        update_beta (bool): If False, return ``beta`` unchanged (eval/inference).
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: indices of shape ``[m, k]`` and either
+        ``beta`` (when ``update_beta`` is False) or the column quantile ``[n]``.
+    """
+    num_tokens, num_experts = scores.shape
+
+    topk_result = (scores - beta).topk(k + 1, dim=1)
+    indices = topk_result.indices[:, :-1]
+
+    if not update_beta:
+        return indices, beta
+
+    assert (num_tokens * k) % num_experts == 0, (
+        "Quantile balancing requires the number of routed assignments "
+        f"({num_tokens} tokens * top-{k}) to be divisible by "
+        f"{num_experts} experts."
+    )
+    col_target = num_tokens * k // num_experts
+    alpha = topk_result.values[:, -1:]
+    beta_local = (scores - alpha).topk(col_target + 1, dim=0).values[-1].contiguous()
+    return indices, beta_local
+
+
+def get_capacity(
+    num_tokens: int, num_experts: int, capacity_factor: float, min_capacity: Optional[int] = None
+) -> int:
+    """
+    Calculate the capacity of each expert.
+
+    Args:
+        num_tokens (int): num of the input tokens.
+        num_experts (int): num of the experts.
+        capacity_factor (float): Capacity factor.
+        min_capacity (int, optional): Minimum capacity. Defaults to None.
+
+    Returns:
+        int: Capacity of each expert.
+    """
+    capacity = math.ceil((num_tokens / num_experts) * capacity_factor)
+    if min_capacity is not None and capacity < min_capacity:
+        capacity = min_capacity
+    return capacity
+
+
+def get_tokens_per_expert_and_token_count(
+    routing_map: torch.Tensor,
+    reduce_group: Union[torch.distributed.ProcessGroup, Tuple[torch.distributed.ProcessGroup, ...]],
+    topk: int = None,
+    with_padding_mask: bool = False,
+) -> torch.Tensor:
+    """
+    Compute global_tokens_per_expert, local_num_tokens and total_num_tokens with padding mask.
+
+    ``reduce_group`` accepts one group or an ordered tuple of orthogonal groups
+    (for example runtime CP followed by TP). The single-group positional API is preserved.
+    """
+    local_tokens_per_expert = routing_map.sum(dim=0)
+    reduce_groups = reduce_group if isinstance(reduce_group, tuple) else (reduce_group,)
+
+    # The reduction all-reduces contiguous tensors in place; reduce a copy so
+    # local_tokens_per_expert keeps this rank's counts for local_num_tokens below.
+    global_tokens_per_expert = local_tokens_per_expert.clone()
+    reduce_world_size = 1
+    for group in reduce_groups:
+        global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
+            global_tokens_per_expert, group
+        )
+        reduce_world_size *= group.size()
+
+    if with_padding_mask:
+        local_num_tokens = local_tokens_per_expert.sum() // topk
+        total_num_tokens = global_tokens_per_expert.sum() // topk
+    else:
+        local_num_tokens = routing_map.shape[0]
+        total_num_tokens = local_num_tokens * reduce_world_size
+    return global_tokens_per_expert, local_num_tokens, total_num_tokens
+
+
+class MoEAuxLossAutoScaler(torch.autograd.Function):
+    """An AutoScaler that triggers the backward pass and scales the grad for auxiliary loss."""
+
+    main_loss_backward_scale: Optional[torch.Tensor] = None
+
+    @staticmethod
+    def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor) -> torch.Tensor:
+        """Preserve the aux_loss by storing it in the context to avoid garbage collection.
+
+        Args:
+            output (torch.Tensor): The output tensor.
+            aux_loss (torch.Tensor): The auxiliary loss tensor.
+
+        Returns:
+            torch.Tensor: The output tensor.
+        """
+        ctx.save_for_backward(aux_loss)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute and scale the gradient for auxiliary loss..
+
+        Args:
+            grad_output (torch.Tensor): The gradient of the output.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: The gradient of the output, scaled auxiliary loss
+                                               gradient.
+        """
+        (aux_loss,) = ctx.saved_tensors
+        if MoEAuxLossAutoScaler.main_loss_backward_scale is None:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
+                1.0, device=aux_loss.device
+            )
+        aux_loss_backward_scale = MoEAuxLossAutoScaler.main_loss_backward_scale
+        scaled_aux_loss_grad = torch.ones_like(aux_loss) * aux_loss_backward_scale
+        return grad_output, scaled_aux_loss_grad
+
+    @staticmethod
+    def set_loss_scale(scale: torch.Tensor) -> None:
+        """set the scale of the aux loss.
+
+        Args:
+            scale (torch.Tensor): The scale value to set. Please ensure that the scale passed in
+                                  matches the scale of the main_loss.
+        """
+        if MoEAuxLossAutoScaler.main_loss_backward_scale is None:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = scale
+        else:
+            MoEAuxLossAutoScaler.main_loss_backward_scale.copy_(scale)
+
+
+def permute(
+    tokens: torch.Tensor,
+    routing_map: torch.Tensor,
+    probs: Optional[torch.Tensor] = None,
+    num_out_tokens: Optional[int] = None,
+    fused: bool = False,
+    drop_and_pad: bool = False,
+    tokens_per_expert: Optional[torch.Tensor] = None,
+    align_size: int = 0,
+    return_batch_invariant_inverse_map: bool = False,
+) -> Tuple[
+    torch.Tensor,
+    Optional[torch.Tensor],
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
+    """Permute the tokens and probs based on the mask.
+    Tokens with the same designated expert will be grouped together.
+    The shape of mask is [tokens, num_experts], it indicates which experts were selected
+    by each token.
+
+    When drop_and_pad=True, in routing_map, the number of non-zeros in each column equals to
+    expert capacity. This function exploits this feature to use ops that support cuda graph.
+
+    If the fused permute and pad kernel is available, it will pad the tokens to the align_size
+    and return the padded permuted tokens, pad_offsets and padded tokens per expert.
+
+    Args:
+        tokens (torch.Tensor): The input token tensor, [num_tokens, hidden].
+        routing_map (torch.Tensor): The sparse token to expert mapping, [num_tokens, num_experts].
+        probs (torch.Tensor, optional): The probs tensor, [num_tokens, num_experts].
+        num_out_tokens (int, optional): The number of output tokens. If None, it's set to
+                                        the number of input tokens.
+        fused (bool, optional): Whether use the fused permute function.
+        drop_and_pad (bool, optional): Whether or not the token dispatcher uses token-drop
+                                       and pads the number of tokens to the expert capacity.
+                                       If set to true, routing_map has a fixed number of non-zeros
+                                       in each column.
+        tokens_per_expert (torch.Tensor, optional): Tensor of shape `[num_experts]` containing
+                                                    actual token counts per expert.
+        align_size (int, optional): The alignment size for the input tensor for fp8 or fp4.
+        return_batch_invariant_inverse_map (bool, optional): Return a fixed-shape
+            batch-invariant inverse map in the `pad_offsets` slot for graph-safe unpermute.
+
+    Returns:
+        Tuple[
+            torch.Tensor,
+            Optional[torch.Tensor],
+            torch.Tensor,
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+        ]:
+            The permuted tokens, (optional) permuted probs, sorted indices,
+            (optional) pad_offsets, (optional) padded_tokens_per_expert.
+    """
+    if return_batch_invariant_inverse_map:
+        assert not fused, "batch-invariant MoE permute requires the unfused path"
+        assert not drop_and_pad, "batch-invariant MoE supports dynamic dropless routing only"
+
+    if fused and probs is None:
+        if not HAVE_TE or fused_permute is None:
+            raise ValueError("fused_permute is not available. Please install TE >= 2.1.0.")
+        permuted_input, sorted_indices = fused_permute(
+            tokens, routing_map, num_out_tokens=num_out_tokens
+        )
+        return permuted_input, None, sorted_indices, None, tokens_per_expert
+
+    if fused and probs is not None:
+        if not HAVE_TE or (
+            fused_permute_and_pad_with_probs is None and fused_permute_with_probs is None
+        ):
+            raise ValueError(
+                "Transformer Engine (TE) fused kernel is not available. "
+                "fused_permute_with_probs typically requires TE >= 2.1.0, and "
+                "fused_permute_and_pad_with_probs` typically requires TE >= 2.12.0. "
+            )
+        if (
+            fused_permute_and_pad_with_probs is not None
+            and tokens_per_expert is not None
+            and align_size > 0
+        ):
+            return fused_permute_and_pad_with_probs(
+                tokens, probs, routing_map, tokens_per_expert, align_size
+            )
+        else:
+            output, permuted_probs, row_id_map = fused_permute_with_probs(
+                tokens, probs, routing_map, num_out_tokens=num_out_tokens
+            )
+            return output, permuted_probs, row_id_map, None, tokens_per_expert
+
+    num_tokens, hidden = tokens.shape
+    num_experts = routing_map.shape[1]
+    permuted_probs = None
+    batch_invariant_inverse_map = None
+    if drop_and_pad and not (num_out_tokens is None):
+        capacity = num_out_tokens // num_experts
+        assert not routing_map.requires_grad
+        # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
+        routing_map = routing_map.to(dtype=torch.int8).T.contiguous()
+        # use argsort to put indices of all non-zeros in the beginning of list
+        # and keep the first `capacity` number of indices
+        sorted_indices = routing_map.argsort(dim=-1, descending=True, stable=True)[
+            :, :capacity
+        ].contiguous()
+        # flatten from [num_experts, capacity] to 1D
+        sorted_indices = sorted_indices.view(-1)
+
+        if probs is not None:
+            # [num_tokens, num_experts] -> num_experts * num_tokens
+            probs_T_1D = probs.T.contiguous().view(-1)
+            # get 1D indices of the probs selected by routing_map
+            indices_dim0 = torch.arange(num_experts, device=routing_map.device).unsqueeze(-1)
+            indices_dim1 = sorted_indices.view(num_experts, capacity)
+            indices_1D = (indices_dim0 * num_tokens + indices_dim1).view(-1)
+            # get probs from indices
+            permuted_probs = probs_T_1D.index_select(0, indices_1D)
+    else:
+        assert (
+            num_out_tokens is not None
+        ), "num_out_tokens is required for the argsort-based permute"
+        routing_map_for_inverse = routing_map
+
+        # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
+        routing_map = routing_map.bool().T.contiguous()
+
+        # Use argsort to get indices of non-zero entries in row-major order.
+        # This is equivalent to masked_select but produces fixed-shape output,
+        # making it compatible with CUDA graph capture.
+        flat_sorted = routing_map.reshape(-1).argsort(descending=True, stable=True)
+        flat_sorted = flat_sorted[:num_out_tokens]
+        sorted_indices = flat_sorted % num_tokens
+
+        if probs is not None:
+            permuted_probs = probs.T.contiguous().reshape(-1)[flat_sorted]
+
+        if return_batch_invariant_inverse_map:
+            batch_invariant_inverse_map = build_batch_invariant_inverse_permutation_map(
+                routing_map_for_inverse, flat_sorted, sorted_indices, num_out_tokens
+            )
+
+    # use the mapping to permute the tokens
+    permuted_input = tokens.index_select(0, sorted_indices)
+
+    return (
+        permuted_input,
+        permuted_probs,
+        sorted_indices,
+        batch_invariant_inverse_map,
+        tokens_per_expert,
+    )
+
+
+def unpermute(
+    permuted_tokens: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    restore_shape: torch.Size,
+    probs: Optional[torch.Tensor] = None,
+    routing_map: Optional[torch.Tensor] = None,
+    fused: bool = False,
+    drop_and_pad: bool = False,
+    pad_offsets: Optional[torch.Tensor] = None,
+    batch_invariant_inverse_map: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Restore the original order of tokens after permutation. If probs are provided, it
+    will also apply them to the tokens before restoring the order.
+
+    When drop_and_pad=True, the tensors will have the following properties:
+      - In routing_map, the number of non-zeros in each column equals to expert capacity
+      - The size of sorted_indices equals to num_experts * capacity, each split of `capacity`
+        contains the indices of tokens routed to an expert.
+    This function exploits these features to use ops that support cuda graph.
+
+    Args:
+        permuted_tokens (torch.Tensor): The permuted token tensor.
+        sorted_indices (torch.Tensor): The indices used to sort the tokens.
+        restore_shape (torch.Size): The shape of the unpermuted tensor.
+        probs (torch.Tensor, optional): The unpermuted probs tensor,
+        routing_map (torch.Tensor, optional): Token to expert mapping, shape
+            [num_tokens, num_experts].
+        fused (bool, optional): Whether use the fused unpermute function.
+        drop_and_pad (bool, optional): Whether or not the token dispatcher uses token-drop
+                                       and pads the number of tokens to the expert capacity.
+        pad_offsets (torch.Tensor, optional):
+            Tensor of per-expert cumulative padding offsets used to remove padding added
+            during permutation. This is the fourth output of `moe_permute_and_pad_with_probs`
+            and is required when unpermuting padded outputs. Defaults to None.
+        batch_invariant_inverse_map (torch.Tensor, optional): Fixed-shape
+            `[2, num_tokens, topk]` map from token/top-k slot to permuted row and
+            global expert id. Used by batch-invariant CUDA graph paths.
+
+    Returns:
+        torch.Tensor: The tokens restored to their original order.
+    """
+    batch_invariant_mode = is_batch_invariant_mode_enabled()
+    if batch_invariant_mode:
+        assert not fused, "batch-invariant MoE unpermute requires the unfused path"
+        assert not drop_and_pad, "batch-invariant MoE supports dynamic dropless routing only"
+
+    if fused:
+        if not HAVE_TE or fused_unpermute is None:
+            raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
+        extra_kwargs = {}
+        if is_te_min_version("2.12.0"):
+            extra_kwargs["pad_offsets"] = pad_offsets
+        return fused_unpermute(
+            permuted_tokens,
+            sorted_indices,
+            merging_probs=probs,
+            restore_shape=restore_shape,
+            **extra_kwargs,
+        )
+
+    if batch_invariant_mode:
+        assert routing_map is not None, "batch-invariant MoE unpermute requires routing_map"
+        assert (
+            batch_invariant_inverse_map is not None
+        ), "batch-invariant MoE unpermute requires the AllToAll inverse map"
+        return batch_invariant_unpermute(
+            permuted_tokens,
+            restore_shape,
+            probs=probs,
+            num_experts=routing_map.size(1),
+            inverse_map=batch_invariant_inverse_map,
+        )
+
+    _, hidden = restore_shape
+    input_dtype = permuted_tokens.dtype
+
+    if probs is not None:
+        assert routing_map is not None, "Mask must be provided to permute the probs."
+        if drop_and_pad:
+            num_experts = routing_map.size(1)
+            num_permuted_tokens = sorted_indices.size(0)
+            capacity = num_permuted_tokens // num_experts
+            num_unpermuted_tokens = probs.size(0)
+
+            # [num_unpermuted_tokens, num_experts] -> num_experts * num_unpermuted_tokens
+            probs_T_1D = probs.T.contiguous().view(-1)
+
+            # get 1D indices of the probs selected by routing_map
+            indices_dim0 = torch.arange(num_experts, device=routing_map.device).unsqueeze(-1)
+            indices_dim1 = sorted_indices.view(num_experts, capacity)
+            indices_1D = (indices_dim0 * num_unpermuted_tokens + indices_dim1).view(-1)
+
+            # get probs from indices
+            permuted_probs = probs_T_1D.index_select(0, indices_1D)
+        else:
+            permuted_probs = probs.T.contiguous().masked_select(routing_map.T.contiguous())
+        # Here may promote permuted_tokens to higher precision (fp32/fp64) if probs is in
+        # higher precision due to moe_router_dtype being enabled. This can lead to
+        # additional GPU memory usage. Use --moe-permute-fusion flag to avoid this extra memory
+        # allocation.
+        permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
+
+    # Create an output tensor filled with zeros
+    output_tokens = torch.zeros(
+        restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
+    )
+    if torch.are_deterministic_algorithms_enabled():
+        # Use index_add which is deterministic when deterministic algorithms are enabled
+        # and is CUDA graph compatible
+        # index_add is deterministic when torch.use_deterministic_algorithms(True) is set
+        # and is CUDA graph compatible unlike scatter_add
+        output_tokens.index_add_(0, sorted_indices, permuted_tokens)
+    else:
+        # Scatter add the permuted_input back to the original positions
+        output_tokens.scatter_add_(
+            0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
+        )
+    out = output_tokens.to(dtype=input_dtype)
+    # Explicitly release intermediate tensor references to enable CUDA
+    # caching allocator to reclaim memory immediately during full
+    # recomputation. Without this, scatter_add_/index_add_ autograd
+    # references prevent GC until the next training iteration.
+    # See: https://github.com/NVIDIA/Megatron-LM/issues/3221
+    del output_tokens, permuted_tokens, sorted_indices
+    return out
+
+
+def sort_chunks_by_idxs(
+    input: torch.Tensor,
+    split_sizes: torch.Tensor,
+    sorted_idxs: torch.Tensor,
+    probs: Optional[torch.Tensor] = None,
+    fused: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Split and sort the input tensor based on the split_sizes and sorted indices.
+
+    Args:
+        input (torch.Tensor): The input tensor.
+        split_sizes (torch.Tensor): The split sizes.
+        sorted_idxs (torch.Tensor): The sorted indices.
+        probs (torch.Tensor, optional): The probs tensor. Defaults to None.
+        fused (bool, optional): Whether to use the fused version of the sort_chunks_by_idxs
+                                function. Defaults to False.
+
+    Returns:
+        Tuple[torch.Tensor, Optional[torch.Tensor]]: The sorted output tensor and permuted probs.
+    """
+    if fused and probs is None:
+        if not HAVE_TE or fused_sort_chunks_by_index is None:
+            raise ValueError(
+                "fused_sort_chunks_by_index is not available. Please install TE >= 2.1.0."
+            )
+        return fused_sort_chunks_by_index(input, split_sizes, sorted_idxs), None
+
+    if fused and probs is not None:
+        if not HAVE_TE or fused_sort_chunks_by_index_with_probs is None:
+            raise ValueError(
+                "fused_sort_chunks_by_index_with_probs is not available. "
+                "Please install TE >= 2.1.0."
+            )
+        return fused_sort_chunks_by_index_with_probs(input, probs, split_sizes, sorted_idxs)
+
+    input = torch.split(input, split_sizes.tolist(), dim=0)
+    output = torch.cat([input[i] for i in sorted_idxs.tolist()], dim=0)
+    if probs is not None:
+        probs = torch.split(probs, split_sizes.tolist(), dim=0)
+        permuted_probs = torch.cat([probs[i] for i in sorted_idxs.tolist()], dim=0)
+    else:
+        permuted_probs = None
+    return output, permuted_probs
+
+
+def group_limited_topk(
+    scores: torch.Tensor,
+    topk: int,
+    num_tokens: int,
+    num_experts: int,
+    num_groups: int,
+    group_topk: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Perform top-k routing on a subset of expert groups.
+
+    When using group-limited routing:
+    1. Experts are divided into 'moe_router_num_groups' equal-sized groups
+    2. For each token, 'moe_router_group_topk' groups are selected based on routing scores
+       (specifically, the sum of top-2 expert scores within each group)
+    3. From these selected groups, 'moe_router_topk' individual experts are chosen
+
+    Two common use cases:
+    - Device-limited routing: Set 'moe_router_num_groups' equal to expert parallel size (EP)
+      to limit each token to experts on a subset of devices
+      (See DeepSeek-V2: https://arxiv.org/pdf/2405.04434)
+
+    - Node-limited routing: Set 'moe_router_num_groups' equal to number of nodes in EP group
+      to limit each token to experts on a subset of nodes
+      (See DeepSeek-V3: https://arxiv.org/pdf/2412.19437)
+
+    Args:
+        scores (torch.Tensor): Softmax scores generated by the router.
+        topk (int): The number of experts to select for each token.
+        num_tokens (int): The number of tokens.
+        num_experts (int): The number of experts.
+        num_groups (int): Number of groups for routed experts.
+        group_topk (int): Number of groups selected for each token.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Probs and indices tensor.
+    """
+    # Organize the experts into groups
+    # Select groups based on sum of top-(topk/group_topk) routing scores within each group
+    group_scores = (
+        scores.view(num_tokens, num_groups, -1).topk(topk // group_topk, dim=-1)[0].sum(dim=-1)
+    )
+    group_idx = torch.topk(group_scores, k=group_topk, dim=-1, sorted=False)[1]
+    group_mask = torch.zeros_like(group_scores)
+    group_mask.scatter_(1, group_idx, 1)
+
+    # Mask the experts based on selection groups
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(num_tokens, num_groups, num_experts // num_groups)
+        .reshape(num_tokens, -1)
+    )
+
+    masked_scores = scores.masked_fill(~score_mask.bool(), float('-inf'))
+    probs, top_indices = torch.topk(masked_scores, k=topk, dim=-1)
+
+    return probs, top_indices
+
+
+def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tensor:
+    """Pad the routing map to ensure each expert has a multiple of pad_multiple tokens.
+
+    This function ensures that each expert has a number of tokens that is a multiple of
+    pad_multiple by converting some 0s to 1s in the routing map. The padding is done by
+    selecting the first N zero elements in each row, where N is the number needed to reach
+    the next multiple of pad_multiple.
+
+    Args:
+        routing_map (torch.Tensor): A boolean or integer tensor of shape [num_tokens,
+            num_experts] indicating which tokens are routed to which experts.
+        pad_multiple (int): The multiple to pad each expert's token count to.
+
+    Returns:
+        torch.Tensor: The padded routing map of shape [num_tokens, num_experts].
+    """
+    # Work on a copy because fused router autograd saves the returned routing
+    # map for backward. Padding a transposed view in place would increment the
+    # saved tensor's version counter and make backward fail.
+    routing_map = routing_map.clone().transpose(0, 1)  # [num_experts, num_tokens]
+
+    # Calculate how many tokens need to be padded for each expert
+    num_ones = routing_map.sum(dim=1)
+    num_to_pad = (-num_ones) % pad_multiple
+
+    # Find the positions of zeros in each row and their ranks
+    is_zero = routing_map == 0
+    zero_ranks = torch.cumsum(is_zero.int(), dim=1)
+
+    # Create mask for elements that need to be padded (converted from 0 to 1)
+    mask = zero_ranks <= num_to_pad.unsqueeze(1)
+    routing_map[mask] = 1
+
+    routing_map = routing_map.transpose(0, 1)
+    return routing_map
+
+
+def topk_routing_with_score_function(
+    logits: torch.Tensor,
+    topk: int,
+    use_pre_softmax: bool = False,
+    num_groups: Optional[int] = None,
+    group_topk: Optional[int] = None,
+    scaling_factor: Optional[float] = None,
+    score_function: str = "softmax",
+    expert_bias: Optional[torch.Tensor] = None,
+    fused: bool = False,
+    router_replay: Optional['RouterReplay'] = None,
+    dense_output: bool = False,
+    precomputed_indices: Optional[torch.Tensor] = None,
+    qb_histogram: Optional[torch.Tensor] = None,
+    qb_bin_bounds: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute the routing probabilities and map for top-k selection with score function.
+
+    Args:
+        logits (torch.Tensor): Logits tensor.
+        topk (int): The number of experts to select for each token.
+        use_pre_softmax (bool, optional): Whether to apply softmax or sigmoid before top-k
+                                          selection. Defaults to False.
+        num_groups (int, optional): Number of groups for routed experts. Defaults to None.
+        group_topk (int, optional): Number of selected groups for each token. Defaults to None.
+        scaling_factor (float, optional): Scaling factor of routing score in top-k selection.
+                                         Defaults to None.
+        score_function (str, optional): The score function to use. Can be "softmax", "sigmoid"
+                                        or "sqrtsoftplus". Defaults to "softmax".
+        expert_bias (torch.Tensor, optional): The bias added to logits for expert routing.
+                                              Defaults to None.
+        fused (bool, optional): Whether to use the fused version. Defaults to False.
+        router_replay (Optional['RouterReplay']): For debugging and development, allows for
+                                             deterministic routing by replaying a previously
+                                             recorded routing sequence.
+
+                                              Defaults to None.
+        dense_output (bool, optional): If True, return dense tensors [num_tokens, topk] instead of
+                                       sparse tensors [num_tokens, num_experts]. Defaults to False.
+        precomputed_indices (torch.Tensor, optional): Top-k indices [num_tokens, topk]
+                                       selected by the caller. When given, the score function's
+                                       own top-k is bypassed and probs are computed at these
+                                       indices (e.g. for quantile balancing). Defaults to None.
+        qb_histogram (torch.Tensor, optional): Caller-owned int32 K3 Quantile Balancing histogram
+                                               with shape [num_experts, num_bins].
+        qb_bin_bounds (torch.Tensor, optional): FP32 CUDA tensor containing the lower and upper
+                                                K3 Quantile Balancing histogram bounds.
+        topk_indices (torch.Tensor, optional): Optional dense top-k index output buffer with shape
+                                               [num_tokens, topk]. Only used by the fused TE path.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            When dense_output=False (default):
+                - routing_probs (torch.Tensor): Shape [num_tokens, num_experts]. Sparse tensor
+                  containing the normalized routing probability for each token-expert pair. Non-zero
+                  entries correspond to the top-k selected experts per token.
+                - routing_map (torch.Tensor): Shape [num_tokens, num_experts]. Boolean mask where
+                  True indicates the token is routed to that expert (i.e. the expert was in the
+                  token's top-k selection). When topk_indices is provided, this is instead that
+                  [num_tokens, topk] dense index buffer.
+            When dense_output=True:
+                - probs (torch.Tensor): Shape [num_tokens, topk]. The normalized routing
+                  probabilities for each token's top-k selected experts.
+                - top_indices (torch.Tensor): Shape [num_tokens, topk]. The expert indices
+                  selected for each token.
+    """
+    assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
+    num_tokens, num_experts = logits.shape
+    use_quantile_balancing = qb_histogram is not None or qb_bin_bounds is not None
+    if use_quantile_balancing and (qb_histogram is None or qb_bin_bounds is None):
+        raise ValueError("qb_histogram and qb_bin_bounds must be provided together.")
+    if use_quantile_balancing:
+        if expert_bias is None:
+            raise ValueError("Quantile Balancing requires an expert bias.")
+        if score_function != "sigmoid":
+            raise ValueError("Quantile Balancing currently requires score_function='sigmoid'.")
+        if use_pre_softmax:
+            raise ValueError("Quantile Balancing does not use pre-softmax routing.")
+        if topk >= num_experts:
+            raise ValueError("Quantile Balancing requires topk < num_experts.")
+        if num_groups is not None or group_topk is not None:
+            raise ValueError("Quantile Balancing does not support group-limited routing.")
+        if router_replay is not None:
+            raise ValueError("Quantile Balancing does not support router replay.")
+        if precomputed_indices is not None:
+            raise ValueError("Histogram Quantile Balancing computes its own top-(k+1).")
+        if qb_histogram.dim() != 2 or qb_histogram.shape[0] != num_experts:
+            raise ValueError(
+                "qb_histogram must have shape [num_experts, num_bins], got "
+                f"{tuple(qb_histogram.shape)}."
+            )
+        if qb_histogram.dtype != torch.int32:
+            raise ValueError("qb_histogram must have dtype torch.int32.")
+        if qb_bin_bounds.shape != (2,) or qb_bin_bounds.dtype != torch.float32:
+            raise ValueError("qb_bin_bounds must be an FP32 tensor with shape [2].")
+    assert not (
+        fused and precomputed_indices is not None
+    ), "precomputed_indices is not supported with the fused top-k score function."
+    if fused:
+        if not HAVE_TE or fused_topk_with_score_function is None:
+            raise ValueError(
+                "fused_topk_with_score_function is not available. Please install TE >= 2.6.0."
+            )
+        if score_function == "sqrtsoftplus" and not is_te_min_version("2.13.0"):
+            raise ValueError(
+                "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
+                "Please upgrade Transformer Engine or disable moe_router_fusion."
+            )
+        kwargs = {
+            "logits": logits,
+            "topk": topk,
+            "use_pre_softmax": use_pre_softmax,
+            "num_groups": num_groups,
+            "group_topk": group_topk,
+            "scaling_factor": scaling_factor,
+            "score_function": score_function,
+            "expert_bias": expert_bias,
+        }
+        if use_quantile_balancing:
+            if not fused_topk_with_score_function_supports_qb:
+                raise ValueError(
+                    "The installed Transformer Engine fused router does not expose Quantile "
+                    "Balancing histogram outputs. Upgrade Transformer Engine or disable "
+                    "moe_router_fusion."
+                )
+            kwargs.update(
+                qb_histogram=qb_histogram,
+                qb_bin_bounds=qb_bin_bounds,
+                qb_histogram_mode="fused_atomic",
+            )
+        if fused_topk_with_score_function_supports_topk_indices and topk_indices is not None:
+            kwargs["topk_indices"] = topk_indices
+        return fused_topk_with_score_function(**kwargs)
+
+    def _compute_topk(
+        scores: torch.Tensor,
+        topk: int,
+        num_groups: Optional[int] = None,
+        group_topk: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute the top-k indices for the given scores.
+
+        Args:
+            scores (torch.Tensor): The scores tensor.
+            topk (int): The number of top-k indices to compute.
+            num_groups (int, optional): The number of groups to compute the top-k indices for.
+                                        Defaults to None.
+            group_topk (int, optional): The number of top-k indices to compute for each group.
+                                        Defaults to None.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: The top-k indices and the top-k scores.
+        """
+        if group_topk:
+            return group_limited_topk(
+                scores=scores,
+                topk=topk,
+                num_tokens=num_tokens,
+                num_experts=num_experts,
+                num_groups=num_groups,
+                group_topk=group_topk,
+            )
+        else:
+            # Sorting top-k turned off during inference
+            return torch.topk(
+                scores,
+                k=topk,
+                dim=1,
+                sorted=torch.is_grad_enabled() or is_batch_invariant_mode_enabled(),
+            )
+
+    def compute_topk(scores, topk, num_groups=None, group_topk=None):
+        # Default behavior if no replay is active
+
+        if router_replay is None:
+            return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
+        else:
+            return router_replay.get_replay_topk(
+                scores, topk, num_groups, group_topk, _compute_topk
+            )
+
+    # Precision notes:
+    # - Logits are converted to fp32 for score functions.
+    # - All the intermediate calculations are in fp32.
+    # - The final probs are casted to the same dtype as the logits.
+    if score_function == "softmax":
+        if use_pre_softmax:
+            scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+            if precomputed_indices is not None:
+                top_indices = precomputed_indices
+                probs = torch.gather(scores, dim=1, index=top_indices)
+            else:
+                probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+        else:
+            if precomputed_indices is not None:
+                top_indices = precomputed_indices
+                scores = torch.gather(logits, dim=1, index=top_indices)
+            else:
+                scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
+            probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
+    elif score_function in ("sigmoid", "sqrtsoftplus"):
+        if score_function == "sigmoid":
+            scores = torch.sigmoid(logits.float())
+        else:
+            scores = torch.nn.functional.softplus(logits.float()).sqrt()
+        if precomputed_indices is not None:
+            top_indices = precomputed_indices
+            scores = torch.gather(scores, dim=1, index=top_indices)
+        elif expert_bias is not None:
+            scores_for_routing = scores + expert_bias.float()
+            if use_quantile_balancing:
+                topk_result = torch.topk(scores_for_routing, topk + 1, dim=1, sorted=True)
+                cutoff = topk_result.values[:, -1:]
+                top_indices = topk_result.indices[:, :-1]
+                with torch.no_grad():
+                    num_bins = qb_histogram.shape[1]
+                    lower, upper = qb_bin_bounds.unbind()
+                    bin_indices = torch.floor(
+                        (cutoff - scores.detach() - lower) * (num_bins / (upper - lower))
+                    ).to(torch.int64)
+                    bin_indices.clamp_(0, num_bins - 1)
+                    expert_offsets = (
+                        torch.arange(num_experts, device=logits.device, dtype=torch.int64)
+                        * num_bins
+                    )
+                    flat_indices = (bin_indices + expert_offsets).reshape(-1)
+                    qb_histogram.view(-1).scatter_add_(
+                        0, flat_indices, torch.ones_like(flat_indices, dtype=torch.int32)
+                    )
+            else:
+                _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+            scores = torch.gather(scores, dim=1, index=top_indices)
+        else:
+            scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+    else:
+        raise ValueError(f"Invalid score_function: {score_function}")
+
+    if scaling_factor:
+        probs = probs * scaling_factor
+
+    probs = probs.type_as(logits)
+
+    if dense_output:
+        return probs, top_indices
+
+    if torch.are_deterministic_algorithms_enabled():
+        # build [num_tokens, num_experts] from [num_tokens, topk]
+        routing_probs = torch.zeros_like(logits)
+        rows = torch.arange(num_tokens, device=logits.device).unsqueeze(1)
+        routing_probs.index_put_((rows, top_indices), probs, accumulate=False)
+
+        routing_map = torch.zeros_like(logits, dtype=logits.dtype)
+        routing_map.index_put_(
+            (rows, top_indices), torch.ones_like(probs, dtype=routing_map.dtype), accumulate=False
+        )
+        routing_map = routing_map.bool()
+    else:
+        # TODO Try using element-wise operations instead of scatter?
+        routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
+        routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+
+    return routing_probs, routing_map
+
+
+def compute_normalized_router_scores(logits: torch.Tensor, score_function: str) -> torch.Tensor:
+    """Compute the normalized score distribution over all experts.
+
+    Args:
+        logits: Router logits with experts in the final dimension.
+        score_function: Score function to use. Must be `softmax`, `sigmoid`, or
+            `sqrtsoftplus`.
+
+    Returns:
+        Float32 normalized router scores with the same shape as `logits`.
+
+    Raises:
+        ValueError: If `score_function` is unsupported.
+    """
+    if score_function == "softmax":
+        return torch.softmax(logits, dim=-1, dtype=torch.float32)
+    if score_function == "sigmoid":
+        scores = torch.sigmoid(logits.float())
+    elif score_function == "sqrtsoftplus":
+        scores = torch.nn.functional.softplus(logits.float()).sqrt()
+    else:
+        raise ValueError(f"Invalid score_function: {score_function}")
+    return scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+
+
+def compute_routing_scores_for_aux_loss(
+    logits: torch.Tensor,
+    topk: int,
+    score_function: str,
+    fused: bool = False,
+    padding_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute routing scores based on the score function.
+
+    Args:
+        logits (torch.Tensor): The logits tensor after gating, shape: [num_tokens, num_experts].
+        topk (int): The number of top-k indices to compute.
+        score_function (str): The score function to use. Can be "softmax", "sigmoid"
+                              or "sqrtsoftplus".
+        fused (bool, optional): Whether to use the fused version. Defaults to False.
+        padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                               Shape [num_tokens]. True = padding (exclude),
+                                               False = valid (include). Defaults to None.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: The routing map and the normalized routing scores.
+    """
+    if fused:
+        if not HAVE_TE or fused_compute_score_for_moe_aux_loss is None:
+            raise ValueError(
+                "fused_compute_score_for_moe_aux_loss is not available. Please install TE >= 2.6.0."
+            )
+        if score_function == "sqrtsoftplus" and not is_te_min_version("2.13.0"):
+            raise ValueError(
+                "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
+                "Please upgrade Transformer Engine or disable moe_router_fusion."
+            )
+        routing_map, scores = fused_compute_score_for_moe_aux_loss(
+            logits=logits, topk=topk, score_function=score_function
+        )
+    else:
+        scores = compute_normalized_router_scores(logits, score_function)
+
+        _, top_indices = torch.topk(scores, k=topk, dim=1)
+        routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+
+    # Apply padding mask to scores if provided
+    if padding_mask is not None:
+        # Invert padding_mask and make True indicates valid tokens
+        valid_mask = (~padding_mask).unsqueeze(-1)
+        routing_map = routing_map * valid_mask
+        scores = scores * valid_mask
+    return routing_map, scores
+
+
+def apply_router_token_dropping(
+    routing_probs: torch.Tensor,
+    routing_map: torch.Tensor,
+    router_topk: int,
+    capacity_factor: float,
+    drop_policy: str = "probs",
+    pad_to_capacity: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply token dropping to top-k expert selection.
+
+    This function enforces expert capacity limits by dropping tokens that exceed
+    the capacity and optionally padding to capacity.
+
+    Args:
+        routing_probs (torch.Tensor): Tensor of shape [num_tokens, num_experts]
+            containing the routing probabilities for selected experts.
+        routing_map (torch.Tensor): Boolean tensor of shape [num_tokens, num_experts]
+            indicating which experts were selected for each token.
+        router_topk (int): Number of experts selected per token.
+        capacity_factor (float): The capacity factor of each expert.
+        drop_policy (str, optional): Policy to drop tokens - "probs" or "position".
+                                     Defaults to "probs".
+        pad_to_capacity (bool, optional): Whether to pad to capacity. Defaults to False.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            - final_probs: Routing probabilities after applying capacity constraints
+            - final_map: Boolean mask after applying capacity constraints
+    """
+    assert routing_probs.ndim == 2 and routing_map.ndim == 2
+    num_tokens, num_experts = routing_probs.shape
+    # Calculate expert capacity
+    expert_capacity = get_capacity(
+        num_tokens=num_tokens * router_topk,
+        num_experts=num_experts,
+        capacity_factor=capacity_factor,
+    )
+
+    # Create capacity mask based on drop policy
+    if expert_capacity > num_tokens:
+        # No need to drop tokens if capacity exceeds the number of tokens
+        capacity_mask = torch.ones_like(routing_probs).bool()
+    else:
+        if drop_policy == "probs":
+            _, capacity_indices = torch.topk(routing_probs, k=expert_capacity, dim=0, sorted=False)
+            capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
+        elif drop_policy == "position":
+            _, capacity_indices = torch.topk(
+                routing_map.int(), k=expert_capacity, dim=0, sorted=False
+            )
+            capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
+        else:
+            raise ValueError(f"Invalid drop_policy: {drop_policy}")
+
+    # Apply capacity constraints
+    if pad_to_capacity:
+        final_map = capacity_mask
+        final_probs = routing_probs * final_map
+    else:
+        # Get exceed mask and maskout exceeded probs and indices
+        final_map = torch.logical_and(routing_map, capacity_mask)
+        final_probs = routing_probs * final_map
+
+    return final_probs, final_map
+
+
+@deprecated(
+    version="0.16", removal_version="0.18", alternative="get_moe_metrics_tracker().record()"
+)
+def save_to_aux_losses_tracker(
+    name: str,
+    loss: torch.Tensor,
+    layer_number: int,
+    num_layers: int,
+    reduce_group: Optional[torch.distributed.ProcessGroup] = None,
+    avg_group: Optional[torch.distributed.ProcessGroup] = None,
+    reduce_group_has_dp: bool = False,
+) -> None:
+    """Save the auxiliary loss for logging.
+    Args:
+        name (str): The name of the loss.
+        loss (torch.Tensor): The loss tensor.
+        layer_number (int): Layer index of the loss.
+        num_layers (int): The number of total layers.
+        reduce_group (torch.distributed.ProcessGroup, optional): The group for reducing the loss.
+            Defaults to None.
+        avg_group (torch.distributed.ProcessGroup, optional): The group for averaging the loss.
+            Defaults to None.
+        reduce_group_has_dp (bool, optional): Whether the reduce group already includes DP ranks.
+            If True, DP averaging is skipped. Defaults to False.
+    """
+    get_moe_metrics_tracker().record(
+        name=name,
+        value=loss,
+        layer_number=layer_number,
+        num_layers=num_layers,
+        reduce_group=reduce_group,
+        avg_group=avg_group,
+        needs_dp_avg=not reduce_group_has_dp,
+    )
+
+
+@deprecated(version="0.16", removal_version="0.18", alternative="get_moe_metrics_tracker().clear()")
+def clear_aux_losses_tracker() -> None:
+    """Clear the auxiliary losses."""
+    get_moe_metrics_tracker().clear()
+
+
+@deprecated(
+    version="0.16", removal_version="0.18", alternative="get_moe_metrics_tracker()._sync_metrics()"
+)
+def reduce_aux_losses_tracker_across_ranks(
+    track_names: Optional[List[str]] = None, pg_collection: Optional[ProcessGroupCollection] = None
+) -> None:
+    """Reduce the auxiliary losses across ranks.
+
+    Args:
+        track_names (Optional[List[str]], optional):
+            The names of the losses to track. Defaults to None.
+        pg_collection (Optional[ProcessGroupCollection], optional):
+            The process group collection. Defaults to None.
+    """
+    tracker = get_moe_metrics_tracker()
+    names_list = track_names if track_names is not None else list(tracker.metrics.keys())
+    tracker._sync_metrics(names_list, pg_collection)
+
+
+@deprecated(version="0.16", removal_version="0.18", alternative="get_moe_metrics_tracker().metrics")
+def get_moe_layer_wise_logging_tracker():
+    """Return the moe layer wise tracker in legacy dict format."""
+    return {
+        name: {
+            "values": entry.values,
+            "reduce_group": entry.reduce_group,
+            "avg_group": entry.avg_group,
+            "needs_dp_avg": entry.needs_dp_avg,
+        }
+        for name, entry in get_moe_metrics_tracker().metrics.items()
+    }
+
+
+@deprecated(
+    version="0.15", removal_version="0.17", alternative="get_moe_metrics_tracker().report()"
+)
+def track_moe_metrics(
+    loss_scale: float,
+    iteration: int,
+    writer: Optional["SummaryWriter"] = None,
+    wandb_writer: Optional["wandb.Run"] = None,
+    total_loss_dict: Optional[dict[str, torch.Tensor]] = None,
+    per_layer_logging: bool = False,
+    force_initialize: bool = False,
+    track_names: Optional[List[str]] = None,
+    num_layers: Optional[int] = None,
+    num_moe_layers: Optional[int] = None,
+    moe_layer_freq: Optional[Union[int, List[int]]] = None,
+    mtp_num_layers: Optional[int] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+) -> str:
+    """Track the MoE metrics for logging.
+
+    Deprecated: Use get_moe_metrics_tracker().report() directly.
+    """
+    return get_moe_metrics_tracker().report(
+        loss_scale=loss_scale,
+        iteration=iteration,
+        writer=writer,
+        wandb_writer=wandb_writer,
+        per_layer_logging=per_layer_logging,
+        force_initialize=force_initialize,
+        track_names=track_names,
+        num_layers=num_layers,
+        num_moe_layers=num_moe_layers,
+        moe_layer_freq=moe_layer_freq,
+        mtp_num_layers=mtp_num_layers,
+        pg_collection=pg_collection,
+        total_loss_dict=total_loss_dict,
+    )
+
+
+def get_updated_expert_bias(
+    tokens_per_expert: torch.Tensor,
+    expert_bias: torch.Tensor,
+    expert_bias_update_rate: float,
+    tp_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Update expert bias for biased expert routing. See https://arxiv.org/abs/2408.15664v1#
+
+    Args:
+        tokens_per_expert (torch.Tensor): The number of tokens assigned to each expert.
+        expert_bias (torch.Tensor): The bias for each expert.
+        expert_bias_udpate_rate (float): The update rate for the expert bias.
+        tp_dp_cp_group (torch.distributed.ProcessGroup, optional): The group spanning the tensor,
+            data, and context parallel ranks that share the router expert-bias update.
+
+    Returns:
+        torch.Tensor: The updated expert bias.
+    """
+    with torch.no_grad():
+        if tp_dp_cp_group is None:
+            # TODO(Hepteract): delete the usage of the global parallel_state.
+            tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
+                with_context_parallel=True
+            )
+
+        # All Reduce Across TPxCPxDP group
+        torch.distributed.all_reduce(tokens_per_expert, group=tp_dp_cp_group)
+        num_experts = tokens_per_expert.shape[-1]
+        total_tokens = tokens_per_expert.sum(dim=-1, keepdim=True)
+        # Compare each tokens_per_expert value with the row average without converting the integer
+        # counts to floating point: tokens_per_expert < total / num_experts iff
+        # tokens_per_expert * num_experts < total.
+        update_direction = torch.sign(total_tokens - tokens_per_expert * num_experts)
+        updated_expert_bias = (
+            expert_bias + update_direction.to(dtype=expert_bias.dtype) * expert_bias_update_rate
+        )
+        return updated_expert_bias
+
+
+def get_updated_expert_bias_with_quantile(
+    histogram: torch.Tensor, bin_bounds: torch.Tensor, expert_bias: torch.Tensor, topk: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Recover Kimi K3 Quantile Balancing biases from a pooled global-batch histogram."""
+    if histogram.dim() < 2:
+        raise ValueError("QB histogram must have shape [..., num_experts, num_bins].")
+    num_experts, num_bins = histogram.shape[-2:]
+    if num_experts <= 0 or num_bins <= 0:
+        raise ValueError("QB histogram dimensions must be positive.")
+    if expert_bias.shape != histogram.shape[:-1]:
+        raise ValueError(
+            f"QB expert_bias shape {expert_bias.shape} does not match expected "
+            f"{histogram.shape[:-1]} for histogram shape {histogram.shape}."
+        )
+    if bin_bounds.shape != histogram.shape[:-2] + (2,):
+        raise ValueError(
+            f"QB bin_bounds shape {bin_bounds.shape} does not match expected "
+            f"{histogram.shape[:-2] + (2,)} for histogram shape {histogram.shape}."
+        )
+    if not 0 < topk < num_experts:
+        raise ValueError(f"QB topk must be in [1, {num_experts}), got {topk}.")
+
+    with torch.no_grad():
+        cumulative_counts = torch.cumsum(histogram, dim=-1, dtype=torch.int64)
+        tokens_per_expert = cumulative_counts[..., -1]
+        # Every token contributes one margin sample to every expert, so all expert totals match.
+        total_tokens = tokens_per_expert[..., 0]
+        target_quantile = total_tokens.to(torch.float32) * (topk / num_experts)
+        target_rank = torch.ceil(target_quantile).to(torch.int64).clamp_min_(1)
+        selected_bins = (
+            (cumulative_counts >= target_rank[..., None, None]).to(torch.int64).argmax(dim=-1)
+        )
+        selected_counts = torch.gather(histogram, -1, selected_bins.unsqueeze(-1)).squeeze(-1)
+        previous_bins = (selected_bins - 1).clamp_min(0)
+        counts_before = torch.gather(cumulative_counts, -1, previous_bins.unsqueeze(-1)).squeeze(-1)
+        counts_before = torch.where(
+            selected_bins == 0, torch.zeros_like(counts_before), counts_before
+        )
+        interpolation = (
+            (target_quantile[..., None] - counts_before.to(torch.float32))
+            / selected_counts.clamp_min(1).to(torch.float32)
+        ).clamp_(0.0, 1.0)
+        lower = bin_bounds[..., 0, None]
+        upper = bin_bounds[..., 1, None]
+        bin_width = (upper - lower) / num_bins
+        updated_expert_bias = lower + (selected_bins.to(torch.float32) + interpolation) * bin_width
+        updated_expert_bias -= updated_expert_bias.mean(dim=-1, keepdim=True)
+        has_tokens = total_tokens > 0
+        updated_expert_bias = torch.where(has_tokens[..., None], updated_expert_bias, expert_bias)
+        bias_min, bias_max = torch.aminmax(updated_expert_bias, dim=-1)
+        updated_bin_bounds = torch.stack((bias_min - 1.0, bias_max + 1.0), dim=-1)
+        updated_bin_bounds = torch.where(has_tokens[..., None], updated_bin_bounds, bin_bounds)
+        return updated_expert_bias, updated_bin_bounds
+
+
+def maybe_move_tensor_to_cpu(
+    tensor: torch.Tensor, as_numpy: bool = False, record_stream: bool = False
+) -> torch.Tensor:
+    """Move a tensor to CPU if it is on GPU.
+    Args:
+        tensor (torch.Tensor): The tensor to move to CPU.
+        as_numpy (bool, optional): Whether to convert the tensor to a numpy array.
+                                   Defaults to False.
+        record_stream (bool, optional): Whether to record the stream of the tensor, to prevent
+                                        memory leak when the DtoH data transfer is on a side
+                                        stream. Defaults to False.
+
+    Returns:
+        torch.Tensor: The tensor moved to CPU.
+    """
+    if torch.is_tensor(tensor) and tensor.is_cuda:
+        cpu_tensor = tensor.to(torch.device("cpu"), non_blocking=True)
+        if as_numpy:
+            cpu_tensor = cpu_tensor.numpy()
+        if record_stream:
+            tensor.record_stream(torch.cuda.current_stream())
+        tensor = cpu_tensor
+    return tensor
+
+
+@internal_api
+class RandomSTE(torch.autograd.Function):
+    """
+    Straight-Through Estimator(STE) function that returns random values
+    with different seed for each rank.
+
+    This is used to generate random logits of router for load-balanced benchmark.
+    """
+
+    @staticmethod
+    def forward(ctx, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass returns random logits with rank-specific seed.
+
+        Args:
+            logits (torch.Tensor): The logits.
+
+        Returns:
+            torch.Tensor: The random logits.
+        """
+        with get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name()):
+            random_logits = logits.clone().normal_()
+        return random_logits
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+        """
+        Backward pass propagates the gradient for logits.
+
+        Args:
+            grad_output (torch.Tensor): The gradient output.
+
+        Returns:
+            torch.Tensor: The gradient input.
+        """
+        return grad_output
+
+
+def apply_random_logits(logits: torch.Tensor) -> torch.Tensor:
+    """
+    Apply the RandomSTE function to the logits.
+
+    Args:
+        logits (torch.Tensor): The logits.
+
+    Returns:
+        torch.Tensor: The random logits.
+    """
+    return RandomSTE.apply(logits)
+
+
+@internal_api
+class RandomSTEShared(torch.autograd.Function):
+    """
+    Straight-Through Estimator(STE) function that returns random values
+    with a shared seed across all ranks.
+    When std < 0, caches and reuses values per layer.
+    """
+
+    _cache = {}
+
+    @staticmethod
+    def forward(ctx, logits, std, layer_number):
+        """Forward pass: apply random bias to logits."""
+        # Check cache if reuse mode (negative std)
+        if std < 0 and layer_number in RandomSTEShared._cache:
+            return logits + RandomSTEShared._cache[layer_number]
+
+        # Generate random bias with shared seed across all ranks
+        with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
+            bias = torch.empty(logits.shape[-1], device=logits.device, dtype=logits.dtype).normal_(
+                std=abs(std)
+            )
+
+        # Cache if reuse mode
+        if std < 0 and layer_number is not None:
+            RandomSTEShared._cache[layer_number] = bias
+
+        return logits + bias
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward pass: pass through gradients."""
+        return grad_output, None, None
+
+
+def apply_biased_logits(logits, std, layer_number=None):
+    """
+    Apply random bias to logits. All ranks get the same random values.
+
+    Args:
+        logits: Input logits tensor [num_tokens, num_experts]
+        std: Standard deviation for random bias. If negative, generate once
+             per layer and reuse (using abs(std) as actual std).
+        layer_number: Layer number for caching when std is negative.
+    """
+    logits = apply_random_logits(logits)
+    return RandomSTEShared.apply(logits, std, layer_number)
+
+
+class RouterGatingLinearFunction(torch.autograd.Function):
+    """
+    Autograd function for router gating linear.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        inp: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        router_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        Forward pass of the RouterGatingLinearFunction function.
+
+        Args:
+            inp (torch.Tensor): The input tensor.
+            weight (torch.Tensor): The weight tensor.
+            bias (torch.Tensor): The bias tensor. Could be None.
+            router_dtype (torch.dtype): The router dtype.
+
+        Returns:
+            torch.Tensor: The output tensor.
+        """
+        ctx.save_for_backward(inp, weight, bias)
+        ctx.router_dtype = router_dtype
+        ctx.input_dtype = inp.dtype
+        ctx.weight_dtype = weight.dtype
+        inp_shape = inp.shape
+        inp = inp.view(-1, inp_shape[-1])
+
+        if te_general_gemm is not None and router_dtype != torch.float64:
+            # cuBLASLt's non-FP8 bias epilogue expects bias and output to have the same
+            # dtype. Router parameters may be BF16 while router logits are FP32, so cast the
+            # small bias vector before passing it to TE.
+            gemm_bias = bias.to(router_dtype) if bias is not None else None
+            output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=gemm_bias)[0]
+        elif bias is None:
+            output = torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())
+        else:
+            output = torch.addmm(
+                bias.to(router_dtype), inp.to(router_dtype), weight.to(router_dtype).t()
+            )
+
+        output = output.view(*inp_shape[:-1], -1)
+        return output
+
+    @staticmethod
+    def backward(
+        ctx, grad_output: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], None]:
+        """
+        Backward pass of the RouterGatingLinearFunction function.
+
+        Args:
+            grad_output (torch.Tensor): The gradient output.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], None]:
+                The gradient input, gradient weight, gradient bias, and None.
+        """
+        inp, weight, bias = ctx.saved_tensors
+        inp_shape = inp.shape
+        grad_shape = grad_output.shape
+        inp = inp.view(-1, inp_shape[-1])
+        grad_output = grad_output.view(-1, grad_shape[-1])
+
+        if te_general_gemm is not None and ctx.router_dtype != torch.float64:
+            grad_input = te_general_gemm(
+                weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
+            )
+            grad_weight = te_general_gemm(
+                inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
+            )
+            grad_input = grad_input[0].to(ctx.input_dtype)
+            grad_weight = grad_weight[0].to(ctx.weight_dtype)
+        else:
+            grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
+            grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
+
+        grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
+        grad_input = grad_input.view(*inp_shape)
+        return grad_input, grad_weight, grad_bias, None
+
+
+def router_gating_linear(
+    inp: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor], router_dtype: torch.dtype
+) -> torch.Tensor:
+    """
+    Customized linear layer for router gating.
+    This linear layer accepts bfloat16 input and weight, and can return output with router_dtype.
+    It can reduce the memory usage by avoiding saving the intermediate high precision tensors.
+
+    Args:
+        inp (torch.Tensor): The input tensor.
+        weight (torch.Tensor): The weight tensor.
+        bias (torch.Tensor): The bias tensor. Could be None.
+        router_dtype (torch.dtype): The router dtype.
+
+    Returns:
+        torch.Tensor: The output tensor.
+    """
+    return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype)
+
+
+def get_align_size_for_quantization(config: TransformerConfig) -> int:
+    """Get the alignment size for quantization.
+
+    Args:
+        config (TransformerConfig): The configuration.
+
+    Returns:
+        int: The alignment size for quantization.
+    """
+    # TE's grouped-tensor and fused grouped-MLP kernels share an expert-token alignment.
+    if config.use_transformer_engine_op_fuser or config.moe_use_grouped_tensor:
+        return TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
+    if config.fp8:
+        return get_fp8_align_size(config.fp8_recipe)
+    if config.fp4:
+        return get_fp4_align_size(config.fp4_recipe)
+    # Legacy high-precision grouped GEMM does not require padding. Defaults to 0.
+    return 0
+
+
+def _deepep_permute_pads_grouped_tensor_input(config: TransformerConfig) -> bool:
+    """Whether DeepEP v1/v2 fused permutation pads input for TE grouped-tensor GEMM."""
+    return (
+        config.moe_use_grouped_tensor
+        and config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend in ("deepep", "deepepv2")
+        and config.moe_permute_fusion
+        and fused_permute_and_pad_with_probs is not None
+    )
+
+
+def skip_routed_expert_padding(config: TransformerConfig) -> bool:
+    """Whether the expert module should skip quantization padding.
+
+    Returns True when padding is already applied by the router, the HybridEP / NCCL-EP
+    dispatcher, or DeepEP's fused permutation kernel.
+    """
+    if config.moe_router_padding_for_quantization:
+        return True
+    if config.moe_token_dispatcher_type == "flex" and config.moe_flex_dispatcher_backend in (
+        "hybridep",
+        "ncclep",
+    ):
+        return True
+    if _deepep_permute_pads_grouped_tensor_input(config):
+        return True
+    return False
+
+
+# TODO(Hepteract): delete the usage of the global parallel_state.
+# Initialize process groups with the global parallel_state.
+def get_default_pg_collection() -> ProcessGroupCollection:
+    """Get the default process groups for MoE.
+
+    Returns:
+        ProcessGroupCollection: The default process groups for MoE.
+    """
+    pg_collection = ProcessGroupCollection()
+    pg_collection.ep = parallel_state.get_expert_model_parallel_group()
+    pg_collection.tp = parallel_state.get_tensor_model_parallel_group()
+    pg_collection.cp = parallel_state.get_context_parallel_group()
+    pg_collection.expt_tp = parallel_state.get_expert_tensor_parallel_group()
+    pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group(with_gtp_remat=False)
+    pg_collection.expt_dp_gtp_remat = parallel_state.get_expert_data_parallel_group(
+        check_initialized=False
+    )
+    pg_collection.tp_ep = parallel_state.get_expert_tensor_and_model_parallel_group()
+    pg_collection.tp_cp = parallel_state.get_tensor_and_context_parallel_group()
+    pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
+        with_context_parallel=True
+    )
+    return pg_collection
+
+
+class MoECudaGraphPartialCaptureSignal(Exception):
+    """
+    Used to early-return from a MoE layer forward pass in CUDA graph capture.
+    This signal is raised when we are partially capturing the CUDA graph of the MoE layer,
+    and the related intermediate tensors are recorded in self.kwargs.
+    Call self.get_early_return_outputs() to collect the CUDA graph outputs.
+    """
+
+    def __init__(self, moe_layer, return_step: str, **kwargs):
+        self.moe_layer = moe_layer
+        self.return_step = return_step
+        self.kwargs = kwargs
+
+    def get_early_return_outputs(
+        self, hidden_states: torch.Tensor, shared_expert_output: torch.Tensor
+    ) -> List[torch.Tensor]:
+        """
+        Get the CUDA graph early return outputs for the MoE layer, including the intermediate
+        tensors and the intermediate attributes of the token dispatcher.
+
+        The returned output tensors are in the order of:
+        - routed experts path outputs
+          - hidden states, probs, and routing map for capturing router
+          - hidden states and probs for capturing router and preprocess
+        - intermediate attributes of the token dispatcher (if capturing the preprocess step)
+        - shared expert path output (if exists)
+        """
+        if self.return_step == "route":
+            # Capturing the router step returns three intermediate tensors:
+            # hidden states, routing probabilities, and routing map.
+            outputs = [hidden_states, self.kwargs['probs'], self.kwargs['routing_map']]
+        elif self.return_step == "preprocess":
+            # Capturing the preprocess step returns two intermediate tensors:
+            # hidden states and routing probabilities.
+            # It also returns the intermediate attributes of the token dispatcher, recorded in
+            # "token_dispatcher.cudagraph_attrs".
+            outputs = [self.kwargs['hidden_states'], self.kwargs['probs']]
+            valid_cudagraph_attrs = []
+            for attr_name in self.moe_layer.token_dispatcher.cudagraph_attrs:
+                hier_attr_name = attr_name.split('.')
+                attr = self.moe_layer.token_dispatcher
+                for name in hier_attr_name:
+                    attr = getattr(attr, name, None)
+                    if attr is None:
+                        break
+                if isinstance(attr, torch.Tensor):
+                    outputs.append(attr)
+                    valid_cudagraph_attrs.append(attr_name)
+            if self.moe_layer.token_dispatcher.valid_cudagraph_attrs is None:
+                self.moe_layer.token_dispatcher.valid_cudagraph_attrs = valid_cudagraph_attrs
+            else:
+                assert (
+                    self.moe_layer.token_dispatcher.valid_cudagraph_attrs == valid_cudagraph_attrs
+                ), (
+                    "valid_cudagraph_attrs mismatch: "
+                    f"{self.moe_layer.token_dispatcher.valid_cudagraph_attrs} != "
+                    f"{valid_cudagraph_attrs}"
+                )
+        # Also return the shared expert output, if it is not None.
+        if shared_expert_output is not None:
+            outputs.append(shared_expert_output)
+        return outputs
+
+
+@internal_api
+@dataclass
+class MoECudaGraphTensorStore:
+    """Storage for tensors used in CUDA graph replay for MoE layers.
+
+    This dataclass stores intermediate tensors computed during CUDA graph replay
+    that need to be resumed from the end of the CUDA graph scope to skip redundant computations.
+
+    Attributes:
+        hidden_states (Optional[torch.Tensor]): The hidden states output from the CUDA graph replay.
+        probs (Optional[torch.Tensor]): The routing probabilities for each token-expert pair.
+        routing_map (Optional[torch.Tensor]): The sparse mapping indicating which experts
+            were selected for each token. Used to skip the normal router step.
+        shared_expert_output (Optional[torch.Tensor]): The output from shared experts
+            computation. Used to skip the normal shared expert computation step.
+    """
+
+    hidden_states: Optional[torch.Tensor] = None
+    probs: Optional[torch.Tensor] = None
+    routing_map: Optional[torch.Tensor] = None
+    shared_expert_output: Optional[torch.Tensor] = None
+
+    def is_empty(self) -> bool:
+        """Check if the store has any non-None tensors.
+
+        Returns:
+            bool: True if all fields are None, False otherwise.
+        """
+        return all(
+            getattr(self, field_name) is None
+            for field_name in ['hidden_states', 'probs', 'routing_map', 'shared_expert_output']
+        )
+
+    def set(self, **kwargs):
+        """Set the tensors in the store from keyword arguments."""
+        for field_name, value in kwargs.items():
+            assert field_name in [
+                'hidden_states',
+                'probs',
+                'routing_map',
+                'shared_expert_output',
+            ], f"Invalid field name: {field_name}"
+            if value is not None:
+                assert isinstance(
+                    value, torch.Tensor
+                ), f"Value must be a torch.Tensor, got {type(value)} for field {field_name}"
+                setattr(self, field_name, value)
+
+    def clear(self):
+        """Reset all stored tensors to None."""
+        for field_name in ['hidden_states', 'probs', 'routing_map', 'shared_expert_output']:
+            setattr(self, field_name, None)
+
+
+def maybe_skip_or_early_return_by_cudagraph(step_condition):
+    """
+    Decorator to skip certain codepaths in the MoE layer forward pass in CUDA graph replay,
+    or early return from the MoE layer forward pass in CUDA graph capture.
+
+    Args:
+        step_condition: The step condition to check. Can be "shared_experts_compute", "route",
+        or "preprocess". If "shared_experts_compute", the shared experts computation will be
+        skipped in replay if it is in the CUDA graph scope. If "route" or "preprocess", the
+        router or preprocess will be skipped in replay if it is in the CUDA graph scope, or
+        early return from the MoE layer forward pass if it is in CUDA graph capturing mode.
+
+    Returns:
+        A decorator function that wraps the MoE layer forward pass.
+    """
+
+    def maybe_raise_signal(moe_layer, **kwargs):
+        """
+        Check if the MoE layer should early return for CUDA graph capture.
+        If so, raise a MoECudaGraphPartialCaptureSignal.
+        """
+        if (
+            moe_layer.config.cuda_graph_impl == "transformer_engine"
+            and moe_layer.training
+            and is_graph_capturing()
+        ):
+            if (
+                step_condition == "route"
+                and CudaGraphModule.moe_router in moe_layer.config.cuda_graph_modules
+                and CudaGraphModule.moe_preprocess not in moe_layer.config.cuda_graph_modules
+            ):
+                raise MoECudaGraphPartialCaptureSignal(moe_layer, "route", **kwargs)
+            elif (
+                step_condition == "preprocess"
+                and CudaGraphModule.moe_preprocess in moe_layer.config.cuda_graph_modules
+            ):
+                raise MoECudaGraphPartialCaptureSignal(moe_layer, "preprocess", **kwargs)
+
+    def decorator(func):
+
+        @functools.wraps(func)
+        def wrapped_func(moe_layer, *args, **kwargs):
+            """
+            Check if we should skip executing the original function based on the current
+            step condition and the tensor store status. If the tensor can be found in the store,
+            it indicates that it is already computed by the CUDA graph replay, so we can skip it.
+            Otherwise, we execute the original function and check if we should raise a signal to
+            early return in CUDA graph capture.
+            """
+
+            if moe_layer.config.cuda_graph_impl != "transformer_engine":
+                return func(moe_layer, *args, **kwargs)
+
+            # The non-cudagraph codepath just calls the original function.
+            if not is_graph_capturing() and moe_layer.cudagraph_tensor_store.is_empty():
+                return func(moe_layer, *args, **kwargs)
+
+            assert (
+                not is_graph_capturing() or moe_layer.cudagraph_tensor_store.is_empty()
+            ), "cudagraph_tensor_store cannot be used when it is capturing cuda graph."
+            if step_condition == "shared_experts_compute":
+                if moe_layer.cudagraph_tensor_store.shared_expert_output is None:
+                    # Don't skip the shared expert computation.
+                    shared_expert_output = func(moe_layer, *args, **kwargs)
+                else:
+                    # Skip the shared expert computation and get value from store.
+                    shared_expert_output = moe_layer.cudagraph_tensor_store.shared_expert_output
+                return shared_expert_output
+            elif step_condition == "route":
+                if moe_layer.cudagraph_tensor_store.probs is None:
+                    # Don't skip the router.
+                    assert (
+                        moe_layer.cudagraph_tensor_store.routing_map is None
+                    ), "routing_map must be None if probs is None"
+                    probs, routing_map = func(moe_layer, *args, **kwargs)
+
+                    # Maybe early return after the router.
+                    maybe_raise_signal(moe_layer, probs=probs, routing_map=routing_map)
+                else:
+                    # Skip the router and get value from store.
+                    probs, routing_map = (
+                        moe_layer.cudagraph_tensor_store.probs,
+                        moe_layer.cudagraph_tensor_store.routing_map,
+                    )
+                return probs, routing_map
+            elif step_condition == "preprocess":
+                if (
+                    moe_layer.cudagraph_tensor_store.is_empty()
+                    or moe_layer.cudagraph_tensor_store.routing_map is not None
+                ):
+                    # Don't skip the preprocess.
+                    hidden_states, probs = func(moe_layer, *args, **kwargs)
+
+                    # Maybe early return after the preprocess.
+                    maybe_raise_signal(moe_layer, hidden_states=hidden_states, probs=probs)
+                else:
+                    # Skip the preprocess and get value from store.
+                    assert (
+                        moe_layer.cudagraph_tensor_store.hidden_states is not None
+                        and moe_layer.cudagraph_tensor_store.probs is not None
+                    ), "hidden_states and probs must be given in moe_preprocess cudagraph replay"
+                    hidden_states, probs = (
+                        moe_layer.cudagraph_tensor_store.hidden_states,
+                        moe_layer.cudagraph_tensor_store.probs,
+                    )
+                return hidden_states, probs
+
+        return wrapped_func
+
+    return decorator

@@ -1,0 +1,691 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import warnings
+from dataclasses import dataclass, field
+from typing import Callable, ContextManager, Literal, Optional
+
+import torch
+
+from megatron.core.tensor_parallel.gtp_parallel_layout import (
+    resolve_tensor_parallel_sequence_shards,
+)
+
+
+def resolve_tensor_parallel_weight_shards(
+    tensor_model_parallel_size: int,
+    tensor_parallel_num_weight_shards: Optional[int],
+    gtp_weight_remat_size: int,
+    shards_field: str = "tensor_parallel_num_weight_shards",
+    tp_field: str = "tensor_model_parallel_size",
+) -> tuple:
+    """Reconcile ``tensor_parallel_num_weight_shards`` and ``gtp_weight_remat_size``.
+
+    ``tensor_parallel_num_weight_shards`` is the user-facing total number of shards each weight is
+    split into across the tensor-parallel + GTP axes. It is the source of truth and implies
+    ``gtp_weight_remat_size = tensor_parallel_num_weight_shards // tensor_model_parallel_size``.
+    When None it defaults to ``tensor_model_parallel_size * gtp_weight_remat_size`` (so the pair
+    stays consistent, and equals ``tensor_model_parallel_size`` in the no-GTP default). Idempotent.
+
+    Returns the reconciled ``(tensor_parallel_num_weight_shards, gtp_weight_remat_size)``.
+    """
+    tp = tensor_model_parallel_size
+    if tensor_parallel_num_weight_shards is None:
+        tensor_parallel_num_weight_shards = tp * gtp_weight_remat_size
+    else:
+        if tensor_parallel_num_weight_shards < tp:
+            raise ValueError(
+                f"{shards_field} ({tensor_parallel_num_weight_shards}) must be "
+                f">= {tp_field} ({tp})."
+            )
+        if tensor_parallel_num_weight_shards % tp != 0:
+            raise ValueError(
+                f"{shards_field} ({tensor_parallel_num_weight_shards}) must be "
+                f"divisible by {tp_field} ({tp})."
+            )
+        gtp_weight_remat_size = tensor_parallel_num_weight_shards // tp
+    return tensor_parallel_num_weight_shards, gtp_weight_remat_size
+
+
+@dataclass
+class ModelParallelConfig:
+    """Base configuration for Megatron Core
+
+    The initialization function has an argument for each parameter.
+    """
+
+    ###################
+    # Model parallelism
+    ###################
+    tensor_model_parallel_size: int = 1
+    """Intra-layer model parallelism. Splits tensors across GPU ranks."""
+
+    tensor_parallel_num_weight_shards: Optional[int] = None
+    """Total number of shards each weight is split into across the tensor-parallel + GTP axes
+       (i.e. ``tensor_model_parallel_size * gtp_weight_remat_size``). This is the user-facing knob:
+       it must be ``>= tensor_model_parallel_size`` and divisible by it. When None it defaults to
+       ``tensor_model_parallel_size`` (no GTP sharding). It is the source of truth and implies
+       ``gtp_weight_remat_size = tensor_parallel_num_weight_shards // tensor_model_parallel_size``
+       (resolved in ``__post_init__``).
+    """
+
+    gtp_weight_remat_size: int = 1
+    """Generalized tensor parallelism with weight rematerialization. Shards model weights
+       across GPU ranks along ``out_features``; each weight is rematerialized independently
+       (per-weight, not per-layer) via async all-gather on every forward AND backward pass.
+       Placed right after tensor parallelism in the parallelism ordering.
+
+       INTERNAL / DERIVED — there is no CLI flag for it; do not set directly. It is computed in
+       ``__post_init__`` from ``tensor_parallel_num_weight_shards`` (= that value divided by
+       ``tensor_model_parallel_size``). Use ``tensor_parallel_num_weight_shards`` to control GTP.
+    """
+
+    tensor_parallel_num_sequence_shards: Optional[int] = None
+    """Number of sequence partitions within a TP x GTP_remat weight-sharding group.
+
+    Defaults to TP when sequence parallelism (SP) is enabled, otherwise 1.
+    By default, GTP_remat ranks process independent microbatches; no sequence
+    partitioning occurs along the GTP_remat axis.
+
+    Increasing this value partitions sequences across GTP_remat ranks, reducing
+    the number of independent batch partitions within each weight-sharding group:
+
+        sp_size = tensor_model_parallel_size if sequence_parallel else 1
+        gtp_remat_num_sequence_shards = tensor_parallel_num_sequence_shards // sp_size
+        gtp_remat_num_batch_shards = gtp_weight_remat_size // gtp_remat_num_sequence_shards
+
+    Both divisions must be exact. Sequence partitioning within GTP_remat requires SP when TP > 1.
+
+    Configured CP adds further sequence partitions across weight replicas.
+    In this config, context_parallel_size must already contain the resolved
+    runtime CP size, excluding TP/SP:
+
+        context_parallel_size = configured_cp_size * gtp_remat_num_sequence_shards
+
+    TP must be the innermost axis and PP the outermost axis in the global rank ordering.
+    """
+
+    pipeline_model_parallel_comm_backend: Optional[Literal["nccl", "ucc"]] = None
+    """Configuring backend option of pipeline parallel communication (e.g., nccl, ucc)
+       If None, the default backend will be used.
+    """
+
+    pipeline_model_parallel_size: int = 1
+    """Inter-layer model parallelism. Splits transformer layers across GPU ranks."""
+
+    virtual_pipeline_model_parallel_size: Optional[int] = None
+    """Interleaved pipeline parallelism is used to improve performance by reducing the pipeline
+       bubble.  Considers a transformer block as a list of smaller transformer (virtual) blocks.
+       The number of virtual blocks per pipeline model parallel rank is the virtual model parallel
+       size.  See Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM:
+       arxiv.org/pdf/2104.04473.pdf for more details.
+    """
+
+    sequence_parallel: bool = False
+    """Makes tensor parallelism more memory efficient for LLMs (20B+) by parallelizing layer norms
+       and dropout sequentially.  See Reducing Activation Recomputation in Large Transformer Models
+       (https://arxiv.org/abs/2205.05198) for more details.
+    """
+
+    context_parallel_size: int = 1
+    """Splits network input along sequence dimension across GPU ranks."""
+
+    hierarchical_context_parallel_sizes: Optional[list[int]] = None
+    """Degrees of the hierarchical context parallelism. Users should provide a list to specify 
+       the sizes for different levels. Taking the a2a+p2p cp comm type as example, it contains
+       groups of two levels, so the first value of the list indicates the group size of the a2a
+       communication type, and the second value indicates the group size of the p2p communication
+       type.
+    """
+
+    max_seqlen_per_dp_cp_rank: Optional[int] = None
+    """
+    Maximum sequence length per DPxCP rank. This is the maximum sequence length each rank
+    can handle without overflowing the memory. Typically, a good starting point is to set this
+    to maximum sequence length / context parallel size.
+    This is used to calculate the number and length of sub-samples assigned to 
+    each rank when sequence_packing_scheduler is not None.
+    """
+
+    dynamic_context_parallel: bool = False
+    """
+    If true, enables dynamic context parallel. This is used to balance the workload of
+    each CP rank when using packed samples with variable sequence lengths. Dynamic CP
+    forms variable-sized CP groups from the DPxCP ranks.
+    """
+
+    min_dynamic_context_parallel_size: int = 1
+    """Minimum CP group size used by dynamic context parallelism."""
+
+    hybrid_context_parallel: bool = False
+    """Deprecated alias for ``dynamic_context_parallel``."""
+
+    sequence_packing_scheduler: Optional[Literal['dp_balanced', 'default_dynamic_cp']] = None
+    """
+    Scheduler for sequence packing and dynamic context parallel.
+    dp_balanced: DP-balanced scheduler for sequence packing.
+    default_dynamic_cp: Packing-aware scheduler with per-microbatch CP group sizes.
+    """
+
+    pad_packed_seq_alignment: int | Literal['max'] | None = None
+    """Pad packed THD inputs to a CP-local multiple, or to max_seqlen_per_dp_cp_rank.
+
+    Applies before sequence-parallel sharding. MXFP8 also requires a multiple of
+    32 after SP sharding; that requirement is combined with this alignment.
+    Padding is represented as a masked dummy sequence.
+    """
+
+    expert_model_parallel_size: int = 1
+    """Distributes Moe Experts across sub data parallel dimension."""
+
+    expert_tensor_parallel_size: Optional[int] = None
+    """Intra-layer tensor model parallelism for expert layer. Splits tensors across GPU ranks.
+       Default is None, which will be set to the value of tensor_model_parallel_size.
+    """
+
+    expert_tensor_parallel_num_weight_shards: Optional[int] = None
+    """Total number of shards each expert weight is split into across the expert-tensor-parallel +
+       expert-GTP axes (i.e. ``expert_tensor_parallel_size * expert_gtp_weight_remat_size``). This
+       is the user-facing knob for expert layers: it must be ``>= expert_tensor_parallel_size`` and
+       divisible by it. When None it defaults to ``expert_tensor_parallel_size`` (no expert GTP
+       sharding). It is the source of truth and implies
+       ``expert_gtp_weight_remat_size = expert_tensor_parallel_num_weight_shards //
+       expert_tensor_parallel_size`` (resolved in ``__post_init__``).
+    """
+
+    expert_gtp_weight_remat_size: int = 1
+    """Generalized tensor parallelism with weight rematerialization, for expert layers. Independent
+       from the decoder's ``gtp_weight_remat_size``.
+       Placed right after expert parallelism in the parallelism ordering.
+
+       INTERNAL / DERIVED — there is no CLI flag for it; do not set directly. It is computed in
+       ``__post_init__`` from ``expert_tensor_parallel_num_weight_shards`` (= that value divided by
+       ``expert_tensor_parallel_size``). Use ``expert_tensor_parallel_num_weight_shards`` to control
+       expert GTP.
+    """
+
+    ###################
+    # Initialization
+    ###################
+    perform_initialization: bool = field(
+        default=True, metadata={"argparse_meta": {"arg_names": ["--no-initialization"]}}
+    )
+    """Controls weights initialization. This option can be useful when you know you are going to
+       load values from a checkpoint.
+    """
+
+    use_cpu_initialization: bool = field(
+        default=False, metadata={"argparse_meta": {"default": None}}
+    )
+    """When set to False, we initialize the weights directly on the GPU. CPU initialization is the
+       same regardless of tensor model parallelism, but GPU initialization is not. Transferring
+       weights from CPU to GPU can take a significant amount of time for large models.
+    """
+
+    ###################
+    # Training
+    ###################
+    fp16: bool = False
+    """If true, train with fp16 mixed precision training."""
+
+    bf16: bool = False
+    """If true, train with bf16 mixed precision training."""
+
+    params_dtype: torch.dtype = torch.float32
+    """dtype used when intializing the weights."""
+
+    timers: Optional[Callable] = None
+    """Timers object to call for various timing functions. See megatron.core.timers.Timers"""
+
+    finalize_model_grads_func: Optional[Callable] = None
+    """Function that finalizes gradients on all workers. Could include ensuring that grads are
+       all-reduced across data parallelism, pipeline parallelism, and sequence parallelism
+       dimensions.
+    """
+
+    grad_scale_func: Optional[Callable] = None
+    """If using loss scaling, this function should take the loss and return the scaled loss. If
+       None, no function is called on the loss.
+    """
+
+    moe_grad_scale_func: Optional[Callable] = None
+    """If using loss scaling for MoE auxiliary losses, this function should return the
+       scale tensor for MoE aux loss. If None, falls back to grad_scale_func.
+    """
+
+    mtp_grad_scale_func: Optional[Callable] = None
+    """If using loss scaling for MTP (Multi-Token Prediction), this function should return the
+       scalar or size-1 scale value for MTP loss. The value is converted to the output tensor
+       device. If None, falls back to grad_scale_func with torch.ones(1).
+    """
+
+    no_sync_func: Optional[Callable] = None
+    """Function that creates a context that suppresses asynchronous data-parallel communication. If
+       the model is an instance of core.distributed.DistributedDataParallel, the default is to use
+       core.distributed.DistributedDataParallel.no_sync.
+    """
+
+    grad_sync_func: Optional[Callable] = None
+    """Function that launches asynchronous gradient reductions (e.g. distributed optimizer gradient
+       reduce-scatters). The function should take one argument: an iterable of parameters whose
+       gradients are to be synchronized.
+    """
+
+    param_sync_func: Optional[Callable] = None
+    """Function that launches asynchronous parameter synchronizations (e.g. distributed optimizer
+       parameter all-gathers). The function should take one argument: an iterable of parameters to
+       be synchronized.
+    """
+
+    deterministic_mode: bool = False
+    """If true, code that has deterministic execution will be chosen. This usually
+       means slower execution, but is good for debugging and testing. Defaults to False."""
+
+    enable_autocast: bool = False
+    """If true runs the forward step function inside torch.autocast context."""
+
+    autocast_dtype: Optional[torch.dtype] = None
+    """dtype to pass to torch.amp.autocast when enabled. If None, is set to pipeline_dtype."""
+
+    num_microbatches_with_partial_activation_checkpoints: Optional[int] = None
+    """If int, set the number of microbatches where not all of the layers will be checkpointed and
+       recomputed. The rest of the microbatches within the window of maximum outstanding
+       microbatches will recompute all layers (either full recompute or selective recompute). If
+       None, the checkpoint and recompute will be left up to the forward_step function.
+
+    """
+
+    ###################
+    # Optimizations
+    ###################
+    gradient_accumulation_fusion: bool = False
+    """If true, fuses weight gradient accumulation to GEMMs. Requires the custom CUDA extension
+       fused_weight_gradient_mlp_cuda module. To use gradient_accumulation_fusion you must install
+       APEX with --cpp_ext and --cuda_ext. For example: "pip install --global-option=\"--cpp_ext\"
+       --global-option=\"--cuda_ext\" ". Note that the extension requires CUDA>=11. Otherwise, you
+       must turn off gradient accumulation fusion. VocabParallelEmbedding then also adds its weight
+       gradient into main_grad in its backward.
+    """
+
+    use_te_rng_tracker: bool = field(
+        default=False, metadata={"argparse_meta": {"arg_names": ["--te-rng-tracker"]}}
+    )
+    """If true, uses RNG state tracker in TransformerEngine if exists.
+    Required for CUDA graphs support.
+    """
+
+    tp_comm_overlap: bool = False
+    """If true, allows overlapping of Linear layer execution with tensor parallel communication
+       collectives like AllGather/ReduceScatter. Overlapping is done for the linear layers wherever
+       possible during the forward and the backward pass.
+    """
+
+    tp_comm_bulk_wgrad: bool = True
+    """Controls All-Gather overlap with Bprop activation gradient GEMM. Don't care if
+       tp_comm_overlap is False.
+    """
+
+    tp_comm_bulk_dgrad: bool = True
+    """Controls Reduce-Scatter overlap with Bprop weight gradient GEMM. Don't care if
+       tp_comm_overlap is False.
+    """
+
+    tp_comm_overlap_ag: bool = True
+    """Controls All-Gather overlap with GEMM by pipelining the GEMM and All-Gather.
+       Don't care if tp_comm_overlap is False.
+    """
+
+    tp_comm_overlap_rs: bool = True
+    """Controls Reduce-Scatter overlap with GEMM by pipelining the GEMM and Reduce-Scatter.
+       Don't care if tp_comm_overlap is False.
+    """
+
+    tp_comm_overlap_rs_dgrad: bool = False
+    """If true, allows Reduce-Scatter overlap with DGRAD GEMM by pipelining the
+       GEMM and Reduce-Scatter splits. Don't care if tp_comm_overlap is False.
+    """
+
+    tp_comm_split_ag: bool = True
+    """Deprecated from TransformerEngine v1.6.0.
+       Controls All-Gather overlap with Fprop GEMM by pipelining the GEMM and All-Gather
+       splits. Don't care if tp_comm_overlap is False.
+    """
+
+    tp_comm_atomic_ag: bool = False
+    """Deprecated from TransformerEngine v1.6.0.
+       If true, allows All-Gather overlap with Fprop GEMM by pipelining the GEMM and All-Gather
+       both done atomically. Don't care if tp_comm_overlap is False.
+    """
+
+    tp_comm_split_rs: bool = True
+    """Deprecated from TransformerEngine v1.6.0.
+       Controls Reduce-Scatter overlap with Fprop GEMM by pipelining the GEMM and
+       Reduce-Scatter splits. Don't care if tp_comm_overlap is False.
+    """
+
+    tp_comm_atomic_rs: bool = False
+    """Deprecated from TransformerEngine v1.6.0.
+       If true, allows Reduce-Scatter overlap with Fprop GEMM by pipelining the GEMM and
+       Reduce-Scatter both done atomically. Don't care if tp_comm_overlap is False.
+    """
+
+    cross_entropy_loss_fusion: bool = False
+    """If this is enabled, the fused cross entropy implementation would be used.
+       Defaults to False.
+    """
+
+    cross_entropy_fusion_impl: Literal['native', 'te'] = 'native'
+    """If 'native', MCore based CE loss fusion is used, if 'te', Parallel CE loss
+       from Transformer Engine library is used. Defaults to 'native'.
+    """
+
+    tp_comm_overlap_disable_qkv: bool = False
+    """
+       If true, the AllGather -> Gemm overlap for QKV gets disabled
+    """
+
+    tp_comm_overlap_disable_fc1: bool = False
+    """
+       If true, the AllGather -> Gemm overlap for FC1 layer of MLP gets disabled
+    """
+
+    tp_comm_bootstrap_backend: Literal['nccl', 'mpi', 'gloo'] = 'nccl'
+    """Set the bootstrapping backend of Tensor parallel communications."""
+
+    overlap_moe_expert_parallel_comm: bool = False
+    """Overlap EP A2A communications with independent computations of different micro-batches
+    in 1f1b phase of pipelining or non-pipelining schedule.
+    """
+
+    delay_wgrad_compute: bool = False
+    """Delay the weight gradient computation to improve batch-level communication overlapping"""
+
+    overlap_dispatch_backward_with_experts_wgrad: bool = False
+    """Delay the weight gradient computation for TE Grouped GEMM MoE experts.
+    When enabled with FSDP, the expert weight gradients are computed on a separate
+    CUDA stream after the data gradients finish, allowing overlap of wgrad compute
+    with EP A2A communication. The FSDP gradient reduce-scatter for
+    expert parameters is deferred until the delayed wgrad computation completes.
+    This requires transformer_engine with GroupedLinear support (TE >= 2.3.0).
+    """
+
+    ep_overlap_early_attn_memory_release: bool = False
+    """Enable early memory release of attention activations during EP overlap.
+    EP overlap can increase peak memory usage when the overlapped forward module allocates 
+    more memory than what is freed by the backward module. This flag addresses this by 
+    reordering the attention backward pass to occur earlier in the schedule.
+    Specifically:
+    - Without this flag: attn_bwd executes after moe_combine_fwd
+    - With this flag: attn_bwd executes before mlp_fwd
+    The earlier execution releases attention activations sooner, reducing peak memory.
+    Note: This may impact performance as moe_combine_fwd and moe_dispatch_bwd become 
+    exposed (not overlapped with other computation).
+    """
+
+    ###################
+    # Pipeline Parallel
+    ###################
+    pipeline_dtype: torch.dtype = None
+    """dtype used in p2p communication, usually params_dtype"""
+
+    variable_seq_lengths: bool = False
+    """Support for variable sequence lengths across microbatches. Setting this communicates the size
+        of tensors during pipeline parallelism communication, because of this extra overhead it
+        should only be set if the sequence length varies by microbatch within a global batch.
+    """
+
+    overlap_p2p_comm: bool = False
+    """When True some of the peer to peer communication for pipeline parallelism will overlap with
+       computation. Must be False if batch_p2p_comm is true.
+    """
+
+    batch_p2p_comm: bool = True
+    """Use batch_isend_irecv instead of individual isend/irecv calls. Must be False if
+       overlap_p2p_comm is True.
+    """
+
+    batch_p2p_sync: bool = True
+    """When using batch_isend_irecv, do a cuda.device.synchronize afterward to work around a bug in
+       older version of PyTorch.
+    """
+
+    use_ring_exchange_p2p: bool = False
+    """Use custom ring_exchange kernel instead of torch.distributed.batch_isend_irecv(). Requires
+       custom built torch with torch.distributed.ring_exchange.
+    """
+
+    deallocate_pipeline_outputs: bool = False
+    """If True, output data is deallocated after the tensor is sent to the next pipeline stage.
+       Helps with saving memory, does nothing when pipeline parallel is not used.
+    """
+
+    defer_embedding_wgrad_compute: bool = False
+    """If true, defers the embedding WGRAD GEMMs while pipeline flush is
+       taking place enabling us to hide pipeline flush latency. Defaults to False.
+    """
+
+    wgrad_deferral_limit: int = 0
+    """This value tunes the number of micro-batches for which the embedding weight gradient compute
+       needs to be deferred to pipeline flush, this argument is invalid if
+       `defer_embedding_wgrad_compute` is False.
+       Defaults to 0, which means all micro-batches are deferred.
+    """
+
+    overlap_p2p_comm_warmup_flush: bool = field(
+        default=False,
+        metadata={"argparse_meta": {"arg_names": ["--overlap-p2p-communication-warmup-flush"]}},
+    )
+    """If true, overlap communication and computation in warm up and flush phase.
+       Only valid when overlap_p2p_comm is True and batch_p2p_comm is False. 
+       Defaults to False.
+    """
+
+    microbatch_group_size_per_vp_stage: Optional[int] = field(
+        default=None,
+        metadata={
+            "argparse_meta": {"arg_names": ["--microbatch-group-size-per-virtual-pipeline-stage"]}
+        },
+    )
+    """This value specifies the number of micro-batches that are executed 
+       at a time for a given virtual stage (both forward and backward).
+       Default (in __post_init__() method below) to pipeline_parallel_size 
+       which specifies a depth-first schedule.
+       Example: for PP=2 VP=2, when microbatch_group_size_per_vp_stage=2, 
+       num_microbatches = 4, we have 
+       rank 0 | 0 1 0 1 2 3 2 3
+       rank 1 |   0 1 0 1 2 3 2 3
+       When microbatch_group_size_per_vp_stage=3, num_microbatches = 5, 
+       we have
+       rank 0 | 0 1 2 0 1 2 3 4 3 4 
+       rank 1 |   0 1 2 0 1 2 3 4 3 4
+    """
+
+    mtp_standalone: bool = False
+    """This will be set automatically according to the pipeline layout, 
+    and will be set to True if MTP is in a separate vpp stage."""
+
+    ###################
+    # CPU Offloading
+    ###################
+    cpu_offloading: bool = False
+    """When set to True, all the activations are offloaded to the CPU asynchronously."""
+
+    cpu_offloading_num_layers: int = 0
+    """Tells the number of transformer layers for which activations has to be offloaded."""
+
+    _cpu_offloading_context: Optional[ContextManager] = (
+        None
+        # Used for internal use only, not to be set by a user.
+        # TODO: Need to move to the 'right' place when possible.
+    )
+    """For internal use only, do not set."""
+
+    cpu_offloading_activations: bool = True
+    """If True, offloads the activations to CPU."""
+
+    cpu_offloading_weights: bool = False
+    """If True, offloads the weights to CPU."""
+
+    cpu_offloading_double_buffering: bool = False
+    """If True, enables double buffering across layers while reloading activations from CPU."""
+
+    cpu_offloading_retain_pinned_cpu_buffers: bool = False
+    """If True, the pinned CPU buffers are retained after offloading and reused for the
+       next iteration. It is useful for cuda graphs capture.
+    """
+
+    ###################
+    # Timing
+    ###################
+    barrier_with_L1_time: bool = field(
+        default=True,
+        metadata={"argparse_meta": {"arg_names": ["--no-barrier-with-level-1-timing"]}},
+    )
+    """Controls barrier with level 1 time measurements. It is up to the user to make sure
+       calling barrier with their timers will not result in hangs. This can happen if for example
+       the user adds a level 1 timer that is not called by all ranks.
+    """
+
+    @property
+    def gtp_remat_num_sequence_shards(self) -> int:
+        """Sequence-shard count within GTP_remat, excluding sequence parallelism across TP."""
+        return resolve_tensor_parallel_sequence_shards(
+            self.tensor_model_parallel_size,
+            self.tensor_parallel_num_sequence_shards,
+            self.gtp_weight_remat_size,
+            self.sequence_parallel,
+        )[1]
+
+    def __post_init__(self):
+        """Python dataclass method that is used to modify attributes after initialization.
+        See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
+        details.
+        """
+        if self.hybrid_context_parallel:
+            warnings.warn(
+                "hybrid_context_parallel is deprecated; use dynamic_context_parallel instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.dynamic_context_parallel:
+                raise ValueError(
+                    "Cannot set both hybrid_context_parallel and dynamic_context_parallel"
+                )
+            self.dynamic_context_parallel = True
+            self.hybrid_context_parallel = False
+
+        if self.dynamic_context_parallel:
+            if self.sequence_packing_scheduler is None:
+                self.sequence_packing_scheduler = 'default_dynamic_cp'
+            if self.sequence_packing_scheduler != 'default_dynamic_cp':
+                raise ValueError(
+                    "Dynamic context parallelism requires "
+                    "sequence_packing_scheduler='default_dynamic_cp'"
+                )
+            if self.min_dynamic_context_parallel_size < 1:
+                raise ValueError("min_dynamic_context_parallel_size must be at least 1")
+            if self.deterministic_mode:
+                raise ValueError("Dynamic context parallelism does not support deterministic_mode")
+        elif self.sequence_packing_scheduler == 'default_dynamic_cp':
+            raise ValueError(
+                "sequence_packing_scheduler='default_dynamic_cp' requires "
+                "dynamic_context_parallel=True"
+            )
+
+        if self.pad_packed_seq_alignment is not None:
+            if self.pad_packed_seq_alignment != 'max':
+                try:
+                    self.pad_packed_seq_alignment = int(self.pad_packed_seq_alignment)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "pad_packed_seq_alignment must be 'max' or a positive integer"
+                    ) from exc
+                if self.pad_packed_seq_alignment <= 0:
+                    raise ValueError("pad_packed_seq_alignment must be 'max' or a positive integer")
+            if self.max_seqlen_per_dp_cp_rank is None:
+                raise ValueError(
+                    "max_seqlen_per_dp_cp_rank is required for packed sequence padding"
+                )
+
+        if self.sequence_parallel:
+            if self.tensor_model_parallel_size <= 1:
+                raise ValueError("Cannot use sequence parallelism without tensor parallelism")
+
+        if self.expert_tensor_parallel_size is None:
+            self.expert_tensor_parallel_size = self.tensor_model_parallel_size
+
+        # Derive the internal gtp_weight_remat_size from the user-facing
+        # tensor_parallel_num_weight_shards:
+        #   num_weight_shards = tensor_model_parallel_size * gtp_weight_remat
+        _, self.gtp_weight_remat_size = resolve_tensor_parallel_weight_shards(
+            self.tensor_model_parallel_size,
+            self.tensor_parallel_num_weight_shards,
+            self.gtp_weight_remat_size,
+        )
+
+        # Same reconciliation for expert layers (expert_tensor_parallel_size finalized above).
+        _, self.expert_gtp_weight_remat_size = resolve_tensor_parallel_weight_shards(
+            self.expert_tensor_parallel_size,
+            self.expert_tensor_parallel_num_weight_shards,
+            self.expert_gtp_weight_remat_size,
+            shards_field="expert_tensor_parallel_num_weight_shards",
+            tp_field="expert_tensor_parallel_size",
+        )
+
+        if self.pipeline_model_parallel_size > 1:
+            if self.pipeline_dtype is None:
+                raise ValueError(
+                    "When using pipeline parallelism, pipeline_dtype must be specified"
+                )
+
+        if self.autocast_dtype is None:
+            self.autocast_dtype = self.params_dtype
+
+        if self.defer_embedding_wgrad_compute and self.pipeline_model_parallel_size == 1:
+            raise ValueError(
+                "Cannot defer embedding wgrad compute when pipeline model parallel is not used"
+            )
+
+        if self.defer_embedding_wgrad_compute and not self.gradient_accumulation_fusion:
+            raise ValueError(
+                "Cannot defer embedding wgrad compute when gradient accumulation fusion is not used"
+            )
+
+        if self.defer_embedding_wgrad_compute and self.wgrad_deferral_limit < 0:
+            raise ValueError(
+                "Wgrad deferral limit should be greater than or equal to 0 when it is enabled!"
+            )
+
+        if self.expert_model_parallel_size > 1 and self.tensor_model_parallel_size > 1:
+            if self.sequence_parallel is False:
+                warnings.warn(
+                    "When using expert parallelism and tensor parallelism for training, "
+                    "sequence parallelism must be used"
+                )
+
+        if self.microbatch_group_size_per_vp_stage is None:
+            self.microbatch_group_size_per_vp_stage = self.pipeline_model_parallel_size
+
+        if self.overlap_p2p_comm_warmup_flush:
+            if not self.overlap_p2p_comm or self.batch_p2p_comm:
+                raise ValueError(
+                    "Pipeline parallel communication overlapping in warmup and flush is only "
+                    "compatible with overlap_p2p_comm but not batch_p2p_comm."
+                )
+
+        if self.gtp_remat_num_sequence_shards > 1 and self.sequence_packing_scheduler is not None:
+            raise ValueError("GTP sequence sharding does not support sequence_packing_scheduler")
+
+        if self.sequence_packing_scheduler is not None:
+            supported_schedulers = ['dp_balanced', 'default_dynamic_cp']
+            if self.sequence_packing_scheduler not in supported_schedulers:
+                raise ValueError(
+                    f"Unsupported scheduler: {self.sequence_packing_scheduler}. "
+                    f"Available schedulers: {supported_schedulers}"
+                )
+            if self.max_seqlen_per_dp_cp_rank is None:
+                raise ValueError(
+                    "max_seqlen_per_dp_cp_rank must be set when sequence_packing_scheduler "
+                    "is not None."
+                )
+            # Needed for passing variable sequences between pp stages.
+            self.variable_seq_lengths = True

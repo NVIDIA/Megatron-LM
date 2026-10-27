@@ -1,0 +1,3 @@
+- agent_type: OpenMathInstructAgent
+  agent_args: {}
+  weight: 1.0

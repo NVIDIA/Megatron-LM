@@ -1,0 +1,343 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import io
+import logging
+import os
+import pathlib
+import sys
+import threading
+from typing import Optional
+
+import click
+import nemo_run as run
+
+from tests.test_utils.python_scripts import recipe_parser
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def is_flaky_failure(concat_allranks_logs: str) -> bool:
+    """Assumes that certain keywords hint towards intermittent failures"""
+
+    return (
+        "The server socket has failed to listen on any local network address."
+        in concat_allranks_logs
+        or "Some NCCL operations have failed or timed out." in concat_allranks_logs
+        or "Watchdog caught collective operation timeout" in concat_allranks_logs
+        or "uncorrectable ECC error encountered" in concat_allranks_logs
+        or "illegal memory access" in concat_allranks_logs
+        or "illegal instruction" in concat_allranks_logs
+        or "torch.distributed.DistNetworkError" in concat_allranks_logs
+        or "Segmentation fault" in concat_allranks_logs
+        or "found NaN in" in concat_allranks_logs
+        or "For debugging consider passing CUDA_LAUNCH_BLOCKING=1" in concat_allranks_logs
+        or "double free or corruption" in concat_allranks_logs
+        or "Call to CUDA function failed." in concat_allranks_logs
+        or "Connection reset by peer" in concat_allranks_logs
+        or "invalid pointer" in concat_allranks_logs
+        or "malloc(): unaligned tcache chunk detected" in concat_allranks_logs
+        or "zmq.error.ZMQError: Address already in use" in concat_allranks_logs
+        or "We couldn't connect to 'https://huggingface.co'" in concat_allranks_logs
+        or "Unpack failed: incomplete input" in concat_allranks_logs
+        or "The read operation timed out" in concat_allranks_logs
+        or "Read timed out" in concat_allranks_logs
+        or "TimeoutError" in concat_allranks_logs
+        or "Connection broken" in concat_allranks_logs
+        or "Temporary failure in name resolution" in concat_allranks_logs
+        or "unspecified launch failure" in concat_allranks_logs
+        or "free(): corrupted unsorted chunks" in concat_allranks_logs
+        or "Segfault encountered" in concat_allranks_logs
+        or "The following metrics failed" in concat_allranks_logs
+        or "removal of container" in concat_allranks_logs
+        or "is already in progress" in concat_allranks_logs
+        or "Error deleting container" in concat_allranks_logs
+    )
+
+
+def _is_hang_prone_flaky_failure(concat_allranks_logs: str) -> bool:
+    """Return whether a streamed failure may prevent the attempt from exiting."""
+    return "Watchdog caught collective operation timeout" in concat_allranks_logs
+
+
+class _ThreadSafeBuffer:
+    """Collect output shared between the log tailer and flaky-failure monitor."""
+
+    def __init__(self):
+        self._buffer = io.StringIO()
+        self._lock = threading.Lock()
+
+    def write(self, data: str) -> None:
+        """Append log output to the buffer."""
+        with self._lock:
+            self._buffer.write(data)
+
+    def flush(self) -> None:
+        """Provide the stream interface expected by the tee wrapper."""
+
+    def getvalue(self) -> str:
+        """Return a consistent snapshot of the buffered output."""
+        with self._lock:
+            return self._buffer.getvalue()
+
+
+def _cancel_on_flaky_failure(
+    experiment: run.Experiment,
+    job_id: str,
+    log_buffer: _ThreadSafeBuffer,
+    stop_event: threading.Event,
+    failure_detected_event: threading.Event,
+    poll_interval: float = 1.0,
+) -> None:
+    """Cancel an active attempt as soon as its streamed logs show a flaky failure."""
+    while not stop_event.wait(poll_interval):
+        if _is_hang_prone_flaky_failure(log_buffer.getvalue()):
+            logger.warning(
+                "Detected flaky failure while job is running; cancelling current attempt."
+            )
+            failure_detected_event.set()
+            experiment.cancel(job_id)
+            return
+
+
+def _collect_failure_logs(workdir: pathlib.Path) -> list[str]:
+    """Reads every log file that may carry a flaky-failure signature.
+
+    The per-rank ``attempt_0/*/std*.log`` files only contain torchrun training
+    output. The golden-value comparison runs in ``run_ci_test.sh`` and emits its
+    assertion (e.g. ``The following metrics failed``) to the nemo-run task log,
+    which lives outside that per-rank tree. Globbing both ensures harness-side
+    failures are seen by ``is_flaky_failure`` and therefore eligible for retry.
+
+    Args:
+        workdir: Working directory under which nemo-run writes all log files.
+
+    Returns:
+        The concatenated lines of every discovered log file, deduplicated by
+        resolved path to avoid double-counting overlapping globs.
+    """
+    seen_paths = set()
+    collected_lines: list[str] = []
+    for pattern in ("**/attempt_0/*/std*.log", "**/*.log"):
+        for log_file_path in workdir.glob(pattern):
+            resolved = log_file_path.resolve()
+            if resolved in seen_paths or not log_file_path.is_file():
+                continue
+            seen_paths.add(resolved)
+            try:
+                with open(log_file_path, "r", errors="replace") as f:
+                    collected_lines.extend(f.readlines())
+            except OSError as error:
+                logger.warning("Could not read log file %s: %s", log_file_path, error)
+    return collected_lines
+
+
+@click.command()
+@click.option("--scope", required=True, type=str, help="Scope of the workload")
+@click.option("--model", required=True, type=str, help="Model of the workload")
+@click.option("--test-case", required=True, type=str, help="Test case of the workload")
+@click.option("--environment", required=True, type=str, help="Environment of the workload")
+@click.option("--platform", required=True, type=str, help="Platform of the workload")
+@click.option("--container-image", required=True, type=str, help="Container image of the workload")
+@click.option(
+    "--n-repeat", required=False, type=int, help="Number of times to repeat the workload", default=1
+)
+@click.option("--data-dir", required=False, type=str, help="Data directory of the workload")
+@click.option("--hf-home", required=False, type=str, help="HF home directory of the workload")
+@click.option("--tag", required=False, type=str, help="Tag of the workload")
+@click.option(
+    "--unit-testmon-mode",
+    type=click.Choice(["full", "enforce", "preselected", "baseline"]),
+    default="full",
+    show_default=True,
+    help="Selective unit-test mode.",
+)
+@click.option(
+    "--enable-lightweight-mode",
+    is_flag=True,
+    show_default=True,
+    required=False,
+    type=bool,
+    default=False,
+    help="To enable lightweight mode",
+)
+@click.option(
+    "--cadence",
+    required=False,
+    type=str,
+    default=None,
+    help=(
+        "Trigger cadence to filter tests by (pr|nightly|mergegroup). "
+        "Empty/unset disables the cadence filter."
+    ),
+)
+def main(
+    scope,
+    model,
+    test_case,
+    environment,
+    platform,
+    container_image,
+    n_repeat: int = 1,
+    data_dir: Optional[str] = None,
+    hf_home: Optional[str] = None,
+    tag: Optional[str] = None,
+    unit_testmon_mode: str = "full",
+    enable_lightweight_mode: Optional[bool] = False,
+    cadence: Optional[str] = None,
+):
+    cadence_arg = cadence or None
+
+    workloads = recipe_parser.load_workloads(
+        container_image="none",
+        scope=scope,
+        model=model,
+        test_case=test_case,
+        environment=environment,
+        container_tag="none",
+        platform=platform,
+        tag=tag,
+        cadence=cadence_arg,
+    )
+
+    workloads = [workload for workload in workloads if workload.type != "build"]
+
+    assert len(workloads) == 1, f"Expected exactly one workload, got {len(workloads)}"
+
+    workload = workloads[0]
+    magic_values = dict(workload.spec)
+    magic_values["assets_dir"] = "/opt/megatron-lm/assets_dir"
+    magic_values["artifacts_dir"] = "/opt/megatron-lm/artifacts_dir"
+    magic_values["environment"] = environment
+    magic_values["n_repeat"] = n_repeat
+    magic_values["test_case"] = workload.spec["test_case"]
+    magic_values["name"] = workload.spec["name"].format(**magic_values)
+    workload.spec["script"] = workload.spec["script"].format(**magic_values)
+
+    inline_script = run.Script(inline=workload.spec["script"])
+
+    artifacts = []
+    artifacts.append(f"{os.getcwd()}:/opt/megatron-lm")
+    if data_dir:
+        artifacts.append(f"{pathlib.Path(data_dir)}:/mnt/artifacts")
+    if hf_home:
+        artifacts.append(f"{pathlib.Path(hf_home)}:/mnt/hf_home")
+
+    executor = run.DockerExecutor(
+        container_image=container_image,
+        num_gpus=-1,
+        runtime="nvidia",
+        ipc_mode="host",
+        shm_size="30g",
+        env_vars={
+            "PYTHONUNBUFFERED": "1",
+            "UNIT_TESTMON_MODE": unit_testmon_mode,
+            "FORCE_COLOR": "1",
+            "TERM": "xterm-256color",
+            "OUTPUT_PATH": os.getcwd(),
+            "ENABLE_LIGHTWEIGHT_MODE": str(enable_lightweight_mode).lower(),
+            "N_REPEAT": str(n_repeat),
+            "CLUSTER": "dgxh100_dgxc",
+            "NCCL_DEBUG": "INFO",
+            "NCCL_DEBUG_FILE": "/opt/megatron-lm/assets_dir/logs/nccl_debug.log",
+            "HF_HOME": "/mnt/hf_home",
+            "TRANSFORMERS_OFFLINE": "1",
+        },
+        packager=run.Packager(),
+        volumes=artifacts,
+    )
+
+    if (
+        scope == "unit-tests"
+        and test_case == "tests/unit_tests/transformer/**/*.py"
+        and environment == "dev"
+        and tag == "latest"
+        and platform == "dgx_h100"
+    ):
+        # NCCL 2.31 finalization waits for peers. Nonblocking communicators let
+        # PyTorch start every communicator's finalization before waiting, avoiding
+        # cyclic waits between the CP group's P2P and collective communicators (#7744).
+        executor.env_vars["TORCH_NCCL_USE_COMM_NONBLOCKING"] = "1"
+        executor.env_vars["PYTEST_ADDOPTS"] = "-o faulthandler_timeout=600"
+        executor.env_vars["TORCH_CPP_LOG_LEVEL"] = "INFO"
+        executor.env_vars["NCCL_DEBUG_SUBSYS"] = "INIT,BOOTSTRAP,ENV,DESTROY"
+        executor.env_vars["NCCL_DEBUG_FILE"] = (
+            "/opt/megatron-lm/assets_dir/logs/nccl_debug.%h.%p.log"
+        )
+
+    n_attempts = 0
+    while n_attempts < 3:
+        tee_buffer = _ThreadSafeBuffer()
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+
+        class _TeeStream:
+            def __init__(self, real_stream, buf):
+                self._real = real_stream
+                self._buf = buf
+
+            def write(self, data):
+                self._real.write(data)
+                self._buf.write(data)
+
+            def flush(self):
+                self._real.flush()
+                self._buf.flush()
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        monitor_stop_event = threading.Event()
+        flaky_failure_detected_event = threading.Event()
+        monitor_thread = None
+        sys.stdout = _TeeStream(original_stdout, tee_buffer)
+        sys.stderr = _TeeStream(original_stderr, tee_buffer)
+        try:
+            with run.Experiment("mcore-ci-test", executor=executor, log_level="INFO") as exp:
+                job_id = exp.add([inline_script], tail_logs=False, name="task-1")
+
+                exp.dryrun(log=True)
+                monitor_thread = threading.Thread(
+                    target=_cancel_on_flaky_failure,
+                    args=(
+                        exp,
+                        job_id,
+                        tee_buffer,
+                        monitor_stop_event,
+                        flaky_failure_detected_event,
+                    ),
+                    daemon=True,
+                )
+                monitor_thread.start()
+                exp.run(detach=False, tail_logs=True, sequential=False)
+        finally:
+            monitor_stop_event.set()
+            if monitor_thread is not None:
+                monitor_thread.join()
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+
+        result_dict = exp.status(return_dict=True)
+        _, job_dict = list(result_dict.items())[0]
+        succeeded = str(job_dict["status"]) == "SUCCEEDED"
+
+        if succeeded:
+            logger.info(f"Job succeeded with status: {job_dict['status']}")
+            sys.exit(0)
+
+        logger.error(f"Job failed with status: {job_dict['status']}")
+        all_ranks_all_logs = [tee_buffer.getvalue()]
+        all_ranks_all_logs.extend(_collect_failure_logs(pathlib.Path(os.getcwd())))
+        all_ranks_all_logs_string = "\n".join(all_ranks_all_logs)
+        if flaky_failure_detected_event.is_set() or is_flaky_failure(all_ranks_all_logs_string):
+            logger.warning("Detected flaky failure, attempt restart.")
+            n_attempts += 1
+            continue
+
+        sys.exit(1)
+
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

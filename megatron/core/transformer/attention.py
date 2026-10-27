@@ -1,0 +1,2333 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from __future__ import annotations
+
+import copy
+import inspect
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Callable, Optional, Protocol, Tuple, Union
+
+import torch
+from torch import Tensor
+
+from megatron.core import tensor_parallel
+from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
+from megatron.core.jit import jit_fuser
+from megatron.core.models.common.embeddings.rope_utils import (
+    apply_rotary_pos_emb,
+    apply_rotary_pos_emb_with_cos_sin,
+)
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.parallel_state import (
+    get_data_parallel_group,
+    get_data_parallel_rank,
+    get_data_parallel_world_size,
+    get_tensor_model_parallel_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
+from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
+from megatron.core.transformer.utils import is_layer_window_attention
+from megatron.core.typed_torch import apply_module, copy_signature, not_none
+from megatron.core.utils import (
+    deprecate_inference_params,
+    divide,
+    get_pg_rank,
+    get_pg_size,
+    is_fa_min_version,
+    is_te_min_version,
+    is_using_quantization_scales,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
+
+from ..models.common.embeddings.yarn_rotary_pos_embedding import (
+    _yarn_get_concentration_factor_from_config,
+)
+from .enums import AttnMaskType
+from .transformer_config import TransformerConfig
+
+try:
+    from einops import rearrange
+except ImportError:
+    rearrange = None
+
+try:
+    from flash_attn_3.flash_attn_interface import _flash_attn_forward
+    from flash_attn_3.flash_attn_interface import (
+        flash_attn_with_kvcache as flash_attn3_with_kvcache,
+    )
+
+    HAVE_FA3 = True
+except ImportError as e:
+    HAVE_FA3 = False
+
+if not HAVE_FA3:
+    try:
+        from flashattn_hopper.flash_attn_interface import _flash_attn_forward
+        from flashattn_hopper.flash_attn_interface import (
+            flash_attn_with_kvcache as flash_attn3_with_kvcache,
+        )
+
+        HAVE_FA3 = True
+    except ImportError as e:
+        pass
+
+# The FA4 version is tracked by the `flash-attn-4` distribution metadata,
+# not `flash_attn.__version__` (which reports the 2.x version) or
+# `flash_attn.cute.__version__` (which is 0.0.0), so we cannot use
+# `is_fa_min_version` here.
+_MIN_FA4_VERSION = "4.0.0b20"
+flash_attn4_varlen_func = None
+try:
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _get_dist_version
+
+    from packaging.version import Version as _Version
+
+    HAVE_FA4 = _Version(_get_dist_version("flash-attn-4")) >= _Version(_MIN_FA4_VERSION)
+    if HAVE_FA4:
+        from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+except (ImportError, PackageNotFoundError):
+    HAVE_FA4 = False
+
+try:
+    from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+
+    HAVE_FMLA = True
+except ImportError:
+    flash_mla_with_kvcache = None
+    get_mla_metadata = None
+    HAVE_FMLA = False
+
+from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+try:
+    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+except:
+    flash_attn_varlen_func = None
+    flash_attn_with_kvcache = None
+
+if HAVE_TE:
+    from megatron.core.extensions.transformer_engine import (
+        SplitAlongDim,
+        TELinear,
+        TENorm,
+        set_save_original_input,
+    )
+else:
+    SplitAlongDim, TELinear, TENorm, set_save_original_input = None, None, None, None
+
+try:
+    from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
+
+    HAVE_FUSED_QKV_ROPE = True
+except ImportError:
+    HAVE_FUSED_QKV_ROPE = False
+
+
+class LinearQkvInterface(Protocol):
+    """Interface for linear_qkv modules."""
+
+    def forward(self, input: Tensor, /) -> tuple[Tensor, object]:
+        """Applies linear_qkv."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Backward pass for the linear_qkv module."""
+        ...
+
+
+class LinearQkvBuilder(Protocol):
+    """Protocol for building linear_qkv layers."""
+
+    def __call__(
+        self,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[torch.Tensor], None],
+        gather_output: bool,
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: str,
+        tp_group: torch.distributed.ProcessGroup | None = None,
+    ) -> LinearQkvInterface: ...
+
+
+class LinearInterface(Protocol):
+    """Interface for linear_q and linear_kv modules."""
+
+    def forward(self, input: Tensor, /) -> tuple[Tensor, object]:
+        """Applies linear_q/linear_kv."""
+        ...
+
+
+class LinearLayerBuilder(Protocol):
+    """Protocol for building linear_q and linear_kv layers."""
+
+    def __call__(
+        self,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[torch.Tensor], None],
+        gather_output: bool,
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+    ) -> LinearInterface: ...
+
+
+class CoreAttentionInterface(Protocol):
+    """Interface for core_attention modules."""
+
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Tensor | None,
+        /,
+        *,
+        attn_mask_type: AttnMaskType,
+        attention_bias: Tensor | None,
+        packed_seq_params: PackedSeqParams | None,
+    ) -> Tensor:
+        """Applies dot product attention."""
+        ...
+
+
+class CoreAttentionBuilder(Protocol):
+    """Protocol for building core_attention layers."""
+
+    def __call__(
+        self,
+        *,
+        config: TransformerConfig,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
+        cp_comm_type: str | None,
+        softmax_scale: float | None,
+        pg_collection: ProcessGroupCollection | None,
+    ) -> CoreAttentionInterface: ...
+
+
+class LinearProjInterface(Protocol):
+    """Interface for linear_proj modules."""
+
+    def forward(self, hidden_states: Tensor, /) -> tuple[Tensor, Tensor | None]:
+        """Applies the linear projection to the output of the core attention."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Computes weight gradients of output projection layer."""
+        ...
+
+
+class LinearProjBuilder(Protocol):
+    """Protocol for building linear_proj layers."""
+
+    def __call__(
+        self,
+        query_projection_size: int,
+        hidden_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[torch.Tensor], None],
+        bias: bool,
+        input_is_parallel: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: str,
+        tp_group: torch.distributed.ProcessGroup | None,
+    ) -> LinearProjInterface: ...
+
+
+@dataclass
+class SelfAttentionSubmodules:
+    """
+    Configuration class for specifying the submodules of a self-attention.
+    """
+
+    linear_qkv: LinearQkvBuilder
+    core_attention: CoreAttentionBuilder
+    linear_proj: LinearProjBuilder
+    q_layernorm: LayerNormBuilder | None = None
+    k_layernorm: LayerNormBuilder | None = None
+
+
+@dataclass
+class CrossAttentionSubmodules:
+    """
+    Configuration class for specifying the submodules of a cross-attention.
+    """
+
+    linear_q: LinearLayerBuilder
+    linear_kv: LinearLayerBuilder
+    core_attention: CoreAttentionBuilder
+    linear_proj: LinearProjBuilder
+
+
+class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
+    """Attention layer abstract class.
+
+    This layer only contains common modules required for the "self attn" and
+    "cross attn" specializations.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: Union[SelfAttentionSubmodules, CrossAttentionSubmodules],
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
+        cp_comm_type: str | None = None,
+        pg_collection: ProcessGroupCollection | None = None,
+        pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
+        name: str | None = None,
+    ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
+        super().__init__(config=config)
+
+        self.config = config
+        self.layer_number = layer_number
+        self._pp_layer_offset = pp_layer_offset
+        self.is_mtp_layer = is_mtp_layer
+
+        self.attn_mask_type = attn_mask_type
+        self.attention_type = attention_type
+        self.batch_invariant_mode = config.batch_invariant_mode
+        self.flash_attention_version = config.flash_attention_version
+
+        # Cache the YaRN concentration factor (a.k.a. attention factor / mscale),
+        # which is a pure function of the config and is reused on every forward
+        # pass for both static and dynamic batching code paths.
+        self._yarn_concentration_factor = _yarn_get_concentration_factor_from_config(config)
+
+        assert self.config.kv_channels is not None
+        assert self.config.num_query_groups is not None
+
+        # For normal attention without groups, num_query_groups == num_attention_heads,
+        # so these two will be the same
+        self.query_projection_size = self.config.kv_channels * self.config.num_attention_heads
+        self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups
+
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        else:
+            assert hasattr(
+                pg_collection, 'tp'
+            ), "Attention pg_collection must have tp process group"
+            assert hasattr(
+                pg_collection, 'cp'
+            ), "Attention pg_collection must have cp process group"
+        self.pg_collection = pg_collection
+        self.tp_group = pg_collection.tp
+
+        # Per attention head and per partition values
+        world_size = get_pg_size(self.pg_collection.tp)
+        self.hidden_size_per_attention_head = divide(
+            self.query_projection_size, self.config.num_attention_heads
+        )
+        if self.config.num_query_groups < world_size:
+            # When num_kv_heads < tp_size, each TP rank (post AG) initially produces
+            # activations for 1 kv_head and (num_q_heads / num_kv_heads) q_heads.
+            # We then pull out the appropriate (num_q_heads / tp_size) q_heads.
+            self.num_query_groups_per_partition = 1
+            self.num_attention_heads_per_partition = divide(
+                self.config.num_attention_heads, self.config.num_query_groups
+            )
+        else:
+            # When num_kv_heads >= tp_size, each TP rank produces activations for
+            # (num_kv_heads / tp_size) kv_heads and (num_q_heads / tp_size) q_heads.
+            self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
+            self.num_attention_heads_per_partition = divide(
+                self.config.num_attention_heads, world_size
+            )
+        self.world_size = world_size
+
+        # To support both CUDA Graphs and key value with different hidden size
+        self.key_hidden_size = self.hidden_size_per_attention_head
+        self.val_hidden_size = self.hidden_size_per_attention_head
+
+        if self.config.num_query_groups < world_size:
+            # TE throws an assertion error if num_kv_heads / num_query_groups
+            # is not divisible by TP size.
+            # TODO(rwaleffe/dnarayanan): Clean this up eventually.
+            tmp_config = copy.deepcopy(self.config)
+            tmp_config.num_query_groups = world_size
+        else:
+            tmp_config = self.config
+        self.core_attention = submodules.core_attention(
+            config=tmp_config,
+            layer_number=self.layer_number,
+            attn_mask_type=self.attn_mask_type,
+            attention_type=self.attention_type,
+            cp_comm_type=cp_comm_type,
+            softmax_scale=self.config.softmax_scale,
+            pg_collection=self.pg_collection,
+        )
+
+        self.checkpoint_core_attention = (
+            self.config.recompute_granularity == 'selective'
+            and "core_attn" in self.config.recompute_modules
+        )
+
+        self.offload_qkv_linear = (
+            self.config.fine_grained_activation_offloading
+            and "qkv_linear" in self.config.offload_modules
+        )
+
+        self.offload_core_attention = (
+            self.config.fine_grained_activation_offloading
+            and "core_attn" in self.config.offload_modules
+        )
+
+        self.offload_attn_proj = (
+            self.config.fine_grained_activation_offloading
+            and "attn_proj" in self.config.offload_modules
+        )
+
+        # Output.
+        self.linear_proj = submodules.linear_proj(
+            self.query_projection_size,
+            self.config.hidden_size,
+            config=self.config,
+            init_method=not_none(self.config.output_layer_init_method),
+            bias=self.config.add_bias_linear,
+            input_is_parallel=True,
+            skip_bias_add=True,
+            is_expert=False,
+            tp_comm_buffer_name='proj',
+            tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
+            name=(name + ".linear_proj") if name is not None else None,
+        )
+
+        if (
+            HAVE_TE
+            and isinstance(self.linear_proj, TELinear)
+            and (
+                (
+                    self.config.fp8
+                    and self.config.fp8_recipe != 'delayed'
+                    and is_te_min_version("2.6.0dev0")
+                )
+                or (self.config.fp4 and is_te_min_version("2.7.0.dev0"))
+            )
+        ):
+            # For fp8/fp4 training, the output of the fused core_attn is saved by itself, and
+            # linear_proj also saves the quantized tensor of this output. Here we set the
+            # linear_proj to save the original input tensors to avoid the extra memory usage of
+            # the quantized tensor.
+            set_save_original_input(self.linear_proj)
+
+    def _get_core_attention_extra_kwargs(
+        self,
+        hidden_states: Tensor,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Tensor,
+        inference_context: Optional[BaseInferenceContext],
+        rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]],
+        rotary_pos_cos: Optional[Tensor],
+        rotary_pos_sin: Optional[Tensor],
+        rotary_pos_cos_sin: Optional[Tensor],
+        attn_mask_type: AttnMaskType,
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> dict:
+        """Hook for attention variants that need extra inputs in core attention."""
+        return {}
+
+    def _checkpointed_attention_forward(
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        rotary_pos_emb=None,
+        attn_mask_type=None,
+        attention_bias=None,
+        packed_seq_params=None,
+        core_attention_extra_kwargs=None,
+    ):
+        """Forward method with selective activation checkpointing."""
+        if core_attention_extra_kwargs is None:
+            core_attention_extra_kwargs = {}
+        tensor_kwarg_names = []
+        checkpoint_inputs = [query, key, value, attention_mask, rotary_pos_emb, attn_mask_type]
+        # Tensor kwargs used by custom core attention modules, such as DSA's x/qr inputs, must
+        # be passed through checkpoint so recompute sees detached checkpoint inputs instead of
+        # closing over the original forward tensors.
+        for name, kwarg_value in core_attention_extra_kwargs.items():
+            if torch.is_tensor(kwarg_value):
+                tensor_kwarg_names.append(name)
+                checkpoint_inputs.append(kwarg_value)
+
+        def custom_forward(*inputs):
+            query, key, value, attention_mask, _, attn_mask_type, *tensor_kwarg_values = inputs
+            attn_mask_type = AttnMaskType(attn_mask_type.item())
+            extra_kwargs = dict(core_attention_extra_kwargs)
+            for name, kwarg_value in zip(tensor_kwarg_names, tensor_kwarg_values):
+                extra_kwargs[name] = kwarg_value
+            output_ = self._run_core_attention(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                **extra_kwargs,
+            )
+            return output_
+
+        if attn_mask_type is None:
+            attn_mask_type = self.attn_mask_type
+        # Megatron's checkpoint wrapper saves only tensor args, so encode the mask enum as a
+        # tensor here and convert it back to AttnMaskType inside custom_forward.
+        attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
+        checkpoint_inputs[5] = attn_mask_type
+        hidden_states = tensor_parallel.checkpoint(custom_forward, False, *checkpoint_inputs)
+
+        return hidden_states
+
+    def _run_core_attention(
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        attn_mask_type=None,
+        attention_bias=None,
+        packed_seq_params=None,
+        **extra_kwargs,
+    ):
+        """Run the configured core attention module."""
+        return apply_module(self.core_attention)(
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type=attn_mask_type,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            **extra_kwargs,
+        )
+
+    def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
+        """Allocate memory to store kv cache during inference."""
+
+        return torch.empty(
+            inference_max_sequence_length,
+            batch_size,
+            self.num_query_groups_per_partition,
+            dim,
+            dtype=dtype,
+            device=torch.cuda.current_device(),
+        )
+
+    def _get_pp_layer_offset_for_inference(self):
+        """Return the pipeline parallel layer offset for inference.
+
+        When pp_layer_offset was explicitly provided (e.g. by MambaBlock for
+        hybrid models using --hybrid-layer-pattern with fVPP), use that value
+        directly.  Otherwise fall back to the standard computation which assumes
+        uniform layer distribution across pipeline stages.
+        """
+        if self._pp_layer_offset is not None:
+            return self._pp_layer_offset
+
+        assert (
+            self.config.virtual_pipeline_model_parallel_size is None
+        ), "Virtual pipeline parallelism is not supported for inference"
+
+        # Import here to avoid circular imports
+        from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+
+        return get_transformer_layer_offset(
+            self.config, vp_stage=None, pp_rank=get_pg_rank(self.pg_collection.pp)
+        )
+
+    def _adjust_key_value_for_inference(
+        self,
+        inference_context: BaseInferenceContext,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        rotary_pos_emb: Tensor,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
+        sequence_len_offset: Optional[int] = None,
+        *,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        inference_params: Optional[BaseInferenceContext] = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, AttnMaskType, Tensor]:
+        """
+        Saves the generated key and value tensors to the end of the buffers in inference_context.
+        Returns the full size keys and values from the provided inference_context, as well as
+        adjusted rotary_pos_emb.
+
+        Args:
+            query (Tensor): Query tensor.
+            key (Tensor): Key tensor.
+            value (Tensor): Value tensor.
+            rotary_pos_emb (Optional[Union[Tensor, Tuple[Tensor, Tensor]]]): Rotary
+                embedding tensor(s).
+            rotary_pos_cos (Optional[Tensor]): Rotary embedding cosine.
+            rotary_pos_sin (Optional[Tensor]): Rotary embedding sine.
+            rotary_pos_cos_sin (Optional[Tensor]): Combined rotary embedding cosine and sine.
+            Currently used exclusively for inference with dynamic batching and flashinfer RoPE.
+            sequence_len_offset (Optional[int]): Sequence length offset used for
+                inference CUDA graphs.
+            cp_group (Optional[ProcessGroup]): Context-parallel group for this
+                forward. Defaults to the group configured on the module.
+
+        Return:
+            Tuple of: query, key, value, rotary_pos_emb, attn_mask_type, block_table.
+        """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+        cp_group = self.pg_collection.cp if cp_group is None else cp_group
+
+        attn_mask_type = self.attn_mask_type
+        if inference_context is None:
+            return query, key, value, rotary_pos_emb, attn_mask_type, None
+
+        # =================================================
+        # Pre-allocate memory for key-values for inference.
+        # =================================================
+        if inference_context.is_static_batching():
+            if self.layer_number not in inference_context.key_value_memory_dict:
+                inf_max_seq_length = inference_context.max_sequence_length
+                inf_max_batch_size = inference_context.max_batch_size
+                inference_key_memory = self._allocate_memory(
+                    inf_max_seq_length, inf_max_batch_size, self.key_hidden_size, key.dtype
+                )
+                inference_value_memory = self._allocate_memory(
+                    inf_max_seq_length, inf_max_batch_size, self.val_hidden_size, value.dtype
+                )
+                inference_context.key_value_memory_dict[self.layer_number] = (
+                    inference_key_memory,
+                    inference_value_memory,
+                )
+            else:
+                # Get the pre-allocated buffers for this layer
+                inference_key_memory, inference_value_memory = (
+                    inference_context.key_value_memory_dict[self.layer_number]
+                )
+
+        if (
+            not inference_context.is_static_batching() or inference_context.sequence_len_offset > 0
+        ) and (not self.training or not is_te_min_version("2.2.0")):
+            # This should mean that we are past the prompt forward_step
+            # and so we need to turn off masking
+            # Note: in ModelOpt, we may use inference_context for speculative decoding
+            # in training. In that case, we do not want to turn off masking as we need
+            # customized attention mask for speculative decoding.
+
+            attn_mask_type = AttnMaskType.no_mask
+
+        if inference_context.is_static_batching():
+            batch_start = inference_context.batch_size_offset
+            batch_end = batch_start + key.size(1)
+            assert batch_end <= inference_key_memory.size(1)
+            sequence_start = inference_context.sequence_len_offset
+            sequence_end = sequence_start + key.size(0)
+            assert sequence_end <= inference_key_memory.size(0), (
+                "Current sequence length is longer than expected maximum sequence length! "
+                "Increase inference_max_seq_length."
+            )
+
+        if self.config.flash_decode:
+            rotary_pos_cos_q = None
+            rotary_pos_sin_q = None
+            rotary_pos_cos_k = None
+            rotary_pos_sin_k = None
+
+            assert inference_context.is_static_batching()
+            if (
+                inference_context.sequence_len_offset > 0 and rotary_pos_cos is not None
+            ):  # Decode phase, not prefill
+                rotary_pos_cos_q = rotary_pos_cos[sequence_end - 1 : sequence_end]
+                rotary_pos_sin_q = rotary_pos_sin[sequence_end - 1 : sequence_end]
+                rotary_pos_cos_k = rotary_pos_cos[sequence_end - 1 : sequence_end]
+                rotary_pos_sin_k = rotary_pos_sin[sequence_end - 1 : sequence_end]
+            elif rotary_pos_cos is not None:  # Prefill
+                rotary_pos_cos_q = rotary_pos_cos[:sequence_end]
+                rotary_pos_sin_q = rotary_pos_sin[:sequence_end]
+                rotary_pos_cos_k = rotary_pos_cos[:sequence_end]
+                rotary_pos_sin_k = rotary_pos_sin[:sequence_end]
+
+            # Flash Decoding assumes that the keys stored in the KV Cache already have RoPE applied.
+            # Apply RoPE before we store the keys to make it compatible with flash decoding kernel
+            if rotary_pos_sin_q is not None and rotary_pos_sin_k is not None:
+                key = apply_rotary_pos_emb_with_cos_sin(
+                    key,
+                    rotary_pos_cos_k,
+                    rotary_pos_sin_k,
+                    rotary_interleaved=self.config.rotary_interleaved,
+                )
+                query = apply_rotary_pos_emb_with_cos_sin(
+                    query,
+                    rotary_pos_cos_q,
+                    rotary_pos_sin_q,
+                    rotary_interleaved=self.config.rotary_interleaved,
+                )
+        else:
+            rotary_pos_cos_q = None
+            rotary_pos_sin_q = None
+
+        # Adjust rotary embeddings.
+        if rotary_pos_emb is not None:
+            q_pos_emb, k_pos_emb = rotary_pos_emb
+            if inference_context.is_static_batching():
+                q_pos_emb = q_pos_emb[sequence_start:sequence_end, :, :, :]
+                k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
+            else:
+                pass
+            rotary_pos_emb = (q_pos_emb, k_pos_emb)
+
+        block_table = None
+        if inference_context.is_static_batching():
+            # Copy key and values.
+            inference_key_memory[sequence_start:sequence_end, batch_start:batch_end, ...] = key
+            inference_value_memory[sequence_start:sequence_end, batch_start:batch_end, ...] = value
+            key = inference_key_memory[:sequence_end, batch_start:batch_end, ...]
+            value = inference_value_memory[:sequence_end, batch_start:batch_end, ...]
+        else:
+            pp_layer_offset = self._get_pp_layer_offset_for_inference()
+
+            # Apply rotary embeddings before appending KV cache.
+            if inference_context.use_flashinfer_fused_rope and (rotary_pos_cos_sin is not None):
+                query, key = inference_context.apply_fused_qk_rotary_emb(
+                    query, key, rotary_pos_cos_sin, self.config
+                )
+            elif rotary_pos_emb is not None:
+                q_pos_emb, k_pos_emb = rotary_pos_emb
+                key = inference_context.apply_rotary_emb_key(
+                    key, k_pos_emb, self.config, cp_group, mscale=self._yarn_concentration_factor
+                )
+
+                rotary_pos_emb = (q_pos_emb, None)  # key rotary emb has been applied
+
+            # Append key/value data tensors to cache.
+            inference_context.append_key_value_cache(
+                self.layer_number - pp_layer_offset, key, value
+            )
+
+            if (
+                getattr(self.config, "cache_mla_latents", None)
+                and not inference_context.is_decode_only()
+            ):
+                # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode)
+                kv_cache, _, block_table = inference_context.key_value_cache(
+                    self.layer_number - pp_layer_offset
+                )
+                # Uncompress the KV cache for prefill/mixed mode
+                key, value = self.uncompress_kv_from_cache(kv_cache)
+            else:
+                # Read key/value *pointer* tensors from cache.
+                key, value, block_table = inference_context.key_value_cache(
+                    self.layer_number - pp_layer_offset
+                )
+        return query, key, value, rotary_pos_emb, attn_mask_type, block_table
+
+    @abstractmethod
+    def get_query_key_value_tensors(
+        self,
+        hidden_states: Tensor,
+        key_value_states: Tensor | None,
+        output_gate: bool = False,
+        split_qkv: bool = True,
+    ) -> (
+        tuple[Tensor, Tensor, Tensor, Tensor]
+        | tuple[Tensor, Tensor, Tensor]
+        | tuple[Tensor, list[int]]
+    ):
+        """
+        This method needs to be implemented based on whether the derived class
+        is "self-attn" or "cross-attn".
+        """
+
+    def get_softmax_scale(
+        self, query_tensor: torch.Tensor, head_dim_index: int = -1
+    ) -> float | None:
+        """Return the softmax scaling value to use.
+
+        Tries, in order:
+        - `self.softmax_scale` (should only be assigned for MLA),
+        - `self.config.softmax_scale`, and if that is `None`, uses
+        - 1 / sqrt(Q head dim), as per `query_tensor` and `head_dim_index`.
+        """
+        if getattr(self, "softmax_scale", None) is not None:
+            softmax_scale = self.softmax_scale
+        elif getattr(self.config, "softmax_scale", None) is not None:
+            softmax_scale = self.config.softmax_scale
+        else:
+            softmax_scale = query_tensor.size(head_dim_index) ** -0.5
+        return softmax_scale
+
+    def flash_decode(
+        self,
+        sequence_len_offset: Tensor,
+        query_layer: Tensor,
+        key_layer: Tensor,
+        value_layer: Tensor,
+        inference_key_memory: Tensor,
+        inference_value_memory: Tensor,
+        rotary_cos: Tensor,
+        rotary_sin: Tensor,
+        rotary_interleaved: bool = False,
+    ) -> tuple[Tensor, Tensor]:
+        """
+        The flash decoding kernel will do the following in a single execution:
+        1. Compute RoPE embedding with precomputed cos & sin tensors
+        2. Update the KV Cache
+        3. Performs the flash attention operation
+        """
+        assert flash_attn_with_kvcache is not None, (
+            "Flash Decoding requires the flash_attn_with_kvcache kernel, "
+            "available in the flash-attn package."
+        )
+        q = query_layer.permute(1, 0, 2, 3)
+        k = key_layer.permute(1, 0, 2, 3)
+        v = value_layer.permute(1, 0, 2, 3)
+        k_cache = inference_key_memory.permute(1, 0, 2, 3)
+        v_cache = inference_value_memory.permute(1, 0, 2, 3)
+
+        if rotary_cos is not None:
+            rotary_cos = rotary_cos.to(query_layer.dtype)
+        if rotary_sin is not None:
+            rotary_sin = rotary_sin.to(query_layer.dtype)
+
+        softmax_offset = self._get_inference_softmax_offset()
+        need_lse = softmax_offset is not None
+
+        kv_kwargs = dict(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k=k,
+            v=v,
+            rotary_cos=rotary_cos,
+            rotary_sin=rotary_sin,
+            cache_seqlens=sequence_len_offset,
+            rotary_interleaved=rotary_interleaved,
+            softmax_scale=self.get_softmax_scale(q),
+        )
+        # This path bypasses self.core_attention and calls flash-attention directly, so the
+        # configured cap has to be passed here too. Only when set, so runs without softcapping
+        # keep their current call signature on older flash-attention builds.
+        softcap = self.config.attn_logit_softcapping
+        if softcap is not None:
+            assert is_fa_min_version(
+                "2.6.0"
+            ), "attn_logit_softcapping requires flash-attn 2.6.0 or newer."
+            kv_kwargs["softcap"] = softcap
+        if need_lse:
+            kv_kwargs["return_softmax_lse"] = True
+            out, softmax_lse = flash_attn_with_kvcache(**kv_kwargs)
+            # out: (B, S, H, D); softmax_lse: (B, H, S)
+            out = self._apply_sink_softmax_correction_bshd(out, softmax_lse, softmax_offset)
+        else:
+            out = flash_attn_with_kvcache(**kv_kwargs)
+        return out
+
+    def _get_inference_softmax_offset(self) -> Optional[Tensor]:
+        """Return the per-head sink (off-by-one / learnable) softmax logit, or None.
+
+        This mirrors how the static-inference path applies the off-by-one /
+        learnable softmax in :class:`DotProductAttention` and (for TE) in
+        :class:`TEDotProductAttention`. The dynamic-inference path bypasses
+        ``self.core_attention`` and calls flash-attention kernels directly,
+        so we plumb the offset back out here and apply the correction as a
+        post-hoc rescale of the flash-attention output.
+
+        Returns:
+            * ``None`` when ``config.softmax_type == "vanilla"`` (no correction).
+            * A tensor of shape ``[num_attention_heads_per_partition]`` of
+              per-head sink logits otherwise.
+        """
+        if self.config.softmax_type == "vanilla":
+            return None
+        # Both local DotProductAttention (zeros for off-by-one, Parameter for
+        # learnable) and the TE backend (learnable) expose `softmax_offset`
+        # directly on the core_attention module.
+        offset = getattr(self.core_attention, "softmax_offset", None)
+        if offset is None:
+            # Fallback: TE off-by-one path may not surface `softmax_offset`
+            # as a named attribute (TE applies a fixed +1 in the denominator
+            # internally). Logit space zero == +1 in the denominator, which
+            # matches off-by-one semantics.
+            assert self.config.softmax_type == "off-by-one", (
+                f"softmax_type={self.config.softmax_type!r} requires a "
+                f"softmax_offset tensor on core_attention but none was found."
+            )
+            if not hasattr(self, "_inference_zero_softmax_offset"):
+                self._inference_zero_softmax_offset = torch.zeros(
+                    self.num_attention_heads_per_partition,
+                    device=torch.cuda.current_device(),
+                    dtype=self.config.params_dtype,
+                )
+            offset = self._inference_zero_softmax_offset
+        return offset
+
+    @staticmethod
+    def _apply_sink_softmax_correction_varlen(
+        output: Tensor, lse: Tensor, softmax_offset: Tensor
+    ) -> Tensor:
+        """Apply sink-softmax post-correction to a varlen flash-attn output.
+
+        For vanilla softmax flash-attention returns
+        ``out_i = sum_j (exp(qk_j) / sum_k exp(qk_k)) * v_j`` with
+        ``lse = log(sum_k exp(qk_k))``. Sink (off-by-one / learnable) softmax
+        replaces the denominator with ``exp(sink_h) + sum_k exp(qk_k)``,
+        which is equivalent to multiplying ``out`` by
+        ``sigmoid(lse - sink_h)``. NaN/inf LSE values can appear for rows
+        with no attended keys (e.g. padding); those rows are kept unmodified
+        — the dynamic-batching path zeros padded tokens downstream.
+
+        Args:
+            output (Tensor): ``(total_q, num_heads, head_dim)``.
+            lse (Tensor): ``(num_heads, total_q)`` log-sum-exp from flash-attn.
+            softmax_offset (Tensor): ``(num_heads,)`` per-head sink logit.
+        """
+        # (H, T) -> (T, H, 1)
+        lse_aligned = lse.transpose(0, 1).unsqueeze(-1).to(torch.float32)
+        sink = softmax_offset.reshape(1, -1, 1).to(device=output.device, dtype=torch.float32)
+        scale = torch.sigmoid(lse_aligned - sink)
+        # Preserve rows where LSE is non-finite (no attended keys).
+        scale = torch.where(torch.isfinite(scale), scale, torch.ones_like(scale))
+        return (output.to(torch.float32) * scale).to(output.dtype)
+
+    @staticmethod
+    def _apply_sink_softmax_correction_bshd(
+        output: Tensor, lse: Tensor, softmax_offset: Tensor
+    ) -> Tensor:
+        """Apply sink-softmax post-correction to a (B, S, H, D) flash-attn output.
+
+        See :meth:`_apply_sink_softmax_correction_varlen` for the math; this
+        variant only differs in tensor layout.
+
+        Args:
+            output (Tensor): ``(B, S, num_heads, head_dim)``.
+            lse (Tensor): ``(B, num_heads, S)`` log-sum-exp from flash-attn.
+            softmax_offset (Tensor): ``(num_heads,)`` per-head sink logit.
+        """
+        # (B, H, S) -> (B, S, H, 1)
+        lse_aligned = lse.permute(0, 2, 1).unsqueeze(-1).to(torch.float32)
+        sink = softmax_offset.reshape(1, 1, -1, 1).to(device=output.device, dtype=torch.float32)
+        scale = torch.sigmoid(lse_aligned - sink)
+        scale = torch.where(torch.isfinite(scale), scale, torch.ones_like(scale))
+        return (output.to(torch.float32) * scale).to(output.dtype)
+
+    def _flash_attention_3_forward_wrapper(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        max_seqlen_q,
+        max_seqlen_k,
+        cu_seqlens_q,
+        seqlens_k,
+        block_table,
+        softmax_scale,
+        window_size: Tuple[int, int] = (-1, -1),
+        return_lse: bool = False,
+    ):
+        """
+        Wrapper for calling the FA3 _flash_attn_forward function.
+        Handles argument conversion for different versions of the _flash_attn_forward API.
+
+        Args:
+            return_lse (bool): If True, the wrapper also returns the per-token
+                log-sum-exp tensor produced by flash-attention (used by the
+                sink / off-by-one softmax correction path).
+        """
+        candidate_kwargs = {
+            "q": q,
+            "k": k,
+            "v": v,
+            "k_new": None,
+            "v_new": None,
+            "qv": None,
+            "out": None,
+            "out_": None,
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_k": None,
+            "cu_seqlens_k_new": None,
+            "seqused_q": None,
+            "seqused_k": seqlens_k,
+            "max_seqlen_q": max_seqlen_q,
+            "max_seqlen_k": max_seqlen_k,
+            "page_table": block_table,
+            "kv_batch_idx": None,
+            "leftpad_k": None,
+            "rotary_cos": None,
+            "rotary_sin": None,
+            "seqlens_rotary": None,
+            "q_descale": None,
+            "k_descale": None,
+            "v_descale": None,
+            "softmax_scale": softmax_scale,
+            "causal": True,
+            "attention_chunk": 0,
+            "softcap": self.config.attn_logit_softcapping or 0.0,
+            "window_size": window_size,
+            "window_size_left": window_size[0],
+            "window_size_right": window_size[1],
+            "rotary_interleaved": True,
+            "scheduler_metadata": None,
+            "num_splits": 0 if not self.batch_invariant_mode else 1,
+            "pack_gqa": None,
+            "sm_margin": 0,
+        }
+
+        # Parse the expect argument names from the function signature
+        if inspect.isfunction(_flash_attn_forward):
+            sig = inspect.signature(_flash_attn_forward)
+        else:
+            assert isinstance(_flash_attn_forward, torch._library.custom_ops.CustomOpDef)
+            sig = inspect.signature(_flash_attn_forward._init_fn)
+        valid_kwargs = set(sig.parameters.keys())
+        assert candidate_kwargs["softcap"] == 0.0 or "softcap" in valid_kwargs, (
+            "This FlashAttention 3 build does not accept softcap, so attn_logit_softcapping "
+            "cannot be honoured. Install a softcap-capable build or unset the config field."
+        )
+        final_kwargs = {k: candidate_kwargs[k] for k in valid_kwargs if k in candidate_kwargs}
+
+        ret = _flash_attn_forward(**final_kwargs)
+        if isinstance(ret, torch.Tensor):
+            output_total = ret
+            unused = ()
+        else:
+            output_total, *unused = ret
+
+        if not return_lse:
+            return output_total
+
+        # FA3 versions return softmax_lse at different positions depending on
+        # the build (some return (out, lse), others
+        # (out, q, k, v, out_padded, lse, p)). We probe by tensor rank because
+        # softmax_lse is always 2D (num_heads, total_q).
+        num_heads = q.shape[-2]
+        softmax_lse = None
+        for item in unused:
+            if isinstance(item, torch.Tensor) and item.dim() == 2 and item.shape[0] == num_heads:
+                softmax_lse = item
+                break
+        assert softmax_lse is not None, (
+            "Could not locate softmax_lse in flash-attn 3 _flash_attn_forward "
+            "return value; sink (off-by-one / learnable) softmax requires "
+            "log-sum-exp output from the kernel."
+        )
+        return output_total, softmax_lse
+
+    def _resolve_flash_version(self) -> Tuple[bool, bool]:
+        """Resolve which FlashAttention generation this attention should run.
+
+        Honors ``config.flash_attention_version`` when pinned, otherwise falls back
+        to the auto preference order (FA4 > FA3 > FA2). Returns ``(use_fa4, use_fa3)``;
+        when both are False the FA2 kernel is used.
+        """
+        pinned = self.flash_attention_version
+        if pinned == 4:
+            assert (
+                HAVE_FA4
+            ), "flash_attention_version=4 requested but FlashAttention-4 is not installed"
+            return True, False
+        if pinned == 3:
+            assert (
+                HAVE_FA3
+            ), "flash_attention_version=3 requested but FlashAttention-3 is not installed"
+            return False, True
+        if pinned == 2:
+            return False, False
+        # Auto: prefer the newest available generation.
+        return HAVE_FA4, (HAVE_FA3 and not HAVE_FA4)
+
+    def flash_decode_and_prefill(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        max_seqlen_q,
+        max_seqlen_k,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqlens_k,
+        block_table,
+        is_decode_only,
+        softmax_offset: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Flash attention kernel for mixed decode and prefill samples.
+
+        Args:
+            q (Tensor): Query tensor.
+            k (Tensor): Key tensor.
+            v (Tensor): Value tensor.
+            max_seqlen_q (int): Query total sequence length.
+            max_seqlen_k (int): Key total sequence length.
+            cu_seqlens_q (Tensor): Cumulative query sequence lengths.
+            cu_seqlens_k (Tensor): Cumulative key sequence lengths.
+            seqlens_k (Tensor): key sequence lengths.
+            block_table (Tensor): KV cache block ids for all samples.
+            is_decode_only (bool): True if batch is decode only.
+            softmax_offset (Optional[Tensor]): Per-head sink (off-by-one or
+                learnable) logit. Shape ``[num_attention_heads_per_partition]``.
+                When provided, the flash-attention output is post-corrected
+                by ``out *= sigmoid(log_sum_exp - softmax_offset)`` so that
+                the attention probabilities match
+                ``exp(qk_i) / (exp(softmax_offset) + sum_j exp(qk_j))`` —
+                the same denominator-with-sink formulation used by the
+                static-inference path (TE / DotProductAttention).
+        Return:
+            (Tensor) Attention output.
+        """
+
+        assert not self.training
+        assert block_table is not None
+
+        # Resolve sliding-window-attention size for this layer.
+        # `config.window_size` is a (left, right) tuple, where -1 means infinite
+        # window in that direction (i.e. full attention). When SWA is not active
+        # for this layer (either globally disabled, or the layer is a "full
+        # attention" layer per `window_attn_skip_freq`), fall back to (-1, -1).
+        if is_layer_window_attention(
+            self.config.window_size, self.config.window_attn_skip_freq, self.layer_number
+        ):
+            window_size = self.config.window_size
+        else:
+            window_size = (-1, -1)
+
+        # Whether we need to retrieve LSE from the flash-attn kernels to apply
+        # the sink (off-by-one / learnable) softmax correction post-hoc.
+        need_lse = softmax_offset is not None
+
+        use_fa4, use_fa3 = self._resolve_flash_version()
+
+        # Flash attn kernel.
+        if not is_decode_only:
+            q = q.squeeze(1)
+            softmax_scale = self.get_softmax_scale(q)
+            softcap = self.config.attn_logit_softcapping
+            softcap_kwargs = {} if softcap is None else {"softcap": softcap}
+            if use_fa4:
+                output_total, softmax_lse = flash_attn4_varlen_func(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    seqused_k=seqlens_k,
+                    page_table=block_table,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                    window_size=window_size,
+                    num_splits=0 if not self.batch_invariant_mode else 1,
+                    **softcap_kwargs,
+                )
+            elif use_fa3:
+                # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
+                # it accepts block_table
+                fa3_ret = self._flash_attention_3_forward_wrapper(
+                    q,
+                    k,
+                    v,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    cu_seqlens_q,
+                    seqlens_k,
+                    block_table,
+                    softmax_scale,
+                    window_size=window_size,
+                    return_lse=need_lse,
+                )
+                if need_lse:
+                    output_total, softmax_lse = fa3_ret
+                else:
+                    output_total = fa3_ret
+                    softmax_lse = None
+            else:
+                assert (
+                    self.batch_invariant_mode is False
+                ), "Batch invariant mode is not supported for flash attention 2"
+                # FA2 treats max_seqlen_q == 1 as one query token per sequence and reshapes q
+                # accordingly under GQA, which requires total_q == num_seqs.
+                assert max_seqlen_q > 1 or q.shape[0] == cu_seqlens_q.shape[0] - 1, (
+                    f"FlashAttention-2 got max_seqlen_q={max_seqlen_q} with {q.shape[0]} query "
+                    f"rows for {cu_seqlens_q.shape[0] - 1} sequences"
+                )
+                fa2_ret = flash_attn_varlen_func(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                    window_size=window_size,
+                    block_table=block_table,
+                    return_attn_probs=need_lse,
+                    **softcap_kwargs,
+                )
+                if need_lse:
+                    # FA2 varlen with return_attn_probs=True returns
+                    # (out, softmax_lse, S_dmask)
+                    output_total, softmax_lse, _ = fa2_ret
+                else:
+                    output_total = fa2_ret
+                    softmax_lse = None
+            if need_lse:
+                # output_total: (total_q, H, D); softmax_lse: (H, total_q)
+                output_total = self._apply_sink_softmax_correction_varlen(
+                    output_total, softmax_lse, softmax_offset
+                )
+            output_total = output_total.unsqueeze(1)
+        else:  # decode only
+            # For speculative decoding, q arrives as (B*S, 1, H, D) where S is
+            # the number of tokens per request. Reshape to (B, S, H, D) so the
+            # decode kernel sees batch=num_requests and seqlen_q=tokens_per_request.
+            num_requests = seqlens_k.shape[0]
+            if self.batch_invariant_mode:
+                # Batch-invariant CUDA-graph buckets can append token-only padding so
+                # model-wide M dimensions stay aligned. Those rows do not represent
+                # requests and must not be passed to attention.
+                input_token_count = q.shape[0]
+                tokens_per_request = int(max_seqlen_q)
+                metadata_token_count = num_requests * tokens_per_request
+                assert metadata_token_count <= input_token_count, (
+                    "Batch-invariant decode metadata describes more query tokens "
+                    f"({metadata_token_count}) than q contains ({input_token_count})."
+                )
+                q = q[:metadata_token_count]
+            else:
+                tokens_per_request = q.shape[0] // num_requests
+            q = q.reshape(num_requests, tokens_per_request, q.shape[2], q.shape[3])
+
+            # If using MLA we use the FlashMLA kernel
+            # The `softmax_scale` attribute check is to find out whether this is an MLA layer or
+            # standard Attention.
+            if isinstance(self.config, MLATransformerConfig) and hasattr(self, "softmax_scale"):
+                # FlashMLA does not currently support sliding window attention.
+                assert window_size == (-1, -1), (
+                    "FlashMLA decode kernel does not support sliding window attention. "
+                    "Set config.window_size = None or use a non-MLA attention layer."
+                )
+                assert self.config.attn_logit_softcapping is None, (
+                    "FlashMLA decode kernel does not support attention logit softcapping. "
+                    "Set config.attn_logit_softcapping = None or use a non-MLA attention layer."
+                )
+                softmax_scale = self.softmax_scale
+                assert softmax_scale is not None
+
+                num_heads_k = 1  # Only a single head for MLA Flash
+                seq_len_q = tokens_per_request
+                num_heads_q = self.num_attention_heads_per_partition
+                num_heads_per_head_k = seq_len_q * num_heads_q // num_heads_k
+
+                cache_seqlens = seqlens_k
+                tile_scheduler_metadata, num_splits = get_mla_metadata(
+                    cache_seqlens,  # cumulative key-lengths
+                    num_heads_per_head_k,  # decode-only lengths
+                    num_heads_k,  # per-head dim of V
+                )
+                head_dim_v = self.config.kv_lora_rank
+                kv_cache = k.unsqueeze(-2)
+                output_total, softmax_lse = flash_mla_with_kvcache(
+                    q,
+                    kv_cache,
+                    block_table,
+                    cache_seqlens,
+                    head_dim_v,
+                    tile_scheduler_metadata,
+                    num_splits,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                )
+                if need_lse:
+                    # output_total: (B, S, H, D_v); softmax_lse: (B, H, S)
+                    output_total = self._apply_sink_softmax_correction_bshd(
+                        output_total, softmax_lse, softmax_offset
+                    )
+            else:
+                if use_fa4:
+                    softmax_scale = self.get_softmax_scale(q)
+                    # Reshape q from (B, S, H, D) to (B*S, H, D) for varlen interface
+                    q_varlen = q.reshape(-1, q.shape[-2], q.shape[-1])
+                    decode_softcap = self.config.attn_logit_softcapping
+                    softcap_kwargs = {} if decode_softcap is None else {"softcap": decode_softcap}
+                    output_total, softmax_lse = flash_attn4_varlen_func(
+                        q_varlen,
+                        k,
+                        v,
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_q=tokens_per_request,
+                        max_seqlen_k=max_seqlen_k,
+                        seqused_k=seqlens_k,
+                        page_table=block_table,
+                        softmax_scale=softmax_scale,
+                        causal=True,
+                        window_size=window_size,
+                        num_splits=0 if not self.batch_invariant_mode else 1,
+                        **softcap_kwargs,
+                    )
+                    if need_lse:
+                        # output_total: (B*S, H, D); softmax_lse: (H, B*S)
+                        output_total = self._apply_sink_softmax_correction_varlen(
+                            output_total, softmax_lse, softmax_offset
+                        )
+                    # Reshape back to (B, S, H, D)
+                    output_total = output_total.reshape(
+                        num_requests, tokens_per_request, *output_total.shape[1:]
+                    )
+                else:
+                    softmax_scale = self.get_softmax_scale(q)
+                    flash_attn_args = {
+                        "q": q,
+                        "k_cache": k,
+                        "v_cache": v,
+                        "cache_seqlens": seqlens_k,
+                        "softmax_scale": softmax_scale,
+                        "causal": True,
+                        "window_size": window_size,
+                        "page_table" if use_fa3 else "block_table": block_table,
+                        "num_splits": 0 if not self.batch_invariant_mode else 1,
+                    }
+                    decode_softcap = self.config.attn_logit_softcapping
+                    if decode_softcap is not None:
+                        flash_attn_args["softcap"] = decode_softcap
+                    if need_lse:
+                        flash_attn_args["return_softmax_lse"] = True
+                    if use_fa3:
+                        kvcache_ret = flash_attn3_with_kvcache(**flash_attn_args)
+                    else:
+                        assert (
+                            not self.batch_invariant_mode
+                        ), "Batch invariant mode is not supported for flash attention 2"
+                        kvcache_ret = flash_attn_with_kvcache(**flash_attn_args)
+                    if need_lse:
+                        # FA2/FA3 *_with_kvcache return (out, softmax_lse) when
+                        # return_softmax_lse=True.
+                        output_total, softmax_lse = kvcache_ret
+                        # output_total: (B, S, H, D); softmax_lse: (B, H, S)
+                        output_total = self._apply_sink_softmax_correction_bshd(
+                            output_total, softmax_lse, softmax_offset
+                        )
+                    else:
+                        output_total = kvcache_ret
+
+            # Reshape back to (B*S, 1, H, D) for consistent output shape.
+            output_total = output_total.reshape(
+                num_requests * tokens_per_request, 1, *output_total.shape[2:]
+            )
+            if self.batch_invariant_mode:
+                padding_token_count = input_token_count - output_total.shape[0]
+                assert padding_token_count >= 0, (
+                    "Batch-invariant attention produced more query rows "
+                    f"({output_total.shape[0]}) than q contained ({input_token_count})."
+                )
+                if padding_token_count > 0:
+                    output_total = torch.cat(
+                        (
+                            output_total,
+                            output_total.new_zeros(padding_token_count, 1, *output_total.shape[2:]),
+                        ),
+                        dim=0,
+                    )
+
+        return output_total
+
+    def _dynamic_core_attention_forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Tensor,
+        inference_context: BaseInferenceContext,
+        block_table: Tensor,
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        **kwargs,
+    ) -> Tensor:
+        """Hook for attention variants that need a custom dynamic-batching path."""
+        raise NotImplementedError(
+            "Dynamic batching is not supported for attention variants that require extra "
+            "core-attention kwargs."
+        )
+
+    def supports_two_stage_attention(self) -> bool:
+        """Specialized attention subclasses retain their atomic forward path."""
+        return type(self).forward is Attention.forward
+
+    def forward_pre_attn_and_core_attn(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        key_value_states: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[int] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        packed_sequence_cp_metadata=None,
+    ) -> Tensor:
+        """
+        Run the QKV input projection and core attention, stopping before linear_proj.
+
+        Args:
+            hidden_states (Tensor): Hidden states.
+            attention_mask (Tensor): Attention mask.
+            key_value_states (Optional[Tensor]): Key/value states (for cross attention).
+            inference_context (Optional[BaseInferenceContext]): Inference context that manages
+                KV cache.
+            rotary_pos_emb (Optional[Union[Tensor, Tuple[Tensor, Tensor]]]): Rotary
+                embedding tensor(s).
+            rotary_pos_cos (Optional[Tensor]): Rotary embedding cosine.
+            rotary_pos_sin (Optional[Tensor]): Rotary embedding sine.
+            rotary_pos_cos_sin (Optional[Tensor]): Combined rotary embedding cosine and sine.
+            Currently used exclusively for inference with dynamic batching and flashinfer RoPE.
+            attention_bias (Optional[Tensor]): Attention bias.
+            packed_seq_params (Optional[PackedSeqparams]): Parameters used for THD format.
+            sequence_len_offset (Optional[int]): Sequence length offset used for
+                inference CUDA graphs.
+
+        Return:
+            Tensor consumed by the attention output projection.
+
+        """
+        assert (
+            packed_sequence_cp_metadata is None
+        ), "Attention does not support packed-sequence chunkwise CP metadata."
+        runtime_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+
+        # Check if we need to skip RoPE
+        # no_rope is 0-indexed array and self.layer_number is 1-indexed
+        no_rope = (
+            self.config.no_rope_freq[self.layer_number - 1] if self.config.no_rope_freq else False
+        )
+        if no_rope:
+            rotary_pos_emb = None
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        if inference_context and inference_context.is_dynamic_batching():
+            assert (
+                HAVE_FA4 or HAVE_FA3 or is_fa_min_version("2.7.3")
+            ), "flash attn verion v2.7.3 and above is required for dynamic batching."
+
+        # hidden_states: [sq, b, h]
+        is_inference_mode = InferenceMode.is_active()
+        # is_using_flash_decode - True is we are using the static inference engine with flash decode
+        is_using_flash_decode = is_inference_mode and self.config.flash_decode
+        # is_using_flashinfer_rope - True if we are using the dynamic inference engine
+        # with flashinfer fused rope
+        is_using_flashinfer_rope = (
+            is_inference_mode
+            and inference_context is not None
+            and not inference_context.is_static_batching()
+            and inference_context.use_flashinfer_fused_rope
+        )
+        if is_using_flash_decode or is_using_flashinfer_rope:
+            # flash decode and flash-infer fused rope use rotary_pos_cos and rotary_pos_sin
+            rotary_pos_emb = None
+        else:
+            assert rotary_pos_cos is None and rotary_pos_sin is None
+
+        # For self attention we just duplicate the rotary_pos_emb if it isn't already
+        if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
+            rotary_pos_emb = (rotary_pos_emb,) * 2
+
+        # =====================
+        # Query, Key, and Value
+        # =====================
+        # Get the query, key and value tensors based on the type of attention -
+        # self or cross attn.
+        nvtx_range_push(suffix="qkv")
+        split_qkv = (self.attention_type == "cross") or not all(
+            [
+                not self.config.test_mode,
+                self.config.fused_single_qkv_rope,
+                inference_context is None,
+                packed_seq_params is None,
+                (
+                    rotary_pos_emb is not None
+                    and rotary_pos_emb[0] is not None
+                    and rotary_pos_emb[1] is not None
+                ),
+                not self.config.flash_decode,
+                HAVE_FUSED_QKV_ROPE,
+                self.q_layernorm is None or isinstance(self.q_layernorm, IdentityOp),
+                self.k_layernorm is None or isinstance(self.k_layernorm, IdentityOp),
+            ]
+        )
+        # Check if fused_single_qkv_rope is requested but either unavailable or not
+        # supported for the current use case.
+        if self.attention_type != "cross":
+            assert not (
+                self.config.fused_single_qkv_rope and split_qkv
+            ), "fused_single_qkv_rope requested but not available/supported for the config."
+
+        qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
+        with qkv_linear_manager as hidden_states:
+            qkv_output = self.get_query_key_value_tensors(
+                hidden_states,
+                key_value_states,
+                split_qkv=split_qkv,
+                output_gate=self.config.attention_output_gate,
+            )
+        # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
+        qkv_output = qkv_linear_manager.group_offload(qkv_output, forced_released_tensors=[])
+        attn_mask_type = self.attn_mask_type
+        block_table = None
+        gate = None
+        if split_qkv:
+            if self.config.attention_output_gate:
+                query, key, value, gate = qkv_output
+            else:
+                query, key, value = qkv_output
+            mixed_qkv = qkv_split_arg_list = None
+        else:
+            assert (
+                not self.config.attention_output_gate
+            ), "attention_output_gate is not supported for unsplit mixed_qkv tensor."
+            mixed_qkv, qkv_split_arg_list = qkv_output
+        nvtx_range_pop(suffix="qkv")
+
+        # ===================================================
+        # Adjust key, value, and rotary_pos_emb for inference
+        # ===================================================
+
+        in_decode_mode = (
+            inference_context is not None
+            and inference_context.is_decode_only()
+            and InferenceMode.is_active()
+        )
+
+        # This branch only runs in the decode phase of flash decoding and returns after the linear
+        # projection. This conditional is not used in the prefill phase or non-flash-decoding cases.
+        nvtx_range_push(suffix="adjust_key_value")
+        if in_decode_mode and self.config.flash_decode:
+            assert self.layer_number in inference_context.key_value_memory_dict
+            assert inference_context.sequence_len_offset is not None
+            inference_key_memory, inference_value_memory = inference_context.key_value_memory_dict[
+                self.layer_number
+            ]
+            output = self.flash_decode(
+                sequence_len_offset=sequence_len_offset,
+                query_layer=query,
+                key_layer=key,
+                value_layer=value,
+                inference_key_memory=inference_key_memory,
+                inference_value_memory=inference_value_memory,
+                rotary_cos=rotary_pos_cos,
+                rotary_sin=rotary_pos_sin,
+                rotary_interleaved=self.config.rotary_interleaved,
+            )
+            out = output.transpose(0, 1).contiguous()
+            context_layer = out.view(out.size(0), out.size(1), -1)
+            return context_layer
+
+        if (
+            in_decode_mode
+            and self.config.cuda_graph_impl == "local"
+            and inference_context.is_static_batching()
+        ):
+            raise ValueError(f"CUDA graphs must use flash decode with static batching!")
+
+        if split_qkv:
+            query, key, value, rotary_pos_emb, attn_mask_type, block_table = (
+                self._adjust_key_value_for_inference(
+                    inference_context,
+                    query,
+                    key,
+                    value,
+                    rotary_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    rotary_pos_cos_sin,
+                    sequence_len_offset,
+                    cp_group=runtime_cp_group,
+                )
+            )
+
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            query = query.squeeze(1)
+            key = key.squeeze(1)
+            value = value.squeeze(1)
+        nvtx_range_pop(suffix="adjust_key_value")
+
+        # ================================================
+        # relative positional embedding (rotary embedding)
+        # ================================================
+        nvtx_range_push(suffix="rotary_pos_emb")
+        if rotary_pos_emb is not None and (
+            not self.config.flash_decode or inference_context is None
+        ):
+            q_pos_emb, k_pos_emb = rotary_pos_emb
+
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                if packed_seq_params.cu_seqlens_q_padded is not None:
+                    cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
+                else:
+                    cu_seqlens_q = packed_seq_params.cu_seqlens_q
+                if packed_seq_params.cu_seqlens_kv_padded is not None:
+                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
+                else:
+                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+                rope_max_seqlen_q = packed_seq_params.max_seqlen_q
+                rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
+                rope_freqs_max_seqlen = (
+                    max(rope_max_seqlen_q, rope_max_seqlen_kv)
+                    if rope_max_seqlen_q is not None and rope_max_seqlen_kv is not None
+                    else None
+                )
+            else:
+                cu_seqlens_q = cu_seqlens_kv = None
+                rope_freqs_max_seqlen = None
+
+            if split_qkv:
+                if q_pos_emb is not None:
+                    # TODO VIJAY: simplify
+                    if inference_context is None or inference_context.is_static_batching():
+                        query = apply_rotary_pos_emb(
+                            query,
+                            q_pos_emb,
+                            config=self.config,
+                            cu_seqlens=cu_seqlens_q,
+                            mscale=self._yarn_concentration_factor,
+                            cp_group=runtime_cp_group,
+                            max_seqlen=rope_freqs_max_seqlen,
+                        )
+                    else:
+                        query = inference_context.apply_rotary_emb_query(
+                            query,
+                            q_pos_emb,
+                            self.config,
+                            cu_seqlens_q,
+                            runtime_cp_group,
+                            mscale=self._yarn_concentration_factor,
+                        )
+                if k_pos_emb is not None:
+                    key = apply_rotary_pos_emb(
+                        key,
+                        k_pos_emb,
+                        config=self.config,
+                        cu_seqlens=cu_seqlens_kv,
+                        mscale=self._yarn_concentration_factor,
+                        cp_group=runtime_cp_group,
+                        max_seqlen=rope_freqs_max_seqlen,
+                    )
+            else:
+                query, key, value = apply_fused_qkv_rotary_pos_emb(
+                    mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
+                )
+
+            # TODO, can apply positional embedding to value_layer so it has
+            # absolute positional embedding.
+            # otherwise, only relative positional embedding takes effect
+            # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
+        nvtx_range_pop(suffix="rotary_pos_emb")
+
+        # ==================================
+        # core attention computation
+        # ==================================
+
+        nvtx_range_push(suffix="core_attention")
+        core_attention_extra_kwargs = self._get_core_attention_extra_kwargs(
+            hidden_states=hidden_states,
+            query=query,
+            key=key,
+            value=value,
+            attention_mask=attention_mask,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            rotary_pos_cos_sin=rotary_pos_cos_sin,
+            attn_mask_type=attn_mask_type,
+            packed_seq_params=packed_seq_params,
+        )
+        core_attn_manager = off_interface(
+            self.offload_core_attention and self.training, query, "core_attn"
+        )
+        if self.checkpoint_core_attention and self.training:
+            # Upstream _checkpointed_attention_forward now threads tensor-valued
+            # core-attention kwargs (e.g. DSA's x/qr) through the checkpoint, so the
+            # variant no longer has to opt out of checkpointing.
+            core_attn_out = self._checkpointed_attention_forward(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                core_attention_extra_kwargs=core_attention_extra_kwargs,
+            )
+        else:
+            if inference_context is None or inference_context.is_static_batching():
+                # Static batching attention kernel.
+                with core_attn_manager as query:
+                    core_attn_out = apply_module(self.core_attention)(
+                        query,
+                        key,
+                        value,
+                        attention_mask,
+                        attn_mask_type=attn_mask_type,
+                        attention_bias=attention_bias,
+                        packed_seq_params=packed_seq_params,
+                        **core_attention_extra_kwargs,
+                    )
+
+            else:
+                if core_attention_extra_kwargs:
+                    core_attn_out = self._dynamic_core_attention_forward(
+                        query,
+                        key,
+                        value,
+                        attention_mask,
+                        inference_context,
+                        block_table,
+                        attn_mask_type,
+                        attention_bias,
+                        packed_seq_params,
+                        **core_attention_extra_kwargs,
+                    )
+                else:
+                    # Dynamic batching attention kernel.
+                    q, k, v = (query, key, value)
+                    cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
+                    cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
+
+                    core_attn_out = self.flash_decode_and_prefill(
+                        q,
+                        k,
+                        v,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        cu_query_lengths,
+                        cu_kv_lengths,
+                        kv_lengths,
+                        block_table,
+                        inference_context.is_decode_only(),
+                        softmax_offset=self._get_inference_softmax_offset(),
+                    )
+                    core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+
+                    # Clear the outputs for padding tokens when using quantization scales
+                    # to avoid corrupting amax calculations
+                    if is_using_quantization_scales(self.config):
+                        inference_context.zero_padding_tokens(core_attn_out)
+
+            core_attn_out = core_attn_manager.group_offload(
+                core_attn_out, forced_released_tensors=[query, key, value]
+            )
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            # reshape to same output shape as unpacked case
+            # (t, np, hn) -> (t, b=1, h=np*hn)
+            # t is the pack size = sum (sq_i)
+            # note that batch is a dummy dimension in the packed case
+            core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+        nvtx_range_pop(suffix="core_attention")
+
+        # Output gate
+        if gate is not None:
+            nvtx_range_push(suffix="output_gate")
+            core_attn_out = self._apply_output_gate(core_attn_out, gate)
+            nvtx_range_pop(suffix="output_gate")
+
+        return core_attn_out
+
+    def forward_post_core_attn(self, core_attn_out: Tensor) -> tuple[Tensor, Tensor | None]:
+        """Apply the attention output projection to a core-attention result."""
+        nvtx_range_push(suffix="linear_proj")
+        attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
+        with attn_proj_manager as core_attn_out:
+            output, bias = apply_module(self.linear_proj)(core_attn_out)
+        output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
+        nvtx_range_pop(suffix="linear_proj")
+
+        return output, bias
+
+    @copy_signature(forward_pre_attn_and_core_attn)
+    def forward(self, *args, **kwargs):
+        """Run core attention followed by the output projection."""
+        return self.forward_post_core_attn(self.forward_pre_attn_and_core_attn(*args, **kwargs))
+
+    @jit_fuser
+    def _apply_output_gate(self, x, gate):
+        x_dtype = x.dtype
+        gate = gate.contiguous()
+        gate = gate.view(*x.shape)
+        x = x * torch.sigmoid(gate.float())
+        x = x.to(x_dtype)
+        return x
+
+    def set_for_recompute_input_layernorm(self):
+        """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
+        raise NotImplementedError("set_for_recompute_input_layernorm is not implemented.")
+
+    def clip_qk(self):
+        """
+        QK Clipping is a technique to clip the query and key attention logits to prevent the
+        attention logits from exploding.
+        """
+        raise NotImplementedError("clip_qk is not implemented.")
+
+
+class SelfAttention(Attention):
+    """Self-attention layer class
+
+    Self-attention layer takes input with size [s, b, h]
+    and returns output of the same size.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: SelfAttentionSubmodules,
+        layer_number: int,
+        attn_mask_type: AttnMaskType = AttnMaskType.padding,
+        cp_comm_type: str | None = None,
+        pg_collection: ProcessGroupCollection | None = None,
+        pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
+        name: str | None = None,
+    ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
+        super().__init__(
+            config=config,
+            submodules=submodules,
+            layer_number=layer_number,
+            attn_mask_type=attn_mask_type,
+            attention_type="self",
+            cp_comm_type=cp_comm_type,
+            pg_collection=pg_collection,
+            pp_layer_offset=pp_layer_offset,
+            is_mtp_layer=is_mtp_layer,
+            name=name,
+        )
+
+        self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
+        if self.config.attention_output_gate:
+            self.linear_qkv_out_dim += self.config.kv_channels * self.config.num_attention_heads
+        self.linear_qkv = submodules.linear_qkv(
+            self.config.hidden_size,
+            self.linear_qkv_out_dim,
+            config=self.config,
+            init_method=not_none(self.config.init_method),
+            gather_output=False,
+            bias=self.config.add_bias_linear or self.config.add_qkv_bias,
+            skip_bias_add=False,
+            is_expert=False,
+            tp_comm_buffer_name='qkv',
+            tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
+            name=(name + ".linear_qkv") if name is not None else None,
+        )
+
+        # Resolve which norm class to use for Q and K.
+        # Config selects the default norm class; spec overrides if set.
+        if self.config.qk_l2_norm:
+            q_norm_cls = submodules.q_layernorm or L2Norm
+            k_norm_cls = submodules.k_layernorm or L2Norm
+        elif self.config.qk_layernorm:
+            # TODO(yuzhongw, janpabloe): Support local backend.
+            q_norm_cls = submodules.q_layernorm or TENorm
+            k_norm_cls = submodules.k_layernorm or TENorm
+            if q_norm_cls is None or k_norm_cls is None:
+                raise ValueError(
+                    "qk_layernorm requires Transformer Engine (for TENorm) or "
+                    "q_layernorm/k_layernorm set in the spec."
+                )
+        else:
+            if submodules.q_layernorm not in (None, IdentityOp):
+                raise ValueError(
+                    f"spec sets q_layernorm={submodules.q_layernorm} but "
+                    "qk_layernorm/qk_l2_norm are disabled"
+                )
+            if submodules.k_layernorm not in (None, IdentityOp):
+                raise ValueError(
+                    f"spec sets k_layernorm={submodules.k_layernorm} but "
+                    "qk_layernorm/qk_l2_norm are disabled"
+                )
+            q_norm_cls = k_norm_cls = None
+
+        self.q_layernorm = (
+            q_norm_cls(
+                hidden_size=self.hidden_size_per_attention_head,
+                config=self.config,
+                eps=self.config.layernorm_epsilon,
+            )
+            if q_norm_cls is not None
+            else None
+        )
+        self.k_layernorm = (
+            k_norm_cls(
+                hidden_size=self.hidden_size_per_attention_head,
+                config=self.config,
+                eps=self.config.layernorm_epsilon,
+            )
+            if k_norm_cls is not None
+            else None
+        )
+
+    def run_realtime_tests(self):
+        """Performs a consistency check.
+
+        This function makes sure that tensors across devices are the same during an experiment.
+        This is often not guaranteed to be so because of silent hardware failures (eg, memory
+        corruption loading a checkpoint, network traffic corruption encountered during
+        data transmission).
+
+        (TODO) In the future, more tensors should be checked across the training run and
+        checked every X iterations. This is left for future work. Equality of tensors is probably
+        not required; transmitting hashes is sufficient."""
+
+        if not self.config.qk_layernorm:
+            return
+
+        # check that all tensor parallel and data parallel ranks have the same
+        # Q & K layernorm parameters.
+        rank = get_data_parallel_rank()
+        inputs = torch.stack(
+            [
+                self.q_layernorm.weight.data,
+                self.q_layernorm.bias.data,
+                self.k_layernorm.weight.data,
+                self.k_layernorm.bias.data,
+            ]
+        )
+        dp_list = [torch.empty_like(inputs) for _ in range(get_data_parallel_world_size())]
+        dp_list[rank] = inputs
+        torch.distributed.all_gather(dp_list, inputs, group=get_data_parallel_group())
+
+        def _compare(srcs, tgts, names, parallelism):
+            assert len(srcs) == len(tgts) == len(names)
+            for src, tgt, name in zip(srcs, tgts, names):
+                assert torch.all(src == tgt), (
+                    f"Discrepancy between {name} in {parallelism} ranks {i} and {rank}. "
+                    f"Diff: {torch.norm(src - tgt)}"
+                )
+
+        for i, dp in enumerate(dp_list):
+            q_w, q_b, k_w, k_b = torch.unbind(dp)
+            _compare(
+                [q_w, q_b, k_w, k_b],
+                [
+                    self.q_layernorm.weight.data,
+                    self.q_layernorm.bias.data,
+                    self.k_layernorm.weight.data,
+                    self.k_layernorm.bias.data,
+                ],
+                ["q_w", "q_b", "k_w", "k_b"],
+                "DP",
+            )
+
+        rank = get_tensor_model_parallel_rank()
+        tp_list = [torch.empty_like(inputs) for _ in range(get_tensor_model_parallel_world_size())]
+        tp_list[rank] = inputs
+        torch.distributed.all_gather(tp_list, inputs, group=get_tensor_model_parallel_group())
+
+        for i, tp in enumerate(tp_list):
+            q_w, q_b, k_w, k_b = torch.unbind(tp)
+            _compare(
+                [q_w, q_b, k_w, k_b],
+                [
+                    self.q_layernorm.weight.data,
+                    self.q_layernorm.bias.data,
+                    self.k_layernorm.weight.data,
+                    self.k_layernorm.bias.data,
+                ],
+                ["q_w", "q_b", "k_w", "k_b"],
+                "TP",
+            )
+
+    def get_query_key_value_tensors(
+        self,
+        hidden_states: Tensor,
+        key_value_states: Tensor | None = None,
+        output_gate: bool = False,
+        split_qkv: bool = True,
+    ) -> (
+        tuple[Tensor, Tensor, Tensor, Tensor]
+        | tuple[Tensor, Tensor, Tensor]
+        | tuple[Tensor, list[int]]
+    ):
+        """
+        Derives `query`, `key` and `value` tensors from `hidden_states`.
+        If `output_gate` is True, then also derives `gate` tensor.
+        If `split_qkv=False`, then the unsplit mixed_qkv tensor is returned.
+        """
+        # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
+        # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
+        mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
+        num_query_heads_per_group = (
+            self.num_attention_heads_per_partition // self.num_query_groups_per_partition
+        )
+        num_qkv_heads_per_group = num_query_heads_per_group + 2
+        if output_gate:
+            num_qkv_heads_per_group += num_query_heads_per_group
+
+        assert self.config.num_query_groups is not None
+        if self.config.num_query_groups < self.world_size:
+            # Note that weights are interleaved in the following manner:
+            # q1 q2 k1 v1 | q3 q4 k2 v2 | q5 q6 k3 v3 | ...
+            # When tp_size > num_kv_heads, we split "q1 q2 k1 v1" over multiple
+            # ranks, so a rank does not have a clean partitioning of just the q_heads
+            # it needs. Instead, we perform the following steps:
+            # 1. Assemble the full "q1 q2 k1 v1 | q3 q4 k2 v2 | q5 q6 k3 v3 | ..."
+            #    through an AG.
+            # 2. Pull out the right slice (e.g., "q1 q2 k1 v1" or "q3 q4 k2 v2").
+            # 3. Split q_heads (e.g., q1, q2), k_heads (e.g., k1), v_heads (e.g., v1).
+            # 4. Further index into query to get only the q_heads that this rank is
+            #    responsible for (e.g., q1).
+            # The block of code below performs steps 1 and 2.
+            mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(
+                mixed_qkv, group=self.pg_collection.tp
+            )
+            idx = get_pg_rank(self.pg_collection.tp) // (
+                self.world_size // self.config.num_query_groups
+            )
+            size = mixed_qkv.size()[-1] // self.config.num_query_groups
+            mixed_qkv = mixed_qkv[:, :, idx * size : (idx + 1) * size]
+
+        # If no output gate: [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
+        # If have output gate: [sq, b, hp] --> [sq, b, ng, (2 * np/ng + 2) * hn]
+        new_tensor_shape = mixed_qkv.size()[:-1] + (
+            self.num_query_groups_per_partition,
+            num_qkv_heads_per_group * self.hidden_size_per_attention_head,
+        )
+        mixed_qkv = mixed_qkv.view(*new_tensor_shape)
+
+        # Split the tensor into query, gate, key, and value.
+        if output_gate:
+            if not split_qkv:
+                raise ValueError("split_qkv not supported for gated attention yet.")
+            # If have output gate: [sq, b, ng, (2 * np/ng + 2) * hn]
+            # --> [sq, b, ng, np/ng * hn], [sq, b, ng, np/ng * hn],
+            # [sq, b, ng, hn], [sq, b, ng, hn]
+            split_arg_list = [
+                num_query_heads_per_group * self.hidden_size_per_attention_head,
+                num_query_heads_per_group * self.hidden_size_per_attention_head,
+                self.hidden_size_per_attention_head,
+                self.hidden_size_per_attention_head,
+            ]
+
+            if SplitAlongDim is not None:
+                query, gate, key, value = SplitAlongDim(mixed_qkv, 3, split_arg_list)
+            else:
+                query, gate, key, value = torch.split(mixed_qkv, split_arg_list, dim=3)
+        else:
+            # If no output gate: [sq, b, ng, (np/ng + 2) * hn]
+            # --> [sq, b, ng, np/ng * hn], None, [sq, b, ng, hn], [sq, b, ng, hn]
+            split_arg_list = [
+                num_query_heads_per_group * self.hidden_size_per_attention_head,
+                self.hidden_size_per_attention_head,
+                self.hidden_size_per_attention_head,
+            ]
+
+            # Return unsplit mixed_qkv and split_arg_list
+            if not split_qkv:
+                return mixed_qkv, split_arg_list
+
+            if SplitAlongDim is not None:
+                query, key, value = SplitAlongDim(mixed_qkv, 3, split_arg_list)
+            else:
+                query, key, value = torch.split(mixed_qkv, split_arg_list, dim=3)
+
+        # Query [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
+        query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
+
+        if self.config.num_query_groups < self.world_size:
+            # query above corresponds to (num_q_heads / num_kv_heads) q_heads.
+            # Index appropriately into query to get (num_q_heads / tp_size) q_heads.
+            # This is step 4 in the list of steps above.
+            idx = get_pg_rank(self.pg_collection.tp) % (
+                self.world_size // self.config.num_query_groups
+            )
+            size = self.num_attention_heads_per_partition // (
+                self.world_size // self.config.num_query_groups
+            )
+            query = query[:, :, idx * size : (idx + 1) * size, :]
+
+        if self.q_layernorm is not None:
+            query = apply_module(self.q_layernorm)(query)
+
+        if self.k_layernorm is not None:
+            key = apply_module(self.k_layernorm)(key)
+
+        if self.config.test_mode:
+            self.run_realtime_tests()
+
+        if output_gate:
+            # Gate [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
+            gate = gate.reshape(*gate.shape[:2], -1, self.hidden_size_per_attention_head)
+            if self.config.num_query_groups < self.world_size:
+                idx = get_tensor_model_parallel_rank() % (
+                    self.world_size // self.config.num_query_groups
+                )
+                size = self.num_attention_heads_per_partition // (
+                    self.world_size // self.config.num_query_groups
+                )
+                gate = gate[:, :, idx * size : (idx + 1) * size, :]
+            return query, key, value, gate
+
+        return query, key, value
+
+    def backward_dw(self) -> None:
+        """Execute weight update operations"""
+        self._backward_qkv_proj()
+        self._backward_output_proj()
+
+    def _backward_qkv_proj(self):
+        """Update weights for QKV projection layer"""
+        self.linear_qkv.backward_dw()
+
+    def _backward_output_proj(self):
+        """Update weights for output projection layer"""
+        self.linear_proj.backward_dw()
+
+    def set_for_recompute_input_layernorm(self):
+        """Set the attention layer for recompute input_layernorm. Only needed for fp8/fp4."""
+        from megatron.core.extensions.transformer_engine import set_save_original_input
+
+        set_save_original_input(self.linear_qkv)
+
+    def clip_qk(self):
+        """
+        QK Clipping is a technique to clip the query and key attention logits to prevent the
+        attention logits from exploding. This function is experimental on GQA.
+        """
+        if not self.config.qk_clip:
+            raise ValueError("qk_clip option needs to be enabled")
+
+        if self.core_attention.current_max_attn_logits is None:
+            raise ValueError("current_max_attn_logits is None")
+
+        assert self.core_attention.current_max_attn_logits.shape == (
+            self.num_attention_heads_per_partition,
+        ), f"current_max_attn_logits shape is not ({self.num_attention_heads_per_partition}, ) \
+                    but {self.core_attention.current_max_attn_logits.shape}"
+
+        grouped_max_attn_logits = torch.max(
+            self.core_attention.current_max_attn_logits.view(
+                self.num_query_groups_per_partition, -1
+            ),
+            dim=1,
+        ).values
+
+        # only update the weight if any head has
+        # current_max_attn_logits > qk_clip_threshold
+        if torch.any(grouped_max_attn_logits > self.config.qk_clip_threshold):
+            # Use num_query_groups_per_partition for tensor parallel scenarios
+
+            # qk_clip_balancing_eta (g, 1, 1)
+            assert grouped_max_attn_logits.shape == (
+                self.num_query_groups_per_partition,
+            ), f"current_max_attn_logits shape is not ({self.num_query_groups_per_partition},) \
+                but {grouped_max_attn_logits.shape}"
+            self.qk_clip_balancing_eta = torch.clamp(
+                self.config.qk_clip_threshold / grouped_max_attn_logits, max=1.0
+            ).view(self.num_query_groups_per_partition, 1, 1)
+            assert torch.all(self.qk_clip_balancing_eta <= 1.0)
+
+            # Handle different weight access patterns (main_param vs direct access)
+            if hasattr(self.linear_qkv.weight, 'main_param'):
+                self.linear_qkv.weight.main_param.data.copy_(
+                    self._clip_linear_qkv(self.linear_qkv.weight.main_param.data)
+                )
+
+            self.linear_qkv.weight.data.copy_(self._clip_linear_qkv(self.linear_qkv.weight.data))
+
+        # reset current_max_attn_logits
+        self.core_attention.current_max_attn_logits = None
+
+    def _clip_linear_qkv(self, weight):
+        """Apply qkclip to linear_qkv layer"""
+        # Reshape to (g, query_projection_size + 2 * kv_projection_size, -1)
+        weight_reshaped = weight.view(
+            self.num_query_groups_per_partition,
+            (self.query_projection_size + 2 * self.kv_projection_size)
+            // self.num_query_groups_per_partition,
+            -1,
+        )
+
+        # Split into query_projection_size and 2 * kv_projection_size parts:
+        # (n, a, -1) and (n, b, -1)
+        weight_q = weight_reshaped[
+            :, : self.query_projection_size // self.num_query_groups_per_partition, :
+        ]
+        weight_k = weight_reshaped[
+            :,
+            self.query_projection_size
+            // self.num_query_groups_per_partition : (
+                self.query_projection_size + self.kv_projection_size
+            )
+            // self.num_query_groups_per_partition,
+            :,
+        ]
+        weight_v = weight_reshaped[
+            :,
+            (self.query_projection_size + self.kv_projection_size)
+            // self.num_query_groups_per_partition :,
+            :,
+        ]
+
+        # extend the qk_clip_balancing_eta to the same shape as weight_q and weight_k
+        self.qk_clip_balancing_eta_extended = self.qk_clip_balancing_eta.repeat(
+            1, weight_q.size(1), 1
+        )
+
+        # Clipping
+        weight_q.mul_(torch.pow(self.qk_clip_balancing_eta_extended, self.config.qk_clip_alpha))
+        weight_k.mul_(torch.pow(self.qk_clip_balancing_eta, 1 - self.config.qk_clip_alpha))
+
+        # Concatenate back and reshape to original shape
+        weight_updated = torch.cat([weight_q, weight_k, weight_v], dim=1)
+        weight_updated = weight_updated.view(
+            self.query_projection_size + 2 * self.kv_projection_size, -1
+        )
+
+        return weight_updated
+
+
+class CrossAttention(Attention):
+    """Cross-attention layer class
+
+    Cross-attention layer takes input with size [s, b, h] and context with size
+    [s, b, h] and returns output of the same size.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: CrossAttentionSubmodules,
+        layer_number: int,
+        attn_mask_type: AttnMaskType = AttnMaskType.padding,
+        cp_comm_type: str | None = None,
+        pg_collection: ProcessGroupCollection | None = None,
+        is_mtp_layer: bool = False,
+        name: str | None = None,
+    ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
+        super().__init__(
+            config=config,
+            submodules=submodules,
+            layer_number=layer_number,
+            attn_mask_type=attn_mask_type,
+            attention_type="cross",
+            cp_comm_type=cp_comm_type,
+            pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
+            name=name,
+        )
+
+        if self.config.num_query_groups != self.config.num_attention_heads:
+            raise ValueError("Group query attention is not currently supported in cross attention.")
+        assert self.query_projection_size == self.kv_projection_size
+
+        self.linear_q = submodules.linear_q(
+            self.config.hidden_size,
+            self.query_projection_size,
+            config=self.config,
+            init_method=not_none(self.config.init_method),
+            gather_output=False,
+            bias=self.config.add_bias_linear,
+            skip_bias_add=False,
+            is_expert=False,
+            name=(name + ".linear_q") if name is not None else None,
+        )
+
+        self.linear_kv = submodules.linear_kv(
+            self.config.hidden_size,
+            2 * self.kv_projection_size,
+            config=self.config,
+            init_method=not_none(self.config.init_method),
+            gather_output=False,
+            bias=self.config.add_bias_linear,
+            skip_bias_add=False,
+            is_expert=False,
+            name=(name + ".linear_kv") if name is not None else None,
+        )
+
+    def get_query_key_value_tensors(
+        self,
+        hidden_states: Tensor,
+        key_value_states: Optional[Tensor],
+        output_gate: bool = False,
+        split_qkv: bool = True,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """
+        Derives `query` tensor from `hidden_states`, and `key`/`value` tensors
+        from `key_value_states`.
+        """
+        assert split_qkv, "split_qkv must be True for CrossAttention"
+        assert not output_gate, "Output gate is not supported in cross attention for now."
+
+        assert key_value_states is not None, "key_value_states cannot be None for CrossAttention"
+        # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
+        mixed_kv, _ = apply_module(self.linear_kv)(key_value_states)
+
+        # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
+        new_tensor_shape = mixed_kv.size()[:-1] + (
+            self.num_attention_heads_per_partition,
+            2 * self.hidden_size_per_attention_head,
+        )
+        mixed_kv = mixed_kv.view(*new_tensor_shape)
+
+        # [sk, b, np, 2 * hn] --> 2 [sk, b, np, hn]
+        key, value = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
+
+        # Attention head [sq, b, h] --> [sq, b, hp]
+        query, _ = apply_module(self.linear_q)(hidden_states)
+
+        # [sq, b, hp] --> [sq, b, np, hn]
+        new_tensor_shape = query.size()[:-1] + (
+            self.num_attention_heads_per_partition,
+            self.hidden_size_per_attention_head,
+        )
+        query = query.view(*new_tensor_shape)
+
+        return query, key, value

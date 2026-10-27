@@ -1,0 +1,762 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import pytest
+import torch
+
+from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+from megatron.core.inference.contexts.attention_context.mamba_metadata import MambaMetadata
+
+
+class TestMambaMetadata:
+
+    @pytest.fixture
+    def metadata_context(self):
+        """Fixture to initialize MambaMetadata with standard constraints."""
+        max_requests = 16
+        max_tokens = 2048
+        # Per-step intermediate-state cap (token budget / block_size + margin);
+        # value is irrelevant to these update() tests, which don't extract state.
+        max_intermediate_count = 17
+        metadata = MambaMetadata(
+            max_requests=max_requests,
+            max_tokens=max_tokens,
+            max_intermediate_count=max_intermediate_count,
+        )
+
+        yield metadata
+        metadata.reset()
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+    def test_decode_indices_dtype(self, dtype):
+        metadata = MambaMetadata(
+            max_requests=4, max_tokens=16, max_intermediate_count=1, decode_indices_dtype=dtype
+        )
+
+        assert metadata._batch_indices_decode_buffer.dtype == dtype
+
+    def test_free_unbound_live_slot(self):
+        metadata = MambaMetadata(max_requests=2, max_tokens=4, max_intermediate_count=1)
+
+        slot = int(metadata.allocate_slot())
+        assert metadata.mamba_state_free_slot_count == 1
+
+        metadata.free_slot(slot)
+
+        assert metadata.mamba_state_free_slot_count == 2
+        assert int(metadata.allocate_slot()) == slot
+
+    def test_allocated_slots_do_not_alias_free_slot_stack(self):
+        metadata = MambaMetadata(max_requests=3, max_tokens=4, max_intermediate_count=1)
+
+        slot_to_release = metadata.allocate_slot()
+        allocated_slot = metadata.allocate_slot()
+        metadata.free_slot(slot_to_release)
+
+        assert isinstance(allocated_slot, int)
+        assert allocated_slot == 1
+
+        metadata.request_to_mamba_state_idx[0] = allocated_slot
+        metadata.reset()
+        slot_to_release = metadata.allocate_slot()
+        allocated_slots = metadata.batch_allocate_slots(2)
+        metadata.free_slot(slot_to_release)
+
+        assert int(slot_to_release) == 1
+        assert set(allocated_slots.tolist()) == {0, 2}
+
+    def test_detached_live_slot_survives_request_cleanup(self):
+        metadata = MambaMetadata(max_requests=2, max_tokens=4, max_intermediate_count=1)
+        slot = int(metadata.allocate_slot())
+        metadata.request_to_mamba_state_idx[0] = slot
+
+        assert metadata.detach_state_slot(0) == slot
+        metadata.free_slots(torch.tensor([0], dtype=torch.int64))
+
+        assert metadata.mamba_state_free_slot_count == 1
+        assert int(metadata.allocate_slot()) != slot
+
+        metadata.free_slot(slot)
+
+        assert metadata.mamba_state_free_slot_count == 1
+        assert int(metadata.allocate_slot()) == slot
+
+    def test_reset_preserves_detached_live_slot(self):
+        metadata = MambaMetadata(max_requests=2, max_tokens=4, max_intermediate_count=1)
+        detached_slot = int(metadata.allocate_slot())
+        request_slot = int(metadata.allocate_slot())
+        metadata.request_to_mamba_state_idx[:2] = torch.tensor(
+            [detached_slot, request_slot], dtype=torch.int32
+        )
+        assert metadata.detach_state_slot(0) == detached_slot
+
+        metadata.reset()
+
+        assert metadata.mamba_state_free_slot_count == 1
+        assert int(metadata.allocate_slot()) == request_slot
+        metadata.free_slot(detached_slot)
+        assert metadata.mamba_state_free_slot_count == 1
+        assert int(metadata.allocate_slot()) == detached_slot
+
+    def test_reserved_dummy_slot_is_not_request_owned(self):
+        metadata = MambaMetadata(
+            max_requests=2, max_tokens=4, max_intermediate_count=1, reserve_dummy_state_slot=True
+        )
+
+        assert metadata.dummy_state_indices.tolist() == [metadata.max_requests]
+        assert torch.all(metadata.request_to_mamba_state_idx == -1)
+        assert metadata.mamba_state_free_slot_count == metadata.max_requests
+
+    def _run_update_test(
+        self,
+        metadata: MambaMetadata,
+        req_seq_lengths: list[int],
+        num_decode_requests: int,
+        padded_dims: InferenceBatchDimensions,
+        enable_chunked_prefill: bool,
+    ):
+        """
+        Helper to construct inputs and run update().
+
+        Args:
+            metadata: The MambaMetadata instance.
+            req_seq_lengths: List of sequence lengths for all active requests.
+                             Order must be [decode_requests..., prefill_requests...].
+            num_decode_requests: Number of requests in req_seq_lengths that are in the decode phase.
+            padded_dims: The padded batch dimensions to test against.
+            enable_chunked_prefill: Whether chunked prefill is enabled.
+        """
+        num_active_requests = len(req_seq_lengths)
+        total_tokens = sum(req_seq_lengths)
+        num_prefill_requests = num_active_requests - num_decode_requests
+
+        real_dims = InferenceBatchDimensions(
+            token_count=total_tokens,
+            prefill_req_count=num_prefill_requests,
+            decode_req_count=num_decode_requests,
+        )
+
+        # Assuming 1:1 mapping (req_id i -> slot i)
+        active_mamba_indices = torch.arange(
+            num_active_requests, dtype=torch.int32, device=metadata.device
+        )
+
+        cu_seqlens = [0]
+        current_len = 0
+        for l in req_seq_lengths:
+            current_len += l
+            cu_seqlens.append(current_len)
+        cu_seqlens_tensor = torch.tensor(cu_seqlens, dtype=torch.int32, device=metadata.device)
+
+        token_to_req = []
+        for req_idx, length in enumerate(req_seq_lengths):
+            token_to_req.extend([req_idx] * length)
+        token_to_req_tensor = torch.tensor(token_to_req, dtype=torch.int32, device=metadata.device)
+
+        metadata.update(
+            active_mamba_indices=active_mamba_indices,
+            token_to_request_idx=token_to_req_tensor,
+            cu_seqlens=cu_seqlens_tensor,
+            batch_dimensions=real_dims,
+            padded_batch_dimensions=padded_dims,
+            enable_chunked_prefill=enable_chunked_prefill,
+        )
+
+        return real_dims, active_mamba_indices
+
+    # -------------------------------------------------------------------------
+    # Scenario 1: Decode Only
+    # -------------------------------------------------------------------------
+
+    @pytest.mark.internal
+    def test_update_decode_only_exact_match(self, metadata_context):
+        """Test simple decode only case where real dims match padded dims."""
+        seq_lengths = [1, 1, 1, 1]  # 4 requests
+        num_decode = 4
+        padded_dims = InferenceBatchDimensions(
+            token_count=4, prefill_req_count=0, decode_req_count=4
+        )
+
+        self._run_update_test(
+            metadata_context, seq_lengths, num_decode, padded_dims, enable_chunked_prefill=False
+        )
+
+        expected_decode = torch.arange(4, dtype=torch.int32, device=metadata_context.device)
+        assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
+
+        assert metadata_context.batch_indices_prefill is None
+        assert metadata_context.device_decode_prefill is None
+        assert metadata_context.cu_seqlens is None
+        assert metadata_context.seq_idx is None
+
+    @pytest.mark.internal
+    def test_update_decode_only_padded(self, metadata_context):
+        """Test decode only with padding (e.g. using CUDA graphs bucket)."""
+        seq_lengths = [1, 1]  # 2 requests
+        num_decode = 2
+        # Padding to 4 requests
+        padded_dims = InferenceBatchDimensions(
+            token_count=4, prefill_req_count=0, decode_req_count=4
+        )
+
+        self._run_update_test(
+            metadata_context, seq_lengths, num_decode, padded_dims, enable_chunked_prefill=False
+        )
+
+        expected_decode = torch.tensor(
+            [0, 1, -1, -1], dtype=torch.int32, device=metadata_context.device
+        )
+        assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
+
+        assert metadata_context.batch_indices_prefill is None
+        assert metadata_context.device_decode_prefill is None
+
+    @pytest.mark.internal
+    def test_update_chunked_enabled_no_prefill_reqs(self, metadata_context):
+        """Test edge case: Chunked prefill enabled, but only decode requests exist."""
+        seq_lengths = [1, 1]
+        num_decode = 2
+        padded_dims = InferenceBatchDimensions(
+            token_count=2, prefill_req_count=0, decode_req_count=2
+        )
+
+        self._run_update_test(
+            metadata_context, seq_lengths, num_decode, padded_dims, enable_chunked_prefill=True
+        )
+
+        # Should behave exactly like decode-only (chunked logic skipped if real_prefill == 0)
+        expected_decode = torch.tensor([0, 1], dtype=torch.int32, device=metadata_context.device)
+        assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
+
+        assert metadata_context.batch_indices_prefill is None
+        assert metadata_context.cu_seqlens is None
+        assert metadata_context.seq_idx is None
+
+    # -------------------------------------------------------------------------
+    # Scenario 2: Prefill Only
+    # -------------------------------------------------------------------------
+
+    @pytest.mark.internal
+    def test_update_prefill_only_exact(self, metadata_context):
+        """Test prefill only scenario (exact match)."""
+        seq_lengths = [10, 20]  # 2 requests
+        num_decode = 0
+        padded_dims = InferenceBatchDimensions(
+            token_count=30, prefill_req_count=2, decode_req_count=0
+        )
+
+        self._run_update_test(
+            metadata_context, seq_lengths, num_decode, padded_dims, enable_chunked_prefill=False
+        )
+
+        expected_prefill = torch.tensor([0, 1], dtype=torch.int32, device=metadata_context.device)
+        assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
+
+        expected_cu_seqlens = torch.tensor(
+            [0, 10, 30], dtype=torch.int32, device=metadata_context.device
+        )
+        assert torch.equal(metadata_context.cu_seqlens, expected_cu_seqlens)
+
+        expected_seq_idx_0 = torch.zeros((1, 10), dtype=torch.int32, device=metadata_context.device)
+        expected_seq_idx_1 = torch.ones((1, 20), dtype=torch.int32, device=metadata_context.device)
+        expected_seq_idx = torch.cat([expected_seq_idx_0, expected_seq_idx_1], dim=1)
+        assert torch.equal(metadata_context.seq_idx, expected_seq_idx)
+
+        assert metadata_context.batch_indices_decode is None
+        assert metadata_context.device_decode_prefill is None
+
+    @pytest.mark.internal
+    def test_update_prefill_only_padded(self, metadata_context):
+        """Test prefill only with padding."""
+        seq_lengths = [10]  # 1 request
+        num_decode = 0
+        # Pad to 3 prefill requests
+        padded_dims = InferenceBatchDimensions(
+            token_count=30, prefill_req_count=3, decode_req_count=0
+        )
+
+        self._run_update_test(
+            metadata_context, seq_lengths, num_decode, padded_dims, enable_chunked_prefill=False
+        )
+
+        expected_prefill = torch.tensor(
+            [0, -1, -1], dtype=torch.int32, device=metadata_context.device
+        )
+        assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
+
+        expected_cu_seqlens = torch.tensor(
+            [0, 10, 10, 10], dtype=torch.int32, device=metadata_context.device
+        )
+        assert torch.equal(metadata_context.cu_seqlens, expected_cu_seqlens)
+
+        expected_seq_idx = torch.full(
+            (1, 30), -1, dtype=torch.int32, device=metadata_context.device
+        )
+        expected_seq_idx[:, :10] = 0
+        assert torch.equal(metadata_context.seq_idx, expected_seq_idx)
+
+        assert metadata_context.batch_indices_decode is None
+        assert metadata_context.device_decode_prefill is None
+
+    # -------------------------------------------------------------------------
+    # Scenario 3: Mixed Batch (Decode + Prefill)
+    # -------------------------------------------------------------------------
+
+    @pytest.mark.internal
+    def test_update_mixed_batch_exact(self, metadata_context):
+        """Test mix of decode and prefill requests (exact match)."""
+        # 2 decode (len 1), 2 prefill (len 10, 20)
+        seq_lengths = [1, 1, 10, 20]
+        num_decode = 2
+        padded_dims = InferenceBatchDimensions(
+            token_count=32, prefill_req_count=2, decode_req_count=2
+        )
+
+        self._run_update_test(
+            metadata_context, seq_lengths, num_decode, padded_dims, enable_chunked_prefill=False
+        )
+
+        expected_decode = torch.tensor([0, 1], dtype=torch.int32, device=metadata_context.device)
+        assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
+
+        expected_prefill = torch.tensor([2, 3], dtype=torch.int32, device=metadata_context.device)
+        assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
+
+        # device_decode_prefill stores [decode_token_count, prefill_token_count].
+        expected_device_counts = torch.tensor(
+            [2, 30], dtype=torch.int32, device=metadata_context.device
+        )
+        assert torch.equal(metadata_context.device_decode_prefill, expected_device_counts)
+
+        expected_cu_seqlens = torch.tensor(
+            [0, 10, 30], dtype=torch.int32, device=metadata_context.device
+        )
+        assert torch.equal(metadata_context.cu_seqlens, expected_cu_seqlens)
+
+        expected_seq_idx_0 = torch.zeros((1, 10), dtype=torch.int32, device=metadata_context.device)
+        expected_seq_idx_1 = torch.ones((1, 20), dtype=torch.int32, device=metadata_context.device)
+        expected_seq_idx_padding = torch.full(
+            (1, 2), -1, dtype=torch.int32, device=metadata_context.device
+        )
+        expected_seq_idx = torch.cat(
+            [expected_seq_idx_0, expected_seq_idx_1, expected_seq_idx_padding], dim=1
+        )
+        assert torch.equal(metadata_context.seq_idx, expected_seq_idx)
+
+    @pytest.mark.internal
+    def test_update_mixed_batch_mtp(self, metadata_context):
+        """Test mixed batch with MTP (decode seq_len > 1) to verify token-count split."""
+        # 2 decode requests each with 3 tokens (1 accepted + 2 speculative),
+        # 1 prefill request with 20 tokens.
+        seq_lengths = [3, 3, 20]
+        num_decode = 2
+        padded_dims = InferenceBatchDimensions(
+            token_count=26, prefill_req_count=1, decode_req_count=2
+        )
+
+        self._run_update_test(
+            metadata_context, seq_lengths, num_decode, padded_dims, enable_chunked_prefill=False
+        )
+
+        expected_decode = torch.tensor([0, 1], dtype=torch.int32, device=metadata_context.device)
+        assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
+
+        expected_prefill = torch.tensor([2], dtype=torch.int32, device=metadata_context.device)
+        assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
+
+        # device_decode_prefill stores [decode_token_count, prefill_token_count].
+        # 2 decode requests * 3 tokens each = 6 decode tokens, 20 prefill tokens.
+        expected_device_counts = torch.tensor(
+            [6, 20], dtype=torch.int32, device=metadata_context.device
+        )
+        assert torch.equal(metadata_context.device_decode_prefill, expected_device_counts)
+
+    @pytest.mark.internal
+    def test_update_padded_prefill_and_decode(self, metadata_context):
+        """Test scenario where padded dimensions differ from real dimensions (Mixed)."""
+        # Real: 1 decode, 1 prefill.
+        seq_lengths = [1, 10]
+        num_decode = 1
+
+        # Padded: 4 decode, 4 prefill. Total tokens 32.
+        padded_dims = InferenceBatchDimensions(
+            token_count=32, prefill_req_count=4, decode_req_count=4
+        )
+
+        self._run_update_test(
+            metadata_context, seq_lengths, num_decode, padded_dims, enable_chunked_prefill=False
+        )
+
+        expected_decode = torch.tensor(
+            [0, -1, -1, -1], dtype=torch.int32, device=metadata_context.device
+        )
+        assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
+
+        expected_prefill = torch.tensor(
+            [1, -1, -1, -1], dtype=torch.int32, device=metadata_context.device
+        )
+        assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
+
+        # device_decode_prefill stores [decode_token_count, prefill_token_count].
+        expected_device_counts = torch.tensor(
+            [1, 10], dtype=torch.int32, device=metadata_context.device
+        )
+        assert torch.equal(metadata_context.device_decode_prefill, expected_device_counts)
+
+        expected_cu = torch.tensor(
+            [0, 10, 10, 10, 10], dtype=torch.int32, device=metadata_context.device
+        )
+        assert torch.equal(metadata_context.cu_seqlens, expected_cu)
+
+        expected_seq_idx = torch.full(
+            (1, 32), -1, dtype=torch.int32, device=metadata_context.device
+        )
+        expected_seq_idx[:, :10] = 0
+        assert torch.equal(metadata_context.seq_idx, expected_seq_idx)
+
+    # -------------------------------------------------------------------------
+    # Scenario 4: Chunked Prefill
+    #
+    # In our unified implementation, all prefill requests (including chunked)
+    # go through the same varlen path and are stored in batch_indices_prefill.
+    # There is no separate batch_indices_chunked_prefill.
+    # -------------------------------------------------------------------------
+
+    @pytest.mark.internal
+    def test_update_chunked_prefill_mixed_exact(self, metadata_context):
+        """Test chunked prefill mixed with decode (Exact match)."""
+        # 1 decode, 1 chunked prefill (len 50), 1 regular prefill (len 10)
+        seq_lengths = [1, 50, 10]
+        num_decode = 1
+
+        # Exact dimensions
+        padded_dims = InferenceBatchDimensions(
+            token_count=61, prefill_req_count=2, decode_req_count=1
+        )
+
+        self._run_update_test(
+            metadata_context, seq_lengths, num_decode, padded_dims, enable_chunked_prefill=True
+        )
+
+        # All prefill requests (chunked + regular) are unified in batch_indices_prefill.
+        expected_prefill = torch.tensor([1, 2], dtype=torch.int32, device=metadata_context.device)
+        assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
+
+        # device_decode_prefill stores [decode_token_count, prefill_token_count].
+        expected_device_counts = torch.tensor(
+            [1, 60], dtype=torch.int32, device=metadata_context.device
+        )
+        assert torch.equal(metadata_context.device_decode_prefill, expected_device_counts)
+
+        expected_cu_seqlens = torch.tensor(
+            [0, 50, 60], dtype=torch.int32, device=metadata_context.device
+        )
+        assert torch.equal(metadata_context.cu_seqlens, expected_cu_seqlens)
+
+        expected_seq_idx_0 = torch.zeros((1, 50), dtype=torch.int32, device=metadata_context.device)
+        expected_seq_idx_1 = torch.ones((1, 10), dtype=torch.int32, device=metadata_context.device)
+        expected_seq_idx_padding = torch.full(
+            (1, 1), -1, dtype=torch.int32, device=metadata_context.device
+        )
+        expected_seq_idx = torch.cat(
+            [expected_seq_idx_0, expected_seq_idx_1, expected_seq_idx_padding], dim=1
+        )
+        assert torch.equal(metadata_context.seq_idx, expected_seq_idx)
+
+    @pytest.mark.internal
+    def test_update_chunked_prefill_mixed_padded(self, metadata_context):
+        """Test chunked prefill mixed with decode (Padded)."""
+        # 2 decode, 1 chunked prefill (len 50), 1 regular prefill (len 10)
+        seq_lengths = [1, 1, 50, 10]
+        num_decode = 2
+        padded_dims = InferenceBatchDimensions(
+            token_count=62, prefill_req_count=2, decode_req_count=2
+        )
+
+        self._run_update_test(
+            metadata_context, seq_lengths, num_decode, padded_dims, enable_chunked_prefill=True
+        )
+
+        expected_decode = torch.tensor([0, 1], dtype=torch.int32, device=metadata_context.device)
+        assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
+
+        # All prefill requests unified in batch_indices_prefill.
+        expected_prefill = torch.tensor([2, 3], dtype=torch.int32, device=metadata_context.device)
+        assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
+
+        # device_decode_prefill stores [decode_token_count, prefill_token_count].
+        expected_device_counts = torch.tensor(
+            [2, 60], dtype=torch.int32, device=metadata_context.device
+        )
+        assert torch.equal(metadata_context.device_decode_prefill, expected_device_counts)
+
+        expected_cu = torch.tensor([0, 50, 60], dtype=torch.int32, device=metadata_context.device)
+        assert torch.equal(metadata_context.cu_seqlens, expected_cu)
+
+        expected_seq_idx = torch.full(
+            (1, 62), -1, dtype=torch.int32, device=metadata_context.device
+        )
+        expected_seq_idx[:, :50] = 0
+        expected_seq_idx[:, 50:60] = 1
+        assert torch.equal(metadata_context.seq_idx, expected_seq_idx)
+
+    @pytest.mark.internal
+    def test_update_chunked_only_padded(self, metadata_context):
+        """Test a case with only chunked prefill (no decode, no regular prefill) but with padding."""
+        # 1 chunked prefill request.
+        seq_lengths = [100]
+        num_decode = 0
+
+        padded_dims = InferenceBatchDimensions(
+            token_count=128, prefill_req_count=2, decode_req_count=0
+        )
+
+        self._run_update_test(
+            metadata_context, seq_lengths, num_decode, padded_dims, enable_chunked_prefill=True
+        )
+
+        assert metadata_context.batch_indices_decode is None
+
+        # Single prefill request unified in batch_indices_prefill, with padding.
+        expected_prefill = torch.tensor([0, -1], dtype=torch.int32, device=metadata_context.device)
+        assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
+
+        expected_cu_seqlens = torch.tensor(
+            [0, 100, 100], dtype=torch.int32, device=metadata_context.device
+        )
+        assert torch.equal(metadata_context.cu_seqlens, expected_cu_seqlens)
+
+        expected_seq_idx = torch.full(
+            (1, 128), -1, dtype=torch.int32, device=metadata_context.device
+        )
+        expected_seq_idx[:, :100] = 0
+        assert torch.equal(metadata_context.seq_idx, expected_seq_idx)
+
+        assert metadata_context.device_decode_prefill is None
+
+    # -------------------------------------------------------------------------
+    # Scenario 5: Paused Requests (Absolute vs Relative Indices)
+    # -------------------------------------------------------------------------
+
+    @pytest.mark.internal
+    def test_update_with_paused_requests_absolute_indices(self, metadata_context):
+        """
+        Test that seq_idx correctly normalizes to 0-based indices when paused
+        requests exist, meaning absolute request IDs are > 0.
+        """
+        # Simulate 2 paused requests, meaning active requests start at index 2
+        # We'll use 2 active prefill requests of lengths 10 and 20.
+        paused_request_count = 2
+        seq_lengths = [10, 20]
+
+        # Absolute request indices: 2 and 3
+        token_to_req = [2] * 10 + [3] * 20
+        token_to_req_tensor = torch.tensor(
+            token_to_req, dtype=torch.int32, device=metadata_context.device
+        )
+
+        # Active mamba slots matching the absolute request IDs
+        active_mamba_indices = torch.tensor(
+            [2, 3], dtype=torch.int32, device=metadata_context.device
+        )
+
+        # cu_seqlens is always local to the active slice passed in
+        cu_seqlens = torch.tensor([0, 10, 30], dtype=torch.int32, device=metadata_context.device)
+
+        dims = InferenceBatchDimensions(token_count=30, prefill_req_count=2, decode_req_count=0)
+
+        metadata_context.update(
+            active_mamba_indices=active_mamba_indices,
+            token_to_request_idx=token_to_req_tensor,
+            cu_seqlens=cu_seqlens,
+            batch_dimensions=dims,
+            padded_batch_dimensions=dims,
+            enable_chunked_prefill=False,
+        )
+
+        # The key assertion: seq_idx should be strictly 0-based relative
+        # to the buffer (0s and 1s), despite the absolute request IDs being 2 and 3.
+        expected_seq_idx_0 = torch.zeros((1, 10), dtype=torch.int32, device=metadata_context.device)
+        expected_seq_idx_1 = torch.ones((1, 20), dtype=torch.int32, device=metadata_context.device)
+        expected_seq_idx = torch.cat([expected_seq_idx_0, expected_seq_idx_1], dim=1)
+
+        assert torch.equal(metadata_context.seq_idx, expected_seq_idx)
+
+
+class TestGDPIntermediateChunkIndices:
+    """The offset -> chunk-row mapping GDP prefix caching extracts state with.
+
+    GDP cannot reuse the Mamba mapping. It chunks at a fixed 64 rather than
+    `mamba_chunk_size`, and its per-chunk states are the states *entering* each
+    chunk, so the state after `offset` tokens is row `offset // 64` of the
+    sequence's chunk range -- where Mamba, whose states come *out* of each chunk,
+    needs a `- 1`. Getting that off by one silently caches a state 64 tokens
+    away from the boundary it is registered against.
+    """
+
+    NUM_HOUSEHOLDER = 2
+    GDP_CHUNK = 64
+
+    def _metadata(self, max_requests=8, max_tokens=2048, max_intermediate_count=16):
+        return MambaMetadata(
+            max_requests=max_requests,
+            max_tokens=max_tokens,
+            max_intermediate_count=max_intermediate_count,
+            d_conv=4,
+            gdp_num_householder=self.NUM_HOUSEHOLDER,
+        )
+
+    def _update(self, metadata, seq_lengths, offsets_per_request):
+        """Run one prefill-only update with the given per-request extraction offsets."""
+        device = metadata.device
+        num_requests = len(seq_lengths)
+        cu = [0]
+        for length in seq_lengths:
+            cu.append(cu[-1] + length)
+
+        token_to_req = []
+        for req_idx, length in enumerate(seq_lengths):
+            token_to_req.extend([req_idx] * length)
+
+        assert max(len(o) for o in offsets_per_request) <= 3
+        offsets = torch.zeros((num_requests, 3), dtype=torch.int32, device=device)
+        counts = torch.zeros(num_requests, dtype=torch.int32, device=device)
+        for i, req_offsets in enumerate(offsets_per_request):
+            offsets[i, : len(req_offsets)] = torch.tensor(req_offsets, dtype=torch.int32)
+            counts[i] = len(req_offsets)
+
+        dims = InferenceBatchDimensions(
+            token_count=cu[-1], prefill_req_count=num_requests, decode_req_count=0
+        )
+        metadata.update(
+            active_mamba_indices=torch.arange(num_requests, dtype=torch.int32, device=device),
+            token_to_request_idx=torch.tensor(token_to_req, dtype=torch.int32, device=device),
+            cu_seqlens=torch.tensor(cu, dtype=torch.int32, device=device),
+            batch_dimensions=dims,
+            padded_batch_dimensions=dims,
+            enable_chunked_prefill=False,
+            intermediate_offsets_gpu=offsets,
+            intermediate_counts_gpu=counts,
+        )
+        return cu
+
+    @pytest.mark.internal
+    def test_single_request_offsets_map_to_their_own_chunk_rows(self):
+        metadata = self._metadata()
+        self._update(metadata, [512], [[128, 256]])
+
+        assert metadata.intermediate_count == 2
+        got = metadata.gdp_intermediate_chunk_indices[:2].tolist()
+        # Sequence 0 starts at chunk row 0, so offset o lands on row o // 64.
+        assert got == [128 // 64, 256 // 64]
+
+    @pytest.mark.internal
+    def test_offsets_are_biased_by_the_preceding_requests_chunks(self):
+        metadata = self._metadata()
+        seq_lengths = [512, 320, 256]
+        self._update(metadata, seq_lengths, [[256], [128], [64]])
+
+        # chunk_offsets is the running sum of ceil(len / 64) per sequence.
+        starts, running = [], 0
+        for length in seq_lengths:
+            starts.append(running)
+            running += (length + self.GDP_CHUNK - 1) // self.GDP_CHUNK
+
+        got = metadata.gdp_intermediate_chunk_indices[:3].tolist()
+        assert got == [starts[0] + 256 // 64, starts[1] + 128 // 64, starts[2] + 64 // 64]
+        assert torch.equal(
+            metadata.gdp_chunk_offsets[: len(seq_lengths)],
+            torch.tensor(starts, dtype=torch.int32, device=metadata.device),
+        )
+
+    @pytest.mark.internal
+    def test_row_zero_is_the_sequence_start_state(self):
+        """Row `chunk_offsets[i]` is the state before any of sequence i's tokens.
+
+        This is what pins the absence of Mamba's `- 1`: an offset of exactly one
+        chunk must map one row past the sequence's first, not onto it.
+        """
+        metadata = self._metadata()
+        self._update(metadata, [256, 256], [[64], [64]])
+
+        got = metadata.gdp_intermediate_chunk_indices[:2].tolist()
+        assert got[0] == 1, "offset 64 of sequence 0 must be its second chunk row"
+        assert got[1] == 4 + 1, "sequence 1 owns 4 chunks' worth of rows before its own"
+
+    @pytest.mark.internal
+    def test_not_built_when_the_model_has_no_gdp_layers(self):
+        metadata = MambaMetadata(max_requests=4, max_tokens=512, max_intermediate_count=4, d_conv=4)
+        dims = InferenceBatchDimensions(token_count=256, prefill_req_count=1, decode_req_count=0)
+        metadata.update(
+            active_mamba_indices=torch.tensor([0], dtype=torch.int32, device=metadata.device),
+            token_to_request_idx=torch.zeros(256, dtype=torch.int32, device=metadata.device),
+            cu_seqlens=torch.tensor([0, 256], dtype=torch.int32, device=metadata.device),
+            batch_dimensions=dims,
+            padded_batch_dimensions=dims,
+            enable_chunked_prefill=False,
+        )
+        assert metadata.gdp_intermediate_chunk_indices is None
+        assert metadata.gdp_chunk_offsets is None
+
+
+class TestMambaIntermediateChunkLayout:
+    @pytest.mark.parametrize(
+        "cu_seqlens,last_chunks,real_count,padded_count,expected_index",
+        [
+            # A two-token continuation straddles an original SSD boundary.
+            ([0, 2, 515], [1, 6], 2, 2, 5),
+            # Native aligned chunking retains its existing index.
+            ([0, 2, 515], [0, 5], 2, 2, 4),
+            # An empty sequence still occupies one zero-length chunk.
+            ([0, 0, 513], [0, 5], 2, 2, 4),
+            # No preceding request: the chunk range starts at zero.
+            ([0, 513], [4], 1, 1, 3),
+            # Padding adds empty chunks but must not shift real requests.
+            ([0, 2, 515, 515, 515], [1, 6, 7, 8], 2, 4, 5),
+        ],
+        ids=["partial-first", "aligned", "empty-first", "single", "padded"],
+    )
+    def test_snapshot_uses_actual_chunk_layout(
+        self, cu_seqlens, last_chunks, real_count, padded_count, expected_index
+    ):
+        metadata = MambaMetadata(
+            max_requests=4, max_tokens=1024, max_intermediate_count=12, d_conv=4
+        )
+        # Supply the descriptors produced by the prefill chunk builder. The
+        # two-token partial-first case has two chunks, although ceil(2/128)=1.
+        metadata.last_chunk_indices = torch.tensor(
+            last_chunks, dtype=torch.int32, device=metadata.device
+        )
+        cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=metadata.device)
+        offsets = torch.zeros((real_count, 3), dtype=torch.int32)
+        counts = torch.zeros(real_count, dtype=torch.int32)
+        offsets[-1, 0] = 512
+        counts[-1] = 1
+
+        metadata._update_intermediate_metadata(
+            offsets, counts, real_count, padded_count, cu_seqlens_gpu=cu
+        )
+
+        assert metadata.intermediate_count == 1
+        assert metadata.intermediate_chunk_indices[0].item() == expected_index
+        assert metadata.intermediate_abs_positions[0].item() == cu_seqlens[real_count - 1] + 512
+        extent = padded_count * 3
+        assert metadata.intermediate_chunk_indices.numel() == extent
+        assert torch.all(metadata.intermediate_chunk_indices[1:] == 0)
+        assert torch.all(metadata.intermediate_abs_positions[1:] == 4)
+        chunk_ptr = metadata.intermediate_chunk_indices.data_ptr()
+        count_ptr = metadata.intermediate_real_count.data_ptr()
+
+        # The graph-facing scratch extent and addresses stay fixed when the
+        # next step has no snapshots; stale valid indices must be cleared.
+        counts.zero_()
+        metadata._update_intermediate_metadata(
+            offsets, counts, real_count, padded_count, cu_seqlens_gpu=cu
+        )
+        assert metadata.intermediate_count == 0
+        assert metadata.intermediate_real_count.item() == 0
+        assert metadata.intermediate_chunk_indices.numel() == extent
+        assert metadata.intermediate_chunk_indices.data_ptr() == chunk_ptr
+        assert metadata.intermediate_real_count.data_ptr() == count_ptr
+        assert torch.all(metadata.intermediate_chunk_indices == 0)
+        assert torch.all(metadata.intermediate_abs_positions == 4)

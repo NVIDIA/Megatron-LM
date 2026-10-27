@@ -1,0 +1,3362 @@
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+
+"""Utility functions used throughout Megatron core"""
+
+import array
+import asyncio
+import functools
+import hashlib
+import inspect
+import logging
+import math
+import operator
+import queue
+import socket
+import sys
+import threading
+import time
+import traceback
+import warnings
+from collections import defaultdict
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
+from datetime import datetime
+from functools import lru_cache, reduce, wraps
+from importlib.metadata import version
+from types import TracebackType
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, TypeVar, Union
+
+import numpy
+import torch
+
+from megatron.core import config
+from megatron.core._rank_utils import (  # pylint: disable=unused-import
+    log_single_rank,
+    set_default_log_ranks,
+)
+from megatron.core.package_info import __version__ as mcore_version
+
+try:
+    from torch.distributed._tensor import DTensor
+    from torch.distributed.tensor.placement_types import Shard
+
+    HAVE_DTENSOR = True
+except ImportError:
+    HAVE_DTENSOR = False
+
+from megatron.core import parallel_state
+from megatron.core._batch_api_compat import deprecated_hybrid_cp_kwargs
+from megatron.core.dist_checkpointing.mapping import ShardedTensor
+
+try:
+    from packaging.version import Version as PkgVersion
+
+    HAVE_PACKAGING = True
+except ImportError:
+    HAVE_PACKAGING = False
+
+logger = logging.getLogger(__name__)
+
+try:
+    # Register the TE CUDA kernels
+    import transformer_engine  # pylint: disable=unused-import
+
+    # Alias the PyTorch wrapper so we can call tex.* APIs
+    import transformer_engine_torch as tex
+except ImportError:
+    # TE isn’t installed or the torch wrapper is missing
+    tex = None
+
+try:
+    _torch_version = PkgVersion(torch.__version__)
+except Exception:
+    # This is a WAR for building docs, where torch is not actually imported
+    _torch_version = PkgVersion("0.0.0") if HAVE_PACKAGING else "0.0.0"
+_te_version = None
+_fa_version = None
+_flashinfer_version = None
+_mamba_ssm_version = None
+_causal_conv1d_version = None
+_emerging_optimizers_version = None
+
+
+_Wrapped = TypeVar('_Wrapped', bound=Callable)
+"""A function or class which has been wrapped by a decorator."""
+
+
+@contextmanager
+def null_decorator(*args, **kwargs):
+    """
+    No-op decorator.
+    """
+    if len(kwargs) == 0 and len(args) == 1 and callable(args[0]):
+        return args[0]
+    else:
+
+        def inner(func):
+            return func
+
+        return inner
+
+
+class ExperimentalNotEnabledError(Exception):
+    """Raised during calls to experimental code when ENABLE_EXPERIMENTAL not set."""
+
+
+def experimental_fn(introduced_with_version: str):
+    """A decorator that marks a function as experimental.
+    Experimental functions may change quickly and do not guarantee backwards
+    compatiblity.
+
+    Experimental functions have a limited lifetime and should
+    either be productionized or deprecated.
+
+    Args:
+        introduced_with_version (str): A version-like string of Mcore at time of
+            introduction.
+
+    Raises:
+        ExperimentalNotEnabledError: Error raised when experimental function
+            was called without enabling the experimental flag.
+    """
+    logged_functions = set()
+
+    def validator(func: _Wrapped, max_lifetime: int = 3) -> _Wrapped:
+        """Validates the request to the experimental function.
+
+        Args:
+            func (Callable): Callee
+            max_lifetime (int, optional): Number of minor version that the experimental
+                function is allowed to exist. Defaults to 3.
+
+        Raises:
+            ExperimentalNotEnabledError: Error raised when experimental function
+                was called without enabling the experimental flag.
+
+        Returns:
+            Callable: The callee function.
+        """
+        if not HAVE_PACKAGING:
+            raise ImportError(
+                "packaging is not installed. Please install it with `pip install packaging`."
+            )
+        if (
+            PkgVersion(introduced_with_version).minor + max_lifetime
+            < PkgVersion(mcore_version).minor
+        ):
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "%s has reached end of life. Please migrate to a non-experimental function.",
+                func.__name__,
+            )
+
+        @wraps(func)
+        def wrapped_func(*args, **kwargs):
+            if config.is_experimental_enabled() is not True:
+                raise ExperimentalNotEnabledError(f"Flag config.ENABLE_EXPERIMENTAL not enabled.")
+            # log once on one rank
+            if func.__name__ not in logged_functions:
+                logged_functions.add(func.__name__)
+                log_single_rank(
+                    logger, logging.INFO, "ENABLE_EXPERIMENTAL is True, running experimental code."
+                )
+
+            return func(*args, **kwargs)
+
+        return wrapped_func
+
+    return validator
+
+
+def experimental_cls(introduced_with_version: str):
+    """A decorator that marks a Class as experimental.
+    Experimental Classes may change quickly and do not guarantee backwards
+    compatiblity.
+
+    Experimental classes have a limited lifetime and should
+    either be productionized or deprecated.
+
+    Args:
+        introduced_with_version (str): A version-like string of Mcore at time of
+            introduction.
+
+    Raises:
+        ExperimentalNotEnabledError: Error raised when experimental class
+            was called without enabling the experimental flag.
+    """
+    logged_classes = set()
+
+    def validator(cls: _Wrapped, max_lifetime: int = 3) -> _Wrapped:
+        """Validates the request to the experimental function.
+
+        Args:
+            func (Callable): Callee
+            max_lifetime (int, optional): Number of minor version that the experimental
+                function is allowed to exist. Defaults to 3.
+
+        Raises:
+            ExperimentalNotEnabledError: Error raised when experimental function
+                was called without enabling the experimental flag.
+
+        Returns:
+            Callable: The callee function.
+        """
+        if not HAVE_PACKAGING:
+            raise ImportError(
+                "packaging is not installed. Please install it with `pip install packaging`."
+            )
+
+        if (
+            PkgVersion(introduced_with_version).minor + max_lifetime
+            < PkgVersion(mcore_version).minor
+        ):
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "%s has reached end of life. Please migrate to a non-experimental function.",
+                cls.__name__,
+            )
+
+        def wrapped_func(cls):
+            def guard(super: super, attr: str):
+                """Pass-through to callee attribute if experimental flag is enabled.
+
+                Args:
+                    super (super): Parent class of callee.
+                    attr (str): Attribute of callee that is being called.
+
+                Raises:
+                    ExperimentalNotEnabledError: Raised if flag is not set.
+
+                Returns:
+                    Attribute of callee.
+                """
+                if attr == "is_experimental":
+                    return config.is_experimental_enabled()
+
+                if config.is_experimental_enabled() is not True:
+                    raise ExperimentalNotEnabledError(
+                        f"Flag config.ENABLE_EXPERIMENTAL not enabled."
+                    )
+                # log once on one rank
+                if cls.__name__ not in logged_classes:
+                    logged_classes.add(cls.__name__)
+                    log_single_rank(
+                        logger,
+                        logging.INFO,
+                        "ENABLE_EXPERIMENTAL is True, running experimental code.",
+                    )
+                return super.__getattribute__(attr)
+
+            class ClassInterceptor(type):
+                """Metaclass to intercept calls from the uninitialized class."""
+
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.__class__ = type(cls.__qualname__, (ClassInterceptor,), {})
+
+                def __getattribute__(self, attr):
+                    """Intercepts calls like A.hello_world()"""
+                    return guard(super(), attr)
+
+            class Proxy(cls, metaclass=ClassInterceptor):
+                """Proxies calls from caller to the callee by relaying all
+                attribute calls through a guarding mechanism.
+
+                We use `__getattribute__` for relaying calls. Opposed to `__getattr__`,
+                this is called regardless of whether the attribute exists or not.
+
+                We need to distinguish two cases: callee is an instance vs. a class.
+
+                If callee is an instance, `__getattribute__` will look and find attributes
+                at the class level.
+
+                If callee is a class, `__getattribute__` will look for attributes at
+                _its_ class, which is `type`. Here, it won't find attributes.
+                We solve this a metaclass mixin which swaps `type` with a custom class
+                that supersets the callee's class. For mixins, any methods provided on
+                parent classes will be provided to the metaclass. We add a
+                `__getattribute__` to the metaclass as to allow it to fetch it from the
+                callees class.
+
+                """
+
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.__class__ = type(cls.__qualname__, (Proxy,), {})
+
+                def __getattribute__(self, attr):
+                    """Intercepts calls like a.hello_world()"""
+                    return guard(super(), attr)
+
+            return Proxy
+
+        return wrapped_func(cls)
+
+    return validator
+
+
+def get_te_version():
+    """Get TE version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    try:
+        import transformer_engine as te
+
+        HAVE_TE = True
+    except ImportError:
+        HAVE_TE = False
+
+    def get_te_version_str():
+        import transformer_engine as te
+
+        if hasattr(te, "__version__"):
+            return str(te.__version__)
+        else:
+            return version("transformer-engine")
+
+    global _te_version
+    if _te_version is None:
+        if HAVE_TE:
+            _te_version = PkgVersion(get_te_version_str())
+        else:
+            _te_version = PkgVersion("0.0.0")
+    return _te_version
+
+
+def is_te_min_version(version, check_equality=True):
+    """Check if minimum version of `transformer-engine` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    if check_equality:
+        return get_te_version() >= PkgVersion(version)
+    return get_te_version() > PkgVersion(version)
+
+
+def get_torch_version():
+    """Get torch version from __version__."""
+
+    global _torch_version
+    return _torch_version
+
+
+def is_torch_min_version(version, check_equality=True):
+    """Check if minimum version of `torch` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+    if check_equality:
+        return get_torch_version() >= PkgVersion(version)
+    return get_torch_version() > PkgVersion(version)
+
+
+def get_fa_version():
+    """Get Flash attention version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    def get_fa_version_str():
+        import flash_attn as fa
+
+        if hasattr(fa, "__version__"):
+            return str(fa.__version__)
+        else:
+            return version("flash-attn")
+
+    global _fa_version
+    if _fa_version is None:
+        _fa_version = PkgVersion(get_fa_version_str())
+    return _fa_version
+
+
+def is_fa_min_version(version, check_equality=True):
+    """Check if minimum version of `flash-attn` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+    if check_equality:
+        return get_fa_version() >= PkgVersion(version)
+    return get_fa_version() > PkgVersion(version)
+
+
+def get_mamba_version():
+    """Get mamba version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    def get_mamba_version_str():
+        import mamba_ssm
+
+        if hasattr(mamba_ssm, "__version__"):
+            return str(mamba_ssm.__version__)
+        else:
+            return version("mamba_ssm")
+
+    global _mamba_ssm_version
+    if _mamba_ssm_version is None:
+        _mamba_ssm_version = PkgVersion(get_mamba_version_str())
+    return _mamba_ssm_version
+
+
+def is_mamba_min_version(version, check_equality=True):
+    """Check if minimum version of `mamba_ssm` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+    if check_equality:
+        return get_mamba_version() >= PkgVersion(version)
+    return get_mamba_version() > PkgVersion(version)
+
+
+def get_causal_conv1d_version():
+    """Get causal_conv1d version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    def get_causal_conv1d_version_str():
+        import causal_conv1d
+
+        if hasattr(causal_conv1d, "__version__"):
+            return str(causal_conv1d.__version__)
+        else:
+            return version("causal_conv1d")
+
+    global _causal_conv1d_version
+    if _causal_conv1d_version is None:
+        _causal_conv1d_version = PkgVersion(get_causal_conv1d_version_str())
+    return _causal_conv1d_version
+
+
+def is_causal_conv1d_min_version(version, check_equality=True):
+    """Check if minimum version of `causal_conv1d` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+    if check_equality:
+        return get_causal_conv1d_version() >= PkgVersion(version)
+    return get_causal_conv1d_version() > PkgVersion(version)
+
+
+def get_flashinfer_version():
+    """Get flashinfer version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    def get_flashinfer_version_str():
+        try:
+            import flashinfer
+        except ImportError:
+            return None
+
+        if hasattr(flashinfer, "__version__"):
+            return str(flashinfer.__version__)
+        else:
+            return version("flashinfer")
+
+    global _flashinfer_version
+    if _flashinfer_version is None:
+        if (flashinfer_version_str := get_flashinfer_version_str()) is not None:
+            _flashinfer_version = PkgVersion(flashinfer_version_str)
+    return _flashinfer_version
+
+
+def is_flashinfer_min_version(version, check_equality=True):
+    """Check if minimum version of `flashinfer` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+    if (flashinfer_version := get_flashinfer_version()) is None:
+        return False
+    if check_equality:
+        return flashinfer_version >= PkgVersion(version)
+    return flashinfer_version > PkgVersion(version)
+
+
+def get_emerging_optimizers_version():
+    """Get emerging_optimizers version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    def get_emerging_optimizers_version_str():
+        import emerging_optimizers
+
+        if hasattr(emerging_optimizers, "__version__"):
+            return str(emerging_optimizers.__version__)
+        else:
+            # The distribution name is hyphenated even though the module is not.
+            return version("emerging-optimizers")
+
+    global _emerging_optimizers_version
+    if _emerging_optimizers_version is None:
+        _emerging_optimizers_version = PkgVersion(get_emerging_optimizers_version_str())
+    return _emerging_optimizers_version
+
+
+def is_emerging_optimizers_min_version(version, check_equality=True):
+    """Check if minimum version of `emerging_optimizers` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+    if check_equality:
+        return get_emerging_optimizers_version() >= PkgVersion(version)
+    return get_emerging_optimizers_version() > PkgVersion(version)
+
+
+# Values that select a fused kernel backend and therefore carry optional dependencies.
+_FUSED_DSA_KERNEL_BACKENDS = ("tilelang", "cudnn")
+# Values that select a DSA implementation needing no optional dependency: "none" plus the
+# DSA-over-GQA paths, which are written in PyTorch and Triton.
+_UNFUSED_DSA_KERNEL_BACKENDS = ("none", "min-memory-triton", "min-memory-torch", "reference")
+_VALID_DSA_KERNEL_BACKENDS = _UNFUSED_DSA_KERNEL_BACKENDS + _FUSED_DSA_KERNEL_BACKENDS
+
+
+def _missing_tilelang_dsa_kernel_dependencies() -> List[str]:
+    """Return missing TileLang DSA kernel dependencies."""
+    try:
+        from megatron.core.transformer.experimental_attention_variant.ops import tilelang_dsa
+    except (ImportError, OSError):
+        return ["TileLang DSA kernels"]
+
+    missing = []
+    if tilelang_dsa.lighting_indexer is None:
+        missing.append("TileLang DSA indexer")
+    if tilelang_dsa.SparseMLA is None:
+        missing.append("TileLang SparseMLA")
+    return missing
+
+
+def _missing_cudnn_dsa_kernel_dependencies() -> List[str]:
+    """Return missing cuDNN DSA kernel dependencies."""
+    missing = []
+    try:
+        from flash_mla import flash_mla_sparse_fwd  # noqa: F401
+    except ImportError:
+        missing.append("flash_mla")
+    try:
+        from cudnn import DSA  # noqa: F401
+    except ImportError:
+        missing.append("cudnn-frontend DSA (nvidia-cudnn-frontend[cutedsl])")
+    return missing
+
+
+def _validate_dsa_kernel_backend_dependencies(dsa_kernel_backend: str) -> None:
+    """Validate optional fused DSA kernel backend dependencies."""
+    if dsa_kernel_backend not in _VALID_DSA_KERNEL_BACKENDS:
+        raise ValueError(
+            "dsa_kernel_backend must be one of: " f"{', '.join(_VALID_DSA_KERNEL_BACKENDS)}."
+        )
+    if dsa_kernel_backend in _UNFUSED_DSA_KERNEL_BACKENDS:
+        return
+    if not torch.cuda.is_available():
+        raise ValueError(
+            f"dsa_kernel_backend={dsa_kernel_backend} requires a CUDA device, "
+            "but none is available."
+        )
+
+    missing = []
+    if dsa_kernel_backend == "tilelang":
+        missing = _missing_tilelang_dsa_kernel_dependencies()
+    elif dsa_kernel_backend == "cudnn":
+        missing = _missing_cudnn_dsa_kernel_dependencies()
+
+    if missing:
+        raise ValueError(
+            f"dsa_kernel_backend={dsa_kernel_backend} requires fused DSA kernels, "
+            f"but the following packages are not available: {', '.join(missing)}. "
+            "Install them or set dsa_kernel_backend=none to use the PyTorch fallback."
+        )
+
+
+def accepts_parameter(func: Callable, name: str) -> bool:
+    """Check if a callable accepts a parameter with the given name or **kwargs."""
+    params = inspect.signature(func).parameters.values()
+    return any(p.name == name or p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+
+
+def ensure_divisibility(numerator, denominator):
+    """Ensure that numerator is divisible by the denominator."""
+    assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
+
+
+def divide(numerator, denominator):
+    """Ensure that numerator is divisible by the denominator and return
+    the division value."""
+    ensure_divisibility(numerator, denominator)
+    return numerator // denominator
+
+
+def round_up_to_nearest_multiple(value: int, multiple: int) -> int:
+    """Round *value* up to the nearest multiple of *multiple*."""
+    return math.ceil(value / multiple) * multiple
+
+
+def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True):
+    """Issue a deprecation warning if tp_group is None and return the default tp group."""
+    # TODO(zijiey): remove this function later.
+    if not torch.distributed.is_initialized():
+        return None
+
+    # if parallel_state is not initialized, pass `tp_group` thru
+    if not parallel_state.is_initialized():
+        return tp_group
+
+    if tp_group is None:
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            warnings.warn(
+                "Warning: tp_group is None, using default tp group. "
+                "Passing tp_group will be mandatory soon",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if is_expert:
+            tp_group = parallel_state.get_expert_tensor_parallel_group(
+                check_initialized=check_initialized
+            )
+        else:
+            tp_group = parallel_state.get_tensor_model_parallel_group(
+                check_initialized=check_initialized
+            )
+    return tp_group
+
+
+def get_pg_size(group=None):
+    """Get world size for a distributed group.
+
+    Args:
+        group: Process group to get world size for. If None, uses default group.
+
+    Returns:
+        int: World size (1 if distributed not initialized or group is None, else group.size())
+    """
+    if not torch.distributed.is_initialized() or group is None:
+        return 1
+    return group.size()
+
+
+def get_pg_rank(group=None):
+    """Get rank for a distributed group.
+
+    Args:
+        group: Process group to get rank for. If None, uses default group.
+
+    Returns:
+        int: Rank (0 if distributed not initialized or group is None, else group.rank())
+    """
+    if not torch.distributed.is_initialized() or group is None:
+        return 0
+    return group.rank()
+
+
+def cat_or_empty(parts: List[torch.Tensor], ref: torch.Tensor) -> torch.Tensor:
+    """Concatenate ``parts`` into one flat tensor, or return an empty tensor matching
+    ``ref``'s dtype and device when there is nothing to concatenate.
+
+    Typical use: the send buffer of an all_to_all whose input splits are all zero on
+    this rank, where ``torch.cat`` of an empty list would raise.
+
+    Args:
+        parts: Tensors to concatenate along dim 0 (may be empty).
+        ref: Tensor whose dtype and device the empty result should match.
+
+    Returns:
+        torch.Tensor: The concatenation, or an empty 1-D tensor.
+    """
+    if parts:
+        return torch.cat(parts)
+    return torch.empty(0, dtype=ref.dtype, device=ref.device)
+
+
+def get_pg_src_rank(group=None):
+    """Calculate the global rank corresponding to the first local rank
+    in the given process group.
+
+    Args:
+        group: Process group to query. If None or distributed is not initialized,
+            returns 0.
+
+    Returns:
+        int: The first (source) global rank in the group.
+    """
+    if not torch.distributed.is_initialized() or group is None:
+        return 0
+    ranks = torch.distributed.get_process_group_ranks(group)
+    return ranks[0]
+
+
+def get_attr_wrapped_model(model, attr, allow_none=True, return_model_obj=False):
+    """Get an attribute from a wrapped model.
+    If return_model_obj is true, return the object that has the 'attr' attribute;
+    otherwise, return the attribute directly."""
+    if isinstance(model, list):
+        raise RuntimeError("_get_attr_wrapped_model given a list of models")
+
+    if allow_none:
+
+        def condition(model, attr):
+            return not hasattr(model, attr)
+
+    else:
+
+        def condition(model, attr):
+            return getattr(model, attr, None) is None
+
+    while condition(model, attr):
+        if not hasattr(model, "module"):
+            raise RuntimeError(f"_get_attr_wrapped_model couldn't find attribute {attr}")
+
+        model = model.module
+
+    if return_model_obj:
+        return model
+    return getattr(model, attr)
+
+
+def get_model_type(model):
+    """Returns model_type attribute"""
+    return get_attr_wrapped_model(model, "model_type")
+
+
+def get_model_xattn(model):
+    """Returns whether the model has the xattn_needed attribute"""
+    try:
+        return get_attr_wrapped_model(model, "xattn_needed")
+    except RuntimeError:
+        return False
+
+
+def get_model_config(model):
+    """Returns the config attribute, allowed to return None"""
+    return get_attr_wrapped_model(model, "config", allow_none=False)
+
+
+class GlobalMemoryBuffer:
+    """Global buffer to avoid dynamic memory allocations.
+    Caller should ensure that buffers of the same name
+    are not used concurrently."""
+
+    def __init__(self):
+        self.buffer = {}
+
+    def get_tensor(self, tensor_shape, dtype, name, mem_alloc_context: Optional[Callable] = None):
+        """
+        Returns (potentially) a sub-tensor from the self.buffer for the given shape.
+        """
+        required_len = reduce(operator.mul, tensor_shape, 1)
+        if (
+            self.buffer.get((name, dtype), None) is None
+            or self.buffer[(name, dtype)].numel() < required_len
+        ):
+            mem_alloc_context = mem_alloc_context if mem_alloc_context else nullcontext
+            with mem_alloc_context():
+                self.buffer[(name, dtype)] = torch.empty(
+                    required_len,
+                    dtype=dtype,
+                    device=torch.cuda.current_device(),
+                    requires_grad=False,
+                )
+
+        return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)
+
+
+def _kernel_make_viewless_tensor(inp, requires_grad):
+    """Make a viewless tensor.
+
+    View tensors have the undesirable side-affect of retaining a reference
+    to the originally-viewed tensor, even after manually setting the '.data'
+    field. This method creates a new tensor that links to the old tensor's
+    data, without linking the viewed tensor, referenced via the '._base'
+    field.
+    """
+    out = torch.empty((1,), dtype=inp.dtype, device=inp.device, requires_grad=requires_grad)
+    out.data = inp.data
+    return out
+
+
+class WrappedTensor:
+    """
+    A wrapper for tensors that enables caller functions to pass an indirect reference
+    to callee functions. By wrapping the tensor, the caller's direct reference is removed,
+    allowing the tensor to be garbage collected once the callee unwraps and frees it.
+    """
+
+    def __init__(self, tensor: torch.Tensor):
+        self._wrapper = [tensor]
+
+    def unwrap(self):
+        """
+        Returns the wrapped tensor while deleting the internal reference.
+        Can only be called once.
+        """
+        if len(self._wrapper) == 0:
+            raise RuntimeError(f"WrappedTensor has already been unwrapped")
+        return self._wrapper.pop(0)
+
+
+class MakeViewlessTensor(torch.autograd.Function):
+    """
+    Autograd function to make a viewless tensor.
+
+    This function should be used in cases where the computation graph needs
+    to be propagated, but we only want a viewless tensor (e.g.,
+    ParallelTransformer's hidden_states). Call this function by passing
+    'keep_graph = True' to 'make_viewless_tensor()'.
+    """
+
+    @staticmethod
+    def forward(ctx, inp, requires_grad):
+        """Runs the fwd pass of _kernel_make_viewless_tensor"""
+        return _kernel_make_viewless_tensor(inp, requires_grad)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """No-op"""
+        return grad_output, None
+
+
+def make_viewless_tensor(inp, requires_grad, keep_graph):
+    """
+    Entry-point for creating viewless tensors.
+
+    This method should be used, rather than calling 'MakeViewlessTensor'
+    or '_kernel_make_viewless_tensor' directly. This method acts as a
+    switch for determining if an autograd function or a regular method
+    should be used to create the tensor.
+    """
+
+    # return tensor as-is, if not a 'view'
+    if inp._base is None:
+        return inp
+
+    # create viewless tensor
+    if keep_graph:
+        return MakeViewlessTensor.apply(inp, requires_grad)
+    else:
+        return _kernel_make_viewless_tensor(inp, requires_grad)
+
+
+def assert_viewless_tensor(tensor, extra_msg=None):
+    """Assert that a tensor is not a view (i.e., its '._base' field is
+    not set)."""
+    if isinstance(tensor, list):
+        [assert_viewless_tensor(t) for t in tensor]
+        return tensor
+    if not isinstance(tensor, torch.Tensor):
+        return tensor
+    assert tensor._base is None, (
+        "Ensure tensor._base is None before setting tensor.data or storing "
+        "tensor to memory buffer. Otherwise, a memory leak will occur (and "
+        f"likely accumulate over iterations). {extra_msg}"
+    )
+    return tensor
+
+
+def safely_set_viewless_tensor_data(tensor, new_data_tensor):
+    """Safely set tensor's '.data' field.
+
+    Check first that the tensor is viewless (i.e., '._base' not set). If not,
+    raise an exception.
+    """
+    assert_viewless_tensor(
+        tensor,
+        extra_msg="FYI, tensor._base has shape %s, and new_data_tensor has shape %s."
+        % ("--" if tensor._base is None else tensor._base.shape, new_data_tensor.shape),
+    )
+    tensor.data = new_data_tensor
+
+
+def copy_parameter_metadata(destination: torch.Tensor, source: torch.Tensor) -> None:
+    """Copy dynamically attached Megatron metadata between parameters.
+
+    Megatron records sharding and refit metadata as public Python attributes.
+    Tensor subclasses use private attributes for their storage and quantization
+    implementation details; those must not leak into a replacement tensor.
+
+    Args:
+        destination: Tensor receiving the metadata.
+        source: Tensor whose metadata should be copied.
+    """
+    for name, value in vars(source).items():
+        if not name.startswith("_"):
+            setattr(destination, name, value)
+
+
+def init_method_normal(sigma):
+    """Init method based on N(0, sigma)."""
+    return functools.partial(torch.nn.init.normal_, mean=0.0, std=sigma)
+
+
+def scaled_init_method_normal(sigma, num_layers, multiplier=2.0):
+    """Init method based on N(0, sigma/sqrt(2*num_layers)."""
+    std = sigma / math.sqrt(multiplier * num_layers)
+
+    return functools.partial(torch.nn.init.normal_, mean=0.0, std=std)
+
+
+def mup_scaled_init_method_normal(sigma, num_layers, width_mult, multiplier=2.0):
+    """MuP scaled init method for output layers: N(0, sigma / (sqrt(2*L) * sqrt(m))).
+
+    Combines the standard scaled initialization (for output projection layers)
+    with MuP width scaling. This ensures that both depth and width scaling
+    are accounted for in the initialization.
+
+    Args:
+        sigma (float): Base standard deviation for initialization.
+        num_layers (int): Number of transformer layers.
+        width_mult (float): Width multiplier (hidden_size / base_hidden_size).
+        multiplier (float): Multiplier for depth scaling (default: 2.0).
+
+    Returns:
+        Callable: Initialization function for torch.nn.init.
+    """
+    std = sigma / (math.sqrt(multiplier * num_layers) * math.sqrt(width_mult))
+    return functools.partial(torch.nn.init.normal_, mean=0.0, std=std)
+
+
+def log_on_each_pipeline_stage(
+    logger: logging.Logger,
+    level: int,
+    msg: object,
+    *args: Any,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    **kwargs: Any,
+):
+    """Log on first rank in each pipeline stage
+
+    Args:
+        logger (logging.Logger): The logger to write the logs
+
+        level (int): Logging level for the message.
+
+        msg (object): Message format string.
+
+        args (Tuple[Any]): Message format arguments.
+
+        kwargs (Dict[str, Any]): All logging.Logger.log keyword arguments
+    """
+    assert torch.distributed.is_initialized()
+
+    if (tp_group is None) != (dp_cp_group is None):
+        raise ValueError("tp_group and dp_cp_group must be provided or not provided together")
+
+    if not logger.isEnabledFor(level):
+        return
+
+    if tp_group is None and dp_cp_group is None:
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        dp_cp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+    else:
+        assert tp_group is not None and dp_cp_group is not None
+        tp_rank = tp_group.rank()
+        dp_cp_rank = dp_cp_group.rank()
+
+    if tp_rank == 0 and dp_cp_rank == 0:
+        logger.log(level, msg, *args, **kwargs)
+
+
+def check_param_hashes_across_dp_replicas(
+    model: List[torch.nn.Module], cross_check: bool = False
+) -> bool:
+    """Computes hashes of all parameters in model, all-gathers hashes across DP replicas,
+    and then checks for equality between the locally-computed hashes and those of other ranks.
+
+    NOTE: This function computes SHA-1 hashes on the CPU and thus needs to move all param
+    tensors from GPU to CPU first; as a result, this function is not intended to be called
+    very frequently in the main training loop.
+
+    Args:
+        model (List[torch.nn.Module]): List of model chunks whose parameter hashes need to
+            be checked.
+        cross_check (bool): If true, will check whether hashes match across all DP replicas.
+
+    Returns:
+        True if all param hashes match with corresponding hash on DP replica 0 or
+        across all replicas if cross_check is enabled, False otherwise.
+    """
+
+    # Compute per-parameter hashes on this rank.
+    # Keep track of expert and non-expert parameters separately since they need to be
+    # all-gathered across different sets of ranks.
+    non_expert_params, expert_params = [], []
+    local_non_expert_param_hashes, local_expert_param_hashes = [], []
+    for model_chunk_id, model_chunk in enumerate(model):
+        for param_name, param in model_chunk.named_parameters():
+            param_hash = torch.frombuffer(
+                array.array(
+                    "B", hashlib.sha1(param.data.to("cpu").float().numpy(force=True)).digest()
+                ),
+                dtype=torch.uint8,
+            )
+            if getattr(param, "allreduce", True):
+                non_expert_params.append((model_chunk_id, param_name, param))
+                local_non_expert_param_hashes.append(param_hash)
+            else:
+                expert_params.append((model_chunk_id, param_name, param))
+                local_expert_param_hashes.append(param_hash)
+
+    # Use data-modulo-expert parallel group to all-gather expert param hashes, regular
+    # data-parallel group for non-expert param hashes.
+    all_param_hashes_match = True
+    for params, local_param_hashes, all_gather_group in zip(
+        [non_expert_params, expert_params],
+        [local_non_expert_param_hashes, local_expert_param_hashes],
+        [
+            parallel_state.get_data_parallel_group(with_gtp_remat=False),
+            parallel_state.get_expert_data_parallel_group(with_gtp_remat=False),
+        ],
+    ):
+        # Collect per-parameter hashes across all ranks in group.
+        assert len(params) == len(local_param_hashes)
+        if len(params) == 0:
+            continue
+        local_param_hashes = torch.stack(local_param_hashes).cuda()
+        all_param_hashes = [
+            torch.zeros_like(local_param_hashes) for _ in range(all_gather_group.size())
+        ]
+        torch.distributed.all_gather(all_param_hashes, local_param_hashes, group=all_gather_group)
+
+        # Make sure local per-parameter hash matches DP rank 0.
+        param_hashes_match = torch.equal(local_param_hashes, all_param_hashes[0])
+        if not param_hashes_match:
+            for i, (model_chunk_id, param_name, param) in enumerate(params):
+                if not torch.equal(local_param_hashes[i], all_param_hashes[0][i]):
+                    rank = torch.distributed.get_rank()
+                    logger.info(
+                        f"[Rank {rank}] Hash not matching for {param_name} in model chunk"
+                        f"{model_chunk_id}"
+                    )
+        if cross_check:
+            # Make sure all ranks have the same hash.
+            all_param_hashes_match &= all(
+                map(lambda x: torch.equal(local_param_hashes, x), all_param_hashes)
+            )
+        else:
+            all_param_hashes_match &= param_hashes_match
+
+    return all_param_hashes_match
+
+
+def make_tp_sharded_tensor_for_checkpoint(
+    tensor, key, tp_axis=0, replica_id=None, prepend_offsets=(), **kwargs
+):
+    """Helper for instantiating a ShardedTensor where the `tp_axis` dimension
+    is sharded across TP group.
+
+    Optionally, can provide offsets which prepend new dimensions to the tensor.
+
+    Args:
+        tensor: Tensor to shard
+        key: Key for the sharded tensor
+        tp_axis: Axis to shard across tensor parallel group (default: 0)
+        replica_id: Replica ID for the tensor (default: None)
+        prepend_offsets: Offsets to prepend to tensor dimensions (default: ())
+        **kwargs: Additional arguments. May include:
+            - tp_group: Tensor parallel group (default: None, falls back to parallel_state)
+            - dp_cp_group: Data parallel + context parallel group
+              (default: None, falls back to parallel_state)
+    """
+    # Pop group parameters from kwargs
+    tp_group = kwargs.pop('tp_group', None)
+    dp_cp_group = kwargs.pop('dp_cp_group', None)
+
+    prepend_axis_num = len(prepend_offsets)
+
+    new_offsets = []
+
+    # Get groups with fallback to parallel_state
+    if tp_group is None and dp_cp_group is None:
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+
+    # Use local get_pg_rank and get_pg_size functions
+    tp_rank = get_pg_rank(tp_group)
+    dp_rank = get_pg_rank(dp_cp_group)
+    tp_size = get_pg_size(tp_group)
+    dp_size = get_pg_size(dp_cp_group)
+    dp_replica_id = get_pg_rank(dp_cp_group)
+
+    new_offsets.append((tp_axis + prepend_axis_num, tp_rank, tp_size))
+
+    is_torch_fsdp2_param = (
+        hasattr(tensor, "is_torch_fsdp2_param") and HAVE_DTENSOR and isinstance(tensor, DTensor)
+    )
+    if is_torch_fsdp2_param:
+        # When using FSDP2, every DP shard is a main replica.
+        dp_replica_id = 0
+        tensor = tensor._local_tensor
+
+        if tp_axis == 0:
+            # both FSDP2 and TP shards axis 0
+            # default MCore uses tp-cp-ep-dp-pp
+            # FSDP2 is compatibile with TP, CP
+            new_offsets[0] = (prepend_axis_num, tp_rank * dp_size + dp_rank, tp_size * dp_size)
+        else:
+            # FSDP2 shards axis 0 and TP shards some other axis
+            new_offsets.append((prepend_axis_num, dp_rank, dp_size))
+
+    gtp_pad_length = 0  # overwritten below for GTP params
+
+    # GTP: a GTP param additionally shards out_features (axis 0) by 1/gtp_remat. Layer that
+    # split onto TP offset — mirrors make_sharded_tensors_for_checkpoint_with_gtp_remat so direct
+    # callers (e.g. VocabParallelEmbedding, which can't use that wrapper because it needs
+    # allow_shape_mismatch) still save GTP weights with correct global offsets/shape.
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+    if HAVE_GTP:
+        from megatron.core.fp8_utils import is_float8tensor
+        from megatron.core.tensor_parallel.gtp_api import (
+            dequantize_gtp_native_fp8,
+            gtp_replica_rank,
+            is_gtp_param,
+        )
+
+        if is_gtp_param(tensor):
+            gtp_rank = get_pg_rank(tensor.group)
+            gtp_remat_size = get_pg_size(tensor.group)
+            if tp_axis == 0:
+                # same axis as TP → one composite axis-0 offset
+                new_offsets[0] = (
+                    prepend_axis_num,
+                    tp_rank * gtp_remat_size + gtp_rank,
+                    tp_size * gtp_remat_size,
+                )
+            else:
+                # GTP shards axis 0, TP shards a different axis → add a separate axis-0 offset
+                new_offsets.append((prepend_axis_num, gtp_rank, gtp_remat_size))
+            # Elect the writer over the gtp_remat-EXCLUDED DP group (its true replicas): the
+            # group stamped on the param by the caller's pg_collection, else the MPU globals.
+            dp_replica_id = gtp_replica_rank(tensor)
+            gtp_pad_length = getattr(tensor, "pad_length", 0)
+            # Native-FP8 GTP shard: the param IS a QuantizedTensor (reports a fake BF16 dtype
+            # over FP8 bytes). Dequantize to real BF16 so the checkpoint stores portable
+            # high-precision values, not raw FP8 bytes mislabeled as BF16. Offsets above were
+            # already read from the FP8 param's GTP attrs; shape is preserved by dequantize.
+            # (dequantize_gtp_native_fp8 restores the base FP8 class for the dequantize call —
+            # TE's tex.dequantize does not recognize the dynamic GTP_<Fp8Tensor> subclass.)
+            if is_float8tensor(tensor):
+                fp8_param = tensor
+                tensor = dequantize_gtp_native_fp8(tensor)
+                # Backlink to the live FP8 param: optimizer sharded_state_dict matches params
+                # to model entries by id(entry.data), which this dequantized copy would break
+                # (see _backfill_gtp_sharded_param_map in optimizer.py).
+                tensor._gtp_dequant_src = fp8_param
+
+    if replica_id is None:
+        replica_id = (0, 0, dp_replica_id)
+
+    sharded_tensor = ShardedTensor.from_rank_offsets(
+        key,
+        tensor,
+        *prepend_offsets,
+        *new_offsets,
+        replica_id=replica_id,
+        prepend_axis_num=prepend_axis_num,
+        **kwargs,
+    )
+    if is_torch_fsdp2_param:
+        # Marker used downstream for FSDP2-related logic, such as TP-DP
+        # sharding / loading for non-trivial parameters like SwiGLU.
+        sharded_tensor.is_torch_fsdp2_param = is_torch_fsdp2_param
+    # Plain attribute (not a ShardedTensor field, so DCP never serializes it): global_shape minus
+    # this gives the true unpadded dim0. Read later by grant_shape_mismatch_for_gtp_padding.
+    sharded_tensor.gtp_pad_length = gtp_pad_length
+    return sharded_tensor
+
+
+def resolve_gtp_pad_for_alignment(*, fp4=False, fp8_recipe=None, fp8=False):
+    """Map a training recipe to the GTP dim-0 alignment tile size.
+
+    Zero-dependency by design (no TE/GTP imports) -- must stay safe to call from checkpoint
+    loading in a non-GTP run, unlike importing generalized_tensor_parallelism.py or gtp_api.py's
+    non-HAVE_GTP symbols.
+    """
+    if fp4:
+        return 16
+    if fp8_recipe == "mxfp8":
+        return 32
+    if fp8:
+        return 16
+    # No MXFP8/NVFP4 tile-size requirement in this recipe -- pad only to the minimum
+    # gtp_remat_size needed for even AG/RS sharding, not a fixed quantization tile size.
+    return 1
+
+
+def grant_shape_mismatch_for_gtp_padding(sharded_state_dict, checkpoint_dir, pad_for_alignment):
+    """Decide, per tensor, whether a checkpoint-vs-expected shape mismatch is GTP padding.
+
+    Reads the checkpoint's real on-disk shape and sets ``allow_shape_mismatch`` for every
+    tensor, GTP-tagged or plain -- narrowing GTP's blanket bypass to real padding, and letting a
+    non-GTP load recognize a GTP-padded checkpoint. A tensor that already has the flag set to
+    ``True`` is left untouched (granted for an unrelated reason, e.g. vocab padding).
+
+    The other 3 of these 4 (save, load) padding combinations can produce a shape difference
+    (an equal size always short-circuits below, regardless of cell)::
+
+        save \\ load     no pad              pads
+        no pad           declared==expected  declared(==dim0_unpadded) < expected
+        pads             declared > expected declared != expected (different pad amounts)
+
+    ``pad_for_alignment`` must come from the caller (the training recipe), not ``GTP_CONFIG`` --
+    that global is only set when GTP is active in *this* process.
+    """
+    from megatron.core.dist_checkpointing.dict_utils import nested_values
+
+    sharded_tensors = [v for v in nested_values(sharded_state_dict) if isinstance(v, ShardedTensor)]
+    if not sharded_tensors:
+        return
+
+    try:
+        from megatron.core.dist_checkpointing.serialization import load_tensors_metadata
+
+        checkpoint_metadata = load_tensors_metadata(str(checkpoint_dir))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"grant_shape_mismatch_for_gtp_padding: could not read metadata, "
+            f"skipping GTP padding check: {e}"
+        )
+        return
+
+    for sh_ten in sharded_tensors:
+        if sh_ten.allow_shape_mismatch:
+            continue  # already granted for an unrelated reason (e.g., vocab padding)
+        if sh_ten.key not in checkpoint_metadata:
+            continue  # let the normal load path raise its own "key missing" error
+        ckpt_shape = checkpoint_metadata[sh_ten.key].global_shape
+        # The GTP-padded axis is dim0 of the WEIGHT, not necessarily index 0 of global_shape --
+        # e.g. a PP-layer axis prepended via prepend_offsets/sharded_offsets shifts it to
+        # prepend_axis_num. The checkpoint-side ShardedTensor is metadata-only (its own
+        # prepend_axis_num is meaningless, always 0), so index both shapes by the live tensor's.
+        axis0 = sh_ten.prepend_axis_num
+        if axis0 >= len(ckpt_shape):
+            continue  # axis layout mismatch -- not a shape this function understands
+        ckpt_dim0 = int(ckpt_shape[axis0])
+        required_dim0 = int(sh_ten.global_shape[axis0])
+        if ckpt_dim0 == required_dim0:
+            continue  # no difference -- nothing to fix
+        dim0_unpadded = required_dim0 - int(getattr(sh_ten, "gtp_pad_length", 0))
+        # Valid padding: either an unpadded save (ckpt_dim0 == dim0_unpadded exactly), or an
+        # alignment-padded one (ckpt_dim0 a multiple of pad_for_alignment). At
+        # pad_for_alignment == 1 (bf16) every integer is "a multiple", so that disjunct is gated
+        # off there -- otherwise any ckpt_dim0 >= required_dim0 would pass as "padding".
+        is_valid_padding = ckpt_dim0 == dim0_unpadded or (
+            pad_for_alignment > 1 and ckpt_dim0 % pad_for_alignment == 0
+        )
+        # Padding only ever adds rows, so also require ckpt_dim0 >= dim0_unpadded.
+        sh_ten.allow_shape_mismatch = ckpt_dim0 >= dim0_unpadded and is_valid_padding
+
+
+def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_id=None, **kwargs):
+    """Helper for instantiating a non-sharded ShardedTensor (replicated across TP and DP group).
+
+    Optionally, can provide offsets which prepend new dimensions to the tensor.
+
+    Keyword Args:
+        tensor: Tensor to create sharded tensor for
+        key: Key for the sharded tensor
+        prepend_offsets: Offsets to prepend to tensor dimensions (default: ())
+        replica_id: Replica ID for the tensor (default: None)
+        **kwargs: Additional arguments. May include:
+            - tp_group: Tensor parallel group (default: None, falls back to parallel_state)
+            - dp_cp_group: Data parallel + context parallel group
+              (default: None, falls back to parallel_state)
+    """
+    # Sanity guard.
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+    if HAVE_GTP:
+        from megatron.core.tensor_parallel.gtp_api import is_gtp_param
+
+        assert not is_gtp_param(tensor), (
+            f"GTP weight-remat param '{key}' reached make_sharded_tensor_for_checkpoint (the "
+            "replicated path); route GTP-sharded weights through "
+            "make_tp_sharded_tensor_for_checkpoint or make_sharded_tensors_for_checkpoint instead."
+        )
+
+    # Pop group parameters from kwargs
+    tp_group = kwargs.pop('tp_group', None)
+    dp_cp_group = kwargs.pop('dp_cp_group', None)
+
+    prepend_axis_num = len(prepend_offsets)
+
+    new_offsets = []
+
+    # Get groups with fallback to parallel_state
+    if tp_group is None and dp_cp_group is None:
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+
+    # Use local get_pg_rank and get_pg_size functions
+    dp_rank = get_pg_rank(dp_cp_group)
+    dp_size = get_pg_size(dp_cp_group)
+    dp_replica_id = get_pg_rank(dp_cp_group)
+
+    is_torch_fsdp2_param = (
+        hasattr(tensor, "is_torch_fsdp2_param") and HAVE_DTENSOR and isinstance(tensor, DTensor)
+    )
+    if is_torch_fsdp2_param:
+        # When using FSDP2, every DP shard is a main replica.
+        dp_replica_id = 0
+        tensor = get_full_tensor_if_necessary(tensor)
+        # Add FSDP sharding rank offsets.
+        new_offsets.append((prepend_axis_num, dp_rank, dp_size))
+
+    if replica_id is None:
+        replica_id = (0, get_pg_rank(tp_group), dp_replica_id)
+
+    sharded_tensor = ShardedTensor.from_rank_offsets(
+        key,
+        tensor,
+        *prepend_offsets,
+        *new_offsets,
+        replica_id=replica_id,
+        prepend_axis_num=prepend_axis_num,
+        **kwargs,
+    )
+    if is_torch_fsdp2_param:
+        # Marker used downstream for FSDP2-related logic, such as TP-DP
+        # sharding / loading for non-trivial parameters like SwiGLU.
+        sharded_tensor.is_torch_fsdp2_param = is_torch_fsdp2_param
+    return sharded_tensor
+
+
+def get_full_tensor_if_necessary(tensor):
+    """
+    Captures an edge case where devices out-number elements in a DTensor,
+    for instance when generating a ShardedTensor. Replicate the DTensor
+    on all ranks to avoid empty DTensors on any rank.
+    """
+    need_full_tensor = False
+    for i in range(tensor.device_mesh.ndim):
+        if (
+            isinstance(tensor.placements[i], Shard)
+            and tensor.device_mesh.shape[i] > tensor.shape[tensor.placements[i].dim]
+        ):
+            need_full_tensor = True
+            break
+
+    tensor = tensor.full_tensor() if need_full_tensor else tensor._local_tensor
+
+    return tensor
+
+
+def to_local_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
+    """Returns the local shard of the given tensor if it is a DTensor."""
+    with torch.no_grad():
+        return tensor.to_local() if HAVE_DTENSOR and isinstance(tensor, DTensor) else tensor
+
+
+def get_data_parallel_group_if_dtensor(
+    tensor: Union[torch.Tensor, "DTensor"], data_parallel_group: "ProcessGroup" = None
+) -> Optional["ProcessGroup"]:
+    """Gets the data parallel group of the given tensor if it is a DTensor."""
+    if HAVE_DTENSOR and isinstance(tensor, DTensor):
+        current_group = tensor.device_mesh.get_group()
+        assert data_parallel_group is None or current_group == data_parallel_group
+        return current_group
+    return None
+
+
+def prepare_input_tensors_for_wgrad_compute(grad_output, all_gathered_input):
+    """Ensure grad_output is stored in a contiguous buffer."""
+    # Doing gather + slicing during the NeMo forward pass can make this tensor
+    # not be contiguous. PyTorch only checks if the tensor is contiguous, and only
+    # clones it if it's not contiguous:
+    # https://github.com/pytorch/pytorch/blob/c47cf9bc7f9e02f649ab4ed53fe4d35732c92ab6/torch/_refs/__init__.py#L2761
+    grad_output = grad_output.contiguous()
+    all_gathered_input = all_gathered_input.contiguous()
+    # Convert the tensor shapes to 2D for execution compatibility
+    if grad_output.dim() == 3:
+        grad_output = grad_output.view(
+            grad_output.shape[0] * grad_output.shape[1], grad_output.shape[2]
+        )
+        all_gathered_input = all_gathered_input.view(
+            all_gathered_input.shape[0] * all_gathered_input.shape[1], all_gathered_input.shape[2]
+        )
+
+    return grad_output, all_gathered_input
+
+
+try:
+    if is_torch_min_version("1.13.0"):
+        dist_all_gather_func = torch.distributed.all_gather_into_tensor
+    else:
+        dist_all_gather_func = torch.distributed._all_gather_base
+except Exception:
+    dist_all_gather_func = torch.distributed._all_gather_base
+
+
+def drain_embedding_wgrad_compute(
+    config, embedding_activation_buffer, grad_output_buffer, weight, tp_group
+):
+    """Helper for performing embedding wgrad GEMM's during the pipeline drain phase, pipelines the
+    AllGather and GEMM's.
+
+    Should only be used when pipeline model parallelism and gradient accumulation
+    fusion are enabled.
+    """
+
+    assert len(embedding_activation_buffer) == len(
+        grad_output_buffer
+    ), "Length of activation and gradient buffers need to be equal!"
+
+    import fused_weight_gradient_mlp_cuda
+
+    from megatron.core.parallel_state import get_global_memory_buffer
+
+    input = embedding_activation_buffer.pop(0)
+    world_size = tp_group.size()
+    dim_size = list(input.size())
+    dim_size[0] = dim_size[0] * world_size
+
+    all_gathered_input = [None, None]
+    if config.sequence_parallel:
+        all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu_0")
+        handle = dist_all_gather_func(all_gather_buffer, input, group=tp_group, async_op=False)
+
+        all_gathered_input[0] = all_gather_buffer
+        all_gather_buffer = None
+    else:
+        all_gathered_input[0] = input
+
+    input = None
+
+    def wgrad_compute(all_gathered_input, grad_output, weight):
+        grad_output, all_gathered_input = prepare_input_tensors_for_wgrad_compute(
+            grad_output, all_gathered_input
+        )
+
+        if hasattr(weight, "__fsdp_param__"):
+            weight.main_grad = weight.get_main_grad()
+
+        if config.gradient_accumulation_fusion:
+            if weight.main_grad.dtype == torch.float32:
+                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
+                    all_gathered_input, grad_output, weight.main_grad
+                )
+            elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
+                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
+                    all_gathered_input, grad_output, weight.main_grad
+                )
+            else:
+                raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
+
+    # We have all_gathered_input list acting as a double buffer here,
+    # since we are pipelining the AllGather and GEMM,one buffer all gathers
+    # the input while the other buffer reads from it for the GEMM. We use i
+    # and (i+1) for indexing to enable this double buffering.
+    for i in range(len(embedding_activation_buffer)):
+        input = embedding_activation_buffer.pop(0)
+        if config.sequence_parallel:
+            name = "mpu_" + str((i + 1) % 2)
+            all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, name)
+            handle = dist_all_gather_func(all_gather_buffer, input, group=tp_group, async_op=True)
+
+            all_gathered_input[(i + 1) % 2] = all_gather_buffer
+            all_gather_buffer = None
+        else:
+            all_gathered_input[(i + 1) % 2] = input
+
+        grad_output = grad_output_buffer.pop(0)
+        wgrad_compute(all_gathered_input[i % 2], grad_output, weight)
+        drain_idx = (i + 1) % 2
+        input, all_gathered_input[i % 2], grad_output = None, None, None
+
+        if config.sequence_parallel:
+            handle.wait()
+
+    grad_output = grad_output_buffer.pop(0)
+    wgrad_compute(all_gathered_input[drain_idx], grad_output, weight)
+    input, all_gathered_input[drain_idx], grad_output = None, None, None
+
+
+def local_multi_tensor_applier(op, noop_flag_buffer, tensor_lists, *args):
+    """Multi tensor op applier"""
+    return op(2048 * 32, noop_flag_buffer, tensor_lists, *args)
+
+
+# computes l2 norm for a list of contiguous tensors
+# works as a drop-in replacement for amp_C.multi_tensor_l2norm
+def local_multi_tensor_l2_norm(chunk_size, noop_flag, tensor_lists, per_tensor, *args):
+    """
+    Computes l2 norm for a list of contiguous tensors
+    works as a drop-in replacement for amp_C.multi_tensor_l2norm
+    """
+    l2 = [[(torch.norm(tensor)) for tensor in tensor_list] for tensor_list in tensor_lists]
+    l2_reduced = torch.norm(torch.tensor(l2))
+    l2_cuda = torch.tensor([float(l2_reduced)], dtype=torch.float, device="cuda")
+    return l2_cuda, None
+
+
+# works as a drop-in replacement for amp_C.multi_tensor_scale
+def local_multi_tensor_scale(chunk_size, noop_flag, tensor_lists, scale):
+    """Works as a drop-in replacement for amp_C.multi_tensor_scale."""
+    for src, dst in zip(tensor_lists[0], tensor_lists[1]):
+        dst.copy_(src * scale)
+
+
+class _ValueWithRank:
+    """This is an internal class, not for use outside this module
+
+    Attributes:
+        _rank (int): rank for the value
+        _value (float) : the value it stores, eg elapsed time
+        _unit (str) : unit for the value
+    """
+
+    def __init__(self, value: float, rank: int, unit: str = "") -> None:
+        """Initializer
+
+        Args:
+            _value (float): the initial value with which it is inited
+            _rank (int): the rank number
+            _unit (str) : the unit of the value, eg ms or flops
+        """
+        self._rank = rank
+        self._value = value
+        self._unit = unit
+
+    def __lt__(self, other) -> bool:
+        """Check if value of self is smaller than other's value
+
+        Args:
+            other (_ValueWithRank): The other object to compare with
+
+        Returns:
+            bool: True if lhs._value of operand is less than rhs._value, else False
+        """
+        return self._value < other._value
+
+    def __gt__(self, other) -> bool:
+        """Check if value of self is larger than other's value
+
+        Args:
+            other (_ValueWithRank): The other object to compare with
+
+        Returns:
+            bool: True if lhs._value of operand is greater than rhs._value, else False
+        """
+        return self._value > other._value
+
+    def __call__(self) -> Tuple[float, int, str]:
+        """Returns the value, the rank, and unit as a Tuple
+
+        Returns:
+            Tuple[float, int, str]: value, rank, unit
+        """
+        return self._value, self._rank, self._unit
+
+    def __str__(self) -> str:
+        """String representation of the object
+
+        Returns:
+            str: strigified object
+        """
+
+        return f"{self._value:.2f}{self._unit}/{self._rank}"
+
+
+@dataclass
+class _StragglerData:
+    """This is an internal dataclass, not for use outside this module
+
+    Attributes:
+        min_elapsed (_ValueWithRank) min iteration time across all ranks
+        max_elapsed (_ValueWithRank) max iteration time across all ranks
+        min_btime (_ValueWithRank) min cpu time across all ranks
+        max_btime (_ValueWithRank) max cpu time across all ranks
+        min_temp (_ValueWithRank): min gpu temp across all ranks
+        max_temp (_ValueWithRank): max gpu temp across all ranks
+        min_power (_ValueWithRank) min gpu power across all ranks
+        max_power (_ValueWithRank) max gpu power across all ranks
+        min_util (_ValueWithRank): min gpu util across all ranks
+        max_util (_ValueWithRank): max gpu util across all ranks
+        min_clock (_ValueWithRank): min gpu clock across all ranks
+        max_clock (_ValueWithRank) max gpu clock across all ranks
+        aflops (List[_ValueWithRank]): sorted array of (_ValueWithRank)
+    """
+
+    # gemm time
+    min_elapsed = _ValueWithRank(sys.float_info.max, 0, "ms")
+    max_elapsed = _ValueWithRank(sys.float_info.min, 0, "ms")
+    # get_batch time
+    min_btime = _ValueWithRank(sys.float_info.max, 0, "us")
+    max_btime = _ValueWithRank(sys.float_info.min, 0, "us")
+    # temp
+    min_temp = _ValueWithRank(sys.float_info.max, 0, "C")
+    max_temp = _ValueWithRank(sys.float_info.min, 0, "C")
+    # power
+    min_power = _ValueWithRank(sys.float_info.max, 0, "W")
+    max_power = _ValueWithRank(sys.float_info.min, 0, "W")
+    # util
+    min_util = _ValueWithRank(sys.float_info.max, 0, "%")
+    max_util = _ValueWithRank(sys.float_info.min, 0, "%")
+    # clock
+    min_clock = _ValueWithRank(sys.float_info.max, 0, "MHz")
+    max_clock = _ValueWithRank(sys.float_info.min, 0, "MHz")
+    aflops: Union[List[_ValueWithRank], None] = None
+
+
+class StragglerDetector:
+    """Singleton Class implementing per rank Straggler Detector
+
+    It use cuda events to time operation of choice using the
+    start and stop methods which can be directly invoked using
+    the class instance or can be used like a python context.
+    After collection, a report() method is available to display
+    the collected metrics. It is only supported if CUDA is
+    available. megatron/core/README_STRAGGLER.md for more info
+
+    Note:
+        The instance and class attributes mentioned below are all
+        private to the class and has no use outside the class
+
+    Attributes:
+        _off (bool): current state of the toggle
+        start (FunctionType): start method
+        stop (FunctionType): stop method
+        world (int): world size
+        rank (int): rank for this instance
+        mmcnt (int): number of ranks to report
+        port (int): control port
+        amp (float): amplification factor for TFLOPs, default 3.0
+        toggle (bool): whether to start/stop detector collection
+        bdata (bool): when true, just collect get_batch
+        dev (int): cuda device
+        evt_q (LifoQueue): cuda event queue
+        start_gemm_ev (list[torch.cuda.Event]): cuda start event
+        stop_gemm_ev (list[torch.cuda.Event]): cuda stop event
+        start_data_ev (list[torch.cuda.Event]): cuda start event
+        stop_data_ev (list[torch.cuda.Event]): cuda stop event
+        start_gemm_tm (list[int]): start time (wallclock)
+        stop_gemm_tm (list[int]): stop time (wallclock)
+        start_data_tm (list[int]): start time for get_batch
+        stop_data_tm (list[int]): stop time for get_batch
+        sock (socket): the controller socket
+        ctrlr (Thread): the controller thread
+    """
+
+    _configured = False
+    """Indicates if the singleton instance is configured or not
+    """
+
+    def __new__(cls: Type["StragglerDetector"]) -> "StragglerDetector":
+        """Constructor
+        Creates an instance of the class if not created
+
+        Args:
+            cls (Type[&#39;StragglerDetector&#39;]): The class type
+
+        Returns:
+            StragglerDetector: the class instance
+        """
+
+        if not hasattr(cls, "_instance"):
+            cls._instance = super(StragglerDetector, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self) -> None:
+        """Initializer
+
+        The inital state of the StragglerDetector instance is disabled.
+        The enabled state is indicated using self._off member variable
+        and the proerty enabled.
+        """
+        self._off: bool = True
+        self.start = self.null_method
+        self.stop = self.null_method
+        self.world: int = 0
+        self.rank: int = 0
+        self.mmcnt: int = 1
+        self.port: int = 0
+        self.amp: float = 3.0
+        self.toggle: bool = False
+        self.bdata: bool = False
+        self.dev: Union[torch.device, int, None] = None
+        self.evt_q: Union[queue.LifoQueue, None] = None
+        self.start_gemm_ev: List[torch.cuda.Event] = []
+        self.stop_gemm_ev: List[torch.cuda.Event] = []
+        self.start_data_ev: List[torch.cuda.Event] = []
+        self.stop_data_ev: List[torch.cuda.Event] = []
+        self.start_gemm_tm: List[int] = []
+        self.stop_gemm_tm: List[int] = []
+        self.start_data_tm: List[int] = []
+        self.stop_data_tm: List[int] = []
+        self.sock: Union[socket.socket, None] = None
+        self.ctrlr: Union[threading.Thread, None] = None
+
+    def configure(
+        self,
+        world: int,
+        rank: int,
+        mmcnt: int = 1,
+        amp: float = 3.0,
+        port: int = 65535,
+        prefill: int = 1024,
+        enabled: bool = False,
+    ) -> None:
+        """This method is called to configure the Singleton instance
+
+        It should be called once per instantiation per process.
+
+        Note:
+            The constructor keeps the state of instance disabled
+            i.e no collection will happen even when start/stop methods are
+            called. Only when enabled is True (self._off is True), the
+            start/stop method pointers get assigned the real collection
+            methods, otherwise they are initialized with null_method
+
+        Args:
+            world (int): World Size
+            rank (int): The rank of this trainer
+            mmcnt (int, optional): Number of ranks to print for showing Min/Max Etpt.
+                                   Defaults to 1.
+            amp (float, optional): Set to 3.0 if we only use timers in fwd pass.
+                                   Defaults to 3.0.
+            port (int, optional): Control port, useful only for rank-0. Defaults to 65535.
+            prefill (int, optional): How many Events to pre-populate. Defaults to 1024.
+            enabled (bool, optional): Whether or not collection is enabled on startup.
+                                      Defaults to False.
+        """
+        if StragglerDetector._configured:
+            # don't throw
+            return
+        StragglerDetector._configured = True
+        self.bdata = False
+        self.start = self.null_method
+        self.stop = self.null_method
+        self._off = True
+        # No CUDA, No Support
+        if torch.cuda.is_available():
+            self._off = not enabled
+            self.world = world
+            self.rank = rank
+            self.mmcnt = mmcnt if mmcnt > 1 else 1
+            self.amp = amp
+            self.port = port
+            self.toggle = False
+            self.bdata = False
+            self.evt_q = queue.LifoQueue()
+            self.start_gemm_ev = []
+            self.stop_gemm_ev = []
+            self.start_data_ev = []
+            self.stop_data_ev = []
+            self.start_gemm_tm = []
+            self.stop_gemm_tm = []
+            self.start_data_tm = []
+            self.stop_data_tm = []
+            backend = torch.distributed.get_backend()
+            if backend == "nccl":
+                self.dev = torch.cuda.current_device()
+            else:
+                self.dev = torch.device("cpu")
+            # cache some events
+            for _ in range(prefill):
+                self.evt_q.put(torch.cuda.Event(enable_timing=True))
+            if self.rank == 0:
+                # Start the controller
+                self._controller()
+            if not self._off:
+                self.start = self.start_method
+                self.stop = self.stop_method
+
+    def reset(self) -> None:
+        """This method is called to reset the metrics state of the instance
+
+        It is generally called from within elapsed() after extracting per rank metrics.
+        """
+        if self._off:
+            return
+        # Pool them
+        if self.evt_q is not None:
+            _ = [self.evt_q.put(ev) for ev in self.start_gemm_ev]
+            _ = [self.evt_q.put(ev) for ev in self.stop_gemm_ev]
+            _ = [self.evt_q.put(ev) for ev in self.start_data_ev]
+            _ = [self.evt_q.put(ev) for ev in self.stop_data_ev]
+        self.start_gemm_ev = []
+        self.stop_gemm_ev = []
+        self.start_data_ev = []
+        self.stop_data_ev = []
+        # Use regular timers
+        self.start_gemm_tm = []
+        self.stop_gemm_tm = []
+        self.start_data_tm = []
+        self.stop_data_tm = []
+        self.bdata = False
+
+    def start_method(self) -> None:
+        """This method adds the start timers.
+
+        Both cuda event and perf_counter are added. If bdata is set to
+        true from __call__, this method skips inserting cuda
+        timer. This way it can be used to measure time spent on
+        CPU - generally useful for timing get_batch()
+        """
+        # Not reentrant
+        if self.evt_q is not None and self.evt_q.qsize() > 1:
+            sev = self.evt_q.get()  # no try-catch
+            eev = self.evt_q.get()  # no try-catch
+        else:
+            sev = torch.cuda.Event(enable_timing=True)
+            eev = torch.cuda.Event(enable_timing=True)
+        # First check if this start is for data
+        if self.bdata:
+            self.start_data_ev.append(sev)
+            self.stop_data_ev.append(eev)
+            self.start_data_tm.append(0)
+            self.stop_data_tm.append(0)
+            idx = len(self.stop_data_tm) - 1
+            self.start_data_tm[idx] = time.perf_counter_ns()
+            self.start_data_ev[idx].record()
+            self.bdata = False
+            return
+        self.start_gemm_ev.append(sev)
+        self.stop_gemm_ev.append(eev)
+        self.start_gemm_tm.append(0)
+        self.stop_gemm_tm.append(0)
+        idx = len(self.stop_gemm_tm) - 1
+        self.start_gemm_tm[idx] = time.perf_counter_ns()
+        self.start_gemm_ev[idx].record()
+
+    def stop_method(self) -> None:
+        """This method adds the stop timers.
+
+        Both cuda event and perf_counter are added. If bdata is set to
+        true from __call__, this method skips inserting cuda
+        timer. Also see start_method()
+        """
+        # Not reentrant
+        # First check if this stop is for data
+        idx = len(self.stop_data_tm) - 1
+        if idx >= 0 and self.stop_data_tm[idx] == 0:
+            self.stop_data_tm[idx] = time.perf_counter_ns()
+            self.stop_data_ev[idx].record()
+            return
+        idx = len(self.stop_gemm_tm) - 1
+        if idx >= 0 and self.stop_gemm_tm[idx] == 0:
+            self.stop_gemm_tm[idx] = time.perf_counter_ns()
+            self.stop_gemm_ev[idx].record()
+
+    def elapsed(self) -> Tuple[float, float, int, int, int, int]:
+        """This method is called from report(), or can be called directly
+
+         It is called to collect all the elapsed time since last reset().
+         It finally calls reset()
+
+        Returns:
+            Tuple[float, float, int, int, int, int]: see below for returns
+                delta       : time spent in kernel
+                batch_delta : time spent in get_batch
+                temp        : observed gpu temp
+                power       : observed gpu power
+                util        : observed gpu utilization
+                clock       : observed gpu clock
+        """
+        if self._off:
+            # match with return below
+            return 0, 0, 0, 0, 0, 0
+        ls_ev = len(self.start_gemm_ev)
+        le_ev = len(self.stop_gemm_ev)
+        ls_bs = len(self.start_data_ev)
+        ls_be = len(self.stop_data_ev)
+        delta = 0.0
+        batch_delta = 0.0
+        temp = 0
+        power = 0
+        clock = 0
+        if ls_ev != le_ev:
+            logger.warning(f"Event Start/Stop out of sync {ls_ev}/{le_ev}")
+        elif ls_bs != ls_be:
+            logger.warning(f"get_batch Start/Stop out of sync {ls_bs}/{ls_be}")
+        else:
+            temp = torch.cuda.temperature()
+            power = torch.cuda.power_draw()
+            util = torch.cuda.utilization()
+            clock = torch.cuda.clock_rate()
+            torch.cuda.synchronize()
+            # Process Events
+            for i in range(ls_ev):
+                e_ev = self.start_gemm_ev[i].elapsed_time(self.stop_gemm_ev[i])
+                e_tm = (self.stop_gemm_tm[i] - self.start_gemm_tm[i]) / 1e6  # ns to ms
+                # Pick the larger of Event and perf_counter time?
+                delta += max(e_ev, e_tm)
+            # Process get_batch
+            for i in range(ls_bs):
+                b_ev = self.start_data_ev[i].elapsed_time(self.stop_data_ev[i])
+                b_tm = (self.stop_data_tm[i] - self.start_data_tm[i]) / 1e6  # ns to ms
+                # data fetching has prefetch, hence take the max, instead of avg
+                batch_delta = max(batch_delta, max(b_ev, b_tm))
+        self.reset()  # Prepare for next round
+        # time in ms, batch_delta in ms, check return above
+        return delta, batch_delta, temp, power, util, clock
+
+    def report(self, total_flops: float = 0.0, log_interval: int = 0) -> bool:
+        """Function to log the min/max metircs and the associated rank over a time period
+
+        It finds the slowest and fastest rank among all ranks. It should be
+        called by all ranks, but only rank-0 prints the analysis
+        At the end it checks, if the straggler detector should
+        remain active or if it should be deactivated.
+
+        Args:
+            total_flops (float, optional): The theoretical flops over the period. Defaults to 0.0.
+            log_interval (int, optional): The training interval over which reporting is called(ms)
+                                          Defaults to 0.
+
+        Returns:
+            bool: True if reported, else False
+        """
+        ret = False
+        if not self._off and total_flops > 0.0 and log_interval > 0:
+            elapsed, btime, temp, power, util, clock = self.elapsed()  # get raw time
+            # btime (get_batch time is max in the iteration)
+            ptime = elapsed / (log_interval * 1.0)  # avg per iteration elapsed time, ms
+            api_flops = total_flops / (log_interval * 1.0)  # avg per iteration flops, ms
+            apir_flops = api_flops / (
+                ptime * 10**9 * self.world
+            )  # this is avg per iteration this rank's thruput, TFLOP/s (note 10**9),
+            et_flops = apir_flops / self.amp  # Estimated TFLOPs, not tracing backward
+
+            o_dt = self._min_max(
+                ptime, btime, float(temp), float(power), float(util), float(clock), et_flops
+            )
+            if self.rank == 0 and o_dt is not None and o_dt.aflops is not None:
+                now = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+                min_flops, min_frank, _ = o_dt.aflops[0]()
+                max_flops, max_frank, _ = o_dt.aflops[-1]()
+                logger.info(
+                    f"{now} | "
+                    f"MnRtt/Rnk: {o_dt.min_elapsed} | "
+                    f"MxRtt/Rnk: {o_dt.max_elapsed} | "
+                    f"MnPwr/Rnk: {o_dt.min_power} | "
+                    f"MxPwr/Rnk: {o_dt.max_power} | "
+                    f"MnTmp/Rnk: {o_dt.min_temp} | "
+                    f"MxTmp/Rnk: {o_dt.max_temp} | "
+                    f"MnUtl/Rnk: {o_dt.min_util} | "
+                    f"MxUtl/Rnk: {o_dt.max_util} | "
+                    f"MnClk/Rnk: {o_dt.min_clock} | "
+                    f"MxClk/Rnk: {o_dt.max_clock} | "
+                    f"MnDRtt/Rnk: {o_dt.min_btime} | "
+                    f"MxDRtt/Rnk: {o_dt.max_btime} | "
+                    f"MnEtpt/Rnk: {min_flops:.2f}TF/{min_frank} | "
+                    f"MxEtpt/Rnk: {max_flops:.2f}TF/{max_frank}"
+                )
+                if self.mmcnt > 1 and self.mmcnt < self.world:
+                    line = f"^^^^ Bottom {self.mmcnt} Ranks with lowest  Etpt(TF):"
+                    for i in range(self.mmcnt):
+                        line += f" {o_dt.aflops[i]},"
+                    logger.info(line)
+                    line = f"^^^^ Top    {self.mmcnt} Ranks with highest Etpt(TF):"
+                    shift = self.world - self.mmcnt
+                    for i in range(self.mmcnt):
+                        line += f" {o_dt.aflops[i + shift]},"
+                    logger.info(line)
+                ret = True
+
+        # Check/Communicate if tracking is turned off or on
+        self._check_toggle()
+        return ret
+
+    def _check_toggle(self) -> None:
+        """Helper method to check if a request to toggle the collection state was made
+
+        It checks iof collection state toggle req was made via the server listening on
+        rank-0 since last call to report(). Called by report(). Calling this method
+        indirectly from report() is the only way to activate the change that is made
+        via rank-0
+        """
+        # If no change just communicate the current
+        off = self._off
+        if self.rank == 0 and self.toggle:
+            off = not self._off
+            self.toggle = False
+        st = torch.tensor(off, dtype=torch.bool, device=self.dev)
+        torch.distributed.broadcast(st, 0)  # Blocking
+        # save old switch
+        off = self._off
+        self._off = bool(st.item())
+        if off != self._off:
+            if not self._off:
+                self.start = self.start_method
+                self.stop = self.stop_method
+                state = "ON"
+            else:
+                self.start = self.null_method
+                self.stop = self.null_method
+                state = "OFF"
+            if self.rank == 0:
+                logger.info(f"Toggling StragglerDetector State {state}")
+
+    def _handler(self) -> None:
+        """Thread function for the controller.
+
+        It is a tcp-server that listens on a port. Uses HTTP protocol.
+        If connected to it using curl, it indicates a toggle of the
+        collection state. The actual toggling happens at the end of
+        calling report() when _check_toggle() is called.
+        """
+        resp = r"HTTP/1.0 200 OK\r\nConnection: Close\r\nContent-length: "
+
+        if self.rank == 0:
+            state = "OFF" if self._off else "ON"
+            logger.info(
+                f"Controller ready to recv commands on port {self.port}. Current state {state}"
+            )
+            while True and self.sock is not None:
+                try:
+                    conn, _ = self.sock.accept()
+                    _ = conn.recv(1024)
+                    self.toggle = True
+                    state = "ON" if self._off else "OFF"
+                    msg = f"Will turn StragglerDetector {state} at next logging interval"
+                    msg_len = len(msg)
+                    final_resp = f"{resp}{msg_len}\r\n\r\n{msg}"
+                    conn.send(final_resp.encode())
+                    conn.close()
+                    logger.info(msg)
+                except Exception as err:
+                    logger.error(f"Error in stragler handler.. {str(err)}")
+                    return
+
+    def _controller(self):
+        """Installs a controller listener that is used to toggle collection state.
+
+        Called from configure(). Ignored for all ranks other than rank-0
+        """
+        try:
+            if self.rank == 0:
+                neth = "0.0.0.0"
+                netp = self.port
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self.sock.bind((neth, netp))
+                self.sock.listen(128)
+                self.ctrlr = threading.Thread(
+                    target=self._handler, args=(), name="straggler", daemon=True
+                )
+                self.ctrlr.start()
+        except Exception as err:
+            logger.warning(f"StragglerDetector cannot be controlled.. {str(err)}")
+
+    def _min_max(
+        self,
+        ptime: float,
+        btime: float,
+        temp: float,
+        power: float,
+        util: float,
+        clock: float,
+        flops: float,
+    ) -> Union[_StragglerData, None]:
+        """Helper function to find the min/max values
+
+        Args:
+            ptime (float): avg per iteration gpu time
+            btime (float): avg per iteration cpu time
+            temp (float): gpu temp at the time of reporting
+            power (float): gpu power at the time of reporting
+            util (float): gpu util at the time of reporting
+            clock (float): gpu clock at the time of reporting
+            flops (float): estimated flops for the rank
+
+        Returns:
+            Union[_StragglerData, None]: It contains the min/max of few metrics and the
+                                         corresponding rank it also has sorted list of
+                                         all (flops, rank) sorted by flops (aflops)
+                                         or returns None if collecton is disabled
+        """
+        if self._off:
+            return None
+        # initialize output data object
+        o_dt = _StragglerData()
+
+        prof_data: Dict[str, Union[int, float]] = {}
+        data_list: List[Dict[str, Union[int, float]]] = []
+        prof_data["rank"] = self.rank
+        prof_data["time"] = ptime
+        prof_data["btime"] = btime
+        prof_data["temp"] = temp
+        prof_data["power"] = power
+        prof_data["util"] = util
+        prof_data["clock"] = clock
+        prof_data["flops"] = flops
+
+        if self.rank == 0:
+            data_list = [prof_data] * self.world
+
+        # this is blocking by default
+        torch.distributed.gather_object(prof_data, object_gather_list=data_list, dst=0)
+
+        if self.rank == 0:
+            min_ctime = min(data_list, key=lambda k: k["time"])  # elapsed
+            max_ctime = max(data_list, key=lambda k: k["time"])  # elapsed
+
+            min_cbatch = min(data_list, key=lambda k: k["btime"])  # batch time
+            max_cbatch = max(data_list, key=lambda k: k["btime"])  # batch time
+
+            min_ctemp = min(data_list, key=lambda k: k["temp"])  # temp
+            max_ctemp = max(data_list, key=lambda k: k["temp"])  # temp
+
+            min_cpower = min(data_list, key=lambda k: k["power"])  # power
+            max_cpower = max(data_list, key=lambda k: k["power"])  # power
+
+            min_cutil = min(data_list, key=lambda k: k["util"])  # gpu util
+            max_cutil = max(data_list, key=lambda k: k["util"])  # gpu util
+
+            min_cclock = min(data_list, key=lambda k: k["clock"])  # gpu clock
+            max_cclock = max(data_list, key=lambda k: k["clock"])  # gpu clock
+
+            min_val = min_ctime["time"]
+            min_rank = min_ctime["rank"]
+            max_val = max_ctime["time"]
+            max_rank = max_ctime["rank"]
+            o_dt.min_elapsed = _ValueWithRank(min_val, int(min_rank), "ms")
+            o_dt.max_elapsed = _ValueWithRank(max_val, int(max_rank), "ms")
+
+            min_val = min_cbatch["btime"]
+            min_rank = min_cbatch["rank"]
+            max_val = max_cbatch["btime"]
+            max_rank = max_cbatch["rank"]
+            o_dt.min_btime = _ValueWithRank(min_val, int(min_rank), "ms")
+            o_dt.max_btime = _ValueWithRank(max_val, int(max_rank), "ms")
+
+            min_val = min_ctemp["temp"]
+            min_rank = min_ctemp["rank"]
+            max_val = max_ctemp["temp"]
+            max_rank = max_ctemp["rank"]
+            o_dt.min_temp = _ValueWithRank(min_val, int(min_rank), "C")
+            o_dt.max_temp = _ValueWithRank(max_val, int(max_rank), "C")
+
+            min_val = min_cpower["power"]
+            min_rank = min_cpower["rank"]
+            max_val = max_cpower["power"]
+            max_rank = max_cpower["rank"]
+            o_dt.min_power = _ValueWithRank(min_val, int(min_rank), "W")
+            o_dt.max_power = _ValueWithRank(max_val, int(max_rank), "W")
+
+            min_val = min_cutil["util"]
+            min_rank = min_cutil["rank"]
+            max_val = max_cutil["util"]
+            max_rank = max_cutil["rank"]
+            o_dt.min_util = _ValueWithRank(min_val, int(min_rank), "%")
+            o_dt.max_util = _ValueWithRank(max_val, int(max_rank), "%")
+
+            min_val = min_cclock["clock"]
+            min_rank = min_cclock["rank"]
+            max_val = max_cclock["clock"]
+            max_rank = max_cclock["rank"]
+            o_dt.min_clock = _ValueWithRank(min_val, int(min_rank), "MHz")
+            o_dt.max_clock = _ValueWithRank(max_val, int(max_rank), "MHz")
+
+            o_dt.aflops = [
+                _ValueWithRank(d.get("flops", 0.0), int(d.get("rank", -1)))
+                for _, d in enumerate(data_list)
+            ]
+            o_dt.aflops.sort(key=lambda val_with_rank: val_with_rank()[0])
+        # wait for everyone here
+        torch.distributed.barrier()
+
+        return o_dt
+
+    @property
+    def enabled(self) -> bool:
+        """Can be called to check the enabled state of the instance
+
+        Note:
+            After the request to toggle the state, the
+            actual state change happens at end of call
+            to report()
+        """
+        return not self._off
+
+    @property
+    def configured(self) -> bool:
+        """Can be called to check if the instance is already configured
+
+        Returns:
+            bool: returns True if configure was called and was a success, else False
+        """
+        return StragglerDetector._configured
+
+    @property
+    def my_rank(self):
+        """Can be called to get configured rank of this instance
+
+        Returns:
+            int: Configured rank for this instance
+        """
+        return self.rank
+
+    @property
+    def world_size(self) -> int:
+        """Can be called to get configured world of this instance
+
+        Returns:
+            int: World size configured for this instance
+        """
+        return self.world
+
+    def null_method(self) -> None:
+        """Default method to initialize start/stop method ptrs"""
+        pass
+
+    def __enter__(self) -> "StragglerDetector":
+        """Define context/instance entry
+
+        Returns:
+            StragglerDetector: the instance
+        """
+        self.start()
+        return self
+
+    def __call__(self, bdata: bool = False) -> "StragglerDetector":
+        """Callable for the instance. Set context state,
+
+        Useful when the context is used for cpu timers only when bdata=True
+
+        Args:
+            bdata (bool, optional): when true, only enables cpu timers. Defaults to False.
+
+        Returns:
+            StragglerDetector: the instance
+        """
+        self.bdata = bdata
+        return self
+
+    def __exit__(
+        self,
+        ex_type: Optional[Type[BaseException]],
+        ex_val: Optional[BaseException],
+        ex_tb: Optional[TracebackType],
+    ) -> bool:
+        """Define context/instance exit, calls the stop method
+
+        Args:
+            ex_type (Optional[Type[BaseException]]): Exception type
+            ex_val (Optional[BaseException]): _description_
+            ex_tb (Optional[TracebackType]): _description_
+
+        Returns:
+            bool: True if the exception was handled
+        """
+        # Should not suppress errors even if turned off
+        if ex_type is not None:
+            err = traceback.format_exception(ex_type, ex_val, ex_tb)
+            logger.warning(f"{str(ex_val)}\n{err}")
+        self.stop()
+        return False
+
+
+# Singleton, global visibility
+__straggler__ = StragglerDetector()
+"""StragglerDetector: private module variable, not be directly accessed
+"""
+
+
+def is_submodule(module, parent_module, strict=True):
+    """
+    Check if a module is a submodule of another module.
+    """
+    if strict:
+        if module is parent_module:
+            return False
+    for m in parent_module.modules():
+        if m is module:
+            return True
+    return False
+
+
+########################
+### tensor parallel ####
+########################
+
+
+@deprecated_hybrid_cp_kwargs
+def get_batch_on_this_tp_rank(
+    batch: dict[str, torch.Tensor],
+    has_cu_seqlens: bool,
+    dynamic_cp: bool,
+    create_attention_mask_in_dataloader: bool,
+    broadcast_src_rank: int,
+    broadcast_group: torch.distributed.ProcessGroup,
+    cp_size: int,
+    tp_rank: int,
+    micro_batch_size: int,
+    seq_length: int,
+    mtp_on_this_rank: bool,
+    pipeline_model_parallel_size: int = 1,
+    is_pipeline_first_stage: bool = False,
+    is_pipeline_last_stage: bool = False,
+):
+    """Broadcast batch tensors from TP rank 0 to all other ranks in the TP group.
+
+    TP rank 0 holds the fully preprocessed batch (from the dataloader or from
+    ``preprocess_sft_batch`` when SFT is enabled). This function broadcasts
+    every required tensor to the remaining TP ranks so that all ranks hold
+    identical data before the forward pass. The set of tensors broadcast depends
+    on the pipeline stage and whether SFT / dynamic CP modes are active.
+
+    For SFT and dynamic CP, variable-length metadata (``cu_seqlens``,
+    ``cu_seqlens_padded``) is broadcast using a length-prefixed protocol: TP
+    rank 0 first sends the numel, then the tensor itself, so receivers can
+    allocate the correct buffer size.
+
+    For dynamic CP, the sequence length may differ per micro-batch (since it
+    depends on `local_cp_size`), so the actual sequence length is broadcast
+    before allocating receive buffers on non-zero TP ranks.
+
+    Args:
+        batch (dict[str, torch.Tensor]): The batch dict. On TP rank 0 this
+            contains the actual data; on other ranks it is ignored (receive
+            buffers are allocated internally).
+        has_cu_seqlens (bool): Whether the batch contains cu_seqlens and
+            max_seqlen metadata (e.g., SFT or --dataloader-inter-document-masking).
+        dynamic_cp (bool): Whether dynamic context parallelism is enabled.
+        create_attention_mask_in_dataloader (bool): Whether the dataloader
+            creates an explicit attention mask tensor.
+        broadcast_src_rank (int): Global rank of the broadcast source (TP rank 0).
+        broadcast_group (torch.distributed.ProcessGroup): The TP process group
+            used for broadcasting.
+        cp_size (int): Context-parallel world size.
+        tp_rank (int): This rank's position within the TP group.
+        micro_batch_size (int): Micro-batch size (number of samples).
+        seq_length (int): Sequence length used for allocating receive buffers
+            (ignored under dynamic CP where it is broadcast per micro-batch).
+        mtp_on_this_rank (bool): Whether Multi-Token Prediction layers are
+            active on this rank (affects which tensors are needed).
+        pipeline_model_parallel_size (int): Number of pipeline-parallel stages.
+        is_pipeline_first_stage (bool): Whether this rank is on the first PP stage.
+        is_pipeline_last_stage (bool): Whether this rank is on the last PP stage.
+
+    Returns:
+        dict[str, torch.Tensor]: The batch dict with all tensors populated on
+        every TP rank. Keys include 'tokens', 'labels', 'loss_mask',
+        'position_ids', 'attention_mask', 'cu_seqlens', 'cu_seqlens_padded',
+        'max_seqlen', 'local_cp_size', and 'hybrid_cp_group'.
+    """
+
+    def _broadcast(item):
+        if item is not None:
+            torch.distributed.broadcast(item, broadcast_src_rank, group=broadcast_group)
+
+    if tp_rank == 0:
+
+        def _broadcast_cu_seqlens(cu_seqlens):
+            dev = torch.cuda.current_device()
+            n = 0 if cu_seqlens is None else int(cu_seqlens.numel())
+            n_tensor = torch.tensor(n, dtype=torch.int64, device=dev)
+            _broadcast(n_tensor)
+
+            if n > 0:
+                assert isinstance(
+                    cu_seqlens, torch.Tensor
+                ), f"Expected cu_seqlens to be a torch.Tensor, got {type(cu_seqlens)}"
+                assert (
+                    cu_seqlens.dtype == torch.int32
+                ), f"Expected cu_seqlens to be of type torch.int32, got {cu_seqlens.dtype}"
+                _broadcast(cu_seqlens)
+
+        if dynamic_cp:
+            dynamic_cp_seq_length = torch.tensor(
+                batch['tokens'].shape[1], dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            _broadcast(dynamic_cp_seq_length)
+
+        if pipeline_model_parallel_size == 1 or mtp_on_this_rank:
+            _broadcast(batch['tokens'])
+            _broadcast(batch['labels'])
+            _broadcast(batch['loss_mask'])
+            _broadcast(batch['position_ids'])
+            if has_cu_seqlens or dynamic_cp:
+                _broadcast_cu_seqlens(batch['cu_seqlens'])
+                _broadcast(batch['max_seqlen'])
+                if cp_size > 1:
+                    _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+            if create_attention_mask_in_dataloader:
+                _broadcast(batch['attention_mask'])
+            if dynamic_cp:
+                _broadcast(batch['local_cp_size'])
+
+        elif is_pipeline_first_stage:
+            batch["labels"] = None
+            batch["loss_mask"] = None
+
+            _broadcast(batch['tokens'])
+            _broadcast(batch['position_ids'])
+            if has_cu_seqlens:
+                _broadcast_cu_seqlens(batch['cu_seqlens'])
+                _broadcast(batch['max_seqlen'])
+                if cp_size > 1:
+                    _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+            if create_attention_mask_in_dataloader:
+                _broadcast(batch['attention_mask'])
+
+        elif is_pipeline_last_stage:
+            batch["tokens"] = None
+            batch["position_ids"] = None
+
+            _broadcast(batch['labels'])
+            _broadcast(batch['loss_mask'])
+            if has_cu_seqlens:
+                _broadcast_cu_seqlens(batch['cu_seqlens'])
+                _broadcast(batch['max_seqlen'])
+                if cp_size > 1:
+                    _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+            if create_attention_mask_in_dataloader:
+                _broadcast(batch['attention_mask'])
+
+        elif has_cu_seqlens:
+            # NOTE(asolergi-nv): Broadcast required THD metadata to intermediate stages.
+            batch["tokens"] = None
+            batch["labels"] = None
+            batch["loss_mask"] = None
+            batch["position_ids"] = None
+            batch["attention_mask"] = None
+
+            _broadcast_cu_seqlens(batch['cu_seqlens'])
+            _broadcast(batch['max_seqlen'])
+            if cp_size > 1:
+                _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+
+    else:
+        if dynamic_cp:
+            dynamic_cp_seq_length = torch.tensor(
+                0, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            _broadcast(dynamic_cp_seq_length)
+            shape = (micro_batch_size, dynamic_cp_seq_length.item())
+        else:
+            shape = (micro_batch_size, seq_length)
+
+        tokens = torch.empty(shape, dtype=torch.int64, device=torch.cuda.current_device())
+        labels = torch.empty(shape, dtype=torch.int64, device=torch.cuda.current_device())
+        loss_mask = torch.empty(shape, dtype=torch.float32, device=torch.cuda.current_device())
+        position_ids = torch.empty(shape, dtype=torch.int64, device=torch.cuda.current_device())
+        cu_seqlens = None
+        cu_seqlens_padded = None
+        max_seqlen = None
+        attention_mask = None
+        local_cp_size = None
+
+        if has_cu_seqlens or dynamic_cp:
+            max_seqlen = torch.empty(
+                micro_batch_size, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+        if create_attention_mask_in_dataloader:
+            attention_mask = torch.empty(
+                (micro_batch_size, 1, seq_length, seq_length),
+                dtype=torch.bool,
+                device=torch.cuda.current_device(),
+            )
+
+        if dynamic_cp:
+            local_cp_size = torch.empty(1, dtype=torch.int32, device=torch.cuda.current_device())
+
+        def _broadcast_cu_seqlens():
+            dev = torch.cuda.current_device()
+
+            n = torch.empty((), dtype=torch.int64, device=dev)
+            _broadcast(n)
+            n = int(n.item())
+
+            if n == 0:
+                return None
+
+            # cu_seqlens / cu_seqlens_padded carry the dataloader's batch dim
+            # (micro_batch_size, padded_len) after default_collate. Preserve
+            # the 2-D layout so flatten_batch_for_packed_sequences can merge
+            # samples correctly when micro_batch_size > 1.
+            assert n % micro_batch_size == 0, (
+                f"cu_seqlens numel ({n}) is not divisible by "
+                f"micro_batch_size ({micro_batch_size})"
+            )
+            cu_seqlens = torch.empty(
+                (micro_batch_size, n // micro_batch_size), dtype=torch.int32, device=dev
+            )
+            _broadcast(cu_seqlens)
+            assert cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == micro_batch_size, (
+                f"Expected cu_seqlens shape ({micro_batch_size}, "
+                f"{n // micro_batch_size}), got {tuple(cu_seqlens.shape)}"
+            )
+            assert (
+                cu_seqlens.dtype == torch.int32
+            ), f"Expected cu_seqlens to be of type torch.int32, got {cu_seqlens.dtype}"
+            return cu_seqlens
+
+        if pipeline_model_parallel_size == 1 or mtp_on_this_rank:
+            _broadcast(tokens)
+            _broadcast(labels)
+            _broadcast(loss_mask)
+            _broadcast(position_ids)
+            if has_cu_seqlens or dynamic_cp:
+                cu_seqlens = _broadcast_cu_seqlens()
+                _broadcast(max_seqlen)
+                if cp_size > 1:
+                    cu_seqlens_padded = _broadcast_cu_seqlens()
+            if create_attention_mask_in_dataloader:
+                _broadcast(attention_mask)
+            if dynamic_cp:
+                _broadcast(local_cp_size)
+
+        elif is_pipeline_first_stage:
+            labels = None
+            loss_mask = None
+
+            _broadcast(tokens)
+            _broadcast(position_ids)
+            if has_cu_seqlens:
+                cu_seqlens = _broadcast_cu_seqlens()
+                _broadcast(max_seqlen)
+                if cp_size > 1:
+                    cu_seqlens_padded = _broadcast_cu_seqlens()
+            if create_attention_mask_in_dataloader:
+                _broadcast(attention_mask)
+
+        elif is_pipeline_last_stage:
+            tokens = None
+            position_ids = None
+
+            _broadcast(labels)
+            _broadcast(loss_mask)
+            if has_cu_seqlens:
+                cu_seqlens = _broadcast_cu_seqlens()
+                _broadcast(max_seqlen)
+                if cp_size > 1:
+                    cu_seqlens_padded = _broadcast_cu_seqlens()
+            if create_attention_mask_in_dataloader:
+                _broadcast(attention_mask)
+
+        elif has_cu_seqlens:
+            # NOTE(asolergi-nv): Broadcast required THD metadata to intermediate stages.
+            tokens = None
+            labels = None
+            loss_mask = None
+            position_ids = None
+
+            cu_seqlens = _broadcast_cu_seqlens()
+            _broadcast(max_seqlen)
+            if cp_size > 1:
+                cu_seqlens_padded = _broadcast_cu_seqlens()
+
+        batch = {
+            'tokens': tokens,
+            'labels': labels,
+            'loss_mask': loss_mask,
+            'position_ids': position_ids,
+            'attention_mask': attention_mask,
+            'cu_seqlens': cu_seqlens,
+            'cu_seqlens_padded': cu_seqlens_padded,
+            'max_seqlen': max_seqlen,
+            'local_cp_size': local_cp_size,
+            'hybrid_cp_group': None,
+        }
+
+    return batch
+
+
+########################
+### context parallel ###
+########################
+
+
+def _get_batch_on_this_cp_rank_per_document_balancing(
+    batch: dict[str, torch.Tensor], cp_group: torch.distributed.ProcessGroup
+):
+    """Partition a batch across CP ranks with per-document zigzag load balancing.
+
+    Applies zigzag load-balanced chunking independently within each
+    sub-sequence (document) using Transformer Engine's
+    ``thd_get_partitioned_indices``. Each document length must be
+    divisible by ``2 * cp_size``. Sequence-dimension tensors (tokens,
+    labels, loss_mask, position_ids) are index-selected to this CP
+    rank's partition; metadata keys (cu_seqlens, cu_seqlens_padded,
+    max_seqlen, etc.) are left unchanged.
+
+    Args:
+        batch (dict[str, torch.Tensor]): Batch dict with tensors of shape
+            ``[micro_batch_size, seq_length, ...]``.
+        cp_group (torch.distributed.ProcessGroup): The context-parallel
+            process group.
+
+    Returns:
+        dict[str, torch.Tensor]: The batch with sequence-dimension tensors
+        partitioned to this CP rank.
+    """
+    cp_size = torch.distributed.get_world_size(cp_group)
+    cp_rank = torch.distributed.get_rank(cp_group)
+
+    if cp_size > 1:
+        # cu_seqlens / cu_seqlens_padded carry a leading batch dim (1, n).
+        # tex.thd_get_partitioned_indices expects a 1-D tensor, so squeeze
+        # the batch dim inline without mutating the batch dict.
+        cu_seqlens_for_te = (
+            batch["cu_seqlens_padded"]
+            if batch["cu_seqlens_padded"] is not None
+            else batch["cu_seqlens"]
+        )[0]
+        SEQUENCE_KEYS = (
+            "tokens",
+            "labels",
+            "loss_mask",
+            "position_ids",
+            "decoder_input",
+            "mtp_input_mask",
+            "padding_mask",
+        )
+        sequence_tensor = next(
+            (batch.get(key) for key in SEQUENCE_KEYS if batch.get(key) is not None), None
+        )
+        if sequence_tensor is None:
+            return batch
+        index = tex.thd_get_partitioned_indices(
+            cu_seqlens_for_te, sequence_tensor.size(1), cp_size, cp_rank
+        )
+        for key in SEQUENCE_KEYS:
+            if batch.get(key) is not None:
+                batch[key] = batch[key].index_select(1, index)
+    return batch
+
+
+def _get_batch_on_this_cp_rank_per_sequence_balancing(
+    batch: dict[str, torch.Tensor], cp_group: torch.distributed.ProcessGroup
+):
+    """Partition a batch across CP ranks with per-sequence zigzag load balancing.
+
+    Applies zigzag load-balanced chunking across the entire sequence. The
+    sequence is split into ``2 * cp_size`` equal chunks and assigned in a
+    zigzag pattern: for CP=2, the 4 chunks are assigned as
+    (chunk_0, chunk_3) -> GPU 0 and (chunk_1, chunk_2) -> GPU 1, balancing
+    compute for causal attention where later tokens attend to more
+    predecessors. The sequence length must be divisible by
+    ``2 * cp_size``. All tensor-valued entries in the batch are
+    partitioned along their sequence dimension; metadata keys
+    (cu_seqlens, cu_seqlens_padded, max_seqlen, etc.) and None-valued
+    entries are left unchanged.
+
+    Args:
+        batch (dict[str, torch.Tensor]): Batch dict with tensors of shape
+            ``[micro_batch_size, seq_length, ...]``.
+        cp_group (torch.distributed.ProcessGroup): The context-parallel
+            process group.
+
+    Returns:
+        dict[str, torch.Tensor]: The batch with sequence-dimension tensors
+        partitioned to this CP rank.
+    """
+
+    cp_size = torch.distributed.get_world_size(cp_group)
+    cp_rank = torch.distributed.get_rank(cp_group)
+
+    # Dynamic CP metadata is not partitioned along the sequence dim — skip by key.
+    # Intermediate PP stages set non-metadata keys to None, so still skip those.
+    METADATA_KEYS = (
+        'cu_seqlens',
+        'cu_seqlens_padded',
+        'dataset_id',
+        'max_seqlen',
+        'local_cp_size',
+        'hybrid_cp_group',
+    )
+
+    if cp_size > 1:
+        for key, val in batch.items():
+            if key in METADATA_KEYS or val is None:
+                continue
+            seq_dim = 2 if key == 'attention_mask' else 1
+            val = val.view(
+                *val.shape[0:seq_dim],
+                2 * cp_size,
+                val.shape[seq_dim] // (2 * cp_size),
+                *val.shape[(seq_dim + 1) :],
+            )
+            index = torch.zeros(2, dtype=torch.int64, device=val.device)
+            index[0].fill_(cp_rank)
+            index[1].fill_(2 * cp_size - cp_rank - 1)
+            val = val.index_select(seq_dim, index)
+            val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
+            batch[key] = val
+
+    return batch
+
+
+def _merge_cu_seqlens_across_micro_batch(cu_seqlens: torch.Tensor, seq_length: int) -> torch.Tensor:
+    """Merge per-sample cu_seqlens into one 1-D tensor for THD attention.
+
+    When micro_batch_size > 1, the dataloader produces cu_seqlens with shape
+    (micro_batch_size, padded_length).  THD / FlashAttention expects a
+    single 1-D cu_seqlens covering all tokens.  This function strips
+    per-row padding (trailing copies of ``seq_length`` beyond the first),
+    offsets each sample's cu_seqlens by ``sample_index * seq_length``, and
+    concatenates them, dropping the leading zero of every sample after the
+    first.
+
+    When micro_batch_size == 1, returns the unpadded ``cu_seqlens[0]``.
+
+    Args:
+        cu_seqlens: int32 tensor of shape ``(micro_batch_size, padded_length)``
+            where each row starts at 0, ends at ``seq_length``, and may be
+            right-padded with extra copies of ``seq_length``.
+        seq_length: per-sample sequence length used to compute offsets and
+            to detect padding.
+
+    Returns:
+        1-D int32 tensor of merged cumulative sequence lengths.
+    """
+
+    def _strip_padding(row):
+        """Return the valid prefix of a padded cu_seqlens row.
+
+        Valid entries run from 0 up to and including the first occurrence
+        of ``seq_length``.  Any trailing copies of ``seq_length`` (padding
+        inserted by the dataset for uniform collation) are dropped.
+        """
+        hits = (row == seq_length).nonzero(as_tuple=True)[0]
+        if hits.numel() > 0:
+            return row[: hits[0].item() + 1]
+        return row
+
+    micro_batch_size = cu_seqlens.shape[0]
+    if micro_batch_size == 1:
+        return _strip_padding(cu_seqlens[0])
+
+    parts = [_strip_padding(cu_seqlens[0])]
+    for i in range(1, micro_batch_size):
+        offset = i * seq_length
+        valid = _strip_padding(cu_seqlens[i])
+        parts.append(valid[1:] + offset)
+    return torch.cat(parts)
+
+
+def flatten_batch_for_packed_sequences(batch: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten a multi-sample batch into a single packed sequence for THD attention.
+
+    When ``micro_batch_size > 1`` and ``cu_seqlens`` is present, THD /
+    FlashAttention still expects one flat token stream with a single 1-D
+    ``cu_seqlens``.  This function merges ``cu_seqlens`` (and
+    ``cu_seqlens_padded`` if present) across samples, reshapes
+    sequence-dimension tensors from ``(mbs, seq_len)`` to
+    ``(1, mbs * seq_len)``, and reduces ``max_seqlen`` to its maximum.
+
+    When ``cu_seqlens`` is absent or ``micro_batch_size == 1``, the batch
+    is returned with only the batch dimension squeezed from ``cu_seqlens``
+    (and ``cu_seqlens_padded``).
+
+    Args:
+        batch: Batch dict produced by ``get_batch_on_this_tp_rank``.
+
+    Returns:
+        The batch dict with packed-sequence tensors flattened.
+    """
+    cu_seqlens = batch.get('cu_seqlens')
+    if cu_seqlens is None:
+        return batch
+
+    seq_length = None
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask'):
+        if batch.get(key) is not None:
+            seq_length = batch[key].shape[1]
+            break
+    if seq_length is None:
+        seq_length = cu_seqlens[0, -1].item()
+
+    batch['cu_seqlens'] = _merge_cu_seqlens_across_micro_batch(cu_seqlens, seq_length).unsqueeze(0)
+    if batch.get('cu_seqlens_padded') is not None:
+        batch['cu_seqlens_padded'] = _merge_cu_seqlens_across_micro_batch(
+            batch['cu_seqlens_padded'], seq_length
+        ).unsqueeze(0)
+    if batch.get('max_seqlen') is not None:
+        batch['max_seqlen'] = batch['max_seqlen'].max().unsqueeze(0)
+
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask'):
+        if batch.get(key) is not None:
+            batch[key] = batch[key].reshape(1, -1)
+
+    return batch
+
+
+def _resolve_dynamic_cp_group_for_batch(
+    batch: Dict[str, Any],
+    dynamic_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]],
+) -> torch.distributed.ProcessGroup:
+    """Resolve and validate the runtime CP group recorded by a scheduled batch."""
+    local_cp_size = batch.get('local_cp_size')
+    if local_cp_size is None:
+        raise ValueError("local_cp_size is required for dynamic context parallelism")
+    if isinstance(local_cp_size, torch.Tensor):
+        local_cp_size = int(local_cp_size.item())
+    else:
+        local_cp_size = int(local_cp_size)
+
+    runtime_cp_group = batch.get('hybrid_cp_group')
+    if runtime_cp_group is None:
+        if dynamic_cp_group_func is None:
+            raise ValueError("dynamic_cp_group_func is required to resolve the dynamic CP group")
+        runtime_cp_group = dynamic_cp_group_func(group_size=local_cp_size)
+    if runtime_cp_group is None:
+        raise ValueError(f"No dynamic CP group exists for local_cp_size={local_cp_size}")
+    runtime_cp_size = runtime_cp_group.size()
+    if runtime_cp_size != local_cp_size:
+        raise ValueError(
+            "Dynamic CP group size does not match local_cp_size: "
+            f"group has {runtime_cp_size} ranks, metadata requests {local_cp_size}."
+        )
+    batch['hybrid_cp_group'] = runtime_cp_group
+    return runtime_cp_group
+
+
+@deprecated_hybrid_cp_kwargs
+def get_batch_on_this_cp_rank(
+    batch: Dict[str, Any],
+    dynamic_cp: bool,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dynamic_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]] = None,
+    use_per_sequence_balancing: bool = False,
+    use_contiguous_cp: bool = False,
+):
+    """Dispatch batch partitioning across context-parallel ranks.
+
+    Routes to the appropriate CP partitioning strategy based on the batch
+    contents and parallelism mode:
+      - **Per-sequence zigzag**: When ``cu_seqlens`` is None, or when
+        ``use_per_sequence_balancing`` is True, delegates to
+        ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
+      - **Per-document zigzag**: When ``cu_seqlens`` is present and
+        ``dynamic_cp`` is False, delegates to
+        ``_get_batch_on_this_cp_rank_per_document_balancing``.
+      - **Dynamic CP**: Resolves the runtime CP group before selecting either
+        sharding strategy. The singleton group is retained as batch metadata.
+      - **Contiguous CP**: Keeps the dynamic-CP residual stream in causal rank order.
+
+    Args:
+        batch (Dict[str, Any]): Input batch tensors. Must contain a
+            'cu_seqlens' key (may be None for pretraining).
+        dynamic_cp (bool): Whether dynamic context parallelism is enabled.
+        cp_group (Optional[torch.distributed.ProcessGroup]): Context-parallel
+            process group used for CP partitioning.
+        dynamic_cp_group_func (Optional[Callable[[int], torch.distributed.ProcessGroup]]):
+            Factory function that returns a dynamic CP process group for a given
+            ``group_size``. Required when ``dynamic_cp`` is True.
+        use_per_sequence_balancing (bool): When True, use per-sequence zigzag
+            even when ``cu_seqlens`` is present (e.g., for inter-document
+            masking where document lengths are not divisible by
+            ``2 * cp_size``).
+        use_contiguous_cp (bool): Use contiguous sequence shards for the linear CP layout.
+
+    Returns:
+        Dict[str, Any]: The batch with sequence-dimension tensors partitioned
+        to this CP rank.
+    """
+
+    if dynamic_cp:
+        cp_group = _resolve_dynamic_cp_group_for_batch(batch, dynamic_cp_group_func)
+
+    if use_contiguous_cp:
+        from megatron.core.context_parallel.utils import _get_batch_on_this_cp_rank_contiguous
+
+        batch = _get_batch_on_this_cp_rank_contiguous(batch, cp_group=cp_group)
+    elif dynamic_cp or use_per_sequence_balancing or batch.get("cu_seqlens") is None:
+        batch = _get_batch_on_this_cp_rank_per_sequence_balancing(batch, cp_group=cp_group)
+    else:
+        batch = _get_batch_on_this_cp_rank_per_document_balancing(batch, cp_group=cp_group)
+    return batch
+
+
+######################
+### NVTX profiling ###
+######################
+
+_nvtx_enabled: bool = False  # Whether NVTX range profiling is enabled
+_nvtx_range_messages: list[str] = []  # Messages associated with active NVTX ranges
+# Permanently pin the string object representing the name of each NVTX range.
+# These string objects may be created during CUDA graph capture.
+# If they are not pinned, the NVTX range names will be garbage-collected and nsys profile crashes.
+_nvtx_range_msg_pool: dict[str, str] = {}
+
+
+def configure_nvtx_profiling(enabled: bool) -> None:
+    """Configure NVTX range profiling to be enabled or disabled.
+
+    Args:
+        enabled (bool): Whether to enable NVTX range profiling
+    """
+    global _nvtx_enabled
+    _nvtx_enabled = enabled
+
+
+def _nvtx_range_get_func_path():
+    """Get the path of a function. Assumes being called from nvtx_range_push/pop.
+
+    Returns:
+        str: Module path and function name joined by a dot
+    """
+    # Get the caller's caller frame (go back 2 frames)
+    frame = inspect.currentframe().f_back.f_back
+    caller_func = inspect.getframeinfo(frame).function
+    module = inspect.getmodule(frame)
+
+    return f"{module.__name__}.{caller_func}"
+
+
+def nvtx_range_push(msg=None, suffix=None) -> None:
+    """Push NVTX range onto stack. If msg is not provided, use the calling function's path.
+
+    Args:
+        msg (str, optional): Message to associate with range
+        suffix (str, optional): Suffix to append to the message
+    """
+    if not _nvtx_enabled:
+        return
+
+    if msg is None:
+        msg = _nvtx_range_get_func_path()
+    if suffix is not None:
+        msg = f"{msg}.{suffix}"
+
+    # If we have entered this range before, do not use the newly-created "msg" object.
+    # But instead point to the original, first-created, "msg" object.
+    # They may hold identical data, but they are different addresses; matters when CUDA-graphed.
+    msg = _nvtx_range_msg_pool.setdefault(msg, msg)
+
+    # Track messages to ensure consistency when popping
+    _nvtx_range_messages.append(msg)
+
+    # Push NVTX range
+    torch.cuda.nvtx.range_push(msg)
+
+
+def nvtx_range_pop(msg=None, suffix=None) -> None:
+    """Pop NVTX range from stack. If msg is not provided, use the calling function's path.
+
+    Args:
+        msg (str, optional): Message to associate with range
+        suffix (str, optional): Suffix to append to the message
+    """
+    if not _nvtx_enabled:
+        return
+
+    if msg is None:
+        msg = _nvtx_range_get_func_path()
+    if suffix is not None:
+        msg = f"{msg}.{suffix}"
+
+    # Update list of NVTX range messages and check for consistency
+    if not _nvtx_range_messages:
+        raise RuntimeError("Attempted to pop NVTX range from empty stack")
+    last_msg = _nvtx_range_messages.pop()
+    if msg is not None and msg != last_msg:
+        raise ValueError(
+            f"Attempted to pop NVTX range from stack with msg={msg}, "
+            f"but last range has msg={last_msg}"
+        )
+
+    # Pop NVTX range
+    torch.cuda.nvtx.range_pop()
+
+
+@lru_cache(maxsize=None)
+def _nvtx_decorator_get_func_path(func):
+    """Get the path of a function.
+
+    Args:
+        func (Callable): Function to get path for.
+
+    Returns:
+        str: Module path and function name joined by a dot
+    """
+    caller_func = func.__name__
+    module = inspect.getmodule(func)
+
+    return f"{module.__name__}.{caller_func}"
+
+
+def nvtx_decorator(message: Optional[str] = None) -> Callable[[_Wrapped], _Wrapped]:
+    """Decorator to add NVTX range to a function.
+
+    The ``_nvtx_enabled`` flag is checked at **call time** inside
+    ``nvtx_range_push`` / ``nvtx_range_pop``, so the decorator works
+    correctly even when applied before ``configure_nvtx_profiling()``
+    is called (e.g. at module-import time).
+
+    Args:
+        message (str, optional): Custom message for the NVTX range. If None, uses function path
+
+    Returns:
+        Callable: Decorated function with NVTX profiling if enabled
+
+    Example:
+        @nvtx_decorator()
+        def my_function():
+            pass
+
+        @nvtx_decorator(message="Custom Range")
+        def another_function():
+            pass
+    """
+
+    def decorator(func: _Wrapped) -> _Wrapped:
+        msg = message or _nvtx_decorator_get_func_path(func)
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            nvtx_range_push(msg)
+            try:
+                return func(*args, **kwargs)
+            finally:
+                nvtx_range_pop(msg)
+
+        return wrapper  # type: ignore[return-value]
+
+    return decorator
+
+
+def unwrap_model(model, module_instances=None):
+    """Unwrap_model to return the final model instance"""
+    if module_instances is None:
+        from megatron.core.distributed import DistributedDataParallel as DDP
+        from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
+        from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+            FullyShardedDataParallelV1,
+            FullyShardedDataParallelV2,
+        )
+        from megatron.core.transformer.module import Float16Module
+
+        module_instances = (
+            DDP,
+            torch_FSDP,
+            FullyShardedDataParallelV1,
+            FullyShardedDataParallelV2,
+            Float16Module,
+        )
+
+    return_list = True
+    if not isinstance(model, list):
+        model = [model]
+        return_list = False
+    unwrapped_model = []
+    for model_module in model:
+        while isinstance(model_module, module_instances):
+            model_module = model_module.module
+        unwrapped_model.append(model_module)
+    if not return_list:
+        return unwrapped_model[0]
+    return unwrapped_model
+
+
+_ASYNC_IO_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.AbstractEventLoop:
+    """Creates an asyncio loop if necessary and then returns the current asyncio loop."""
+    global _ASYNC_IO_LOOP
+    if loop is None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError as e:
+            if _ASYNC_IO_LOOP is not None:
+                return _ASYNC_IO_LOOP
+            else:
+                _ASYNC_IO_LOOP = loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+    return loop
+
+
+def is_using_quantization_scales(config):
+    """Returns whether the model is using quantization scales based on the config."""
+    return getattr(config, "fp8", False) or getattr(config, "fp4", False)
+
+
+_ASYNC_TASK_STATS = defaultdict(lambda: [0, 0.0])  # cnt, total_time
+
+
+def trace_async_exceptions(func: Optional[Callable] = None, *, verbose: bool = False):
+    """Decorator to be applied to every coroutine that runs in a separate task.
+
+    This is needed because asyncio tasks do not propagate exceptions.
+    Coroutines running inside separate tasks will fail silently if not decorated.
+
+    Passing in `verbose=True` will print additional lifetime logging information about the task.
+    Such functionality is relied on by some users, and can be enabled as shown below:
+    ```
+        @trace_async_exceptions(verbose=True)
+        async def my_coroutine(...):
+            ...
+    ```
+    """
+
+    def _log_verbose(name: str, start: float) -> None:
+        elapsed = (time.perf_counter() - start) * 1000.0
+        cnt, tot = _ASYNC_TASK_STATS[name]
+        _ASYNC_TASK_STATS[name] = [cnt + 1, tot + elapsed]
+        avg = _ASYNC_TASK_STATS[name][1] / _ASYNC_TASK_STATS[name][0]
+
+        log10 = numpy.log10(max(cnt, 1))
+        if numpy.isclose(log10, round(log10)):
+            logger.info(
+                f"{name} completed in {elapsed:.3f} ms, "
+                f"lifetime avg: {avg:.3f} ms, "
+                f"lifetime cnt: {cnt + 1}"
+            )
+
+    def _decorate(fn: Callable):
+        if asyncio.iscoroutinefunction(fn):
+
+            @functools.wraps(fn)
+            async def wrapper(*args, **kwargs):
+                if verbose:
+                    start = time.perf_counter()
+                try:
+                    return await fn(*args, **kwargs)
+                except Exception as e:
+                    logger.error(f"Exception in async function {fn.__name__}: {e}")
+                    traceback.print_exc()
+                    sys.exit(1)
+                finally:
+                    if verbose:
+                        _log_verbose(fn.__qualname__, start)
+
+        elif inspect.isasyncgenfunction(fn):
+
+            @functools.wraps(fn)
+            async def wrapper(*args, **kwargs):
+                if verbose:
+                    start = time.perf_counter()
+                agen = fn(*args, **kwargs)
+                try:
+                    async for item in agen:
+                        yield item
+                except Exception as e:
+                    logger.error(f"Exception in async generator {fn.__name__}: {e}")
+                    traceback.print_exc()
+                    sys.exit(1)
+                finally:
+                    if verbose:
+                        _log_verbose(fn.__qualname__, start)
+
+        else:
+            raise TypeError("trace_async_exceptions must be used on async functions or generators")
+        return wrapper
+
+    return _decorate if func is None else _decorate(func)
+
+
+# ============================================================================
+# Backward Compatibility Decorators
+# ============================================================================
+
+
+def deprecated(
+    version: str,
+    removal_version: Optional[str] = None,
+    alternative: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> Callable[[_Wrapped], _Wrapped]:
+    """
+    Mark a function as deprecated.
+
+    This decorator:
+    1. Adds deprecation metadata to the function
+    2. Issues a DeprecationWarning when the function is called
+    3. Allows the compatibility checker to track deprecation lifecycle
+
+    Args:
+        version: Version where deprecation starts (e.g., "1.0.0")
+        removal_version: Version where function will be removed (e.g., "2.0.0")
+        alternative: Name of the recommended replacement function
+        reason: Optional explanation for the deprecation
+
+    Returns:
+        Decorator function
+
+    Example:
+        @deprecated(
+            version="1.0.0",
+            removal_version="2.0.0",
+            alternative="new_train_model",
+            reason="Improved performance and cleaner API"
+        )
+        def old_train_model(config):
+            pass
+    """
+
+    def decorator(func: _Wrapped) -> _Wrapped:
+        # Add metadata
+        func._deprecated = True
+        func._deprecated_version = version
+        func._removal_version = removal_version
+        func._alternative = alternative
+        func._deprecation_reason = reason
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            # Build warning message
+            msg_parts = [f"{func.__name__} is deprecated since version {version}."]
+
+            if alternative:
+                msg_parts.append(f"Use {alternative} instead.")
+
+            if removal_version:
+                msg_parts.append(f"Will be removed in version {removal_version}.")
+
+            if reason:
+                msg_parts.append(f"Reason: {reason}")
+
+            warnings.warn(" ".join(msg_parts), DeprecationWarning, stacklevel=2)
+
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def internal_api(func: _Wrapped) -> _Wrapped:
+    """
+    Mark a function or class as internal API (not for external use).
+
+    Use this decorator for:
+    - Internal APIs not intended for public consumption
+    - Experimental features that may change without notice
+    - Implementation details that are not part of the stable API
+
+    Objects marked with this decorator will be exempt from backward
+    compatibility checks.
+
+    Args:
+        func: The function or class to mark as internal
+
+    Returns:
+        The original function/class with an internal API marker
+
+    Example:
+        @internal_api
+        def _internal_helper():
+            '''For internal use only'''
+            pass
+
+        @internal_api
+        class ExperimentalFeature:
+            '''This API may change without notice'''
+            pass
+    """
+    func._internal_api = True
+    return func
+
+
+def experimental_api(func: _Wrapped) -> _Wrapped:
+    """
+    Mark a function or class as experimental API.
+
+    Use this decorator for:
+    - Experimental features that may change without notice
+    - New APIs under active development
+    - Features that are not yet stable
+
+    Objects marked with this decorator will be exempt from backward
+    compatibility checks, allowing rapid iteration during development.
+
+    Args:
+        func: The function or class to mark as experimental
+
+    Returns:
+        The original function/class with an experimental API marker
+
+    Example:
+        @experimental_api
+        def new_experimental_feature():
+            '''This API is experimental and may change'''
+            pass
+
+        @experimental_api
+        class ExperimentalModel:
+            '''This model is under active development'''
+            pass
+    """
+    func._experimental_api = True
+    return func
+
+
+def deprecate_args(
+    *deprecated_keys: str, message="Argument '{name}' has been deprecated and should not be used."
+) -> Callable[[_Wrapped], _Wrapped]:
+    """
+    Intercepts specific keyword arguments to raise a custom TypeError.
+
+    Args:
+        *deprecated_keys: Strings representing the argument names to block.
+        message: Custom error message string. Use {name} as a placeholder.
+    """
+
+    def decorator(func: _Wrapped) -> _Wrapped:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            # Check if any deprecated key is present in kwargs
+            found_deprecated = set(deprecated_keys) & set(kwargs.keys())
+
+            if found_deprecated:
+                bad_key = list(found_deprecated)[0]
+                raise TypeError(message.format(name=bad_key))
+
+            # Send args to the real function
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def deprecate_inference_params(inference_context, inference_params):
+    """Print warning for deprecated `inference_params`."""
+    if inference_context is None and inference_params is not None:
+        warnings.warn(
+            "`inference_params` renamed to `inference_context`, and will be "
+            "removed in `megatron-core` 0.13."
+        )
+        return inference_params
+    return inference_context
+
+
+#: Attribute a parameter-sharding backend sets on each parameter it publishes asynchronously.
+#: See :func:`ensure_params_ready`.
+PARAM_READY_CALLBACK_ATTR = "_ensure_param_ready_callback"
+
+
+def ensure_params_ready(params: Iterable[Any]) -> None:
+    """Make ``params`` readable now, finishing any outstanding backend publication.
+
+    A parameter-sharding backend (DDP with ``overlap_param_gather``, FSDP, ...) publishes values
+    asynchronously, so only the owning module's forward pre-hook makes ``param.data`` valid. Any
+    consumer reading it earlier -- ahead of that module, or from another stream -- calls this
+    first. Backends mark their params with :data:`PARAM_READY_CALLBACK_ATTR`; unmarked params
+    no-op, so neither side needs to know about the other.
+
+    Callbacks are shared per communication bucket, so each fires once, not once per parameter.
+    """
+    fired = set()
+    for param in params:
+        callback = getattr(param, PARAM_READY_CALLBACK_ATTR, None)
+        if callback is None or id(callback) in fired:
+            continue
+        fired.add(id(callback))
+        callback()

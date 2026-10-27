@@ -1,0 +1,72 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import os
+
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+import json
+import logging
+
+import click
+
+from tests.functional_tests.python_test_utils import common
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+@click.command()
+@click.option("--logs-dir", required=True, type=str, help="Path to Tensorboard logs")
+@click.option("--train-iters", required=True, type=int, help="Number of train iters")
+@click.option("--output-path", required=False, type=str, help="Path to write golden values")
+@click.option(
+    "--is-convergence-test/--is-normal-test",
+    type=bool,
+    help="Use first or all tensorboard logs",
+    default=False,
+)
+@click.option("--step-size", required=False, default=5, type=int, help="Step size of sampling")
+def collect_train_test_metrics(
+    logs_dir: str, train_iters: str, output_path: str, is_convergence_test: bool, step_size: int
+):
+    summaries = common.read_tb_logs_as_list(
+        logs_dir,
+        index=(-1 if is_convergence_test else 0),
+        train_iters=train_iters,
+        start_idx=1,
+        step_size=step_size,
+    )
+
+    if summaries is None:
+        logger.warning("No tensorboard logs found, no golden values created.")
+        return
+
+    summaries = {
+        golden_value_key: golden_value
+        for (golden_value_key, golden_value) in summaries.items()
+        if golden_value_key
+        in [
+            "iteration-time",
+            "mem-allocated-bytes",
+            "mem-max-allocated-bytes",
+            "lm loss",
+            "num-zeros",
+            "mtp_1 loss",
+            "mtp_2 loss",
+            "total loss",
+        ]
+    }
+
+    if output_path is not None:
+        serialized_summaries = json.dumps(
+            {
+                golden_value_key: golden_values.model_dump()
+                for golden_value_key, golden_values in summaries.items()
+            },
+            indent=4,
+            allow_nan=False,
+        )
+        with open(output_path, "w") as fh:
+            fh.write(serialized_summaries)
+
+
+if __name__ == "__main__":
+    collect_train_test_metrics()

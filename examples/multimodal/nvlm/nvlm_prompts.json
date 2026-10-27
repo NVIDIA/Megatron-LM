@@ -1,0 +1,165 @@
+{
+    "COMMENT": "Mixture of our own custom prompts and some prompts from https://huggingface.co/datasets/liuhaotian/LLaVA-Pretrain/viewer and https://huggingface.co/datasets/HuggingFaceM4/M3IT",
+    "Captioning": {
+        "raw": [
+        "Can you briefly explain what you see in the image?",
+        "Describe what's happening in this image in one short sentence.",
+        "Write a short caption that accurately represents the content of this image.",
+        "Please generate a descriptive caption for the image provided.",
+        "How would you summarize the scene depicted in the picture in short?",
+        "Describe the image briefly.",
+        "Write a succinct description of the image, capturing its main components, the relationships between them, and any notable details.",
+        "Create a concise caption that accurately describes the main elements in the image provided.",
+        "Write a brief, yet comprehensive, description of the image.",
+        "Describe the image in a clear and concise manner.",
+        "For the given image, provide a one-sentence summary that captures the most important details.",
+        "Generate a short caption for the picture.",
+        "Write a short and informative description that highlights the primary subjects and actions occurring in the given image.",
+        "Provide a concise and informative caption for the image, focusing on the primary subjects.",
+        "Write a clear description of the image, make sure the key features are well covered.",
+        "Offer a succinct explanation of the picture presented."
+        ]
+    },
+    "CaptioningPretraining": {
+        "raw": [
+        "Give a brief description of image.",
+        "Give a brief description of the image.",
+        "Provide a brief description of the given image.",
+        "Provide a one-sentence caption for the provided image.",
+        "Write a terse but informative summary of the picture.",
+        "Describe the image concisely.",
+        "Generate a clear and concise summary of the photo."
+        ]
+    },
+    "CaptioningSFT": {
+        "raw": [
+        "Give a brief description of the image.",
+        "Give a short and clear explanation of the subsequent image.",
+        "Present a compact description of the photo's key features.",
+        "Provide a brief description of the given image.",
+        "Provide a one-sentence caption for the provided image.",
+        "Render a clear and concise summary of the photo.",
+        "Share a concise interpretation of the image provided.",
+        "Summarize the visual content of the image.",
+        "Write a terse but informative summary of the picture.",
+        "Describe the image concisely."
+        ]
+    },
+    "VQAPretraining": {
+        "raw": [
+        "Question: {} Short answer:",
+        "Question: {} Answer:"
+        ]
+    },
+    "VQASFT": {
+        "raw": [
+        "{}",
+        "{}\nAnswer the question using a single word or phrase."
+        ],
+        "docvqa": [
+        "{}",
+        "{}\nAnswer this question using the text in the image directly."
+        ]
+    },
+    "DocPretraining": {
+        "raw": [
+        "Retrieve the text from the given pdf image.",
+        "Extract the text from the provided document.",
+        "Transcribe the text displayed in the image."
+        ],
+        "ocr_multi": [
+        "Apply grounded Optical Character Recognition (OCR) to the provided image.",
+        "Extract all texts and their bounding boxes from the given image using grounded OCR.",
+        "Extract and transcribe all visible text from the provided image, ensuring accurate spatial recognition.",
+        "Conduct a detailed optical character recognition analysis on this image, maintaining the text's original layout and positioning.",
+        "Execute a thorough text recognition procedure on this visual input, ensuring that the spatial arrangement of the text is accurately represented.",
+        "Perform an in-depth OCR scan of the image, capturing both the content and contextual positioning of all textual information.",
+        "OCR with grounding:"
+        ],
+        "md": [
+        "Extract the text from the given image and format it in Markdown.",
+        "Convert the text from the provided image into Markdown format.",
+        "Transform the text from the given image into Markdown syntax.",
+        "Extract and convert the text from the image to Markdown.",
+        "Retrieve the text from the image and present it in Markdown format."
+        ],
+        "grounded_ocr": [
+        "{}. Text:",
+        "Recognize the text in this region: {}.",
+        "Identify the text in this area: {}.",
+        "Detect the text within this section: {}."
+        ],
+        "referring_grounding": [
+        "Region of \"{}\" is:",
+        "Locate the text \"{}\" in the image.",
+        "Identify the text \"{}\" in the image and provide the coordinates."
+        ]
+    },
+    "CaptioningDetailed": {
+        "raw": [
+        "Create a comprehensive paragraph that captures the essence of the image while weaving a cohesive narrative around its elements.",
+        "Compose a paragraph that thoroughly describes the image's content, providing context and connections between different aspects of the scene.",
+        "Provide a detailed, paragraph-length description of the image that paints a vivid picture and tells a coherent story.",
+        "Write a rich and engaging paragraph that delves into the image's components, describing not only what is seen but also how the elements relate to one another.",
+        "Give a well-rounded, paragraph-length explanation of the image, describing the scene and its components while forming a complete and engaging narrative.",
+        "Produce a paragraph that not only describes the individual elements in the image but also weaves them together to form a cohesive, connected account.",
+        "Construct a paragraph that captures the image's details and context, offering a more in-depth and engaging story than a simple caption.",
+        "Compose a descriptive paragraph that brings the image to life through detailed storytelling, connecting the various visual elements into a unified narrative.",
+        "Create a paragraph that provides an extensive and interconnected description of the image, ensuring that the narrative is both detailed and cohesive.",
+        "Write a compelling and detailed paragraph that delves into the image's components, linking them together to create a unified and engaging story."
+        ]
+    },
+    "OCR": {
+        "raw": [
+        "Can you read the text from image and output here?",
+        "Extract and document the text from the provided image.",
+        "Converting the text embedded in this image into a readable document.",
+        "Transcribe all the text you find.",
+        "Can you extract all visible text from the image here?"
+        ],
+        "markdown": [
+        "Can you extract all visible text from the provided image?",
+        "Converting the text embedded in this image into a readable markdown document.",
+        "Can you read the text in the document as markdown?",
+        "Transcribe the document as markdown.",
+        "Extract and document the text from the provided image."
+        ],
+        "table_markdown": [
+        "Can you extract all visible text from the provided table?",
+        "Can you read the text in the provided table as markdown?",
+        "Transcribe the table as markdown.",
+        "Extract and document the text from the provided table image."
+        ],
+        "plain": [
+        "Transcribe the document as plain text.",
+        "Extract and document the text from the provided image.",
+        "Converting the text embedded in this image into a readable document.",
+        "Transcribe all the text you find.",
+        "Can you extract all visible text from the image here?"
+        ],
+        "bbox_plain": [
+        "Transcribe the document as plain text along with bounding boxes.",
+        "Extract and document the text from the provided image along with bounding boxes.",
+        "Converting the text embedded in this image into a readable documen along with bounding boxes.",
+        "Can you extract all visible text with bounding boxes from the image here?"
+        ]
+    },
+    "VQA": {
+        "raw": [
+        "Given the image, answer the following question with few words.",
+        "Answer the following question: ",
+        "What is the answer to this question?",
+        "Write the answer: ",
+        "Please answer this question: "
+        ]
+    },
+    "Embedded": {
+        "raw": [
+        "Given the image, answer the following question with few words.",
+        "Answer the following question: ",
+        "What is the answer to this question?",
+        "Write the answer: ",
+        "Please answer this question: "
+        ]
+    }
+}

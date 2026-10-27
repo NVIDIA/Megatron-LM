@@ -1,0 +1,5 @@
+- agent_type: CountdownAgent
+  agent_args:
+    hf_dataset_name: "Jiayi-Pan/Countdown-Tasks-3to4"
+    split: "train"
+  weight: 1.0

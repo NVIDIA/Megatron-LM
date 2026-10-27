@@ -1,0 +1,579 @@
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+
+import inspect
+import os
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+import torch
+
+import megatron.core.transformer.utils as transformer_utils
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import (
+    is_layer_window_attention,
+    set_attention_backend,
+    set_model_config_attribute,
+    set_model_to_sequence_parallel,
+)
+from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
+
+_NVTE_BACKEND_ENV_VARS = ('NVTE_FLASH_ATTN', 'NVTE_FUSED_ATTN', 'NVTE_UNFUSED_ATTN')
+_NVTE_FLASH_VERSION_ENV_VARS = tuple(f'NVTE_FLASH_ATTN_V{version}' for version in (2, 3, 4))
+_BACKEND_ENV_VALUES = {
+    AttnBackend.local: ('0', '0', '0'),
+    AttnBackend.flash: ('1', '0', '0'),
+    AttnBackend.fused: ('0', '1', '0'),
+    AttnBackend.unfused: ('0', '0', '1'),
+    AttnBackend.auto: ('1', '1', '1'),
+}
+
+
+@pytest.fixture
+def isolated_nvte_attention_env():
+    """Restore process-wide NVTE attention settings after a test."""
+    with patch.dict(os.environ):
+        clear_nvte_env_vars()
+        yield
+
+
+def _attention_config(**overrides):
+    return TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4, **overrides)
+
+
+@pytest.mark.parametrize("backend", [*AttnBackend, "unfused"])
+def test_set_attention_backend_accepts_all_enums_and_string(backend, isolated_nvte_attention_env):
+    set_attention_backend(_attention_config(attention_backend=backend))
+
+    expected_backend = AttnBackend[backend] if isinstance(backend, str) else backend
+    assert (
+        tuple(os.environ[name] for name in _NVTE_BACKEND_ENV_VARS)
+        == _BACKEND_ENV_VALUES[expected_backend]
+    )
+    assert all(name not in os.environ for name in _NVTE_FLASH_VERSION_ENV_VARS)
+
+
+def test_set_attention_backend_rejects_process_wide_conflicts(isolated_nvte_attention_env):
+    set_attention_backend(
+        _attention_config(attention_backend=AttnBackend.flash, flash_attention_version=3)
+    )
+    assert tuple(os.environ[name] for name in _NVTE_FLASH_VERSION_ENV_VARS) == ('0', '1', '0')
+
+    conflicts = (
+        _attention_config(attention_backend=AttnBackend.fused, flash_attention_version=3),
+        _attention_config(attention_backend=AttnBackend.flash, flash_attention_version=2),
+    )
+    for config in conflicts:
+        with pytest.raises(AssertionError, match="process-wide"):
+            set_attention_backend(config)
+
+
+class _TrackingConfig:
+    def __init__(self, value):
+        self._runtime_value = value
+        self.update_count = 0
+
+    @property
+    def runtime_value(self):
+        return self._runtime_value
+
+    @runtime_value.setter
+    def runtime_value(self, value):
+        self._runtime_value = value
+        self.update_count += 1
+
+
+class _ConfigModule(torch.nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+
+def test_set_model_config_attribute_updates_distinct_configs_once():
+    root_config = _TrackingConfig("original")
+    child_config = _TrackingConfig("original")
+    unsupported_config = SimpleNamespace()
+
+    module = _ConfigModule(root_config)
+    module.first_child = _ConfigModule(child_config)
+    module.second_child = _ConfigModule(child_config)
+    module.unsupported_child = _ConfigModule(unsupported_config)
+    model = SimpleNamespace(config=root_config, module=SimpleNamespace(module=module))
+    new_value = object()
+
+    set_model_config_attribute(model, "runtime_value", new_value)
+
+    assert root_config.runtime_value is new_value
+    assert child_config.runtime_value is new_value
+    assert root_config.update_count == 1
+    assert child_config.update_count == 1
+    assert not hasattr(unsupported_config, "runtime_value")
+
+
+class TestGPTModel:
+
+    def setup_method(self, method):
+        os.environ.pop('NVTE_FUSED_ATTN', None)
+        os.environ.pop('NVTE_FLASH_ATTN', None)
+        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+        os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+
+        self.tensor_model_parallel_size = 2
+        Utils.initialize_model_parallel(self.tensor_model_parallel_size, 1)
+        model_parallel_cuda_manual_seed(123)
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=48,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            tensor_model_parallel_size=self.tensor_model_parallel_size,
+            sequence_parallel=False,
+        )
+        self.gpt_model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=100,
+            max_sequence_length=8,
+            position_embedding_type="rope",
+            parallel_output=False,
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    def test_post_process_forward(self):
+        _ = self.gpt_model.config
+        sequence_length = self.gpt_model.max_sequence_length
+        micro_batch_size = 2
+
+        self.gpt_model.cuda()
+
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+        ).cuda()
+
+        logits = self.gpt_model.forward(
+            input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+        )
+        assert logits.shape[0] == micro_batch_size
+        assert logits.shape[1] == sequence_length
+        assert logits.shape[2] == self.gpt_model.vocab_size
+
+        set_model_to_sequence_parallel(self.gpt_model, set_to=True)
+        logits = self.gpt_model.forward(
+            input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+        )
+        # Test cache has been built
+        assert transformer_utils._sequence_parallel_attr_cache is not None
+
+        # Check the modules have been flipped
+        for attribute, modules in transformer_utils._sequence_parallel_attr_cache[
+            id(self.gpt_model)
+        ].items():
+            for module in modules:
+                assert getattr(module, attribute) == True
+
+        assert logits.shape[0] == micro_batch_size
+        assert logits.shape[1] == sequence_length
+        assert logits.shape[2] == self.gpt_model.vocab_size
+
+        set_model_to_sequence_parallel(self.gpt_model, set_to=False)
+        logits = self.gpt_model.forward(
+            input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+        )
+
+        assert logits.shape[0] == micro_batch_size
+        assert logits.shape[1] == sequence_length
+        assert logits.shape[2] == self.gpt_model.vocab_size
+
+        # Check the modules have been flipped
+        for attribute, modules in transformer_utils._sequence_parallel_attr_cache[
+            id(self.gpt_model)
+        ].items():
+            for module in modules:
+                assert getattr(module, attribute) == False
+
+
+class TestIsLayerWindowAttention:
+    """Comprehensive tests for is_layer_window_attention function."""
+
+    def test_no_window_size(self):
+        """Test when window_size is None or empty."""
+        config = TransformerConfig(
+            num_layers=4, hidden_size=64, num_attention_heads=8, window_size=None
+        )
+
+        # Should return False for any layer when window_size is None
+        for layer_number in [1, 2, 3, 4]:
+            assert (
+                is_layer_window_attention(
+                    config.window_size, config.window_attn_skip_freq, layer_number
+                )
+                == False
+            )
+
+        # Test with empty list
+        config.window_size = []
+        for layer_number in [1, 2, 3, 4]:
+            assert (
+                is_layer_window_attention(
+                    config.window_size, config.window_attn_skip_freq, layer_number
+                )
+                == False
+            )
+
+    def test_window_size_with_no_skip_freq(self):
+        """Test when window_size is set but window_attn_skip_freq is None."""
+        config = TransformerConfig(
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=8,
+            window_size=(10, 0),
+            window_attn_skip_freq=None,
+        )
+
+        # Should return True for all layers when skip_freq is None
+        for layer_number in [1, 2, 3, 4]:
+            assert (
+                is_layer_window_attention(
+                    config.window_size, config.window_attn_skip_freq, layer_number
+                )
+                == True
+            )
+
+    def test_integer_skip_frequency(self):
+        """Test window attention with integer skip frequency."""
+        config = TransformerConfig(
+            num_layers=8,
+            hidden_size=64,
+            num_attention_heads=8,
+            window_size=(10, 0),
+            window_attn_skip_freq=3,  # Skip every 3rd layer
+        )
+
+        # Layer numbers are 1-indexed
+        # Layers 3, 6 should NOT use window attention (skip)
+        # Other layers should use window attention
+        expected_results = {
+            1: True,  # 1 % 3 != 0
+            2: True,  # 2 % 3 != 0
+            3: False,  # 3 % 3 == 0
+            4: True,  # 4 % 3 != 0
+            5: True,  # 5 % 3 != 0
+            6: False,  # 6 % 3 == 0
+            7: True,  # 7 % 3 != 0
+            8: True,  # 8 % 3 != 0
+        }
+
+        for layer_number, expected in expected_results.items():
+            result = is_layer_window_attention(
+                config.window_size, config.window_attn_skip_freq, layer_number
+            )
+            assert result == expected, f"Layer {layer_number}: expected {expected}, got {result}"
+
+    def test_list_skip_frequency(self):
+        """Test window attention with list-based skip frequency."""
+        config = TransformerConfig(
+            num_layers=6,
+            hidden_size=64,
+            num_attention_heads=8,
+            window_size=(10, 0),
+            window_attn_skip_freq=[True, False, True, False, True, False],
+        )
+
+        # List is 0-indexed, but layer_number is 1-indexed
+        # So layer 1 uses index 0, layer 2 uses index 1, etc.
+        expected_results = {
+            1: True,  # index 0: True
+            2: False,  # index 1: False
+            3: True,  # index 2: True
+            4: False,  # index 3: False
+            5: True,  # index 4: True
+            6: False,  # index 5: False
+        }
+
+        for layer_number, expected in expected_results.items():
+            result = is_layer_window_attention(
+                config.window_size, config.window_attn_skip_freq, layer_number
+            )
+            assert result == expected, f"Layer {layer_number}: expected {expected}, got {result}"
+
+    def test_list_skip_frequency_boolean_conversion(self):
+        """Test that list values are properly converted to boolean."""
+        config = TransformerConfig(
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=8,
+            window_size=(10, 0),
+            window_attn_skip_freq=[1, 0, 2, 0],  # Non-boolean values
+        )
+
+        # bool(1) = True, bool(0) = False, bool(2) = True
+        expected_results = {
+            1: True,  # bool(1) = True
+            2: False,  # bool(0) = False
+            3: True,  # bool(2) = True
+            4: False,  # bool(0) = False
+        }
+
+        for layer_number, expected in expected_results.items():
+            result = is_layer_window_attention(
+                config.window_size, config.window_attn_skip_freq, layer_number
+            )
+            assert result == expected, f"Layer {layer_number}: expected {expected}, got {result}"
+
+    def test_invalid_skip_frequency_type(self):
+        """Test error handling for invalid window_attn_skip_freq types."""
+        config = TransformerConfig(
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=8,
+            window_size=(10, 0),
+            window_attn_skip_freq="invalid",  # String is invalid
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            is_layer_window_attention(config.window_size, config.window_attn_skip_freq, 1)
+
+        assert "Invalid `window_attn_skip_freq`" in str(exc_info.value)
+        assert "str" in str(exc_info.value)
+        assert "invalid" in str(exc_info.value)
+
+    def test_edge_cases(self):
+        """Test edge cases for is_layer_window_attention."""
+        # Test with minimal configuration
+        config = TransformerConfig(
+            num_layers=1, hidden_size=64, num_attention_heads=8, window_size=(5, 0)
+        )
+
+        assert (
+            is_layer_window_attention(config.window_size, config.window_attn_skip_freq, 1) == True
+        )
+
+        # Test with large layer numbers
+        config = TransformerConfig(
+            num_layers=100,
+            hidden_size=64,
+            num_attention_heads=8,
+            window_size=(10, 0),
+            window_attn_skip_freq=10,
+        )
+
+        # Layer 100 should not use window attention (100 % 10 == 0)
+        assert (
+            is_layer_window_attention(config.window_size, config.window_attn_skip_freq, 100)
+            == False
+        )
+        # Layer 99 should use window attention (99 % 10 != 0)
+        assert (
+            is_layer_window_attention(config.window_size, config.window_attn_skip_freq, 99) == True
+        )
+
+    def test_window_size_different_formats(self):
+        """Test with different window_size formats."""
+        # Test with tuple
+        config = TransformerConfig(
+            num_layers=2, hidden_size=64, num_attention_heads=8, window_size=(10, 0)
+        )
+
+        assert (
+            is_layer_window_attention(config.window_size, config.window_attn_skip_freq, 1) == True
+        )
+
+        # Test with single integer (if supported)
+        try:
+            config.window_size = 10
+            result = is_layer_window_attention(config.window_size, config.window_attn_skip_freq, 1)
+            # If this doesn't raise an error, it should return True
+            assert result == True
+        except (TypeError, ValueError):
+            # Some implementations might not support single integer
+            pass
+
+    def test_layer_number_edge_cases(self):
+        """Test with different layer number edge cases."""
+        config = TransformerConfig(
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=8,
+            window_size=[10, 0],
+            window_attn_skip_freq=2,
+        )
+
+        # Test layer 0 (though typically layers are 1-indexed)
+        # 0 % 2 == 0, so should return False
+        assert (
+            is_layer_window_attention(config.window_size, config.window_attn_skip_freq, 0) == False
+        )
+
+        # Test negative layer numbers
+        # -1 % 2 != 0 in Python, so should return True
+        assert (
+            is_layer_window_attention(config.window_size, config.window_attn_skip_freq, -1) == True
+        )
+        assert (
+            is_layer_window_attention(config.window_size, config.window_attn_skip_freq, -2) == False
+        )  # -2 % 2 == 0
+
+    def test_comprehensive_scenario(self):
+        """Test a comprehensive scenario with multiple configurations."""
+        scenarios = [
+            {
+                "config": TransformerConfig(
+                    num_layers=12,
+                    hidden_size=64,
+                    num_attention_heads=8,
+                    window_size=[16, 0],
+                    window_attn_skip_freq=4,
+                ),
+                "expected": {
+                    1: True,
+                    2: True,
+                    3: True,
+                    4: False,  # First group
+                    5: True,
+                    6: True,
+                    7: True,
+                    8: False,  # Second group
+                    9: True,
+                    10: True,
+                    11: True,
+                    12: False,  # Third group
+                },
+            },
+            {
+                "config": TransformerConfig(
+                    num_layers=6,
+                    hidden_size=64,
+                    num_attention_heads=8,
+                    window_size=[8, 8],
+                    window_attn_skip_freq=[True, True, False, False, True, False],
+                ),
+                "expected": {1: True, 2: True, 3: False, 4: False, 5: True, 6: False},
+            },
+        ]
+
+        for i, scenario in enumerate(scenarios):
+            config = scenario["config"]
+            expected = scenario["expected"]
+
+            for layer_number, expected_result in expected.items():
+                result = is_layer_window_attention(
+                    config.window_size, config.window_attn_skip_freq, layer_number
+                )
+                assert (
+                    result == expected_result
+                ), f"Scenario {i+1}, Layer {layer_number}: expected {expected_result}, got {result}"
+
+
+class TestIsLayerWindowAttentionIntegration:
+    """Integration tests for is_layer_window_attention with other components."""
+
+    def test_with_transformer_config_validation(self):
+        """Test that function works with fully validated TransformerConfig objects."""
+        config = TransformerConfig(
+            num_layers=8,
+            hidden_size=768,
+            num_attention_heads=12,
+            window_size=[128, 0],
+            window_attn_skip_freq=2,
+            use_cpu_initialization=True,
+        )
+
+        # Function should work with complete config
+        for layer in range(1, 9):
+            result = is_layer_window_attention(
+                config.window_size, config.window_attn_skip_freq, layer
+            )
+            expected = layer % 2 != 0  # Skip every 2nd layer
+            assert result == expected
+
+    def test_performance_with_many_layers(self):
+        """Test performance with a large number of layers."""
+        config = TransformerConfig(
+            num_layers=1000,
+            hidden_size=64,
+            num_attention_heads=8,
+            window_size=[10, 0],
+            window_attn_skip_freq=list(range(1000)),  # Large list
+        )
+
+        # This should complete without performance issues
+        results = []
+        for layer in range(1, 101):  # Test first 100 layers
+            result = is_layer_window_attention(
+                config.window_size, config.window_attn_skip_freq, layer
+            )
+            results.append(result)
+
+        # Verify some results
+        assert len(results) == 100
+        assert isinstance(results[0], bool)
+
+
+def _scale(value, factor=1):
+    return value * factor
+
+
+def _unexpected_checkpoint(*args, **kwargs):
+    raise AssertionError("used the checkpoint implementation for the other precision")
+
+
+@pytest.mark.parametrize("precision", [{"fp8": "e4m3"}, {"fp4": "nvfp4"}])
+def test_precision_aware_checkpoint_uses_te_checkpoint_for_fp8_and_fp4(precision, monkeypatch):
+    calls = []
+
+    def fake_te_checkpoint(
+        function, distribute_saved_activations, get_rng_state_tracker, tp_group, *args, **kwargs
+    ):
+        calls.append((distribute_saved_activations, get_rng_state_tracker, tp_group, args, kwargs))
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "megatron.core.extensions.transformer_engine.te_checkpoint", fake_te_checkpoint
+    )
+    monkeypatch.setattr(transformer_utils.tensor_parallel, "checkpoint", _unexpected_checkpoint)
+    config = SimpleNamespace(**{"fp8": None, "fp4": None, **precision})
+    tp_group = object()
+
+    output = transformer_utils.precision_aware_checkpoint(
+        _scale, config, tp_group, 3, distribute_saved_activations=True, factor=2
+    )
+
+    assert output == 6
+    assert calls == [
+        (
+            True,
+            transformer_utils.tensor_parallel.random.get_cuda_rng_tracker,
+            tp_group,
+            (3,),
+            {"factor": 2},
+        )
+    ]
+
+
+def test_precision_aware_checkpoint_binds_kwargs_for_tensor_parallel_checkpoint(monkeypatch):
+    calls = []
+
+    def fake_checkpoint(function, distribute_saved_activations, *args):
+        calls.append((distribute_saved_activations, args))
+        return function(*args)
+
+    monkeypatch.setattr(transformer_utils.tensor_parallel, "checkpoint", fake_checkpoint)
+    monkeypatch.setattr(
+        "megatron.core.extensions.transformer_engine.te_checkpoint", _unexpected_checkpoint
+    )
+    config = SimpleNamespace(fp8=None, fp4=None)
+
+    output = transformer_utils.precision_aware_checkpoint(_scale, config, object(), 3, factor=2)
+
+    assert output == 6
+    assert calls == [(False, (3,))]

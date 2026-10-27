@@ -1,0 +1,331 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import sys
+from argparse import ArgumentParser
+from types import SimpleNamespace
+
+import pytest
+
+from megatron.training.argument_utils import ArgumentGroupFactory, _default_config_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
+from megatron.training.config import TrainingConfig, ValidationConfig
+from megatron.training.global_vars import set_args
+from megatron.training.training import get_train_valid_test_num_samples
+from tests.unit_tests.test_utilities import Utils
+
+
+def create_test_args(**overrides):
+    """Create a minimal args namespace for testing eval batch size logic."""
+    args = SimpleNamespace()
+    args.iteration = 0
+    args.train_samples = None
+    args.train_iters = 100
+    args.eval_interval = 10
+    args.eval_iters = 5
+    args.global_batch_size = 32
+    args.micro_batch_size = 4
+    args.eval_global_batch_size = 32
+    args.eval_micro_batch_size = 4
+    args.data_parallel_size = 1
+    args.consumed_train_samples = 0
+    args.consumed_valid_samples = 0
+    args.dataloader_type = "external"
+    args.skip_train = False
+    args.start_eval_at_iter = None
+    args.full_validation = False
+    args.multiple_validation_sets = False
+    args.phase_transition_iterations = None
+    for key, val in overrides.items():
+        setattr(args, key, val)
+    return args
+
+
+class TestEvalBatchSizeConfig:
+    """Test that eval batch size fields are present in ValidationConfig and wired to CLI."""
+
+    def test_validation_config_has_eval_fields(self):
+        """ValidationConfig should have eval_global_batch_size and eval_micro_batch_size."""
+        config = ValidationConfig()
+        assert config.eval_global_batch_size is None
+        assert config.eval_micro_batch_size is None
+
+    def test_validation_config_accepts_eval_values(self):
+        """ValidationConfig should accept explicit eval batch size values."""
+        config = ValidationConfig(eval_global_batch_size=64, eval_micro_batch_size=8)
+        assert config.eval_global_batch_size == 64
+        assert config.eval_micro_batch_size == 8
+
+    def test_cli_args_generated(self):
+        """ArgumentGroupFactory should generate --eval-global-batch-size and --eval-micro-batch-size."""
+        parser = ArgumentParser()
+        factory = ArgumentGroupFactory(ValidationConfig)
+        factory.build_group(parser, "validation")
+        # Parse with the new flags
+        args = parser.parse_args(["--eval-global-batch-size", "64", "--eval-micro-batch-size", "8"])
+        assert args.eval_global_batch_size == 64
+        assert args.eval_micro_batch_size == 8
+
+    def test_cli_args_default_none(self):
+        """CLI args should default to None when not specified."""
+        parser = ArgumentParser()
+        factory = ArgumentGroupFactory(ValidationConfig)
+        factory.build_group(parser, "validation")
+        args = parser.parse_args([])
+        assert args.eval_global_batch_size is None
+        assert args.eval_micro_batch_size is None
+
+
+class TestEvalBatchSizeDefaults:
+    """Test fallback defaults: when eval batch sizes are None, they should use training values."""
+
+    def test_defaults_to_training_values(self):
+        """When eval batch sizes are None, validate_args sets them to training values."""
+        # Simulate what validate_args does
+        args = create_test_args(eval_global_batch_size=None, eval_micro_batch_size=None)
+        # Apply the defaulting logic (same as in validate_args)
+        if args.eval_global_batch_size is None:
+            args.eval_global_batch_size = args.global_batch_size
+        if args.eval_micro_batch_size is None:
+            args.eval_micro_batch_size = args.micro_batch_size
+        assert args.eval_global_batch_size == 32
+        assert args.eval_micro_batch_size == 4
+
+    def test_explicit_values_preserved(self):
+        """Explicit eval batch sizes should not be overwritten by training values."""
+        args = create_test_args(
+            global_batch_size=32,
+            micro_batch_size=4,
+            eval_global_batch_size=64,
+            eval_micro_batch_size=8,
+        )
+        # Apply the defaulting logic
+        if args.eval_global_batch_size is None:
+            args.eval_global_batch_size = args.global_batch_size
+        if args.eval_micro_batch_size is None:
+            args.eval_micro_batch_size = args.micro_batch_size
+        assert args.eval_global_batch_size == 64
+        assert args.eval_micro_batch_size == 8
+
+
+class TestEvalBatchSizeDivisibility:
+    """Test that eval_global_batch_size must be divisible by (eval_micro_batch_size * data_parallel_size)."""
+
+    def test_valid_divisibility(self):
+        """No error when eval_global_batch_size is divisible."""
+        args = create_test_args(
+            eval_global_batch_size=64, eval_micro_batch_size=8, data_parallel_size=2
+        )
+        # 64 % (8 * 2) == 0 → should pass
+        assert (
+            args.eval_global_batch_size % (args.eval_micro_batch_size * args.data_parallel_size)
+            == 0
+        )
+
+    def test_invalid_divisibility_raises(self):
+        """AssertionError when eval_global_batch_size is not divisible."""
+        args = create_test_args(
+            eval_global_batch_size=50, eval_micro_batch_size=8, data_parallel_size=2
+        )
+        # 50 % (8 * 2) == 50 % 16 == 2 → should fail
+        with pytest.raises(AssertionError, match="eval_global_batch_size"):
+            assert (
+                args.eval_global_batch_size % (args.eval_micro_batch_size * args.data_parallel_size)
+                == 0
+            ), (
+                f"eval_global_batch_size ({args.eval_global_batch_size}) must be divisible by "
+                f"eval_micro_batch_size ({args.eval_micro_batch_size}) * "
+                f"data_parallel_size ({args.data_parallel_size})"
+            )
+
+    def test_only_eval_mbs_set(self):
+        """When only eval_micro_batch_size is set, eval_global_batch_size falls back to global_batch_size."""
+        args = create_test_args(
+            global_batch_size=32,
+            micro_batch_size=4,
+            eval_global_batch_size=None,
+            eval_micro_batch_size=2,
+            data_parallel_size=1,
+        )
+        if args.eval_global_batch_size is None:
+            args.eval_global_batch_size = args.global_batch_size
+        # 32 % (2 * 1) == 0 → valid
+        assert (
+            args.eval_global_batch_size % (args.eval_micro_batch_size * args.data_parallel_size)
+            == 0
+        )
+        assert args.eval_global_batch_size == 32
+        assert args.eval_micro_batch_size == 2
+
+
+class TestEvalBatchSizeDivisibilityWithGTP:
+    """Test that the GTP weight-remat axis is factored into the eval divisibility check.
+
+    Unlike TestEvalBatchSizeDivisibility above, these call the real validate_args instead of
+    re-implementing its expression, so a future change to that expression is actually caught.
+    """
+
+    @staticmethod
+    def _build_args(
+        monkeypatch, num_weight_shards, eval_global_batch_size, eval_micro_batch_size=1, cli_args=()
+    ):
+        """Build a minimal GTP config: world_size 8 = gtp_weight_remat_size x data_parallel_size."""
+        monkeypatch.setattr(sys, 'argv', ['test_eval_batch_size.py', *cli_args])
+        args = parse_args()
+        # parse_args reads WORLD_SIZE from the environment. Pin it, since data_parallel_size is
+        # derived from it and the test must not depend on how the job was launched.
+        args.world_size = 8
+        args.num_layers = 2
+        args.hidden_size = 128
+        args.num_attention_heads = 4
+        args.max_position_embeddings = 1024
+        args.seq_length = 1024
+        args.micro_batch_size = 1
+        args.global_batch_size = 8
+        args.train_iters = 1
+        args.lr = 1e-4
+        args.tokenizer_type = 'NullTokenizer'
+        args.vocab_size = 1024
+        args.tensor_parallel_num_weight_shards = num_weight_shards
+        args.eval_global_batch_size = eval_global_batch_size
+        args.eval_micro_batch_size = eval_micro_batch_size
+        return args
+
+    def test_gtp_remat_factored_into_divisibility(self, monkeypatch):
+        """Divisible by eval_micro_batch_size * data_parallel_size, but not by the GTP axis."""
+        args = self._build_args(monkeypatch, num_weight_shards=8, eval_global_batch_size=4)
+        # 4 % (1 * 1) == 0 satisfies the two-factor check, but evaluate() divides by
+        # eval_micro_batch_size * data_parallel_size * gtp_weight_remat_size, which floors to
+        # 4 // 8 == 0 microbatches: evaluation would silently do nothing.
+        with pytest.raises(AssertionError, match="batch_parallel_size"):
+            validate_args(args)
+
+    def test_gtp_remat_divisible_config_passes(self, monkeypatch):
+        """A config divisible by the full data-distribution breadth validates."""
+        args = self._build_args(monkeypatch, num_weight_shards=8, eval_global_batch_size=8)
+        validate_args(args)
+        assert args.gtp_weight_remat_size == 8
+        assert args.data_parallel_size == 1
+        assert args.batch_parallel_size == 8
+        # The division evaluate() performs; it must leave at least one microbatch.
+        num_microbatches = args.eval_global_batch_size // (
+            args.eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size
+        )
+        assert num_microbatches == 1
+
+    @pytest.mark.parametrize(
+        "cp,sequence_shards,weight_shards,samples", [(2, 2, 2, 2), (1, 2, 4, 4), (2, 2, 4, 2)]
+    )
+    def test_gtp_remat_sequence_shards_use_independent_sample_count(
+        self, monkeypatch, cp, sequence_shards, weight_shards, samples
+    ):
+        """Sequence partitions do not multiply the eval batch size."""
+        monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+        args = self._build_args(
+            monkeypatch, num_weight_shards=weight_shards, eval_global_batch_size=samples
+        )
+        args.context_parallel_size = cp
+        args.tensor_parallel_num_sequence_shards = sequence_shards
+        args.ckpt_format = "torch_dist"
+        validate_args(args)
+        assert args.batch_parallel_size == samples
+        assert args.eval_global_batch_size // (args.eval_micro_batch_size * samples) == 1
+
+    @pytest.mark.parametrize(
+        "tp,sp,shards,total_cp,samples",
+        [
+            (1, False, 64, 128, 1),
+            (2, True, 64, 64, 1),
+            (2, True, 16, 16, 4),
+            (2, True, None, 2, 32),
+            (2, False, None, 2, 32),
+            (1, False, None, 2, 64),
+        ],
+    )
+    def test_sequence_shard_cli_resolves_runtime_cp(
+        self, monkeypatch, tp, sp, shards, total_cp, samples
+    ):
+        monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+        cli_args = ["--tensor-model-parallel-size", str(tp), "--context-parallel-size", "2"]
+        if sp:
+            cli_args.append("--sequence-parallel")
+        if shards is not None:
+            cli_args.extend(["--tensor-parallel-num-sequence-shards", str(shards)])
+        args = self._build_args(monkeypatch, 64, samples, cli_args=cli_args)
+        args.world_size = 128
+        args.global_batch_size = 128
+        args.ckpt_format = "torch_dist"
+        validate_args(args)
+        assert args.context_parallel_size == total_cp
+        assert args.data_parallel_size == 1
+        assert args.batch_parallel_size == samples
+        assert args.tensor_parallel_num_sequence_shards == (
+            shards if shards is not None else (tp if sp else 1)
+        )
+        config = core_transformer_config_from_args(args)
+        assert config.context_parallel_size == total_cp
+        assert config.gtp_remat_num_sequence_shards == total_cp // 2
+        assert (
+            config.tensor_parallel_num_sequence_shards == args.tensor_parallel_num_sequence_shards
+        )
+
+
+class TestGetTrainValidTestNumSamples:
+    """Test that get_train_valid_test_num_samples uses eval_global_batch_size."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_num_samples_uses_eval_gbs(self, run_config):
+        """eval/test sample counts should use eval_global_batch_size, not global_batch_size."""
+        args = create_test_args(
+            global_batch_size=32,
+            eval_global_batch_size=16,
+            train_iters=100,
+            eval_interval=10,
+            eval_iters=5,
+        )
+        set_args(args)
+        run_config.train = _default_config_from_args(TrainingConfig, args)
+        run_config.validation = _default_config_from_args(ValidationConfig, args)
+        train_samples, eval_samples, test_samples = get_train_valid_test_num_samples()
+        # eval_samples = ((100 // 10) + 1) * 5 * 16 = 11 * 5 * 16 = 880
+        assert eval_samples == 880
+        # test_samples = 5 * 16 = 80
+        assert test_samples == 80
+
+    def test_num_samples_default_matches_training(self, run_config):
+        """When eval_global_batch_size == global_batch_size, results should match old behavior."""
+        args = create_test_args(
+            global_batch_size=32,
+            eval_global_batch_size=32,
+            train_iters=100,
+            eval_interval=10,
+            eval_iters=5,
+        )
+        set_args(args)
+        run_config.train = _default_config_from_args(TrainingConfig, args)
+        run_config.validation = _default_config_from_args(ValidationConfig, args)
+        train_samples, eval_samples, test_samples = get_train_valid_test_num_samples()
+        # eval_samples = 11 * 5 * 32 = 1760
+        assert eval_samples == 1760
+        # test_samples = 5 * 32 = 160
+        assert test_samples == 160
+        # train_samples = 100 * 32 = 3200
+        assert train_samples == 3200
+
+    def test_num_samples_with_skip_train(self, run_config):
+        """With skip_train, eval_iters used directly (no multiplier from train_iters/eval_interval)."""
+        args = create_test_args(
+            global_batch_size=32, eval_global_batch_size=8, skip_train=True, eval_iters=10
+        )
+        set_args(args)
+        run_config.train = _default_config_from_args(TrainingConfig, args)
+        run_config.validation = _default_config_from_args(ValidationConfig, args)
+        train_samples, eval_samples, test_samples = get_train_valid_test_num_samples()
+        # eval_samples = 10 * 8 = 80
+        assert eval_samples == 80
+        # test_samples = 10 * 8 = 80
+        assert test_samples == 80

@@ -1,0 +1,383 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# OVERVIEW
+# --------
+# This is the comment-facing orchestrator for `/claude fix [optional steer]`.
+# GitHub evaluates `issue_comment` workflows from the default branch, so this
+# command becomes available only after the workflow is merged. One accepted
+# comment starts one bounded session; it does not run in response to a push.
+#
+#   issue comment
+#       |
+#       v
+#   authorize -> attempt 1 -> optional attempt 2 -> optional attempt 3
+#       |                                                    |
+#       +--> acknowledge (best effort)                       |
+#       +---------------------> final report <---------------+
+#
+# 1. `authorize` freezes the original PR head and current base SHA. It also
+#    verifies the exact command, requester write access, open fork PR, enabled
+#    maintainer edits, and a non-default/non-protected fork branch. It checks
+#    the complete PR file list for forbidden control or security-policy files.
+#    Optional text after `/claude fix` becomes steering; a bare command relies
+#    on the merge conflict or supported CI failure. A separate best-effort job
+#    acknowledges the command without making repair depend on a cosmetic API
+#    call.
+#
+# 2. Each attempt calls `_claude-fix-attempt.yml` from this trusted revision.
+#    That reusable workflow prepares a read-only Claude patch, validates and
+#    publishes it from a fresh runner, ensures CI exists for the exact SHA, and
+#    waits for the NVIDIA `pull-request/<PR>` CI run to finish.
+#
+# 3. Attempt 1 also tests an unchanged head when Claude has nothing to publish.
+#    A supported lint or non-GB200 unit-test failure enables the next attempt.
+#    Unsupported, stale, timed-out, green, and no-progress results stop early.
+#    Attempt 3 is the hard limit.
+#
+# 4. A session leaves at most one service-account commit in the PR branch
+#    history. The first change is an ordinary fast-forward push. A later attempt
+#    may amend only the exact bot commit returned by the preceding attempt, with
+#    an exact force-with-lease. Contributor history and concurrent branch
+#    updates cannot be replaced. Every service-account commit has a validated
+#    Signed-off-by trailer, and every new SHA is checked by CI again.
+#
+# 5. The service account posts a fixed terminal result. Detailed
+#    per-published-SHA what/why comments are posted separately by that account
+#    in the reusable workflow. A full manual rerun is ignored; another command
+#    starts a new session with a new immutable original-head snapshot.
+#
+# SECURITY MODEL
+# --------------
+# Permissions default to none and are granted per job. The acknowledgement job
+# alone receives pull-request write access; it has no checkout or secrets and
+# cannot block a repair. Claude never receives the service PAT or GitHub write
+# access. Fixed publish, CI-authorization, and reporting steps receive the PAT
+# explicitly. The command is nevertheless explicit maintainer authorization to
+# execute the generated SHA in credentialed internal CI, so maintainers must
+# use it only on PRs they already trust.
+name: Claude Fix PR
+
+on: # zizmor: ignore[concurrency-limits] queued commands must not replace a run
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  authorize:
+    name: Authorize Claude Fix
+    if: |
+      github.repository == 'NVIDIA/Megatron-LM' &&
+      github.run_attempt == 1 &&
+      github.event.issue.pull_request &&
+      github.event.comment.user.type == 'User' &&
+      github.event.comment.user.login != 'svcnvidia-nemo-ci' &&
+      startsWith(github.event.comment.body, '/claude fix')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+      pr_number: ${{ steps.gate.outputs.pr_number }}
+      requester: ${{ steps.gate.outputs.requester }}
+      head_repo: ${{ steps.gate.outputs.head_repo }}
+      head_ref: ${{ steps.gate.outputs.head_ref }}
+      head_sha: ${{ steps.gate.outputs.head_sha }}
+      base_ref: ${{ steps.gate.outputs.base_ref }}
+      base_sha: ${{ steps.gate.outputs.base_sha }}
+      steer_b64: ${{ steps.gate.outputs.steer_b64 }}
+      previous_ci_run_id: ${{ steps.gate.outputs.previous_ci_run_id }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.issue.number }}
+      COMMENT_BODY: ${{ github.event.comment.body }}
+      REQUESTER: ${{ github.event.comment.user.login }}
+    steps:
+      - name: Validate command, maintainer, and pull request
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          # GitHub comments can preserve CRLF line endings from pasted commands.
+          COMMENT_BODY=${COMMENT_BODY//$'\r\n'/$'\n'}
+          echo "should_run=false" >> "$GITHUB_OUTPUT"
+          case "$COMMENT_BODY" in
+            "/claude fix"|"/claude fix "*|$'/claude fix\n'*) ;;
+            *) exit 0 ;;
+          esac
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+
+          encoded_requester=$(jq -rn --arg v "$REQUESTER" '$v | @uri')
+          permission=$(gh api "repos/$REPO/collaborators/$encoded_requester/permission" \
+            --jq '.permission' 2>/dev/null || true)
+          case "$permission" in
+            admin|write) ;;
+            *)
+              gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
+                -f body="❌ You need write access to use \`/claude fix\`." >/dev/null
+              exit 1
+              ;;
+          esac
+
+          pr=$(gh api "repos/$REPO/pulls/$PR_NUMBER")
+          test "$(jq -r '.state' <<<"$pr")" = open
+          test "$(jq -r '.merged' <<<"$pr")" = false
+          test "$(jq -r '.base.repo.full_name' <<<"$pr")" = "$REPO"
+          test "$(jq -r '.maintainer_can_modify' <<<"$pr")" = true
+          head_repo=$(jq -r '.head.repo.full_name // empty' <<<"$pr")
+          head_ref=$(jq -r '.head.ref // empty' <<<"$pr")
+          head_sha=$(jq -r '.head.sha // empty' <<<"$pr")
+          base_ref=$(jq -r '.base.ref // empty' <<<"$pr")
+          [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]
+          test -n "$head_repo" && test -n "$head_ref" && test -n "$base_ref"
+          test "$head_repo" != "$REPO"
+          test "$head_ref" != "$base_ref"
+
+          fork=$(gh api "repos/$head_repo")
+          test "$(jq -r '.fork' <<<"$fork")" = true
+          test "$(jq -r '.source.full_name // empty' <<<"$fork")" = "$REPO"
+          default_ref=$(jq -r '.default_branch // empty' <<<"$fork")
+          test -n "$default_ref"
+          test "$head_ref" != "$default_ref"
+          encoded_head_ref=$(jq -rn --arg v "$head_ref" '$v | @uri')
+          branch=$(gh api "repos/$head_repo/branches/$encoded_head_ref")
+          test "$(jq -r '.protected' <<<"$branch")" = false
+          test "$(jq -r '.commit.sha' <<<"$branch")" = "$head_sha"
+          encoded_base_ref=$(jq -rn --arg v "$base_ref" '$v | @uri')
+          base_sha=$(gh api "repos/$REPO/commits/$encoded_base_ref" --jq '.sha')
+          [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]
+
+          changed_files=$(jq -r '.changed_files' <<<"$pr")
+          [[ "$changed_files" =~ ^[0-9]+$ ]] && (( changed_files < 3000 ))
+          files=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files?per_page=100" |
+            jq -cs '[.[][]]')
+          test "$(jq 'length' <<<"$files")" = "$changed_files"
+          if jq -e '[.[] | (.filename, (.previous_filename // empty)) |
+            select(test("^\\.github/|(^|/)CODEOWNERS$|(^|/)SECURITY\\.md$"))] |
+            length > 0' <<<"$files" >/dev/null; then
+            gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
+              -f body="❌ Claude fix does not run on pull requests that change repository control or security-policy files." >/dev/null
+            exit 1
+          fi
+
+          steer=${COMMENT_BODY#'/claude fix'}
+          steer=${steer# }
+          test "$(printf '%s' "$steer" | wc -c)" -le 2000
+          steer_b64=$(printf '%s' "$steer" | base64 -w 0)
+
+          ci_branch="pull-request/$PR_NUMBER"
+          runs=$(gh api --method GET \
+            "repos/$REPO/actions/workflows/cicd-main.yml/runs" \
+            -f branch="$ci_branch" -f event=push -f per_page=100)
+          previous_ci_run_id=$(jq -r --arg sha "$head_sha" '
+            (([.workflow_runs[] | select(.head_sha == $sha)] |
+              sort_by(.created_at, .id) | last) // {}) |
+            select(.status == "completed" and .conclusion == "failure") |
+            .id' <<<"$runs")
+
+          {
+            echo "should_run=true"
+            echo "pr_number=$PR_NUMBER"
+            echo "requester=$REQUESTER"
+            echo "head_repo=$head_repo"
+            echo "head_ref=$head_ref"
+            echo "head_sha=$head_sha"
+            echo "base_ref=$base_ref"
+            echo "base_sha=$base_sha"
+            echo "steer_b64=$steer_b64"
+            echo "previous_ci_run_id=$previous_ci_run_id"
+          } >>"$GITHUB_OUTPUT"
+
+  acknowledge:
+    name: Acknowledge Claude Fix
+    needs: authorize
+    if: needs.authorize.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    continue-on-error: true
+    permissions:
+      issues: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      COMMENT_ID: ${{ github.event.comment.id }}
+    steps:
+      # GitHub currently rejects PR-comment reactions when the job has only
+      # `issues: write`, despite documenting that permission as sufficient.
+      # Keep the practical `pull-requests: write` grant isolated in this job.
+      - name: React to trigger comment
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$COMMENT_ID" =~ ^[1-9][0-9]*$ ]]
+          response="$RUNNER_TEMP/claude-fix-reaction-response.txt"
+          if ! gh api --include --method POST \
+            "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
+            -f content=eyes >"$response"; then
+            grep -i '^x-accepted-github-permissions:' "$response" || true
+            echo "::warning::Could not add the acknowledgement reaction."
+            exit 1
+          fi
+          grep -i '^x-accepted-github-permissions:' "$response" || true
+
+  attempt_1:
+    name: Claude Fix Attempt 1
+    needs: authorize
+    if: needs.authorize.outputs.should_run == 'true'
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+      pull-requests: read
+    uses: ./.github/workflows/_claude-fix-attempt.yml
+    with:
+      pr_number: ${{ needs.authorize.outputs.pr_number }}
+      requester: ${{ needs.authorize.outputs.requester }}
+      head_repo: ${{ needs.authorize.outputs.head_repo }}
+      head_ref: ${{ needs.authorize.outputs.head_ref }}
+      expected_head_sha: ${{ needs.authorize.outputs.head_sha }}
+      original_head_sha: ${{ needs.authorize.outputs.head_sha }}
+      base_ref: ${{ needs.authorize.outputs.base_ref }}
+      base_sha: ${{ needs.authorize.outputs.base_sha }}
+      steer_b64: ${{ needs.authorize.outputs.steer_b64 }}
+      previous_ci_run_id: ${{ needs.authorize.outputs.previous_ci_run_id }}
+      attempt: 1
+      model: ${{ vars.CLAUDE_MODEL }}
+    secrets:
+      nvidia_inference_url: ${{ secrets.NVIDIA_INFERENCE_URL }}
+      nvidia_inference_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
+      service_pat: ${{ secrets.PAT }}
+
+  attempt_2:
+    name: Claude Fix Attempt 2
+    needs: [authorize, attempt_1]
+    if: |
+      needs.attempt_1.result == 'success' &&
+      needs.attempt_1.outputs.outcome == 'actionable'
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+      pull-requests: read
+    uses: ./.github/workflows/_claude-fix-attempt.yml
+    with:
+      pr_number: ${{ needs.authorize.outputs.pr_number }}
+      requester: ${{ needs.authorize.outputs.requester }}
+      head_repo: ${{ needs.authorize.outputs.head_repo }}
+      head_ref: ${{ needs.authorize.outputs.head_ref }}
+      expected_head_sha: ${{ needs.attempt_1.outputs.sha }}
+      original_head_sha: ${{ needs.authorize.outputs.head_sha }}
+      service_commit_sha: ${{ needs.attempt_1.outputs.service_commit_sha }}
+      base_ref: ${{ needs.authorize.outputs.base_ref }}
+      base_sha: ${{ needs.authorize.outputs.base_sha }}
+      steer_b64: ${{ needs.authorize.outputs.steer_b64 }}
+      previous_ci_run_id: ${{ needs.attempt_1.outputs.ci_run_id }}
+      attempt: 2
+      model: ${{ vars.CLAUDE_MODEL }}
+    secrets:
+      nvidia_inference_url: ${{ secrets.NVIDIA_INFERENCE_URL }}
+      nvidia_inference_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
+      service_pat: ${{ secrets.PAT }}
+
+  attempt_3:
+    name: Claude Fix Attempt 3
+    needs: [authorize, attempt_2]
+    if: |
+      needs.attempt_2.result == 'success' &&
+      needs.attempt_2.outputs.outcome == 'actionable' &&
+      needs.attempt_2.outputs.created == 'true'
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+      pull-requests: read
+    uses: ./.github/workflows/_claude-fix-attempt.yml
+    with:
+      pr_number: ${{ needs.authorize.outputs.pr_number }}
+      requester: ${{ needs.authorize.outputs.requester }}
+      head_repo: ${{ needs.authorize.outputs.head_repo }}
+      head_ref: ${{ needs.authorize.outputs.head_ref }}
+      expected_head_sha: ${{ needs.attempt_2.outputs.sha }}
+      original_head_sha: ${{ needs.authorize.outputs.head_sha }}
+      service_commit_sha: ${{ needs.attempt_2.outputs.service_commit_sha }}
+      base_ref: ${{ needs.authorize.outputs.base_ref }}
+      base_sha: ${{ needs.authorize.outputs.base_sha }}
+      steer_b64: ${{ needs.authorize.outputs.steer_b64 }}
+      previous_ci_run_id: ${{ needs.attempt_2.outputs.ci_run_id }}
+      attempt: 3
+      model: ${{ vars.CLAUDE_MODEL }}
+    secrets:
+      nvidia_inference_url: ${{ secrets.NVIDIA_INFERENCE_URL }}
+      nvidia_inference_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
+      service_pat: ${{ secrets.PAT }}
+
+  report:
+    name: Report Claude Fix Result
+    needs: [authorize, attempt_1, attempt_2, attempt_3]
+    if: always() && !cancelled() && needs.authorize.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    env:
+      GH_TOKEN: ${{ secrets.PAT }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      A1_RESULT: ${{ needs.attempt_1.result }}
+      A2_RESULT: ${{ needs.attempt_2.result }}
+      A3_RESULT: ${{ needs.attempt_3.result }}
+      A1_OUTCOME: ${{ needs.attempt_1.outputs.outcome }}
+      A2_OUTCOME: ${{ needs.attempt_2.outputs.outcome }}
+      A3_OUTCOME: ${{ needs.attempt_3.outputs.outcome }}
+      A1_CI_URL: ${{ needs.attempt_1.outputs.ci_run_url }}
+      A2_CI_URL: ${{ needs.attempt_2.outputs.ci_run_url }}
+      A3_CI_URL: ${{ needs.attempt_3.outputs.ci_run_url }}
+    steps:
+      - name: Post fixed terminal result
+        shell: bash
+        run: |
+          set -euo pipefail
+          account=$(gh api user)
+          test "$(jq -r '.login' <<<"$account")" = svcnvidia-nemo-ci
+          test "$(jq -r '.id' <<<"$account")" = 245956830
+          outcome=$A1_OUTCOME; attempt=1; ci_url=$A1_CI_URL
+          if [[ -n "$A2_OUTCOME" ]]; then outcome=$A2_OUTCOME; attempt=2; ci_url=$A2_CI_URL; fi
+          if [[ -n "$A3_OUTCOME" ]]; then outcome=$A3_OUTCOME; attempt=3; ci_url=$A3_CI_URL; fi
+          if [[ "$A1_RESULT" =~ ^(failure|cancelled)$ ||
+                "$A2_RESULT" =~ ^(failure|cancelled)$ ||
+                "$A3_RESULT" =~ ^(failure|cancelled)$ ]]; then
+            outcome=workflow_error
+            ci_url=""
+          fi
+          case "$outcome" in
+            green) message="✅ Claude fix CI passed after attempt $attempt." ;;
+            actionable) message="❌ Claude fix stopped after attempt $attempt; supported lint or unit tests still fail." ;;
+            unsupported) message="❌ Claude fix stopped because CI failed outside the supported lint and unit-test scope." ;;
+            stale) message="❌ Claude fix stopped because the pull request head or base changed." ;;
+            timeout) message="❌ Claude fix stopped because exact-SHA CI did not complete in time." ;;
+            no_progress) message="❌ Claude did not produce another safe change." ;;
+            *) message="❌ Claude fix stopped because a workflow step failed. [Inspect the run]($RUN_URL)." ;;
+          esac
+          if [[ "$ci_url" == https://github.com/NVIDIA/Megatron-LM/actions/runs/* ]]; then
+            message="$message [View exact-SHA CI]($ci_url)."
+          fi
+          gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
+            -f body="$message" >/dev/null

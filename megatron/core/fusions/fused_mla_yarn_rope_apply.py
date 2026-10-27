@@ -1,0 +1,1016 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
+from typing import Optional
+from unittest.mock import MagicMock
+
+import torch
+from packaging import version
+
+from megatron.core.utils import null_decorator
+
+try:
+    import triton
+    import triton.language as tl
+
+    if version.parse(triton.__version__) < version.parse("3.4.0") and not torch.cuda.is_available():
+        HAVE_TRITON = False
+    else:
+        HAVE_TRITON = tl.constexpr(version.parse(triton.__version__) >= version.parse("2.0.0"))
+except ImportError:
+    HAVE_TRITON = False
+
+if not HAVE_TRITON:
+    triton = MagicMock()
+    triton.jit = null_decorator
+    triton.autotune = null_decorator
+    triton.heuristics = null_decorator
+    tl = MagicMock()
+
+
+@triton.jit
+def _get_thd_token_idx(cu_seqlens, pid_m, seq_num, cp_rank, cp_size):
+    # Cast ``pid_m`` and ``cu_seqlens`` loads to a single shared dtype so
+    # the loop-body reassignments don't surface as
+    # "initial value is int32 but redefined as int64" in newer Triton
+    # versions (which promote ``// Python_int`` to int64).
+    pid_m = pid_m.to(tl.int64)
+    token_idx = tl.full((), -1, dtype=tl.int64)
+    this_seq_len = tl.full((), 0, dtype=tl.int64)
+    seq_idx = 0
+    last_cum_seqlen = tl.load(cu_seqlens).to(tl.int64) // cp_size
+    while seq_idx < seq_num:
+        cur_cum_seqlen = tl.load(cu_seqlens + seq_idx + 1).to(tl.int64) // cp_size
+        if token_idx == -1 and cur_cum_seqlen > pid_m:
+            token_idx = pid_m - last_cum_seqlen
+            this_seq_len = cur_cum_seqlen - last_cum_seqlen
+        last_cum_seqlen = cur_cum_seqlen
+        seq_idx += 1
+    # Padding tokens beyond cu_seqlens[-1] (from THD CUDA-graph padding)
+    # never match any sequence, leaving token_idx == -1.  Clamp to 0 so
+    # the cos/sin table loads stay in-bounds; the wrong RoPE result is
+    # harmless because padding positions are excluded by loss_mask.
+    if token_idx == -1:
+        token_idx = tl.full((), 0, dtype=tl.int64)
+    if cp_size > 1:
+        if token_idx < this_seq_len // 2:
+            token_idx = token_idx + cp_rank * this_seq_len // 2
+        else:
+            token_idx = (token_idx - this_seq_len // 2) + (
+                2 * cp_size - cp_rank - 1
+            ) * this_seq_len // 2
+    return token_idx
+
+
+@triton.jit
+def _mla_rope_fwd_inplace_kernel(
+    Q,
+    COS,
+    SIN,
+    nope_dim,
+    emb_dim: tl.constexpr,
+    head_num: tl.constexpr,
+    batch_size,
+    seq_num,
+    cu_seqlens_q,
+    position_ids,
+    stride_x_seq,
+    stride_x_nheads,
+    stride_cos_seq,
+    stride_sin_seq,
+    cp_rank,
+    cp_size,
+    INVERSE: tl.constexpr,
+    REMOVE_INTERLEAVING: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """
+    Forward pass: apply RoPE inplace to the trailing emb_dim elements.
+    Reads from interleaved layout, writes back to interleaved layout.
+
+    Input:
+        Q: [seq_len, batch_size, head_num, nope_dim + emb_dim]
+            or [total_seq_len, head_num, nope_dim + emb_dim]
+        COS/SIN: [max_seq_len, emb_dim]
+
+        batch_size: batch size for sbhd format, not used for thd format
+        seq_num: number of sequences for thd format, not used for sbhd format
+        cu_seqlens_q: [seq_num + 1] accumulated sequence lengths for thd format
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_head = tl.program_id(axis=1)
+
+    if position_ids is not None:
+        token_idx = tl.load(position_ids + pid_m)
+    elif cu_seqlens_q is None:
+        token_idx = pid_m // batch_size
+    else:
+        token_idx = _get_thd_token_idx(cu_seqlens_q, pid_m, seq_num, cp_rank, cp_size)
+
+    cos_left = tl.load(COS + token_idx * stride_cos_seq + tl.arange(0, emb_dim // 2))
+    sin_left = tl.load(SIN + token_idx * stride_sin_seq + tl.arange(0, emb_dim // 2))
+    cos_right = tl.load(
+        COS + token_idx * stride_cos_seq + emb_dim // 2 + tl.arange(0, emb_dim // 2)
+    )
+    sin_right = tl.load(
+        SIN + token_idx * stride_sin_seq + emb_dim // 2 + tl.arange(0, emb_dim // 2)
+    )
+    if INVERSE:
+        sin_left = -sin_left
+        sin_right = -sin_right
+    cos_left = cos_left.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
+    sin_left = sin_left.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
+    cos_right = cos_right.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
+    sin_right = sin_right.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
+
+    Q = Q + pid_m * stride_x_seq + pid_head * BLOCK_H * stride_x_nheads
+
+    x_off = tl.arange(0, BLOCK_H)[:, None] * stride_x_nheads + nope_dim
+    mask = (pid_head * BLOCK_H + tl.arange(0, BLOCK_H))[:, None] < head_num
+    # x1 = t[..., 0::2], x2 = t[..., 1::2], split from one contiguous load of the emb_dim elements.
+    x_emb_off = x_off + tl.arange(0, emb_dim)[None, :]
+    x = tl.load(Q + x_emb_off, mask=mask)
+    x_1, x_2 = tl.split(tl.reshape(x, (BLOCK_H, emb_dim // 2, 2)))
+
+    # x_left = x_1 * cos_left - x_2 * sin_left, x_right = x_2 * cos_right + x_1 * sin_right.
+    # The products are paired into FMAs explicitly: the pairing the compiler picks on its own
+    # changes with the load pattern and with BLOCK_H. These are the pairings the kernel compiled
+    # to with two stride-2 loads, so the rounding is unchanged.
+    x_left = tl.fma(x_1, cos_left, -(x_2 * sin_left))
+    if INVERSE:
+        x_right = tl.fma(x_2, cos_right, x_1 * sin_right)
+    else:
+        x_right = tl.fma(x_1, sin_right, x_2 * cos_right)
+
+    if REMOVE_INTERLEAVING:
+        tl.store(Q + x_emb_off, tl.interleave(x_left, x_right), mask=mask)
+    else:
+        # The interleaved input and split output layouts alias. Finish all loads
+        # before any warp stores to the overlapping destination addresses.
+        tl.debug_barrier()
+        x_left_off = x_off + tl.arange(0, emb_dim // 2)[None, :]
+        x_right_off = x_left_off + emb_dim // 2
+        tl.store(Q + x_left_off, x_left, mask=mask)
+        tl.store(Q + x_right_off, x_right, mask=mask)
+
+
+_autotuned_mla_rope_fwd_inplace_kernel = triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 1}),
+        triton.Config({"BLOCK_H": 2}),
+        triton.Config({"BLOCK_H": 4}),
+        triton.Config({"BLOCK_H": 8}),
+        triton.Config({"BLOCK_H": 16}),
+        triton.Config({"BLOCK_H": 32}),
+        triton.Config({"BLOCK_H": 64}),
+        triton.Config({"BLOCK_H": 128}),
+    ],
+    key=["emb_dim", "head_num"],
+    restore_value=["Q"],
+)(_mla_rope_fwd_inplace_kernel)
+
+
+@triton.jit
+def _mla_rope_bwd_inplace_kernel(
+    DO,
+    COS,
+    SIN,
+    nope_dim,
+    emb_dim: tl.constexpr,
+    head_num: tl.constexpr,
+    batch_size,
+    seq_num,
+    cu_seqlens_q,
+    position_ids,
+    stride_x_seq,
+    stride_x_nheads,
+    stride_cos_seq,
+    stride_sin_seq,
+    cp_rank,
+    cp_size,
+    INVERSE: tl.constexpr,
+    REMOVE_INTERLEAVING: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """
+    Backward pass: inverse RoPE inplace on the trailing emb_dim elements.
+    Reads from interleaved layout, writes to interleaved layout.
+
+    Input:
+        DO: [seq_len, batch_size, head_num, nope_dim + emb_dim]
+            or [total_seq_len, head_num, nope_dim + emb_dim]
+        COS/SIN: [max_seq_len, emb_dim]
+
+        batch_size, seq_num, and cu_seqlens_q are the same as in the forward pass
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_head = tl.program_id(axis=1)
+
+    if position_ids is not None:
+        token_idx = tl.load(position_ids + pid_m)
+    elif cu_seqlens_q is None:
+        token_idx = pid_m // batch_size
+    else:
+        token_idx = _get_thd_token_idx(cu_seqlens_q, pid_m, seq_num, cp_rank, cp_size)
+
+    cos_left = tl.load(COS + token_idx * stride_cos_seq + tl.arange(0, emb_dim // 2))
+    sin_left = tl.load(SIN + token_idx * stride_sin_seq + tl.arange(0, emb_dim // 2))
+    cos_right = tl.load(
+        COS + token_idx * stride_cos_seq + emb_dim // 2 + tl.arange(0, emb_dim // 2)
+    )
+    sin_right = tl.load(
+        SIN + token_idx * stride_sin_seq + emb_dim // 2 + tl.arange(0, emb_dim // 2)
+    )
+    if INVERSE:
+        sin_left = -sin_left
+        sin_right = -sin_right
+    cos_left = cos_left.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
+    sin_left = sin_left.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
+    cos_right = cos_right.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
+    sin_right = sin_right.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
+
+    DO = DO + pid_m * stride_x_seq + pid_head * BLOCK_H * stride_x_nheads
+
+    x_off = tl.arange(0, BLOCK_H)[:, None] * stride_x_nheads + nope_dim
+    mask = (pid_head * BLOCK_H + tl.arange(0, BLOCK_H))[:, None] < head_num
+    if REMOVE_INTERLEAVING:
+        x_1_off = x_off + tl.arange(0, emb_dim // 2)[None, :] * 2
+        x_2_off = x_1_off + 1
+        x_left = tl.load(DO + x_1_off, mask=mask)
+        x_right = tl.load(DO + x_2_off, mask=mask)
+    else:
+        x_left_off = x_off + tl.arange(0, emb_dim // 2)[None, :]
+        x_right_off = x_left_off + emb_dim // 2
+        x_left = tl.load(DO + x_left_off, mask=mask)
+        x_right = tl.load(DO + x_right_off, mask=mask)
+        x_1_off = x_off + tl.arange(0, emb_dim // 2)[None, :] * 2
+        x_2_off = x_1_off + 1
+
+    x_1 = x_left * cos_left + x_right * sin_right
+    x_2 = -x_left * sin_left + x_right * cos_right
+
+    if not REMOVE_INTERLEAVING:
+        # The split input and interleaved output layouts alias. Finish all loads
+        # before any warp stores to the overlapping destination addresses.
+        tl.debug_barrier()
+    tl.store(DO + x_1_off, x_1, mask=mask)
+    tl.store(DO + x_2_off, x_2, mask=mask)
+
+
+_autotuned_mla_rope_bwd_inplace_kernel = triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 1}),
+        triton.Config({"BLOCK_H": 2}),
+        triton.Config({"BLOCK_H": 4}),
+        triton.Config({"BLOCK_H": 8}),
+        triton.Config({"BLOCK_H": 16}),
+        triton.Config({"BLOCK_H": 32}),
+        triton.Config({"BLOCK_H": 64}),
+        triton.Config({"BLOCK_H": 128}),
+    ],
+    key=["emb_dim", "head_num"],
+    restore_value=["DO"],
+)(_mla_rope_bwd_inplace_kernel)
+
+
+class _FusedMLARoPEInplace(torch.autograd.Function):
+    """
+    Autograd function for applying RoPE inplace to the trailing emb_dim
+    elements of a multi-head tensor (leaving the first nope_dim elements unchanged).
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        cos,
+        sin,
+        nope_dim,
+        emb_dim,
+        cu_seqlens_q,
+        cp_rank,
+        cp_size,
+        rotary_interleaved=False,
+        inverse=False,
+        remove_interleaving=False,
+        position_ids=None,
+    ):
+        """
+        Forward function for _FusedMLARoPEInplace.
+
+        Args:
+            q: [seq_len, batch_size, head_num, nope_dim + emb_dim]
+                or [total_seq_len, head_num, nope_dim + emb_dim]
+            cos/sin: [max_seq_len, 1, 1, emb_dim]
+            cu_seqlens_q: [seq_num + 1] accumulated sequence lengths for thd format
+            rotary_interleaved: whether to apply RoPE interleaved, only supports False for now
+            inverse: if True, negate sin inside the kernel to apply the inverse rotation
+        """
+        assert not rotary_interleaved
+        max_seqlen = None
+        batch_size = None
+        seq_num = None
+        if cu_seqlens_q is None:
+            # sbhd
+            assert position_ids is None
+            max_seqlen, batch_size, nheads, headdim = q.shape
+            q = q.view(-1, nheads, headdim)
+            total_seqlen = q.shape[0]
+        else:
+            # thd
+            total_seqlen, nheads, headdim = q.shape
+            seq_num = len(cu_seqlens_q) - 1
+            if position_ids is not None:
+                assert position_ids.shape == (total_seqlen,)
+        assert q.stride(-1) == 1
+        assert cos.stride(-1) == 1
+        assert sin.stride(-1) == 1
+        assert headdim == nope_dim + emb_dim
+        assert emb_dim % 4 == 0
+
+        grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
+        _autotuned_mla_rope_fwd_inplace_kernel[grid](
+            q,
+            cos,
+            sin,
+            nope_dim,
+            emb_dim,
+            nheads,
+            batch_size,
+            seq_num,
+            cu_seqlens_q,
+            position_ids,
+            q.stride(0),
+            q.stride(1),
+            cos.stride(0),
+            sin.stride(0),
+            cp_rank,
+            cp_size,
+            INVERSE=inverse,
+            REMOVE_INTERLEAVING=remove_interleaving,
+        )
+        ctx.save_for_backward(cos, sin, *(() if position_ids is None else (position_ids,)))
+        ctx.has_position_ids = position_ids is not None
+        ctx.nope_dim = nope_dim
+        ctx.emb_dim = emb_dim
+        ctx.cu_seqlens_q = cu_seqlens_q
+        ctx.rotary_interleaved = rotary_interleaved
+        ctx.inverse = inverse
+        ctx.remove_interleaving = remove_interleaving
+        ctx.cp_rank = cp_rank
+        ctx.cp_size = cp_size
+        if cu_seqlens_q is None:
+            q = q.view(max_seqlen, batch_size, nheads, headdim)
+        return q
+
+    @staticmethod
+    def backward(ctx, grad):
+        """
+        Backward function for _FusedMLARoPEInplace.
+
+        Args:
+            grad: [seq_len, batch_size, head_num, nope_dim + emb_dim]
+                or [total_seq_len, head_num, nope_dim + emb_dim]
+        """
+        if ctx.has_position_ids:
+            cos, sin, position_ids = ctx.saved_tensors
+        else:
+            cos, sin = ctx.saved_tensors
+            position_ids = None
+        max_seqlen = None
+        batch_size = None
+        seq_num = None
+        if ctx.cu_seqlens_q is None:
+            max_seqlen, batch_size, nheads, headdim = grad.shape
+            grad = grad.contiguous().view(-1, nheads, headdim)
+            total_seqlen = grad.shape[0]
+        else:
+            seq_num = len(ctx.cu_seqlens_q) - 1
+            if ctx.has_position_ids:
+                grad = grad.contiguous()
+            total_seqlen, nheads, headdim = grad.shape
+        assert grad.stride(-1) == 1
+
+        grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
+        _autotuned_mla_rope_bwd_inplace_kernel[grid](
+            grad,
+            cos,
+            sin,
+            ctx.nope_dim,
+            ctx.emb_dim,
+            nheads,
+            batch_size,
+            seq_num,
+            ctx.cu_seqlens_q,
+            position_ids,
+            grad.stride(0),
+            grad.stride(1),
+            cos.stride(0),
+            sin.stride(0),
+            ctx.cp_rank,
+            ctx.cp_size,
+            INVERSE=ctx.inverse,
+            REMOVE_INTERLEAVING=ctx.remove_interleaving,
+        )
+        if ctx.cu_seqlens_q is None:
+            grad = grad.view(max_seqlen, batch_size, nheads, headdim)
+        return grad, None, None, None, None, None, None, None, None, None, None, None
+
+
+def fused_mla_rope_inplace(
+    t: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    nope_dim: int,
+    emb_dim: int,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cp_rank: int = 0,
+    cp_size: int = 1,
+    rotary_interleaved: bool = False,
+    inverse: bool = False,
+    remove_interleaving: bool = False,
+    position_ids: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Fused RoPE applied inplace to the trailing emb_dim elements of a tensor,
+    leaving the first nope_dim elements unchanged.
+    It supports both sbhd and thd input formats.
+
+    When ``inverse=True`` the rotation is reversed, which is useful for
+    undoing RoPE on the attention output.
+
+    For the notations below, seq_len is the length of the sequence per batch for sbhd format,
+    total_seq_len is the total length of the sequences for thd format.
+    max_seq_len is the maximum length of the sequences in the input tensor.
+
+    Args:
+        t: [seq_len, batch_size, head_num, nope_dim + emb_dim]
+            or [total_seq_len, head_num, nope_dim + emb_dim]
+        cos/sin: [max_seq_len, 1, 1, emb_dim]
+        cu_seqlens_q: [seq_num + 1] accumulated sequence lengths for thd format
+        rotary_interleaved: whether to apply RoPE interleaved, only supports False for now
+        inverse: if True, apply the inverse rotation
+        remove_interleaving: if True, output RoPE dims in non-interleaved layout
+        position_ids: optional THD row positions. When supplied, these positions
+            replace the built-in CP row-to-position mapping.
+
+    Returns:
+        t: inplace modified input tensor
+    """
+    return _FusedMLARoPEInplace.apply(
+        t,
+        cos,
+        sin,
+        nope_dim,
+        emb_dim,
+        cu_seqlens_q,
+        cp_rank,
+        cp_size,
+        rotary_interleaved,
+        inverse,
+        remove_interleaving,
+        position_ids,
+    )
+
+
+def fused_mla_rope_out_of_place(
+    t: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    nope_dim: int,
+    emb_dim: int,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cp_rank: int = 0,
+    cp_size: int = 1,
+    rotary_interleaved: bool = False,
+    inverse: bool = False,
+    remove_interleaving: bool = False,
+    position_ids: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Apply the fused RoPE kernel without modifying the input tensor.
+
+    Use this wrapper when an upstream autograd function may have retained its
+    output for backward. The underlying kernel remains in-place, so a private
+    copy is required to keep the retained tensor unchanged.
+    """
+    return fused_mla_rope_inplace(
+        t.clone(),
+        cos,
+        sin,
+        nope_dim,
+        emb_dim,
+        cu_seqlens_q=cu_seqlens_q,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        rotary_interleaved=rotary_interleaved,
+        inverse=inverse,
+        remove_interleaving=remove_interleaving,
+        position_ids=position_ids,
+    )
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 1}),
+        triton.Config({"BLOCK_H": 2}),
+        triton.Config({"BLOCK_H": 4}),
+        triton.Config({"BLOCK_H": 8}),
+        triton.Config({"BLOCK_H": 16}),
+        triton.Config({"BLOCK_H": 32}),
+        triton.Config({"BLOCK_H": 64}),
+        triton.Config({"BLOCK_H": 128}),
+    ],
+    key=["emb_dim", "k_dim", "v_dim", "head_num"],
+)
+@triton.jit
+def _mla_rope_fwd_kv_split_kernel(
+    KV,
+    K_POS_EMB,
+    O_KEY,
+    O_VALUE,
+    COS,
+    SIN,
+    emb_dim: tl.constexpr,
+    k_dim: tl.constexpr,
+    v_dim: tl.constexpr,
+    head_num: tl.constexpr,
+    batch_size,
+    seq_num,
+    cu_seqlens_kv,
+    stride_kv_seq,
+    stride_kv_nheads,
+    stride_emb_seq,
+    stride_k_seq,
+    stride_k_nheads,
+    stride_v_seq,
+    stride_v_nheads,
+    cp_rank,
+    cp_size,
+    REMOVE_INTERLEAVING: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """
+    Forward pass: split KV into key and value, apply RoPE to k_pos_emb,
+    and concatenate the result onto key.
+
+    Input:
+        KV: [seq_len, batch_size, head_num, k_dim + v_dim]
+            or [total_seq_len, head_num, k_dim + v_dim]
+        K_POS_EMB: [seq_len, batch_size, emb_dim] or [total_seq_len, emb_dim]
+        COS/SIN: [max_seq_len, emb_dim]
+
+        batch_size: batch size for sbhd format, not used for thd format
+        seq_num: number of sequences for thd format, not used for sbhd format
+        cu_seqlens_kv: [seq_num + 1] accumulated sequence lengths for thd format
+
+    Output:
+        O_KEY: [seq_len, batch_size, head_num, emb_dim + k_dim]
+            or [total_seq_len, head_num, emb_dim + k_dim]
+        O_VALUE: [seq_len, batch_size, head_num, v_dim] or [total_seq_len, head_num, v_dim]
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_head = tl.program_id(axis=1)
+
+    if cu_seqlens_kv is None:
+        token_idx = pid_m // batch_size
+    else:
+        token_idx = _get_thd_token_idx(cu_seqlens_kv, pid_m, seq_num, cp_rank, cp_size)
+
+    cos_left = tl.load(COS + token_idx * emb_dim + tl.arange(0, emb_dim // 2))
+    sin_left = tl.load(SIN + token_idx * emb_dim + tl.arange(0, emb_dim // 2))
+    cos_right = tl.load(COS + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, emb_dim // 2))
+    sin_right = tl.load(SIN + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, emb_dim // 2))
+
+    KV_ptr = KV + pid_m * stride_kv_seq + pid_head * BLOCK_H * stride_kv_nheads
+    kv_off = tl.arange(0, BLOCK_H)[:, None] * stride_kv_nheads
+    mask = (pid_head * BLOCK_H + tl.arange(0, BLOCK_H))[:, None] < head_num
+    k_in_off = kv_off + tl.arange(0, k_dim)[None, :]
+    v_in_off = kv_off + k_dim + tl.arange(0, v_dim)[None, :]
+    k = tl.load(KV_ptr + k_in_off, mask=mask)
+    v = tl.load(KV_ptr + v_in_off, mask=mask)
+
+    K_ptr = O_KEY + pid_m * stride_k_seq + pid_head * BLOCK_H * stride_k_nheads
+    V_ptr = O_VALUE + pid_m * stride_v_seq + pid_head * BLOCK_H * stride_v_nheads
+
+    k_out_off = tl.arange(0, BLOCK_H)[:, None] * stride_k_nheads + tl.arange(0, k_dim)[None, :]
+    v_out_off = tl.arange(0, BLOCK_H)[:, None] * stride_v_nheads + tl.arange(0, v_dim)[None, :]
+    tl.store(K_ptr + k_out_off, k, mask=mask)
+    tl.store(V_ptr + v_out_off, v, mask=mask)
+
+    EMB = K_POS_EMB + pid_m * stride_emb_seq
+    # x1 = t[..., 0::2], x2 = t[..., 1::2]
+    x_1 = tl.load(EMB + tl.arange(0, emb_dim // 2) * 2)
+    x_2 = tl.load(EMB + tl.arange(0, emb_dim // 2) * 2 + 1)
+
+    x_left = x_1 * cos_left - x_2 * sin_left
+    x_right = x_2 * cos_right + x_1 * sin_right
+    x_left = x_left.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
+    x_right = x_right.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
+
+    if REMOVE_INTERLEAVING:
+        x_1_off = (
+            tl.arange(0, BLOCK_H)[:, None] * stride_k_nheads
+            + k_dim
+            + tl.arange(0, emb_dim // 2)[None, :] * 2
+        )
+        x_2_off = x_1_off + 1
+        tl.store(K_ptr + x_1_off, x_left, mask=mask)
+        tl.store(K_ptr + x_2_off, x_right, mask=mask)
+    else:
+        x_left_off = (
+            tl.arange(0, BLOCK_H)[:, None] * stride_k_nheads
+            + k_dim
+            + tl.arange(0, emb_dim // 2)[None, :]
+        )
+        x_right_off = x_left_off + emb_dim // 2
+        tl.store(K_ptr + x_left_off, x_left, mask=mask)
+        tl.store(K_ptr + x_right_off, x_right, mask=mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 1}),
+        triton.Config({"BLOCK_H": 2}),
+        triton.Config({"BLOCK_H": 4}),
+        triton.Config({"BLOCK_H": 8}),
+        triton.Config({"BLOCK_H": 16}),
+        triton.Config({"BLOCK_H": 32}),
+        triton.Config({"BLOCK_H": 64}),
+        triton.Config({"BLOCK_H": 128}),
+    ],
+    key=["emb_dim", "k_dim", "v_dim", "head_num"],
+)
+@triton.jit
+def _mla_rope_bwd_kv_split_kernel(
+    dK,
+    dV,
+    dKV,
+    dEMB,
+    COS,
+    SIN,
+    emb_dim: tl.constexpr,
+    k_dim: tl.constexpr,
+    v_dim: tl.constexpr,
+    head_num: tl.constexpr,
+    batch_size,
+    seq_num,
+    cu_seqlens_kv,
+    stride_dk_seq,
+    stride_dk_nheads,
+    stride_dv_seq,
+    stride_dv_nheads,
+    stride_dkv_seq,
+    stride_dkv_nheads,
+    stride_demb_seq,
+    cp_rank,
+    cp_size,
+    REMOVE_INTERLEAVING: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """
+    Backward pass for the KV-split RoPE.
+
+    Input:
+        dK: [seq_len, batch_size, head_num, emb_dim + k_dim]
+            or [total_seq_len, head_num, emb_dim + k_dim]
+        dV: [seq_len, batch_size, head_num, v_dim] or [total_seq_len, head_num, v_dim]
+        COS/SIN: [max_seq_len, emb_dim]
+
+        batch_size, seq_num, and cu_seqlens_kv are the same as in the forward pass
+
+    Output:
+        dKV: [seq_len, batch_size, head_num, k_dim + v_dim]
+            or [total_seq_len, head_num, k_dim + v_dim]
+        dEMB: [seq_len, batch_size, emb_dim] or [total_seq_len, emb_dim]
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_head = tl.program_id(axis=1)
+
+    if cu_seqlens_kv is None:
+        token_idx = pid_m // batch_size
+    else:
+        token_idx = _get_thd_token_idx(cu_seqlens_kv, pid_m, seq_num, cp_rank, cp_size)
+
+    dKV_ptr = dKV + pid_m * stride_dkv_seq + pid_head * BLOCK_H * stride_dkv_nheads
+    dkv_off = tl.arange(0, BLOCK_H)[:, None] * stride_dkv_nheads
+    mask = (pid_head * BLOCK_H + tl.arange(0, BLOCK_H))[:, None] < head_num
+    dk_out_off = dkv_off + tl.arange(0, k_dim)[None, :]
+    dv_out_off = dkv_off + k_dim + tl.arange(0, v_dim)[None, :]
+
+    dK_ptr = dK + pid_m * stride_dk_seq + pid_head * BLOCK_H * stride_dk_nheads
+    dV_ptr = dV + pid_m * stride_dv_seq + pid_head * BLOCK_H * stride_dv_nheads
+    dk_in_off = tl.arange(0, BLOCK_H)[:, None] * stride_dk_nheads + tl.arange(0, k_dim)[None, :]
+    dv_in_off = tl.arange(0, BLOCK_H)[:, None] * stride_dv_nheads + tl.arange(0, v_dim)[None, :]
+    dk = tl.load(dK_ptr + dk_in_off, mask=mask)
+    dv = tl.load(dV_ptr + dv_in_off, mask=mask)
+    tl.store(dKV_ptr + dk_out_off, dk, mask=mask)
+    tl.store(dKV_ptr + dv_out_off, dv, mask=mask)
+
+    if pid_head == 0:
+        x_left_accum = tl.zeros((BLOCK_H, emb_dim // 2), dtype=tl.float32)
+        x_right_accum = tl.zeros((BLOCK_H, emb_dim // 2), dtype=tl.float32)
+        for i in tl.static_range(triton.cdiv(head_num, BLOCK_H)):
+            dK_ptr = dK + pid_m * stride_dk_seq + i * BLOCK_H * stride_dk_nheads
+            x_off = tl.arange(0, BLOCK_H)[:, None] * stride_dk_nheads + k_dim
+            mask = (i * BLOCK_H + tl.arange(0, BLOCK_H))[:, None] < head_num
+            # ``other=0`` is required, not cosmetic: a masked-out lane is undefined without it,
+            # and these values are added unconditionally into the accumulators below and then
+            # reduced with ``tl.sum``. Every other masked load in this file feeds a masked store,
+            # which discards the invalid lanes; a reduction cannot.
+            if REMOVE_INTERLEAVING:
+                x_1_off = x_off + tl.arange(0, emb_dim // 2)[None, :] * 2
+                x_2_off = x_1_off + 1
+                x_left = tl.load(dK_ptr + x_1_off, mask=mask, other=0.0)
+                x_right = tl.load(dK_ptr + x_2_off, mask=mask, other=0.0)
+            else:
+                x_left_off = x_off + tl.arange(0, emb_dim // 2)[None, :]
+                x_right_off = x_left_off + emb_dim // 2
+                x_left = tl.load(dK_ptr + x_left_off, mask=mask, other=0.0)
+                x_right = tl.load(dK_ptr + x_right_off, mask=mask, other=0.0)
+            x_left_accum += x_left
+            x_right_accum += x_right
+        x_left_accum = tl.sum(x_left_accum, axis=0)
+        x_right_accum = tl.sum(x_right_accum, axis=0)
+        x_left_accum = x_left_accum.to(dEMB.dtype.element_ty)
+        x_right_accum = x_right_accum.to(dEMB.dtype.element_ty)
+
+        cos_left = tl.load(COS + token_idx * emb_dim + tl.arange(0, emb_dim // 2))
+        sin_left = tl.load(SIN + token_idx * emb_dim + tl.arange(0, emb_dim // 2))
+        cos_right = tl.load(COS + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, emb_dim // 2))
+        sin_right = tl.load(SIN + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, emb_dim // 2))
+
+        x_1 = x_left_accum * cos_left + x_right_accum * sin_right
+        x_2 = -x_left_accum * sin_left + x_right_accum * cos_right
+        dEMB_ptr = dEMB + pid_m * stride_demb_seq
+        tl.store(dEMB_ptr + tl.arange(0, emb_dim // 2) * 2, x_1)
+        tl.store(dEMB_ptr + tl.arange(0, emb_dim // 2) * 2 + 1, x_2)
+
+
+class _FusedMLARoPEKVSplit(torch.autograd.Function):
+    """
+    Autograd function for applying RoPE to MLA's key and value.
+    Splits KV, applies RoPE to k_pos_emb, concatenates onto key.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        kv,
+        k_pos_emb,
+        cos,
+        sin,
+        emb_dim,
+        k_dim,
+        v_dim,
+        cu_seqlens_kv,
+        cp_rank,
+        cp_size,
+        rotary_interleaved=False,
+        remove_interleaving=False,
+    ):
+        """
+        Forward function for _FusedMLARoPEKVSplit.
+
+        Args:
+            kv: [seq_len, batch_size, head_num, k_dim + v_dim]
+                or [total_seq_len, head_num, k_dim + v_dim]
+            k_pos_emb: [seq_len, batch_size, 1, emb_dim] or [total_seq_len, 1, emb_dim]
+            cos/sin: [max_seq_len, 1, 1, emb_dim]
+            cu_seqlens_kv: [seq_num + 1] accumulated sequence lengths for thd format
+            rotary_interleaved: whether to apply RoPE interleaved, only supports False for now
+        """
+        assert not rotary_interleaved
+        max_seqlen = None
+        batch_size = None
+        seq_num = None
+        if cu_seqlens_kv is None:
+            # sbhd
+            max_seqlen, batch_size, nheads, headdim = kv.shape
+            kv = kv.view(-1, nheads, headdim)
+            k_pos_emb = k_pos_emb.view(-1, emb_dim)
+            total_seqlen = kv.shape[0]
+        else:
+            # thd
+            seq_num = len(cu_seqlens_kv) - 1
+            total_seqlen, nheads, headdim = kv.shape
+        assert headdim == k_dim + v_dim
+        assert kv.stride(-1) == 1
+        assert k_pos_emb.stride(-1) == 1
+        assert cos.is_contiguous()
+        assert sin.is_contiguous()
+        assert emb_dim % 4 == 0
+
+        o_key = kv.new_empty(total_seqlen, nheads, emb_dim + k_dim)
+        o_value = kv.new_empty(total_seqlen, nheads, v_dim)
+
+        grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
+        _mla_rope_fwd_kv_split_kernel[grid](
+            kv,
+            k_pos_emb,
+            o_key,
+            o_value,
+            cos,
+            sin,
+            emb_dim,
+            k_dim,
+            v_dim,
+            nheads,
+            batch_size,
+            seq_num,
+            cu_seqlens_kv,
+            kv.stride(0),
+            kv.stride(1),
+            k_pos_emb.stride(0),
+            o_key.stride(0),
+            o_key.stride(1),
+            o_value.stride(0),
+            o_value.stride(1),
+            cp_rank,
+            cp_size,
+            REMOVE_INTERLEAVING=remove_interleaving,
+        )
+        ctx.save_for_backward(cos, sin)
+        ctx.remove_interleaving = remove_interleaving
+        ctx.rotary_interleaved = rotary_interleaved
+        ctx.emb_dim = emb_dim
+        ctx.k_dim = k_dim
+        ctx.v_dim = v_dim
+        ctx.cu_seqlens_kv = cu_seqlens_kv
+        ctx.cp_rank = cp_rank
+        ctx.cp_size = cp_size
+        if cu_seqlens_kv is None:
+            o_key = o_key.view(max_seqlen, -1, nheads, emb_dim + k_dim)
+            o_value = o_value.view(max_seqlen, -1, nheads, v_dim)
+        return o_key, o_value
+
+    @staticmethod
+    def backward(ctx, dk, dv):
+        """
+        Backward function for _FusedMLARoPEKVSplit.
+
+        Args:
+            dk: [seq_len, batch_size, head_num, emb_dim + k_dim]
+                or [total_seq_len, head_num, emb_dim + k_dim]
+            dv: [seq_len, batch_size, head_num, v_dim] or [total_seq_len, head_num, v_dim]
+        """
+        cos, sin = ctx.saved_tensors
+        max_seqlen = None
+        batch_size = None
+        seq_num = None
+        if ctx.cu_seqlens_kv is None:
+            # sbhd
+            max_seqlen, batch_size, nheads, _ = dk.shape
+            dk = dk.contiguous().view(-1, nheads, ctx.emb_dim + ctx.k_dim)
+            dv = dv.contiguous().view(-1, nheads, ctx.v_dim)
+            total_seqlen = dk.shape[0]
+        else:
+            # thd
+            seq_num = len(ctx.cu_seqlens_kv) - 1
+            total_seqlen, nheads, _ = dk.shape
+        assert dk.stride(-1) == 1
+        assert dv.stride(-1) == 1
+
+        d_kv = dk.new_empty(total_seqlen, nheads, ctx.k_dim + ctx.v_dim)
+        d_emb = dk.new_empty(total_seqlen, 1, ctx.emb_dim)
+
+        grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
+        _mla_rope_bwd_kv_split_kernel[grid](
+            dk,
+            dv,
+            d_kv,
+            d_emb,
+            cos,
+            sin,
+            ctx.emb_dim,
+            ctx.k_dim,
+            ctx.v_dim,
+            nheads,
+            batch_size,
+            seq_num,
+            ctx.cu_seqlens_kv,
+            dk.stride(0),
+            dk.stride(1),
+            dv.stride(0),
+            dv.stride(1),
+            d_kv.stride(0),
+            d_kv.stride(1),
+            d_emb.stride(0),
+            ctx.cp_rank,
+            ctx.cp_size,
+            REMOVE_INTERLEAVING=ctx.remove_interleaving,
+        )
+        if ctx.cu_seqlens_kv is None:
+            d_kv = d_kv.view(max_seqlen, batch_size, nheads, ctx.k_dim + ctx.v_dim)
+            d_emb = d_emb.view(max_seqlen, batch_size, 1, ctx.emb_dim)
+        return d_kv, d_emb, None, None, None, None, None, None, None, None, None, None
+
+
+def fused_mla_rope_kv_split(
+    kv: torch.Tensor,
+    k_pos_emb: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    emb_dim: int,
+    k_dim: int,
+    v_dim: int,
+    cu_seqlens_kv: Optional[torch.Tensor] = None,
+    cp_rank: int = 0,
+    cp_size: int = 1,
+    rotary_interleaved: bool = False,
+    remove_interleaving: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fused function for applying RoPE to MLA's key and value.
+    It splits the input tensor kv into key and value,
+    and concatenates the processed RoPE to the key.
+
+    For the notations below, seq_len is the length of sequence per batch for sbhd format,
+    total_seq_len is the total length of the sequences for thd format.
+    max_seq_len is the maximum length of the sequences in the input tensor.
+
+    Args:
+        kv: [seq_len, batch_size, head_num, k_dim + v_dim]
+            or [total_seq_len, head_num, k_dim + v_dim]
+        k_pos_emb: [seq_len, batch_size, 1, emb_dim] or [total_seq_len, 1, emb_dim]
+        cos/sin: [max_seq_len, 1, 1, emb_dim]
+        cu_seqlens_kv: [seq_num + 1] accumulated sequence lengths for thd format
+        rotary_interleaved: whether to apply RoPE interleaved, only supports False for now
+        remove_interleaving: if True, output RoPE dims in non-interleaved layout
+
+    Returns:
+        key: [seq_len, batch_size, head_num, emb_dim + k_dim]
+            or [total_seq_len, head_num, emb_dim + k_dim]
+        value: [seq_len, batch_size, head_num, v_dim] or [total_seq_len, head_num, v_dim]
+    """
+    return _FusedMLARoPEKVSplit.apply(
+        kv,
+        k_pos_emb,
+        cos,
+        sin,
+        emb_dim,
+        k_dim,
+        v_dim,
+        cu_seqlens_kv,
+        cp_rank,
+        cp_size,
+        rotary_interleaved,
+        remove_interleaving,
+    )
+
+
+def fused_apply_mla_rope_for_q(
+    t: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    qk_head_dim: int,
+    emb_dim: int,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cp_rank: int = 0,
+    cp_size: int = 1,
+    rotary_interleaved: bool = False,
+) -> torch.Tensor:
+    """Backward-compatible in-place MLA query RoPE API.
+
+    New callers should choose :func:`fused_mla_rope_inplace` or
+    :func:`fused_mla_rope_out_of_place` explicitly. This legacy name keeps
+    its original mutation behavior and does not add a clone to the hot path.
+    """
+    return fused_mla_rope_inplace(
+        t,
+        cos,
+        sin,
+        qk_head_dim,
+        emb_dim,
+        cu_seqlens_q=cu_seqlens_q,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        rotary_interleaved=rotary_interleaved,
+    )
+
+
+def fused_apply_mla_rope_for_kv(
+    kv: torch.Tensor,
+    k_pos_emb: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    emb_dim: int,
+    k_dim: int,
+    v_dim: int,
+    cu_seqlens_kv: Optional[torch.Tensor] = None,
+    cp_rank: int = 0,
+    cp_size: int = 1,
+    rotary_interleaved: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Backward-compatible name for the MLA key/value split RoPE API."""
+    return fused_mla_rope_kv_split(
+        kv,
+        k_pos_emb,
+        cos,
+        sin,
+        emb_dim,
+        k_dim,
+        v_dim,
+        cu_seqlens_kv=cu_seqlens_kv,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        rotary_interleaved=rotary_interleaved,
+    )

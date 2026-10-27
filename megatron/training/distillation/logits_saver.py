@@ -1,0 +1,943 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+"""
+Utilities for saving top-K log-probabilities during model training with minimal overhead.
+
+This module provides hook-based utilities to capture and persist top-K log-probabilities
+during training while respecting tensor parallelism and minimizing communication,
+computation, I/O, and disk space overhead.
+
+The forward hook accumulates raw logits across microbatches and, once all microbatches
+have been collected, converts them to log-probs and writes them to disk in a single I/O call.
+
+For efficient global top-K log-prob computation across TP ranks:
+- Local top-K is computed on fp32 logits first to avoid materializing
+  a full vocab-sized log-softmax tensor
+- The log-softmax denominator (log-sum-exp) is computed TP-aware and applied
+  only to the top-K values
+- Local candidates are gathered to TP rank 0 for global top-K selection
+- TP rank 0 saves the full top-K log-probabilities (unsharded)
+
+Index storage optimization:
+- Global vocab requires 17 bits, so we store lower 16 bits as uint16
+- The 17th bit is stored separately, bit-packed 1 bit/element (not torch.bool,
+  which is 1 byte/element) via v2_pack_indices/v2_unpack_indices
+- To reconstruct: global_index = (bit_17 << 16) | low_16_bits
+"""
+
+import io
+import json
+import logging
+import multiprocessing as mp
+import os
+import tarfile
+from collections import OrderedDict
+from types import MethodType
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+import torch.distributed as dist
+
+try:
+    import zstandard
+
+    HAVE_ZSTANDARD = True
+except ImportError:
+    HAVE_ZSTANDARD = False
+
+from megatron.core import parallel_state
+from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.num_microbatches_calculator import get_num_microbatches
+from megatron.training import get_args, get_tensorboard_writer
+from megatron.training.distillation.utils import (
+    CACHED_LOGITS_INDEX_SENTINEL,
+    CACHED_LOGITS_LOGPROB_SENTINEL,
+    LOGPROBS_FORMAT_VERSION,
+    LOGPROBS_TAR_MEMBER_SUFFIX,
+    META_TAR_MEMBER,
+    batched_tar_prefix,
+    compute_dataset_hash,
+    get_consumed_train_samples,
+    get_current_iteration,
+    is_packed_sequence_run,
+    is_remote_storage_path,
+    open_logit_file,
+    pad_and_stack_cu_seqlens,
+    quarantine_contained_tars,
+    reassemble_cp_sequence,
+    storage_glob_with_caching,
+    storage_makedirs,
+    storage_move,
+    v2_batched_tar_filename,
+    v2_pack_indices,
+)
+from megatron.training.utils import print_rank_last
+
+logger = logging.getLogger(__name__)
+
+# Module-level reference so checkpoint/shutdown code can call flush().
+_ACTIVE_LOGITS_SAVER: Optional["LogitsSaverHooks"] = None
+
+
+def get_logits_saver() -> Optional["LogitsSaverHooks"]:
+    """Return the active :class:`LogitsSaverHooks` instance, or *None*."""
+    return _ACTIVE_LOGITS_SAVER
+
+
+def check_logits_saver_failure() -> None:
+    """Raise if the async logits-saver background write has failed.
+
+    ``_write_batched_tar`` runs in a persistent async worker process whose
+    completion queue only ever reports "done", never "failed" -- an
+    uncaught exception there silently kills the worker with no signal back
+    to the main training process (see ``_failure_event`` on
+    :class:`LogitsSaverHooks`).  Call this once per iteration from the main
+    training loop so a dead/broken logits-saver worker surfaces promptly as
+    a training crash instead of an unnoticed stall that only manifests much
+    later (e.g. a hang at the next blocking checkpoint finalize).
+    """
+    saver = get_logits_saver()
+    if saver is not None and saver._failure_event.is_set():
+        raise RuntimeError(
+            "Cached-logits saver background write failed (async worker for "
+            f"save_dir='{saver.save_dir}' hit an unrecoverable error and "
+            "exited). Check the worker process log for the original "
+            "traceback. Aborting training rather than silently continuing "
+            "with a stalled logits-saver worker."
+        )
+
+
+_MAX_VOCAB_SIZE = 2 ** 17  # 131072 - maximum supported vocab size
+
+class LogitsSaverHooks:
+    """
+    Hook-based utility to save top-K log-probabilities during training with minimal overhead.
+
+    This class provides a forward hook to attach to the module that outputs logits.
+    The hook accumulates logits across microbatches and saves all log-probs to disk
+    in a single I/O call once all microbatches have been collected.
+
+    Top-K selection is performed on raw logits first, then log-probabilities
+    are computed only for the selected positions using the log-softmax
+    denominator (log-sum-exp).  Because log-softmax is monotonically
+    increasing, the top-K positions are identical to those of the raw logits.
+    This avoids materializing a full vocab-sized log-softmax tensor.
+
+    The implementation efficiently handles tensor parallelism by:
+    - Computing local top-K on fp32 logits to reduce memory and communication
+    - Concatenating values and indices before all_gather
+    - Computing global top-K from gathered results
+    - Having TP rank 0 gather CP shards so CP rank 0 can save one DP shard
+
+    When ``p`` is set, a top-P (nucleus) mask is applied after global top-K
+    selection.  The K dimension is truncated to the maximum per-token nucleus
+    size (reducing the amount of data written to disk), and tokens whose
+    nucleus is smaller than that maximum have their trailing entries masked
+    with cached-logit value/index sentinels.  These sentinels are
+    compatible with :func:`topk_kl_div` in ``cached_logits_loss.py`` because
+    the value sentinel makes the masked teacher probability effectively zero.
+    At least ``min_k`` entries are always kept per token.
+
+    Indices are stored efficiently: uint16 for lower 16 bits + separate high bit tensor.
+    CP rank 0 stores one CP-group payload per DP rank; tar filenames are DP-only.
+
+    Iteration data is accumulated in memory and flushed as a tar archive at
+    checkpoint time via the async checkpoint queue.
+
+    Tars and their inner payload members are named by the **global sample
+    range** they cover (``dp{d}__{start}-{end}.tar``,
+    ``{start}-{end}.pt.zst``) rather than by training-iteration number --
+    the same "sample index" space :class:`~megatron.training.distillation.utils.LogprobsReshardPlan`
+    already computes internally.  This makes discovery/filtering agnostic
+    to whether the loader's MBS/DP/GBS differ from this run's.
+
+    Dedup of stale/superseded shards from a crash-and-resume happens
+    lazily, per flush, right before the new tar is written (see
+    :func:`~megatron.training.distillation.utils.quarantine_contained_tars`)
+    -- **not** eagerly at construction time.  Only existing shards whose
+    range is fully contained in the range about to be written are
+    touched, so retroactively regenerating a few specific (e.g.
+    corrupted) shards doesn't quarantine unrelated future-dated shards
+    this run never rewrites.  An exact-range rewrite doesn't need
+    quarantining at all: writing to the same deterministic filename
+    naturally overwrites the old contents in place (``os.replace``
+    locally, an overwrite-by-put on MSC).  This is not an exhaustive
+    dedup guarantee (see that function's docstring for the corner case it
+    doesn't cover); the loader's
+    :class:`~megatron.training.distillation.cached_logits_loss.TeacherTarDataset`
+    enforces a sequential/no-overlap check across discovered shards as a
+    safety net.
+
+    Args:
+        save_dir: Directory to save log-prob files
+        k: Number of top log-probabilities to save globally
+        p: Optional top-P (nucleus) threshold applied after global top-K
+            selection.  When set, only the smallest set of leading entries
+            per token whose cumulative probability mass reaches ``p`` is
+            kept; remaining entries are masked with cached-logit value/index
+            sentinels.
+        min_k: Minimum number of entries kept per token when top-P masking
+            is active, regardless of cumulative mass.  Defaults to 1.
+        save_dtype: String name of the dtype for top-K log-probabilities on
+            disk.  One of ``'fp16'``, ``'bf16'``, or ``'fp32'``.
+    """
+
+    _DTYPE_MAP = {
+        'fp16': torch.float16,
+        'bf16': torch.bfloat16,
+        'fp32': torch.float32,
+    }
+
+    def __init__(
+        self,
+        save_dir: str,
+        k: int,
+        *,
+        p: Optional[float] = None,
+        min_k: int = 1,
+        save_dtype: str = 'fp16',
+    ):
+        assert k > 0, "Number of top log-probabilities to save must be positive"
+        assert save_dir is not None, "Save directory must be provided"
+        if save_dtype not in self._DTYPE_MAP:
+            raise ValueError(
+                f"save_dtype must be one of {list(self._DTYPE_MAP)}, got '{save_dtype}'"
+            )
+        self._save_dtype = self._DTYPE_MAP[save_dtype]
+
+        if p is not None and not (0.0 < p <= 1.0):
+            raise ValueError(
+                f"p must be in (0, 1] or None, got {p}"
+            )
+        if min_k < 1:
+            raise ValueError(
+                f"min_k must be >= 1, got {min_k}"
+            )
+
+        self.save_dir = save_dir
+        self.k = k
+        self.p = p
+        self.min_k = min_k
+
+        # Parallel state info
+        self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        self.tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        self.tp_group = parallel_state.get_tensor_model_parallel_group()
+        self.cp_rank = parallel_state.get_context_parallel_rank()
+        self.cp_size = parallel_state.get_context_parallel_world_size()
+        self.cp_group = parallel_state.get_context_parallel_group()
+        self.dp_rank = parallel_state.get_data_parallel_rank()
+        self.dp_size = parallel_state.get_data_parallel_world_size()
+        self._tp_dst_rank_global = parallel_state.get_tensor_model_parallel_src_rank()
+        self._cp_dst_rank_global = dist.get_global_rank(self.cp_group, 0)
+
+        # Track number of MTP outputs to ignore
+        args = get_args()
+        self._mtp_num_layers = args.mtp_num_layers or 0
+        self._curr_mtp_passes = 0
+
+        # Dataset-identity hash + serialised metadata, written as the
+        # first member of every batched tar so the student loader can
+        # verify alignment per-tar without an extra tarfile.open.
+        self.dataset_hash, self._dataset_identifiers = compute_dataset_hash()
+        self.metadata_dict: Dict[str, Any] = {
+            "hash": self.dataset_hash,
+            "identifiers": self._dataset_identifiers,
+            "saver": {
+                "k": self.k,
+                "p": self.p,
+                "min_k": self.min_k,
+                "save_dtype": save_dtype,
+                # Recorded so the loader can build a LogprobsReshardPlan and
+                # support changing MBS / DP / GBS at student-side load time.
+                "format_version": LOGPROBS_FORMAT_VERSION,
+                "mbs_save": int(args.micro_batch_size),
+                "dp_size_save": int(self.dp_size),
+                "gbs_save": int(args.global_batch_size),
+                # Recorded so the loader can tell whether this tar was
+                # written by a CP-aware (cu_seqlens-persisting) saver.
+                "cp_size_save": int(self.cp_size),
+            },
+        }
+        self._meta_bytes: bytes = json.dumps(
+            self.metadata_dict, sort_keys=False, separators=(',', ':'),
+        ).encode("utf-8")
+
+        # Packed (--sft) documents are padded to a multiple of
+        # 2 * context_parallel_size of *this* run (SFTDataset
+        # ._calculate_padding_divisor), baked permanently into this cache.
+        # Surface the resulting load-time CP constraint up front rather than
+        # only when a student's TeacherTarDataset construction later raises
+        # or warns about it (see the cp_size_save checks there).
+        if is_packed_sequence_run() and self.cp_size > 1:
+            print_rank_last(
+                f"Cached-logits saver: writing packed (--sft) sequences with "
+                f"context-parallel size {self.cp_size}. Document padding is "
+                f"baked in for this CP size -- students must load with a CP "
+                f"size that evenly divides {self.cp_size} (a larger load CP "
+                "will fail with a clear error; a smaller load CP works "
+                "mechanically but may see trailing content this run "
+                "truncated that its own data pipeline would have kept)."
+            )
+
+        # Hook states – store already-processed top-K results (not full logits)
+        self._accumulated_results: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        # Parallel to _accumulated_results (same append-guard, same length):
+        # each microbatch's document boundaries, set by set_current_cu_seqlens()
+        # just before the forward pass that _forward_hook fires on.
+        self._accumulated_cu_seqlens: List[Optional[torch.Tensor]] = []
+        self._pending_cu_seqlens: Optional[torch.Tensor] = None
+        self._hook_handles: List[Any] = []
+        self._loss_overrides: List[Tuple[torch.nn.Module, Any]] = []
+
+        # Batched tar state — accumulates until checkpoint time.
+        self._pending_writes: "OrderedDict[Tuple[int, int], bytes]" = OrderedDict()
+
+        # Top-P logging: per-microbatch kept counts (populated by _apply_topp_truncation)
+        self._topp_kept_counts: List[float] = []
+
+        # Set by the async worker process (via _write_batched_tar's failure_event
+        # arg) if a background write hits an unrecoverable error; the worker's
+        # completion queue only reports "done", never "failed", so this is the
+        # only channel by which a dead/broken worker becomes visible to the main
+        # process. Checked once per iteration by check_logits_saver_failure().
+        #
+        # Must be a Manager-backed proxy, not a raw mp.Event(): the async
+        # checkpoint request is handed off via Queue.put() to an already
+        # -running PersistentAsyncCaller worker
+        # (megatron/core/dist_checkpointing/strategies/async_utils.py), not
+        # inherited at Process.start() time. Raw multiprocessing
+        # Event/Lock/Condition objects can only be shared by inheritance and
+        # raise "Condition objects should only be shared between processes
+        # through inheritance" if pickled through a queue afterward; a
+        # Manager().Event() proxy communicates with a separate manager server
+        # process instead, so it is safely picklable/shareable this way.
+        self._failure_event: "mp.managers.EventProxy" = mp.Manager().Event()
+
+        # Create save directory if needed
+        storage_makedirs(self.save_dir, exist_ok=True)
+
+        # Register as the active saver so checkpoint code can flush
+        global _ACTIVE_LOGITS_SAVER
+        _ACTIVE_LOGITS_SAVER = self
+
+    def set_current_cu_seqlens(self, cu_seqlens_padded: Optional[torch.Tensor]) -> None:
+        """Record the document boundaries for the microbatch about to run.
+
+        Call this from ``forward_step``, immediately before invoking the
+        model, with the same ``cu_seqlens_padded`` (falling back to
+        ``cu_seqlens`` if padded is unavailable) that the batch dict already
+        carries -- i.e. the *global, un-CP-sharded* per-document boundaries
+        Megatron-Core's own CP partitioning consumes (see
+        ``_get_batch_on_this_cp_rank_per_document_balancing``). ``None`` for
+        unpacked (non-SFT) runs. Consumed once by the next ``_forward_hook``
+        invocation and not needed again until the following microbatch.
+        """
+        self._pending_cu_seqlens = cu_seqlens_padded
+
+    def _forward_hook(
+        self,
+        module: torch.nn.Module,
+        input: Any,
+        output: Tuple[torch.Tensor, ...],
+    ) -> None:
+        """Capture top-K log-probs for one output-layer forward.
+
+        This hook should be registered on the module that outputs logits.
+        Each microbatch is processed immediately to extract only the small
+        top-K values and indices, avoiding storage of full vocab-sized logits
+        across microbatches.
+        """
+        if not module.training:
+            return
+
+        if self._curr_mtp_passes == self._mtp_num_layers:
+            # Main output logits come after MTP logits.
+            logits = output[0] if isinstance(output, tuple) else output
+
+            with torch.no_grad():
+                result = self._process_single_microbatch(logits)
+            if result is not None:
+                self._accumulated_results.append(result)
+                self._accumulated_cu_seqlens.append(self._pending_cu_seqlens)
+
+            if len(self._accumulated_results) == get_num_microbatches():
+                self._save_accumulated_log_probs()
+                self._accumulated_results.clear()
+                self._accumulated_cu_seqlens.clear()
+
+            self._curr_mtp_passes = 0
+        else:
+            self._curr_mtp_passes += 1
+
+    def attach_hooks(self, model: LanguageModule) -> None:
+        """Attach logits-saving hooks.
+
+        When ``--freeze-all-layers`` is set, also replaces LM loss with a
+        zero-valued tensor (avoids wasted CE when weights are frozen).
+
+        Args:
+            model: Model to instrument. Must own ``output_layer`` (last PP stage).
+        """
+        fwd_handle = model.output_layer.register_forward_hook(self._forward_hook)
+        self._hook_handles.append(fwd_handle)
+        if get_args().freeze_all_layers:
+            self._override_language_model_loss(model)
+
+    def _override_language_model_loss(self, model: LanguageModule) -> None:
+        """Replace LM loss with a zero-valued tensor that preserves gradient edges."""
+        def _compute_zero_language_model_loss(_self, _labels, logits):
+            return (logits * 0).sum(dim=-1).transpose(0, 1).contiguous()
+
+        original_loss = model.compute_language_model_loss
+        self._loss_overrides.append((model, original_loss))
+        model.compute_language_model_loss = MethodType(_compute_zero_language_model_loss, model)
+
+    def remove_hooks(self) -> None:
+        """Remove all registered hooks."""
+        for handle in self._hook_handles:
+            handle.remove()
+        self._hook_handles.clear()
+        for model_chunk, original_loss in self._loss_overrides:
+            model_chunk.compute_language_model_loss = original_loss
+        self._loss_overrides.clear()
+
+    def _save_accumulated_log_probs(self) -> None:
+        """Move accumulated top-K results to CPU and save to disk.
+
+        By this point each microbatch has already been processed in the
+        forward hook, so this method only transfers the small top-K
+        tensors to CPU, concatenates them into a single per-iteration
+        monolith along the sample (batch) dim, and writes them out in a
+        single I/O call.
+
+        Every microbatch carries the same K (= ``effective_k =
+        min(self.k, global_vocab_size)``) because
+        :meth:`_apply_topp_truncation` masks rather than truncates, so
+        the concat is a single allocation with no K-padding step.
+        """
+        if self.tp_rank != 0:
+            return
+        if not self._accumulated_results:
+            logger.warning("No accumulated log-probs to save")
+            return
+
+        all_values = []
+        all_indices = []
+        all_cu_seqlens = []
+        any_cu_seqlens = False
+
+        for (values, indices), cu_seqlens in zip(
+            self._accumulated_results, self._accumulated_cu_seqlens
+        ):
+            gathered = self._gather_full_cp_microbatch(values, indices, cu_seqlens)
+            if gathered is None:
+                continue
+            full_values, full_indices = gathered
+            all_values.append(full_values.cpu())
+            all_indices.append(full_indices.cpu())
+            if cu_seqlens is not None:
+                any_cu_seqlens = True
+            all_cu_seqlens.append(cu_seqlens)
+
+        if self.cp_rank != 0:
+            self._topp_kept_counts.clear()
+            return
+
+        if all_values:
+            values_tensor = torch.cat(all_values, dim=1)
+            # v2_pack_indices bit-packs the 17th bit, which must happen on the
+            # full per-iteration monolith (see its docstring) -- so indices are
+            # concatenated across microbatches *before* splitting/packing here,
+            # rather than packed per-microbatch and concatenated after.
+            indices_tensor = torch.cat(all_indices, dim=1)
+            indices_low_tensor, bit_17_tensor = v2_pack_indices(indices_tensor)
+            # Document boundaries, if this run has any (--sft), stacked into
+            # one (samples_per_dp_per_iter, max_boundaries) tensor matching
+            # the values/indices monolith's sample dim. --sft is a run-wide
+            # flag, so every accumulated microbatch should uniformly carry
+            # (or uniformly lack) cu_seqlens; a mix indicates a bug upstream
+            # in set_current_cu_seqlens() call sites.
+            if any_cu_seqlens:
+                if any(c is None for c in all_cu_seqlens):
+                    raise RuntimeError(
+                        "Some but not all accumulated microbatches carried "
+                        "cu_seqlens this iteration; set_current_cu_seqlens() "
+                        "must be called consistently for every microbatch."
+                    )
+                cu_seqlens_padded_tensor = pad_and_stack_cu_seqlens(all_cu_seqlens).cpu()
+            else:
+                cu_seqlens_padded_tensor = None
+            self._buffer_iteration(
+                values_tensor, indices_low_tensor, bit_17_tensor, cu_seqlens_padded_tensor
+            )
+
+        if self._topp_kept_counts:
+            # Log the average number of top-P kept tokens per microbatch to tensorboard
+            avg_kept = sum(self._topp_kept_counts) / len(self._topp_kept_counts)
+            self._topp_kept_counts.clear()
+            if (writer := get_tensorboard_writer()) is not None:
+                writer.add_scalar('avg-logprobs-kept', avg_kept, get_current_iteration())
+
+    def _process_single_microbatch(
+        self, logits: torch.Tensor
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Process a single logits tensor and return top-K log-probability data.
+
+        Selects local top-K positions on raw logits first, then computes
+        the global log-sum-exp denominator using ``torch.logsumexp`` for
+        the local shard (leveraging PyTorch's fused CUDA kernel) combined
+        across TP ranks via a numerically stable log-space reduction.
+        This avoids materializing a full vocab-sized log-softmax tensor.
+
+        All TP ranks participate in the collective operations (all-reduce for
+        the log-sum-exp combination, gather for top-K candidates), but only
+        TP rank 0 performs the final global top-K and returns the result.
+        Other ranks return ``None``.
+
+        Args:
+            logits: Tensor of shape (seq_len, batch, local_vocab_size)
+
+        Returns:
+            Tuple of (log_prob_values, global_indices) on TP rank 0,
+            ``None`` on other TP ranks.
+        """
+        local_vocab_size = logits.shape[-1]
+        global_vocab_size = local_vocab_size * self.tp_size
+
+        assert global_vocab_size <= _MAX_VOCAB_SIZE, (
+            f"Global vocab size {global_vocab_size} exceeds maximum supported {_MAX_VOCAB_SIZE} (17 bits)"
+        )
+
+        effective_k = min(self.k, global_vocab_size)
+        local_k = min(effective_k, local_vocab_size)
+
+        # Convert to fp32 to lessen precision issues
+        logits = logits.float()
+
+        local_logit_vals, local_indices = torch.topk(logits, local_k, dim=-1)
+
+        # Local log-sum-exp via PyTorch's fused CUDA kernel
+        local_lse = torch.logsumexp(logits, dim=-1, keepdim=True)
+
+        if self.tp_size > 1:
+            # Combine local log-sum-exp values across TP ranks using
+            # the standard numerically stable log-space reduction:
+            #   global_lse = max_lse + log(sum_i(exp(lse_i - max_lse)))
+            max_lse = local_lse.clone()
+            dist.all_reduce(max_lse, op=dist.ReduceOp.MAX, group=self.tp_group)
+            sum_exp_lse = torch.exp(local_lse - max_lse)
+            dist.all_reduce(sum_exp_lse, op=dist.ReduceOp.SUM, group=self.tp_group)
+            global_lse = max_lse + torch.log(sum_exp_lse)
+        else:
+            global_lse = local_lse
+
+        local_logprob_vals = local_logit_vals - global_lse
+
+        if self.tp_size > 1:
+            result = self._compute_global_topk(
+                local_logit_vals, local_logprob_vals, local_indices, effective_k, local_vocab_size
+            )
+            if result is None:
+                return None
+            global_values, global_indices = result
+        else:
+            global_values, global_indices = local_logprob_vals, local_indices
+
+        if self.p is not None:
+            global_values, global_indices = self._apply_topp_truncation(
+                global_values, global_indices,
+            )
+
+        global_values = global_values.to(self._save_dtype)
+
+        return global_values, global_indices
+
+    def _gather_full_cp_microbatch(
+        self,
+        values: torch.Tensor,
+        indices: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor] = None,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Gather CP-local top-K tensors and reconstruct full sequence order on CP rank 0.
+
+        Every CP rank reaches this point with the same K
+        (= ``effective_k = min(self.k, global_vocab_size)``) because
+        :meth:`_apply_topp_truncation` masks rather than truncates, so no
+        inter-rank K coordination is required before the gather.
+
+        *cu_seqlens*, when not ``None``, is this microbatch's global
+        (un-CP-sharded) document boundaries -- see
+        :meth:`set_current_cu_seqlens` -- and is passed through to
+        :func:`reassemble_cp_sequence` so the reconstruction inverts the
+        real per-document zigzag CP partitioning instead of assuming a
+        single whole-sequence zigzag.
+        """
+        if self.cp_size == 1:
+            return values, indices
+
+        if self.cp_rank == 0:
+            values_gather_list = [torch.empty_like(values) for _ in range(self.cp_size)]
+            indices_gather_list = [torch.empty_like(indices) for _ in range(self.cp_size)]
+        else:
+            values_gather_list = None
+            indices_gather_list = None
+
+        dist.gather(values, values_gather_list, dst=self._cp_dst_rank_global, group=self.cp_group)
+        dist.gather(indices, indices_gather_list, dst=self._cp_dst_rank_global, group=self.cp_group)
+
+        if self.cp_rank != 0:
+            return None
+
+        return (
+            reassemble_cp_sequence(values_gather_list, cu_seqlens=cu_seqlens),
+            reassemble_cp_sequence(indices_gather_list, cu_seqlens=cu_seqlens),
+        )
+
+    def _compute_global_topk(
+        self,
+        local_logit_vals: torch.Tensor,
+        local_logprob_vals: torch.Tensor,
+        local_indices: torch.Tensor,
+        k: int,
+        local_vocab_size: int,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Gather local top-K candidates to rank 0 and compute global top-K.
+
+        The ranking is performed on fp32 *logit* values for numerical
+        precision; the returned log-prob values are still fp32 here and
+        are only cast to the on-disk ``save_dtype`` by the caller.
+
+        Only TP rank 0 receives the gathered data and performs the final
+        top-K selection.  Other ranks return ``None`` after participating
+        in the ``gather`` collective.
+
+        Args:
+            local_logit_vals: Local top-K fp32 logit values (seq, batch, local_k)
+            local_logprob_vals: Local top-K fp32 log-prob values at the
+                same positions (seq, batch, local_k)
+            local_indices: Local top-K indices in [0, local_vocab_size)
+            k: Target number of top elements
+            local_vocab_size: Size of the local vocab shard (vocab_size / tp_size)
+
+        Returns:
+            Tuple of (global_logprob_values, global_indices) on TP rank 0,
+            ``None`` on other TP ranks.
+        """
+        vocab_offset = self.tp_rank * local_vocab_size
+        global_indices = local_indices + vocab_offset
+
+        # Pack logits, log-probs, and indices into a single tensor.
+        # fp32 can exactly represent integers up to 2^24, sufficient for
+        # 17-bit vocab indices.  Shape: (seq, batch, local_k, 3)
+        combined = torch.stack(
+            [local_logit_vals,
+             local_logprob_vals.float(),
+             global_indices.float()],
+            dim=-1,
+        )
+
+        if self.tp_rank == 0:
+            gather_list = [torch.empty_like(combined) for _ in range(self.tp_size)]
+        else:
+            gather_list = None
+        dist.gather(combined, gather_list, dst=self._tp_dst_rank_global, group=self.tp_group)
+
+        if self.tp_rank != 0:
+            return None
+
+        # (seq, batch, tp_size * local_k, 3)
+        gathered = torch.cat(gather_list, dim=-2)
+
+        gathered_logits = gathered[..., 0]
+        gathered_logprobs = gathered[..., 1].to(local_logprob_vals.dtype)
+        gathered_indices = gathered[..., 2].to(local_indices.dtype)
+
+        _, topk_positions = torch.topk(gathered_logits, k, dim=-1)
+
+        topk_logprobs = torch.gather(gathered_logprobs, -1, topk_positions)
+        topk_global_indices = torch.gather(gathered_indices, -1, topk_positions)
+
+        return topk_logprobs, topk_global_indices
+
+    def _apply_topp_truncation(
+        self,
+        values: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply top-P (nucleus) mask to already-sorted top-K log-probs.
+
+        Keeps the smallest set of leading entries per token whose
+        cumulative probability mass is at least ``self.p``, with a floor
+        of ``self.min_k`` kept entries.  Out-of-nucleus entries are
+        replaced with cached-logit value/index sentinels but the full K
+        dimension is preserved, so every saved microbatch (and therefore
+        every saved iteration's monolith and every CP rank's gather
+        buffer) carries the same uniform K = ``effective_k``.
+
+        Keeping a uniform K simplifies the rest of the pipeline:
+
+        * No CP-rank max-K coordination collective or pad before the
+          ``dist.gather``.
+        * No per-microbatch pad-and-cat when concatenating microbatches
+          into the per-iter monolith on the saver side.
+        * No cross-iter pad-and-cat when the loader assembles a load
+          microbatch from slices that span multiple saved iterations.
+
+        zstd compresses sentinel runs in masked positions down to roughly
+        the proportional unmasked size, so the disk-cost overhead of
+        carrying the full K is small in practice.
+
+        Args:
+            values: Top-K log-prob values, sorted descending along the
+                last dimension.  Shape ``(seq, batch, K)``.
+            indices: Corresponding global vocab indices (int64).
+
+        Returns:
+            Tuple of ``(values, indices)`` with the same shape as the
+            inputs, with out-of-nucleus entries masked by
+            :data:`CACHED_LOGITS_LOGPROB_SENTINEL` /
+            :data:`CACHED_LOGITS_INDEX_SENTINEL`.  These sentinels are
+            compatible with :func:`topk_kl_div`, which masks by the
+            value sentinel to zero out the corresponding loss
+            contributions.
+        """
+        probs = values.float().exp()
+        cumprobs = probs.cumsum(dim=-1)
+        # Standard nucleus rule: keep entry i iff the cumulative mass
+        # *before* it is < p.  This guarantees we include the entry
+        # that crosses the threshold and always keeps top-1.
+        keep_mask = (cumprobs - probs) < self.p
+
+        k = values.size(-1)
+        min_keep = min(self.min_k, k)
+        arange = torch.arange(k, device=values.device)
+        keep_mask = keep_mask | (arange < min_keep)
+
+        # For logging purposes
+        kept_per_token = keep_mask.sum(dim=-1)
+        self._topp_kept_counts.append(kept_per_token.float().mean().item())
+
+        # Mask out-of-nucleus entries
+        values = torch.where(keep_mask, values, CACHED_LOGITS_LOGPROB_SENTINEL)
+        indices = torch.where(keep_mask, indices, CACHED_LOGITS_INDEX_SENTINEL)
+        # The index sentinel does not survive v2_pack_indices()/v2_unpack_indices();
+        # topk_kl_div() also masks by the value sentinel to compensate.
+
+        return values, indices
+
+    def _buffer_iteration(
+        self,
+        values_tensor: torch.Tensor,
+        indices_low_tensor: torch.Tensor,
+        bit_17_tensor: torch.Tensor,
+        cu_seqlens_padded_tensor: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Serialize a per-iteration monolith and buffer for async flush.
+
+        File format (``format_version == 2``): serialized dict with:
+
+        - ``values``: ``(seq, samples_per_dp_per_iter, K_max)`` tensor of
+          log-probabilities in ``self._save_dtype`` (default ``torch.float16``)
+        - ``indices_low``: ``(seq, samples_per_dp_per_iter, K_max)`` uint16
+          tensor (lower 16 bits of vocab indices)
+        - ``bit_17``: 1-D uint8 tensor, the 17th bit of every index in
+          ``indices_low`` bit-packed via ``numpy.packbits`` (see
+          :func:`~megatron.training.distillation.utils.v2_pack_indices`)
+        - ``cu_seqlens_padded``: optional ``(samples_per_dp_per_iter,
+          max_boundaries)`` int tensor of per-sample document boundaries
+          (only present for ``--sft`` / packed runs); ``None`` otherwise.
+          Consumed by the loader to do document-aware CP reslicing (see
+          :func:`~megatron.training.distillation.utils.slice_tensor_for_cp_rank`).
+        - ``format_version``: integer payload-format identifier
+
+        Storing one monolith per iteration (rather than a list of per-mb
+        tensors) lets the loader serve any load microbatch as a contiguous
+        view along the sample dim, which is what the
+        :class:`LogprobsReshardPlan`-driven loader relies on.
+
+        Keyed by the global sample range ``(start_sample, end_sample)``
+        this iteration covers, rather than the training-iteration number.
+        ``training.py`` only updates ``args.consumed_train_samples`` after
+        ``train_step()`` returns, so at this point (inside the forward
+        hook, within ``train_step``) it still holds exactly the sample
+        count *before* this iteration's batch -- ``start_sample``, for
+        free.  ``end_sample`` matches how ``training.py`` itself computes
+        the current global batch size.
+        """
+        buffer = io.BytesIO()
+        torch.save({
+            'values': values_tensor,
+            'indices_low': indices_low_tensor,
+            'bit_17': bit_17_tensor,
+            'cu_seqlens_padded': cu_seqlens_padded_tensor,
+            'format_version': LOGPROBS_FORMAT_VERSION,
+        }, buffer)
+        data = buffer.getvalue()
+        start_sample = get_consumed_train_samples()
+        end_sample = start_sample + get_num_microbatches() * self.dp_size * get_args().micro_batch_size
+        self._pending_writes[(start_sample, end_sample)] = data
+
+    # ------------------------------------------------------------------
+    #  Flush helpers
+    # ------------------------------------------------------------------
+
+    def take_pending_data(
+        self,
+    ) -> Tuple[
+        str, "OrderedDict[Tuple[int, int], bytes]", bytes, bool, List[str], "mp.managers.EventProxy"
+    ]:
+        """Take ownership of buffered data for async flush at checkpoint time.
+
+        Also lists this rank's own DP shards here, on the main training
+        process, rather than leaving
+        :func:`~megatron.training.distillation.utils.quarantine_contained_tars`
+        to list them again from inside the (persistent, spawned) async
+        checkpoint worker process -- that process shares no state with
+        the main one, so every DP rank's worker independently re-listing
+        the same remote directory on every flush is what actually drives
+        object-store rate limiting (e.g. MSC "Too Many Requests").
+
+        The underlying listing call is a collective for remote storage
+        (broadcasts once per pipeline stage), so this must run
+        unconditionally on **every** rank owning a
+        :class:`LogitsSaverHooks` instance, not just the ranks with
+        pending writes -- otherwise idle ranks would never enter the
+        collective and the active ones would hang waiting for them.
+
+        Returns:
+            Tuple of (tar_path, writes, meta_bytes, msc_enabled, existing_tars,
+            failure_event). If there is no pending data (e.g. non-TP-rank-0 or
+            non-CP-rank-0), ``writes`` will be an empty OrderedDict and
+            ``tar_path`` will be an empty string. ``failure_event`` is set by
+            the worker (see :func:`_write_batched_tar`) if the write hits an
+            unrecoverable error, so the main process can detect a dead/broken
+            worker instead of silently stalling (see
+            :func:`check_logits_saver_failure`).
+        """
+        # NOTE: We need to re-enabled MSC in the async saving process, so we pass this flag.
+        msc_enabled = MultiStorageClientFeature.is_enabled()
+
+        # Uncached: this is a point-in-time snapshot to hand off to the async
+        # writer, not something later calls in this (long-lived) process
+        # should keep reusing.
+        prefix = batched_tar_prefix(self.dp_rank)
+        existing_tars = storage_glob_with_caching(self.save_dir, f"*{prefix}*.tar", cached=False)
+
+        if not self._pending_writes:
+            return (
+                "", OrderedDict(), self._meta_bytes, msc_enabled, existing_tars,
+                self._failure_event,
+            )
+
+        writes = self._pending_writes
+        self._pending_writes = OrderedDict()
+
+        bundle_start = min(s for s, _ in writes)
+        bundle_end = max(e for _, e in writes)
+        tar_filename = v2_batched_tar_filename(self.dp_rank, bundle_start, bundle_end)
+        tar_path = os.path.join(self.save_dir, tar_filename)
+        print_rank_last(f"Handing off {len(writes)} logit iterations for async flush")
+        return (
+            tar_path, writes, self._meta_bytes, msc_enabled, existing_tars, self._failure_event,
+        )
+
+    @staticmethod
+    def _write_batched_tar(
+        tar_path: str,
+        writes: "OrderedDict[Tuple[int, int], bytes]",
+        meta_bytes: bytes,
+        msc_enabled: bool = False,
+        existing_tars: Optional[List[str]] = None,
+        failure_event: Optional["mp.managers.EventProxy"] = None,
+    ) -> None:
+        """Write a tar archive containing multiple iterations.
+
+        Called in the async checkpoint background process.  Early-returns
+        when there is nothing to write (non-TP-rank-0 or non-CP-rank-0 ranks).
+
+        The dataset-identity metadata is written as the **first** member
+        (named :data:`META_TAR_MEMBER`) so the student-side tar reader
+        sees it before any payload members and can
+        verify alignment before any iteration data is decoded.
+
+        Each subsequent member is named ``{start_sample}-{end_sample}.pt.zst``
+        (the global sample range that iteration covers) so that the
+        student-side tar reader can stream iterations by member name,
+        without needing to know the training iteration count at all.
+
+        Quarantines any existing shards this write will supersede (see
+        :func:`~megatron.training.distillation.utils.quarantine_contained_tars`)
+        **before** writing the new tar, not after: if a crash happens
+        between the quarantine and the write completing, the result is
+        at worst a temporary hole (no live shard covering that range)
+        rather than two overlapping live shards.  A hole self-heals on
+        resume -- the corresponding checkpoint didn't complete either,
+        so the resumed run naturally regenerates that range and
+        reflushes it -- whereas an overlap would require the loader's
+        sequential/no-overlap check to catch it as a hard error.
+
+        *existing_tars*, when provided, is a listing of this DP rank's
+        own shards under *save_dir*, fetched once on the main training
+        process (see :meth:`take_pending_data`) and handed off through
+        the async request rather than re-listed here -- this process is
+        a persistent, spawned worker with no shared state with the main
+        process, so every DP rank's worker independently calling
+        ``storage_glob`` on every flush is what actually triggers
+        object-store rate limiting.
+
+        *failure_event*, when provided, is set before any exception here
+        is re-raised. The persistent async worker's own completion queue
+        only ever reports "done", never "failed" (see ``async_loop`` in
+        ``megatron.core.dist_checkpointing.strategies.async_utils``), so an
+        uncaught exception here silently kills this worker process with no
+        signal back to the main training process -- future writes (both
+        logits *and* regular checkpoints, which share this same per-rank
+        worker) would then silently never complete. Setting the event lets
+        the main process detect this promptly via
+        :func:`check_logits_saver_failure` instead of only noticing much
+        later, e.g. as a hang at the next blocking checkpoint finalize.
+        """
+        if not writes:
+            return
+        try:
+            if msc_enabled:
+                # NOTE: MSC is not enabled in the async saving process by default.
+                MultiStorageClientFeature.enable()
+
+            if not HAVE_ZSTANDARD:
+                raise ImportError(
+                    "zstandard is required to write batched logit tars. "
+                    "Install via `pip install zstandard`."
+                )
+
+            storage_makedirs(os.path.dirname(tar_path), exist_ok=True)
+            for old_path, quarantined in quarantine_contained_tars(
+                tar_path, known_tars=existing_tars
+            ):
+                print_rank_last(
+                    f"Quarantined superseded cached-logits shard {old_path} -> {quarantined}"
+                )
+
+            write_path = tar_path if is_remote_storage_path(tar_path) else f"{tar_path}.tmp"
+            compressor = zstandard.ZstdCompressor(level=3)
+
+            with open_logit_file(write_path, "wb") as stream:
+                with tarfile.open(fileobj=stream, mode="w") as tar:
+                    info = tarfile.TarInfo(name=META_TAR_MEMBER)
+                    info.size = len(meta_bytes)
+                    tar.addfile(info, io.BytesIO(meta_bytes))
+
+                    for (start_sample, end_sample), data in writes.items():
+                        data = compressor.compress(data)
+                        member_name = f"{start_sample}-{end_sample}{LOGPROBS_TAR_MEMBER_SUFFIX}"
+                        info = tarfile.TarInfo(name=member_name)
+                        info.size = len(data)
+                        tar.addfile(info, io.BytesIO(data))
+            if write_path != tar_path:
+                storage_move(write_path, tar_path)
+        except Exception:
+            if failure_event is not None:
+                failure_event.set()
+            raise

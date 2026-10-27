@@ -1,0 +1,42 @@
+name: Claude Code Review
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────
+  # Retired: /claude review and /claude strict-review
+  # Pull-request reviews moved to the /review command, which reads the
+  # same rubric from skills/pr-review. Reply with the equivalent
+  # /review command instead of running a review.
+  # ──────────────────────────────────────────────────────────────────
+  redirect-to-review:
+    name: Redirect to /review
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      github.event.comment.user.type != 'Bot' &&
+      (contains(github.event.comment.body, '/claude review') ||
+       contains(github.event.comment.body, '/claude strict-review'))
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.issue.number }}
+      RETIRED_COMMAND: ${{ contains(github.event.comment.body, '/claude strict-review') && '/claude strict-review' || '/claude review' }}
+      REVIEW_COMMAND: ${{ contains(github.event.comment.body, '/claude strict-review') && '/review mode=strict' || '/review' }}
+    steps:
+      - name: Point to /review
+        env:
+          NOTICE: |
+            @${{ github.event.comment.user.login }} `${{ env.RETIRED_COMMAND }}` has been retired. Pull-request reviews now run through `/review`; comment this instead:
+
+            ```
+            ${{ env.REVIEW_COMMAND }}
+            ```
+
+            Add `model=claude` to keep a Claude reviewer (the default is `model=codex`). `mode=light|strict` selects the review depth. Comment `/review help` for all options.
+        run: gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$NOTICE"

@@ -1,0 +1,30 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+from unittest import mock
+
+import pytest
+
+from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
+from megatron.core.msc_utils import MultiStorageClientFeature
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if exitstatus == 5:
+        session.exitstatus = 0
+
+
+@pytest.fixture(scope='session', autouse=True)
+def disable_msc():
+    MultiStorageClientFeature.disable()
+    yield
+
+
+@pytest.fixture(scope="class")
+def tmp_dir_per_class(tmp_path_factory):
+    return tmp_path_factory.mktemp("data")
+
+
+@pytest.fixture(autouse=True)
+def checkpoint_run_config(run_config):
+    """Checkpoint saves read their metadata settings from the run config."""
+    return run_config

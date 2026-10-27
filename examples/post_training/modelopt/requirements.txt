@@ -1,0 +1,6 @@
+diskcache
+datasets
+nvidia-modelopt
+omegaconf
+tensorstore!=0.1.46,!=0.1.72
+transformers

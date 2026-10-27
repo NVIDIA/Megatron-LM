@@ -1,0 +1,196 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import os
+import sys
+from pathlib import Path
+
+import pytest
+import torch
+import torch.distributed
+
+from megatron.core import config
+from megatron.core.utils import is_te_min_version
+from tests.test_utils.python_scripts.download_unit_tests_dataset import download_and_extract_asset
+from tests.unit_tests.dist_checkpointing import TempNamedDir
+from tests.unit_tests.test_utilities import (
+    Utils,
+    reset_transient_process_state,
+    restore_process_state,
+    snapshot_process_state,
+)
+
+
+def pytest_configure(config):
+    """Set NCCL defaults for the unit-test suite.
+
+    These previously lived as ``export``s in ``tests/unit_tests/run_ci_test.sh``.
+    They reduce NCCL memory usage / SM contention and were originally added to
+    fix NCCL hangs observed for FSDP v1 (among other MCore algorithms). Setting
+    them here — at session start, before any test initializes NCCL communicators
+    — keeps that default while moving the test-bucket configuration out of the
+    CI launch script and into pytest. Individual buckets that want
+    production-like NCCL settings (e.g. MFSDP v2) can pop these in their own
+    conftest before initializing their process group.
+    """
+    os.environ.setdefault("NCCL_MAX_NCHANNELS", "1")
+    os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
+
+
+def pytest_addoption(parser):
+    """
+    Additional command-line arguments passed to pytest.
+    For now:
+        --experimental: Enable the Mcore experimental flag (DEFAULT: False)
+    """
+    parser.addoption(
+        '--experimental',
+        action='store_true',
+        help="pass that argument to enable experimental flag during testing (DEFAULT: False)",
+    )
+
+
+def pytest_runtest_logreport(report):
+    if report.failed:
+        rank = os.environ.get("RANK", "?")
+        print(
+            f"\n[rank {rank}] {report.nodeid} ({report.when})\n" f"{report.longreprtext}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+@pytest.fixture(autouse=True)
+def experimental(request):
+    """Simple fixture setting the experimental flag [CPU | GPU]"""
+    config.ENABLE_EXPERIMENTAL = request.config.getoption("--experimental") is True
+
+
+@pytest.fixture
+def run_config(monkeypatch):
+    """Provide a config owner for isolated training-runtime consumers."""
+    from megatron.core.optimizer import OptimizerConfig
+    from megatron.training import global_vars
+    from megatron.training.config import (
+        CheckpointConfig,
+        LoggerConfig,
+        PretrainConfigContainer,
+        SchedulerConfig,
+        TrainingConfig,
+    )
+
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+    container = PretrainConfigContainer(
+        train=TrainingConfig(),
+        model=None,
+        optimizer=OptimizerConfig(),
+        scheduler=SchedulerConfig(),
+        logger=LoggerConfig(),
+        checkpoint=CheckpointConfig(),
+    )
+    global_vars.set_run_config(container)
+    return container
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if exitstatus == 5:
+        session.exitstatus = 0
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup():
+    yield
+    if torch.distributed.is_initialized():
+        try:
+            if torch.cuda.is_available():
+                torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+            else:
+                torch.distributed.barrier()
+        except Exception:
+            return
+        torch.distributed.destroy_process_group()
+
+
+@pytest.fixture(scope="function", autouse=True)
+def set_env():
+    if is_te_min_version("1.3"):
+        os.environ['NVTE_FLASH_ATTN'] = '0'
+        os.environ['NVTE_FUSED_ATTN'] = '0'
+
+
+@pytest.fixture(scope="session")
+def tmp_path_dist_ckpt(tmp_path_factory) -> Path:
+    """Common directory for saving the checkpoint.
+
+    Can't use pytest `tmp_path_factory` directly because directory must be shared between processes.
+    """
+
+    tmp_dir = tmp_path_factory.mktemp('ignored', numbered=False)
+    tmp_dir = tmp_dir.parent.parent / 'tmp_dist_ckpt'
+
+    if Utils.rank == 0:
+        with TempNamedDir(tmp_dir, sync=False):
+            yield tmp_dir
+
+    else:
+        yield tmp_dir
+
+
+@pytest.fixture(scope="session", autouse=True)
+def ensure_test_data():
+    """Ensure test data is available at /opt/data by downloading if necessary."""
+    data_path = Path("/opt/data")
+
+    # Check if data directory exists and has content
+    if not data_path.exists() or not any(data_path.iterdir()):
+        print("Test data not found at /opt/data. Downloading...")
+
+        try:
+            # Download assets to /opt/data
+            download_and_extract_asset(assets_dir=data_path)
+
+            print("Test data downloaded successfully.")
+
+        except ImportError as e:
+            print(f"Failed to import download function: {e}")
+            # Don't fail the tests, just warn
+        except Exception as e:
+            print(f"Failed to download test data: {e}")
+            # Don't fail the tests, just warn
+    else:
+        print("Test data already available at /opt/data")
+
+
+@pytest.fixture(autouse=True)
+def reset_env_vars():
+    """Reset environment variables"""
+    # Store the original environment variables before the test
+    original_env = dict(os.environ)
+
+    # Run the test
+    yield
+
+    # After the test, restore the original environment
+    os.environ.clear()
+    os.environ.update(original_env)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def restore_module_process_state():
+    snapshot = snapshot_process_state()
+    yield
+    restore_process_state(snapshot)
+
+
+@pytest.fixture(scope="class", autouse=True)
+def restore_class_process_state():
+    snapshot = snapshot_process_state()
+    yield
+    restore_process_state(snapshot)
+
+
+@pytest.fixture(autouse=True)
+def reset_process_state():
+    snapshot = snapshot_process_state()
+    yield
+    reset_transient_process_state()
+    restore_process_state(snapshot)

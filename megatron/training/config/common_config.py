@@ -1,0 +1,191 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+from dataclasses import dataclass, field
+from typing import Literal
+import os
+
+@dataclass(kw_only=True)
+class RNGConfig:
+    """Configuration settings for random number generation."""
+
+    seed: int = 1234
+    """Random seed used for python, numpy, pytorch, and cuda."""
+
+    te_rng_tracker: bool = False
+    """Use Transformer Engine's RNG tracker. Authoritative over the model's derived copy."""
+
+    inference_rng_tracker: bool = False
+    """Use an RNG tracker configured for inference."""
+
+    data_parallel_random_init: bool = False
+    """Enable random initialization of params across data parallel ranks"""
+
+    def validate(self) -> None:
+        """Validate the seed before training runtime initialization."""
+        if self.seed is None or self.seed <= 0:
+            raise ValueError("Seed must be a positive integer.")
+
+    def finalize_model_config(self, model_config: object) -> None:
+        """Derive Core tracker settings from this run's RNG policy."""
+        from megatron.core.transformer import TransformerConfig
+
+        transformer = getattr(model_config, "transformer", model_config)
+        if not isinstance(transformer, TransformerConfig):
+            return
+        if transformer.cuda_graph_impl != "none" and "transformer_engine" in (
+            transformer.transformer_impl, transformer.cuda_graph_impl
+        ):
+            self.te_rng_tracker = True
+        # Core retains these fields for standalone use; within a run they are derived.
+        transformer.use_te_rng_tracker = self.te_rng_tracker
+        transformer.inference_rng_tracker = self.inference_rng_tracker
+
+
+@dataclass(kw_only=True)
+class ProfilingConfig:
+    """Configuration settings for profiling the training process."""
+
+    use_nsys_profiler: bool = False
+    """Enable nsys profiling, mutually exclusive with use_pytorch_profiler.
+    The legacy CLI --profile selects nsys unless --use-pytorch-profiler is also set.
+    When using this option, nsys options should be specified in
+    commandline. An example nsys commandline is
+    `nsys profile -s none -t nvtx,cuda -o <path/to/output_file> --force-overwrite true
+    --capture-range=cudaProfilerApi --capture-range-end=stop`.
+    """
+
+    profile_step_start: int = 10
+    """Global step to start profiling."""
+
+    profile_step_end: int = 12
+    """Global step to stop profiling."""
+
+    use_pytorch_profiler: bool = False
+    """Use the built-in pytorch profiler, mutually exclusive with use_nsys_profiler.
+    The legacy CLI requires both --profile and --use-pytorch-profiler to select this backend.
+    Useful if you wish to view profiles in tensorboard."""
+
+    pytorch_profiler_collect_shapes: bool = False
+    """Collect tensor shape in pytorch profiler."""
+  
+    pytorch_profiler_collect_callstack: bool = False
+    """Collect callstack in pytorch profiler."""
+  
+    pytorch_profiler_collect_chakra: bool = False
+    """Collect chakra trace in pytorch profiler."""
+
+    profile_ranks: list[int] = field(default_factory=lambda: [])
+    """Global ranks to profile."""
+
+    record_memory_history: bool = False
+    """Record memory history in last rank."""
+
+    memory_snapshot_path: str = "snapshot.pickle"
+    """Specifies where to dump the memory history pickle."""
+
+    record_shapes: bool = False
+    """Record shapes of tensors in `torch.autograd.profiler.emit_nvtx` for the Nsys profiler."""
+
+    nvtx_ranges: bool = False
+    """Enable NVTX range annotations for profiling. When enabled, inserts NVTX markers
+    to categorize execution in profiler output."""
+
+    run_workload_inspector_server: bool = False
+    """Run the optional workload-inspector web server for on-demand profiling."""
+
+    def validate(self) -> None:
+        """Validate profiler settings before training runtime initialization."""
+        # Match torch.profiler.schedule's active-window requirement. Inactive
+        # options and CUDA-profiler windows retain their existing CLI behavior.
+        if self.use_nsys_profiler and self.use_pytorch_profiler:
+            raise ValueError("use_nsys_profiler and use_pytorch_profiler are mutually exclusive")
+        if self.use_pytorch_profiler:
+            if self.profile_step_end <= self.profile_step_start:
+                raise ValueError("PyTorch profiling requires profile_step_end > profile_step_start")
+
+
+@dataclass(kw_only=True)
+class DistributedInitConfig:
+    """Configuration settings for distributed training initialization."""
+
+    distributed_backend: Literal["nccl", "gloo"] = "nccl"
+    """Which backend to use for distributed training."""
+
+    fake_process_group: bool = False
+    """Initialize fake process groups and skip all distributed communication operations.
+    This allows profiling distributed training memory usage with a single GPU.
+    Set WORLD_SIZE and RANK to the desired distributed scale."""
+
+    distributed_timeout_minutes: int = 10
+    """Timeout minutes for torch.distributed."""
+
+    align_grad_reduce: bool = True
+    """If not set, all PP stages will launch gradient reduces simultaneously.
+    Otherwise, each PP stage will independently launch as needed.
+    """
+
+    local_rank: int = field(default_factory=lambda: int(os.getenv("LOCAL_RANK", "0")))
+    """local rank passed from distributed launcher."""
+
+    lazy_mpu_init: bool = False
+    """If set to True, initialize_megatron() skips DDP initialization and returns function to complete it instead.
+    Also turns on --use-cpu-initialization flag. This is for external DDP manager."""
+
+    use_torch_fsdp2: bool = False
+    """Use the torch FSDP2 implementation. FSDP2 is not currently working with Pipeline Parallel.
+    It is still not in a stable release stage, and may therefore contain bugs or other
+    potential issues."""
+
+    nccl_communicator_config_path: str | None = None
+    """Path to the yaml file with NCCL communicator configurations. The number of min/max thread
+    groups and thread group cluster size of each communicator can be configured by setting
+    `min_ctas`, `max_ctas`, and `cga_cluster_size`."""
+
+    use_tp_pp_dp_mapping: bool = False
+    """If set, distributed ranks initialize order is changed from tp-cp-ep-dp-pp to tp-cp-ep-pp-dp.
+    """
+
+    use_gloo_process_groups: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--disable-gloo-process-groups"]}})
+    """If enabled, create Gloo process groups for communications."""
+
+    use_sharp: bool = False
+    """Set the use of SHARP for the collective communications of data-parallel process groups.
+    When `True`, run barrier within each data-parallel process group,
+    which specifies the SHARP application target groups.
+    """
+
+    sharp_enabled_group: Literal["dp", "dp_replica"] | None = None
+    """IB SHARP can be enabled from only one communication group.
+    By default, it is enabled from dp group if not specified and use_sharp=True.
+    Available options: [dp, dp_replica]
+    """
+
+    high_priority_stream_groups: list[str] | None = field(default_factory=list)
+    """Specify which communicator groups should use high priority streams during creation.
+    Assigning high priority to communication streams ensures that communication kernels
+    are scheduled with higher priority, minimizing the exposed communication when it is
+    overlapped with other computation kernels.
+    """
+
+    distributed_timeout_seconds_after_init: int | None = None
+    """Timeout in seconds for process groups after initialization. This timeout is applied to all process groups after initialization and the first iteration completes."""
+
+    flight_recorder_dump_path: str | None = None
+    """Path for NCCL flight recorder trace dumps. Sets TORCH_FR_DUMP_TEMP_FILE and TORCH_NCCL_DEBUG_INFO_TEMP_FILE env variables before distributed init."""
+
+    flight_recorder_trace_buffer_size: int = 2000
+    """Size of the NCCL flight recorder trace buffer (TORCH_NCCL_TRACE_BUFFER_SIZE)."""
+
+    flight_recorder_dump_on_timeout: bool = True
+    """Dump flight recorder traces on NCCL timeout (TORCH_NCCL_DUMP_ON_TIMEOUT)."""
+
+    flight_recorder_include_stack_trace: bool = False
+    """Include stack traces in flight recorder dumps (TORCH_INCLUDE_STACK_TRACE)."""
+
+    flight_recorder_include_only_active: bool = True
+    """Include only active operations in flight recorder dumps (TORCH_INCLUDE_ONLY_ACTIVE)."""
+
+    flight_recorder_extra_dump_on_exec: bool = True
+    """Enable extra flight recorder dump on execution (TORCH_NCCL_EXTRA_DUMP_ON_EXEC)."""
+
+    disable_jit_fuser: bool = False
+    """Disable the JIT fuser."""
