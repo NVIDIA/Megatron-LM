@@ -789,6 +789,89 @@ def _make_draft_loop_controller(
     return controller, model, context
 
 
+class TestGraphedCommitPass:
+    """Routing and input layout of the CUDA-graphed (fixed-shape) commit pass."""
+
+    NUM_DECODE = 3
+    PADDED = 4
+    NUM_SPEC = 2
+
+    def _setup(self, prefill_req_count=0, num_mtp_depths=NUM_SPEC):
+        context = _make_context(
+            num_decode_requests=self.NUM_DECODE, num_speculative_tokens=self.NUM_SPEC
+        )
+        controller, model, context = _make_draft_loop_controller(
+            context,
+            num_mtp_depths=num_mtp_depths,
+            active_request_count=self.NUM_DECODE,
+            graphed=True,
+        )
+        controller._mtp_resolved_padded_count = self.PADDED
+        controller.model_config.cuda_graph_impl = "local"
+        context.padded_batch_dimensions = SimpleNamespace(prefill_req_count=prefill_req_count)
+        # Main-forward rows for PADDED requests of (1 + NUM_SPEC) tokens; row i holds value i.
+        context.mtp_decoder_hidden_states = _hidden(self.PADDED * (self.NUM_SPEC + 1))
+        context._mtp_setup_commit_graphed = mock.Mock()
+        controller._accepted_token_counts_per_request[: self.NUM_DECODE] = torch.tensor(
+            [2, 0, 1], device=DEVICE
+        )
+        kv_writes = []
+
+        def compute_mtp_kv_write(**kwargs):
+            kv_writes.append(kwargs)
+            model.all_forwards.append(("mtp_kv_write", kwargs))
+
+        model.compute_mtp_kv_write = compute_mtp_kv_write
+        model.kv_write_calls = kv_writes
+        return controller, model, context
+
+    def _run(self, controller):
+        base_position = torch.tensor([10, 20, 30], dtype=torch.int64, device=DEVICE)
+        controller._compute_serial_mtp_and_sample(base_position=base_position)
+        return base_position
+
+    def test_decode_only_graphed_step_replays_commit_graph(self):
+        controller, model, context = self._setup()
+        base_position = self._run(controller)
+
+        controller._mtp_commit_pass.assert_not_called()
+        controller._mtp_dummy_prefill_forward.assert_not_called()
+        assert len(model.kv_write_calls) == 1
+        call = model.kv_write_calls[0]
+        assert call["cache_key"] == ("mtp_commit", self.PADDED)
+        assert call["eager"] is False
+        assert call["mtp_inference_context"] is context
+
+        # Request r's slot j reads main row r*(S+1)+j and the input token one row later;
+        # rows of padding requests are zeroed.
+        stride = self.NUM_SPEC + 1
+        rows = [r * stride + j for r in range(self.NUM_DECODE) for j in range(self.NUM_SPEC)]
+        padding = (self.PADDED - self.NUM_DECODE) * self.NUM_SPEC
+        expected_hidden = torch.tensor(rows + [0] * padding, dtype=torch.float32, device=DEVICE)
+        expected_tokens = torch.tensor(
+            [1000 + r + 1 for r in rows] + [0] * padding, dtype=torch.int64, device=DEVICE
+        )
+        assert torch.equal(call["hidden_states"][:, 0, 0], expected_hidden)
+        assert torch.equal(call["next_token_ids"][0], expected_tokens)
+
+        args, kwargs = context._mtp_setup_commit_graphed.call_args
+        assert args == (self.NUM_DECODE, self.PADDED)
+        assert kwargs["accepted_counts"] is controller._accepted_token_counts_per_request
+        assert kwargs["base_positions"] is base_position
+
+    def test_mixed_step_takes_eager_commit(self):
+        controller, model, context = self._setup(prefill_req_count=1)
+        self._run(controller)
+        controller._mtp_commit_pass.assert_called_once()
+        assert model.kv_write_calls == []
+
+    def test_fewer_draft_depths_than_speculative_tokens_takes_eager_commit(self):
+        controller, model, context = self._setup(num_mtp_depths=1)
+        self._run(controller)
+        controller._mtp_commit_pass.assert_called_once()
+        assert model.kv_write_calls == []
+
+
 class TestSerialMtpDraftLoop:
     """The draft loop's KV-cache-specific behaviour."""
 

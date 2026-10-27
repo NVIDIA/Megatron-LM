@@ -73,7 +73,7 @@ class LanguageModule(MegatronModule):
         )
 
     def _setup_mtp_cuda_graphs(self):
-        """Wrap `compute_mtp_single_step` with a CudaGraphManager.
+        """Wrap `compute_mtp_single_step` and `compute_mtp_kv_write` with CudaGraphManagers.
 
         Must be called by subclasses after `self.mtp` is created.
         """
@@ -82,6 +82,13 @@ class LanguageModule(MegatronModule):
                 self.config,
                 base_module=self,
                 function_name="compute_mtp_single_step",
+                need_backward=False,
+                inline_capture=True,
+            )
+            self._mtp_kv_write_cudagraph_manager = CudaGraphManager(
+                self.config,
+                base_module=self,
+                function_name="compute_mtp_kv_write",
                 need_backward=False,
                 inline_capture=True,
             )
@@ -387,6 +394,41 @@ class LanguageModule(MegatronModule):
         logits = self._scale_logits(logits)
 
         return mtp_hidden, logits
+
+    @torch.inference_mode()
+    def compute_mtp_kv_write(
+        self,
+        hidden_states: Tensor,
+        next_token_ids: Tensor,
+        position_ids: Tensor,
+        eager: bool = False,
+        cache_key=None,
+        mtp_inference_context=None,
+    ) -> Tensor:
+        """Run the MTP layer only to write its draft K/V (the speculative-decoding commit pass).
+
+        Unlike `compute_mtp_single_step`, skips the output layer: the commit pass needs only the
+        attention's KV append, so its output hidden is discarded by the caller.
+
+        Args:
+            hidden_states (Tensor): Main-model hidden states, one row per committed position.
+            next_token_ids (Tensor): The token following each position [1, N].
+            position_ids (Tensor): Position IDs [1, N]; unused by attention without RoPE.
+            eager, cache_key: Consumed by `CudaGraphManager`, if it exists.
+            mtp_inference_context: Inference context whose metadata routes the KV writes.
+
+        Returns:
+            Tensor: The MTP layer's output hidden states.
+        """
+        # CudaGraphManager consumes these args, if it exists
+        del eager, cache_key
+        return self.mtp.layers[0].forward_single_position(
+            hidden_states=hidden_states,
+            next_token_ids=next_token_ids,
+            position_ids=position_ids,
+            embedding=self.embedding,
+            inference_context=mtp_inference_context,
+        )
 
     def sharded_state_dict(
         self,

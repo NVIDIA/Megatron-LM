@@ -1225,6 +1225,33 @@ class DynamicInferenceEngine(AbstractEngine):
                                 context.mtp_metadata.advance_decode_step()
                             context.mtp_metadata.end_forward()
 
+                            # Fixed-shape commit-pass graph: num_speculative_tokens rows per
+                            # request, every row on the dummy block (see
+                            # `_mtp_commit_pass_graphed`). Replayed on graphed decode-only steps.
+                            if controller._mtp_commit_graph_supported():
+                                commit_rows = n * controller.num_speculative_tokens
+                                context._mtp_setup_commit_graphed(n, n)
+                                unwrapped.compute_mtp_kv_write(
+                                    hidden_states=torch.zeros(
+                                        (
+                                            commit_rows // tp_size if sp_enabled else commit_rows,
+                                            1,
+                                            model_config.hidden_size,
+                                        ),
+                                        device=device,
+                                        dtype=model_config.params_dtype,
+                                    ),
+                                    next_token_ids=torch.zeros(
+                                        (1, commit_rows), device=device, dtype=torch.long
+                                    ),
+                                    position_ids=torch.zeros(
+                                        (1, commit_rows), device=device, dtype=torch.long
+                                    ),
+                                    mtp_inference_context=context,
+                                    cache_key=("mtp_commit", n),
+                                )
+                                context.mtp_metadata.end_forward()
+
                 context.reset()
 
             # Per-iteration memory accounting, scoped to the CUDA-graph mempool.

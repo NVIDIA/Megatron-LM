@@ -1813,6 +1813,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # rather than being inferred from the request counts.
         if self.mtp_metadata.is_varlen_forward:
             return False
+        # The graphed commit pass is uniform (num_speculative_tokens rows per request) and is
+        # captured once per request count, so it takes the decode kernel even on a mixed step.
+        if self.mtp_metadata.is_graphed_commit_forward:
+            return True
         if self._using_cuda_graph_this_step:
             return self.padded_batch_dimensions.prefill_req_count == 0
         return self.num_prefill_requests == 0

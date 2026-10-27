@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.inference.communication_utils import broadcast_from_last_pipeline_stage
+from megatron.core.inference.text_generation_controllers.mtp_utils_triton import HAVE_TRITON
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
@@ -118,6 +119,105 @@ class MTPControllerMixin:
         )
         self._async_sched_mtp_verification_gpu_ready_event = torch.cuda.Event()
         self._async_sched_accepted_counts_cpu_ready_event = torch.cuda.Event()
+
+    def _mtp_commit_graph_supported(self) -> bool:
+        """Whether the commit pass can be CUDA-graphed at all for this model.
+
+        The graphed layout gives every request `num_speculative_tokens` rows and attends over
+        `start + num_speculative_tokens` keys, which stays inside the positions the draft loop
+        itself writes only when the draft loop runs a depth per speculative token.
+        """
+        return (
+            HAVE_TRITON
+            and getattr(self.model_config, "cuda_graph_impl", None) == "local"
+            and self.num_mtp_depths == self.num_speculative_tokens
+        )
+
+    def _mtp_commit_graphed_this_step(self, context) -> bool:
+        """Whether this step's commit pass replays the fixed-shape CUDA graph.
+
+        Requires a graphed, decode-only main step. Under the NVLS dispatcher each rank decides
+        locally (its all-gather-v / reduce-scatter-v accept per-rank token counts); under the NCCL
+        and training dispatchers the EP batch-dimension sync makes every graphed step decode-only
+        on all ranks, so the decision is uniform there.
+        """
+        return (
+            self._mtp_resolved_padded_count is not None
+            and self._mtp_commit_graph_supported()
+            and context.padded_batch_dimensions.prefill_req_count == 0
+        )
+
+    def _mtp_commit_row_indices(self, padded_count: int) -> Tensor:
+        """[padded_count * num_speculative_tokens] main-forward rows feeding the graphed commit.
+
+        Request r's slot j reads the main hidden at r * (num_spec + 1) + j (base, then drafts),
+        and pairs it with the input token one row later.
+        """
+        cache = self.__dict__.setdefault("_mtp_commit_row_index_cache", {})
+        if padded_count not in cache:
+            stride = self.num_speculative_tokens + 1
+            requests = torch.arange(padded_count, device=torch.cuda.current_device())
+            slots = torch.arange(self.num_speculative_tokens, device=requests.device)
+            cache[padded_count] = (requests[:, None] * stride + slots[None, :]).reshape(-1)
+        return cache[padded_count]
+
+    def _mtp_commit_pass_graphed(
+        self,
+        context,
+        unwrapped_model,
+        gathered_hidden,
+        active_request_count: int,
+        padded_count: int,
+        base_position,
+    ) -> None:
+        """Commit pass for a graphed decode-only step, replayed from a CUDA graph.
+
+        Same KV writes as `_mtp_commit_pass` on a decode-only step: request r's accepted drafts
+        are refreshed from the main hiddens at positions `base_r - 1 - a_r ..`. Instead of
+        packing the variable number of refreshed rows, every request gets
+        `num_speculative_tokens` rows whose unused tail writes the dummy block, so the forward's
+        shape depends only on `padded_count`, needs no host sync, and replays the
+        ("mtp_commit", padded_count) graph.
+        """
+        num_slots = self.num_speculative_tokens
+        real_rows = active_request_count * num_slots
+        rows = self._mtp_commit_row_indices(padded_count)
+        hidden = gathered_hidden.index_select(0, rows.clamp(max=gathered_hidden.shape[0] - 1))
+        input_ids = context.gpu_view.token_to_input_ids
+        tokens = input_ids.index_select(0, (rows + 1).clamp(max=input_ids.shape[0] - 1))
+        # Rows past the real requests read padding (or clamped) main-forward rows.
+        hidden[real_rows:] = 0
+        tokens[real_rows:] = 0
+        if self._sp_enabled:
+            hidden = scatter_to_sequence_parallel_region(
+                hidden, group=self.inference_wrapped_model.tp_group
+            )
+
+        # A graphed decode-only step has no in-flight chunked prefill to carry a boundary for.
+        context.mtp_metadata.invalidate_chunk_boundary()
+        active_slice = slice(context.paused_request_count, context.total_request_count)
+        context._mtp_setup_commit_graphed(
+            active_request_count,
+            padded_count,
+            accepted_counts=self._accepted_token_counts_per_request,
+            base_positions=base_position,
+            block_table_src=context.request_to_kv_block_ids[active_slice],
+        )
+        if context._nvls_dispatcher:
+            NVLSAllGatherVDispatcher.modify_real_token_count_for_mtp(real_rows)
+
+        token_ids = tokens.view(1, -1)
+        unwrapped_model.compute_mtp_kv_write(
+            hidden_states=hidden,
+            next_token_ids=token_ids,
+            # Positions are unused for attention (no RoPE); the write positions come from the
+            # metadata.
+            position_ids=torch.zeros_like(token_ids),
+            eager=False,
+            cache_key=("mtp_commit", padded_count),
+            mtp_inference_context=context,
+        )
+        context.mtp_metadata.end_forward()
 
     def _mtp_commit_pass(
         self,
@@ -426,6 +526,36 @@ class MTPControllerMixin:
         )
         context.mtp_metadata.end_forward()
 
+    def _mtp_dummy_commit_graphed_forward(
+        self, context, unwrapped_model, padded_count: int
+    ) -> None:
+        """Replay the ("mtp_commit", padded_count) graph with every row on the dummy block.
+
+        The EP-dummy counterpart of `_mtp_commit_pass_graphed`, issuing the same MoE collectives
+        with the same token count. Its KV writes and reads touch only the dummy block.
+        """
+        num_rows = padded_count * self.num_speculative_tokens
+        dummy_hidden = torch.zeros(
+            (num_rows, 1, self.model_config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=self.model_config.params_dtype,
+        )
+        if self._sp_enabled:
+            dummy_hidden = scatter_to_sequence_parallel_region(
+                dummy_hidden, group=self.inference_wrapped_model.tp_group
+            )
+        dummy_tokens = torch.zeros((1, num_rows), device=dummy_hidden.device, dtype=torch.long)
+        context._mtp_setup_commit_graphed(padded_count, padded_count)
+        unwrapped_model.compute_mtp_kv_write(
+            hidden_states=dummy_hidden,
+            next_token_ids=dummy_tokens,
+            position_ids=torch.zeros_like(dummy_tokens),
+            eager=False,
+            cache_key=("mtp_commit", padded_count),
+            mtp_inference_context=context,
+        )
+        context.mtp_metadata.end_forward()
+
     def _compute_serial_mtp_and_sample(self, base_position: Optional[Tensor] = None) -> None:
         """Run the MTP phase with the main forward's execution state held across it."""
         context = self.inference_wrapped_model.inference_context
@@ -500,29 +630,6 @@ class MTPControllerMixin:
             # Cast to int64 to match CUDA graph capture dtype expectations.
             base_position = (adjusted_offsets + processed_tokens).to(torch.int64)
 
-        # Before the draft loop, refresh every committed position's draft KV from the MAIN model
-        # hidden states, so committed KV never carries a stale chained-draft-hidden value (which
-        # would decay acceptance with depth). One forward covers both prefill prompts (seeded
-        # roll-by-one from the prompt) and decode accepted drafts (refreshed). Runs only on the
-        # last PP stage, where the gathered decoder hidden states exist.
-        if getattr(context, "enable_mtp_kv_cache", False) and has_mtp:
-            issued_slot = self._mtp_commit_pass(
-                context,
-                unwrapped_model,
-                hidden_states,
-                num_decode_requests=active_request_count - context.num_prefill_requests,
-                active_request_count=active_request_count,
-                base_position=base_position,
-            )
-            if not issued_slot:
-                # EP consistency: every rank runs exactly one commit-pass forward per step (real
-                # above, or this dummy) so the MoE all-to-alls stay count-matched.
-                self._mtp_dummy_prefill_forward(context, unwrapped_model)
-
-        # Start with the freshly sampled base token.
-        next_token_ids = self._sampled_tokens_cuda[:active_request_count].clone()
-        current_hidden = last_accepted_hidden if has_mtp else None
-
         # Compute padding needed to make batch compatible with SP and CUDA graphs.
         if self._mtp_resolved_padded_count is not None:
             # CUDA-graph path: use the EP-synced padded count.
@@ -536,6 +643,37 @@ class MTPControllerMixin:
         else:
             padded_count = active_request_count
         pad_count = padded_count - active_request_count
+
+        # Before the draft loop, refresh every committed position's draft KV from the MAIN model
+        # hidden states, so committed KV never carries a stale chained-draft-hidden value (which
+        # would decay acceptance with depth). One forward covers both prefill prompts (seeded
+        # roll-by-one from the prompt) and decode accepted drafts (refreshed). Runs only on the
+        # last PP stage, where the gathered decoder hidden states exist. EP consistency: every
+        # rank runs exactly one commit-pass forward per step (graphed, eager, or the dummy below)
+        # so the MoE collectives stay count-matched.
+        if getattr(context, "enable_mtp_kv_cache", False) and has_mtp:
+            if self._mtp_commit_graphed_this_step(context):
+                self._mtp_commit_pass_graphed(
+                    context,
+                    unwrapped_model,
+                    hidden_states,
+                    active_request_count=active_request_count,
+                    padded_count=padded_count,
+                    base_position=base_position,
+                )
+            elif not self._mtp_commit_pass(
+                context,
+                unwrapped_model,
+                hidden_states,
+                num_decode_requests=active_request_count - context.num_prefill_requests,
+                active_request_count=active_request_count,
+                base_position=base_position,
+            ):
+                self._mtp_dummy_prefill_forward(context, unwrapped_model)
+
+        # Start with the freshly sampled base token.
+        next_token_ids = self._sampled_tokens_cuda[:active_request_count].clone()
+        current_hidden = last_accepted_hidden if has_mtp else None
 
         # Pad hidden states and scatter for sequence parallelism.
         if has_mtp:
@@ -745,7 +883,10 @@ class MTPControllerMixin:
         mtp_context_kwarg = {"mtp_inference_context": context} if mtp_cache_active else {}
         with context._mtp_forward_phase(preserve_step_bookkeeping=mtp_cache_active):
             if mtp_cache_active:
-                self._mtp_dummy_prefill_forward(context, unwrapped_model)
+                if self._mtp_commit_graphed_this_step(context):
+                    self._mtp_dummy_commit_graphed_forward(context, unwrapped_model, padded_count)
+                else:
+                    self._mtp_dummy_prefill_forward(context, unwrapped_model)
                 context.mtp_metadata.begin_decode_for_capture(padded_count, graphed=main_graphed)
             for depth in range(self.num_mtp_depths):
                 nvtx_range_push(f"mtp-spec-decoding/dummy-depth-{depth}")
