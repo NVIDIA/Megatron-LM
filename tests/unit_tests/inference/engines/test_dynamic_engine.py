@@ -1255,7 +1255,8 @@ class DynamicInferenceEngineTestBase:
                     else InferenceCudaGraphScope.none
                 ),
                 transformer_impl=test_config.transformer_impl,
-                inference_grouped_gemm_backend=("flashinfer" if test_config.mxfp8 else "torch"),
+                # MXFP8 MoE runs on FlashInfer; every other model keeps the config default.
+                **({"inference_grouped_gemm_backend": "flashinfer"} if test_config.mxfp8 else {}),
                 inference_flashinfer_mxfp8_token_capacity=(
                     test_config.inference_flashinfer_mxfp8_token_capacity
                 ),
