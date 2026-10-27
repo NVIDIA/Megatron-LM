@@ -1527,11 +1527,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             ``mlp_output_with_bias``: tuple of (mlp_output, mlp_bias).
         """
         seq_len, batch_size = hidden_states.shape[:2]
+        router = getattr(self.mlp, "router", None)
         pad = 0
         if self.is_moe_layer:
             pad = max(0, num_chunks - seq_len)
         else:
             num_chunks = min(num_chunks, seq_len)
+        if pad and getattr(router, "routing_type", None) == "quantile_balancing":
+            # The dummy tokens need a padding mask, which quantile balancing does not support yet.
+            raise NotImplementedError(
+                f"MLP chunking (mlp_chunks_for_training / mlp_chunks_for_prefill = {num_chunks}) "
+                f"with quantile-balancing routing needs a local sequence of at least {num_chunks} "
+                f"tokens, got {seq_len}: shorter sequences are padded with masked dummy tokens, "
+                "and quantile balancing does not support padding masks yet."
+            )
         if pad:
             hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, 0, 0, pad))
             # Mask the dummy tokens even without a caller mask, so the router leaves them out
@@ -1556,11 +1565,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             if self.is_moe_layer and input_ids is not None
             else (None,) * num_chunks
         )
-        router = getattr(self.mlp, "router", None)
         replay = ChunkedRouterReplay(
             getattr(router, "router_replay", None),
             [chunk.shape[0] * batch_size for chunk in chunks],
             pad * batch_size,
+            # MoELayer checkpoints each call under selective "moe" recompute.
+            chunks_recompute=getattr(self.mlp, "moe_layer_recompute", False) and self.mlp.training,
         )
 
         # Compute outputs for each chunk, preserving sequence-aligned MoE metadata.
@@ -1573,7 +1583,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 chunk_moe_kwargs["input_ids"] = input_id_chunk
             if self.is_moe_layer:
                 chunk_moe_kwargs["packed_seq_params"] = packed_seq_params
-            replay.before_chunk(i)
+            replay_topk_idx = replay.chunk_indices(i)
+            if replay_topk_idx is not None:
+                chunk_moe_kwargs["replay_topk_idx"] = replay_topk_idx
             outputs.append(
                 apply_module(self.mlp)(chunk, padding_mask=padding_mask_chunk, **chunk_moe_kwargs)
             )

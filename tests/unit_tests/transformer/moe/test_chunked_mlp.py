@@ -46,21 +46,41 @@ class ToyRouter(torch.nn.Module):
 
 
 class ToyMoE(torch.nn.Module):
-    """Per-token MoE stand-in: output = x * (sum of the selected experts' probs), masked to 0."""
+    """Per-token MoE stand-in: output = x * (sum of the selected experts' probs), masked to 0.
 
-    def __init__(self):
+    Like ``MoELayer``, it replays ``replay_topk_idx`` around its router call and, with
+    ``moe_layer_recompute``, checkpoints that call (``calls`` then also logs the recompute).
+    """
+
+    def __init__(self, moe_layer_recompute=False):
         super().__init__()
         self.router = ToyRouter()
+        self.moe_layer_recompute = moe_layer_recompute
         self.calls = []
 
-    def forward(self, x, padding_mask=None, packed_seq_params=None, input_ids=None):
-        probs, indices = self.router(x)
-        self.calls.append(
-            {"tokens": x.shape[0], "padding_mask": padding_mask, "indices": indices.clone()}
-        )
-        out = x * probs.sum(dim=-1).reshape(x.shape[0], x.shape[1], 1)
-        if padding_mask is not None:  # [b, s], True = padding
-            out = out * (~padding_mask).transpose(0, 1).unsqueeze(-1)
+    def forward(
+        self, x, padding_mask=None, packed_seq_params=None, input_ids=None, replay_topk_idx=None
+    ):
+        def custom_forward(x):
+            with RouterReplay.replay_indices_for_call(self.router.router_replay, replay_topk_idx):
+                probs, indices = self.router(x)
+            self.calls.append(
+                {
+                    "tokens": x.shape[0],
+                    "x": x.detach().clone(),
+                    "padding_mask": padding_mask,
+                    "indices": indices.clone(),
+                }
+            )
+            out = x * probs.sum(dim=-1).reshape(x.shape[0], x.shape[1], 1)
+            if padding_mask is not None:  # [b, s], True = padding
+                out = out * (~padding_mask).transpose(0, 1).unsqueeze(-1)
+            return out
+
+        if self.moe_layer_recompute and self.training:
+            out = torch.utils.checkpoint.checkpoint(custom_forward, x, use_reentrant=True)
+        else:
+            out = custom_forward(x)
         return out, None
 
 
@@ -176,7 +196,7 @@ def test_routing_replay_record_into_static_buffer():
 
 def test_chunked_router_replay_without_replay_is_a_no_op():
     replay = ChunkedRouterReplay(None, [3, 3], 0)
-    replay.before_chunk(0)
+    assert replay.chunk_indices(0) is None
     replay.after_chunk()
     replay.finish()
 
@@ -185,3 +205,83 @@ def test_pad_without_real_tokens():
     # No real token to copy from: the dummies replay distinct experts 0..topk-1.
     padded = ChunkedRouterReplay._pad(torch.empty(0, K, dtype=torch.long), 3)
     assert torch.equal(padded, torch.arange(K).expand(3, -1))
+
+
+def _forward_calls_by_input(calls):
+    return {tuple(c["x"].flatten().tolist()): c["indices"] for c in calls}
+
+
+@pytest.mark.parametrize("seq_len", [30, 3])
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_routing_replay_with_moe_recompute(batch_size, seq_len):
+    """With selective "moe" recompute, backward reruns each chunk's checkpointed MoE call alone,
+    not the chunk loop. Each rerun still replays its own chunk's slice."""
+    torch.manual_seed(0)
+    num_chunks = 4
+    real_tokens = seq_len * batch_size
+    mlp = ToyMoE(moe_layer_recompute=True).train()
+    rr = mlp.router.router_replay
+    target = torch.randint(0, E, (real_tokens, K))
+    x = torch.randn(seq_len, batch_size, H, requires_grad=True)
+
+    rr.set_target_indices(target)
+    rr.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+    out, _ = _run_in_chunks(mlp, x, None, num_chunks)
+    forward_calls = list(mlp.calls)
+    assert len(forward_calls) == num_chunks
+    assert torch.equal(torch.cat([c["indices"] for c in forward_calls])[:real_tokens], target)
+    # No rerun pops the micro-batch's entry, so it is dropped up front.
+    assert rr.replay_backward_list == []
+
+    mlp.calls.clear()
+    rr.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
+    out.sum().backward()
+    assert len(mlp.calls) == num_chunks
+    expected = _forward_calls_by_input(forward_calls)
+    for rerun in mlp.calls:
+        assert torch.equal(rerun["indices"], expected[tuple(rerun["x"].flatten().tolist())])
+    assert rr.call_topk_idx is None
+
+
+def test_replay_slice_is_bound_to_its_call():
+    """A rerun replays the slice its call was given, whatever the backward order."""
+    torch.manual_seed(0)
+    mlp = ToyMoE(moe_layer_recompute=True).train()
+    rr = mlp.router.router_replay
+    rr.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+    xs = [torch.randn(3, 1, H, requires_grad=True) for _ in range(3)]
+    slices = [torch.randint(0, E, (3, K)) for _ in range(3)]
+    outs = [mlp(x, replay_topk_idx=idx)[0] for x, idx in zip(xs, slices)]
+
+    mlp.calls.clear()
+    rr.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
+    order = (1, 2, 0)
+    for i in order:
+        outs[i].sum().backward()
+    assert len(mlp.calls) == 3
+    for call, i in zip(mlp.calls, order):
+        assert torch.equal(call["indices"], slices[i])
+
+
+def test_moe_recompute_keeps_earlier_micro_batches_entries():
+    """Only this micro-batch's entry is dropped; earlier ones (e.g. pipeline 1F1B) stay queued."""
+    mlp = ToyMoE(moe_layer_recompute=True).train()
+    rr = mlp.router.router_replay
+    earlier = torch.randint(0, E, (5, K))
+    rr.set_target_indices(earlier)
+    rr.set_target_indices(torch.randint(0, E, (8, K)))
+    rr.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+    _run_in_chunks(mlp, torch.randn(8, 1, H, requires_grad=True), None, 4)
+    assert len(rr.replay_backward_list) == 1 and rr.replay_backward_list[0] is earlier
+
+
+def test_quantile_balancing_rejects_padded_chunks():
+    """Dummy tokens need a padding mask, which quantile balancing does not support yet."""
+    mlp = ToyMoE()
+    mlp.router.routing_type = "quantile_balancing"
+    with pytest.raises(NotImplementedError, match="quantile-balancing"):
+        _run_in_chunks(mlp, torch.randn(3, 2, H), None, 4)
+    assert mlp.calls == []
+    # A sequence of at least num_chunks tokens needs no padding and runs as before.
+    _run_in_chunks(mlp, torch.randn(8, 2, H), None, 4)
+    assert len(mlp.calls) == 4

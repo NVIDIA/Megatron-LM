@@ -25,6 +25,7 @@ from megatron.core.transformer.moe.moe_utils import (
     maybe_skip_or_early_return_by_cudagraph,
 )
 from megatron.core.transformer.moe.router import TopKRouter
+from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
@@ -707,6 +708,7 @@ class MoELayer(BaseMoELayer):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        replay_topk_idx: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass for the MoE layer.
 
@@ -723,6 +725,10 @@ class MoELayer(BaseMoELayer):
                                                    False = valid. Defaults to None.
             input_ids (torch.Tensor, optional): Token IDs with shape
                 [batch_size, seq_length]. Required by hash routing.
+            replay_topk_idx (torch.Tensor, optional): Routing replay indices of exactly these
+                tokens, ``[seq_length * bsz, topk]``, replayed in place of the micro-batch's
+                (see ``ChunkedRouterReplay``). Being an argument, they are also what a
+                recompute of this call replays.
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
@@ -744,9 +750,15 @@ class MoELayer(BaseMoELayer):
                     if not self.run_shared_experts_after_router:
                         shared_expert_output = self.shared_experts_compute(layer_input)
 
-                    probs, routing_map = self.route(
-                        layer_input, padding_mask, input_ids, packed_seq_params=packed_seq_params
-                    )
+                    with RouterReplay.replay_indices_for_call(
+                        getattr(self.router, "router_replay", None), replay_topk_idx
+                    ):
+                        probs, routing_map = self.route(
+                            layer_input,
+                            padding_mask,
+                            input_ids,
+                            packed_seq_params=packed_seq_params,
+                        )
                     hidden_states, probs = self.preprocess(
                         layer_input, probs, routing_map, padding_mask
                     )
