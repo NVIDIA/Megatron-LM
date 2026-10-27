@@ -102,12 +102,11 @@ class TestCUDAGraphTokenCountAlignment:
     mixed and decode token counts line up exactly -- asserted below.
 
     HYBRID (the shipping default) deliberately spaces the two families differently, so
-    that alignment does not hold. It does not need to: a prefill on any EP rank sends
-    every rank eager (`adjust_batch_dims_for_expert_parallelism` returns None as soon as
-    the all-reduced non-decode flag is set), so a mixed graph is never selected while
-    another rank is decode-only. What EP does rely on is that every rank picks the same
-    graph for a decode-only step, which
-    `test_decode_only_ep_ranks_select_the_same_graph` covers for both distributions.
+    that alignment does not hold. It does not need to: `adjust_batch_dims_for_expert_parallelism`
+    all-reduces all three batch dimensions, so every EP rank matches against identical
+    dimensions and selects the same graph whether the step is decode-only or, because some
+    rank prefills, a mixed graph that the decode-only ranks pad into. Both cases are covered
+    below for both distributions.
     """
 
     @pytest.mark.parametrize("num_cuda_graphs", [1, 16, 32, -1])
@@ -523,14 +522,13 @@ class TestMatchGraphConfigWithEP:
         assert result is not None
 
     # ------------------------------------------------------------------ #
-    # 3. Any rank has prefill → all ranks fall back to eager (None)
+    # 3. Any rank has prefill → every rank pads into the same mixed graph
     # ------------------------------------------------------------------ #
     @pytest.mark.internal
     @pytest.mark.parametrize("num_cuda_graphs", [1, 16, 32, -1])
-    def test_any_prefill_rank_forces_eager(self, num_cuda_graphs):
-        """When at least one EP rank has a prefill request,
-        adjust_batch_dims_for_expert_parallelism returns None and ALL ranks
-        get None from match_graph_config (eager mode)."""
+    def test_prefill_on_one_rank_pads_all_ranks_into_one_mixed_graph(self, num_cuda_graphs):
+        """When at least one EP rank has a prefill request, every rank matches against the
+        EP-wide maxima and selects the same mixed graph, large enough for every rank."""
         ep_group = self._get_ep_group()
         graph_list = _generate_graphs(num_cuda_graphs)
         rank = dist.get_rank()
@@ -543,7 +541,11 @@ class TestMatchGraphConfigWithEP:
 
         result = _match(real, graph_list, ep_group=ep_group)
         _assert_consistent_across_ranks(result, ep_group)
-        assert result is None, "All ranks should run eager when any rank has prefill"
+        assert result is not None, "A mixed graph must be selected on every rank"
+        assert result.prefill_req_count > 0, "Decode-only ranks pad into the mixed graph"
+        # The shared graph covers this rank's real work.
+        assert result.token_count >= real.token_count
+        assert result.req_count >= real.req_count
 
     # ------------------------------------------------------------------ #
     # 4. Mixed prefill graphs with strict matching
@@ -806,8 +808,7 @@ class TestSpeculativeDecodingBatchDimensions:
         """Verify EP sync when ranks have different request states with speculative tokens.
 
         Even ranks have decode-only requests; odd ranks have mixed prefill+decode.
-        Since any prefill rank causes all ranks to fall back to eager (None),
-        the test verifies that all ranks consistently get None.
+        All ranks must select the same mixed graph, sized for the EP-wide maxima.
         """
         ep_group = self._get_ep_group()
         num_speculative_tokens = 2
@@ -849,16 +850,18 @@ class TestSpeculativeDecodingBatchDimensions:
 
         result = _match(real, graph_list, ep_group=ep_group)
 
-        # Any rank has prefill → all ranks get None (eager mode).
+        # Any rank has prefill → every rank selects the same mixed graph.
         _assert_consistent_across_ranks(result, ep_group)
-        assert result is None, "Any prefill rank should force all ranks to eager mode"
+        assert result is not None, "All ranks must select a shared mixed graph"
+        assert result.prefill_req_count >= 1
+        assert result.token_count >= real.token_count
 
     @pytest.mark.internal
     def test_ep_speculative_decode_to_mixed_graph_transition(self):
         """Verify EP consistency when ranks have mixed prefill/decode states.
 
-        When one EP rank is decode-only and another has prefill, the NCCL
-        EP sync detects the prefill and returns None for all ranks (eager mode).
+        When one EP rank is decode-only and another has prefill, the NCCL EP sync
+        raises every rank's dimensions to the group maxima so all select one mixed graph.
         """
         ep_group = self._get_ep_group()
         num_speculative_tokens = 3
@@ -892,6 +895,8 @@ class TestSpeculativeDecodingBatchDimensions:
 
         result = _match(real, graph_list, ep_group=ep_group)
 
-        # Odd ranks have prefill → any prefill rank forces all to eager (None).
+        # Odd ranks have prefill → every rank selects the same mixed graph.
         _assert_consistent_across_ranks(result, ep_group)
-        assert result is None, "Any prefill rank should force all ranks to eager mode"
+        assert result is not None, "All ranks must select a shared mixed graph"
+        assert result.prefill_req_count >= 2
+        assert result.token_count >= real.token_count

@@ -1548,10 +1548,12 @@ class TransformerConfig(ModelParallelConfig):
 
     inference_moe_token_dispatcher_type: Literal['nccl', 'nvls'] = 'nvls'
     """Token dispatcher to use for MoE expert parallelism during inference.
-    - 'nccl': AllGather/ReduceScatter via NCCL. Fixed token counts per rank; requires
-      decode-only CUDA graphs (forced automatically).
+    - 'nccl': AllGather/ReduceScatter via NCCL. Fixed token counts per rank, so the
+      dynamic engine synchronizes CUDA graph selection across EP ranks. Works on any GPU.
     - 'nvls': Variable-count AllGather-V/ReduceScatter-V via NVLS multimem kernels.
-      Requires Hopper+ GPUs with NVLink and symmetric memory. Default.
+      Requires Hopper+ GPUs with NVLink and symmetric memory. Default; on a GPU without
+      NVLS support (compute capability < 9) the model and the dynamic context use 'nccl'
+      instead (see resolve_inference_moe_dispatcher_type).
     Only applies when transformer_impl='inference_optimized' and EP > 1."""
 
     mrope_section: Optional[List[int]] = None

@@ -35,6 +35,7 @@ from megatron.core.transformer.moe.token_dispatcher import (
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
+    resolve_inference_moe_dispatcher_type,
 )
 from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualExpertLoadBalancer
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -459,7 +460,7 @@ class MoELayer(BaseMoELayer):
         The active dispatcher is selected at the start of `forward` based on
         `InferenceMode.is_active()`.
         """
-        dispatcher_type = self.config.inference_moe_token_dispatcher_type
+        dispatcher_type = resolve_inference_moe_dispatcher_type(self.config)
         dispatcher_cls = (
             NVLSAllGatherVDispatcher if dispatcher_type == 'nvls' else NCCLAllGatherDispatcher
         )

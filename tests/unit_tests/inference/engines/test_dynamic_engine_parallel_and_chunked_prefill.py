@@ -1324,14 +1324,11 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
                 "expected no CUDA graphs to be captured with num_cuda_graphs=None, got "
                 f"{len(context.cuda_graph_batch_dimensions_list)}"
             )
-        elif dispatcher == "nvls":
-            assert (
-                context.use_cuda_graphs_for_non_decode_steps
-            ), "expected full (decode + non-decode) graph coverage with the nvls dispatcher"
         else:
-            assert (
-                not context.use_cuda_graphs_for_non_decode_steps
-            ), "nccl EP dispatcher is expected to force-disable non-decode graphs"
+            assert context.use_cuda_graphs_for_non_decode_steps, (
+                f"expected full (decode + non-decode) graph coverage with the {dispatcher} "
+                "dispatcher"
+            )
 
         for request in env.requests:
             assert (

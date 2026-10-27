@@ -58,6 +58,7 @@ from megatron.core.transformer.moe.paged_stash import (
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceAllGatherDispatcherBase,
     NVLSAllGatherVDispatcher,
+    resolve_inference_moe_dispatcher_type,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -1445,7 +1446,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self._mcore_activation_type = self._resolve_mcore_activation_type()
         self._activation_clamp_scale = config.activation_func_tanh_clamp_scale
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
-        self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
+        self._nvls_dispatcher = resolve_inference_moe_dispatcher_type(config) == 'nvls'
         self._flashinfer_mxfp8_token_capacity = config.inference_flashinfer_mxfp8_token_capacity
 
     def _resolve_flashinfer_activation_type(self):
