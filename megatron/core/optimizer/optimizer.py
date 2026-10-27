@@ -1653,9 +1653,29 @@ class ChainedOptimizer(MegatronOptimizer):
         else:
             return [optimizer.state_dict() for optimizer in self.chained_optimizers]
 
+    def _is_fsdp_chain(self) -> bool:
+        """Whether every member is a FullyShardedOptimizer (their states share one FQN mapping)."""
+        from .fully_sharded_optimizer import FullyShardedOptimizer
+
+        return bool(self.chained_optimizers) and all(
+            isinstance(optimizer, FullyShardedOptimizer) for optimizer in self.chained_optimizers
+        )
+
     def sharded_state_dict(
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False, **kwargs
     ):
+        if self._is_fsdp_chain():
+            # FSDP transforms use one FQN-keyed mapping. Each optimizer owns disjoint
+            # parameters, so their states can share it.
+            self._synchronize_steps()
+            sharded_state_dict = {"state": {}, "param_to_group_meta": {}}
+            for optimizer in self.chained_optimizers:
+                optim_state_dict = optimizer.sharded_state_dict(
+                    model_sharded_state_dict, is_loading, **kwargs
+                )
+                for key, value in optim_state_dict.items():
+                    sharded_state_dict[key].update(value)
+            return sharded_state_dict
         metadata = kwargs.get('metadata') or {}
         # ChainedOptimizer should add its prefix to the tensor state keys only if
         # DistributedOptimizer is used (non-empty 'distrib_optim_sharding_type') and uses
@@ -1686,6 +1706,12 @@ class ChainedOptimizer(MegatronOptimizer):
             return sharded_state_dict
 
     def load_state_dict(self, state_dict):
+        if self._is_fsdp_chain():
+            # Each FSDP optimizer selects its own FQNs from the combined mapping.
+            for optimizer in self.chained_optimizers:
+                optimizer.load_state_dict(state_dict)
+            self._synchronize_steps()
+            return
         # If there is only one optimizer, we read the state dict as a single optimizer.
         if len(self.chained_optimizers) == 1:
             self.chained_optimizers[0].load_state_dict(state_dict)
