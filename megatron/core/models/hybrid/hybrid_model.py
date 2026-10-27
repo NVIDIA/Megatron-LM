@@ -477,8 +477,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
     def preprocess_for_fine_grained_offloading(self):
         """Preprocess for fine-grained activation offloading."""
-        if not torch.is_grad_enabled():
-            return
         off_interface.init_chunk_handler(
             pp_rank=self.pg_collection.pp.rank(),
             vp_size=self.config.virtual_pipeline_model_parallel_size,

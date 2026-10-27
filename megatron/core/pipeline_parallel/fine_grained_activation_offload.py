@@ -653,8 +653,7 @@ class PipelineOffloadManager:
             eligible_offload_groups = [
                 group
                 for group in chunk.offload_groups
-                if group.offload
-                and (group.total_offload_bytes > 0 or self._activation_offload_fraction == 0)
+                if group.offload and group.total_offload_bytes > 0
             ]
             offloaded_groups_count = len(eligible_offload_groups)
             disabled_groups_count = int(

@@ -27,13 +27,13 @@ backends, full-layer recomputation and CUDA graphs.
 The manager's minimum tensor size, offload fraction and last-group margin apply.
 After warmup, fraction zero selects no transfers. Warmup can still copy eligible
 tensors to collect size statistics. The default minimum is 1,048,576 elements;
-short correctness tests use 1024 elements to exercise copies. Native GPU checks cover fixed-length training, evaluation before the first
-training iteration, and sequence lengths 8/256/64/256 after a small warmup.
-The fraction is selected from warmup-eligible groups; changing sizes does not
-recompute a positive-fraction budget. Fraction zero remains transfer-free after
-warmup even when previously small tensors become eligible. Use multiple GDN
-layers when measuring steady-state savings: one GDN group is kept resident after
-warmup. Evaluation, no-grad and fully frozen recurrence execution bypass the scope.
+short correctness tests use 1024 elements to exercise copies. This integration
+covers fixed-length runs beginning with training. Evaluation before the first
+training iteration and changes to tensor sizes after warmup are outside this
+PR's scope. The fraction is selected from warmup-eligible groups; changing
+sizes does not recompute that policy. Use multiple GDN layers when measuring
+steady-state savings: one GDN group is kept resident after warmup. No-grad and
+fully frozen recurrence execution bypass the GDN scope.
 
 ## Saved tensors and integration boundary
 
@@ -152,7 +152,9 @@ Complete-Qwen measurements at `1f2c9ae4f7e617b12caa115e387d95e668517c62`
 use one RTX A6000, sequence 4096, four microbatches, fraction 1, the default
 tensor threshold and norm recomputation off. Each setting has three
 fresh-process on/off pairs, three warmup steps and ten measured complete optimizer
-steps. Peak allocated memory decreases by 952 MiB: 3.43% with unfused pre-GDR
+steps. These runs include the separately retained evaluation-first and size-change
+policy fixes; they are measurements at the recorded revision, not the current head.
+Peak allocated memory decreases by 952 MiB: 3.43% with unfused pre-GDR
 and 3.47% with native fused pre-GDR. Paired median step-time changes are
 +0.50% (−0.26% to +0.55%) and +4.11% (+3.58% to +6.11%), respectively.
 Peak reserved memory increases by 650–652 MiB and 738–756 MiB; offloading
