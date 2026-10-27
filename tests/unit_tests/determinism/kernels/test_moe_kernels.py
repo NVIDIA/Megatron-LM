@@ -4,9 +4,9 @@
 
 Operator level: token permute / unpermute (torch and TE-fused, both branches of the
 ``torch.are_deterministic_algorithms_enabled()`` switch), chunk sorting, top-k routing (torch
-and TE-fused), group-limited routing, the load-balancing aux loss (torch and TE-fused), and
-the router gating GEMM, and virtual-expert planning against a CPU oracle in eager and CUDA
-graphs. Module level: ``TopKRouter``, ``TEGroupedMLP`` / ``SequentialMLP`` on
+and TE-fused), group-limited routing, the load-balancing aux loss (torch and TE-fused), and the
+router gating GEMM, per-expert token counting, and virtual-expert planning against a CPU oracle
+in eager and CUDA graphs. Module level: ``TopKRouter``, ``TEGroupedMLP`` / ``SequentialMLP`` on
 deliberately uneven expert loads (including an empty expert), and a full ``MoELayer`` through
 the all-gather and all-to-all dispatchers (plus the flex/DeepEP dispatcher from
 ``fused_a2a.py`` when the dependency and the GPUs are available), and the inference
@@ -881,6 +881,30 @@ def test_default_fused_aux_loss_is_the_racy_path():
     with deterministic_algorithms(False):
         differing = count_differing_replays(fn, (probs,), replays=8, backward=False)
     assert differing > 0, "atomic aux loss happened to repeat bit-exactly on this hardware/shape"
+
+
+@pytest.mark.parametrize("with_padding_mask", [False, True])
+def test_tokens_per_expert_and_token_count_replays(with_padding_mask):
+    """Per-expert token counts (integer atomics) replay and equal ``routing_map.sum(0)``."""
+    Utils.initialize_model_parallel()
+    try:
+        seeded()
+        routing_map, _ = _routing(num_tokens=65536, num_experts=256, topk=8)
+        if with_padding_mask:
+            routing_map[-1000:] = False
+        group = parallel_state.get_tensor_model_parallel_group()
+        ref, _ = assert_replays_bit_exact(
+            lambda m: moe_utils.get_tokens_per_expert_and_token_count(
+                m, group, topk=8, with_padding_mask=with_padding_mask
+            )[0],
+            (routing_map,),
+            backward=False,
+            contention=True,
+            what="get_tokens_per_expert_and_token_count",
+        )
+        assert torch.equal(ref["out"], routing_map.sum(dim=0) * group.size())
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("router_dtype", [torch.float32, torch.float64])

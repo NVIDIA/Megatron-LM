@@ -15,6 +15,7 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
+from megatron.core.fusions.fused_tokens_per_expert import fused_tokens_per_expert
 from megatron.core.inference.moe.sigmoid_topk import HAVE_TRITON as HAVE_SIGMOID_TOPK_KERNEL
 from megatron.core.inference.moe.sigmoid_topk import is_sigmoid_topk_supported, sigmoid_topk_routing
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -307,7 +308,7 @@ def get_tokens_per_expert_and_token_count(
     ``reduce_group`` accepts one group or an ordered tuple of orthogonal groups
     (for example runtime CP followed by TP). The single-group positional API is preserved.
     """
-    local_tokens_per_expert = routing_map.sum(dim=0)
+    local_tokens_per_expert = fused_tokens_per_expert(routing_map)
     reduce_groups = reduce_group if isinstance(reduce_group, tuple) else (reduce_group,)
 
     # The reduction all-reduces contiguous tensors in place; reduce a copy so

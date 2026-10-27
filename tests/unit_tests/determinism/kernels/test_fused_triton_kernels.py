@@ -4,6 +4,8 @@
 
 * ``fused_pad_routing_map`` / ``fused_indices_to_multihot``: integer routing bookkeeping with
   unique stores -- replay and agree with the torch reference.
+* ``fused_tokens_per_expert``: per-expert token counts with integer atomics -- replays (also
+  under side-stream contention) and agrees bit for bit with ``routing_map.sum(dim=0)``.
 * ``fused_row_copy``: copy with unique stores -- replays and agrees bit for bit with
   ``Tensor.contiguous`` on row-strided views.
 * ``fused_moe_residual_add``: elementwise with unique stores -- forward and backward replay and
@@ -32,6 +34,7 @@ from megatron.core.fusions.fused_indices_converter import fused_indices_to_multi
 from megatron.core.fusions.fused_moe_residual_add import fused_moe_residual_add
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.fusions.fused_row_copy import contiguous_rows
+from megatron.core.fusions.fused_tokens_per_expert import fused_tokens_per_expert
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse import (
     fused_csa_teacher_lse,
 )
@@ -280,6 +283,23 @@ def test_fused_pad_routing_map_replays_and_matches_torch(
         what="pad_routing_map",
     )
     assert torch.equal(fused["out"].to(torch_out["out"].dtype), torch_out["out"])
+
+
+# --- tokens per expert --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("num_tokens, num_experts", [(16384, 256), (4097, 72)])
+def test_fused_tokens_per_expert_replays_and_matches_torch(num_tokens, num_experts):
+    seeded()
+    routing_map = _topk_routing_map(num_tokens, num_experts, 8)
+    fused, _ = assert_replays_bit_exact(
+        fused_tokens_per_expert,
+        (routing_map,),
+        backward=False,
+        contention=True,
+        what="fused_tokens_per_expert",
+    )
+    assert torch.equal(fused["out"], routing_map.sum(dim=0))
 
 
 # --- indices <-> multihot ----------------------------------------------------------------
