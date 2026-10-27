@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Literal, Optional, TypeAlias, overload
+from typing import Generic, Literal, NamedTuple, Optional, TypeAlias, TypeVar, overload
 
 import torch
 from torch import Tensor, nn
@@ -13,6 +13,29 @@ ResidualBranchOutput: TypeAlias = Tensor | tuple[Tensor, Optional[Tensor]]
 ResidualConnectionState: TypeAlias = tuple[Tensor, ...]
 ResidualConnectionWriteState: TypeAlias = tuple[Tensor, ...]
 ResidualConnectionOperation: TypeAlias = Literal["read", "write"]
+
+_StateT = TypeVar("_StateT")
+
+
+class ResidualBranchInput(NamedTuple, Generic[_StateT]):
+    """Common preparation result for residual implementations sharing a branch forward.
+
+    The shared forward runs the branch on ``branch_input``, then passes ``state``
+    unchanged to the matching residual-update hook. Each implementation controls input
+    preparation (normalization and dtype) and the saved state needed to apply its update.
+
+    Ordinary Mamba stores its residual tensor; current WR stores ``(wide_residual,)``.
+    The contract allows future token-dependent WR variants to save per-token coefficients
+    needed at writeback, and an mHC adapter to save predicted mixing/write maps. These
+    implementations can reuse the same branch forward: it passes ``state`` as a
+    single value without unpacking it; the update hook extracts the tensors it needs.
+
+    This container preserves tensor references for one branch execution; cross-layer carry
+    is a separate contract.
+    """
+
+    branch_input: Tensor
+    state: _StateT
 
 
 class ResidualConnection(nn.Module, ABC):
