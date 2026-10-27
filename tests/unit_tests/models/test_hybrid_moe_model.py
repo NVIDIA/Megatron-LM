@@ -242,6 +242,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_paged_stash": False,
     "moe_paged_stash_buffer_size_factor_cpu": 0.0,
     "moe_paged_stash_buffer_size_factor_cuda": 1.1,
+    "moe_paged_stash_mxfp8_activations": False,
+    "moe_paged_stash_page_copy": False,
     "moe_paged_stash_page_size": 64,
     "moe_per_layer_logging": False,
     "moe_permute_fusion": False,
