@@ -140,6 +140,19 @@ class TestMambaMixer:
         torch.testing.assert_close(conv_state, conv_ref, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(ssm_state, ssm_ref, atol=1e-5, rtol=1e-5)
 
+    def test_ssm_decode_rejects_sequence_first_input(self):
+        """Without batch_indices, a (1, b, proj) input would decode b requests on one slot."""
+        mixer = self.get_mixer()
+        batch_size = 2
+        zxBCdt = torch.randn(1, batch_size, mixer.in_proj.weight.shape[0], device="cuda")
+        conv_shape, ssm_shape = mixer.mamba_state_shapes_per_request()
+        conv_state = torch.zeros(batch_size, *conv_shape, device="cuda")
+        ssm_state = torch.zeros(batch_size, *ssm_shape, device="cuda")
+
+        with torch.no_grad(), InferenceMode.active():
+            with pytest.raises(AssertionError, match="one state slot per request"):
+                mixer.ssm_decode(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
+
     @pytest.mark.parametrize("batch_size", [1, 2])
     def test_static_decode_is_per_request(self, batch_size):
         """A static-batching decode step advances each request on its own state slot."""

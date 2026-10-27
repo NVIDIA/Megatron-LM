@@ -833,9 +833,16 @@ def test_batch_invariant_unfused_mixer_replays_bit_exactly(monkeypatch):
 # --- Mamba mixer: static-batching decode (_static_decode) -----------------------------------
 
 
-@pytest.mark.skipif(mamba_mixer_module.mamba_chunk_scan_combined is None, reason="needs mamba_ssm")
+@pytest.mark.skipif(
+    not mamba_mixer_module.HAVE_MAMBA_SSM,
+    reason="the decode step's gated RMSNorm comes from mamba_ssm",
+)
 def test_mixer_static_decode_replays():
-    """One token for each of several requests, each advancing its own conv/SSM state slot."""
+    """A static-batching decode step (one token for each of 64 requests) replays bitwise.
+
+    Determinism only: tests/unit_tests/ssm/test_mamba_mixer.py checks that each request decodes
+    on its own state slot.
+    """
     mixer = _build_mixer(deterministic_mode=False)
     try:
         seeded()

@@ -633,6 +633,55 @@ class TestHybridModel:
                 assert logits.shape[1] == 1
             assert logits.shape[2] == self.model.vocab_size
 
+    def test_static_batch_inference_matches_single_requests(self):
+        """Each request in a static batch gets the logits it gets when run on its own."""
+        self.model.cuda()
+        self.model.eval()  # no dropout
+        max_sequence_length = self.model.max_sequence_length
+        prompt_length = 2
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        tokens = torch.randint(
+            self.model.vocab_size, (2, max_sequence_length), generator=generator, device="cuda"
+        )
+
+        def static_generation_logits(tokens):
+            """Prefill the prompt, then decode the remaining tokens one step at a time, as the
+            static-batching text generation controller does. Returns (batch, steps, vocab)."""
+            inference_context = StaticInferenceContext(
+                max_batch_size=tokens.shape[0], max_sequence_length=max_sequence_length
+            )
+            position_ids = torch.arange(max_sequence_length, device="cuda").expand_as(tokens)
+            windows = [(0, prompt_length)] + [
+                (start, start + 1) for start in range(prompt_length, max_sequence_length)
+            ]
+            logits = []
+            with InferenceMode.active():
+                for start, end in windows:
+                    if start > 0:
+                        inference_context.enable_decode_mode()
+                    logits.append(
+                        self.model.forward(
+                            input_ids=tokens[:, start:end],
+                            position_ids=position_ids[:, start:end],
+                            attention_mask=None,
+                            inference_context=inference_context,
+                            runtime_gather_output=True,
+                        )
+                    )
+                    inference_context.increment_sequence_len_offset(end - start)
+            return torch.cat(logits, dim=1)
+
+        batch_logits = static_generation_logits(tokens)
+        for i in range(tokens.shape[0]):
+            # The batched and single-request runs use different GEMM shapes, which agree to
+            # about 1e-3 relative; a request decoded on another request's state is off by O(1).
+            torch.testing.assert_close(
+                batch_logits[i : i + 1],
+                static_generation_logits(tokens[i : i + 1]),
+                atol=2e-2,
+                rtol=2e-2,
+            )
+
     def test_save_load(self, tmp_path):
         path = tmp_path / "model.pt"
         torch.save(self.model.state_dict(), path)

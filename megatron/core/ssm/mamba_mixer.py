@@ -1126,6 +1126,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             conv_state: The convolution state tensor for inference.
             ssm_state: The selective scan state tensor for inference.
             batch_indices: A map from batch id to position in the Mamba state tensors.
+                If None, request i uses state slot i, so the state tensors must hold
+                exactly one slot per request.
             intermediate_conv_state: Optional buffer for storing conv state at each
                 sequence step (for speculative decoding rollback).
             intermediate_ssm_state: Optional buffer for storing SSM state at each
@@ -1136,6 +1138,14 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         """
         batch_size, seq_len, _ = zxBCdt.shape
         dtype = zxBCdt.dtype
+        if batch_indices is None:
+            # A mismatch here usually means a sequence-first (s, b, d) input, which the
+            # kernels would otherwise decode as one request with b tokens.
+            assert batch_size == conv_state.shape[0] == ssm_state.shape[0], (
+                f"ssm_decode expects batch-first input with one state slot per request; got "
+                f"{batch_size} requests for {conv_state.shape[0]} conv and "
+                f"{ssm_state.shape[0]} SSM state slots"
+            )
 
         z, xBC, dt = torch.split(
             zxBCdt,
