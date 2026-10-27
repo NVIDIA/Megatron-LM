@@ -207,13 +207,6 @@ def _even_shard_rows(rows: int, world_size: int) -> list[int]:
     return [min(max(rows - rank * shard_rows, 0), shard_rows) for rank in range(world_size)]
 
 
-def _assert_tensors_identical(expected: torch.Tensor, actual: torch.Tensor, what: str) -> None:
-    """Assert a checkpoint restores local tensor values, shapes, and dtypes exactly."""
-    assert not isinstance(expected, DTensor), f"{what}: snapshot should be local"
-    assert not isinstance(actual, DTensor), f"{what}: checkpoint wrapper leaked into runtime state"
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0, msg=f"{what}: value mismatch")
-
-
 def _snapshot_state(
     model: nn.Module, optimizer: torch.optim.Optimizer
 ) -> tuple[dict[str, torch.Tensor], dict[int, dict]]:
@@ -244,7 +237,14 @@ def _assert_model_matches_snapshot(
     # cross-rank "at least one rank compared something" check.
     local_nonempty = False
     for key, expected in model_snapshot.items():
-        _assert_tensors_identical(expected, current[key], f"model[{key}]")
+        actual = current[key]
+        assert not isinstance(expected, DTensor), f"model[{key}]: snapshot should be local"
+        assert not isinstance(
+            actual, DTensor
+        ), f"model[{key}]: checkpoint wrapper leaked into runtime state"
+        torch.testing.assert_close(
+            actual, expected, rtol=0, atol=0, msg=f"model[{key}]: value mismatch"
+        )
         local_nonempty = local_nonempty or expected.numel() > 0
     return local_nonempty
 
@@ -260,7 +260,15 @@ def _assert_optimizer_matches_snapshot(
         for key, expected in expected_state.items():
             actual = current[index][key]
             if torch.is_tensor(expected):
-                _assert_tensors_identical(expected, actual, f"optim[{index}][{key}]")
+                assert not isinstance(
+                    expected, DTensor
+                ), f"optim[{index}][{key}]: snapshot should be local"
+                assert not isinstance(
+                    actual, DTensor
+                ), f"optim[{index}][{key}]: checkpoint wrapper leaked into runtime state"
+                torch.testing.assert_close(
+                    actual, expected, rtol=0, atol=0, msg=f"optim[{index}][{key}]: value mismatch"
+                )
             else:
                 assert expected == actual, f"optim[{index}][{key}] scalar mismatch"
 
