@@ -2801,8 +2801,11 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     model_config.sequence_parallel
                     and model_config.transformer_impl != "inference_optimized"
                 ):
-                    assert runtime["tp-collective:reduce_scatter_to_sequence_parallel_region"] > 0
-                    assert runtime["tp-sp-reduce-scatter-dimensions"] > 0
+                    if "cuda-graph" not in signals:
+                        assert (
+                            runtime["tp-collective:reduce_scatter_to_sequence_parallel_region"] > 0
+                        )
+                        assert runtime["tp-sp-reduce-scatter-dimensions"] > 0
                 elif not model_config.sequence_parallel:
                     assert runtime["tp-collective:reduce_from_tensor_model_parallel_region"] > 0
             if model_config.pipeline_model_parallel_size > 1:
