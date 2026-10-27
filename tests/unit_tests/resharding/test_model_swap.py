@@ -21,7 +21,11 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.resharding.refit import clear_all_caches, swap_model_weights
+from megatron.core.resharding.refit import (
+    clear_all_caches,
+    prepare_swap_model_weights,
+    swap_model_weights,
+)
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
@@ -182,8 +186,15 @@ def _build_gpt(
     pg_collection,
     parallel_output: bool = True,
     num_moe_experts: Optional[int] = None,
+    transformer_impl: str = "transformer_engine",
+    share_embeddings_and_output_weights: bool = False,
 ) -> GPTModel:
-    layer_spec = get_gpt_layer_with_transformer_engine_spec(
+    spec_builder = (
+        get_gpt_layer_local_spec
+        if transformer_impl == "local"
+        else get_gpt_layer_with_transformer_engine_spec
+    )
+    layer_spec = spec_builder(
         num_experts=num_moe_experts, moe_grouped_gemm=(num_moe_experts is not None)
     )
     mtp_block_spec = None
@@ -201,7 +212,7 @@ def _build_gpt(
         post_process=post_process,
         fp16_lm_cross_entropy=False,
         parallel_output=parallel_output,
-        share_embeddings_and_output_weights=False,
+        share_embeddings_and_output_weights=share_embeddings_and_output_weights,
         position_embedding_type="rope",
         rotary_percent=1.0,
         pg_collection=pg_collection,
@@ -558,6 +569,798 @@ def test_swap_gpt_parametrized(
     clear_all_caches()
     _destroy_pg_collection(src_pgs)
     _destroy_pg_collection(dst_pgs)
+    Utils.destroy_model_parallel()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize("src_tp,precision", [(1, "bf16"), (2, "bf16"), (1, "fp8")])
+def test_repeated_refit_matches_fresh_models_and_reuses_plan(src_tp: int, precision: str):
+    """A->B->C->A refits execute new weights without moving target storage."""
+    Utils.initialize_distributed()
+    world = dist.get_world_size()
+    if world % src_tp:
+        pytest.skip("WORLD_SIZE must be divisible by src_tp")
+    Utils.initialize_model_parallel(tensor_model_parallel_size=src_tp)
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    seq_len, vocab_size = 8, 64
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=32,
+        num_attention_heads=4,
+        num_query_groups=2,
+        use_cpu_initialization=True,
+        pipeline_dtype=torch.bfloat16,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        fp8="hybrid" if precision == "fp8" else None,
+        fp8_recipe="tensorwise" if precision == "fp8" else None,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+    )
+    src_pgs = _build_pg_collection(tp_size=src_tp)
+    dst_pgs = _build_pg_collection(tp_size=1)
+
+    def build(seed, pg_collection):
+        torch.manual_seed(seed)
+        model_parallel_cuda_manual_seed(
+            seed,
+            tp_rank=dist.get_rank(pg_collection.tp),
+            ep_rank=dist.get_rank(pg_collection.ep),
+            etp_rank=dist.get_rank(pg_collection.expt_tp),
+        )
+        return (
+            _build_gpt(config, vocab_size, seq_len, pg_collection, parallel_output=False)
+            .to(device)
+            .eval()
+        )
+
+    sources = [build(seed, src_pgs) for seed in (101, 202, 303)]
+    fresh_targets = [build(seed, dst_pgs) for seed in (101, 202, 303)]
+    target = build(404, dst_pgs)
+    fp8_activation = []
+    handles = []
+    if precision == "fp8":
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        def record_fp8_activation(_module, _inputs):
+            fp8_activation.append(FP8GlobalStateManager.is_fp8_enabled())
+
+        for module in target.modules():
+            if not any(module.children()):
+                handles.append(module.register_forward_pre_hook(record_fp8_activation))
+    tokens = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
+    positions = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
+    attention_mask = torch.triu(
+        torch.ones((1, 1, seq_len, seq_len), device=device, dtype=torch.bool), diagonal=1
+    )
+
+    def logits(model, pg_collection):
+        with torch.no_grad():
+            output = _run_forward(model, tokens, positions, attention_mask, pg_collection)
+        assert output is not None
+        return output.detach().clone()
+
+    source_outputs = [logits(model, src_pgs) for model in sources]
+    references = [logits(model, dst_pgs) for model in fresh_targets]
+    initial = logits(target, dst_pgs)
+    # TP2/TP1 variation measured one BF16 step; parameters are also compared exactly below.
+    cross_topology_tolerance = 2e-3 if src_tp > 1 else 5e-4
+    for source_output, reference in zip(source_outputs, references):
+        assert torch.equal(source_output.argmax(dim=-1), reference.argmax(dim=-1))
+        assert torch.allclose(
+            source_output, reference, atol=cross_topology_tolerance, rtol=cross_topology_tolerance
+        )
+    if precision == "fp8":
+        assert any(fp8_activation), "No module executed inside Transformer Engine FP8 autocast"
+    for left, right in zip(references, references[1:]):
+        assert not torch.allclose(left, right, atol=1e-3, rtol=1e-3)
+    assert all(not torch.allclose(initial, ref, atol=1e-3, rtol=1e-3) for ref in references)
+
+    target_layout = {
+        name: (tuple(param.shape), param.dtype, tuple(param.stride()), param.data_ptr())
+        for name, param in target.named_parameters()
+    }
+    clear_all_caches()
+    prepare_swap_model_weights([sources[0]], [target])
+    from megatron.core.resharding import refit as refit_module
+
+    assert len(refit_module._plan_cache) == 1
+    prepared_plan = next(iter(refit_module._plan_cache.values()))
+    observed = []
+    for source_index in (0, 1, 2, 0):
+        fp8_activation.clear()
+        swap_model_weights([sources[source_index]], [target], refit_method="nccl")
+        torch.cuda.synchronize()
+        actual = logits(target, dst_pgs)
+        if precision == "fp8":
+            assert any(fp8_activation), "The post-refit target step did not execute FP8"
+        expected = references[source_index]
+        observed.append(actual)
+        assert torch.equal(actual.argmax(dim=-1), expected.argmax(dim=-1))
+        assert torch.allclose(actual, expected, atol=5e-4, rtol=5e-4)
+        assert next(iter(refit_module._plan_cache.values())) is prepared_plan
+        assert {
+            name: (tuple(param.shape), param.dtype, tuple(param.stride()), param.data_ptr())
+            for name, param in target.named_parameters()
+        } == target_layout
+        reference_params = dict(fresh_targets[source_index].named_parameters())
+        assert all(
+            torch.equal(param, reference_params[name]) for name, param in target.named_parameters()
+        )
+
+    assert torch.equal(observed[0].argmax(dim=-1), observed[-1].argmax(dim=-1))
+    assert not torch.allclose(observed[0], observed[1], atol=1e-3, rtol=1e-3)
+    assert not torch.allclose(observed[1], observed[2], atol=1e-3, rtol=1e-3)
+    for handle in handles:
+        handle.remove()
+
+    dist.barrier()
+    del sources, fresh_targets, target
+    clear_all_caches()
+    _destroy_pg_collection(src_pgs)
+    _destroy_pg_collection(dst_pgs)
+    Utils.destroy_model_parallel()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def test_refit_reshards_expert_tensor_parallel_weights_and_executes_them():
+    """ETP2 expert shards become an executing ETP1 model matching a fresh load."""
+    Utils.initialize_distributed()
+    world = dist.get_world_size()
+    if world % 2:
+        pytest.skip("ETP2 refit requires an even WORLD_SIZE")
+    try:
+        import transformer_engine  # noqa: F401
+    except Exception:
+        pytest.skip("Transformer Engine is required for grouped MoE experts")
+
+    from megatron.core.inference.shards import build_inference_pg_collection
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_tensor_parallel_size=2)
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    source_pgs = build_inference_pg_collection(
+        world_size=world, tp_size=1, ep_size=1, expt_tp_size=2
+    )
+    reference_pgs = build_inference_pg_collection(
+        world_size=world, tp_size=1, ep_size=1, expt_tp_size=1
+    )
+    target_pgs = build_inference_pg_collection(
+        world_size=world, tp_size=1, ep_size=1, expt_tp_size=1
+    )
+
+    def build(seed, pg_collection, expert_tp):
+        torch.manual_seed(seed)
+        model_parallel_cuda_manual_seed(
+            seed, tp_rank=0, ep_rank=0, etp_rank=dist.get_rank(pg_collection.expt_tp)
+        )
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=32,
+            num_attention_heads=4,
+            num_query_groups=2,
+            num_moe_experts=4,
+            moe_ffn_hidden_size=64,
+            moe_grouped_gemm=True,
+            moe_router_dtype="fp64",
+            moe_token_dispatcher_type="alltoall",
+            add_bias_linear=False,
+            expert_tensor_parallel_size=expert_tp,
+            use_cpu_initialization=True,
+            pipeline_dtype=torch.bfloat16,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+        )
+        return (
+            _build_gpt(
+                config,
+                vocab_size=64,
+                seq_len=8,
+                pg_collection=pg_collection,
+                parallel_output=False,
+                num_moe_experts=4,
+            )
+            .to(device)
+            .eval()
+        )
+
+    reference = build(1701, reference_pgs, 1)
+    source = build(1701, source_pgs, 2)
+    target = build(1802, target_pgs, 1)
+    source_expert_pointers = {
+        name: param.data_ptr() for name, param in source.named_parameters() if ".experts." in name
+    }
+    clear_all_caches()
+    swap_model_weights([reference], [source], refit_method="nccl")
+    torch.cuda.synchronize()
+    assert source_expert_pointers == {
+        name: param.data_ptr() for name, param in source.named_parameters() if ".experts." in name
+    }
+    clear_all_caches()
+    tokens = torch.arange(8, device=device, dtype=torch.long).unsqueeze(0)
+    positions = torch.arange(8, device=device, dtype=torch.long).unsqueeze(0)
+    attention_mask = torch.triu(
+        torch.ones((1, 1, 8, 8), device=device, dtype=torch.bool), diagonal=1
+    )
+    expert_steps = {"source": 0, "reference": 0, "target": 0}
+    handles = []
+    for label, model in (("source", source), ("reference", reference), ("target", target)):
+        for module in model.modules():
+            if hasattr(module, "experts") and hasattr(module, "router"):
+                handles.append(
+                    module.register_forward_hook(
+                        lambda _module, _inputs, _output, key=label: expert_steps.__setitem__(
+                            key, expert_steps[key] + 1
+                        )
+                    )
+                )
+
+    def run(model, pg_collection):
+        with torch.no_grad():
+            return (
+                _run_forward(model, tokens, positions, attention_mask, pg_collection)
+                .detach()
+                .clone()
+            )
+
+    source_output = run(source, source_pgs)
+    expected = run(reference, reference_pgs)
+    initial = run(target, target_pgs)
+    assert expert_steps["source"] and expert_steps["reference"] and expert_steps["target"]
+    # ETP2 grouped GEMM measured one BF16 quantum; retain exact greedy identity.
+    assert torch.equal(source_output.argmax(dim=-1), expected.argmax(dim=-1))
+    assert torch.allclose(source_output, expected, atol=2e-3, rtol=2e-3)
+    assert not torch.allclose(initial, expected, atol=1e-3, rtol=1e-3)
+
+    target_expert_pointers = {
+        name: param.data_ptr() for name, param in target.named_parameters() if ".experts." in name
+    }
+    swap_model_weights([source], [target], refit_method="nccl")
+    torch.cuda.synchronize()
+    refitted = run(target, target_pgs)
+    assert expert_steps["target"] >= 2, "The post-refit step did not execute the experts"
+    assert torch.equal(refitted.argmax(dim=-1), expected.argmax(dim=-1))
+    assert torch.allclose(refitted, expected, atol=5e-4, rtol=5e-4)
+    reference_params = dict(reference.named_parameters())
+    assert all(
+        torch.equal(param, reference_params[name]) for name, param in target.named_parameters()
+    )
+    assert target_expert_pointers == {
+        name: param.data_ptr() for name, param in target.named_parameters() if ".experts." in name
+    }
+
+    for handle in handles:
+        handle.remove()
+    dist.barrier()
+    del source, reference, target
+    clear_all_caches()
+    for pg_collection in (source_pgs, reference_pgs, target_pgs):
+        _destroy_pg_collection(pg_collection)
+    Utils.destroy_model_parallel()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def test_tied_embedding_refit_preserves_alias_and_executes_new_weight():
+    """A tied input/output weight remains one destination object after a real refit."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    source_pgs = _build_pg_collection(tp_size=1)
+    target_pgs = _build_pg_collection(tp_size=1)
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=32,
+        num_attention_heads=4,
+        num_query_groups=2,
+        use_cpu_initialization=True,
+        pipeline_dtype=torch.bfloat16,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+    )
+
+    def build(seed, pg_collection):
+        torch.manual_seed(seed)
+        model_parallel_cuda_manual_seed(seed)
+        return (
+            _build_gpt(
+                config,
+                vocab_size=64,
+                seq_len=8,
+                pg_collection=pg_collection,
+                parallel_output=False,
+                share_embeddings_and_output_weights=True,
+            )
+            .to(device)
+            .eval()
+        )
+
+    source, target = build(1201, source_pgs), build(1302, target_pgs)
+    source_weight = source.shared_embedding_or_output_weight()
+    target_weight = target.shared_embedding_or_output_weight()
+    assert source_weight is source.embedding.word_embeddings.weight
+    assert target_weight is target.embedding.word_embeddings.weight
+    assert target.output_layer.weight is None
+    target_pointer = target_weight.data_ptr()
+    tokens = torch.arange(8, device=device, dtype=torch.long).unsqueeze(0)
+    positions = torch.arange(8, device=device, dtype=torch.long).unsqueeze(0)
+    attention_mask = torch.triu(
+        torch.ones((1, 1, 8, 8), device=device, dtype=torch.bool), diagonal=1
+    )
+    with torch.no_grad():
+        expected = _run_forward(source, tokens, positions, attention_mask, source_pgs).clone()
+        initial = _run_forward(target, tokens, positions, attention_mask, target_pgs).clone()
+    assert not torch.allclose(initial, expected, atol=1e-3, rtol=1e-3)
+
+    swap_model_weights([source], [target], refit_method="nccl")
+    torch.cuda.synchronize()
+    with torch.no_grad():
+        actual = _run_forward(target, tokens, positions, attention_mask, target_pgs)
+    assert target.shared_embedding_or_output_weight() is target.embedding.word_embeddings.weight
+    assert target.shared_embedding_or_output_weight().data_ptr() == target_pointer
+    assert torch.equal(target.shared_embedding_or_output_weight(), source_weight)
+    assert torch.equal(actual.argmax(dim=-1), expected.argmax(dim=-1))
+    torch.testing.assert_close(actual, expected, atol=5e-4, rtol=5e-4)
+
+    dist.barrier()
+    del source, target
+    clear_all_caches()
+    _destroy_pg_collection(source_pgs)
+    _destroy_pg_collection(target_pgs)
+    Utils.destroy_model_parallel()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize("refit_backend", ["nccl", "nixl"])
+def test_gtp_shards_execute_real_transfer_and_match_fresh_oracle(refit_backend: str):
+    """GTP shards from every rank reconstruct a full destination used by inference."""
+    if refit_backend == "nixl":
+        pytest.importorskip("nixl._api", reason="NIXL is not installed in this runtime")
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    rank, world = dist.get_rank(), dist.get_world_size()
+    if world < 2:
+        Utils.destroy_model_parallel()
+        pytest.skip("GTP transfer requires at least two ranks")
+
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    src_pgs = _build_pg_collection(tp_size=1)
+    dst_pgs = _build_pg_collection(tp_size=1)
+    gtp_group = dist.new_group(ranks=list(range(world)))
+    src_pgs.gtp_remat = gtp_group
+
+    class TinyWeightModel(torch.nn.Module):
+        def __init__(self, weight, pg_collection):
+            super().__init__()
+            self.weight = torch.nn.Parameter(weight)
+            self.pg_collection = pg_collection
+            self.config = types.SimpleNamespace(num_moe_experts=None)
+
+        def forward(self, inputs):
+            return inputs @ self.weight.t()
+
+    rows_per_rank, columns = 2, 4
+    full_weight = torch.arange(
+        world * rows_per_rank * columns, device=device, dtype=torch.float32
+    ).reshape(world * rows_per_rank, columns)
+    source = TinyWeightModel(
+        full_weight[rank * rows_per_rank : (rank + 1) * rows_per_rank].clone(), src_pgs
+    )
+    source.weight.is_gtp_weight_remat = True
+    source.weight.group = gtp_group
+    source.weight.pad_length = 0
+    target = TinyWeightModel(torch.full_like(full_weight, -17), dst_pgs)
+    oracle = TinyWeightModel(full_weight.clone(), dst_pgs)
+    inputs = torch.arange(3 * columns, device=device, dtype=torch.float32).reshape(3, columns)
+    expected = oracle(inputs)
+    initial = target(inputs)
+    target_ptr = target.weight.data_ptr()
+    assert source.weight.shape != target.weight.shape
+    assert not torch.equal(initial, expected)
+
+    clear_all_caches()
+    prepare_swap_model_weights([source], [target])
+    from megatron.core.resharding import refit as refit_module
+
+    plan = next(iter(refit_module._plan_cache.values()))
+    assert {op.peer_rank for op in plan.recv_ops} == set(range(world))
+    assert len(plan.recv_ops) == world
+    swap_model_weights([source], [target], refit_method=refit_backend)
+    torch.cuda.synchronize()
+
+    assert target.weight.data_ptr() == target_ptr
+    assert torch.equal(target.weight, oracle.weight)
+    assert torch.equal(target(inputs), expected)
+
+    dist.barrier()
+    del source, target, oracle
+    clear_all_caches()
+    _destroy_pg_collection(src_pgs)
+    _destroy_pg_collection(dst_pgs)
+    Utils.destroy_model_parallel()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def test_refit_executes_context_parallel_collectives_with_new_weights(monkeypatch):
+    Utils.initialize_distributed()
+    world = dist.get_world_size()
+    if world < 2 or world % 2:
+        pytest.skip("Mamba context parallelism requires an even world of at least two ranks")
+    if not has_mamba_deps:
+        pytest.skip("Mamba dependencies are not available")
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
+    from megatron.core.ssm import mamba_context_parallel as mamba_cp
+
+    source_pgs = _build_pg_collection(tp_size=1)
+    target_pgs = _build_pg_collection(tp_size=1)
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    class TinyContextParallelModel(torch.nn.Module):
+        def __init__(self, seed, pg_collection):
+            super().__init__()
+            torch.manual_seed(seed)
+            self.pg_collection = pg_collection
+            self.config = types.SimpleNamespace(num_moe_experts=None)
+            self.conv_weight = torch.nn.Parameter(torch.randn(16, 1, 3, device=device))
+            self.conv_bias = torch.nn.Parameter(torch.randn(16, device=device))
+            self.dt_bias = torch.nn.Parameter(torch.randn(4, device=device))
+            self.A_log = torch.nn.Parameter(torch.randn(4, device=device))
+            self.D = torch.nn.Parameter(torch.randn(8, device=device))
+
+        def forward(self, local_sequence):
+            cp = mamba_cp.MambaContextParallel(
+                cp_group=self.pg_collection.cp,
+                d_inner_local_tp=8,
+                nheads_local_tp=4,
+                ngroups_local_tp=2,
+                d_state=2,
+                conv1d_weight_cp1=self.conv_weight,
+                conv1d_bias_cp1=self.conv_bias,
+                conv1d_padding=2,
+                dt_bias_cp1=self.dt_bias,
+                A_log_cp1=self.A_log,
+                D_cp1=self.D,
+                D_has_hdim=True,
+            )
+            redistributed = cp.pre_conv_ssm(local_sequence)
+            head_scale = (cp.get_dt_bias() + cp.get_A_log()).repeat_interleave(2)
+            recurrent = cp.post_conv_ssm(redistributed[..., :4] * (cp.get_D() + head_scale))
+            convolution = cp.conv1d(redistributed[..., 4:12].permute(1, 2, 0))
+            return recurrent, convolution
+
+    source = TinyContextParallelModel(1403, source_pgs)
+    target = TinyContextParallelModel(1504, target_pgs)
+    cp_rank = target_pgs.cp.rank()
+    local_input = (
+        torch.arange(2 * 28, device=device, dtype=torch.float32).reshape(2, 1, 28) + 100 * cp_rank
+    )
+    with torch.no_grad():
+        expected = tuple(tensor.clone() for tensor in source(local_input))
+        initial = tuple(tensor.clone() for tensor in target(local_input))
+    assert any(not torch.equal(before, after) for before, after in zip(initial, expected))
+    calls = {"sequence_to_head": 0, "head_to_sequence": 0}
+    real_sequence_to_head = mamba_cp.all_to_all_sp2hp
+    real_head_to_sequence = mamba_cp.all_to_all_hp2sp
+
+    def observe_sequence_to_head(*args, **kwargs):
+        calls["sequence_to_head"] += 1
+        return real_sequence_to_head(*args, **kwargs)
+
+    def observe_head_to_sequence(*args, **kwargs):
+        calls["head_to_sequence"] += 1
+        return real_head_to_sequence(*args, **kwargs)
+
+    monkeypatch.setattr(mamba_cp, "all_to_all_sp2hp", observe_sequence_to_head)
+    monkeypatch.setattr(mamba_cp, "all_to_all_hp2sp", observe_head_to_sequence)
+    swap_model_weights([source], [target], refit_method="nccl")
+    calls.update(sequence_to_head=0, head_to_sequence=0)
+    with torch.no_grad():
+        actual = target(local_input)
+
+    source_parameters = dict(source.named_parameters())
+    assert all(
+        torch.equal(parameter, source_parameters[name])
+        for name, parameter in target.named_parameters()
+    )
+    assert calls == {"sequence_to_head": 5, "head_to_sequence": 1}
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+    dist.barrier()
+    del source, target
+    clear_all_caches()
+    _destroy_pg_collection(source_pgs)
+    _destroy_pg_collection(target_pgs)
+    Utils.destroy_model_parallel()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def test_noncollocated_multi_destination_pools_receive_and_execute_same_weights():
+    """One source refits two disjoint destination pools through real NCCL copies."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    rank, world = dist.get_rank(), dist.get_world_size()
+    if world < 3:
+        Utils.destroy_model_parallel()
+        pytest.skip("Two destination pools require one source and two destination ranks")
+
+    from megatron.core.inference.shards import build_inference_pg_collection
+
+    source_pgs = build_inference_pg_collection(world_size=1, tp_size=1, rank_offset=0)
+    destination_pgs = [
+        build_inference_pg_collection(world_size=1, tp_size=1, rank_offset=offset)
+        for offset in (1, 2)
+    ]
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    class TinyModel(torch.nn.Module):
+        def __init__(self, value, pg_collection):
+            super().__init__()
+            self.weight = torch.nn.Parameter(value)
+            self.pg_collection = pg_collection
+            self.config = types.SimpleNamespace(num_moe_experts=None)
+
+        def forward(self, inputs):
+            return inputs @ self.weight.t()
+
+    expected_weight = torch.arange(16, device=device, dtype=torch.float32).reshape(4, 4)
+    source = TinyModel(expected_weight.clone(), source_pgs) if rank == 0 else None
+    pool_index = rank - 1 if rank in (1, 2) else 0
+    target = (
+        TinyModel(torch.full_like(expected_weight, -11 - rank), destination_pgs[pool_index])
+        if rank in (1, 2)
+        else None
+    )
+    inputs = torch.arange(8, device=device, dtype=torch.float32).reshape(2, 4)
+    expected_output = inputs @ expected_weight.t()
+    if target is not None:
+        assert not torch.equal(target(inputs), expected_output)
+        target_ptr = target.weight.data_ptr()
+
+    clear_all_caches()
+    model_source = [source] if source is not None else None
+    model_target = [target] if target is not None else None
+    prepare_swap_model_weights(
+        model_source, model_target, num_dst_pools=2, dst_pool_index=pool_index
+    )
+    swap_model_weights(
+        model_source, model_target, refit_method="nccl", num_dst_pools=2, dst_pool_index=pool_index
+    )
+    torch.cuda.synchronize()
+
+    if target is not None:
+        assert target.weight.data_ptr() == target_ptr
+        assert torch.equal(target.weight, expected_weight)
+        assert torch.equal(target(inputs), expected_output)
+    received = [None] * world
+    local_received = rank in (1, 2) and torch.equal(target.weight, expected_weight)
+    dist.all_gather_object(received, local_received)
+    assert received[1:3] == [True, True]
+
+    dist.barrier()
+    del source, target
+    clear_all_caches()
+    _destroy_pg_collection(source_pgs)
+    for pg_collection in destination_pgs:
+        _destroy_pg_collection(pg_collection)
+    Utils.destroy_model_parallel()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize("variant", ["gdn", "gdp"])
+def test_swap_gated_recurrent_variants_matches_fresh_model(variant: str):
+    """GDN and GDP weights execute the fresh source model's fixed-history output."""
+    if not has_mamba_deps:
+        pytest.skip("HybridModel dependencies are not available")
+
+    if variant == "gdn":
+        from megatron.core.ssm.gated_delta_net import HAVE_FLA
+
+        if not HAVE_FLA:
+            pytest.skip("GDN requires FLA")
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            num_query_groups=2,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=16,
+            linear_value_head_dim=32,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+            experimental_attention_variant="gated_delta_net",
+            linear_attention_freq=[1, 1],
+            gdn_kernel_backend="fla",
+            activation_func=torch.nn.functional.silu,
+            normalization="RMSNorm",
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+        )
+        stack_spec, pattern = hybrid_stack_spec, "G*"
+    else:
+        from megatron.core.models.hybrid.hybrid_layer_specs import (
+            gated_delta_product_inference_stack_spec,
+        )
+        from megatron.core.ssm.gated_delta_product import HAVE_FLA, HAVE_MAMBA_SSM
+
+        if not (HAVE_FLA and HAVE_MAMBA_SSM):
+            pytest.skip("GDP dependencies are not available")
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_query_groups=4,
+            ffn_hidden_size=128,
+            normalization="RMSNorm",
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            mamba_num_heads=16,
+            mamba_head_dim=16,
+            mamba_num_groups=4,
+            mamba_state_dim=16,
+            gdp_num_householder=2,
+            is_hybrid_model=True,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+        )
+        stack_spec, pattern = gated_delta_product_inference_stack_spec, "M*"
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    source_pgs = _build_pg_collection(tp_size=1)
+    target_pgs = _build_pg_collection(tp_size=1)
+
+    def build(seed, pg_collection):
+        torch.manual_seed(seed)
+        model_parallel_cuda_manual_seed(seed)
+        return (
+            _build_hybrid(
+                config,
+                vocab_size=64,
+                seq_len=8,
+                pg_collection=pg_collection,
+                hybrid_layer_pattern=pattern,
+                parallel_output=False,
+                stack_spec=stack_spec,
+            )
+            .to(device)
+            .eval()
+        )
+
+    source, target = build(717, source_pgs), build(818, target_pgs)
+    tokens = torch.arange(8, device=device, dtype=torch.long).unsqueeze(0)
+    positions = torch.arange(8, device=device, dtype=torch.long).unsqueeze(0)
+    attention_mask = torch.triu(
+        torch.ones((1, 1, 8, 8), device=device, dtype=torch.bool), diagonal=1
+    )
+    with torch.no_grad():
+        expected = _run_forward(source, tokens, positions, attention_mask, source_pgs).clone()
+        initial = _run_forward(target, tokens, positions, attention_mask, target_pgs).clone()
+    assert not torch.allclose(initial, expected, atol=5e-2, rtol=5e-2)
+
+    swap_model_weights([source], [target], refit_method="nccl")
+    torch.cuda.synchronize()
+    with torch.no_grad():
+        actual = _run_forward(target, tokens, positions, attention_mask, target_pgs)
+    source_parameters = dict(source.named_parameters())
+    assert all(
+        torch.equal(parameter, source_parameters[name])
+        for name, parameter in target.named_parameters()
+    )
+    assert torch.equal(actual.argmax(dim=-1), expected.argmax(dim=-1))
+    torch.testing.assert_close(actual, expected, atol=5e-4, rtol=5e-4)
+
+    dist.barrier()
+    del source, target
+    clear_all_caches()
+    _destroy_pg_collection(source_pgs)
+    _destroy_pg_collection(target_pgs)
+    Utils.destroy_model_parallel()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def test_refit_executes_sliding_window_and_learnable_sink_attention():
+    """Refit transfers the sink parameter and preserves the windowed output oracle."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    source_pgs = _build_pg_collection(tp_size=1)
+    target_pgs = _build_pg_collection(tp_size=1)
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=64,
+        num_attention_heads=4,
+        num_query_groups=2,
+        use_cpu_initialization=True,
+        pipeline_dtype=torch.float32,
+        params_dtype=torch.float32,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        window_size=(4, 0),
+        softmax_type="learnable",
+    )
+
+    def build(seed, pg_collection, model_config=config):
+        torch.manual_seed(seed)
+        model_parallel_cuda_manual_seed(seed)
+        return (
+            _build_gpt(
+                model_config,
+                vocab_size=64,
+                seq_len=8,
+                pg_collection=pg_collection,
+                parallel_output=False,
+                transformer_impl="local",
+            )
+            .to(device)
+            .eval()
+        )
+
+    source, target = build(919, source_pgs), build(1020, target_pgs)
+    source_sinks = {
+        name: parameter
+        for name, parameter in source.named_parameters()
+        if name.endswith("softmax_offset")
+    }
+    target_sinks = {
+        name: parameter
+        for name, parameter in target.named_parameters()
+        if name.endswith("softmax_offset")
+    }
+    assert source_sinks.keys() == target_sinks.keys() and source_sinks
+    with torch.no_grad():
+        for index, parameter in enumerate(source_sinks.values()):
+            parameter.copy_(torch.linspace(-2 - index, 2 + index, parameter.numel(), device=device))
+
+    full_config = copy.deepcopy(config)
+    full_config.window_size = None
+    full_attention = build(1121, source_pgs, model_config=full_config)
+    full_attention.load_state_dict(source.state_dict())
+    tokens = torch.arange(8, device=device, dtype=torch.long).unsqueeze(0)
+    positions = torch.arange(8, device=device, dtype=torch.long).unsqueeze(0)
+    attention_mask = torch.triu(
+        torch.ones((1, 1, 8, 8), device=device, dtype=torch.bool), diagonal=1
+    )
+    with torch.no_grad():
+        expected = _run_forward(source, tokens, positions, attention_mask, source_pgs).clone()
+        without_window = _run_forward(
+            full_attention, tokens, positions, attention_mask, source_pgs
+        ).clone()
+        sink_values = {name: parameter.clone() for name, parameter in source_sinks.items()}
+        for parameter in source_sinks.values():
+            parameter.zero_()
+        without_sink = _run_forward(source, tokens, positions, attention_mask, source_pgs).clone()
+        for name, parameter in source_sinks.items():
+            parameter.copy_(sink_values[name])
+        initial = _run_forward(target, tokens, positions, attention_mask, target_pgs).clone()
+    assert not torch.allclose(expected, without_window, atol=1e-5, rtol=1e-5)
+    assert not torch.allclose(expected, without_sink, atol=1e-5, rtol=1e-5)
+    assert not torch.allclose(expected, initial, atol=1e-5, rtol=1e-5)
+
+    swap_model_weights([source], [target], refit_method="nccl")
+    torch.cuda.synchronize()
+    with torch.no_grad():
+        actual = _run_forward(target, tokens, positions, attention_mask, target_pgs)
+    for name, parameter in target_sinks.items():
+        assert torch.equal(parameter, source_sinks[name])
+    assert torch.equal(actual.argmax(dim=-1), expected.argmax(dim=-1))
+    torch.testing.assert_close(actual, expected, atol=5e-4, rtol=5e-4)
+
+    dist.barrier()
+    del source, target, full_attention
+    clear_all_caches()
+    _destroy_pg_collection(source_pgs)
+    _destroy_pg_collection(target_pgs)
     Utils.destroy_model_parallel()
     gc.collect()
     torch.cuda.empty_cache()

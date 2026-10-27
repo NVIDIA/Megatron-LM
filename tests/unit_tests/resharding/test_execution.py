@@ -280,6 +280,50 @@ class TestExecutionBatches:
 
         assert service.runs == []
 
+    def test_transport_failure_is_propagated_and_not_transactional(self):
+        """A failed later batch leaves earlier writes visible until caller recovery."""
+
+        class FailSecondRun(MockCopyService):
+            def run(self):
+                if len(self.runs) == 1:
+                    self.runs.append(
+                        (
+                            [task_id for _, _, task_id in self.sends],
+                            [task_id for _, _, task_id in self.recvs],
+                        )
+                    )
+                    raise RuntimeError("injected transport failure")
+                super().run()
+
+        src_module = _make_module_with_params(
+            {
+                "first": torch.tensor([1.0, 2.0], device="cuda"),
+                "second": torch.tensor([3.0, 4.0], device="cuda"),
+            }
+        )
+        dst_module = _make_module_with_params(
+            {"first": torch.zeros(2, device="cuda"), "second": torch.zeros(2, device="cuda")}
+        )
+        service = FailSecondRun()
+        Utils.initialize_distributed()
+
+        with (
+            patch("megatron.core.resharding.execution.dist.barrier") as barrier,
+            patch("megatron.core.resharding.execution.refresh_module_caches") as refresh,
+            pytest.raises(RuntimeError, match="injected transport failure"),
+        ):
+            execute_reshard_plan(self._two_parameter_plan(), src_module, dst_module, service)
+
+        destination = dict(dst_module.named_parameters())
+        assert torch.equal(
+            destination["first"], torch.tensor([1.0, 2.0], device=destination["first"].device)
+        )
+        assert torch.equal(destination["second"], torch.zeros_like(destination["second"]))
+        assert service.runs == [([0], [0]), ([1], [1])]
+        assert service.sends and service.recvs
+        barrier.assert_not_called()
+        refresh.assert_not_called()
+
 
 # ===========================================================================
 # Non-collocated mode

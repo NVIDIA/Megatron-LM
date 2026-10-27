@@ -101,11 +101,13 @@ def _restore_torch_settings(settings):
     mode, warn_only = settings["deterministic"]
     torch.use_deterministic_algorithms(mode, warn_only=warn_only)
     torch.utils.deterministic.fill_uninitialized_memory = settings["fill_uninitialized_memory"]
-    (
-        torch.backends.cudnn.deterministic,
-        torch.backends.cudnn.benchmark,
-        torch.backends.cudnn.allow_tf32,
-    ) = settings["cudnn"]
+    # Some compiler paths freeze direct backend-property mutation.  set_flags
+    # is the restoration primitive used by cudnn.flags itself and remains valid
+    # after torch.backends.disable_global_flags().
+    cudnn_deterministic, cudnn_benchmark, cudnn_allow_tf32 = settings["cudnn"]
+    torch.backends.cudnn.set_flags(
+        _benchmark=cudnn_benchmark, _deterministic=cudnn_deterministic, _allow_tf32=cudnn_allow_tf32
+    )
     (
         torch.backends.cuda.matmul.allow_tf32,
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
