@@ -136,17 +136,24 @@ CONTIGUITY = pytest.mark.parametrize("contiguous", [True, False], ids=["kernel",
 
 
 def test_dynamic_context_rejects_context_parallelism_before_allocating_cache():
-    model_config = TransformerConfig(
-        params_dtype=torch.bfloat16,
-        num_layers=1,
-        hidden_size=32,
-        kv_channels=8,
-        num_attention_heads=4,
-        context_parallel_size=2,
-    )
+    """A real CP=2 group must be rejected instead of building a CP-unaware KV cache."""
+    if Utils.world_size < 2:
+        pytest.skip("context parallelism needs at least two ranks")
+    Utils.initialize_model_parallel(context_parallel_size=2)
+    try:
+        model_config = TransformerConfig(
+            params_dtype=torch.bfloat16,
+            num_layers=1,
+            hidden_size=32,
+            kv_channels=8,
+            num_attention_heads=4,
+            context_parallel_size=2,
+        )
 
-    with pytest.raises(ValueError, match="does not support context parallelism"):
-        DynamicInferenceContext(model_config, InferenceConfig(buffer_size_gb=0.01))
+        with pytest.raises(ValueError, match="does not support context parallelism"):
+            DynamicInferenceContext(model_config, InferenceConfig(buffer_size_gb=0.01))
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_zero_padding_rows_module_supports_missing_triton(monkeypatch):
