@@ -638,15 +638,21 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 HyperConnectionHybridLayer,
             ]
 
-        # mHC calls split TransformerLayer methods directly, bypassing the inner
-        # layer's __call__ and FSDP hooks. Let the selected wrapper own that layer;
-        # routed experts retain their separate expert-DP units below.
-        mhc_inner_layers = {
-            submodule.inner_layer
-            for submodule in module.modules()
-            if isinstance(submodule, HyperConnectionHybridLayer)
-            and any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules)
-        }
+        # mHC calls inner-layer methods directly, bypassing the inner layer's FSDP hooks.
+        # If the wrapper is an FSDP unit, let it own those parameters and skip wrapping
+        # the inner layer separately. Routed experts keep their own expert-DP units.
+        mhc_inner_layers_to_skip = set()
+        for submodule in module.modules():
+            if not isinstance(submodule, HyperConnectionHybridLayer):
+                continue
+
+            wrapper_is_fsdp_unit = any(
+                isinstance(submodule, module_type) for module_type in fsdp_unit_modules
+            )
+            if not wrapper_is_fsdp_unit:
+                continue
+
+            mhc_inner_layers_to_skip.add(submodule.inner_layer)
 
         # mHC replay invokes norms before the enclosing wrapper's backward hook.
         # Give parameterized norms their own gather and gradient-reduction hooks.
@@ -654,7 +660,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if config.recompute_granularity == "selective" and "mhc" in (
             config.recompute_modules or []
         ):
-            for layer in mhc_inner_layers:
+            for layer in mhc_inner_layers_to_skip:
                 for name in ("input_layernorm", "pre_mlp_layernorm"):
                     norm = getattr(layer, name, None)
                     if norm is not None and next(norm.parameters(), None) is not None:
@@ -752,7 +758,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             **common_fully_shard_kwargs,
                         )
             for submodule in reversed(list(module.modules())):
-                if submodule is module or submodule in mhc_inner_layers:
+                if submodule is module or submodule in mhc_inner_layers_to_skip:
                     # Shard the root last; mHC inner layers belong to their wrapper.
                     continue
                 if submodule in mhc_recompute_norms or any(
