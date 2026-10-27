@@ -55,6 +55,7 @@ from megatron.core.inference.unified_memory import (
     prefetch_managed_module_parameters,
 )
 from megatron.core.inference.utils import device_memory_summary, set_decode_expert_padding
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.num_microbatches_calculator import reconfigure_num_microbatches_calculator
 from megatron.core.optimizer import MegatronOptimizer
@@ -1715,7 +1716,7 @@ def _bounded_artifact_key(key, limit=100):
 
     keys containing characters outside [a-zA-Z0-9_.-] (env ids contain ':') are given
     a 7-char CRC suffix by wandb's sanitizer.
-    
+
     Worst-case key budget: 128 - 13 - 6 - 7 = 102 ~= 100.
     """
     if len(key) <= limit:
@@ -3252,6 +3253,9 @@ def megatron_rl_inference_mode(
 
     # If we get a lower precision wrapper, we go one object deeper.
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
+    training_lang_module = (
+        unwrap_model(training_model[0]) if training_model is not None else lang_module
+    )
 
     # Switch MoE layers to full CUDA graph capture for inference
     if cfg.rl.rl_training_cuda_graphs and args.num_experts is not None:
@@ -3275,12 +3279,14 @@ def megatron_rl_inference_mode(
                 ):
                     model_chunk.start_param_sync(force_sync=True)
 
-
-    rotary_module = getattr(lang_module, "rotary_pos_emb", None)
+    rotary_modules = (
+        getattr(lang_module, "rotary_pos_emb", None),
+        getattr(training_lang_module, "rotary_pos_emb", None),
+    )
     # Release ordinary embeddings while retaining constants used by live CUDA graphs.
-    clear_rotary_cache = getattr(rotary_module, "clear_cache", None)
-    if clear_rotary_cache is not None:
-        clear_rotary_cache()
+    for rotary_module in rotary_modules:
+        if isinstance(rotary_module, RotaryEmbedding):
+            rotary_module.clear_cache()
 
     with torch.no_grad():
 
@@ -3288,11 +3294,14 @@ def megatron_rl_inference_mode(
             with nvtx_range("rl/offload-optimizer-before-inference", time=True):
                 if not cfg.rl.rl_training_cuda_graphs:
                     with nvtx_range("rl/offload/grad-buffers", time=True):
-                        model_for_grad_offload = training_model if training_model is not None else model
+                        model_for_grad_offload = (
+                            training_model if training_model is not None else model
+                        )
                         model_for_grad_offload[0].offload_grad_buffers()
                 else:
                     logger.warning(
-                        "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
+                        "Gradient buffers will not be offloaded when training cudagraphs are enabled!"
+                    )
                 with nvtx_range("rl/offload/optimizer-state", time=True):
                     optimizer.offload_to_cpu()
 
@@ -3355,11 +3364,11 @@ def megatron_rl_inference_mode(
                     optimizer.restore_from_cpu()
 
         # Set training model back to train mode (not inference model if they're separate)
-        training_lang_module = unwrap_model(training_model[0]) if training_model is not None else lang_module
         training_lang_module.train()
 
-        if clear_rotary_cache is not None:
-            clear_rotary_cache()
+        for rotary_module in rotary_modules:
+            if isinstance(rotary_module, RotaryEmbedding):
+                rotary_module.clear_cache()
 
         logger.debug(f"[{dist.get_rank()}] Exiting inference mode")
 

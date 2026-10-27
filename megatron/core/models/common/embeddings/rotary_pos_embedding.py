@@ -14,7 +14,7 @@ import logging
 import math
 from collections import OrderedDict
 from dataclasses import dataclass
-from weakref import WeakSet
+from weakref import ReferenceType, ref
 
 import torch
 from torch import Tensor, nn
@@ -38,6 +38,7 @@ __all__ = ['RotaryEmbedding', 'MultimodalRotaryEmbedding']
 
 @dataclass(frozen=True)
 class _RotaryCacheKey:
+    rotary_embedding: ReferenceType[RotaryEmbedding]
     seq_len: int
     offset: int
     packed_seq: bool
@@ -68,10 +69,9 @@ class RotaryEmbedding(nn.Module):
             Defaults to None.
     """
 
-    # Maximum number of ordinary cached entries per instance.
-    CACHE_CAPACITY = 32
-    # The legacy forward.cache_clear() was shared across instances.
-    _cache_instances: ClassVar[WeakSet[RotaryEmbedding]] = WeakSet()
+    # Maximum number of ordinary cached entries shared across instances of this class.
+    CACHE_CAPACITY_FOR_NON_CG_EMBS = 32
+    _embedding_cache: ClassVar[OrderedDict[_RotaryCacheKey, tuple[Tensor, float]]] = OrderedDict()
 
     def __init__(
         self,
@@ -106,18 +106,23 @@ class RotaryEmbedding(nn.Module):
             if cp_group is not None
             else parallel_state.get_context_parallel_group(check_initialized=False)
         )
-        self._embedding_cache: OrderedDict[_RotaryCacheKey, tuple[Tensor, float]] = OrderedDict()
-        self._cache_instances.add(self)
 
     @classmethod
-    def _clear_all_caches(cls) -> None:
-        """Support legacy forward.cache_clear() without retaining embedding instances."""
-        for module in tuple(cls._cache_instances):
-            module.clear_cache()
+    def _remove_expired_cache_entries(cls, _owner: ReferenceType[RotaryEmbedding]) -> None:
+        """Release cached tensors when their embedding instance is destroyed."""
+        for key in list(cls._embedding_cache):
+            if key.rotary_embedding() is None:
+                cls._embedding_cache.pop(key, None)
 
-    def clear_cache(self) -> None:
-        """Release ordinary embeddings; CUDA graph owners retain their own constants."""
-        self._embedding_cache.clear()
+    @classmethod
+    def clear_cache(cls) -> None:
+        """Clear this class's ordinary cache; live CUDA graphs retain their constants."""
+        cls._embedding_cache.clear()
+
+    @classmethod
+    def cache_parameters(cls) -> dict[str, int | bool]:
+        """Return legacy LRU parameters for the ordinary embedding cache."""
+        return {"maxsize": cls.CACHE_CAPACITY_FOR_NON_CG_EMBS, "typed": False}
 
     def _get_emb_and_scale(self, max_seq_len: int, offset: int) -> tuple[Tensor, float]:
         """Compute an uncached embedding and its attention scaling factor."""
@@ -138,7 +143,13 @@ class RotaryEmbedding(nn.Module):
         if device.type == "cpu":
             device = torch.device("cuda", torch.cuda.current_device())
         key = _RotaryCacheKey(
-            max_seq_len, offset, packed_seq, cp_group, device, self.inv_freq.dtype
+            ref(self, type(self)._remove_expired_cache_entries),
+            max_seq_len,
+            offset,
+            packed_seq,
+            cp_group,
+            device,
+            self.inv_freq.dtype,
         )
         capturing = torch.cuda.is_current_stream_capturing()
         if key in self._embedding_cache:
@@ -155,7 +166,7 @@ class RotaryEmbedding(nn.Module):
             # the ordinary cache, where they could outlive that graph or be reused by another.
             if not capturing:
                 self._embedding_cache[key] = (emb, scale)
-                if len(self._embedding_cache) > self.CACHE_CAPACITY:
+                if len(self._embedding_cache) > self.CACHE_CAPACITY_FOR_NON_CG_EMBS:
                     self._embedding_cache.popitem(last=False)
 
         register_capture_constant(emb)
@@ -371,9 +382,11 @@ class RotaryEmbedding(nn.Module):
         return rotary_seq_len
 
 
-# Both RotaryEmbedding.forward.cache_clear() and instance.forward.cache_clear()
-# retain the former class-wide scope while protecting captured constants.
-setattr(RotaryEmbedding.forward, "cache_clear", RotaryEmbedding._clear_all_caches)
+# Backward compatibility: both RotaryEmbedding.forward.cache_clear()
+# and instance.forward.cache_clear() retain the former class-wide cache
+# scope while protecting captured constants.
+setattr(RotaryEmbedding.forward, "cache_clear", RotaryEmbedding.clear_cache)
+setattr(RotaryEmbedding.forward, "cache_parameters", RotaryEmbedding.cache_parameters)
 
 
 class MultimodalRotaryEmbedding(nn.Module):

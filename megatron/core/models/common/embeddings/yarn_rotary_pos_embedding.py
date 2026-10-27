@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import logging
 import math
+from collections import OrderedDict
 from functools import lru_cache
 from typing import ClassVar, Optional
-from weakref import WeakSet
 
 import torch
 from torch import Tensor
 
-from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.rotary_pos_embedding import (
+    RotaryEmbedding,
+    _RotaryCacheKey,
+)
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import internal_api
 
@@ -46,7 +49,9 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             Defaults to None.
     """
 
-    _cache_instances: ClassVar[WeakSet[RotaryEmbedding]] = WeakSet()
+    # Use a separated cache rather than reusing base RotaryEmbedding for
+    # a separated capacity counting
+    _embedding_cache: ClassVar[OrderedDict[_RotaryCacheKey, tuple[Tensor, float]]] = OrderedDict()
 
     def __init__(
         self,
@@ -233,7 +238,8 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         return (self.cos_cached[:seq_len, ...], self.sin_cached[:seq_len, ...])
 
 
-setattr(YarnRotaryEmbedding.forward, "cache_clear", YarnRotaryEmbedding._clear_all_caches)
+setattr(YarnRotaryEmbedding.forward, "cache_clear", YarnRotaryEmbedding.clear_cache)
+setattr(YarnRotaryEmbedding.forward, "cache_parameters", YarnRotaryEmbedding.cache_parameters)
 
 
 # Inverse dim formula to find dim based on number of rotations

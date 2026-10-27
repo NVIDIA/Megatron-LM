@@ -601,7 +601,9 @@ class _CudagraphGlobalRecord:
 
     # Owners are local/full-iteration graphs or TE graph callables.
     # Weak keys avoid extending their lifetimes merely to retain their constants.
-    capture_constants: WeakKeyDictionary[object, dict[int, torch.Tensor]] = WeakKeyDictionary()
+    capture_constants: WeakKeyDictionary[torch.cuda.CUDAGraph, dict[int, torch.Tensor]] = (
+        WeakKeyDictionary()
+    )
     active_capture_constants: dict[int, torch.Tensor] | None = None
     captured_runners: WeakSet["_CudaGraphRunner"] = WeakSet()
 
@@ -819,7 +821,7 @@ def create_cudagraphs():
 
 
 @contextmanager
-def capture_constants(owner: object) -> Iterator[None]:
+def capture_constants(owner_graph: torch.cuda.CUDAGraph) -> Iterator[None]:
     """Retain constants for a graph owner until teardown or owner destruction.
 
     Wrap the capture context, not replay. For APIs that capture several graphs at
@@ -831,7 +833,7 @@ def capture_constants(owner: object) -> Iterator[None]:
     _CudagraphGlobalRecord.active_capture_constants = constants
     try:
         yield
-        _CudagraphGlobalRecord.capture_constants[owner] = constants
+        _CudagraphGlobalRecord.capture_constants[owner_graph] = constants
     finally:
         _CudagraphGlobalRecord.active_capture_constants = previous
 

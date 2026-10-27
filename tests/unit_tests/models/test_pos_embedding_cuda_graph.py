@@ -291,8 +291,43 @@ def test_failed_capture_releases_rotary_constants(embedding_type):
         Utils.destroy_model_parallel()
 
 
+def _embedding_tensor(module, seq_len=16):
+    result = module(seq_len)
+    return result[0] if isinstance(result, tuple) else result
+
+
 @pytest.mark.parametrize("embedding_type", [RotaryEmbedding, YarnRotaryEmbedding])
-def test_legacy_cache_clear_scope_and_module_lifetime(embedding_type):
+def test_rotary_cache_capacity_is_shared_across_instances(embedding_type):
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        first = embedding_type(32, 1.0, rotary_base=10000)
+        second = embedding_type(32, 1.0, rotary_base=100000)
+        first_tensor = _embedding_tensor(first)
+        second_tensor = _embedding_tensor(second)
+        assert not torch.equal(first_tensor, second_tensor)
+        assert _embedding_tensor(first) is first_tensor
+        assert _embedding_tensor(second) is second_tensor
+        first_ref, second_ref = weakref.ref(first_tensor), weakref.ref(second_tensor)
+        del first_tensor, second_tensor
+
+        capacity = embedding_type.CACHE_CAPACITY_FOR_NON_CG_EMBS
+        for seq_len in range(32, 32 + capacity - 2):
+            second(seq_len)
+        assert first_ref() is not None
+        assert second_ref() is not None
+
+        # Touching the first instance must update the shared LRU order.
+        assert _embedding_tensor(first) is first_ref()
+        second(32 + capacity)
+        assert first_ref() is not None
+        assert second_ref() is None
+    finally:
+        embedding_type.clear_cache()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("embedding_type", [RotaryEmbedding, YarnRotaryEmbedding])
+def test_class_cache_clear_scope_and_module_lifetime(embedding_type):
     Utils.initialize_model_parallel(1, 1)
     try:
         first = embedding_type(32, 1.0)
@@ -300,27 +335,32 @@ def test_legacy_cache_clear_scope_and_module_lifetime(embedding_type):
         other_type = YarnRotaryEmbedding if embedding_type is RotaryEmbedding else RotaryEmbedding
         other = other_type(32, 1.0)
 
-        def embedding_ref(module):
-            result = module(16)
-            return weakref.ref(result[0] if isinstance(result, tuple) else result)
+        other_ref = weakref.ref(_embedding_tensor(other))
+        for forward in (None, first.forward, embedding_type.forward):
+            first_ref = weakref.ref(_embedding_tensor(first))
+            second_ref = weakref.ref(_embedding_tensor(second))
+            if forward is None:
+                first.clear_cache()
+            elif hasattr(forward, "cache_parameters"):
+                assert forward.cache_parameters() == {
+                    "maxsize": embedding_type.CACHE_CAPACITY_FOR_NON_CG_EMBS,
+                    "typed": False,
+                }
+                forward.cache_clear()
+            assert first_ref() is None
+            assert second_ref() is None
+            assert other_ref() is not None
 
-        first_ref, second_ref, other_ref = map(embedding_ref, (first, second, other))
-        first.clear_cache()
-        assert first_ref() is None
-        assert second_ref() is not None
-        assert other_ref() is not None
-
-        first_ref = embedding_ref(first)
-        first.forward.cache_clear()
-        assert first_ref() is None
-        assert second_ref() is None
-        assert other_ref() is not None
-
-        first_ref = embedding_ref(first)
+        first_refs = [weakref.ref(_embedding_tensor(first, seq_len)) for seq_len in (16, 32)]
+        second_ref = weakref.ref(_embedding_tensor(second))
         module_ref = weakref.ref(first)
         del first
         gc.collect()
         assert module_ref() is None
-        assert first_ref() is None
+        assert all(tensor_ref() is None for tensor_ref in first_refs)
+        assert second_ref() is not None
+        assert other_ref() is not None
     finally:
+        RotaryEmbedding.clear_cache()
+        YarnRotaryEmbedding.clear_cache()
         Utils.destroy_model_parallel()
