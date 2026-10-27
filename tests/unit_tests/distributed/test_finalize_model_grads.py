@@ -298,6 +298,52 @@ class TestAllReduceLNGrads:
             [self.model], self.transformer_config, parallel_state.get_tensor_model_parallel_group()
         )
 
+    @pytest.mark.parametrize("root_sequence_parallel", [False, True])
+    @pytest.mark.parametrize("tp_size", [1, 2])
+    def test_independent_module_sequence_parallel_gradients(self, root_sequence_parallel, tp_size):
+        if root_sequence_parallel and tp_size == 1:
+            pytest.skip("Root SP requires TP greater than one")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        groups = ProcessGroupCollection.use_mpu_process_groups()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=2,
+            tensor_model_parallel_size=tp_size,
+            sequence_parallel=root_sequence_parallel,
+            qk_layernorm=False,
+        )
+        model = torch.nn.Module()
+        model.ddp_config = DistributedDataParallelConfig()
+        model.vision_norm = torch.nn.LayerNorm(4, device="cuda")
+        model.replicated = torch.nn.Parameter(torch.ones(4, device="cuda"))
+        model.unused = torch.nn.Parameter(torch.ones(4, device="cuda"))
+        model.frozen = torch.nn.Parameter(torch.ones(4, device="cuda"), requires_grad=False)
+        local_value = groups.tp.rank() + 1
+        for parameter in model.vision_norm.parameters():
+            parameter.sequence_parallel = True
+            parameter.main_grad = torch.full_like(parameter, local_value)
+        model.replicated.main_grad = torch.full_like(model.replicated, local_value)
+        model.unused.sequence_parallel = True
+        model.unused.main_grad = None
+        model.frozen.sequence_parallel = True
+        model.frozen.main_grad = torch.full_like(model.frozen, local_value)
+
+        _allreduce_non_tensor_model_parallel_grads([model], config, groups.tp)
+
+        expected_sum = tp_size * (tp_size + 1) / 2
+        for parameter in model.vision_norm.parameters():
+            torch.testing.assert_close(
+                parameter.main_grad, torch.full_like(parameter, expected_sum)
+            )
+        torch.testing.assert_close(
+            model.replicated.main_grad, torch.full_like(model.replicated, local_value)
+        )
+        torch.testing.assert_close(
+            model.frozen.main_grad, torch.full_like(model.frozen, local_value)
+        )
+        assert model.unused.main_grad is None
+
     @pytest.mark.parametrize(
         ("freeze_model", "pp_size", "share_embeddings"),
         [(True, 2, True), (False, 2, True), (True, 2, False), (False, 2, False)],
