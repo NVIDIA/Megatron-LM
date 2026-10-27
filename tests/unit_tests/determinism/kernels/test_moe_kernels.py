@@ -1276,17 +1276,21 @@ class TestMoEModules:
         not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
         reason="MXFP8 parameter storage needs Blackwell",
     )
-    def test_vllm_mxfp8_weight_stacking_replays(self):
-        """The mixed-precision vLLM path builds canonical expert stacks bit-exactly."""
+    @pytest.mark.parametrize("backend", ["VLLM", "FLASHINFER"])
+    def test_mxfp8_expert_weight_build_replays(self, backend):
+        """vLLM canonical stacks and FlashInfer write-through routed stacks build bit-exactly."""
         from types import SimpleNamespace
 
         from megatron.core.inference.moe import InferenceGroupedGemmBackend
+        from megatron.core.inference.moe.flashinfer_mxfp8 import HAVE_FLASHINFER_ROUTED_MXFP8
+
+        if backend == "FLASHINFER" and not HAVE_FLASHINFER_ROUTED_MXFP8:
+            pytest.skip("needs FlashInfer routed MXFP8")
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
         from megatron.core.transformer.moe.experts import InferenceGroupedMLP
 
         class GroupedMLPStub:
             _stack_mxfp8_linear_weight = InferenceGroupedMLP._stack_mxfp8_linear_weight
-            _mxfp8_linear_expert_weights = InferenceGroupedMLP._mxfp8_linear_expert_weights
 
         seeded()
         weights = tuple(torch.randn(64, 128, device="cuda", dtype=torch.bfloat16) for _ in range(4))
@@ -1294,7 +1298,7 @@ class TestMoEModules:
         def build_stacks(*bf16_weights):
             grouped = GroupedMLPStub()
             grouped.num_local_experts = 2
-            grouped.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.VLLM
+            grouped.inference_grouped_gemm_backend = InferenceGroupedGemmBackend[backend]
             grouped.linear_fc1 = SimpleNamespace()
             grouped.linear_fc2 = SimpleNamespace()
             for linear, offset in ((grouped.linear_fc1, 0), (grouped.linear_fc2, 2)):
@@ -1313,54 +1317,7 @@ class TestMoEModules:
             )
 
         assert_replays_bit_exact(
-            build_stacks, weights, backward=False, what="vLLM MXFP8 expert-weight stacking"
-        )
-
-    @pytest.mark.skipif(
-        not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
-        reason="FlashInfer routed MXFP8 needs Blackwell",
-    )
-    def test_flashinfer_mxfp8_weight_build_replays(self):
-        """The FlashInfer path builds write-through routed expert stacks bit-exactly."""
-        from types import SimpleNamespace
-
-        from megatron.core.inference.moe import InferenceGroupedGemmBackend
-        from megatron.core.inference.moe.flashinfer_mxfp8 import HAVE_FLASHINFER_ROUTED_MXFP8
-        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-        from megatron.core.transformer.moe.experts import InferenceGroupedMLP
-
-        if not HAVE_FLASHINFER_ROUTED_MXFP8:
-            pytest.skip("needs FlashInfer routed MXFP8")
-
-        class GroupedMLPStub:
-            _mxfp8_linear_expert_weights = InferenceGroupedMLP._mxfp8_linear_expert_weights
-
-        seeded()
-        weights = tuple(torch.randn(96, 128, device="cuda", dtype=torch.bfloat16) for _ in range(4))
-
-        def build_routed(*bf16_weights):
-            grouped = GroupedMLPStub()
-            grouped.num_local_experts = 2
-            grouped.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.FLASHINFER
-            grouped.linear_fc1 = SimpleNamespace()
-            grouped.linear_fc2 = SimpleNamespace()
-            for linear, offset in ((grouped.linear_fc1, 0), (grouped.linear_fc2, 2)):
-                for expert in range(2):
-                    setattr(
-                        linear,
-                        f"weight{expert}",
-                        MXFP8Tensor.from_bf16(bf16_weights[offset + expert], backend="triton"),
-                    )
-            InferenceGroupedMLP._build_concatenated_mxfp8_weights(grouped)
-            return (
-                grouped._fc1_weight.data.view(torch.uint8),
-                grouped._fc1_weight.scale,
-                grouped._fc2_weight.data.view(torch.uint8),
-                grouped._fc2_weight.scale,
-            )
-
-        assert_replays_bit_exact(
-            build_routed, weights, backward=False, what="FlashInfer MXFP8 routed weight build"
+            build_stacks, weights, backward=False, what=f"{backend} MXFP8 expert-weight build"
         )
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")

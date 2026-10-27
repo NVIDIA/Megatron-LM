@@ -131,10 +131,7 @@ class MXFP8Tensor:
     # Legacy direct constructors have unknown logical dtype until their next
     # successful update.
     dtype: Optional[torch.dtype] = field(default=None, kw_only=True)
-    # Optional write-through target. When set, quantize_ hands the logical value to this
-    # callable instead of writing data and scale, which then hold only broadcast
-    # placeholders describing the logical geometry. FlashInfer's routed MoE uses this so
-    # refit updates its kernel layout directly, without a second canonical weight copy.
+    # When set, quantize_ writes through this callable (see attach_routed_mxfp8_writeback).
     writeback: Optional[Callable[[torch.Tensor], None]] = field(
         default=None, kw_only=True, repr=False, compare=False
     )

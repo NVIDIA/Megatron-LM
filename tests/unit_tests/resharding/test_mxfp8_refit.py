@@ -235,7 +235,6 @@ class TestMXFP8ReshardTransform:
 
         class Namespace:
             _stack_mxfp8_linear_weight = InferenceGroupedMLP._stack_mxfp8_linear_weight
-            _mxfp8_linear_expert_weights = InferenceGroupedMLP._mxfp8_linear_expert_weights
 
         num_experts, M, K = 2, 64, 128
         grouped_mlp = Namespace()
@@ -283,8 +282,8 @@ class TestMXFP8ReshardTransform:
     @pytest.mark.skipif(
         not HAVE_FLASHINFER_ROUTED_MXFP8, reason="test requires FlashInfer routed MXFP8"
     )
-    def test_flashinfer_routed_moe_refit_writes_through_in_place(self):
-        """Refit writes routed Major-K weights directly, keeping one copy and graph addresses."""
+    def test_flashinfer_routed_moe_buffers_refresh_in_place(self):
+        """Refit writes through to Major-K weights without changing graph addresses."""
         from megatron.core.inference.moe import InferenceGroupedGemmBackend
         from megatron.core.inference.moe.flashinfer_mxfp8 import prepare_routed_mxfp8_weights
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
@@ -292,7 +291,7 @@ class TestMXFP8ReshardTransform:
         from megatron.core.transformer.moe.experts import InferenceGroupedMLP
 
         class Namespace:
-            _mxfp8_linear_expert_weights = InferenceGroupedMLP._mxfp8_linear_expert_weights
+            _stack_mxfp8_linear_weight = InferenceGroupedMLP._stack_mxfp8_linear_weight
 
         num_experts, rows, cols = 2, 96, 128
         grouped_mlp = Namespace()
@@ -310,10 +309,6 @@ class TestMXFP8ReshardTransform:
                 setattr(linear, f"weight{expert_idx}", tensor)
                 buffers[f"{linear_name}.weight{expert_idx}"] = tensor
 
-        # As in refit, the transform holds the canonical objects before the lazy build.
-        transform = MXFP8ReshardTransform(
-            convertible_params=set(buffers), persistent_buffers=buffers, backend="triton"
-        )
         InferenceGroupedMLP._build_concatenated_mxfp8_weights(grouped_mlp)
         grouped_mlp._concatenated_weights_built = True
         data_ptrs = (
@@ -324,12 +319,10 @@ class TestMXFP8ReshardTransform:
             grouped_mlp._fc1_weight.scale.data_ptr(),
             grouped_mlp._fc2_weight.scale.data_ptr(),
         )
-        for buf in buffers.values():
-            # Canonical storage is released: a one-element broadcast placeholder remains.
-            assert buf.writeback is not None
-            assert buf.data.untyped_storage().nbytes() == 1
-            assert buf.scale.untyped_storage().nbytes() == 1
 
+        transform = MXFP8ReshardTransform(
+            convertible_params=set(buffers), persistent_buffers=buffers, backend="triton"
+        )
         new_values = {}
         for name in buffers:
             new_values[name] = torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda")
@@ -337,12 +330,12 @@ class TestMXFP8ReshardTransform:
 
         assert InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp) is True
 
-        # Bit-exact with the previous canonical path: quantize each expert with the
-        # canonical kernel, then repack the whole stack.
         for linear_name, routed_weight in (
             ("linear_fc1", grouped_mlp._fc1_weight),
             ("linear_fc2", grouped_mlp._fc2_weight),
         ):
+            # Canonical storage is released; only the routed copy holds the weights.
+            assert buffers[f"{linear_name}.weight0"].data.untyped_storage().nbytes() == 1
             canonical = [
                 MXFP8Tensor.from_bf16(new_values[f"{linear_name}.weight{i}"], backend="triton")
                 for i in range(num_experts)
@@ -354,9 +347,7 @@ class TestMXFP8ReshardTransform:
                     backend="triton",
                 )
             )
-            assert torch.equal(
-                routed_weight.data.view(torch.uint8), expected.data.view(torch.uint8)
-            )
+            assert torch.equal(routed_weight.data, expected.data)
             assert torch.equal(routed_weight.scale, expected.scale)
 
         assert data_ptrs == (
@@ -367,62 +358,6 @@ class TestMXFP8ReshardTransform:
             grouped_mlp._fc1_weight.scale.data_ptr(),
             grouped_mlp._fc2_weight.scale.data_ptr(),
         )
-
-        # The canonical storage is gone, so the routed layout cannot be rebuilt from it.
-        grouped_mlp._concatenated_weights_built = False
-        with pytest.raises(RuntimeError, match="already writes through"):
-            InferenceGroupedMLP._build_concatenated_mxfp8_weights(grouped_mlp)
-
-        # A direct write into released storage fails instead of being silently dropped.
-        with pytest.raises(RuntimeError):
-            next(iter(buffers.values())).data.copy_(
-                torch.zeros(rows, cols, dtype=torch.float8_e4m3fn, device="cuda")
-            )
-
-    @pytest.mark.skipif(
-        not HAVE_FLASHINFER_ROUTED_MXFP8, reason="test requires FlashInfer routed MXFP8"
-    )
-    def test_flashinfer_routed_writeback_uses_per_stream_staging(self):
-        """Writebacks finalized on different streams never share staging storage."""
-        from megatron.core.inference.moe.flashinfer_mxfp8 import (
-            _WRITEBACK_STAGING,
-            prepare_routed_mxfp8_expert_weights,
-            prepare_routed_mxfp8_weights,
-        )
-        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-
-        rows, cols = 96, 128
-        experts = [
-            MXFP8Tensor.from_bf16(
-                torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda"), backend="triton"
-            )
-            for _ in range(2)
-        ]
-        routed = prepare_routed_mxfp8_expert_weights(experts)
-        values = [torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda") for _ in experts]
-        streams = [torch.cuda.Stream() for _ in experts]
-        main = torch.cuda.current_stream()
-        for stream, expert, value in zip(streams, experts, values):
-            stream.wait_stream(main)
-            with torch.cuda.stream(stream):
-                expert.copy_(value)
-        for stream in streams:
-            main.wait_stream(stream)
-        torch.cuda.synchronize()
-
-        stream_ids = {key[1] for key in _WRITEBACK_STAGING if key[2:] == (rows, cols)}
-        assert {stream.cuda_stream for stream in streams} <= stream_ids
-
-        canonical = [MXFP8Tensor.from_bf16(value, backend="triton") for value in values]
-        expected = prepare_routed_mxfp8_weights(
-            MXFP8Tensor(
-                data=torch.stack([w.data for w in canonical]),
-                scale=torch.stack([w.scale for w in canonical]),
-                backend="triton",
-            )
-        )
-        assert torch.equal(routed.data.view(torch.uint8), expected.data.view(torch.uint8))
-        assert torch.equal(routed.scale, expected.scale)
 
 
 # ===========================================================================

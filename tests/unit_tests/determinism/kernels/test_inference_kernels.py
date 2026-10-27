@@ -328,34 +328,37 @@ def test_mixed_precision_parameter_conversion_replays():
     reason="FlashInfer routed MXFP8 needs Blackwell",
 )
 def test_flashinfer_routed_mxfp8_writeback_replays():
-    """Repacking experts and refit writeback into the routed layout replay exactly."""
+    """Refit writes through to FlashInfer's routed MXFP8 layout bit-exactly."""
     from megatron.core.inference.moe.flashinfer_mxfp8 import (
         HAVE_FLASHINFER_ROUTED_MXFP8,
-        prepare_routed_mxfp8_expert_weights,
+        attach_routed_mxfp8_writeback,
+        prepare_routed_mxfp8_weights,
     )
     from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
     if not HAVE_FLASHINFER_ROUTED_MXFP8:
         pytest.skip("needs FlashInfer routed MXFP8")
-
     seeded()
-    initial = tuple(torch.randn(96, 128, device="cuda", dtype=torch.bfloat16) for _ in range(2))
-    refit = tuple(torch.randn(96, 128, device="cuda", dtype=torch.bfloat16) for _ in range(2))
+    initial, update = (
+        torch.randn(2, 96, 128, device="cuda", dtype=torch.bfloat16) for _ in range(2)
+    )
 
-    def build_and_refit(initial0, initial1, refit0, refit1):
-        experts = [MXFP8Tensor.from_bf16(x, backend="triton") for x in (initial0, initial1)]
-        routed = prepare_routed_mxfp8_expert_weights(experts)
-        built = (routed.data.view(torch.uint8).clone(), routed.scale.clone())
-        for expert, value in zip(experts, (refit0, refit1)):
+    def refit(initial, update):
+        experts = [MXFP8Tensor.from_bf16(w, backend="triton") for w in initial]
+        routed = prepare_routed_mxfp8_weights(
+            MXFP8Tensor(
+                data=torch.stack([e.data for e in experts]),
+                scale=torch.stack([e.scale for e in experts]),
+                backend="triton",
+            )
+        )
+        for i, (expert, value) in enumerate(zip(experts, update)):
+            attach_routed_mxfp8_writeback(expert, routed, i)
             expert.copy_(value)
-        return built + (routed.data.view(torch.uint8), routed.scale)
+        return routed.data.view(torch.uint8), routed.scale
 
     assert_replays_bit_exact(
-        build_and_refit,
-        initial + refit,
-        backward=False,
-        contention=True,
-        what="FlashInfer routed MXFP8 repack and writeback",
+        refit, (initial, update), backward=False, contention=True, what="routed MXFP8 writeback"
     )
 
 

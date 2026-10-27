@@ -95,8 +95,9 @@ except ImportError:
 from megatron.core.inference.moe import ActivationType as McoreActivationType
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
+    attach_routed_mxfp8_writeback,
     flashinfer_routed_mxfp8_moe,
-    prepare_routed_mxfp8_expert_weights,
+    prepare_routed_mxfp8_weights,
     require_flashinfer_routed_mxfp8,
 )
 from megatron.core.inference.moe.flashinfer_nvfp4 import (
@@ -1510,10 +1511,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
             "MXFP8",
         )
 
-    def _mxfp8_linear_expert_weights(self, linear_name: str, backend: str) -> list[MXFP8Tensor]:
-        """Return one linear's validated per-expert MXFP8 weights in canonical layout."""
+    def _stack_mxfp8_linear_weight(self, linear_name: str, backend: str) -> MXFP8Tensor:
+        """Stack one linear's per-expert MXFP8 weights in canonical layout."""
         linear = getattr(self, linear_name)
-        weights = []
+        q_list, s_list = [], []
         source_dtype: torch.dtype | None = None
         for i in range(self.num_local_experts):
             weight = getattr(linear, f'weight{i}')
@@ -1533,16 +1534,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
                         f"Conflicting source dtypes for {linear_name} expert weights: "
                         f"{source_dtype} and {mxfp8.dtype}."
                     )
-            weights.append(mxfp8)
-        return weights
-
-    def _stack_mxfp8_linear_weight(self, linear_name: str, backend: str) -> MXFP8Tensor:
-        """Stack one linear's per-expert MXFP8 weights in canonical layout."""
-        weights = self._mxfp8_linear_expert_weights(linear_name, backend)
-        source_dtype = next((w.dtype for w in weights if w.dtype is not None), None)
+            q_list.append(mxfp8.data)
+            s_list.append(mxfp8.scale)
         return MXFP8Tensor(
-            data=torch.stack([w.data for w in weights], dim=0).contiguous(),
-            scale=torch.stack([w.scale for w in weights], dim=0).contiguous(),
+            data=torch.stack(q_list, dim=0).contiguous(),
+            scale=torch.stack(s_list, dim=0).contiguous(),
             dtype=source_dtype,
             backend=backend,
         )
@@ -1553,10 +1549,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         """Build contiguous expert stacks after checkpoint loading.
 
         The torch and vLLM backends rebind each per-expert MXFP8Tensor to its stacked view.
-        FlashInfer repacks each expert into a shuffled Major-K stack for its routed-MoE
-        kernel, releases the canonical storage, and makes each per-expert MXFP8Tensor write
-        through to its routed slot, so refit updates the kernel's weights directly and only
-        one copy of the expert weights stays resident.
+        FlashInfer derives a shuffled Major-K stack for its routed-MoE kernel and makes the
+        canonical tensors write through to it, releasing their storage.
         """
 
         use_flashinfer_routed = (
@@ -1567,9 +1561,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
             require_flashinfer_routed_mxfp8()
         for linear_name, buf_name in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS:
             linear = getattr(self, linear_name)
+            stacked_weight = self._stack_mxfp8_linear_weight(linear_name, backend)
             if use_flashinfer_routed:
-                expert_weights = self._mxfp8_linear_expert_weights(linear_name, backend)
-                concatenated_weight = prepare_routed_mxfp8_expert_weights(expert_weights)
+                concatenated_weight = prepare_routed_mxfp8_weights(stacked_weight)
                 logger.info(
                     "Prepared FlashInfer routed MXFP8 %s weights: experts=%d "
                     "shape=(%d, %d)->(%d, %d)",
@@ -1580,14 +1574,15 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     concatenated_weight.padded_rows,
                     concatenated_weight.padded_cols,
                 )
+                for i in range(self.num_local_experts):
+                    weight = InferenceGroupedMLP._unwrap_mxfp8_weight(getattr(linear, f'weight{i}'))
+                    attach_routed_mxfp8_writeback(weight, concatenated_weight, i)
             else:
-                stacked_weight = self._stack_mxfp8_linear_weight(linear_name, backend)
                 concatenated_weight = stacked_weight
             setattr(self, buf_name, concatenated_weight)
 
-            # The torch and vLLM paths redirect per-expert storage into the stacked
-            # representation. FlashInfer's per-expert weights already write through to
-            # their routed slots.
+            # The torch and vLLM paths can redirect per-expert storage into the stacked
+            # representation.
             if not use_flashinfer_routed:
                 for i in range(self.num_local_experts):
                     w = getattr(linear, f'weight{i}')
@@ -1599,13 +1594,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
                         w.data.scale = stacked_weight.scale[i]
         self._uses_mxfp8_weights = True
 
+    @torch.inference_mode(False)
+    @torch.no_grad()
     def refresh_flashinfer_mxfp8_weights(self) -> bool:
-        """Report whether an MXFP8 refit updated routed FlashInfer expert weights.
+        """Refresh routed Major-K expert weights in place after an MXFP8 refit.
 
-        Refit writes through each per-expert MXFP8Tensor directly into the routed Major-K
-        stack (see attach_routed_mxfp8_writeback), so nothing is repacked here. A True
-        return still tells refit that graph-visible weight buffers changed asynchronously
-        and must be synchronized before graphs replay.
+        Returns whether derived FlashInfer weights were refreshed.
         """
         if (
             not self._concatenated_weights_built
@@ -1619,15 +1613,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
             # routed representation to refresh.
             return False
 
-        for linear_name, _ in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS:
-            linear = getattr(self, linear_name)
-            for i in range(self.num_local_experts):
-                mxfp8 = InferenceGroupedMLP._unwrap_mxfp8_weight(getattr(linear, f'weight{i}'))
-                if mxfp8 is None or mxfp8.writeback is None:
-                    raise RuntimeError(
-                        f"{linear_name}.weight{i} does not write through to the routed "
-                        "FlashInfer MXFP8 weights, so a refit would not reach the kernel."
-                    )
+        # Refit already wrote through to the routed weights (attach_routed_mxfp8_writeback);
+        # returning True still makes refit synchronize before graphs replay.
         return True
 
     @torch.inference_mode(False)
