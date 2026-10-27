@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import os
+from dataclasses import replace
 from inspect import signature
 from unittest import mock
 
@@ -23,7 +24,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import Attention
-from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.multi_latent_attention import (
     FusedMLASelfAttention,
     MLASelfAttention,
@@ -128,6 +129,53 @@ backend = TESpecProvider()
 linear_qkv_down_proj_options = [backend.linear(), backend.column_parallel_linear()]
 
 
+def _dynamic_flash_attention_call(attention, is_decode_only):
+    """Run a dynamic-batching MLA forward up to the attention kernel and return the kernel's
+    bound arguments."""
+    attention.eval()
+    attention.config.cache_mla_latents = True
+    attention.cache_mla_latents = True
+
+    hidden_states = torch.empty((1, 1, attention.config.hidden_size))
+    query = torch.empty((1, 1, 1, 1))
+    key = torch.empty_like(query)
+    value = torch.empty_like(query)
+    block_table = torch.zeros((1, 1), dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
+    sequence_lengths = torch.ones(1, dtype=torch.int32)
+
+    inference_context = mock.Mock()
+    inference_context.is_static_batching.return_value = False
+    inference_context.is_decode_only.return_value = is_decode_only
+    inference_context.cu_query_lengths.return_value = (cu_seqlens, 1)
+    inference_context.cu_kv_lengths.return_value = (cu_seqlens, sequence_lengths, 1)
+
+    with (
+        mock.patch.object(attention, "prepare_for_absorption"),
+        mock.patch.object(
+            attention, "get_query_key_value_tensors", return_value=(query, key, value, None, None)
+        ),
+        mock.patch.object(
+            attention,
+            "_adjust_key_value_for_inference",
+            return_value=(query, key, value, None, AttnMaskType.causal, block_table),
+        ),
+        mock.patch.object(
+            attention,
+            "flash_decode_and_prefill",
+            side_effect=RuntimeError("flash attention call reached"),
+        ) as flash_decode_and_prefill,
+        pytest.raises(RuntimeError, match="flash attention call reached"),
+    ):
+        attention(hidden_states, attention_mask=None, inference_context=inference_context)
+
+    return signature(Attention.flash_decode_and_prefill).bind(
+        attention,
+        *flash_decode_and_prefill.call_args.args,
+        **flash_decode_and_prefill.call_args.kwargs,
+    )
+
+
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))
 class TestParallelMLAAttention:
 
@@ -175,52 +223,29 @@ class TestParallelMLAAttention:
     @pytest.mark.parametrize("is_decode_only", [False, True])
     def test_dynamic_inference_forwards_decode_only_to_flash_attention(self, is_decode_only):
         """Test that MLA forwards the dynamic context's decode-only state."""
-        attention = self.parallel_attention
-        attention.eval()
-        attention.config.cache_mla_latents = True
-        attention.cache_mla_latents = True
-
-        hidden_states = torch.empty((1, 1, attention.config.hidden_size))
-        query = torch.empty((1, 1, 1, 1))
-        key = torch.empty_like(query)
-        value = torch.empty_like(query)
-        block_table = torch.zeros((1, 1), dtype=torch.int32)
-        cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
-        sequence_lengths = torch.ones(1, dtype=torch.int32)
-
-        inference_context = mock.Mock()
-        inference_context.is_static_batching.return_value = False
-        inference_context.is_decode_only.return_value = is_decode_only
-        inference_context.cu_query_lengths.return_value = (cu_seqlens, 1)
-        inference_context.cu_kv_lengths.return_value = (cu_seqlens, sequence_lengths, 1)
-
-        with (
-            mock.patch.object(attention, "prepare_for_absorption"),
-            mock.patch.object(
-                attention,
-                "get_query_key_value_tensors",
-                return_value=(query, key, value, None, None),
-            ),
-            mock.patch.object(
-                attention,
-                "_adjust_key_value_for_inference",
-                return_value=(query, key, value, None, AttnMaskType.causal, block_table),
-            ),
-            mock.patch.object(
-                attention,
-                "flash_decode_and_prefill",
-                side_effect=RuntimeError("flash attention call reached"),
-            ) as flash_decode_and_prefill,
-            pytest.raises(RuntimeError, match="flash attention call reached"),
-        ):
-            attention(hidden_states, attention_mask=None, inference_context=inference_context)
-
-        flash_call = signature(Attention.flash_decode_and_prefill).bind(
-            attention,
-            *flash_decode_and_prefill.call_args.args,
-            **flash_decode_and_prefill.call_args.kwargs,
-        )
+        flash_call = _dynamic_flash_attention_call(self.parallel_attention, is_decode_only)
         assert flash_call.arguments["is_decode_only"] is is_decode_only
+
+    @pytest.mark.skipif(not is_te_min_version("2.8.0"), reason="softmax_type requires TE >= 2.8.0")
+    @pytest.mark.parametrize("softmax_type", ["off-by-one", "learnable"])
+    @pytest.mark.parametrize("is_decode_only", [False, True])
+    def test_dynamic_inference_forwards_sink_offset_to_flash_attention(
+        self, softmax_type, is_decode_only
+    ):
+        """Test that MLA hands its per-head sink logits to the dynamic-batching kernel."""
+        config = replace(self.transformer_config, softmax_type=softmax_type)
+        attention = MLASelfAttention(
+            config,
+            get_mla_self_attn_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        expected = attention._get_inference_softmax_offset()
+        assert expected.shape == (attention.num_attention_heads_per_partition,)
+
+        flash_call = _dynamic_flash_attention_call(attention, is_decode_only)
+        softmax_offset = flash_call.arguments.get("softmax_offset")
+        assert softmax_offset is not None and torch.equal(softmax_offset, expected)
 
     def test_constructor(self):
         assert isinstance(self.parallel_attention, MLASelfAttention)
@@ -2442,6 +2467,39 @@ class TestFusedMLAQUpProjIntegration:
                 assert grad is not None
                 assert torch.isfinite(grad).all()
                 assert torch.count_nonzero(grad) > 0
+
+
+def _batch_invariant_mla_config(**overrides):
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=64,
+        num_attention_heads=4,
+        q_lora_rank=32,
+        kv_lora_rank=32,
+        qk_head_dim=32,
+        qk_pos_emb_head_dim=16,
+        v_head_dim=32,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        attention_dropout=0.0,
+        batch_invariant_mode=True,
+        attention_backend=AttnBackend.flash,
+        flash_attention_version=3,
+    )
+    kwargs.update(overrides)
+    return MLATransformerConfig(**kwargs)
+
+
+def test_batch_invariant_mode_accepts_mla_without_latent_cache():
+    assert _batch_invariant_mla_config().batch_invariant_mode
+
+
+def test_batch_invariant_mode_rejects_mla_latent_cache():
+    """Dynamic MLA decodes with absorbed FlashMLA attention, whose split-KV schedule depends on
+    the whole batch, and runs mixed steps unabsorbed, so a request's output depends on its
+    co-batch."""
+    with pytest.raises(ValueError, match="not supported with cache_mla_latents"):
+        _batch_invariant_mla_config(cache_mla_latents=True)
 
 
 def _fused_kv_rope_quant_config(**overrides):

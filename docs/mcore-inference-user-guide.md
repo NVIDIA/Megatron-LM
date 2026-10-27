@@ -164,6 +164,11 @@ workload rather than generalizing from any single comparison.
 > must be validated numerically rather than inferred from alignment.
 > Keep `use_transformer_engine_op_fuser=False`. Forward batch invariance does
 > not promise bitwise-identical gradients across different minibatches.
+>
+> MLA models with `cache_mla_latents` (required for dynamic batching) reject
+> batch-invariant mode: their decode-only steps run absorbed attention through
+> FlashMLA, whose split-KV schedule depends on the whole batch, while other steps
+> and training run unabsorbed attention.
 
 > **Selective MXFP8 parameter storage.** Use the same Transformer Engine per-module
 > precision recipe for training and inference through `TransformerConfig.quant_recipe`

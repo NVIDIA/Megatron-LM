@@ -604,6 +604,7 @@ class MultiLatentAttention(Attention):
                     kv_lengths,
                     block_table,
                     inference_context.is_decode_only(),
+                    softmax_offset=self._get_inference_softmax_offset(),
                 )
                 # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
                 if not inference_context.is_decode_only():

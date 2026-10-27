@@ -4784,6 +4784,13 @@ class MLATransformerConfig(TransformerConfig):
             self.kv_lora_rank = derived
 
         if self.cache_mla_latents:
+            if self.batch_invariant_mode:
+                raise ValueError(
+                    "batch_invariant_mode is not supported with cache_mla_latents: decode-only "
+                    "steps run absorbed attention through FlashMLA, which derives its split-KV "
+                    "schedule from the whole batch, while mixed steps and training run "
+                    "unabsorbed attention, so a request's output depends on its co-batch."
+                )
             assert (
                 self.apply_rope_fusion is False
             ), "Rope Fusion is not compatible with caching latents"
