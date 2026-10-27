@@ -2877,8 +2877,9 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 assert type(controller.inference_wrapped_model.model.output_layer).__name__ == (
                     "TELMHeadColumnParallelLinear"
                 )
-                assert runtime["mxfp8-head-capture-forwards"] > 0
-                assert runtime["cuda-graph-mxfp8-head-replays"] > 0
+                if "cuda-graph" in signals:
+                    assert runtime["mxfp8-head-capture-forwards"] > 0
+                    assert runtime["cuda-graph-mxfp8-head-replays"] > 0
         if "routing-replay" in signals:
             assert model_config.moe_enable_routing_replay
             assert context.moe_routing_metadata is not None
