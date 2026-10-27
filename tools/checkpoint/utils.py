@@ -75,7 +75,8 @@ def initialize_checkpoint_converter_distributed():
 
     Model construction reads ranks and sizes from the fake process groups through
     ``get_pg_rank`` and ``get_pg_size``, which ignore a group until torch.distributed is
-    initialized. The in-process store needs no port, so it does not clash with the saver process.
+    initialized. The in-process store needs no port, so the loader and saver processes of a
+    conversion, and other jobs on the same host, cannot clash on one.
     """
     if not torch.distributed.is_initialized():
         torch.distributed.init_process_group(
