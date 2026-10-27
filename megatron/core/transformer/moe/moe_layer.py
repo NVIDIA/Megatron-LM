@@ -562,6 +562,14 @@ class MoELayer(BaseMoELayer):
             self.config,
             num_moe_experts=self.num_physical_experts,
             moe_enable_scheduler=False,
+            # Reconstruct defaulted CP inputs before __post_init__ runs again.
+            # Resolved defaults are not user-specified layout/mode overrides.
+            linear_cp_mode=(
+                None if self.config._linear_cp_mode_was_default else self.config.linear_cp_mode
+            ),
+            linear_cp_layout=(
+                self.config.linear_cp_layout if self.config._linear_cp_layout_explicit else None
+            ),
             # The enclosing layer owns graph capture. This physical-layout
             # config constructs only the token dispatcher, not another MoE
             # layer or graph. Retaining the logical layer's capture policy

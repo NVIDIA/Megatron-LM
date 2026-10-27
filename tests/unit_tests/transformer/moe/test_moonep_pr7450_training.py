@@ -222,3 +222,33 @@ def test_fsdp_direct_main_grad_two_updates(distributed_world, monkeypatch, preci
         assert not any(reports), reports
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("layout", [None, "contiguous"])
+@pytest.mark.parametrize("mode", [None, "headwise"])
+def test_dispatcher_config_preserves_defaulted_linear_cp_inputs(layout, mode):
+    from types import SimpleNamespace
+
+    from megatron.core.transformer.moe.moe_layer import MoELayer
+    from tests.unit_tests.transformer.moe.test_echo_moe_scheduler import _scheduler_config
+
+    config = _scheduler_config(
+        experimental_attention_variant="gdn", linear_cp_layout=layout, linear_cp_mode=mode
+    )
+    before = dict(vars(config))
+    layer = SimpleNamespace(config=config, num_physical_experts=8)
+    physical = MoELayer._get_token_dispatcher_config(layer)
+    assert physical.num_moe_experts == 8
+    assert not physical.moe_enable_scheduler
+    assert physical.linear_cp_mode == config.linear_cp_mode
+    assert physical.linear_cp_layout == config.linear_cp_layout
+    assert physical._linear_cp_mode_was_default == config._linear_cp_mode_was_default
+    assert physical._linear_cp_layout_explicit == config._linear_cp_layout_explicit
+    assert vars(config) == before
+    # An explicitly incompatible user setting remains an error.
+    with pytest.raises(ValueError, match="requires linear_cp_layout='contiguous'"):
+        _scheduler_config(
+            experimental_attention_variant="gdn",
+            linear_cp_mode="chunkwise",
+            linear_cp_layout="zigzag",
+        )
