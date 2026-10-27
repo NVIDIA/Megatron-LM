@@ -233,7 +233,7 @@ def check_checkpoint_args(
         _compare('max_position_embeddings')
         _compare('make_vocab_size_divisible_by')
         if not args.use_dist_ckpt:
-            _compare('padded_vocab_size')
+            _compare('padded_vocab_size', config_section='tokenizer')
         _compare('tokenizer_type')
     if cfg.rng.data_parallel_random_init:
         _compare('data_parallel_random_init', config_section='rng')
