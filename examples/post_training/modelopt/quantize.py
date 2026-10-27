@@ -494,7 +494,7 @@ if __name__ == "__main__":
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     cfg = inference_cfg_container_from_args(args, build_model_config=False)
-    set_run_config()
+    set_run_config(cfg)
     initialize_megatron(training=False)
 
     check_arguments()
