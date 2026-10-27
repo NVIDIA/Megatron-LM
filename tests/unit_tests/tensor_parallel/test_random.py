@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
 
@@ -13,8 +13,10 @@ from megatron.core.tensor_parallel.random import (
     convert_cuda_rng_state,
     cudagraph_needs_generator_registration,
     get_cuda_rng_tracker,
+    is_graph_safe_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -477,5 +479,55 @@ def test_checkpoint_without_output_multiple_hook_tensors():
         assert torch.allclose(input1.grad, input2.grad)
         assert torch.allclose(weight_a1.grad, weight_a2.grad)
         assert torch.allclose(weight_b1.grad, weight_b2.grad)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def _graph_safe_generator_offsets():
+    """Philox offsets of the live default generator state and every tracker state."""
+    default_generator = torch.cuda.default_generators[torch.cuda.current_device()]
+    tracker_states = get_cuda_rng_tracker().get_states()
+    return [default_generator.graphsafe_get_state().get_offset()] + [
+        tracker_states[name].get_offset() for name in sorted(tracker_states)
+    ]
+
+
+@pytest.mark.parametrize("fork_tracker", [False, True])
+@pytest.mark.parametrize("tracker", ["te", "cudagraphable"])
+def test_checkpoint_without_output_replays_graph_safe_rng(tracker, fork_tracker):
+    """A rebuild under a graph-safe RNG tracker replays the forward dropout mask.
+
+    Graph-safe trackers hold live generator states that the forward pass advances. The
+    rebuild must draw from the forward position of its stream and leave the live states
+    where the forward pass left them.
+    """
+    if tracker == "te" and not is_te_min_version("1.5.0"):
+        pytest.skip("Transformer Engine RNG tracker is unavailable")
+    Utils.initialize_model_parallel()
+    try:
+        model_parallel_cuda_manual_seed(
+            123,
+            te_rng_tracker=tracker == "te",
+            use_cudagraphable_rng=tracker == "cudagraphable",
+            force_reset_rng=True,
+        )
+        assert is_graph_safe_cuda_rng_tracker(get_cuda_rng_tracker())
+
+        def dropout(x):
+            return torch.nn.functional.dropout(x, p=0.5, training=True)
+
+        x = torch.randn(64, 64, device="cuda", requires_grad=True)
+        manager = CheckpointWithoutOutputManager()
+        with get_cuda_rng_tracker().fork() if fork_tracker else contextlib.nullcontext():
+            output = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(dropout, x)
+        # p=0.5 keeps an element with scale 2; d(sum(output))/dx is that scale.
+        expected_grad = (output.detach() != 0).to(x.dtype) * 2
+        consumer = output * 1.0
+        manager.discard_all_outputs_and_register_unified_recompute(consumer)
+
+        offsets = _graph_safe_generator_offsets()
+        consumer.sum().backward()
+        torch.testing.assert_close(x.grad, expected_grad, rtol=0, atol=0)
+        assert _graph_safe_generator_offsets() == offsets
     finally:
         Utils.destroy_model_parallel()

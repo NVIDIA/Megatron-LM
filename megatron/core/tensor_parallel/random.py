@@ -652,6 +652,32 @@ def _get_all_rng_states():
     return cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker
 
 
+def _get_recompute_rng_states():
+    """Get the rng states that an output-discarding checkpoint restores for its rebuild.
+
+    Graph-safe trackers hold live generator states that keep advancing after this call.
+    Outside CUDA graph capture, the generator states are cloned, so an eager rebuild replays
+    the forward random stream (for example a dropout mask) and leaves the live generators
+    untouched. During capture, the live states are kept: the capture owns their advancement.
+    """
+    cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker = _get_all_rng_states()
+    if (
+        not is_graph_safe_cuda_rng_tracker(get_cuda_rng_tracker())
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker
+
+    def snapshot(state):
+        # Byte-tensor states are already copies; only generator states advance in place.
+        return state.clone_state() if isinstance(state, torch.Generator) else state
+
+    return (
+        cpu_rng_state,
+        snapshot(cuda_rng_state),
+        {name: snapshot(state) for name, state in cuda_rng_state_tracker.items()},
+    )
+
+
 def _set_all_rng_states(cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker):
     """Set all the rng states."""
     torch.set_rng_state(cpu_rng_state)
@@ -925,7 +951,7 @@ class _RecomputeRegion:
         self._function = function
         self._layout = _ArgLayout(args)
         # Taken before the function draws any random number.
-        self._rng_states = _get_all_rng_states()
+        self._rng_states = _get_recompute_rng_states()
         self._te_context = _TERecomputeContext(use_te_context)
         self._retained_storage_ptrs = (
             frozenset(t.untyped_storage().data_ptr() for t in self._layout.tensors_of(args))
