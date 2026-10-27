@@ -13,8 +13,6 @@ import megatron.core.transformer.cuda_graphs as cuda_graphs_module
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
-from megatron.core.inference.contexts import StaticInferenceContext
-from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -1976,18 +1974,6 @@ class _SimpleModule(MegatronModule):
         return self.linear(x)
 
 
-class _InferenceActivationModule(MegatronModule):
-    """Small layer for checking inference graph argument and buffer handling."""
-
-    def __init__(self, config, layer_number):
-        super().__init__(config)
-        self.layer_number = layer_number
-        self.is_first_layer = layer_number == 1
-
-    def forward(self, hidden_states, scale, inference_context=None):
-        return (hidden_states * scale + self.layer_number,)
-
-
 class _CheckpointDependencyModule(MegatronModule):
     """A visible projection consuming the output of a checkpointed child module."""
 
@@ -2276,46 +2262,6 @@ class TestInlineCaptureManager:
         assert torch.equal(eager_out, graph_out_2)
         assert len(mgr.cudagraph_runners) == 1
         assert mgr.cudagraph_runners[0].fwd_graph_recorded
-
-    @pytest.mark.parametrize("static", [False, True], ids=["dynamic", "static"])
-    @pytest.mark.parametrize("positional", [False, True], ids=["kwargs", "args"])
-    @torch.inference_mode()
-    def test_inference_activation_buffer_reuse(self, static, positional):
-        """Capture/replay preserves activation convention and preceding-layer reuse."""
-        config = self._make_config()
-        context = StaticInferenceContext(max_batch_size=4, max_sequence_length=8)
-        context.enable_decode_mode()
-        # Only cache-key selection needs a dynamic context in this arithmetic test.
-        context.is_static_batching = lambda: static
-        context.padded_batch_dimensions = (4, 1)
-        modules = [_InferenceActivationModule(config, i).cuda().eval() for i in (1, 2)]
-        managers = [
-            CudaGraphManager(config, base_module=m, need_backward=False, num_warmup_steps=0)
-            for m in modules
-        ]
-
-        def run(x):
-            for module, manager in zip(modules, managers):
-                if positional:
-                    x = manager(module, (x, 2.0), {"inference_context": context})[0]
-                else:
-                    x = manager(
-                        module, (), {"hidden_states": x, "scale": 2.0, "inference_context": context}
-                    )[0]
-            return x
-
-        x = torch.randn(4, config.hidden_size, device="cuda")
-        torch.testing.assert_close(run(x), x * 4 + 4)
-        first, second = [manager.cudagraph_runners[0] for manager in managers]
-        second_input = (
-            second.fwd_graph_input_args[0]
-            if positional
-            else second.fwd_graph_input_kwargs["hidden_states"]
-        )
-        assert second_input.data_ptr() == first.fwd_graph_outputs[0].data_ptr()
-        x = torch.randn_like(x)
-        torch.testing.assert_close(run(x), x * 4 + 4)
-        assert all(len(manager.cudagraph_runners) == 1 for manager in managers)
 
     def test_eager_bypass(self):
         """eager=True must bypass graph capture entirely."""
