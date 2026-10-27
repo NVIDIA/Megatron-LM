@@ -147,7 +147,7 @@ def test_checkpointed_forward_uses_layer_tp_group_not_global(precision, monkeypa
     )
     object.__setattr__(layer, "config", config)
     object.__setattr__(layer, "tp_group", tp_group)
-    object.__setattr__(layer, "mtp_layer_pattern", None)
+    object.__setattr__(layer, "is_hybrid_mtp", False)
     object.__setattr__(
         layer,
         "_proj_and_transformer_layer",

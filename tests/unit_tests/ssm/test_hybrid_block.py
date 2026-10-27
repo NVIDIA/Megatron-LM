@@ -756,7 +756,9 @@ class TestHybridBlock:
                 vocab_size=128,
                 max_sequence_length=8,
                 hybrid_layer_pattern=f"{Symbols.MAMBA}/{Symbols.MAMBA}",
-                pg_collection=self.get_pg_collection(),
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                    required_pgs=["tp", "pp", "cp", "dp_cp"]
+                ),
             )
 
     def get_hybrid_block(self, layer_pattern, *, stack_spec=hybrid_stack_spec, **config_kwargs):
