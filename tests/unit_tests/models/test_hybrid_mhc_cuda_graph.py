@@ -8,12 +8,14 @@ also requires the cuTile projection and aggregation-backward paths; Hopper can
 use the supported Triton/native combination selected by the same auto policy.
 """
 
+import inspect
 from collections import Counter
 from functools import wraps
 
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.fusions import fused_mhc_kernels
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -147,6 +149,28 @@ def _count_recompute_rebuilds(monkeypatch):
 
     monkeypatch.setattr(tensor_parallel_random._RecomputeRegion, 'rebuild', counted_rebuild)
     return rebuilds
+
+
+def _record_bda_managers(monkeypatch):
+    """Record whether each HyperConnectionModule bias-dropout-add received a recompute manager."""
+    received = {}
+    original = HyperConnectionModule.fused_h_res_h_post_bda
+    signature = inspect.signature(original)
+
+    def recording(self, *args, **kwargs):
+        # GPT layers pass the manager positionally, Hybrid wrappers by keyword.
+        manager = signature.bind(self, *args, **kwargs).arguments.get('manager')
+        received.setdefault(id(self), []).append(manager is not None)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(HyperConnectionModule, 'fused_h_res_h_post_bda', recording)
+    return received
+
+
+def _attention_hyper_connection(layer):
+    if isinstance(layer, HyperConnectionHybridLayer):
+        return layer.hyper_connection
+    return layer.self_attention_hyper_connection
 
 
 def _config(kind, scopes, fused=False, tp=1, cp=1, ep=1, **overrides):
@@ -296,7 +320,7 @@ class TestMHCTEGraphs:
                 **{input_name: unsupported},
             )
 
-    @pytest.mark.parametrize('kind', ['gpt', 'gpt_moe', 'hybrid', 'hybrid_moe_mtp'])
+    @pytest.mark.parametrize('kind', ['gpt', 'gpt_moe', 'hybrid', 'hybrid_gdn', 'hybrid_moe_mtp'])
     @pytest.mark.parametrize('fused', [False, True])
     def test_attention_graph_split_with_mhc_recompute(self, kind, fused, monkeypatch):
         self._run(kind, [CudaGraphModule.attn], fused, monkeypatch, **_ATTENTION_GRAPH_SPLIT)
@@ -339,6 +363,18 @@ class TestMHCTEGraphs:
             for hyper_connection in hyper_connections:
                 assert not {id(module) for module in hyper_connection.modules()} & covered
 
+    def test_attention_graph_split_keeps_gdn_eager_for_scheduler_thd(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
+        config = _config('hybrid_gdn', [CudaGraphModule.attn], **_ATTENTION_GRAPH_SPLIT)
+        model = _model('hybrid_gdn', config, ProcessGroupCollection.use_mpu_process_groups())
+        gdn_wrapper = model.decoder.layers[0]
+        assert gdn_wrapper._is_attention_graph_split()
+        assert _layer_is_graphable(gdn_wrapper, config)
+        # GDN reads packed offsets on the host, so packed THD batches keep it eager.
+        config.sequence_packing_scheduler = 'dp_balanced'
+        assert not _layer_is_graphable(gdn_wrapper, config)
+
     def test_attention_graph_split_rejects_compound_hybrid_layer(self):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
@@ -378,6 +414,7 @@ class TestMHCTEGraphs:
         expected_backend_calls = _expected_mhc_backend_calls(fused)
         backend_calls = _record_mhc_backend_calls(monkeypatch)
         rebuilds = _count_recompute_rebuilds(monkeypatch)
+        bda_managers = _record_bda_managers(monkeypatch)
         init_num_microbatches_calculator(
             rank=0,
             global_batch_size=2,
@@ -512,11 +549,15 @@ class TestMHCTEGraphs:
             expected_output, expected_input_grad, expected_grads = step(reference, value)
             backend_calls['eager'].clear()
             rebuilds.clear()
+            bda_managers.clear()
             actual_output, actual_input_grad, actual_grads = step(graphed, value)
             if attention_graph_split:
                 # mHC runs eagerly around the replayed graphs, and its recompute regions re-run.
                 assert expected_backend_calls <= set(backend_calls['eager']), backend_calls
                 assert rebuilds['rebuild'] > 0
+                # The eager attention-side bias-dropout-add stays a recompute checkpoint.
+                for layer in expected:
+                    assert bda_managers[id(_attention_hyper_connection(layer))] == [True]
             torch.testing.assert_close(actual_output, expected_output, rtol=2e-2, atol=2e-3)
             torch.testing.assert_close(actual_input_grad, expected_input_grad, rtol=2e-2, atol=2e-3)
             assert actual_grads.keys() == expected_grads.keys()
@@ -774,23 +815,44 @@ def test_attention_graph_split_scheduler_thd_replay(kind, chunks, monkeypatch):
                 ]
                 assert len(callables) == 1
             rotary = models[0].module.rotary_pos_emb(32, packed_seq=True)
-            physical = torch.tensor([0, 8, 16, 24, 32], dtype=torch.int32, device='cuda')
-            packed = []
-            for valid_end in (32, 24):
-                valid = physical.clone()
-                valid[-1] = valid_end
+            # (physical, valid) cumulative offsets at the fixed capacity of 4 documents. Compared
+            # documents are partly valid, and the second packing has fewer documents, padded
+            # with repeated trailing offsets as the scheduler pads its metadata.
+            packings = [
+                ([0, 8, 16, 24, 32], [0, 6, 14, 22, 22]),
+                ([0, 16, 32, 32, 32], [0, 12, 28, 28, 28]),
+            ]
+            packed, valid_rows = [], []
+            cp_rank = parallel_state.get_context_parallel_rank()
+            for physical, valid in packings:
+                offsets = [
+                    torch.tensor(values, dtype=torch.int32, device='cuda')
+                    for values in (valid, physical)
+                ]
                 packed.append(
                     PackedSeqParams(
                         qkv_format='thd',
-                        cu_seqlens_q=valid,
-                        cu_seqlens_kv=valid.clone(),
-                        cu_seqlens_q_padded=physical,
-                        cu_seqlens_kv_padded=physical.clone(),
+                        cu_seqlens_q=offsets[0],
+                        cu_seqlens_kv=offsets[0].clone(),
+                        cu_seqlens_q_padded=offsets[1],
+                        cu_seqlens_kv_padded=offsets[1].clone(),
                         max_seqlen_q=32,
                         max_seqlen_kv=32,
                         pad_between_seqs=True,
                     )
                 )
+                # THD context parallelism splits each document into 2*CP chunks and gives this
+                # rank chunks cp_rank and 2*CP-1-cp_rank. Keep only its valid local rows.
+                rows = []
+                for index in range(len(physical) - 1):
+                    length = physical[index + 1] - physical[index]
+                    valid_length = valid[index + 1] - valid[index]
+                    chunk_size = length // 4
+                    for chunk_index in (cp_rank, 3 - cp_rank):
+                        positions = range(chunk_index * chunk_size, (chunk_index + 1) * chunk_size)
+                        rows.extend(position < valid_length for position in positions)
+                valid_rows.append(torch.tensor(rows, device='cuda'))
+                assert len(rows) == 16
 
             def run_decoder(chunk, mb, hidden):
                 return models[chunk].module.decoder(
@@ -800,8 +862,8 @@ def test_attention_graph_split_scheduler_thd_replay(kind, chunks, monkeypatch):
                     packed_seq_params=packed[mb % 2],
                 )
 
-            def valid_tokens(mb):
-                return 12 if mb % 2 else 16
+            def valid(mb, tensor):
+                return tensor[valid_rows[mb % 2]]
 
             def parameter_grads(chunk):
                 return {
@@ -819,7 +881,7 @@ def test_attention_graph_split_scheduler_thd_replay(kind, chunks, monkeypatch):
                     inputs[chunk, mb] = hidden.detach().clone()
                     output = run_decoder(chunk, mb, hidden)
                     value = output.detach().clone()
-                    output[: valid_tokens(mb)].float().sum().backward()
+                    valid(mb, output).float().sum().backward()
                     expected[chunk, mb] = value, hidden.grad.detach().clone()
                     if mb in (1, 3):
                         expected_params[chunk, mb + 1] = parameter_grads(chunk)
@@ -829,6 +891,22 @@ def test_attention_graph_split_scheduler_thd_replay(kind, chunks, monkeypatch):
 
             helper.create_cudagraphs()
             assert helper.graphs_created()
+            replays = []
+            graphed_layers = [layer for layers in helper.callables_per_chunk for layer in layers]
+            for layer in graphed_layers:
+                assert len(layer.cuda_graphs) == 4
+                counted_graphs = []
+                for graph_index, graph in enumerate(layer.cuda_graphs):
+
+                    def counted(*args, _layer=layer, _index=graph_index, _graph=graph, **kwargs):
+                        assert _index == _layer.current_microbatch % len(_layer.cuda_graphs)
+                        replays.append((id(_layer), _layer.current_microbatch))
+                        return _graph(*args, **kwargs)
+
+                    counted.reset = graph.reset
+                    counted_graphs.append(counted)
+                layer.cuda_graphs = counted_graphs
+            bda_managers = _record_bda_managers(monkeypatch)
             for count in (4, 2, 4):
                 _, _, warmup, _ = get_pp_rank_microbatches(
                     count, chunks, 2, p2p_communicator=helper.p2p_communicator
@@ -838,6 +916,8 @@ def test_attention_graph_split_scheduler_thd_replay(kind, chunks, monkeypatch):
                 )
                 forwards, backwards, pending = [0] * chunks, [0] * chunks, {}
                 rebuilds.clear()
+                replays.clear()
+                bda_managers.clear()
                 for entry in order:
                     chunk = abs(entry) - 1
                     if entry > 0:
@@ -847,8 +927,8 @@ def test_attention_graph_split_scheduler_thd_replay(kind, chunks, monkeypatch):
                         hidden = inputs[chunk, mb].clone().requires_grad_(True)
                         output = run_decoder(chunk, mb, hidden)
                         torch.testing.assert_close(
-                            output[: valid_tokens(mb)],
-                            expected[chunk, mb][0][: valid_tokens(mb)],
+                            valid(mb, output),
+                            valid(mb, expected[chunk, mb][0]),
                             msg=lambda m: f'output count={count} chunk={chunk} mb={mb}: {m}',
                         )
                         pending[chunk, mb] = hidden, output
@@ -856,15 +936,22 @@ def test_attention_graph_split_scheduler_thd_replay(kind, chunks, monkeypatch):
                         mb = backwards[chunk]
                         backwards[chunk] += 1
                         hidden, output = pending.pop((chunk, mb))
-                        output[: valid_tokens(mb)].float().sum().backward()
+                        valid(mb, output).float().sum().backward()
                         torch.testing.assert_close(
                             hidden.grad,
                             expected[chunk, mb][1],
                             msg=lambda m: f'input grad count={count} chunk={chunk} mb={mb}: {m}',
                         )
                 assert not pending
-                # The mHC recompute regions around the replayed graphs re-ran in backward.
+                # Every graphed layer replayed once per packed microbatch, and the mHC recompute
+                # regions around the replays, including the attention-side bias-dropout-add,
+                # re-ran in backward.
+                assert sorted(replays) == sorted(
+                    (id(layer), mb) for layer in graphed_layers for mb in range(count)
+                )
                 assert rebuilds['rebuild'] > 0
+                for layer in graphed_layers:
+                    assert bda_managers[id(_attention_hyper_connection(layer))] == [True] * count
                 for chunk in range(chunks):
                     actual = parameter_grads(chunk)
                     assert actual.keys() == expected_params[chunk, count].keys()

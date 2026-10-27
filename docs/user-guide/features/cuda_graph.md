@@ -107,7 +107,8 @@ fixed local token capacity; the source global batch size and micro-batch size 1
 must stay fixed. PP/VPP also requires `--cuda-graph-dynamic-microbatches`, which
 keeps graph inputs alive until their corresponding backward even when packing
 reduces the number of microbatches. Dynamic CP, EP communication overlap, delayed
-wgrad, and paged stash are outside this path. For mHC models, scheduler-packed THD
+wgrad, and paged stash are outside this path. GDN layers stay eager with these batches
+because they read the packed sequence offsets on the host. For mHC models, scheduler-packed THD
 graphs additionally require the mHC attention graph split described under mHC
 training.
 
@@ -194,8 +195,10 @@ through the captured mHC prefix. Whole-layer and whole-MoE TE capture are not
 supported for mHC MoE models. Hybrid partial MoE capture requires separate attention and
 MoE layers, as provided by the standard Hybrid layer specs. TE graphs require independent
 MTP depths (`mtp_use_repeated_layer=False`); this restriction is specific to TE graphs.
-TE mHC capture/replay also requires `padding_mask=None`: the mHC graph boundaries do
-not yet carry the MoE token padding mask into a captured router.
+Except under the attention graph split described below, TE mHC capture/replay also
+requires `padding_mask=None`: the mHC graph boundaries do not yet carry the MoE token
+padding mask into a captured router. The split captures no router, and its eager MLP
+receives the padding mask.
 
 Full-iteration MoE capture requires fixed-capacity, padded expert inputs. The
 eager reference must use the same capacity and padding settings, since capacity
@@ -230,14 +233,15 @@ static input and keeps that copy for the captured backward, so the aggregate is 
 checkpointed and no checkpoint output shares memory with the graph. The bias-dropout-add
 and the MLP sublayer are recomputed as in eager training; `mla_up_proj` may also be
 recomputed. The split applies to GPT layers built from `HyperConnectionTransformerLayer`
-and to Hybrid wrappers around attention-only layers. Hybrid MLP, MoE, GDN, and Mamba
+and to Hybrid wrappers around attention or GDN mixers. Hybrid MLP, MoE, and Mamba
 wrappers run eagerly. Under a graph-safe RNG tracker, which CUDA graphs use, a rebuilt
 checkpoint restores copies of the forward generator states, so a recomputed
 bias-dropout-add applies its forward dropout mask.
 
 The split also accepts scheduler-packed THD batches with the packing options described
 above: its attention graph takes the fixed-capacity sequence offsets, while the eager
-mHC operations and MLP receive the batch's packed metadata.
+mHC operations and MLP receive the batch's packed metadata. GDN wrappers then run
+eagerly, as for any GDN layer with these batches.
 
 Activation offloading and expert-parallel communication overlap are rejected for
 these mHC graph modes. Packed THD input outside the attention graph split,

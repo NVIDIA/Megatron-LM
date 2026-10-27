@@ -492,14 +492,15 @@ def _graph_safe_generator_offsets():
     ]
 
 
+@pytest.mark.parametrize("draw", ["default", "default_then_tracker"])
 @pytest.mark.parametrize("fork_tracker", [False, True])
 @pytest.mark.parametrize("tracker", ["te", "cudagraphable"])
-def test_checkpoint_without_output_replays_graph_safe_rng(tracker, fork_tracker):
-    """A rebuild under a graph-safe RNG tracker replays the forward dropout mask.
+def test_checkpoint_without_output_replays_graph_safe_rng(tracker, fork_tracker, draw):
+    """A rebuild under a graph-safe RNG tracker replays the forward dropout masks.
 
     Graph-safe trackers hold live generator states that the forward pass advances. The
-    rebuild must draw from the forward position of its stream and leave the live states
-    where the forward pass left them.
+    rebuild must draw from the forward position of every stream it uses, the current default
+    stream and the tracker's, and leave the live states where the forward pass left them.
     """
     if tracker == "te" and not is_te_min_version("1.5.0"):
         pytest.skip("Transformer Engine RNG tracker is unavailable")
@@ -514,14 +515,18 @@ def test_checkpoint_without_output_replays_graph_safe_rng(tracker, fork_tracker)
         assert is_graph_safe_cuda_rng_tracker(get_cuda_rng_tracker())
 
         def dropout(x):
-            return torch.nn.functional.dropout(x, p=0.5, training=True)
+            y = torch.nn.functional.dropout(x, p=0.5, training=True)
+            if draw == "default":
+                return y
+            with get_cuda_rng_tracker().fork():
+                return torch.nn.functional.dropout(y, p=0.5, training=True)
 
         x = torch.randn(64, 64, device="cuda", requires_grad=True)
         manager = CheckpointWithoutOutputManager()
         with get_cuda_rng_tracker().fork() if fork_tracker else contextlib.nullcontext():
             output = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(dropout, x)
-        # p=0.5 keeps an element with scale 2; d(sum(output))/dx is that scale.
-        expected_grad = (output.detach() != 0).to(x.dtype) * 2
+        # Each p=0.5 dropout keeps an element with scale 2; d(sum(output))/dx is that product.
+        expected_grad = (output.detach() != 0).to(x.dtype) * (2 if draw == "default" else 4)
         consumer = output * 1.0
         manager.discard_all_outputs_and_register_unified_recompute(consumer)
 

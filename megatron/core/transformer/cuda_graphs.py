@@ -2229,6 +2229,14 @@ def _layer_is_graphable(layer, config):
             isinstance(layer.self_attention, IdentityOp)
             and isinstance(layer.cross_attention, IdentityOp)
         ):
+            from megatron.core.ssm.gated_delta_net.common import _GDNBase
+
+            # GDN reads packed sequence offsets on the host, which capture forbids, so it
+            # stays eager for scheduler-packed THD batches.
+            if getattr(config, "sequence_packing_scheduler", None) is not None and isinstance(
+                layer.self_attention, _GDNBase
+            ):
+                return False
             # attn layer.
             return True
         if (
