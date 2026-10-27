@@ -780,8 +780,9 @@ def consume_seqlen_stats_in_iteration(
 
     Args:
         pg_collection: Process groups of the grid that every rank trains on. Their
-            TP, CP and PP sizes give the deduplication factor. None reads them from
-            the global parallel state.
+            TP, CP and PP sizes give the deduplication factor. Omitting it is
+            deprecated: the sizes are then read from the global parallel state, with a
+            ProcessGroupFallbackWarning.
 
     Returns:
         ``(total_real_tokens, seqlen_squared_sum)`` summed across the whole
@@ -817,6 +818,9 @@ def consume_seqlen_stats_in_iteration(
         torch.distributed.all_reduce(t)
         dedup = pg_collection.tp.size() * pg_collection.cp.size() * pg_collection.pp.size()
     elif torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
+        warn_global_process_group_fallback(
+            "consume_seqlen_stats_in_iteration", deprecated_in="0.21", removed_in="0.23"
+        )
         torch.distributed.all_reduce(t)
         tp_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
         cp_size = max(mpu.get_context_parallel_world_size(), 1)
@@ -1549,8 +1553,9 @@ def _get_train_full_dataset_sample_count(args, dataset_provider, pg_collection=N
     Opt-in providers must accept ``restore_dataloader_state=False`` and expose
     the finite loader through ``_dataloader`` on ranks that own training data.
     Actual restoration happens after model setup resolves the checkpoint iteration.
-    The sample counts are reduced over the groups of ``pg_collection``, or over
-    the global parallel state when it is None.
+    The sample counts are reduced over the groups of ``pg_collection``. Omitting it is
+    deprecated: they are then reduced over the global parallel state, with a
+    ProcessGroupFallbackWarning.
     """
     cfg = get_run_config()
     if not getattr(dataset_provider, 'supports_train_full_dataset', False):
@@ -1569,6 +1574,13 @@ def _get_train_full_dataset_sample_count(args, dataset_provider, pg_collection=N
         if hasattr(train_data_iterator, '_dataloader')
         else None
     )
+    if pg_collection is None:
+        warn_global_process_group_fallback(
+            "_get_train_full_dataset_sample_count", deprecated_in="0.21", removed_in="0.23"
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["mp", "dp_gtp_remat", "dp_cp_gtp_remat"]
+        )
     total_num_samples = reduce_max_stat_across_model_parallel_group(
         _reduce_sum_across_data_parallel_group(
             local_num_samples,
@@ -1577,7 +1589,7 @@ def _get_train_full_dataset_sample_count(args, dataset_provider, pg_collection=N
             ),
             pg_collection=pg_collection,
         ),
-        group=pg_collection.mp if pg_collection is not None else None,
+        group=pg_collection.mp,
     )
     if total_num_samples is None:
         raise ValueError("--train-full-dataset resolved to an empty training dataset")
@@ -2336,7 +2348,8 @@ def wrap_model_chunks_with_ddp(
         pg_collection: Optional :class:`ProcessGroupCollection`. When provided,
             forwarded to standard DDP and Megatron-FSDP, used to pick the DP x CP group
             Torch FSDP2 shards over, and used to source DP world sizes for layout
-            computation.
+            computation. Omitting it is deprecated: the layout is then sized from the global
+            parallel state, with a ProcessGroupFallbackWarning.
         bucket_sizes: Optional per-chunk bucket size override; defaults to
             ``[ddp_config.bucket_size] * len(model_chunks)``.
         disable_bucketing_per_chunk: Optional per-chunk disable_bucketing flag;
@@ -2367,11 +2380,13 @@ def wrap_model_chunks_with_ddp(
         else:
             compute_layout = None
         if compute_layout is not None:
-            layout_pgs = (
-                pg_collection
-                if pg_collection is not None
-                else ProcessGroupCollection.use_mpu_process_groups()
-            )
+            if pg_collection is None:
+                warn_global_process_group_fallback(
+                    "wrap_model_chunks_with_ddp", deprecated_in="0.21", removed_in="0.23"
+                )
+                layout_pgs = ProcessGroupCollection.use_mpu_process_groups()
+            else:
+                layout_pgs = pg_collection
             assert layout_pgs.dp_cp is not None, (
                 "wrap_model_chunks_with_ddp requires a dp_cp process group to size "
                 "the distributed-optimizer parameter layout"
@@ -2566,27 +2581,36 @@ def _build_pg_collection_from_parallel_state(args):
     return pg_collection
 
 
-def _get_model_pg_collection(model, pg_collection):
+def _get_model_pg_collection(model, pg_collection, *, owner="the training loop"):
     """Return the process groups that this rank's model chunks run on.
 
     A model built on a collection carries it; under a multi-module collection it holds the
     groups of this rank's module. A model without one runs on ``pg_collection`` when that is a
-    single-grid collection. Only a caller that passes neither reads the global parallel state.
+    single-grid collection. When there is neither, the global parallel state is used with a
+    ProcessGroupFallbackWarning that names ``owner``, the function whose caller omitted the
+    collection; this fallback is deprecated.
     """
     model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
     if model_pg_collection is not None:
         return model_pg_collection
     if isinstance(pg_collection, ProcessGroupCollection):
         return pg_collection
+    warn_global_process_group_fallback(owner, deprecated_in="0.21", removed_in="0.23")
     return ProcessGroupCollection.use_mpu_process_groups()
 
 
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None, ddp_config=None):
-    """Build the model using a finalized DDP config, or legacy args if omitted."""
+    """Build the model using a finalized DDP config, or legacy args if omitted.
+
+    pg_collection: process groups that the model is built and wrapped on. Omitting it is
+        deprecated: they are then built from the global parallel state, with a
+        ProcessGroupFallbackWarning.
+    """
     cfg = get_run_config()
     args = get_args()
     args.model_type = model_type
     if pg_collection is None:
+        warn_global_process_group_fallback("get_model", deprecated_in="0.21", removed_in="0.23")
         pg_collection = _build_pg_collection_from_parallel_state(args)
 
     if has_nvidia_modelopt:
@@ -3283,13 +3307,16 @@ def dummy_train_step(data_iterator, pg_collection: ProcessGroupCollection | None
 
     Args:
         data_iterator: Training data iterator to advance by one iteration.
-        pg_collection: Process groups of the model the batches are read for. None reads
-            them from the global parallel state.
+        pg_collection: Process groups of the model the batches are read for. Omitting it is
+            deprecated: they are then read from the global parallel state, with a
+            ProcessGroupFallbackWarning.
     """
     cfg = get_run_config()
     args = get_args()
     if pg_collection is None:
-        # Compatibility for callers that pass no collection.
+        warn_global_process_group_fallback(
+            "dummy_train_step", deprecated_in="0.21", removed_in="0.23"
+        )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(
             required_pgs=["tp", "pp", "cp", "dynamic_cp"]
         )
@@ -3400,7 +3427,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     pg_collection: process groups forwarded to the schedule: the model's collection, or a
         multi-module collection for the cross-grid case. None makes the schedule use the global
         parallel state. Reductions source per-rank groups from the model, or from a single-grid
-        pg_collection when the model carries none.
+        pg_collection when the model carries none; with neither, they use the global parallel
+        state with a ProcessGroupFallbackWarning, a deprecated fallback.
     p2p_communicator: pipeline communicator forwarded to the schedule; the pipelined schedules
         take it together with pg_collection.
     """
@@ -3585,7 +3613,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(get_train_state().iteration)
 
-    model_pg_collection = _get_model_pg_collection(model, pg_collection)
+    model_pg_collection = _get_model_pg_collection(model, pg_collection, owner="train_step")
     samples_seen_in_iteration = _get_samples_seen_in_iteration(
         losses_reduced, args, model_pg_collection
     )
@@ -3790,7 +3818,12 @@ def training_log(
     packed_sequence_stats: Optional[Dict[str, float]] = None,
     num_microbatches: int | None = None,
 ):
-    """Log training information such as losses, timing, ...."""
+    """Log training information such as losses, timing, ....
+
+    pg_collection: process groups of the model whose statistics are logged. Omitting it is
+        deprecated: the global parallel state is used instead, with a
+        ProcessGroupFallbackWarning.
+    """
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     train_state = get_train_state()
@@ -3802,6 +3835,16 @@ def training_log(
     wandb_writer = get_wandb_writer()
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
+    # The memory report prints on rank 0 of this data-parallel group; None selects
+    # pg_collection.dp.
+    memory_report_group = None
+    if pg_collection is None:
+        warn_global_process_group_fallback("training_log", deprecated_in="0.21", removed_in="0.23")
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["mp", "pp", "dp", "dp_gtp_remat", "dp_cp_gtp_remat"]
+        )
+        # The rank of mpu.get_data_parallel_rank(), which spans the GTP weight-remat axis.
+        memory_report_group = pg_collection.dp_gtp_remat
 
     # total_loss_dict sums over a log interval and is reset once printed. The first
     # iteration always prints: under --log-interval 100 that is an extra line inside an
@@ -3883,9 +3926,8 @@ def training_log(
         wandb_writer.log(packed_sequence_stats, iteration)
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
-    _lr_mp_group = pg_collection.mp if pg_collection is not None else None
     learning_rate: float | None = reduce_max_stat_across_model_parallel_group(
-        learning_rate, group=_lr_mp_group
+        learning_rate, group=pg_collection.mp
     )
     if learning_rate is None and args.freeze_all_layers:
         learning_rate = 0.0
@@ -4045,12 +4087,6 @@ def training_log(
                 "DSA indexer logging requires a language-model ProcessGroupCollection"
             )
             pg_collection = pg_collection.get_language_model_collection()
-        if pg_collection is None:
-            # Compatibility path for legacy training entrypoints such as tasks/finetune_utils.py.
-            # The core logger still receives explicit groups and does not read MPU globals.
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=['pp', 'dp']
-            )
         assert isinstance(
             pg_collection, ProcessGroupCollection
         ), "DSA indexer logging requires a ProcessGroupCollection"
@@ -4227,7 +4263,9 @@ def training_log(
                 )
             report_memory(
                 f'(after {iteration} iterations)',
-                process_group=pg_collection.dp if pg_collection is not None else None,
+                process_group=(
+                    pg_collection.dp if memory_report_group is None else memory_report_group
+                ),
             )
             reported_memory_in_this_iteration = True
             loaded_iteration = max(get_loaded_iteration() or 0, 0)
@@ -4238,7 +4276,9 @@ def training_log(
             not reported_memory_in_this_iteration:
             report_memory(
                 f'(after {iteration} iterations)',
-                process_group=pg_collection.dp if pg_collection is not None else None,
+                process_group=(
+                    pg_collection.dp if memory_report_group is None else memory_report_group
+                ),
             )
         # Write timers to wandb, don't reset the counts.
         if cfg.logger.log_timers_to_tensorboard:
@@ -4529,7 +4569,8 @@ def _check_gpu_sniff_test_pg_collection(
 def _run_gpu_sniff_test(tag, span_name='megatron.train.sniff_test', pg_collection=None):
     """Run the GPU sniff test over the EP, DP and TP groups of ``pg_collection``.
 
-    None tests the groups of the global parallel state.
+    Omitting it is deprecated: run_gpu_sniff_test() then tests the groups of the global
+    parallel state, with a ProcessGroupFallbackWarning.
     """
     from megatron.training.gpu_sniff_test import run_gpu_sniff_test
 
@@ -4547,15 +4588,15 @@ def _run_gpu_sniff_test(tag, span_name='megatron.train.sniff_test', pg_collectio
     print_datetime(f'finished GPU sniff test ({tag})')
 
 
-def _param_hashes_match_across_dp_replicas(model):
+def _param_hashes_match_across_dp_replicas(model, pg_collection):
     """Return whether every data-parallel replica of the model holds the same parameters.
 
-    The replicas are those of the model's process-group collection; a model without one is
-    checked across the replicas of the global parallel state.
+    The replicas are those of the model's process-group collection, or of ``pg_collection``,
+    the run's collection, for a model without one (see ``_get_model_pg_collection``).
     """
-    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
-    if model_pg_collection is None:
-        model_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    model_pg_collection = _get_model_pg_collection(
+        model, pg_collection, owner="_param_hashes_match_across_dp_replicas"
+    )
     return check_param_hashes_across_dp_replicas(
         model,
         cross_check=True,
@@ -4576,8 +4617,10 @@ def post_training_step_callbacks(
 ):
     """Run all post-training-step functions (e.g., FT heartbeats, GC).
 
-    pg_collection: process groups of the run's single grid, which the periodic GPU sniff test
-        exercises. None tests the groups of the global parallel state.
+    pg_collection: process groups of the run's single grid. The periodic GPU sniff test
+        exercises them, and the weight hash check compares the replicas of a model that carries
+        no collection of its own over them. Omitting it is deprecated: the global parallel
+        state is used instead, with a ProcessGroupFallbackWarning.
     """
     args = get_args()
     # Temporary args/config duplication during the training-loop refactor:
@@ -4602,7 +4645,7 @@ def post_training_step_callbacks(
         if should_disable_forward_pre_hook(args):
             disable_forward_pre_hook(model, optimizer=optimizer)
         assert _param_hashes_match_across_dp_replicas(
-            model
+            model, pg_collection
         ), "Parameter hashes not matching across DP replicas"
         torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
@@ -4779,8 +4822,9 @@ def _get_data_parallel_world_size(pg_collection, args):
     """Return the number of ranks that read distinct sequences.
 
     This independent-sequence degree spans the GTP weight-remat axis, so it can differ from the
-    number of weight replicas. It comes from the ``dp_gtp_remat`` group of ``pg_collection``, or
-    from the global parallel state when ``pg_collection`` is None.
+    number of weight replicas. It comes from the ``dp_gtp_remat`` group of ``pg_collection``.
+    Without a collection, train() falls back to the global parallel state, with a
+    ProcessGroupFallbackWarning; this fallback is deprecated.
     """
     if pg_collection is not None:
         sample_group = pg_collection.dp_gtp_remat
@@ -4790,6 +4834,7 @@ def _get_data_parallel_world_size(pg_collection, args):
             raise ValueError("The training process groups must include dp_gtp_remat")
         return sample_group.size()
     if mpu.model_parallel_is_initialized():
+        warn_global_process_group_fallback("train", deprecated_in="0.21", removed_in="0.23")
         return mpu.get_data_parallel_world_size()
     # Bootstrap fallback before process groups are initialized.
     return get_batch_parallel_size(args)
@@ -4830,10 +4875,12 @@ def train(
     p2p_communicator: pipeline communicator forwarded to the schedule; the pipelined schedules
         take it together with pg_collection.
     pg_collection: process groups that select the schedule and are forwarded to it: the model's
-        collection, or a multi-module collection for the cross-grid case. None selects and runs
-        the schedule on the global parallel state. A single-grid collection also sizes the
-        batch accounting and runs the sequence statistics, the skipped-iteration batches and
-        the GPU sniff test. A multi-module collection rejects the GPU sniff test.
+        collection, or a multi-module collection for the cross-grid case. A single-grid
+        collection also sizes the batch accounting, runs the sequence statistics, the
+        skipped-iteration batches and the GPU sniff test, and serves as the model's groups when
+        the model carries none. Omitting it is deprecated: the global parallel state is used
+        instead, with a ProcessGroupFallbackWarning. A multi-module collection rejects the GPU
+        sniff test.
 
     Raises:
         ValueError: if ``--gpu-sniff-test-interval`` is set with a multi-module collection.
@@ -4976,7 +5023,7 @@ def train(
     for model_module in model:
         model_module.train()
 
-    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+    model_pg_collection = _get_model_pg_collection(model, pg_collection, owner="train")
     # The parameter norm of a multi-module model sums over every module's grid.
     params_norm_pg_collection = (
         pg_collection
@@ -5202,7 +5249,7 @@ def train(
     if cfg.train.check_weight_hash_across_dp_replicas_interval is not None:
         with _otel_managed_span('job', 'megatron.startup.weight_hash_check', is_goodput_span=True):
             assert _param_hashes_match_across_dp_replicas(
-                model
+                model, pg_collection
             ), "Parameter hashes not matching across DP replicas"
             torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
@@ -5876,7 +5923,7 @@ def evaluate(
     )
     forward_backward_func = _get_forward_backward_func(pg_collection, config)
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
-    eval_pgc = _get_model_pg_collection(model, pg_collection)
+    eval_pgc = _get_model_pg_collection(model, pg_collection, owner="evaluate")
     # gtp_remat-inclusive, mirroring train_step: gtp_remat peers hold distinct micro-batches, so
     # the reduction must cover every distinct-data rank. Reducing over the replicate dp_cp would
     # average a 1/gtp_remat subsample of the eval batch (768 sequences read, 12 averaged at
@@ -6097,7 +6144,10 @@ def evaluate_and_print_results(
         assert len(eval_iters) == len(data_iterators)
 
         # with full validation we need to distribute eval_iters to all ranks
-        if _get_model_pg_collection(model, pg_collection).tp.rank() == 0:
+        eval_pgc = _get_model_pg_collection(
+            model, pg_collection, owner="evaluate_and_print_results"
+        )
+        if eval_pgc.tp.rank() == 0:
             eval_iters = torch.tensor(cfg.validation.eval_iters, dtype=torch.long, device='cuda')
         else:
             eval_iters = torch.tensor([0] * len(eval_iters), dtype=torch.long, device='cuda')
@@ -6299,6 +6349,9 @@ def build_train_valid_test_data_loaders(
     if is_distributed:
         build_data_pipeline = True
     elif pg_collection is None:
+        warn_global_process_group_fallback(
+            "build_train_valid_test_data_loaders", deprecated_in="0.21", removed_in="0.23"
+        )
         build_data_pipeline = mpu.get_tensor_model_parallel_rank() == 0
     else:
         build_data_pipeline = get_pg_rank(pg_collection.tp) == 0
