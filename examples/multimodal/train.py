@@ -15,17 +15,13 @@ from dataloader_provider import is_first_or_last_stage, train_valid_test_dataloa
 from model import model_provider
 from multimodal_args import add_multimodal_extra_args
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, LLaVAModel
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.parallel_state import (
-    get_pipeline_model_parallel_world_size,
-    get_tensor_and_context_parallel_group,
-    get_tensor_model_parallel_rank,
-    is_pipeline_last_stage,
-)
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+from megatron.core.pipeline_parallel.utils import is_pp_last_stage
+from megatron.core.process_groups_config import resolve_process_groups
+from megatron.core.utils import get_attr_wrapped_model, nvtx_range_pop, nvtx_range_push
 from megatron.training import get_args, get_run_config, get_timers, get_tokenizer, pretrain
 from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
@@ -38,21 +34,43 @@ from megatron.training.training import (
 )
 
 
-def _get_batch_broadcast_group(args):
-    """Select the group that receives a prepared multimodal batch."""
-    if (
+def _deduplicates_dataloader_across_context_parallel(args):
+    """Whether one rank of each TP x CP group reads the batch for the whole group.
+
+    Otherwise each tensor-parallel group reads its own batch.
+    """
+    return (
         getattr(args, "deduplicate_dataloader_across_context_parallel", False)
         and args.context_parallel_size > 1
-    ):
-        return get_tensor_and_context_parallel_group()
-    return None
+    )
 
 
-def get_batch(data_iterator, image_token_index, img_seq_len):
+def get_batch(data_iterator, image_token_index, img_seq_len, pg_collection=None):
     """Generate a batch
 
     Note: attn_mask_type in layer_specs.py sets the attention mask. Attention mask is None here.
+
+    Args:
+        data_iterator: Iterator over this rank's micro-batches, or None on ranks without a
+            dataloader.
+        image_token_index: Token id of the image placeholder.
+        img_seq_len: Number of image embeddings per image.
+        pg_collection: Process groups of the model. The batch is read on the first rank of
+            its tensor-parallel group (or of its TP x CP group with a dataloader deduplicated
+            across context parallelism) and broadcast over that group; its pipeline-parallel
+            group gives the stage. None falls back to the global parallel state with a
+            ProcessGroupFallbackWarning; that fallback is deprecated.
     """
+    args = get_args()
+    deduplicate_across_context_parallel = _deduplicates_dataloader_across_context_parallel(args)
+    pg_collection = resolve_process_groups(
+        pg_collection,
+        owner="examples.multimodal.train.get_batch",
+        # The TP x CP group carries the batch only when the dataloader is deduplicated across CP.
+        required=("tp", "pp", "tp_cp") if deduplicate_across_context_parallel else ("tp", "pp"),
+        deprecated_in="0.21",
+        removed_in="0.23",
+    )
     cfg = get_run_config()
     imgs = None
     tokens = None
@@ -69,18 +87,19 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
     samples_seen = None
     sample_lengths = None
 
-    args = get_args()
-    batch_broadcast_group = _get_batch_broadcast_group(args)
+    batch_broadcast_group = (
+        pg_collection.tp_cp if deduplicate_across_context_parallel else pg_collection.tp
+    )
 
     def broadcast(keys, dtype):
-        return tensor_parallel.broadcast_data(
-            keys, data, dtype, tp_group=batch_broadcast_group
-        )
+        return tensor_parallel.broadcast_data(keys, data, dtype, tp_group=batch_broadcast_group)
 
     # Dataloader doesn't run on the middle stages in a pipeline parallel model.
-    pp_size = get_pipeline_model_parallel_world_size()
+    pp_size = pg_collection.pp.size()
     if not is_first_or_last_stage(
-        pp_size, getattr(args, "encoder_pipeline_model_parallel_size", 0)
+        pp_size,
+        getattr(args, "encoder_pipeline_model_parallel_size", 0),
+        pg_collection=pg_collection,
     ):
         # Note these are all set to None above.
         return (
@@ -101,7 +120,7 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
 
     # Broadcast data.
     nvtx_range_push("get_data")
-    if data_iterator is not None and get_tensor_model_parallel_rank() == 0:
+    if data_iterator is not None and pg_collection.tp.rank() == 0:
         timers = get_timers()
         timers('dataloader-next', log_level=1).start()
         try:
@@ -175,7 +194,7 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
         num_frames = torch.tensor([], dtype=torch.int, device=data_text.device)
 
     # Last pipeline parallel stage doesn't need images.
-    if pp_size > 1 and is_pipeline_last_stage():
+    if pp_size > 1 and is_pp_last_stage(pg_collection.pp):
         imgs = None
 
     # If cu_lengths and max_lengths are non-dummy, construct PackedSeqParams. Otherwise, leave it at None.
@@ -387,7 +406,18 @@ def scaled_loss_func(loss_mask, output_tensor, samples_seen):
     )
 
 
-def loss_func(loss_mask, output_tensor, samples_seen):
+def loss_func(loss_mask, output_tensor, samples_seen, pg_collection=None):
+    """Masked language-model loss.
+
+    Args:
+        loss_mask: Mask of the tokens that count toward the loss.
+        output_tensor: Per-token losses of the model.
+        samples_seen: Number of samples in the batch, reported as a metric.
+        pg_collection: Process groups of the model. With context parallelism, the reported
+            loss and token count are summed over its context-parallel group. None falls back
+            to the global parallel state with a ProcessGroupFallbackWarning; that fallback is
+            deprecated.
+    """
     args = get_args()
 
     losses = output_tensor.view(-1).float()
@@ -407,15 +437,21 @@ def loss_func(loss_mask, output_tensor, samples_seen):
     global_loss = loss.detach().clone()
     global_num_tokens = num_tokens.clone()
     if torch.distributed.is_initialized() and args.context_parallel_size > 1:
+        pg_collection = resolve_process_groups(
+            pg_collection,
+            owner="examples.multimodal.train.loss_func",
+            required=("cp",),
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        # torch.distributed reduces over all ranks for a None group.
+        if pg_collection.cp is None:
+            raise ValueError("loss_func with context parallelism requires pg_collection.cp")
         torch.distributed.all_reduce(
-            global_loss,
-            op=torch.distributed.ReduceOp.SUM,
-            group=parallel_state.get_context_parallel_group(),
+            global_loss, op=torch.distributed.ReduceOp.SUM, group=pg_collection.cp
         )
         torch.distributed.all_reduce(
-            global_num_tokens,
-            op=torch.distributed.ReduceOp.SUM,
-            group=parallel_state.get_context_parallel_group(),
+            global_num_tokens, op=torch.distributed.ReduceOp.SUM, group=pg_collection.cp
         )
 
     reporting_loss = torch.cat([global_loss.view(1), global_num_tokens.view(1)])
@@ -439,6 +475,7 @@ def forward_step(data_iterator, model: LLaVAModel):
         loss_func (callable): Loss function with a loss mask specified.
     """
     timers = get_timers()
+    pg_collection = get_attr_wrapped_model(model, "pg_collection")
 
     # Get the batch.
     timers('batch-generator', log_level=1).start()
@@ -456,7 +493,12 @@ def forward_step(data_iterator, model: LLaVAModel):
         vision_packed_seq_params,
         has_pad_img,
         samples_seen,
-    ) = get_batch(data_iterator, model.module.module.image_token_index, model.module.module.img_seq_len)
+    ) = get_batch(
+        data_iterator,
+        model.module.module.image_token_index,
+        model.module.module.img_seq_len,
+        pg_collection=pg_collection,
+    )
     timers('batch-generator').stop()
 
     output_tensor, loss_mask = model(
@@ -477,7 +519,9 @@ def forward_step(data_iterator, model: LLaVAModel):
     if args.use_loss_scaling and args.context_parallel_size == 1:
         loss_function = partial(scaled_loss_func, loss_mask, samples_seen=samples_seen)
     else:
-        loss_function = partial(loss_func, loss_mask, samples_seen=samples_seen)
+        loss_function = partial(
+            loss_func, loss_mask, samples_seen=samples_seen, pg_collection=pg_collection
+        )
 
     return output_tensor, loss_function
 
