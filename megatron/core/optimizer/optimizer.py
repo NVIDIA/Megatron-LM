@@ -1857,7 +1857,12 @@ class ChainedOptimizer(MegatronOptimizer):
         return self._step()
 
     def grads_states_parallel_group_is_shared(self):
-        """Check if all optimizers share the same gradient statistics parallel group."""
+        """Whether all optimizers' gradient statistics can share one reduction."""
+        if any(
+            getattr(optimizer, 'requires_individual_grad_stats', False)
+            for optimizer in self.chained_optimizers
+        ):
+            return False
         reference_group = self.chained_optimizers[0].get_grad_stats_parallel_group()
         return all(
             optimizer.get_grad_stats_parallel_group() == reference_group
@@ -1999,15 +2004,8 @@ class ChainedOptimizer(MegatronOptimizer):
             if len(parameters) == 0:
                 continue
 
-            use_fsdp_decoupled_grad = (
-                # Megatron-FSDP always uses decoupled_grad with FusedAdam.
-                optimizer.config.use_precision_aware_optimizer
-                and getattr(parameters[0], "__fsdp_param__", False)
-            )
-            use_decoupled_grad = (
-                optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-                or use_fsdp_decoupled_grad
-            )
+            # All members share this config (asserted in __init__).
+            use_decoupled_grad = self._uses_decoupled_grad(parameters)
 
             main_params = []
             params_by_grad_norm_group = {}
