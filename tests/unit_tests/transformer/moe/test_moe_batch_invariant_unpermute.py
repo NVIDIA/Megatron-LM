@@ -111,3 +111,58 @@ def test_unpermute_with_probs_uses_loop(ep_world_size):
     )
     ref = batch_invariant._unpermute_loop(rows, restore_shape, probs, num_experts, inverse_map, 2)
     assert torch.equal(_bits(out), _bits(ref))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_fused_unpermute_backward_is_cuda_graph_capturable(ep_world_size, dtype):
+    """The fused forward and backward capture into one CUDA graph and replay bitwise.
+
+    The engine's AllToAll combine takes this ``probs=None`` path inside captured graphs, so
+    no step may depend on the inverse map's contents (no boolean indexing). The map holds
+    an invalid slot and leaves rows 3 and 5 unused; their gradients must stay zero. The
+    upstream gradient is non-contiguous and carries signed zeros.
+    """
+    ep_world_size(2)
+    num_experts, hidden = 4, 40
+    # Tokens x top-2 slots; slot (1, 1) is invalid, rows 3 and 5 belong to no slot.
+    inverse_rows = torch.tensor([[0, 4], [1, -1], [2, 6]], device="cuda")
+    inverse_experts = torch.tensor([[0, 3], [1, -1], [2, 0]], device="cuda")
+    inverse_map = torch.stack((inverse_rows, inverse_experts))
+    restore_shape = torch.Size((3, hidden))
+    rows = _adversarial((7, hidden), dtype, seed=11).requires_grad_()
+    grad = _adversarial((hidden, 3), dtype, seed=12).t()  # non-contiguous
+    assert not grad.is_contiguous()
+
+    def step():
+        rows.grad = None
+        out = batch_invariant.unpermute(
+            rows, restore_shape, probs=None, num_experts=num_experts, inverse_map=inverse_map
+        )
+        out.backward(grad)
+        return out
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(2):
+            step()
+    torch.cuda.current_stream().wait_stream(side)
+
+    graph = torch.cuda.CUDAGraph()
+    rows.grad = None
+    with torch.cuda.graph(graph):
+        out = batch_invariant.unpermute(
+            rows, restore_shape, probs=None, num_experts=num_experts, inverse_map=inverse_map
+        )
+        out.backward(grad)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    loop_rows = rows.detach().clone().requires_grad_()
+    loop = batch_invariant._unpermute_loop(
+        loop_rows, restore_shape, None, num_experts, inverse_map, 2
+    )
+    loop.backward(grad)
+    assert torch.equal(_bits(out), _bits(loop))
+    assert torch.equal(_bits(rows.grad), _bits(loop_rows.grad))
+    assert torch.equal(_bits(rows.grad[[3, 5]]), _bits(torch.zeros_like(rows.grad[[3, 5]])))

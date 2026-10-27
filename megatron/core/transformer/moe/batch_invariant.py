@@ -108,6 +108,43 @@ def _rank_tree_unpermute_kernel(
     tl.store(out_ptr + token.to(tl.int64) * hidden + offsets, out, mask=in_hidden)
 
 
+@triton.jit
+def _rank_tree_unpermute_bwd_kernel(
+    grad_out_ptr,
+    grad_out_stride_token,
+    grad_out_stride_hidden,
+    inverse_rows_ptr,
+    valid_ptr,
+    grad_rows_ptr,
+    hidden,
+    TOPK: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """One program per (token, hidden block): scatter the token's gradient to its rows.
+
+    Each permuted row belongs to one (token, slot), so the stores never collide. The grid
+    depends only on tensor shapes, which keeps the backward CUDA-graph capturable.
+    """
+    token = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    in_hidden = offsets < hidden
+    grad = tl.load(
+        grad_out_ptr
+        + token.to(tl.int64) * grad_out_stride_token
+        + offsets * grad_out_stride_hidden,
+        mask=in_hidden,
+        other=0.0,
+    )
+    # The loop accumulates into zeros, so -0.0 arrives as +0.0. Written as a select:
+    # ``grad + 0.0`` may be folded away.
+    grad = tl.where(grad == 0, 0.0, grad).to(grad_rows_ptr.dtype.element_ty)
+    for k in tl.static_range(TOPK):
+        row = tl.load(inverse_rows_ptr + token * TOPK + k)
+        valid = tl.load(valid_ptr + token * TOPK + k) != 0
+        safe_row = tl.where(valid, row, 0).to(tl.int64)
+        tl.store(grad_rows_ptr + safe_row * hidden + offsets, grad, mask=in_hidden & valid)
+
+
 class _RankTreeUnpermute(torch.autograd.Function):
     """Fused ``unpermute`` for ``probs=None``: same arithmetic tree as the loop, one launch."""
 
@@ -136,7 +173,7 @@ class _RankTreeUnpermute(torch.autograd.Function):
                 num_warps=4,
             )
         valid = (inverse_rows >= 0) & (inverse_experts >= 0) & (inverse_experts < num_experts)
-        ctx.save_for_backward(inverse_rows, valid)
+        ctx.save_for_backward(inverse_rows, valid.to(torch.int8))
         ctx.num_rows = rows.shape[0]
         return out
 
@@ -144,12 +181,25 @@ class _RankTreeUnpermute(torch.autograd.Function):
     def backward(ctx, grad_output):
         # pylint: disable=missing-function-docstring
         inverse_rows, valid = ctx.saved_tensors
-        tokens = torch.arange(inverse_rows.shape[0], device=grad_output.device)
-        tokens = tokens.unsqueeze(1).expand_as(inverse_rows)[valid]
-        grad_rows = grad_output.new_zeros(ctx.num_rows, grad_output.shape[-1])
-        # Each permuted row belongs to one (token, slot). Adding +0.0 maps -0.0 to +0.0,
-        # as the loop's accumulation into zeros does.
-        grad_rows.index_copy_(0, inverse_rows[valid], grad_output.index_select(0, tokens) + 0.0)
+        num_tokens, topk = inverse_rows.shape
+        hidden = grad_output.shape[-1]
+        grad_output = grad_output.reshape(num_tokens, hidden)
+        # Rows no (token, slot) owns keep a zero gradient.
+        grad_rows = grad_output.new_zeros(ctx.num_rows, hidden)
+        if num_tokens > 0:
+            block_h = min(triton.next_power_of_2(hidden), 512)
+            _rank_tree_unpermute_bwd_kernel[(num_tokens, triton.cdiv(hidden, block_h))](
+                grad_output,
+                grad_output.stride(0),
+                grad_output.stride(1),
+                inverse_rows,
+                valid,
+                grad_rows,
+                hidden,
+                TOPK=topk,
+                BLOCK_H=block_h,
+                num_warps=4,
+            )
         return grad_rows, None, None, None, None
 
 
