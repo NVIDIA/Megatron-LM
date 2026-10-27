@@ -20,6 +20,7 @@ from megatron.core.activations import squared_relu
 from megatron.core.inference.communication.torch_symm_triton import are_tensors_nvls_eligible
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
+from megatron.core.transformer.moe.moe_utils import fused_topk_with_score_function
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.initialize import _set_random_seed
@@ -33,6 +34,10 @@ requires_torch_grouped_mm = pytest.mark.skipif(
     not is_torch_min_version("2.10") or not hasattr(torch, '_grouped_mm'),
     reason="Requires PyTorch >= 2.10 with torch._grouped_mm",
 )
+requires_te_fused_router = pytest.mark.skipif(
+    fused_topk_with_score_function is None, reason="Requires the transformer-engine fused router"
+)
+ROUTER_FUSION = [False, pytest.param(True, marks=requires_te_fused_router)]
 
 
 _NVFP4_ACTIVATIONS = {
@@ -253,6 +258,72 @@ class TestInferenceTopKRouter:
 
         # Same expert selections
         assert training_experts == inference_experts
+
+    @pytest.mark.parametrize("batch_invariant", [False, True], ids=["compiled", "eager"])
+    @pytest.mark.parametrize("topk", [1, 2])
+    @pytest.mark.parametrize("fusion", ROUTER_FUSION)
+    def test_inference_routing_is_dense_topk(self, monkeypatch, fusion, topk, batch_invariant):
+        """Inference routing is [num_tokens, topk] fp32 probs and int64 expert IDs for every
+        router fusion setting and top-k, and selects the training routing's experts and probs."""
+        import megatron.core.transformer.moe.router as router_module
+
+        # Batch-invariant mode routes eagerly instead of through the compiled routing function.
+        monkeypatch.setattr(
+            router_module, "is_batch_invariant_mode_enabled", lambda: batch_invariant
+        )
+        router = self._make_router(moe_router_topk=topk, moe_router_fusion=fusion)
+        num_tokens = 16
+        hidden = torch.randn(
+            num_tokens, 1, NANOV3_BASE["hidden_size"], device="cuda", dtype=torch.bfloat16
+        )
+        with torch.no_grad():
+            # Nonzero expert bias, so selection (scores + bias) differs from the probs (scores).
+            router.expert_bias.copy_(0.05 * torch.randn_like(router.expert_bias))
+            training_probs, training_map = router(hidden)
+        with torch.inference_mode(), InferenceMode.active():
+            probs, top_indices = router(hidden)
+
+        assert probs.shape == top_indices.shape == (num_tokens, topk)
+        assert probs.dtype == torch.float32 and top_indices.dtype == torch.int64
+        inference_map = torch.zeros_like(training_map).scatter(1, top_indices, True)
+        assert torch.equal(inference_map, training_map)
+        torch.testing.assert_close(probs, training_probs.gather(1, top_indices))
+
+    @requires_te
+    @pytest.mark.parametrize(
+        "backend", ["vllm", pytest.param("torch", marks=requires_torch_grouped_mm)]
+    )
+    @pytest.mark.parametrize("topk", [1, 2])
+    @pytest.mark.parametrize("fusion", ROUTER_FUSION)
+    def test_moe_layer_matches_training(self, fusion, topk, backend):
+        """The inference MoE layer consumes the inference routing for every router fusion
+        setting and top-k: at EP=1 its output matches the same layer's training path."""
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            InferenceAllGatherDispatcherBase,
+            NVLSAllGatherVDispatcher,
+        )
+
+        if backend == "torch" and torch.cuda.get_device_capability()[0] < 9:
+            pytest.skip("BF16 torch grouped_mm requires SM90+")
+        config = _make_base_config(
+            moe_router_topk=topk,
+            moe_router_fusion=fusion,
+            moe_shared_expert_intermediate_size=None,
+            inference_grouped_gemm_backend=backend,
+        )
+        layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        # Standalone layer without a dynamic context: no symmetric buffers or padding mask.
+        NVLSAllGatherVDispatcher._delete_buffers()
+        InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
+        hidden = torch.randn(16, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            training_output, _ = layer(hidden.clone())
+        with torch.inference_mode(), InferenceMode.active():
+            inference_output, _ = layer(hidden.clone())
+
+        error = (inference_output.float() - training_output.float()).norm()
+        assert error <= 2e-2 * training_output.float().norm()
 
 
 # ──────────────────────────────────────────────────────────────────────

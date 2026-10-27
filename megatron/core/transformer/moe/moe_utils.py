@@ -888,6 +888,9 @@ def topk_routing_with_score_function(
     assert not (
         fused and precomputed_indices is not None
     ), "precomputed_indices is not supported with the fused top-k score function."
+    # TE capability controls the implementation, not the requested output format: dense output
+    # needs TE's dense index output, so without it the unfused path computes the routing.
+    fused = fused and (not dense_output or fused_topk_with_score_function_supports_topk_indices)
     if fused:
         if not HAVE_TE or fused_topk_with_score_function is None:
             raise ValueError(
@@ -920,9 +923,15 @@ def topk_routing_with_score_function(
                 qb_bin_bounds=qb_bin_bounds,
                 qb_histogram_mode="fused_atomic",
             )
+        if dense_output and topk_indices is None:
+            topk_indices = torch.empty((num_tokens, topk), dtype=torch.int64, device=logits.device)
         if fused_topk_with_score_function_supports_topk_indices and topk_indices is not None:
             kwargs["topk_indices"] = topk_indices
-        return fused_topk_with_score_function(**kwargs)
+        probs, routing_map = fused_topk_with_score_function(**kwargs)
+        if dense_output:
+            # TE wrote the selected expert IDs to topk_indices; its probs are full width.
+            return probs.gather(1, topk_indices), topk_indices
+        return probs, routing_map
 
     def _compute_topk(
         scores: torch.Tensor,

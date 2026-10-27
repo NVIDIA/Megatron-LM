@@ -123,6 +123,46 @@ def test_fused_router_only_forwards_supported_topk_indices(monkeypatch, supports
     assert "topk_indices" not in received_kwargs
 
 
+@pytest.mark.internal
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not HAVE_ROUTER_FUSION,
+    reason="TE fused router ops not available",
+)
+@pytest.mark.parametrize("dense_te_indices", [False, True])
+@pytest.mark.parametrize("topk", [1, 2])
+@pytest.mark.parametrize(
+    "score_function,use_pre_softmax", [("softmax", False), ("softmax", True), ("sigmoid", False)]
+)
+def test_fused_dense_routing_matches_unfused(
+    monkeypatch, score_function, use_pre_softmax, topk, dense_te_indices
+):
+    """fused=True honours dense_output: [num_tokens, topk] probs and int64 expert IDs equal to
+    the unfused routing, with or without TE's dense index output."""
+    if dense_te_indices and not HAVE_DENSE_ROUTER_FUSION:
+        pytest.skip("TE dense fused router output is not available")
+    monkeypatch.setattr(
+        moe_utils, "fused_topk_with_score_function_supports_topk_indices", dense_te_indices
+    )
+    torch.manual_seed(123)
+    num_tokens, num_experts = 32, 16
+    logits = torch.randn(num_tokens, num_experts, device="cuda")
+    kwargs = dict(score_function=score_function, use_pre_softmax=use_pre_softmax, dense_output=True)
+    if score_function == "sigmoid":
+        kwargs.update(
+            expert_bias=0.05 * torch.randn(num_experts, device="cuda"), scaling_factor=2.5
+        )
+
+    ref_probs, ref_indices = topk_routing_with_score_function(logits, topk, **kwargs)
+    probs, indices = topk_routing_with_score_function(logits, topk, fused=True, **kwargs)
+
+    assert probs.shape == indices.shape == (num_tokens, topk)
+    assert probs.dtype == logits.dtype and indices.dtype == torch.int64
+    # Top-k order is unspecified; compare each token's routes ordered by expert ID.
+    order, ref_order = indices.argsort(dim=1), ref_indices.argsort(dim=1)
+    assert torch.equal(indices.gather(1, order), ref_indices.gather(1, ref_order))
+    torch.testing.assert_close(probs.gather(1, order), ref_probs.gather(1, ref_order))
+
+
 @pytest.mark.parametrize("padding", ["none", "mixed", "all"])
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_expert_bias_dense_counts_match_bool_path(padding, deterministic):
