@@ -64,6 +64,26 @@ class TestParallelTransformerBlock:
         layer_1: TransformerLayer = parallel_transformer_block._get_layer(1)
         assert layer_1.layer_number == 2
 
+    @pytest.mark.parametrize("recompute_method", [None, "uniform", "block"])
+    def test_layer_backward_hooks_receive_activation_gradients(self, recompute_method):
+        """Both eager and recomputed layer calls expose input-gradient completion."""
+        block = self.parallel_transformer_block.cuda()
+        if recompute_method is not None:
+            block.config.recompute_granularity = "full"
+            block.config.recompute_method = recompute_method
+            block.config.recompute_num_layers = 1
+        seen = []
+
+        def check_input_gradient(_module, grad_input, _grad_output):
+            assert grad_input and grad_input[0] is not None
+            seen.append(True)
+
+        for layer in block.layers:
+            layer.register_full_backward_hook(check_input_gradient)
+        x = torch.randn(8, 2, block.config.hidden_size, device="cuda", requires_grad=True)
+        block(x, attention_mask=None).float().square().mean().backward()
+        assert seen == [True] * block.config.num_layers
+
     def test_gpu_forward(self):
         parallel_transformer_block = self.parallel_transformer_block
         config: TransformerConfig = parallel_transformer_block.config

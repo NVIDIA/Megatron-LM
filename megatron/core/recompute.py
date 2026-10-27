@@ -113,7 +113,6 @@ def checkpointed_forward(
                 # layers (currently MambaLayer in HybridStack) pop the kwargs
                 # they don't accept and treat the return as a single tensor.
                 layer_kwargs = dict(
-                    hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     context=context,
                     context_mask=context_mask,
@@ -129,13 +128,13 @@ def checkpointed_forward(
                     layer_kwargs["input_ids"] = input_ids
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
-                        hidden_states, context = layer(**layer_kwargs)
+                        hidden_states, context = layer(hidden_states, **layer_kwargs)
                     elif isinstance(getattr(layer, "inner_layer", None), TransformerLayer):
                         # Hybrid mHC wrappers accept the TransformerLayer execution inputs,
                         # including hash-routing token IDs, but not cross-attention-only kwargs.
                         for k in ("context", "context_mask", "attention_bias"):
                             layer_kwargs.pop(k, None)
-                        hidden_states, context = layer(**layer_kwargs)
+                        hidden_states, context = layer(hidden_states, **layer_kwargs)
                     else:  # MambaLayer (HybridStack `M` slot)
                         for k in (
                             "context",
@@ -153,7 +152,7 @@ def checkpointed_forward(
                             layer_kwargs["packed_sequence_cp_metadata"] = (
                                 packed_sequence_cp_metadata
                             )
-                        hidden_states = layer(**layer_kwargs)
+                        hidden_states = layer(hidden_states, **layer_kwargs)
                         context = None
 
                 # Some layer paths may still return a tuple (defensive).

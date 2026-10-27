@@ -2263,7 +2263,6 @@ class TestInlineCaptureManager:
         assert len(mgr.cudagraph_runners) == 1
         assert mgr.cudagraph_runners[0].fwd_graph_recorded
 
-    @torch.inference_mode()
     def test_eager_bypass(self):
         """eager=True must bypass graph capture entirely."""
         config = self._make_config()

@@ -1356,8 +1356,8 @@ class TestFsdpNonUnitBucketPreservation:
                 )
 
             def forward(self, hidden_states):
-                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
-                return self.mamba_layer(hidden_states=h)
+                h, _ = self.attn_layer(hidden_states, attention_mask=None)
+                return self.mamba_layer(h)
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)
@@ -1462,8 +1462,8 @@ class TestFsdpMambaConvParamGather:
                 )
 
             def forward(self, hidden_states):
-                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
-                return self.mamba_layer(hidden_states=h)
+                h, _ = self.attn_layer(hidden_states, attention_mask=None)
+                return self.mamba_layer(h)
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)
@@ -1564,8 +1564,8 @@ class TestFsdpHybridModelDoubleBuffer:
                 )
 
             def forward(self, hidden_states):
-                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
-                return self.mamba_layer(hidden_states=h)
+                h, _ = self.attn_layer(hidden_states, attention_mask=None)
+                return self.mamba_layer(h)
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)

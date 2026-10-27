@@ -622,9 +622,7 @@ class TestResidualStreamRecomputeIntegration:
         hidden_states = torch.randn(4, 3, 24, device="cuda", requires_grad=True)
         context = build_residual_stream_recompute_plan(1, 1)[0]
         output, _ = layer(
-            hidden_states=hidden_states,
-            attention_mask=None,
-            residual_stream_recompute_context=context,
+            hidden_states, attention_mask=None, residual_stream_recompute_context=context
         )
         context.finalize(output)
         output.square().mean().backward()
@@ -739,13 +737,11 @@ class TestResidualStreamRecomputeIntegration:
 
         reference.residual_read.register_forward_hook(record_read("eager"), with_kwargs=True)
         recomputed.residual_read.register_forward_hook(record_read("replay"), with_kwargs=True)
-        reference_output = reference(hidden_states=reference_input)
+        reference_output = reference(reference_input)
         reference_output.square().mean().backward()
 
         context = build_residual_stream_recompute_plan(1, 1)[0]
-        recomputed_output = recomputed(
-            hidden_states=recomputed_input, residual_stream_recompute_context=context
-        )
+        recomputed_output = recomputed(recomputed_input, residual_stream_recompute_context=context)
         assert len(context.manager.checkpoints) == 2
         context.finalize(recomputed_output)
         recomputed_output.square().mean().backward()

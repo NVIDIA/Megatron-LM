@@ -1836,7 +1836,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 else:
                     # GPT path: single TransformerLayer
                     hidden_states, _ = self.mtp_model_layer(
-                        hidden_states=hidden_states,
+                        hidden_states,
                         attention_mask=attention_mask,
                         context=context,
                         context_mask=context_mask,

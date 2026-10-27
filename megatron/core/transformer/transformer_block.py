@@ -745,7 +745,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     )
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
-                            hidden_states=hidden_states,
+                            hidden_states,
                             attention_mask=attention_mask,
                             context=context,
                             context_mask=context_mask,

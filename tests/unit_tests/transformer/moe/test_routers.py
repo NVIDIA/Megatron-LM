@@ -2020,7 +2020,7 @@ class TestHashRouting:
         hidden_states = torch.randn(8, 2, config.hidden_size, device="cuda", requires_grad=True)
         input_ids = torch.randint(0, config.hash_moe_vocab_size, (2, 8), device="cuda")
 
-        output, _ = layer(hidden_states=hidden_states, attention_mask=None, input_ids=input_ids)
+        output, _ = layer(hidden_states, attention_mask=None, input_ids=input_ids)
 
         assert layer.mlp.router.is_hash_layer
         assert output.shape == hidden_states.shape
