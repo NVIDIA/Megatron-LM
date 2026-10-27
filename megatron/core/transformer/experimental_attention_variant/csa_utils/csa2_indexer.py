@@ -24,7 +24,7 @@ from megatron.core.ops.attention.csa.indexer_quantization import (
 )
 
 from . import fused_sparse_attention
-from .csa2_candidates import CSA2CandidateBlocks, select_compact_positions
+from .csa2_candidates import CSA2CandidateBlocks, fused_candidate_blocks, select_compact_positions
 from .csa2_teacher_lse import fused_csa_window_lse
 from .thd_utils import CSA2THDCompressionLayout, CSA2THDLayout
 
@@ -203,43 +203,64 @@ def _compact_candidate_offsets(cu_q: Tensor, offsets: Tensor, ratio: int) -> Ten
 
 
 @torch.no_grad()
-def fused_mxfp8_topk(inputs: CSA2IndexerInputs, topk: int) -> Tensor:
-    """Use cuDNN's compact MXFP8 scorer for ordinary Full/Reindex selection.
+def fused_compact_topk(inputs: CSA2IndexerInputs, topk: int, precision: str) -> Tensor:
+    """Use cuDNN's compact BF16/MXFP8 scorer for unrestricted key selection.
 
     All layouts use the existing packed rows, including CP-local queries and
     global keys. Dispatch-local scratch and host-known bounds keep capture
     independent of live prefix values without a second workspace/cache API.
+    BF16 retains bounded scoring on devices/frontends without compact support.
     """
+    if precision not in ("bf16", "mxfp8"):
+        raise ValueError("CSA2 compact selection precision must be bf16 or mxfp8")
     q, k, weights = inputs.q, inputs.k, inputs.weights
     width = min(topk, inputs.key_capacity)
     shape = (*inputs.output_shape, width)
     if q.shape[0] == 0 or k.shape[0] == 0 or width == 0 or inputs.max_keys == 0:
         return torch.full(shape, -1, dtype=torch.int32, device=q.device)
+    fused_sparse_attention._ensure_dsa_namespace()
+    compact = getattr(fused_sparse_attention._DSA, "indexer_forward_top_k_wrapper", None)
+    if not callable(compact) or torch.cuda.get_device_capability(q.device)[0] < 10:
+        if precision == "bf16":
+            indices, _ = fused_candidate_blocks(
+                inputs, topk_blocks=0, block_size=1, precision=precision, token_topk=topk
+            )
+            return indices
+        raise RuntimeError("CSA2 MXFP8 selection requires cuDNN compact support and SM100 or later")
     heads = q.shape[-2]
     weights = (weights.float() * (q.shape[-1] ** -0.5 * heads**-0.5)).to(weights.dtype)
-    if heads == 32:
+    if precision == "mxfp8" and heads == 32:
         q = torch.nn.functional.pad(q, (0, 0, 0, 32))
         weights = torch.nn.functional.pad(weights, (0, 32))
     cu_q, cu_k, max_q, max_k = inputs.packed_metadata
     offsets = inputs.packed_causal_offsets
     # Odd r2 spans can have one more causal candidate than complete K groups.
     max_k = max(max_k, (max_q + inputs.ratio - 1) // inputs.ratio)
-    quantized = []
-    for value, prefix, num_heads in ((q, cu_q, q.shape[-2]), (k, cu_k, 1)):
-        scale_prefix = make_indexer_mxfp8_scale_cu_seqlens(prefix, num_heads)
-        capacity = indexer_mxfp8_thd_scale_capacity(value.shape[0], prefix.numel() - 1, num_heads)
-        scales = torch.empty(
-            indexer_mxfp8_thd_scale_shape(capacity, num_heads, value.shape[-1]),
-            dtype=torch.float8_e8m0fnu,
-            device=value.device,
+    precision_kwargs = {}
+    if precision == "mxfp8":
+        quantized = []
+        for value, prefix, num_heads in ((q, cu_q, q.shape[-2]), (k, cu_k, 1)):
+            scale_prefix = make_indexer_mxfp8_scale_cu_seqlens(prefix, num_heads)
+            capacity = indexer_mxfp8_thd_scale_capacity(
+                value.shape[0], prefix.numel() - 1, num_heads
+            )
+            scales = torch.empty(
+                indexer_mxfp8_thd_scale_shape(capacity, num_heads, value.shape[-1]),
+                dtype=torch.float8_e8m0fnu,
+                device=value.device,
+            )
+            data, scales = quantize_indexer_mxfp8(
+                value, cu_seqlens=prefix, cu_seqlens_scale_padded=scale_prefix, out_scale=scales
+            )
+            quantized.append((data, scales, scale_prefix))
+        (q, qs, q_prefix), (k, ks, k_prefix) = quantized
+        precision_kwargs.update(
+            q_scale=qs,
+            k_scale=ks,
+            cu_seqlens_q_scale_padded=q_prefix,
+            cu_seqlens_k_scale_padded=k_prefix,
         )
-        data, scales = quantize_indexer_mxfp8(
-            value, cu_seqlens=prefix, cu_seqlens_scale_padded=scale_prefix, out_scale=scales
-        )
-        quantized.append((data, scales, scale_prefix))
-    (q, qs, q_prefix), (k, ks, k_prefix) = quantized
-    fused_sparse_attention._ensure_dsa_namespace()
-    result = fused_sparse_attention._DSA.indexer_forward_top_k_wrapper(
+    result = compact(
         q,
         k.unsqueeze(1),
         weights,
@@ -250,16 +271,13 @@ def fused_mxfp8_topk(inputs: CSA2IndexerInputs, topk: int) -> Tensor:
         max_seqlen_q=max_q,
         max_seqlen_k=max_k,
         q_causal_offsets=offsets,
-        precision="mxfp8",
-        q_scale=qs,
-        k_scale=ks,
-        cu_seqlens_q_scale_padded=q_prefix,
-        cu_seqlens_k_scale_padded=k_prefix,
+        precision=precision,
         cand_buffer=torch.empty(q.shape[0] * max_k, dtype=torch.float32, device=q.device),
         cand_batch_offsets=_compact_candidate_offsets(cu_q, offsets, inputs.ratio),
         deterministic=True,
         return_softmax=False,
         topk_indices_global=False,
+        **precision_kwargs,
     )
     indices = result["indices"]
     valid = (indices >= 0) & (indices < inputs.visible[:, None]) & inputs.valid[:, None]

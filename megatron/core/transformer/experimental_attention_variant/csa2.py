@@ -22,6 +22,7 @@ from torch import nn
 from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.ops._backends import require
+from megatron.core.ops.attention.csa.cudnn_pooling import get_cudnn_r2_pool
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import async_gather_from_sequence_parallel_region
@@ -63,9 +64,9 @@ from .csa_utils.csa2_context_parallel import (
 from .csa_utils.csa2_indexer import (
     CSA2IndexerInputs,
     fused_candidate_topk,
+    fused_compact_topk,
     fused_csa2_indexer_loss,
     fused_csa2_indexer_sparse_attn,
-    fused_mxfp8_topk,
     prepare_csa2_indexer_inputs,
 )
 from .csa_utils.fused_sparse_attention import (
@@ -332,6 +333,9 @@ class CSA2Compressor(MegatronModule):
         self.compress_ratio = compress_ratio
         self.tp_group = pg_collection.tp
         self.use_fused_compressor = use_fused_dsa_kernels(config)
+        self._fused_r2_pool = (
+            get_cudnn_r2_pool() if compress_ratio == 2 and self.use_fused_compressor else None
+        )
         linear_kwargs = dict(
             config=config,
             init_method=config.init_method,
@@ -409,8 +413,15 @@ class CSA2Compressor(MegatronModule):
             gate = self.linear_wgate(x)[0] if self.linear_wgate is not None else None
         return latent, gate
 
-    @torch.compile
     def _pool_r2(self, latent, gate, dtype, valid_groups=None):
+        if self._fused_r2_pool is not None:
+            pooled = self._fused_r2_pool(latent, gate, dtype, valid_groups)
+            if pooled is not None:
+                return pooled
+        return self._pool_r2_native(latent, gate, dtype, valid_groups)
+
+    @torch.compile
+    def _pool_r2_native(self, latent, gate, dtype, valid_groups=None):
         """Pool non-overlapping pairs in FP32, with one final activation cast."""
         shape = (latent.shape[0] // 2, 2, *latent.shape[1:])
         pooled = (latent.float().reshape(shape) * gate.float().reshape(shape).softmax(1)).sum(1)
@@ -801,15 +812,10 @@ class CSA2Indexer(MegatronModule):
 
     @torch.no_grad()
     def _fused_topk(self, inputs: CSA2IndexerInputs) -> torch.Tensor:
-        """Select physical packed indices with compact MXFP8 or bounded BF16 scoring."""
+        """Select physical packed indices with the shared BF16/MXFP8 compact scorer."""
         if inputs.candidates is not None:
             return fused_candidate_topk(inputs, self.topk, self.precision)
-        if self.precision == "mxfp8":
-            return fused_mxfp8_topk(inputs, self.topk)
-        indices, _ = fused_candidate_blocks(
-            inputs, topk_blocks=0, block_size=1, precision=self.precision, token_topk=self.topk
-        )
-        return indices
+        return fused_compact_topk(inputs, self.topk, self.precision)
 
     @torch.no_grad()
     def _candidate_blocks(

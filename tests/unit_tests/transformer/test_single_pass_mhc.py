@@ -5,7 +5,11 @@
 import pytest
 import torch
 
-from megatron.core.transformer.hyper_connection import HyperConnectionModule, SinglePassMHCState
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    SinglePassMHCState,
+    get_mhc_aggregate,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -59,6 +63,41 @@ def test_entry_selects_first_stream_and_exit_uses_last_mix():
     torch.testing.assert_close(SinglePassMHCState(mix).contract(x, 3), x[..., -4:])
     with pytest.raises(ValueError, match="preceding"):
         SinglePassMHCState(mix[:, :, :2]).contract(x, 3)
+
+
+@pytest.mark.parametrize("backend", ["none", "native", "triton", "cutile"])
+def test_final_contraction_preserves_fp32_mix_and_gradients(backend):
+    """The final readout must use the requested backend without rounding its mix."""
+    from megatron.core.fusions import fused_mhc_kernels
+
+    if backend == "cutile" and not fused_mhc_kernels.is_cutile_available():
+        pytest.skip("cuTile unavailable")
+    cfg = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        enable_mhc_connections=True,
+        mhc_single_pass=True,
+        use_fused_mhc=backend != "none",
+        mhc_fused_backend="auto" if backend == "none" else backend,
+    )
+    torch.manual_seed(432)
+    x = torch.randn(129, 1, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    mix = torch.randn(129, 1, 4, device="cuda", dtype=torch.float32, requires_grad=True)
+    aggregate = get_mhc_aggregate(cfg)
+    assert (aggregate is None) == (backend == "none")
+    actual = SinglePassMHCState(mix).contract(x, 4, aggregate=aggregate)
+    expected = (x.float().unflatten(-1, (4, 128)) * mix.unsqueeze(-1)).sum(-2).bfloat16()
+    probe = torch.randn_like(actual)
+    actual_grads = torch.autograd.grad(actual, (x, mix), probe, retain_graph=True)
+    expected_grads = torch.autograd.grad(expected, (x, mix), probe)
+    assert actual.dtype == x.dtype
+    assert actual_grads[1].dtype == torch.float32
+    for observed, reference in zip((actual, *actual_grads), (expected, *expected_grads)):
+        cosine = torch.nn.functional.cosine_similarity(
+            observed.float().flatten(), reference.float().flatten(), dim=0
+        )
+        assert cosine >= 0.99999
 
 
 @pytest.mark.parametrize("backend", ["none", "native", "triton"])
@@ -117,7 +156,9 @@ def test_single_pass_mhc_replays_bit_exact(fused):
             output = self.mhc.fused_h_res_h_post_bda(
                 residual_mix, residual, post, (branch, None), 0.0, True, False
             )
-            return state.contract(output, config.mhc_num_residual_streams)
+            return state.contract(
+                output, config.mhc_num_residual_streams, aggregate=get_mhc_aggregate(config)
+            )
 
     assert_module_replays_bit_exact(
         Projection(),

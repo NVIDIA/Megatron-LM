@@ -131,6 +131,31 @@ def _stack(cfg, spec, groups, start=0, end=6):
     )
 
 
+@pytest.mark.parametrize("fused", [False, True])
+def test_hybrid_final_contraction_uses_configured_aggregate(setup, monkeypatch, fused):
+    """Do not silently drop the fusion callback at the HybridStack boundary."""
+    cfg, spec, groups = setup
+    cfg.use_fused_mhc = fused
+    cfg.mhc_fused_backend = "native"
+    calls = []
+
+    def aggregate(streams, mix):
+        calls.append((streams.shape, mix.dtype))
+        return (streams.float() * mix.unsqueeze(-1)).sum(-2)
+
+    monkeypatch.setattr(
+        hybrid_block,
+        "get_mhc_aggregate",
+        lambda config: aggregate if config.use_fused_mhc else None,
+    )
+    stack = _stack(cfg, spec, groups)
+    x = torch.randn(8, 2, cfg.hidden_size, requires_grad=True)
+    output, _ = _run(stack, x, cfg, groups)
+    output.square().mean().backward()
+    assert calls == ([(torch.Size([8, 2, 2, 16]), torch.float32)] if fused else [])
+    assert torch.isfinite(x.grad).all()
+
+
 def _run(stack, x, cfg, groups, values=None):
     codec = V41StateCodec(cfg, BatchShape(x.shape[0], x.shape[1]), groups.cp)
     context = V41ForwardContext(codec=codec, values={} if values is None else values)
