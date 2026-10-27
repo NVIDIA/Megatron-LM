@@ -57,7 +57,10 @@ On RTX PRO 6000 (SM120), exact NVFP4 training comparisons require
 `NVTE_NVFP4_DISABLE_RHT=1` and `NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING=1`
 before Python starts. These tests cover a constrained recipe, not full NVFP4
 or convergence. Hardware and recipe support remain Transformer Engine's
-responsibility.
+responsibility. In the reduced GDN2 TP2 test on SM120/TE 2.20.2, NVFP4 fused
+weight-gradient GEMM failed even without offloading when non-distributed DDP gave
+an FP32 `main_grad` only 8-byte alignment. The TP2 fusion comparison uses the
+distributed optimizer, which aligns parameter buffers.
 
 ## Saved tensors and integration boundary
 
