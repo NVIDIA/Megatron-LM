@@ -1,12 +1,15 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
 import torch.nn as nn
 
-from megatron.core import fp8_utils
+from megatron.core import fp8_utils, parallel_state
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -17,6 +20,18 @@ try:
     HAVE_MXFP8_TENSOR = True
 except ImportError:
     HAVE_MXFP8_TENSOR = False
+
+try:
+    from transformer_engine.pytorch.fp8 import check_fp8_support
+
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelLinear,
+        TERowParallelLinear,
+    )
+
+    fp8_available, reason_for_no_fp8 = check_fp8_support()
+except ImportError:
+    fp8_available, reason_for_no_fp8 = False, "FP8 requires Transformer Engine"
 
 # MXFP8 needs Blackwell or newer.
 mxfp8_available = HAVE_MXFP8_TENSOR and get_device_arch_version() >= 10
@@ -168,6 +183,137 @@ class TestFP8Padding:
 
             # Verify output has original shape
             assert output.shape == (6, 2, 4096)  # Back to original seq_len
+
+
+@pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+class TestFP8PaddingSequenceParallel:
+    """The padding wrapper on tensor-parallel TE linears with sequence parallelism.
+
+    The module's own all-gather (column-parallel) or reduce-scatter (row-parallel) must stay the
+    only communication, so the wrapped FP8 output equals the unwrapped one.
+    """
+
+    TP = 2
+    BATCH = 2
+    # The wrapper pads 40 tokens (20 per rank); 32 tokens (16 per rank) are already aligned.
+    SEQ_LENS = [pytest.param(32, id="aligned"), pytest.param(40, id="padded")]
+
+    def setup_method(self, method):
+        if Utils.world_size % self.TP != 0:
+            pytest.skip(f"requires a world size divisible by TP={self.TP}")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=self.TP)
+        model_parallel_cuda_manual_seed(123)
+        fp8_utils._fp8_inference_wrapped_modules.clear()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        fp8_utils._fp8_inference_wrapped_modules.clear()
+
+    def _config(self):
+        return TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            tensor_model_parallel_size=self.TP,
+            sequence_parallel=True,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+            add_bias_linear=False,
+            fp8="e4m3",
+            fp8_recipe="tensorwise",
+        )
+
+    def _setup(self, config, parallel_mode, seq_len):
+        """Build the TE linear from a full weight and return it with this rank's input and the
+        expected output, computed in fp64 from the full operands."""
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        rank = tp_group.rank()
+        in_features, out_features = (256, 128) if parallel_mode == "row" else (128, 256)
+        generator = torch.Generator().manual_seed(seq_len)
+        x = torch.randn(seq_len, self.BATCH, in_features, generator=generator).bfloat16()
+        weight = (torch.randn(out_features, in_features, generator=generator) * 0.05).bfloat16()
+        expected = torch.einsum("sbk,nk->sbn", x.double(), weight.double())
+
+        kwargs = dict(
+            config=config,
+            init_method=config.init_method,
+            bias=False,
+            skip_bias_add=True,
+            is_expert=False,
+            tp_group=tp_group,
+        )
+        if parallel_mode == "row":
+            module = TERowParallelLinear(
+                in_features, out_features, input_is_parallel=True, **kwargs
+            )
+            weight_shard = weight.chunk(self.TP, dim=1)[rank]
+            x_local = x.chunk(self.TP, dim=2)[rank]
+            expected = expected.chunk(self.TP, dim=0)[rank]
+        else:
+            module = TEColumnParallelLinear(
+                in_features, out_features, gather_output=False, **kwargs
+            )
+            weight_shard = weight.chunk(self.TP, dim=0)[rank]
+            x_local = x.chunk(self.TP, dim=0)[rank]
+            expected = expected.chunk(self.TP, dim=2)[rank]
+        assert module.sequence_parallel
+        with torch.no_grad():
+            module.weight.copy_(weight_shard)
+        return module.eval(), x_local.contiguous().cuda(), expected.cuda()
+
+    @staticmethod
+    def _forward(module, x, fp8_config=None):
+        context = nullcontext() if fp8_config is None else fp8_utils.get_fp8_context(fp8_config)
+        with torch.no_grad(), context:
+            output, _ = module(x)
+        return output
+
+    @staticmethod
+    def _rel_err(actual, expected):
+        """Relative Frobenius error over the whole tensor-parallel group."""
+        sums = torch.stack(
+            [((actual.double() - expected.double()) ** 2).sum(), (expected.double() ** 2).sum()]
+        )
+        torch.distributed.all_reduce(sums, group=parallel_state.get_tensor_model_parallel_group())
+        return (sums[0] / sums[1]).sqrt().item()
+
+    @pytest.mark.parametrize("parallel_mode", ["row", "column"])
+    def test_wrapper_is_noop_outside_fp8(self, parallel_mode):
+        module, x, expected = self._setup(self._config(), parallel_mode, seq_len=40)
+        unwrapped = self._forward(module, x)
+        fp8_utils.prepare_model_for_fp8_inference(module)
+        wrapped = self._forward(module, x)
+
+        torch.testing.assert_close(wrapped, unwrapped)
+        torch.testing.assert_close(wrapped.double(), expected, atol=2e-2, rtol=2e-2)
+
+    @pytest.mark.parametrize("parallel_mode", ["row", "column"])
+    @pytest.mark.parametrize("seq_len", SEQ_LENS)
+    def test_wrapped_output_matches_unwrapped(self, parallel_mode, seq_len):
+        config = self._config()
+        module, x, expected = self._setup(config, parallel_mode, seq_len)
+        unwrapped = self._forward(module, x, config)
+
+        inner_seq_lens = []
+        inner_forward = module.forward
+
+        def recording_forward(input_tensor, *args, **kwargs):
+            inner_seq_lens.append(input_tensor.shape[0])
+            return inner_forward(input_tensor, *args, **kwargs)
+
+        module.forward = recording_forward
+        fp8_utils.prepare_model_for_fp8_inference(module)
+        wrapped = self._forward(module, x, config)
+
+        if seq_len == 40:
+            assert inner_seq_lens[0] > x.shape[0], "the wrapper did not pad the FP8 input"
+        assert module.sequence_parallel
+        assert wrapped.shape == unwrapped.shape == expected.shape
+        # E4M3 quantization of both operands keeps the result within a few percent.
+        assert self._rel_err(unwrapped, expected) < 0.15
+        # Zero padding rows leave the FP8 scales unchanged, so only GEMM rounding differs. A second
+        # reduction across the TP ranks would scale the output by TP (relative error TP - 1).
+        assert self._rel_err(wrapped, unwrapped) < 0.05
 
 
 @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
