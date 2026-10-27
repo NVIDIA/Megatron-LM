@@ -799,7 +799,15 @@ def test_gradients_follow_canonical_source_order(ep_group, dtype, backend):
     try:
         plan = transport.prepare_plan(_placement(config, table))
         native = _native_grads(config)
-        destinations = tuple(ReplicaGradDestination(tuple(tensor)) for tensor in native)
+        destinations = tuple(
+            ReplicaGradDestination(
+                tuple(tensor),
+                bases=torch.tensor(
+                    [row.data_ptr() for row in tensor], dtype=torch.int64, device=config.device
+                ),
+            )
+            for tensor in native
+        )
         for projection, tensor in enumerate(native):
             tensor.fill_(7)
             if rank == 1:
