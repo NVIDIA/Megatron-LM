@@ -6315,7 +6315,8 @@ def build_train_valid_test_data_loaders(
         pg_collection: Process groups of the run. Unless the provider is distributed-aware,
             the first rank of its tensor-parallel group builds the data pipeline. A provider
             with a ``pg_collection`` parameter receives it, and the loaders shard samples over
-            its data-parallel group. None uses the global parallel state.
+            its data-parallel group. Omitting it is deprecated: the global parallel state is
+            used instead, with a ProcessGroupFallbackWarning.
     """
 
     args = get_args()
@@ -6436,8 +6437,9 @@ def build_train_valid_test_data_iterators(
         build_train_valid_test_datasets_provider: Function that builds the train, validation
             and test datasets.
         pg_collection: Process groups of the run, used to build the data loaders and to agree
-            on the number of full-validation iterations across its data-parallel ranks. None
-            uses the global parallel state.
+            on the number of full-validation iterations across its data-parallel ranks.
+            Omitting it is deprecated: the global parallel state is used instead, with a
+            ProcessGroupFallbackWarning.
     """
 
     cfg = get_run_config()

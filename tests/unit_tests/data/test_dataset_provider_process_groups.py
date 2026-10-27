@@ -21,11 +21,13 @@ import torch
 import pretrain_gpt
 import pretrain_hybrid
 import pretrain_vlm
-from megatron.core import parallel_state, process_groups_config
+from megatron.core import parallel_state, process_groups_config, tensor_parallel
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.training import training
 from megatron.training.config import TrainingConfig, ValidationConfig
+from megatron.training.datasets import data_samplers
 from megatron.training.state import TrainState
+from megatron.training.utils import is_first_or_last_pipeline_stage
 from tests.unit_tests.test_utilities import Utils
 
 # Tests of the explicit path fail on any fallback warning, as under strict mode.
@@ -342,6 +344,178 @@ def test_vlm_dataset_rank_check_without_groups_warns_and_uses_the_global_group(m
     assert use_mpu.call_args.kwargs == {"required_pgs": ["tp"]}
 
 
+# The deprecated fallbacks of the data path warn
+
+
+def test_stage_check_without_a_pipeline_group_warns_and_reads_the_global_grid(monkeypatch):
+    calls = []
+
+    def first_stage(ignore_virtual=True, vp_stage=None):
+        calls.append(("first", ignore_virtual, vp_stage))
+        return False
+
+    def last_stage(ignore_virtual=True, vp_stage=None):
+        calls.append(("last", ignore_virtual, vp_stage))
+        return True
+
+    monkeypatch.setattr(parallel_state, "is_pipeline_first_stage", first_stage)
+    monkeypatch.setattr(parallel_state, "is_pipeline_last_stage", last_stage)
+
+    with _fallback_warning("is_first_or_last_pipeline_stage", "pp_group"):
+        assert is_first_or_last_pipeline_stage(1) is True
+    assert calls == [("first", False, 1), ("last", False, 1)]
+
+
+@no_fallback
+def test_stage_check_with_a_pipeline_group_does_not_warn(monkeypatch):
+    _forbid_global_process_groups(monkeypatch)
+    _use_fake_groups(monkeypatch)
+
+    assert is_first_or_last_pipeline_stage(None, pp_group=_FakeGroup(1, [0, 1, 2])) is False
+
+
+def _loader_args(dataloader_type):
+    return SimpleNamespace(
+        dataloader_type=dataloader_type,
+        num_workers=0,
+        data_sharding=True,
+        dynamic_context_parallel=False,
+        sequence_packing_scheduler=None,
+        use_varlen_dataset=False,
+        varlen_sbhd_validation=False,
+    )
+
+
+def test_pretraining_sampler_without_groups_warns_and_shards_over_the_global_group(
+    monkeypatch, run_config
+):
+    run_config.train.micro_batch_size = 1
+    monkeypatch.setattr(data_samplers, "get_args", lambda: _loader_args("single"))
+    monkeypatch.setattr(parallel_state, "get_data_parallel_rank", lambda: 1)
+    monkeypatch.setattr(parallel_state, "get_data_parallel_world_size", lambda: 2)
+
+    with _fallback_warning("build_pretraining_data_loader"):
+        loader = data_samplers.build_pretraining_data_loader(range(8), consumed_samples=2)
+
+    assert list(loader.batch_sampler) == [[3], [5], [7]]
+
+
+@no_fallback
+def test_external_data_loader_without_groups_reads_no_groups(monkeypatch, run_config):
+    _forbid_global_process_groups(monkeypatch)
+    monkeypatch.setattr(data_samplers, "get_args", lambda: _loader_args("external"))
+    dataset = range(8)
+
+    assert data_samplers.build_pretraining_data_loader(dataset, consumed_samples=0) is dataset
+
+
+def test_full_validation_group_without_groups_warns_and_uses_the_global_group(monkeypatch):
+    global_group = object()
+    get_group = Mock(return_value=global_group)
+    monkeypatch.setattr(parallel_state, "get_data_parallel_group", get_group)
+
+    with _fallback_warning("build_train_valid_test_data_iterators"):
+        group = training._get_data_parallel_group(
+            None, with_context_parallel=True, owner="build_train_valid_test_data_iterators"
+        )
+    assert group is global_group
+    get_group.assert_called_once_with(with_context_parallel=True)
+
+
+@pytest.fixture(params=[pretrain_gpt, pretrain_hybrid], ids=["gpt", "hybrid"])
+def batch_script(request, monkeypatch):
+    """A get_batch entry point with stubbed TP and CP helpers that record their groups."""
+    module = request.param
+    _use_fake_groups(monkeypatch)
+    args = SimpleNamespace(
+        sequence_packing_scheduler=None,
+        dynamic_context_parallel=False,
+        context_parallel_size=1,
+        sft=False,
+        dataloader_inter_document_masking=False,
+        create_attention_mask_in_dataloader=False,
+        micro_batch_size=1,
+        seq_length=8,
+        pipeline_model_parallel_size=1,
+    )
+    config = SimpleNamespace(
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=None,
+        virtual_pipeline_model_parallel_size=None,
+        sequence_parallel=False,
+        tensor_model_parallel_size=2,
+        linear_cp_layout="zigzag",
+        attention_cp_layout="zigzag",
+    )
+    monkeypatch.setattr(module, "get_args", lambda: args)
+    monkeypatch.setattr(module, "core_transformer_config_from_args", lambda args: config)
+    tp_broadcast = Mock(side_effect=lambda batch, **kwargs: dict.fromkeys(module.BATCH_KEYS))
+    monkeypatch.setattr(module, "get_batch_on_this_tp_rank", tp_broadcast)
+    if module is pretrain_gpt:
+        monkeypatch.setattr(module, "get_batch_on_this_cp_rank", lambda batch, **kwargs: batch)
+    else:
+        monkeypatch.setattr(module, "get_batches_on_this_cp_rank", Mock())
+    return SimpleNamespace(module=module, tp_broadcast=tp_broadcast)
+
+
+def test_get_batch_without_groups_warns_and_uses_the_global_groups(batch_script, monkeypatch):
+    module = batch_script.module
+    global_groups = ProcessGroupCollection(
+        tp=_FakeGroup(1, [5, 7]),
+        pp=_FakeGroup(0, [11]),
+        cp=_FakeGroup(0, [5]),
+        tp_cp=_FakeGroup(1, [5, 7]),
+    )
+    use_mpu = Mock(return_value=global_groups)
+    monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", use_mpu)
+
+    with _fallback_warning(f"{module.__name__}.get_batch"):
+        module.get_batch(None)
+
+    kwargs = batch_script.tp_broadcast.call_args.kwargs
+    assert kwargs["broadcast_group"] is global_groups.tp
+    assert kwargs["broadcast_src_rank"] == 5
+
+
+def test_vlm_get_batch_without_groups_warns_and_uses_the_global_group(monkeypatch):
+    tp_group = _FakeGroup(1, [3, 7])
+    monkeypatch.setattr(
+        ProcessGroupCollection,
+        "use_mpu_process_groups",
+        Mock(return_value=ProcessGroupCollection(tp=tp_group)),
+    )
+    monkeypatch.setattr(
+        pretrain_vlm,
+        "get_args",
+        lambda: SimpleNamespace(context_parallel_size=1, sequence_parallel=False),
+    )
+    groups = []
+
+    def broadcast_data(keys, data, datatype, tp_group=None):
+        groups.append(tp_group)
+        return {key: torch.zeros(1, 4, dtype=datatype) for key in keys}
+
+    monkeypatch.setattr(tensor_parallel, "broadcast_data", broadcast_data)
+
+    with _fallback_warning("pretrain_vlm.get_batch"):
+        pretrain_vlm.get_batch(None)
+
+    assert groups == [tp_group, tp_group]
+
+
+def test_vlm_model_provider_without_groups_warns_before_using_the_global_groups(monkeypatch):
+    class GlobalGroupsRead(Exception):
+        pass
+
+    monkeypatch.setattr(pretrain_vlm, "get_args", Mock)
+    monkeypatch.setattr(
+        ProcessGroupCollection, "use_mpu_process_groups", Mock(side_effect=GlobalGroupsRead)
+    )
+
+    with _fallback_warning("pretrain_vlm.model_provider"), pytest.raises(GlobalGroupsRead):
+        pretrain_vlm.model_provider()
+
+
 # 4-GPU tests
 
 
@@ -405,6 +579,25 @@ def test_data_loaders_build_datasets_on_the_run_tensor_parallel_group(monkeypatc
 
         # The first rank of each strided pair builds; on the global grid, ranks 0, 2, ... would.
         assert provider_calls == ([pgs] if tp_group.rank() == 0 else [])
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_data_loaders_without_groups_warn_and_build_on_the_global_grid(monkeypatch, run_config):
+    world_size = Utils.world_size
+    if world_size < 4 or world_size % 2:
+        pytest.skip("needs an even world size of at least 4")
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+    try:
+        provider_calls = []
+
+        with _fallback_warning("build_train_valid_test_data_loaders"):
+            _build_loaders(
+                monkeypatch, run_config, None, provider_calls, provider_accepts_groups=False
+            )
+
+        global_tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        assert provider_calls == ([None] if global_tp_rank == 0 else [])
     finally:
         Utils.destroy_model_parallel()
 

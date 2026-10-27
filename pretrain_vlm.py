@@ -73,6 +73,8 @@ def model_provider(
         add_decoder (bool): Construct the decoder module (used with pipeline parallelism). Defaults to True. When we use pipelining, the decoder
             will live on only a subset of the pipeline stages (specifically, every stage after the first one).
         parallel_output (bool): Enable model parallel output.
+        pg_collection: Process groups of the model. Omitting it is deprecated: the groups are
+            built from the global parallel state, with a ProcessGroupFallbackWarning.
 
     Returns:
         model (megatron.core.models.multimodal.llava_model.LLaVAModel): A multimodal model
@@ -81,8 +83,11 @@ def model_provider(
     vision_model_type = "clip"
 
     if pg_collection is None:
-        # LLaVAModel requires an explicit process-group collection; this script trains on the
-        # global parallel grid, so resolve that fallback here rather than inside megatron/core.
+        # LLaVAModel requires an explicit process-group collection; training passes the run's
+        # groups, and direct callers that omit them get the global parallel grid.
+        warn_global_process_group_fallback(
+            "pretrain_vlm.model_provider", deprecated_in="0.21", removed_in="0.23"
+        )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     assert (
@@ -358,8 +363,8 @@ def get_batch(data_iterator, pg_collection=None):
     Args:
         data_iterator: Iterable dataset.
         pg_collection: Process groups of the model. The batch is broadcast from the first
-            rank of its tensor-parallel group. None builds the group from the global parallel
-            state.
+            rank of its tensor-parallel group. Omitting it is deprecated: the group is built
+            from the global parallel state, with a ProcessGroupFallbackWarning.
 
     Returns:
         sample: A data sample with images, tokens, etc.
@@ -368,6 +373,9 @@ def get_batch(data_iterator, pg_collection=None):
     cp_size = args.context_parallel_size
     if pg_collection is None:
         # Compatibility for direct entrypoint callers; forward_step passes the model's groups.
+        warn_global_process_group_fallback(
+            "pretrain_vlm.get_batch", deprecated_in="0.21", removed_in="0.23"
+        )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
     if vars(pg_collection).get("tp") is None:
         raise ValueError("get_batch requires pg_collection.tp")
