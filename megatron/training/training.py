@@ -165,6 +165,7 @@ from megatron.training.initialize import (
     write_args_to_tensorboard,
 )
 from megatron.training.kernel_warmup import warmup_training_kernels
+from megatron.training.logging.dsa_flops import dsa_indexer_flops, dsa_layer_flops
 
 # Retain the training.py import path used by existing multimodal callers.
 from megatron.training.logging.packed_sequence_stats import (
@@ -997,7 +998,7 @@ def num_floating_point_operations(
 
     def hybrid_flops(total_tokens, seqlen_squared_sum, hidden_size,
                      num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
-                     gdp_num_householder,
+                     num_dsa_layers, gdp_num_householder,
                      num_gdn_layers=0,
                      mamba_state_dim=128, mamba_head_dim=64,
                      mamba_num_groups=8, mamba_num_heads=128,
@@ -1011,7 +1012,7 @@ def num_floating_point_operations(
                      gdn_num_qk_heads=16, gdn_num_v_heads=32,
                      gdn_conv_kernel_dim=4, gdn_use_gdn2=False,
                      vocab_size=256000, mtp_num_layers=0):
-        """Calculate total FLOPs for the hybrid model."""
+        """Calculate total training FLOPs for the hybrid model, including DSA."""
         mamba_flops = (
             gated_delta_product_layer_flops(total_tokens, hidden_size,
                                             gdp_num_householder,
@@ -1022,7 +1023,26 @@ def num_floating_point_operations(
                                    mamba_state_dim, mamba_head_dim,
                                    mamba_num_groups, mamba_num_heads)
         )
+        dsa_attention_flops = (
+            dsa_layer_flops(
+                total_tokens=total_tokens,
+                seqlen_squared_sum=seqlen_squared_sum,
+                hidden_size=hidden_size,
+                num_attention_heads=num_attn_heads,
+                q_lora_rank=args.q_lora_rank,
+                kv_lora_rank=args.kv_lora_rank,
+                qk_head_dim=args.qk_head_dim,
+                qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
+                v_head_dim=args.v_head_dim,
+                dsa_indexer_topk=args.dsa_indexer_topk,
+                dsa_indexer_kpool=getattr(args, "dsa_indexer_kpool", 1),
+                dsa_indexer_kpool_always_select_tail=getattr(
+                    args, "dsa_indexer_kpool_always_select_tail", True
+                ),
+            ) if num_dsa_layers else 0
+        )
         flops_fwd = (
+                num_dsa_layers * dsa_attention_flops +
                 num_attn_layers * attn_layer_flops(total_tokens, seqlen_squared_sum,
                                                    hidden_size, num_attn_heads, gqa,
                                                    gqa_groups, kv_channels) +
@@ -1038,7 +1058,26 @@ def num_floating_point_operations(
                                                   gdn_conv_kernel_dim, gdn_use_gdn2) +
                 (2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
         )
-        return flops_fwd * 3
+        # The indexer has its own loss-dependent backward cost.
+        indexer_flops = (
+            dsa_indexer_flops(
+                total_tokens=total_tokens,
+                seqlen_squared_sum=seqlen_squared_sum,
+                hidden_size=hidden_size,
+                q_lora_rank=args.q_lora_rank,
+                dsa_indexer_n_heads=args.dsa_indexer_n_heads,
+                dsa_indexer_head_dim=args.dsa_indexer_head_dim,
+                dsa_indexer_topk=args.dsa_indexer_topk,
+                num_dsa_layers=num_dsa_layers,
+                dsa_indexer_loss_coeff=args.dsa_indexer_loss_coeff,
+                dsa_indexer_use_sparse_loss=getattr(args, "dsa_indexer_use_sparse_loss", False),
+                dsa_indexer_skip_topk_offset=args.dsa_indexer_skip_topk_offset,
+                dsa_indexer_topk_freq=args.dsa_indexer_topk_freq,
+                hybrid_layer_pattern=args.hybrid_layer_pattern,
+                dsa_indexer_kpool=getattr(args, "dsa_indexer_kpool", 1),
+            ) if num_dsa_layers else 0
+        )
+        return flops_fwd * 3 + indexer_flops
 
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
@@ -1112,6 +1151,11 @@ def num_floating_point_operations(
         # causal mask of packed attention.
         if args.multi_latent_attention:
             assert not args.group_query_attention
+        if args.experimental_attention_variant == "dsa":
+            # DSA attention and its indexer are counted separately below.
+            standard_self_attn_term = 0
+            standard_self_attn_core_term = 0
+        elif args.multi_latent_attention:
             '''
             Basic arithmetic
             let B is batch size, s is seq_len, h is embedding dim,
@@ -1345,6 +1389,45 @@ def num_floating_point_operations(
             # ragged ``sum(L_i^2)`` and so undercounts the BSHD figure correctly.
             + seqlen_squared_sum_in_batch * self_attn_core_term
         )
+        if args.experimental_attention_variant == "dsa":
+            total_floating_point_operations += (
+                num_layers
+                * dsa_layer_flops(
+                    total_tokens=total_real_tokens_in_batch,
+                    seqlen_squared_sum=seqlen_squared_sum_in_batch,
+                    hidden_size=args.hidden_size,
+                    num_attention_heads=args.num_attention_heads,
+                    q_lora_rank=args.q_lora_rank,
+                    kv_lora_rank=args.kv_lora_rank,
+                    qk_head_dim=args.qk_head_dim,
+                    qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
+                    v_head_dim=args.v_head_dim,
+                    dsa_indexer_topk=args.dsa_indexer_topk,
+                    dsa_indexer_kpool=getattr(args, "dsa_indexer_kpool", 1),
+                    dsa_indexer_kpool_always_select_tail=getattr(
+                        args, "dsa_indexer_kpool_always_select_tail", True
+                    ),
+                )
+                * forward_backward_expansion_factor
+            )
+            # Pass all DSA layers; the helper counts only layers that compute an index.
+            total_floating_point_operations += dsa_indexer_flops(
+                total_tokens=total_real_tokens_in_batch,
+                seqlen_squared_sum=seqlen_squared_sum_in_batch,
+                hidden_size=args.hidden_size,
+                q_lora_rank=args.q_lora_rank,
+                dsa_indexer_n_heads=args.dsa_indexer_n_heads,
+                dsa_indexer_head_dim=args.dsa_indexer_head_dim,
+                dsa_indexer_topk=args.dsa_indexer_topk,
+                num_dsa_layers=num_layers,
+                dsa_indexer_loss_coeff=args.dsa_indexer_loss_coeff,
+                dsa_indexer_use_sparse_loss=getattr(args, "dsa_indexer_use_sparse_loss", False),
+                dsa_indexer_skip_topk_offset=args.dsa_indexer_skip_topk_offset,
+                dsa_indexer_topk_freq=args.dsa_indexer_topk_freq,
+                mtp_num_layers=mtp_num_layers,
+                mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
+                dsa_indexer_kpool=getattr(args, "dsa_indexer_kpool", 1),
+            )
         return total_floating_point_operations
 
     def _uses_gated_delta_product_spec(args):
@@ -1374,8 +1457,11 @@ def num_floating_point_operations(
             Symbols,
             get_hybrid_layer_counts,
         )
-        num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers = (
-            itemgetter(Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)(
+        num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers, num_dsa_layers = (
+            itemgetter(
+                Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE,
+                Symbols.DS_ATTENTION,
+            )(
                 get_hybrid_layer_counts(args.hybrid_layer_pattern)
             )
         )
@@ -1392,6 +1478,7 @@ def num_floating_point_operations(
             num_mamba_layers=num_mamba_layers,
             num_mlp_layers=num_mlp_layers,
             num_moe_layers=num_moe_layers,
+            num_dsa_layers=num_dsa_layers,
             num_gdn_layers=num_gdn_layers,
             mamba_state_dim=args.mamba_state_dim,
             mamba_head_dim=args.mamba_head_dim,
@@ -4290,13 +4377,6 @@ def save_checkpoint_and_time(
             with _otel_managed_span('checkpoint', 'megatron.checkpoint.report_memory', is_goodput_span=True):
                 report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_gtp_remat_group)
         num_checkpoints_memory_reported += 1
-
-        if args.fp8:
-            # Run garbage collection after checkpoint saving to free memory from
-            # dequantized bf16 tensors that were temporarily created during fp8
-            # model checkpoint saving.
-            with _otel_managed_span('checkpoint', 'megatron.checkpoint.gc_collect', is_goodput_span=True):
-                gc.collect()
 
         # timers.log reports min & max across ranks -> a collective. Sitting right
         # after the per-rank-imbalanced save (and outside the save spans), it's a
