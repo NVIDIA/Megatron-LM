@@ -77,6 +77,22 @@ def _apply_linear(
     return torch.matmul(x, weight.t(), **kwargs)
 
 
+class FusedTPHandoff:
+    """
+    Links an InferenceRowParallelLinear to the InferenceLayerNormColumnParallelLinear
+    that consumes its output under fused reduce-scatter + add + rms-norm + all-gather.
+
+    Whether the fused kernel runs is decided per forward (NVLS support, dtype, shape,
+    symmetric memory size, batch-invariant mode), so the row-parallel layer records it
+    here on every forward and the column-parallel layer reads it instead of assuming it.
+    """
+
+    def __init__(self):
+        # True when the last forward left the next layer's normalized, all-gathered
+        # input in the symmetric memory buffer.
+        self.next_layer_input_in_symm_buffer = False
+
+
 class InferenceLinear(TELinear):
     """Inference optimized version of TELinear."""
 
@@ -188,11 +204,10 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         # reduce-scatter in between (e.g. the MTP eh_proj projection).
         self.barrier_before_all_gather = False
 
-        # Boolean to be toggled externally for skipping norm and all-gather.
-        # This is used when enabling fused reduce-scatter + add + rms-norm + all-gather
-        # in tensor parallelism. In this case, the preceeding RowParallelLinear layer
-        # has already applied the rms-norm and all-gather.
-        self.skip_norm_and_all_gather = False
+        # Set externally when enabling fused reduce-scatter + add + rms-norm + all-gather
+        # in tensor parallelism: the handoff of the preceeding RowParallelLinear layer,
+        # which records whether it has already applied the rms-norm and all-gather.
+        self.fused_tp_handoff: Optional[FusedTPHandoff] = None
 
     def set_barrier_before_all_gather(self, value: bool = True) -> None:
         """Request a barrier before this layer's input all-gather reuses the buffer.
@@ -249,7 +264,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         """
         # Necessary conditions to ensure we are executing the fused rs-add-rmsnorm-ag
         # in the preceeding RowParallelLinear layer.
-        # 1. skip_norm_and_all_gather is True
+        # 1. that layer ran the fused kernel in this forward (see FusedTPHandoff)
         # 2. tp_size > 1
         # 3. enough symmetric memory is available - if available it already has the output
 
@@ -263,7 +278,8 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
 
         symm_mem_buffer = self._maybe_allocate_symmetric_buffer(x)
         is_in_fused_mode = (
-            self.skip_norm_and_all_gather
+            self.fused_tp_handoff is not None
+            and self.fused_tp_handoff.next_layer_input_in_symm_buffer
             and self.tp_size > 1
             and symm_mem_buffer["handle"] is not None
         )
@@ -456,6 +472,10 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         # Placeholder for next layer norm weights for fused
         # reduce-scatter + add + rms-norm + all-gather
         self.next_layer_norm_weights = None
+        # Residual handed over via _set_residual, consumed by the next forward.
+        self.residual = None
+        # Records for the next layer whether that fused kernel ran.
+        self.fused_tp_handoff = FusedTPHandoff()
         self.config = config
 
     def _matmul_reduce_scatter(self, x, residual=None):
@@ -464,6 +484,8 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         It will first try to write the matmul output to symmetric memory
         and perform an NVLS multicast reduce-scatter. If that is not possible,
         it will revert to torch.dist (NCCL) reduce-scatter.
+        Given a residual and the next layer norm weights, the NVLS path also fuses
+        the residual add, rms-norm and all-gather and records it in fused_tp_handoff.
         """
         use_mxfp8 = isinstance(self.weight, MXFP8Tensor)
         symm_mem_buffer_dims = list(x.size())
@@ -493,18 +515,13 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             x = _apply_linear(x, self.weight, self.config, out=symm_mem_buffer["tensor"])
 
             # perform nvls reduce-scatter
-            if self.next_layer_norm_weights is None:
+            if residual is None or self.next_layer_norm_weights is None:
                 output_dims = list(x.size())
                 output_dims[0] = x.size(0) // self.tp_size
                 output = torch.empty(output_dims, dtype=x.dtype, device=x.device)
                 multimem_reduce_scatter(output, x, symm_mem_buffer["handle"])
                 return output
             else:
-                assert hasattr(self, "residual"), (
-                    "For fused reduce-scatter + add + rms-norm + all-gather, "
-                    "residual must be set via _set_residual()"
-                )
-                residual = self.residual
                 fused_multimem_rs_add_norm_ag(
                     residual,
                     symm_mem_buffer["tensor"],
@@ -513,6 +530,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
                     self.next_layer_norm_weights,
                     self.config.layernorm_epsilon,
                 )
+                self.fused_tp_handoff.next_layer_input_in_symm_buffer = True
                 # 1. Residual has the output of the reduce-scatter + residual add
                 #    Care must be taken in the model definition, so as to not apply the
                 #    residual again.
@@ -534,6 +552,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
     def _set_residual(self, residual: torch.Tensor):
         """
         Set residual for fused reduce-scatter + add + rms-norm + all-gather.
+        The next forward adds it to its output, fused or not.
         """
         self.residual = residual
 
@@ -546,12 +565,21 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         if self.training:
             return super().forward(x)
 
+        # A residual passed in or handed over via _set_residual means the caller skips
+        # its own residual add, so the output must include it whether or not the fused
+        # kernel runs.
+        if residual is None:
+            residual = self.residual
+        self.residual = None
+        self.fused_tp_handoff.next_layer_input_in_symm_buffer = False
         if self.tp_size == 1:
             x = _apply_linear(x, self.weight, self.config)
-            return x, None
         else:
-            x = self._matmul_reduce_scatter(x)
-            return x, None
+            x = self._matmul_reduce_scatter(x, residual)
+        if residual is not None and not self.fused_tp_handoff.next_layer_input_in_symm_buffer:
+            # Same as the caller's eval-mode bias-dropout-add, in place on the fresh output.
+            x = x.to(residual.dtype).add_(residual)
+        return x, None
 
 
 def is_inference_column_parallel_linear(module) -> bool:

@@ -470,7 +470,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
             # Configure all fused TP communication settings in one call
             current_layer.configure_fused_tp_inference(
-                skip_qkv_norm_and_all_gather=(i > 0),
+                qkv_fused_tp_handoff=(
+                    self.layers[i - 1].get_fc2_fused_tp_handoff() if i > 0 else None
+                ),
                 fc2_next_layer_norm_weights=next_qkv_norm_weights,
             )
 

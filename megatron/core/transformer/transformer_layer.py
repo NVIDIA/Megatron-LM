@@ -60,6 +60,7 @@ from megatron.core.utils import (
 
 if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
+    from megatron.core.tensor_parallel.inference_layers import FusedTPHandoff
 
 logger = logging.getLogger(__name__)
 
@@ -1473,6 +1474,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         if self.is_moe_layer:
             moe_kwargs["packed_seq_params"] = packed_seq_params
 
+        if using_fused_tp_inference_kernel:
+            # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
+            # operation in MLP's fc2, which adds it since _apply_mlp_bda_step will not.
+            self._set_fc2_residual(residual)
+
         if self.recompute_mlp:
             mlp_output_with_bias = precision_aware_checkpoint(
                 apply_module(self.mlp),
@@ -1528,10 +1534,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             bias_output = bias_chunks[0] if bias_chunks else None
             mlp_output_with_bias = (mlp_output, bias_output)
         else:
-            if using_fused_tp_inference_kernel:
-                # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
-                # operation in MLP's fc2.
-                self._set_fc2_residual(residual)
             mlp_output_with_bias = apply_module(self.mlp)(
                 pre_mlp_layernorm_output, padding_mask=padding_mask, **moe_kwargs
             )
@@ -1674,26 +1676,31 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
     def configure_fused_tp_inference(
         self,
-        skip_qkv_norm_and_all_gather: bool = False,
+        qkv_fused_tp_handoff: Optional[FusedTPHandoff] = None,
         fc2_next_layer_norm_weights: Optional[Tensor] = None,
     ):
         """
         Configure settings for fused TP communication in inference mode.
 
         Args:
-            skip_qkv_norm (bool): Whether to skip norm and all-gather for linear_qkv.
+            qkv_fused_tp_handoff (Optional[FusedTPHandoff]): Previous layer's MLP FC2
+                handoff, which records whether it applied linear_qkv's norm and all-gather.
             fc2_next_layer_norm_weights (Optional[Tensor]): Next layer's QKV norm weights
                 for current layer's MLP FC2.
         """
-        self.self_attention.linear_qkv.skip_norm_and_all_gather = skip_qkv_norm_and_all_gather
+        self.self_attention.linear_qkv.fused_tp_handoff = qkv_fused_tp_handoff
 
         # Use current layer's own MLP FC1 norm weights for attention's/mixer's out_proj
         mlp_fc1_weights = self.get_mlp_layer_norm_weights()
         self._set_proj_next_layer_norm_weights(mlp_fc1_weights)
 
-        self.mlp.linear_fc1.skip_norm_and_all_gather = True
+        self.mlp.linear_fc1.fused_tp_handoff = self.self_attention.linear_proj.fused_tp_handoff
         # Use next layer's attention norm weights for current layer's MLP FC2
         self._set_fc2_next_layer_norm_weights(fc2_next_layer_norm_weights)
+
+    def get_fc2_fused_tp_handoff(self) -> FusedTPHandoff:
+        """Get the MLP FC2 handoff for the next layer's QKV."""
+        return self.mlp.linear_fc2.fused_tp_handoff
 
     def _set_proj_next_layer_norm_weights(self, weights: Tensor):
         """Set next layer norm weights for attention/mixer's linear_proj."""
