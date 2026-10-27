@@ -517,12 +517,8 @@ class MCoreSavePlanner(DefaultSavePlanner):
         Returns:
             The global plan and the checkpoint metadata, as the base planner does.
         """
-        if hasattr(self, '_dedup_save_plans'):
-            deduped_plans = self._dedup_save_plans(all_plans)
-        else:  # torch < 2.7
-            from torch.distributed.checkpoint._dedup_save_plans import dedup_save_plans
-
-            deduped_plans = dedup_save_plans(all_plans, self.dedup_save_to_lowest_rank)
+        # TorchDistSaveShardedStrategy already dedups plans, so dedup here is a NOP.
+        deduped_plans = all_plans
         global_plan, metadata = create_default_global_save_plan(deduped_plans)
         if self.flatten_state_dict:
             planner_data_dict = [p.planner_data for p in global_plan]
