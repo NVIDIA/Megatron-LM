@@ -234,7 +234,7 @@ def test_validate_run_at_every_call_site():
     cfg.validate_run(**{**RUN, "global_batch_size": None})
 
     # Through the container: the sections supply the inputs.
-    # The CUDA-graph rule reads the model's transformer section; skipped for a model without one.
+    # Training containers require a transformer section for the CUDA-graph rule.
     from megatron.training.models.base import ModelConfig
 
     @dataclasses.dataclass
@@ -253,7 +253,7 @@ def test_validate_run_at_every_call_site():
     def container(model=None, rl=None, **rl_kwargs):
         return PretrainConfigContainer(
             train=TrainingConfig(micro_batch_size=4, global_batch_size=12),
-            model=model,
+            model=TransformerModelConfig() if model is None else model,
             optimizer=OptimizerConfig(),
             scheduler=SchedulerConfig(),
             logger=LoggerConfig(),
@@ -275,6 +275,7 @@ def test_validate_run_at_every_call_site():
     cuda_graph_container = container(
         rl_offload_optimizer_during_inference=True, rl_training_cuda_graphs=True
     )
+    cuda_graph_container.model.transformer.cuda_graph_impl = "local"
     cuda_graph_container.validate()
     assert not cuda_graph_container.ddp.grad_buffer_offload
     cuda_graph_container.rl.finalize_ddp_config(cuda_graph_container.ddp)
@@ -287,8 +288,10 @@ def test_validate_run_at_every_call_site():
     explicit_layout_container.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
     with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
         explicit_layout_container.validate()
-    container(model=TopologyOnlyModelConfig(), rl_training_cuda_graphs=True).validate()
-    container(model=TopologyOnlyModelConfig(), rl=RLConfig()).validate()
+    with pytest.raises(ValueError, match="Training requires model.transformer"):
+        container(model=TopologyOnlyModelConfig(), rl_training_cuda_graphs=True).validate()
+    with pytest.raises(ValueError, match="Training requires model.transformer"):
+        container(model=TopologyOnlyModelConfig(), rl=RLConfig()).validate()
     with pytest.raises(ValueError, match="no CUDA graphs"):
         container(model=TransformerModelConfig(), rl_training_cuda_graphs=True).validate()
     with pytest.raises(ValueError, match="must be 1"):

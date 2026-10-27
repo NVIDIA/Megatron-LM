@@ -21,6 +21,7 @@ from megatron.training.models import (
     MimoModelConfig,
     T5ModelConfig,
 )
+from megatron.training.models.base import ModelConfig
 
 
 @pytest.mark.parametrize("inference", [False, True])
@@ -75,6 +76,26 @@ def test_validation_is_read_only_and_finalization_runs_once(
     rng_finalize.assert_called_once_with(model)
     assert "_finalized" not in after
     assert copy.deepcopy(cfg)._finalized
+
+
+@pytest.mark.parametrize(
+    "model,message",
+    [
+        (None, "Training requires a model config"),
+        (ModelConfig(), "Training requires model.transformer"),
+        (BertModelConfig(transformer=None, seq_length=16), "Training requires model.transformer"),
+    ],
+)
+def test_training_requires_model_transformer(monkeypatch, run_config, model, message):
+    run_config.model = model
+    derive = Mock(side_effect=AssertionError("Invalid configs must not begin derivation"))
+    monkeypatch.setattr(run_config, "_finalize", derive)
+    for check in (run_config.validate, run_config.validate, run_config.finalize):
+        with pytest.raises(ValueError, match=message):
+            check()
+        assert run_config.model is model
+        assert not run_config._finalized
+    derive.assert_not_called()
 
 
 @pytest.mark.parametrize("invalid_policy", ["ddp_offload", "model_pipeline"])

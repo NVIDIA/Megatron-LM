@@ -60,7 +60,7 @@ from megatron.core.utils import (
     unwrap_model,
 )
 from megatron.training.argument_utils import _default_config_from_args
-from megatron.training.config import TokenizerConfig
+from megatron.training.config import PretrainConfigContainer, TokenizerConfig
 from megatron.training.global_vars import get_run_config, get_tokenizer, get_train_state
 from megatron.training.utils.checkpoint_utils import (
     file_exists,
@@ -2903,7 +2903,10 @@ def load_checkpoint(
         ckpt_world_size = getattr(ckpt_args, 'world_size', 0)
         run_world_size = safe_get_world_size()
         ckpt_dp = getattr(ckpt_args, 'data_parallel_size', 0)
-        run_dp = cfg.get_data_parallel_size()
+        run_dp = (
+            cfg.get_data_parallel_size()
+            if isinstance(cfg, PretrainConfigContainer) else args.data_parallel_size
+        )
         mismatch_msg = '(TP, PP) mismatch after resume ({} vs {} from checkpoint)'.format(
             run_tp_pp, ckpt_tp_pp
         )

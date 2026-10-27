@@ -280,6 +280,12 @@ def test_explicit_inference_bootstrap_preserves_sparse_args(monkeypatch, isolate
     assert global_vars.get_args() is args
     assert global_vars.get_run_config() is cfg
     assert cfg.model is None
+    before = deepcopy(cfg.to_dict())
+    cfg.validate()
+    cfg.validate()
+    cfg.finalize()
+    cfg.finalize()
+    assert cfg.to_dict() == before
     assert cfg.checkpoint.save_optim is (not aliases)
     assert cfg.checkpoint.save_rng is (not aliases)
     assert cfg.checkpoint.load_optim is (not aliases)

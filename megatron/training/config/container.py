@@ -63,50 +63,6 @@ class ConfigContainerBase:
 
     _finalized: bool = field(default=False, init=False, repr=False, compare=False)
 
-    def get_model_world_size(self) -> int:
-        """Return ranks in the model grid, which may be a subset of the launch."""
-        launch_world_size = safe_get_world_size()
-        world_size = (
-            self.model.mimo_llm_world_size if isinstance(self.model, MimoModelConfig) else None
-        )
-        if world_size is None:
-            world_size = launch_world_size
-        if not 0 < world_size <= launch_world_size:
-            raise ValueError("Training model world size must fit within the global launch")
-        return world_size
-
-    def get_data_parallel_size(self) -> int:
-        """Return replica DP, excluding batch partitions within GTP weight groups."""
-        world_size = self.get_model_world_size()
-        transformer = self.model.transformer
-        tp = transformer.tensor_model_parallel_size
-        pp = transformer.pipeline_model_parallel_size
-        cp = transformer.context_parallel_size
-        weight_size = transformer.gtp_weight_remat_size
-        if min(tp, pp, cp, weight_size) < 1:
-            raise ValueError("Parallel sizes must be positive")
-        sequence_shards = transformer.gtp_remat_num_sequence_shards
-        if cp % sequence_shards:
-            raise ValueError("Runtime context-parallel size must contain the GTP sequence shards")
-        # Runtime CP already includes sequence shards inside each GTP weight group.
-        model_parallel_size = tp * pp * (cp // sequence_shards) * weight_size
-        if world_size % model_parallel_size:
-            raise ValueError(
-                f"world_size ({world_size}) must be divisible by TP x PP x "
-                f"CP x weight-remat size ({model_parallel_size})"
-            )
-        return world_size // model_parallel_size
-
-    def get_batch_parallel_size(self) -> int:
-        """Return independent batch partitions, including GTP batch shards but not CP."""
-        data_parallel_size = self.get_data_parallel_size()
-        transformer = self.model.transformer
-        return (
-            data_parallel_size
-            * transformer.gtp_weight_remat_size
-            // transformer.gtp_remat_num_sequence_shards
-        )
-
     def validate(self) -> None:
         """Check sub-configs without mutation; callers may validate repeatedly."""
         for config_field in dataclass_fields(self):
@@ -292,7 +248,7 @@ class ConfigContainerBase:
 
 @dataclass(kw_only=True)
 class PretrainConfigContainer(ConfigContainerBase):
-    """Top-level container holding all configuration objects."""
+    """Training configuration; requires a model with a non-null transformer config."""
 
     train: TrainingConfig
     validation: ValidationConfig = field(default_factory=ValidationConfig)
@@ -311,6 +267,50 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
+
+    def get_model_world_size(self) -> int:
+        """Return ranks in the model grid, which may be a subset of the launch."""
+        launch_world_size = safe_get_world_size()
+        world_size = (
+            self.model.mimo_llm_world_size if isinstance(self.model, MimoModelConfig) else None
+        )
+        if world_size is None:
+            world_size = launch_world_size
+        if not 0 < world_size <= launch_world_size:
+            raise ValueError("Training model world size must fit within the global launch")
+        return world_size
+
+    def get_data_parallel_size(self) -> int:
+        """Return replica DP, excluding batch partitions within GTP weight groups."""
+        world_size = self.get_model_world_size()
+        transformer = self.model.transformer
+        tp = transformer.tensor_model_parallel_size
+        pp = transformer.pipeline_model_parallel_size
+        cp = transformer.context_parallel_size
+        weight_size = transformer.gtp_weight_remat_size
+        if min(tp, pp, cp, weight_size) < 1:
+            raise ValueError("Parallel sizes must be positive")
+        sequence_shards = transformer.gtp_remat_num_sequence_shards
+        if cp % sequence_shards:
+            raise ValueError("Runtime context-parallel size must contain the GTP sequence shards")
+        # Runtime CP already includes sequence shards inside each GTP weight group.
+        model_parallel_size = tp * pp * (cp // sequence_shards) * weight_size
+        if world_size % model_parallel_size:
+            raise ValueError(
+                f"world_size ({world_size}) must be divisible by TP x PP x "
+                f"CP x weight-remat size ({model_parallel_size})"
+            )
+        return world_size // model_parallel_size
+
+    def get_batch_parallel_size(self) -> int:
+        """Return independent batch partitions, including GTP batch shards but not CP."""
+        data_parallel_size = self.get_data_parallel_size()
+        transformer = self.model.transformer
+        return (
+            data_parallel_size
+            * transformer.gtp_weight_remat_size
+            // transformer.gtp_remat_num_sequence_shards
+        )
 
     def finalize_optimizer_config(self, optimizer: OptimizerConfig) -> OptimizerConfig:
         """Derive configured or legacy-built optimizer precision from the finalized model."""
@@ -412,6 +412,10 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     def validate(self) -> None:
         """Validate each section and the cross-config GTP, batch-size, and RL policies."""
+        if self.model is None:
+            raise ValueError("Training requires a model config")
+        if getattr(self.model, "transformer", None) is None:
+            raise ValueError("Training requires model.transformer to be configured")
         self.rl.validate_ddp_config(self.ddp)
         super().validate()
         self._validate_gtp_config()
@@ -511,8 +515,8 @@ class InferenceConfigContainer(ConfigContainerBase):
     ``DistributedDataParallelConfig``, ``RerunStateMachineConfig``, ``StragglerDetectionConfig``.
     """
 
-    model: ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoModelConfig
-    """Which model to load for inference."""
+    model: ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoModelConfig | None
+    """Model to load, or None for args-only entrypoints without model inputs."""
 
     checkpoint: CheckpointConfig
     """Checkpoint configuration used to load model weights."""
