@@ -109,7 +109,7 @@ def calc_params_l2_norm(
     args = get_args()
 
     if getattr(args, 'use_megatron_fsdp', False):
-        params_data = defaultdict(list)
+        params_by_sharding = defaultdict(list)
         for model_chunk in model:
             model_chunk.stop_communication()
             for name, param in model_chunk.named_parameters():
@@ -127,10 +127,13 @@ def calc_params_l2_norm(
                     # only needs to distinguish sharded from replicated mesh axes.
                     placements = tuple(Shard(p.dim) if p.is_shard() else p for p in placements)
                     local_param = param
-                params_data[(mesh, placements, local_param.dtype)].append(local_param)
+                params_by_sharding[(mesh, placements, local_param.dtype)].append(local_param)
 
         return _calc_sharded_params_l2_norm(
-            ((mesh, placements, tensors) for (mesh, placements, _), tensors in params_data.items()),
+            (
+                (mesh, placements, tensors)
+                for (mesh, placements, _), tensors in params_by_sharding.items()
+            ),
             return_squared_tensor=return_squared_tensor,
         )
 
