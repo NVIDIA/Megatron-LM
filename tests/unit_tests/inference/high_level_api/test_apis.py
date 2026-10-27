@@ -160,11 +160,6 @@ class TestLifecycleGuards:
                 self.submitted = 0
                 self.aborted = []
 
-            def add_request(self, *_args, **_kwargs):
-                future = futures[self.submitted]
-                self.submitted += 1
-                return future
-
             def add_request_with_id(self, *_args, **_kwargs):
                 index = self.submitted
                 self.submitted += 1
