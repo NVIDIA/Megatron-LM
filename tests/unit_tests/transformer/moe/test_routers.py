@@ -163,6 +163,85 @@ def test_fused_dense_routing_matches_unfused(
     torch.testing.assert_close(probs.gather(1, order), ref_probs.gather(1, ref_order))
 
 
+@pytest.fixture
+def te_fused_router_calls(monkeypatch):
+    """Stand in for TE's fused router and record its calls. Like TE, it returns full-width
+    probs and a bool map, or writes the selected expert IDs to topk_indices and returns it."""
+    calls = []
+
+    def fused_router(topk_indices=None, **kwargs):
+        calls.append(kwargs)
+        probs, routing_map = topk_routing_with_score_function(**kwargs)
+        if topk_indices is None:
+            return probs, routing_map
+        topk_indices.copy_(routing_map.nonzero()[:, 1].view(topk_indices.shape))
+        return probs, topk_indices
+
+    monkeypatch.setattr(moe_utils, "HAVE_TE", True)
+    monkeypatch.setattr(moe_utils, "fused_topk_with_score_function", fused_router)
+    monkeypatch.setattr(moe_utils, "fused_topk_with_score_function_supports_topk_indices", True)
+    return calls
+
+
+def test_fused_dense_routing_returns_caller_index_buffer(te_fused_router_calls):
+    """Dense fused routing gathers the probs at a caller's int16 index buffer and returns it."""
+    torch.manual_seed(123)
+    logits = torch.randn(4, 8)
+    topk_indices = torch.empty(4, 2, dtype=torch.int16)
+
+    probs, indices = topk_routing_with_score_function(
+        logits, 2, fused=True, dense_output=True, topk_indices=topk_indices
+    )
+    ref_probs, ref_indices = topk_routing_with_score_function(logits, 2, dense_output=True)
+
+    assert len(te_fused_router_calls) == 1 and indices is topk_indices
+    order, ref_order = indices.long().argsort(dim=1), ref_indices.argsort(dim=1)
+    assert torch.equal(indices.long().gather(1, order), ref_indices.gather(1, ref_order))
+    torch.testing.assert_close(probs.gather(1, order), ref_probs.gather(1, ref_order))
+
+
+@pytest.mark.parametrize("output", ["sparse", "dense", "index_buffer"])
+@pytest.mark.parametrize(
+    "action",
+    [RouterReplayAction.RECORD, RouterReplayAction.REPLAY_FORWARD],
+    ids=["record", "replay"],
+)
+def test_fused_routing_honours_router_replay(te_fused_router_calls, action, output):
+    """Router replay owns the top-k selection, which TE's fused router makes internally, so
+    fused routing with replay routes unfused and keeps the requested output format."""
+    torch.manual_seed(123)
+    logits = torch.randn(4, 8)
+    target = torch.tensor([[1, 2], [0, 7], [3, 4], [5, 6]])
+    kwargs = dict(dense_output=output == "dense")
+    if output == "index_buffer":
+        kwargs["topk_indices"] = torch.empty(4, 2, dtype=torch.int16)
+    router_replay = RouterReplay()
+    try:
+        router_replay.set_router_replay_action(action)
+        if action == RouterReplayAction.REPLAY_FORWARD:
+            router_replay.set_target_indices(target)
+        probs, routing = topk_routing_with_score_function(
+            logits, 2, fused=True, router_replay=router_replay, **kwargs
+        )
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+    assert not te_fused_router_calls
+    if action == RouterReplayAction.RECORD:
+        target = logits.topk(2, dim=1).indices
+        assert torch.equal(router_replay.get_recorded_indices(), target)
+    if output == "sparse":
+        assert probs.shape == (4, 8)
+        assert torch.equal(
+            routing, torch.zeros_like(logits, dtype=torch.bool).scatter(1, target, 1)
+        )
+    else:
+        assert probs.shape == (4, 2 if output == "dense" else 8)
+        assert torch.equal(routing.long(), target)
+        if output == "index_buffer":
+            assert routing is kwargs["topk_indices"]
+
+
 @pytest.mark.parametrize("padding", ["none", "mixed", "all"])
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_expert_bias_dense_counts_match_bool_path(padding, deterministic):
