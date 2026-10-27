@@ -21,7 +21,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_masked_update,
 )
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
 from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
@@ -32,7 +32,7 @@ from megatron.core.ssm.ops.common.intermediate_extraction import (
 )
 from megatron.core.ssm.ops.mamba2.batch_invariant_decode import MambaBatchInvariantDecode
 from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
-from megatron.core.ssm.packed_seq_helpers import build_packed_seq_idx
+from megatron.core.ssm.packed_seq_helpers import build_packed_seq_idx, get_cu_seqlens
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
@@ -82,11 +82,17 @@ except ImportError:
     HAVE_MAMBA_SSM = False
 
 try:
-    from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
+    from megatron.core.ssm.ops.mamba2.ssd_combined import (
+        causal_conv1d_cpp_available,
+        mamba_chunk_scan_combined_varlen,
+        mamba_split_conv1d_scan_combined_varlen,
+    )
 
     HAVE_SSM_OPS_VARLEN = True
 except ImportError:
+    causal_conv1d_cpp_available = None
     mamba_chunk_scan_combined_varlen = None
+    mamba_split_conv1d_scan_combined_varlen = None
     HAVE_SSM_OPS_VARLEN = False
 
 if not HAVE_MAMBA_SSM:
@@ -323,6 +329,15 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
                 ),
             )
 
+        if self.config.mamba_varlen_ssd_training:
+            assert (
+                self.use_mem_eff_path
+            ), "mamba_varlen_ssd_training requires use_mamba_mem_eff_path"
+            assert HAVE_SSM_OPS_VARLEN, "mamba_varlen_ssd_training requires Triton"
+            assert (
+                causal_conv1d_cpp_available()
+            ), "mamba_varlen_ssd_training requires causal_conv1d >= 1.5.1"
+
         conv_dim = self.d_inner_local_tp + 2 * self.ngroups_local_tp * self.d_state  # x B C
         with get_cuda_rng_tracker().fork():
             # weight shape: [conv_dim, 1, d_conv]
@@ -487,6 +502,18 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         inference_mode=False,
     ):
         """Run Mamba through its normalized SSM output, before output projection."""
+        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+            # Mamba's context parallelism is bound to the static CP group at construction; it
+            # does not follow a per-microbatch (dynamic or hybrid) CP group.
+            runtime_cp_group = resolve_cp_group(self.cp.cp_group, packed_seq_params)
+            if runtime_cp_group is not self.cp.cp_group:
+                runtime_ranks = torch.distributed.get_process_group_ranks(runtime_cp_group)
+                static_ranks = torch.distributed.get_process_group_ranks(self.cp.cp_group)
+                assert runtime_ranks == static_ranks, (
+                    f"Mamba layers do not support dynamic context parallelism: the microbatch's "
+                    f"CP group (ranks {runtime_ranks}) differs from the static CP group "
+                    f"(ranks {static_ranks})."
+                )
         zxBCdt, _ = self.in_proj(hidden_states)
 
         zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
@@ -726,6 +753,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         of forward activations stored for backprop and therefore reduces memory pressure during
         training.
         """
+        if packed_seq_params is not None and self.config.mamba_varlen_ssd_training:
+            return self._ssm_training_varlen(zxBCdt, packed_seq_params)
 
         # transpose: l b pd --> b l pd
         zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
@@ -767,6 +796,60 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         )
 
         y = rearrange(y, "b l d -> l b d").contiguous()
+        y = self.cp.post_conv_ssm(y, packed_seq_params)
+
+        if self.rmsnorm:
+            y = self.norm(y)
+
+        return y
+
+    def _ssm_training_varlen(
+        self, zxBCdt: torch.Tensor, packed_seq_params: PackedSeqParams
+    ) -> torch.Tensor:
+        """
+        Performs SSM computation for a training step on packed sequences, with SSD chunks aligned
+        to sequence starts.
+
+        Computes the same function as `mamba_split_conv1d_scan_combined`, but the SSD chunks restart
+        at every sequence start, so the output of a sequence does not depend on what else is packed
+        with it.
+        """
+        assert zxBCdt.shape[1] == 1, "packed sequences must have batch size 1"
+        sequence_packing_available, reason_for_no_sequence_packing = (
+            _check_mamba_sequence_packing_support(for_inference_not_training=False)
+        )
+        assert sequence_packing_available, reason_for_no_sequence_packing
+
+        zxBCdt = zxBCdt.squeeze(1)
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "mamba_varlen_ssd_training cannot run inside a CUDA graph capture: the chunk layout "
+            "depends on the sequence lengths and is built with a GPU sync. Leave Mamba layers out "
+            "of the captured region."
+        )
+        metadata = _get_varlen_chunk_metadata(packed_seq_params, self.chunk_size, zxBCdt.shape[0])
+
+        y = mamba_split_conv1d_scan_combined_varlen(
+            zxBCdt,
+            rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+            self.cp.get_conv1d_bias(),
+            self.cp.get_dt_bias().float(),
+            -torch.exp(self.cp.get_A_log().float()),
+            D=(
+                rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
+                if self.D_has_hdim
+                else self.cp.get_D()
+            ),
+            chunk_size=self.chunk_size,
+            cu_chunk_seqlens=metadata.cu_chunk_seqlens,
+            last_chunk_indices=metadata.last_chunk_indices,
+            seq_idx=metadata.seq_idx_for_varlen,
+            activation=self.activation,
+            headdim=None if self.D_has_hdim else self.headdim,
+            ngroups=self.cp.ngroups_local_tpcp,
+            state_dtype=self.mamba_training_ssm_states_dtype,
+        )
+
+        y = rearrange(y, "l d -> l 1 d")
         y = self.cp.post_conv_ssm(y, packed_seq_params)
 
         if self.rmsnorm:
@@ -1528,3 +1611,94 @@ def _check_mamba_sequence_packing_support(
     elif not is_mamba_min_version(mamba_min):
         return False, f"mamba_ssm >= {mamba_min} is required"
     return True, None
+
+
+@dataclass
+class VarlenChunkMetadata:
+    """Chunk layout for the varlen SSD kernels, where chunks restart at every sequence start.
+
+    Example: sequence lengths [300, 1000, 200] with chunk_size 128 give
+    cu_chunk_seqlens = [0, 128, 256, 300, 428, ..., 1196, 1300, 1428, 1500],
+    seq_idx_for_varlen = [0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2] and
+    last_chunk_indices = [2, 10, 12, 12], whose last entry is the empty extra sequence after
+    cu_seqlens[-1]. The field names follow the inference `MambaMetadata`.
+    """
+
+    cu_chunk_seqlens: torch.Tensor
+    """(nchunks + 1,) int32 token offset of every chunk."""
+    last_chunk_indices: torch.Tensor
+    """(len(cu_seqlens),) int32 index of the last chunk of every sequence, including the extra
+    one after cu_seqlens[-1] as in `build_packed_seq_idx`; an empty sequence repeats the
+    previous index."""
+    seq_idx_for_varlen: torch.Tensor
+    """(nchunks,) int32 sequence index of every chunk."""
+    cu_seqlens: torch.Tensor
+    """The sequence boundaries the layout was built from."""
+    key: Tuple[int, int, int]
+    """(chunk_size, num_tokens, version of cu_seqlens) the layout was built for."""
+
+
+def _build_varlen_chunk_metadata(
+    cu_seqlens: torch.Tensor, chunk_size: int, num_tokens: int
+) -> VarlenChunkMetadata:
+    """Builds the varlen SSD chunk layout of a pack. Synchronizes with the GPU once.
+
+    Tokens beyond the last boundary form one extra sequence, as in `build_packed_seq_idx`.
+    """
+    device = cu_seqlens.device
+    cu_seqlens_with_max = F.pad(cu_seqlens.long(), (0, 1), value=num_tokens)
+    seq_lengths = (cu_seqlens_with_max[1:] - cu_seqlens_with_max[:-1]).clamp(min=0)
+    chunks_per_seq = (seq_lengths + chunk_size - 1) // chunk_size
+    nchunks, packed_tokens = torch.stack([chunks_per_seq.sum(), seq_lengths.sum()]).tolist()
+    assert (
+        packed_tokens == num_tokens
+    ), f"cu_seqlens cover {packed_tokens} tokens but the packed row has {num_tokens}"
+    seq_starts = seq_lengths.cumsum(0) - seq_lengths
+    first_chunk = chunks_per_seq.cumsum(0) - chunks_per_seq
+    seq_idx_for_varlen = torch.repeat_interleave(
+        torch.arange(seq_lengths.numel(), device=device), chunks_per_seq, output_size=nchunks
+    )
+    chunk_starts = (
+        seq_starts[seq_idx_for_varlen]
+        + (torch.arange(nchunks, device=device) - first_chunk[seq_idx_for_varlen]) * chunk_size
+    )
+    return VarlenChunkMetadata(
+        cu_chunk_seqlens=F.pad(chunk_starts, (0, 1), value=num_tokens).to(torch.int32),
+        last_chunk_indices=(chunks_per_seq.cumsum(0) - 1).to(torch.int32),
+        seq_idx_for_varlen=seq_idx_for_varlen.to(torch.int32),
+        cu_seqlens=cu_seqlens,
+        key=(chunk_size, num_tokens, None if cu_seqlens.is_inference() else cu_seqlens._version),
+    )
+
+
+# Attribute of PackedSeqParams that caches the layout. It is deliberately not a dataclass field:
+# CUDA graphs and TE attention see only the fields, and dataclasses.replace drops it.
+_VARLEN_CHUNK_METADATA_ATTR = "_mamba_varlen_chunk_metadata"
+
+
+def _get_varlen_chunk_metadata(
+    packed_seq_params: PackedSeqParams, chunk_size: int, num_tokens: int
+) -> VarlenChunkMetadata:
+    """Returns the varlen SSD chunk layout of a pack, building it on the first Mamba layer.
+
+    The sequences are those of `build_packed_seq_idx`. The layout is cached on the
+    PackedSeqParams object, so all Mamba layers of a microbatch share one GPU sync, also across
+    activation recompute; under virtual pipeline parallelism each model chunk builds its own.
+    It is rebuilt when the boundaries are replaced or modified in place. A layout built under
+    torch.inference_mode is not cached, so that a later training forward on the same pack never
+    sees inference tensors.
+    """
+    cu_seqlens = get_cu_seqlens(packed_seq_params)
+    assert isinstance(cu_seqlens, torch.Tensor), "varlen chunk metadata needs cu_seqlens"
+    version = None if cu_seqlens.is_inference() else cu_seqlens._version
+    metadata = getattr(packed_seq_params, _VARLEN_CHUNK_METADATA_ATTR, None)
+    if (
+        metadata is not None
+        and metadata.cu_seqlens is cu_seqlens
+        and metadata.key == (chunk_size, num_tokens, version)
+    ):
+        return metadata
+    metadata = _build_varlen_chunk_metadata(cu_seqlens, chunk_size, num_tokens)
+    if not (torch.is_inference_mode_enabled() or cu_seqlens.is_inference()):
+        setattr(packed_seq_params, _VARLEN_CHUNK_METADATA_ATTR, metadata)
+    return metadata

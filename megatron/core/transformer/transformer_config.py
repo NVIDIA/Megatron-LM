@@ -1633,6 +1633,15 @@ class TransformerConfig(ModelParallelConfig):
     )
     """Controls usage of the memory efficient path for Mamba layers."""
 
+    mamba_varlen_ssd_training: bool = False
+    """When training on packed (THD) sequences, run the Mamba SSD with chunks that restart at every
+    sequence start, instead of the fused kernel's fixed chunk grid over the packed row. The conv1d
+    and SSD output of a sequence then does not depend on what else is packed with it, for a fixed
+    kernel configuration: across processes, pin it with --deterministic-mode or
+    --triton-autotune-mode pinned (MAMBA_DETERMINISTIC does not apply to these kernels). Costs one
+    GPU sync per microbatch and model chunk. Under local CUDA graphs, Mamba layers run eagerly on
+    packed input; full_iteration CUDA graphs are not supported."""
+
     gdp_cutedsl_kernel: bool = False
     """Whether to use the CuTeDSL kernel for the GatedDeltaProduct mixer."""
 
@@ -4077,6 +4086,10 @@ class TransformerConfig(ModelParallelConfig):
         assert not (
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
+        assert not (self.cuda_graph_impl == "full_iteration" and self.mamba_varlen_ssd_training), (
+            'mamba_varlen_ssd_training is not supported with cuda_graph_impl="full_iteration": '
+            "its chunk layout is built with a GPU sync."
+        )
 
         if self.moe_megakernel_backend == "mok":
             if self.cuda_graph_impl in ("local", "transformer_engine"):

@@ -757,8 +757,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="dispatch",
         notes="Selects the pip causal_conv1d / mamba_ssm kernels (causal_conv1d_fn, "
         "mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined, causal_conv1d_update_cuda) or "
-        "the Megatron forks (ops/common, ops/mamba2: varlen scan, causal_conv1d_update, "
-        "selective_state_update). Module-level replay: test_ssm_conv1d.py::TestMambaMixerDeterminism; "
+        "the Megatron forks (ops/common, ops/mamba2: varlen scan, the varlen training SSD behind "
+        "mamba_varlen_ssd_training, causal_conv1d_update, selective_state_update). Module-level "
+        "replay: test_ssm_conv1d.py::TestMambaMixerDeterminism; "
         "kernels replayed piecewise in test_ssm_kernels.py.",
     ),
     KernelEntry(

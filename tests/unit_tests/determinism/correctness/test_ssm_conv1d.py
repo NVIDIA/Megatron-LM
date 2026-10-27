@@ -18,6 +18,7 @@ from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.tuning import policy as tuning_policy
 from tests.unit_tests.determinism.configs import hybrid_base
 from tests.unit_tests.determinism.utils import (
     assert_bit_exact,
@@ -77,12 +78,19 @@ def _conv_backward(x, weight, bias, grad):
     return torch.autograd.grad(out, (x, weight, bias), grad_outputs=grad)
 
 
-def _build_mixer(deterministic_mode=True):
+def _build_mixer(deterministic_mode=True, mamba_varlen_ssd_training=False):
     """A bare MambaMixer on the suite's shared hybrid config."""
     Utils.initialize_model_parallel()
     model_parallel_cuda_manual_seed(123)
     config = TransformerConfig(
-        **(hybrid_base() | {"num_layers": 1, "deterministic_mode": deterministic_mode})
+        **(
+            hybrid_base()
+            | {
+                "num_layers": 1,
+                "deterministic_mode": deterministic_mode,
+                "mamba_varlen_ssd_training": mamba_varlen_ssd_training,
+            }
+        )
     )
     mixer = MambaMixer(
         config,
@@ -169,16 +177,29 @@ class TestMambaMixerDeterminism:
         Utils.destroy_model_parallel()
 
     @requires_deterministic_conv1d
-    @pytest.mark.parametrize("packed_layout", ["none", "unpadded", "padded"])
-    def test_mixer_replays_bit_exactly(self, monkeypatch, packed_layout):
+    @pytest.mark.parametrize(
+        "packed_layout, varlen_ssd",
+        [
+            ("none", False),
+            ("unpadded", False),
+            ("padded", False),
+            ("unpadded", True),
+            ("padded", True),
+        ],
+    )
+    def test_mixer_replays_bit_exactly(self, monkeypatch, packed_layout, varlen_ssd):
         """Two runs of one mixer agree bitwise under the deterministic conv reduction.
 
         ``MAMBA_DETERMINISTIC`` pins the SSD scan, whose nondeterminism would otherwise reach
-        the conv weight gradient, so a failure points at the convolution.
+        the conv weight gradient, so a failure points at the convolution. The varlen SSD path
+        (``mamba_varlen_ssd_training``) runs Megatron's own kernels, which follow the tuning
+        package's deterministic mode instead.
         """
         monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
         monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
-        mixer = _build_mixer()
+        if varlen_ssd:
+            monkeypatch.setattr(tuning_policy, "_deterministic_override", True)
+        mixer = _build_mixer(mamba_varlen_ssd_training=varlen_ssd)
         hidden_size = mixer.config.hidden_size
         micro_batch = _MICRO_BATCH if packed_layout == "none" else 1
         packed_seq_params = None
@@ -220,9 +241,11 @@ class TestMambaMixerDeterminism:
 
         assert_bit_exact(out_a, grads_a, out_b, grads_b)
 
-        if packed_seq_params is not None:
+        if packed_seq_params is not None and not varlen_ssd:
             # A separately constructed reference also catches missing/wrong boundaries,
-            # even if the broken implementation would replay deterministically.
+            # even if the broken implementation would replay deterministically. The varlen
+            # path takes its boundaries from cu_seqlens, not seq_idx; test_mamba_mixer.py
+            # checks its chunk layout.
             assert packed_seq_params.seq_idx is None
             packed_seq_params.seq_idx = torch.tensor(
                 [[0] * 256 + [1] * 384 + [2] * 384], device="cuda", dtype=torch.int32

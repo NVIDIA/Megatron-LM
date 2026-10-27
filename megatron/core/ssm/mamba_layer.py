@@ -369,6 +369,14 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             and kwargs.get('inference_context') is None
             and not torch.is_inference_mode_enabled()  # for inference eager dummy_forward
         ):
+            # The varlen SSD path builds its chunk layout from the sequence lengths with a GPU
+            # sync, so it cannot be captured. Run the layer eagerly instead; the other layers'
+            # graphs and the inference graphs of this layer are unaffected.
+            if (
+                self.config.mamba_varlen_ssd_training
+                and kwargs.get('packed_seq_params') is not None
+            ):
+                return False
             return True
         elif InferenceMode.is_active() and (
             hasattr(self, 'cudagraph_manager')
