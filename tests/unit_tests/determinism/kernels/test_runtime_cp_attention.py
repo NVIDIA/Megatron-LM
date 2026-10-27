@@ -256,7 +256,8 @@ def _replay_flash_dispatch(path, flash_version, sink):
             hidden_dropout=0.0,
             add_bias_linear=False,
             softmax_scale=0.25,  # Not 1/sqrt(head_dim): the choice must be observable.
-            flash_attention_version=flash_version,  # Pin it so every environment replays the same kernel.
+            # Pin the version so every environment replays the same kernel.
+            flash_attention_version=flash_version,
         )
         submodules = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
         module = SelfAttention(
@@ -358,14 +359,13 @@ def test_flash_decode_dispatch_config_softmax_scale_replays(path):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and flash-attn")
 @pytest.mark.parametrize("path", ["prefill", "decode"])
-@pytest.mark.parametrize("flash_version", [2])
-def test_flash_decode_dispatch_learnable_sink_replays(path, flash_version):
+def test_flash_decode_dispatch_learnable_sink_replays(path):
     """The dynamic-inference attention dispatch applies a per-head sink deterministically."""
     from megatron.core.transformer import attention as attention_module
 
-    if flash_version == 2 and (
+    if (
         attention_module.flash_attn_varlen_func is None
         or attention_module.flash_attn_with_kvcache is None
     ):
         pytest.skip("requires flash-attn")
-    _replay_flash_dispatch(path, flash_version, sink=True)
+    _replay_flash_dispatch(path, flash_version=2, sink=True)
