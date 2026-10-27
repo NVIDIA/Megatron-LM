@@ -46,6 +46,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     micro_batch_size = (
         cfg.validation.eval_micro_batch_size if is_eval else cfg.train.micro_batch_size
     )
+
     if split == Split.valid and cfg.validation.full_validation:
         batch_sampler = MegatronFullValidationSampler(
             total_samples=len(dataset),
@@ -95,16 +96,15 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             DistributedSignalHandler(cfg.train.exit_signal).__enter__()
 
     maybe_worker_init_fn = worker_init_fn if args.num_workers > 0 else None
-    # Identity collate for VarlenDataset and packing-scheduler paths;
-    # they emit one variable-length dict per sample, not stack-able by
-    # the default collate. --varlen-sbhd-validation is excluded: it bypasses
-    # packing and emits fixed-length [seq_length] samples that the default
-    # collate stacks normally.
+    # Identity collate for VarlenDataset and packing-scheduler paths; they emit
+    # one variable-length dict per sample, not stack-able by the default
+    # collate. --varlen-sbhd-validation is excluded: it bypasses packing and
+    # emits fixed-length [seq_length] samples that the default collate stacks
+    # normally.
     if (
         (args.use_varlen_dataset and not args.varlen_sbhd_validation)
         or args.dynamic_context_parallel
         or args.sequence_packing_scheduler is not None
-        or getattr(args, "use_vanilla_collate_fn", False)
     ):
         extra_kwargs = {"collate_fn": lambda x: x}
     else:
@@ -114,12 +114,6 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     # without consuming a draw.
     loader_generator = torch.Generator()
     loader_generator.manual_seed(torch.initial_seed())
-    if args.sequence_packing_scheduler is not None and args.num_workers > 0 and not is_eval:
-        # Keep a full next global batch in flight for packing schedulers.
-        items_per_step = cfg.train.global_batch_size // (
-            micro_batch_size * mpu.get_data_parallel_world_size()
-        )
-        extra_kwargs["prefetch_factor"] = max(2, -(-items_per_step // args.num_workers))
     return torch.utils.data.DataLoader(
         dataset,
         batch_sampler=batch_sampler,

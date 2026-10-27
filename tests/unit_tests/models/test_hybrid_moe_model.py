@@ -419,6 +419,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "dynamic_context_parallel": False,
     "min_dynamic_context_parallel_size": 1,
     "hybrid_context_parallel": False,
+    "dynamic_context_parallel": False,
+    "min_dynamic_context_parallel_size": 1,
     "max_seqlen_per_dp_cp_rank": None,
     "fallback_to_eager_attn": False,
     "inference_cuda_graph_scope": {
@@ -430,6 +432,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "inference_disable_triton_nvls_kernels": False,
     "inference_grouped_gemm_backend": "vllm",
     "inference_flashinfer_mxfp8_token_capacity": None,
+    "inference_moe_nvfp4_recipe": None,
     "inference_moe_disable_fused_quant_kernels": False,
     "inference_moe_token_dispatcher_type": "nvls",
     "linear_attention_type": None,

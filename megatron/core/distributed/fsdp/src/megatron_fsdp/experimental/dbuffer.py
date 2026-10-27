@@ -215,6 +215,15 @@ class DBuffer:
             return symm_mem.is_symm_mem_tensor(self.local_buffer)
         return self.allocated_from_symm_mem
 
+    @property
+    def is_allocated(self) -> bool:
+        """Whether the local buffer has backing storage.
+
+        ``release_storage()`` clears this and ``reallocate_storage()`` restores it.
+        Empty local buffers are always allocated.
+        """
+        return self.local_buffer.numel() == 0 or self.local_buffer.untyped_storage().nbytes() > 0
+
     def reallocate_storage(self) -> None:
         """Restore the local buffer's backing storage to its logical size."""
         # The allocator may hand back a different address than release_storage() freed.

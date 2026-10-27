@@ -3,6 +3,7 @@
 """Training-loop plumbing regression tests."""
 
 import inspect
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
@@ -32,7 +33,16 @@ class _Rerun:
         return False, True, 0  # (checkpoint, exit, code)
 
 
-def _run(*, args_overrides=None, model=None, optimizer=None, return_result=False, **kwargs):
+class _RerunThroughOptimizer(_Rerun):
+    """Run one forward/backward body and continue through the optimizer step."""
+
+    def should_checkpoint_and_exit(self):
+        return False, False, 0
+
+
+def _run(
+    *, args_overrides=None, model=None, optimizer=None, config=None, return_result=False, **kwargs
+):
     args = SimpleNamespace(
         save_params_interval=None,
         save_activations_interval=None,
@@ -65,21 +75,42 @@ def _run(*, args_overrides=None, model=None, optimizer=None, return_result=False
             model=model,
             optimizer=optimizer,
             opt_param_scheduler=None,
-            config=SimpleNamespace(),
+            config=config or SimpleNamespace(),
             forward_backward_func=lambda **kw: captured.update(kw) or [],
             iteration=0,
             **kwargs,
         )
+    # Dev's 12-field result with main's scheduled microbatch count appended.
+    assert len(result) == 13
+    assert result[-2] is None  # early exit before optimizer/sample accounting
+    captured['returned_num_microbatches'] = result[-1]
     return result if return_result else captured
 
 
 def test_train_step_early_exit_keeps_normal_result_field_order():
+    # Dev's 12-field train_step result, with main's scheduled microbatch count
+    # (ea99fdfce) appended as the 13th field.
     result = _run(return_result=True)
-    assert len(result) == 12
+    assert len(result) == 13
     assert result[:5] == ({}, True, False, True, 0)
     assert result[5:8] == (None, None, None)
     assert result[8] == 1  # num_microbatches, not an exit-path placeholder
     assert result[11] is None  # samples_seen is not computed before early exit
+    assert result[12] == 1  # main's appended scheduled microbatch count
+
+
+def test_train_step_returns_scheduled_microbatch_count():
+    packed_iterator = iter([1, 2, 3])
+    with (
+        mock.patch.object(
+            training_mod, 'wrap_data_iterator', return_value=(packed_iterator, 3, 60, 1200)
+        ),
+        mock.patch.object(training_mod, 'get_attr_wrapped_model', return_value=object()),
+        mock.patch.object(training_mod, 'set_seqlen_stats_in_iteration'),
+    ):
+        captured = _run(config=SimpleNamespace(sequence_packing_scheduler='default_dynamic_cp'))
+    assert captured['num_microbatches'] == captured['returned_num_microbatches'] == 3
+    assert captured['data_iterator'] is packed_iterator
 
 
 def test_train_step_forwards_schedule_plumbing():
@@ -470,7 +501,14 @@ def test_train_step_wraps_sequence_packing_after_rerun_check():
     config = SimpleNamespace(sequence_packing_scheduler="default_dynamic_cp")
     captured = {}
     forwarded_iterators = []
-    model = [SimpleNamespace(force_all_reduce=False, zero_grad_buffer=lambda: None)]
+    # wrap_data_iterator takes pg_collection from the model (main ea99fdfce), so the
+    # mock has to carry one for the plumbing assertion below.
+    model_pg_collection = object()
+    model = [
+        SimpleNamespace(
+            force_all_reduce=False, zero_grad_buffer=lambda: None, pg_collection=model_pg_collection
+        )
+    ]
     rerun = mock.MagicMock()
     rerun.should_run_forward_backward.side_effect = [True, True, False]
     rerun.should_checkpoint_and_exit.return_value = (False, True, 0)
@@ -504,11 +542,13 @@ def test_train_step_wraps_sequence_packing_after_rerun_check():
     assert rerun.should_run_forward_backward.call_args_list[0].args[0] is original_iterator
     assert rerun.should_run_forward_backward.call_args_list[1].args[0] is packed_iterator
     assert rerun.should_run_forward_backward.call_args_list[2].args[0] is packed_iterator
-    wrap_data_iterator.assert_called_once_with(original_iterator, config, 1)
+    wrap_data_iterator.assert_called_once_with(
+        original_iterator, config, 1, pg_collection=model_pg_collection
+    )
     assert forwarded_iterators == [packed_iterator, packed_iterator]
     assert captured["num_microbatches"] == 3
-    assert len(result) == 12
-    assert result[8:] == (3, 12.0, 34.0, None)
+    assert len(result) == 13
+    assert result[8:] == (3, 12.0, 34.0, None, 3)
 
 
 @pytest.mark.parametrize(
@@ -724,3 +764,179 @@ def test_train_step_supports_bare_distributed_optimizer_for_mxfp8_staging():
         _run(model=model, optimizer=optimizer)
 
     optimizer._copy_main_params_to_param_buffer.assert_called_once_with()
+
+
+def test_model_process_groups_fall_back_when_attribute_is_missing_or_none():
+    fallback = object()
+    with mock.patch.object(
+        training_mod.ProcessGroupCollection, "use_mpu_process_groups", return_value=fallback
+    ) as use_mpu_process_groups:
+        assert training_mod._get_model_pg_collection(SimpleNamespace()) is fallback
+        assert (
+            training_mod._get_model_pg_collection(SimpleNamespace(pg_collection=None)) is fallback
+        )
+
+    assert use_mpu_process_groups.call_count == 2
+
+
+def test_model_process_groups_are_found_through_model_wrappers():
+    pg_collection = object()
+    wrapped_model = SimpleNamespace(module=SimpleNamespace(pg_collection=pg_collection))
+
+    assert training_mod._get_model_pg_collection(wrapped_model) is pg_collection
+
+
+def test_train_step_invokes_tensor_metric_observer_before_optimizer():
+    args = SimpleNamespace(
+        save_params_interval=None,
+        save_activations_interval=None,
+        save_tokens_per_expert_interval=None,
+        save_wgrads_interval=None,
+        save_dgrads_interval=None,
+        reuse_grad_buf_for_mxfp8_param_ag=False,
+        overlap_param_gather=False,
+        seq_length=8,
+        micro_batch_size=1,
+        decoder_seq_length=None,
+        empty_unused_memory_level=0,
+        vision_pretraining=False,
+        qk_clip=False,
+        log_num_zeros_in_grad=False,
+        data_parallel_size=1,
+        gtp_weight_remat_size=1,
+    )
+    events = []
+    pg_collection = SimpleNamespace(mp=object(), pp=object(), dp_cp=object(), dp_cp_gtp_remat=None)
+    model = [
+        SimpleNamespace(
+            force_all_reduce=False, zero_grad_buffer=lambda: None, pg_collection=pg_collection
+        )
+    ]
+    optimizer = SimpleNamespace(
+        zero_grad=lambda: None, step=lambda: events.append("optimizer") or (True, 1.0, 0)
+    )
+    scheduler = mock.MagicMock()
+
+    def observer(**kwargs):
+        events.append("observer")
+        assert model[0].force_all_reduce is False
+        assert kwargs == {
+            "model": model,
+            "optimizer": optimizer,
+            "iteration": 7,
+            "pg_collection": pg_collection,
+        }
+
+    with (
+        mock.patch.object(training_mod, "get_args", return_value=args),
+        mock.patch.object(training_mod, "get_timers", return_value=mock.MagicMock()),
+        mock.patch.object(
+            training_mod, "get_rerun_state_machine", return_value=_RerunThroughOptimizer()
+        ),
+        mock.patch.object(training_mod, "get_num_microbatches", return_value=1),
+        mock.patch.object(training_mod, "has_nvidia_modelopt", False),
+        mock.patch.object(training_mod, "is_pp_last_stage", return_value=False),
+        mock.patch.object(training_mod, "_get_samples_seen_in_iteration", return_value=1),
+        mock.patch.object(
+            training_mod,
+            "logical_and_across_model_parallel_group",
+            side_effect=lambda value, group: value,
+        ),
+        mock.patch.object(
+            training_mod,
+            "reduce_max_stat_across_model_parallel_group",
+            side_effect=lambda value, group: value,
+        ),
+    ):
+        training_mod.train_step(
+            forward_step_func=lambda *a, **k: None,
+            data_iterator=iter([]),
+            model=model,
+            optimizer=optimizer,
+            opt_param_scheduler=scheduler,
+            config=SimpleNamespace(barrier_with_L1_time=False, log_max_attention_logit=False),
+            forward_backward_func=lambda **kw: [],
+            iteration=7,
+            tensor_metric_observer=observer,
+        )
+
+    assert events == ["observer", "optimizer"]
+    assert model[0].force_all_reduce is False
+    scheduler.step.assert_called_once_with(increment=1)
+
+
+def test_train_step_scopes_forward_tensor_observation_around_schedule():
+    args = SimpleNamespace(
+        save_params_interval=None,
+        save_activations_interval=None,
+        save_tokens_per_expert_interval=None,
+        save_wgrads_interval=None,
+        save_dgrads_interval=None,
+        reuse_grad_buf_for_mxfp8_param_ag=False,
+        overlap_param_gather=False,
+        seq_length=8,
+        micro_batch_size=1,
+        decoder_seq_length=None,
+        empty_unused_memory_level=0,
+        vision_pretraining=False,
+        qk_clip=False,
+        log_num_zeros_in_grad=False,
+        data_parallel_size=1,
+        gtp_weight_remat_size=1,
+    )
+    events = []
+    pg_collection = SimpleNamespace(mp=object(), pp=object(), dp_cp=object(), dp_cp_gtp_remat=None)
+    model = [
+        SimpleNamespace(
+            force_all_reduce=False, zero_grad_buffer=lambda: None, pg_collection=pg_collection
+        )
+    ]
+    optimizer = SimpleNamespace(
+        zero_grad=lambda: None, step=lambda: events.append("optimizer") or (True, 1.0, 0)
+    )
+
+    class Observer:
+        @contextmanager
+        def observe_forward_backward(self, **kwargs):
+            assert kwargs == {"model": model, "iteration": 7, "pg_collection": pg_collection}
+            events.append("observe-enter")
+            yield
+            events.append("observe-exit")
+
+        def __call__(self, **kwargs):
+            events.append("commit")
+
+    with (
+        mock.patch.object(training_mod, "get_args", return_value=args),
+        mock.patch.object(training_mod, "get_timers", return_value=mock.MagicMock()),
+        mock.patch.object(
+            training_mod, "get_rerun_state_machine", return_value=_RerunThroughOptimizer()
+        ),
+        mock.patch.object(training_mod, "get_num_microbatches", return_value=1),
+        mock.patch.object(training_mod, "has_nvidia_modelopt", False),
+        mock.patch.object(training_mod, "is_pp_last_stage", return_value=False),
+        mock.patch.object(training_mod, "_get_samples_seen_in_iteration", return_value=1),
+        mock.patch.object(
+            training_mod,
+            "logical_and_across_model_parallel_group",
+            side_effect=lambda value, group: value,
+        ),
+        mock.patch.object(
+            training_mod,
+            "reduce_max_stat_across_model_parallel_group",
+            side_effect=lambda value, group: value,
+        ),
+    ):
+        training_mod.train_step(
+            forward_step_func=lambda *a, **k: None,
+            data_iterator=iter([]),
+            model=model,
+            optimizer=optimizer,
+            opt_param_scheduler=mock.MagicMock(),
+            config=SimpleNamespace(barrier_with_L1_time=False, log_max_attention_logit=False),
+            forward_backward_func=lambda **kw: events.append("forward-backward") or [],
+            iteration=7,
+            tensor_metric_observer=Observer(),
+        )
+
+    assert events == ["observe-enter", "forward-backward", "observe-exit", "commit", "optimizer"]

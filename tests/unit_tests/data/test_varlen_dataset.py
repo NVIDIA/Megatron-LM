@@ -1282,7 +1282,12 @@ def test_sbhd_get_batch_returns_dataset_padding_mask(monkeypatch):
     from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
 
     padding_mask = torch.tensor([[False, False, True, True]], dtype=torch.bool)
+    # NOTE(nightly-sync 26_10_2026): main's DCP V2 rewrite (ea99fdfce) made get_batch return a
+    # list in BATCH_KEYS order instead of dev's 7-tuple, so a TP receiver's batch must carry
+    # every key. Dev's assertion is unchanged in intent -- the dataset padding mask must still
+    # survive the handoff -- it is just addressed by name now that it is no longer last.
     source_batch = {
+        **dict.fromkeys(pretrain_gpt.BATCH_KEYS),
         "tokens": torch.tensor([[1, 2, 0, 0]], dtype=torch.int64),
         "labels": torch.tensor([[2, 0, 0, 0]], dtype=torch.int64),
         "loss_mask": torch.tensor([[1.0, 1.0, 0.0, 0.0]]),
@@ -1296,27 +1301,48 @@ def test_sbhd_get_batch_returns_dataset_padding_mask(monkeypatch):
         use_varlen_dataset=True,
         varlen_sbhd_validation=True,
         dynamic_context_parallel=False,
+        # Fields main's rewritten get_batch reads that dev's did not.
+        context_parallel_size=1,
+        dataloader_inter_document_masking=False,
+        create_attention_mask_in_dataloader=False,
+        micro_batch_size=1,
+        seq_length=4,
+        pipeline_model_parallel_size=2,
     )
     config = SimpleNamespace(
-        virtual_pipeline_model_parallel_size=None, pad_packed_seq_alignment=None
+        virtual_pipeline_model_parallel_size=None,
+        pad_packed_seq_alignment=None,
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=0,
     )
 
     monkeypatch.setattr(pretrain_gpt, "get_args", lambda: args)
     monkeypatch.setattr(pretrain_gpt, "core_transformer_config_from_args", lambda _: config)
     # Exercise an intermediate PP stage: it must not take the legacy early return.
     monkeypatch.setattr(pretrain_gpt, "is_first_or_last_pipeline_stage", lambda _: False)
-    monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank", lambda *args, **kwargs: False)
+    # Merged pretrain_gpt carries main's aliased import, so patch the alias.
+    monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank_func", lambda *args, **kwargs: False)
+    # Main's rewrite reads the process groups in get_batch itself rather than leaving them to
+    # the callee; stub them so this stays a single-process unit test. A non-zero TP rank keeps
+    # the batch on the broadcast-receive path, which is what exercises needs_padding_mask.
+    monkeypatch.setattr(pretrain_gpt.mpu, "get_tensor_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(pretrain_gpt.mpu, "get_tensor_model_parallel_src_rank", lambda: 0)
+    monkeypatch.setattr(pretrain_gpt.mpu, "get_tensor_model_parallel_group", lambda: None)
+    monkeypatch.setattr(pretrain_gpt.mpu, "is_pipeline_first_stage", lambda: False)
+    monkeypatch.setattr(pretrain_gpt.mpu, "is_pipeline_last_stage", lambda: False)
+    monkeypatch.setattr(pretrain_gpt, "get_context_parallel_group", lambda: None)
 
     def get_batch_on_this_tp_rank(*args, **kwargs):
         assert kwargs["needs_padding_mask"] is True
         return source_batch.copy()
 
     monkeypatch.setattr(pretrain_gpt, "get_batch_on_this_tp_rank", get_batch_on_this_tp_rank)
-    monkeypatch.setattr(pretrain_gpt, "get_batch_on_this_cp_rank", lambda batch: batch)
+    monkeypatch.setattr(pretrain_gpt, "get_batch_on_this_cp_rank", lambda batch, **_kwargs: batch)
     prebuild = MagicMock()
     monkeypatch.setattr(cp_balanced_indexer, "prebuild_balanced_layouts", prebuild)
 
-    *_, returned_padding_mask = pretrain_gpt.get_batch(iter(()))
+    returned = pretrain_gpt.get_batch(iter(()))
+    returned_padding_mask = returned[pretrain_gpt.BATCH_KEYS.index("padding_mask")]
     assert torch.equal(returned_padding_mask, padding_mask)
     prebuild.assert_not_called()
 
@@ -1325,14 +1351,21 @@ def test_sbhd_dataset_is_built_on_intermediate_pipeline_stage(monkeypatch):
     """Every PP stage needs SBHD padding metadata for its local MoE layers."""
     import pretrain_gpt
 
-    args = SimpleNamespace(use_varlen_dataset=True, varlen_sbhd_validation=True)
+    # NOTE(nightly-sync 26_10_2026): sequence_packing_scheduler is explicit now because the
+    # merged is_dataset_built_on_rank keeps main's direct `args.sequence_packing_scheduler`
+    # read rather than dev's getattr, matching pretrain_hybrid's resolution.
+    args = SimpleNamespace(
+        use_varlen_dataset=True, varlen_sbhd_validation=True, sequence_packing_scheduler=None
+    )
     monkeypatch.setattr(pretrain_gpt, "get_args", lambda: args)
     monkeypatch.setattr(
         pretrain_gpt, "core_transformer_config_from_args", lambda _: SimpleNamespace()
     )
     monkeypatch.setattr(pretrain_gpt.mpu, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(pretrain_gpt, "is_first_or_last_pipeline_stage", lambda _: False)
-    monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank", lambda *args, **kwargs: False)
+    # Merged pretrain_gpt carries main's aliased import, so patch the alias. The restored
+    # varlen-SBHD disjunct should short-circuit before this is consulted at all.
+    monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank_func", lambda *args, **kwargs: False)
 
     assert pretrain_gpt.is_dataset_built_on_rank() is True
 

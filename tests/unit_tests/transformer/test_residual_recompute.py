@@ -846,6 +846,11 @@ class TestResidualStreamRecomputeIntegration:
                 events.append("cp_prepare")
                 return hidden_states, layer_packed_seq_params
 
+            def get_layer_padding_mask(self, layer_index, default, masks):
+                assert layer_index == 0
+                assert masks is None
+                return default
+
             def finalize_layer(self, layer_index, hidden_states):
                 assert layer_index == 0
                 events.append("cp_finalize")

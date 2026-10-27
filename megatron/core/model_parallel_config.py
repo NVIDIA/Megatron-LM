@@ -147,7 +147,7 @@ class ModelParallelConfig:
     """Splits network input along sequence dimension across GPU ranks."""
 
     hierarchical_context_parallel_sizes: Optional[list[int]] = None
-    """Degrees of the hierarchical context parallelism. Users should provide a list to specify 
+    """Degrees of the hierarchical context parallelism. Users should provide a list to specify
        the sizes for different levels. Taking the a2a+p2p cp comm type as example, it contains
        groups of two levels, so the first value of the list indicates the group size of the a2a
        communication type, and the second value indicates the group size of the p2p communication
@@ -159,13 +159,13 @@ class ModelParallelConfig:
     Maximum sequence length per DPxCP rank. This is the maximum sequence length each rank
     can handle without overflowing the memory. Typically, a good starting point is to set this
     to maximum sequence length / context parallel size.
-    This is used to calculate the number and length of sub-samples assigned to 
+    This is used to calculate the number and length of sub-samples assigned to
     each rank when sequence_packing_scheduler is not None.
     """
 
     dynamic_context_parallel: bool = False
     """
-    If true, enables dynamic context parallel. This is used to balance the workload of 
+    If true, enables dynamic context parallel. This is used to balance the workload of
     each CP rank when we use packed samples with variable sequence lengths.
     Dynamic CP forms variable-sized CP groups from the DPxCP ranks dynamically.
     Please set max_seqlen_per_dp_cp_rank.
@@ -471,14 +471,14 @@ class ModelParallelConfig:
 
     ep_overlap_early_attn_memory_release: bool = False
     """Enable early memory release of attention activations during EP overlap.
-    EP overlap can increase peak memory usage when the overlapped forward module allocates 
-    more memory than what is freed by the backward module. This flag addresses this by 
+    EP overlap can increase peak memory usage when the overlapped forward module allocates
+    more memory than what is freed by the backward module. This flag addresses this by
     reordering the attention backward pass to occur earlier in the schedule.
     Specifically:
     - Without this flag: attn_bwd executes after moe_combine_fwd
     - With this flag: attn_bwd executes before mlp_fwd
     The earlier execution releases attention activations sooner, reducing peak memory.
-    Note: This may impact performance as moe_combine_fwd and moe_dispatch_bwd become 
+    Note: This may impact performance as moe_combine_fwd and moe_dispatch_bwd become
     exposed (not overlapped with other computation).
     """
 
@@ -556,7 +556,7 @@ class ModelParallelConfig:
         metadata={"argparse_meta": {"arg_names": ["--overlap-p2p-communication-warmup-flush"]}},
     )
     """If true, overlap communication and computation in warm up and flush phase.
-       Only valid when overlap_p2p_comm is True and batch_p2p_comm is False. 
+       Only valid when overlap_p2p_comm is True and batch_p2p_comm is False.
        Defaults to False.
     """
 
@@ -566,22 +566,22 @@ class ModelParallelConfig:
             "argparse_meta": {"arg_names": ["--microbatch-group-size-per-virtual-pipeline-stage"]}
         },
     )
-    """This value specifies the number of micro-batches that are executed 
+    """This value specifies the number of micro-batches that are executed
        at a time for a given virtual stage (both forward and backward).
-       Default (in __post_init__() method below) to pipeline_parallel_size 
+       Default (in __post_init__() method below) to pipeline_parallel_size
        which specifies a depth-first schedule.
-       Example: for PP=2 VP=2, when microbatch_group_size_per_vp_stage=2, 
-       num_microbatches = 4, we have 
+       Example: for PP=2 VP=2, when microbatch_group_size_per_vp_stage=2,
+       num_microbatches = 4, we have
        rank 0 | 0 1 0 1 2 3 2 3
        rank 1 |   0 1 0 1 2 3 2 3
-       When microbatch_group_size_per_vp_stage=3, num_microbatches = 5, 
+       When microbatch_group_size_per_vp_stage=3, num_microbatches = 5,
        we have
-       rank 0 | 0 1 2 0 1 2 3 4 3 4 
+       rank 0 | 0 1 2 0 1 2 3 4 3 4
        rank 1 |   0 1 2 0 1 2 3 4 3 4
     """
 
     mtp_standalone: bool = False
-    """This will be set automatically according to the pipeline layout, 
+    """This will be set automatically according to the pipeline layout,
     and will be set to True if MTP is in a separate vpp stage."""
 
     ###################
@@ -656,6 +656,7 @@ class ModelParallelConfig:
                 "hybrid_context_parallel is deprecated and will be removed in a future release. "
                 "Use dynamic_context_parallel instead.",
                 DeprecationWarning,
+                stacklevel=2,
             )
             if self.dynamic_context_parallel:
                 raise ValueError(
@@ -663,6 +664,7 @@ class ModelParallelConfig:
                     "Please use dynamic_context_parallel only."
                 )
             self.dynamic_context_parallel = True
+            self.hybrid_context_parallel = False
 
         if self.dynamic_context_parallel:
             if self.sequence_packing_scheduler is None:
@@ -678,6 +680,17 @@ class ModelParallelConfig:
                     f"min_dynamic_context_parallel_size must be >= 1, "
                     f"got {self.min_dynamic_context_parallel_size}"
                 )
+
+            if self.deterministic_mode:
+                raise ValueError("Dynamic context parallelism does not support deterministic_mode")
+        # NOTE(nightly-sync 26_10_2026): main's ea99fdfce additionally rejects
+        # sequence_packing_scheduler='default_dynamic_cp' when dynamic_context_parallel is
+        # False. That restriction is not adopted here because dev treats the packing-aware
+        # scheduler as usable under static CP and has test coverage asserting that
+        # configuration constructs successfully (e.g.
+        # tests/unit_tests/transformer/test_balanced_dynamic_pack_config.py and
+        # tests/unit_tests/transformer/experimental_attention_variant/
+        # test_attention_variant_dsa.py).
 
         if self.thd_tail_padding_policy not in (None, "append_dummy_seq", "extend_last"):
             raise ValueError(

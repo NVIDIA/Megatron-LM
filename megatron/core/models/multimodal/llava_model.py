@@ -1154,7 +1154,7 @@ class LLaVAModel(MegatronModule):
                 from megatron.core.utils import get_batch_on_this_cp_rank
 
                 batch = get_batch_on_this_cp_rank(
-                    batch, is_hybrid_cp=False, cp_group=self.pg_collection.cp
+                    batch, dynamic_cp=False, cp_group=self.pg_collection.cp
                 )
             else:
                 assert HAVE_TEX and is_te_min_version(

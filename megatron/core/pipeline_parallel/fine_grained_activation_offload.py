@@ -1073,6 +1073,8 @@ class ChunkOffloadHandler:
         debug_rank("tensor_need_offloading_checker")
         if not self._can_manage_tensor_for_offload(tensor):
             return False
+        if is_checkpoint_without_output_tensor(tensor):
+            return False
         if _te_do_not_offload(tensor):
             return False
         if is_checkpoint_without_output_tensor(tensor):

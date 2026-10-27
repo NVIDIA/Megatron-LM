@@ -215,6 +215,11 @@ def test_dsv4_retains_dev_runtime_cp_layout_ownership(monkeypatch, dynamic):
         sequence_packing_scheduler="default_dynamic_cp" if dynamic else "dp_balanced",
         max_seqlen_per_dp_cp_rank=128,
         dsa_cp_balance_indexer=True,
+        # Required by TransformerConfig for the dynamic=True case: loss scaling cannot
+        # use the static TP x CP group once CP groups are picked per microbatch. This
+        # test only asserts CP-layout ownership, so the flag is incidental to it, and
+        # the dynamic=False case ignores it.
+        calculate_per_token_loss=True,
     )
     assert config.dsa_cp_balance_indexer
     assert config.dynamic_context_parallel == dynamic
