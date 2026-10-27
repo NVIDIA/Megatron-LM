@@ -1,5 +1,5 @@
 {
-  "_comment": "Grandfathered reads of global process-group state in megatron/core. Entries are scope:kind:detail; duplicates count separate calls. This list must only shrink. Remove stale entries with `python tools/check_process_group_usage.py --update`.",
+  "_comment": "Grandfathered uses of global parallel_state in megatron/core. Entries are scope:kind:detail; duplicates count separate calls. This list must only shrink. Remove stale entries with `python tools/check_process_group_usage.py --update`.",
   "allowed": {
     "megatron/core/config_logger.py": [
       "log_config_to_disk:function:parallel_state.get_all_ranks"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Fail on *new* reads of global process-group state in ``megatron/core``.
+"""Fail on *new* uses of the global ``parallel_state`` in ``megatron/core``.
 
 ``megatron.core.parallel_state`` holds the process groups for a single, global parallel grid.
 Reading it inside library code is being removed: for a model built on independent parallel grids
@@ -58,9 +58,9 @@ DEPRECATED_PREFIXES = ("get_",)
 # "_gloo" covers the Gloo group accessors (get_data_parallel_group_gloo,
 # get_expert_data_parallel_group_gloo), which also return groups of the global grid.
 DEPRECATED_SUFFIXES = ("_group", "_groups", "_gloo", "_rank", "_ranks", "_world_size", "_src_rank")
-# Matched by the rules above, but not accessors: get_nccl_options is not deprecated, and the
-# others are counted with DEPRECATED_FUNCTIONS. The test helpers that forbid the global grid stub
-# the accessors only and expect these to keep working.
+# get_ functions that are not accessors, whether or not the suffixes above match them:
+# get_nccl_options is not deprecated, and the others are counted with DEPRECATED_FUNCTIONS. The
+# test helpers that forbid the global grid stub the accessors only and expect these to keep working.
 NOT_ACCESSORS = {
     "get_nccl_options",
     "get_all_ranks",
@@ -359,7 +359,9 @@ def main(argv=None) -> int:
     total = sum(counts.values())
 
     if args.stats:
-        print(f"{total} global process-group read(s) across {len(found)} file(s) in megatron/core")
+        print(
+            f"{total} use(s) of global parallel_state across {len(found)} file(s) in megatron/core"
+        )
         for kind in KINDS:
             print(f"  {kind:10} {counts[kind]}")
         return 0
@@ -371,7 +373,7 @@ def main(argv=None) -> int:
 
     if added:
         n = sum(len(v) for v in added.values())
-        print(f"ERROR: {n} new read(s) of global process-group state in megatron/core:\n")
+        print(f"ERROR: {n} new use(s) of global parallel_state in megatron/core:\n")
         for rel, hits in sorted(added.items()):
             # Show current source locations while keeping line numbers out of the baseline.
             for lineno, identity in _violations_in(REPO_ROOT / rel):
@@ -380,7 +382,18 @@ def main(argv=None) -> int:
         print(
             "\nmegatron/core must not read process groups from parallel_state. Accept a "
             "ProcessGroupCollection or an explicit torch.distributed.ProcessGroup from the "
-            "caller and pass it through.\n"
+            "caller and pass it through."
+        )
+        if any(hit.split(":", 2)[1] == "function" for hits in added.values() for hit in hits):
+            print(
+                "A 'function' use has a replacement of its own, which the function's "
+                "_deprecated_accessor decorator in parallel_state.py names: for example the "
+                "vp_stage of the model chunk, the virtual_pipeline_model_parallel_size of the "
+                "model's configuration, is_pp_first_stage() or is_vp_first_stage() and their "
+                "last-stage forms in megatron.core.pipeline_parallel.utils, or megatron.core.utils "
+                "for the memory buffer."
+            )
+        print(
             "Note that ProcessGroupCollection.use_mpu_process_groups() is NOT a valid "
             "replacement -- it reads the same global state.\n"
             "resolve_process_groups() is counted too: it may only replace a read in the same "
@@ -394,7 +407,7 @@ def main(argv=None) -> int:
             json.dumps(
                 {
                     "_comment": (
-                        "Grandfathered reads of global process-group state in megatron/core. "
+                        "Grandfathered uses of global parallel_state in megatron/core. "
                         "Entries are scope:kind:detail; duplicates count separate calls. "
                         "This list must only shrink. Remove stale entries with "
                         "`python tools/check_process_group_usage.py --update`."
@@ -432,7 +445,7 @@ def main(argv=None) -> int:
         return 1
 
     print(
-        f"OK: no new global process-group reads ({total} grandfathered, "
+        f"OK: no new uses of global parallel_state ({total} grandfathered, "
         f"{counts[GUARDED]} of them guarded)."
     )
     return 0
