@@ -2536,9 +2536,10 @@ def _forward_backward_grad_context(args):
 def _build_pg_collection_from_parallel_state(args):
     """Return the process groups of the global parallel grid as one collection.
 
-    pretrain() builds the model and its optimizer and runs the training loop on this collection,
-    and get_model() builds one when it is called without a collection. The collection carries
-    the Gloo groups the distributed optimizer uses for checkpoint I/O (``intra_dp_cp_gloo`` and
+    pretrain() builds the model and its optimizer and runs the training loop on this collection.
+    setup_model_and_optimizer() and get_model() build one, with a ProcessGroupFallbackWarning,
+    when they are called without a collection. The collection carries the Gloo groups the
+    distributed optimizer uses for checkpoint I/O (``intra_dp_cp_gloo`` and
     ``intra_expt_dp_gloo``), or None for those the job did not create. With
     ``--create-all-gather-group`` the collection also carries the separate data-parallel
     all-gather communicators (``dp_cp_ag``, and ``expt_dp_ag`` with expert parallelism), which
@@ -2972,8 +2973,9 @@ def setup_model_and_optimizer(
 
     pg_collection: process groups that the model and its optimizer are built on. With Gloo
         process groups enabled, a ProcessGroupCollection also supplies them
-        (``intra_dp_cp_gloo`` and ``intra_expt_dp_gloo``). None makes get_model() build the
-        model on the global parallel state, and the optimizer reads it as well.
+        (``intra_dp_cp_gloo`` and ``intra_expt_dp_gloo``). Omitting it is deprecated: one
+        collection is then built from the global parallel state, with a
+        ProcessGroupFallbackWarning, and both the model and the optimizer are built on it.
     """
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use cfg_container; remaining settings still use legacy args.
@@ -2984,6 +2986,14 @@ def setup_model_and_optimizer(
     one_logger = get_one_logger()
 
     cfg = cfg_container if cfg_container is not None else get_run_config()
+
+    if pg_collection is None:
+        warn_global_process_group_fallback(
+            "setup_model_and_optimizer", deprecated_in="0.21", removed_in="0.23"
+        )
+        # Built once, so that the model and its optimizer run on the same groups, including
+        # the all-gather communicators that --create-all-gather-group adds.
+        pg_collection = _build_pg_collection_from_parallel_state(args)
 
     # Typically, --skip-train is the only thing needed to disable the optimizer.
     has_normal_optimizer = not cfg.validation.skip_train
@@ -3077,28 +3087,32 @@ def setup_model_and_optimizer(
             cuda_graph_impl=getattr(args, 'cuda_graph_impl', 'none'),
         )
 
-    if args.logits_save_dir is not None and is_pp_last_stage(
-        _get_model_pg_collection(model, pg_collection).pp
-    ):
-        from megatron.training.distillation import LogitsSaverHooks
-
-        logits_saver = LogitsSaverHooks(
-            save_dir=args.logits_save_dir,
-            k=args.logits_save_top_k,
-            p=args.logits_save_top_p,
-            min_k=args.logits_save_top_p_min_k,
-            save_dtype=args.logits_save_dtype,
-            pg_collection=unwrapped_model[-1].pg_collection,
+    if args.logits_save_dir is not None or args.logits_load_dir is not None:
+        # The logits hooks attach to the output layer on the model's last pipeline stage, and
+        # the saver runs on the same groups that decide that stage.
+        logits_pg_collection = _get_model_pg_collection(
+            model, pg_collection, owner="setup_model_and_optimizer"
         )
-        logits_saver.attach_hooks(unwrapped_model[-1])
+        on_last_stage = is_pp_last_stage(logits_pg_collection.pp)
 
-    if args.logits_load_dir is not None and is_pp_last_stage(
-        _get_model_pg_collection(model, pg_collection).pp
-    ):
-        from megatron.training.distillation import StudentLogitsCapture
+        if args.logits_save_dir is not None and on_last_stage:
+            from megatron.training.distillation import LogitsSaverHooks
 
-        student_logits_capture = StudentLogitsCapture()
-        student_logits_capture.attach_hooks(unwrapped_model[-1])
+            logits_saver = LogitsSaverHooks(
+                save_dir=args.logits_save_dir,
+                k=args.logits_save_top_k,
+                p=args.logits_save_top_p,
+                min_k=args.logits_save_top_p_min_k,
+                save_dtype=args.logits_save_dtype,
+                pg_collection=logits_pg_collection,
+            )
+            logits_saver.attach_hooks(unwrapped_model[-1])
+
+        if args.logits_load_dir is not None and on_last_stage:
+            from megatron.training.distillation import StudentLogitsCapture
+
+            student_logits_capture = StudentLogitsCapture()
+            student_logits_capture.attach_hooks(unwrapped_model[-1])
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
     if skip_optimizer:
