@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import contextlib
 import os
 from inspect import signature
 from unittest import mock
@@ -10,6 +11,7 @@ import torch
 import megatron.core.transformer.multi_latent_attention as mla_module
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
@@ -2483,6 +2485,37 @@ def test_fused_kv_rope_quant_config_requires_mxfp8_attention(dpa_option):
         _fused_kv_rope_quant_config(**overrides)
 
 
+def test_fused_kv_rope_quant_config_accepts_fp4():
+    """FP4 models may run MXFP8 attention; whether they do is decided at run time."""
+    config = _fused_kv_rope_quant_config(fp8=None, fp4="e2m1")
+    assert config.use_fused_mla_kv_rope_quant and config.fp4
+
+
+@pytest.mark.parametrize(
+    "recipe_name, dpa_recipe, expected",
+    [
+        ("MXFP8BlockScaling", "", True),
+        ("NVFP4BlockScaling", "MXFP8BlockScaling", True),
+        ("NVFP4BlockScaling", "", False),
+        ("NVFP4BlockScaling", "DelayedScaling", False),
+        ("Float8CurrentScaling", "MXFP8BlockScaling", False),
+    ],
+)
+def test_is_mxfp8_attention_active(recipe_name, dpa_recipe, expected):
+    """NVFP4 recipes with FP8 DPA run attention in MXFP8 when NVTE_DPA_FP8_RECIPE says so."""
+    te_recipe = pytest.importorskip("transformer_engine.common.recipe")
+    recipe = getattr(te_recipe, recipe_name)(fp8_dpa=True)
+    manager = mock.Mock()
+    manager.is_fp8_enabled.return_value = True
+    manager.get_fp8_recipe.return_value = recipe
+    env = {"NVTE_DPA_FP8_RECIPE": dpa_recipe, "NVTE_FP8_DPA_BWD": "1"}
+    with (
+        mock.patch.object(mla_module, "FP8GlobalStateManager", manager),
+        mock.patch.dict(os.environ, env),
+    ):
+        assert mla_module._is_mxfp8_attention_active() is expected
+
+
 @pytest.mark.launch_on_gb200
 @pytest.mark.skipif(
     get_device_arch_version() < 10,
@@ -2498,7 +2531,7 @@ class TestFusedMLAKVRoPEQuant:
         yield
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize("variant", ["mla", "fused_mla", "fused_q_uproj"])
+    @pytest.mark.parametrize("variant", ["mla", "fused_mla", "fused_q_uproj", "fp4"])
     def test_matches_unfused_path(self, variant):
         if mla_module.fused_mla_kv_rope_mxfp8 is None:
             pytest.skip("Transformer Engine lacks fused_mla_kv_rope_mxfp8")
@@ -2522,7 +2555,22 @@ class TestFusedMLAKVRoPEQuant:
             "NVTE_FLASH_ATTN": "0",
             "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
         }
-        with mock.patch.dict(os.environ, env, clear=False):
+        quantization_context, dpa_recipe = get_fp8_context, contextlib.nullcontext()
+        if variant == "fp4":
+            # NVFP4 linears with MXFP8 attention. TE reads NVTE_DPA_FP8_RECIPE and
+            # NVTE_DPA_FP8_FORMAT when DotProductAttention is imported, so patch those too.
+            from transformer_engine.common.recipe import Format
+            from transformer_engine.pytorch.attention.dot_product_attention import (
+                dot_product_attention as te_dpa,
+            )
+
+            overrides = dict(fp8=None, fp4="e2m1")
+            env.update(NVTE_DPA_FP8_RECIPE="MXFP8BlockScaling", NVTE_DPA_FP8_FORMAT="E4M3")
+            quantization_context = get_fp4_context
+            dpa_recipe = mock.patch.multiple(
+                te_dpa, _dpa_fp8_recipe="MXFP8BlockScaling", _dpa_fp8_format=Format.E4M3
+            )
+        with mock.patch.dict(os.environ, env, clear=False), dpa_recipe:
             attention_cls, submodules = (
                 (FusedMLASelfAttention, get_fused_mla_submodules())
                 if variant == "fused_mla"
@@ -2555,7 +2603,9 @@ class TestFusedMLAKVRoPEQuant:
             results = []
             for attention in (reference, fused):
                 x = hidden_states.clone().requires_grad_(True)
-                with spy as kernel, get_fp8_context(config):
+                # NVFP4 stochastic rounding draws from the RNG: give both passes the same draws.
+                torch.manual_seed(1)
+                with spy as kernel, quantization_context(config):
                     output, _ = attention(x, None)
                 output.backward(grad_output)
                 calls = kernel.call_count
