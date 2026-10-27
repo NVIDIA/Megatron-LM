@@ -187,6 +187,7 @@ from .activation_logging import (
     save_tokens_per_expert,
 )
 from .async_utils import maybe_finalize_async_save
+from .ckpt import native as native_ckpt
 from .dgrad_logging import disable_dgrad_logging, enable_dgrad_logging, save_dgrads
 from .global_vars import (
     destroy_global_vars,
@@ -3181,6 +3182,21 @@ def setup_model_and_optimizer(
         print_rank_0("> converted checkpoint: %s -> %s." % (load_ckpt_format, args.ckpt_format))
         torch.distributed.barrier()
         exit()
+
+    if (
+        args.save is not None
+        and args.use_dist_ckpt
+        and train_state.iteration > 0
+        and not (args.no_load_optim or args.finetune or args.moe_use_upcycling)
+    ):
+        native_ckpt.register_after_load(
+            model,
+            optimizer,
+            opt_param_scheduler,
+            train_state.iteration,
+            train_state.num_floating_point_operations_so_far,
+            preprocess_common_state_dict,
+        )
 
     return model, optimizer, opt_param_scheduler
 
