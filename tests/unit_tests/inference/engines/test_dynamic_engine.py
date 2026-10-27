@@ -13,7 +13,7 @@ from collections import Counter, OrderedDict, deque
 from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
-from functools import partial
+from functools import partial, wraps
 from typing import Dict, List, Optional, Tuple
 from unittest import mock
 
@@ -26,6 +26,8 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.activations import squared_relu
+from megatron.core.inference.apis.async_llm import MegatronAsyncLLM
+from megatron.core.inference.apis.llm import MegatronLLM
 from megatron.core.inference.batch_dimensions_utils import TOKEN_ROUNDER
 from megatron.core.inference.config import (
     AsyncScheduleMode,
@@ -48,6 +50,7 @@ from megatron.core.inference.disaggregation.engine import StateHandoffDynamicInf
 from megatron.core.inference.engines import DynamicInferenceEngine, dynamic_engine
 from megatron.core.inference.engines.dynamic_engine import EngineState, RequestEntry
 from megatron.core.inference.headers import Headers
+from megatron.core.inference.inference_client import InferenceClient, InferenceRequestAborted
 from megatron.core.inference.inference_request import (
     PREFIX_EOS_TOKEN_ID_FIELD,
     PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
@@ -108,6 +111,19 @@ try:
     HAVE_TORCH_MEMORY_SAVER = True
 except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
+
+
+def _async_inference_mode(function):
+    """Keep inference mode active while an async test coroutine executes."""
+
+    @wraps(function)
+    async def wrapped(*args, **kwargs):
+        # torch.inference_mode's regular decorator exits as soon as an async
+        # function returns its coroutine, before that coroutine is awaited.
+        with torch.inference_mode():
+            return await function(*args, **kwargs)
+
+    return wrapped
 
 
 class _ImageOnlyCapabilityWrapper:
@@ -890,6 +906,20 @@ def mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
     )
 
 
+class _StreamingTransportTokenizer:
+    """Pickle-safe tokenizer for the real coordinator transport witness."""
+
+    vocab_size = 100
+    bos = None
+    eod = 99
+
+    def tokenize(self, prompt):
+        return prompt if isinstance(prompt, list) else [ord(char) % 99 for char in prompt]
+
+    def detokenize(self, tokens, **_kwargs):
+        return "".join(f"<{token}>" for token in tokens)
+
+
 @dataclass
 class DynamicEngineTestConfig:
     """Test configuration args."""
@@ -1502,10 +1532,8 @@ class DynamicInferenceEngineTestBase:
         # Text generation controller.
         tokenizer = types.SimpleNamespace(
             vocab_size=test_config.vocab_size,
-            eod=test_config.vocab_size - 1,
             unk_token_id=0,
             detokenize=lambda tokens, **_kwargs: "".join(f"<{token}>" for token in tokens),
-            tokenize=lambda text: [ord(char) % (test_config.vocab_size - 1) for char in text],
             convert_tokens_to_ids=lambda token: 98 if token == "<image>" else 0,
         )
         text_generation_controller = TextGenerationController(
@@ -3324,6 +3352,277 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         delete_cuda_graphs()
         reset_rounder()
         Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @_async_inference_mode
+    async def test_real_coordinator_streams_before_completion_and_matches_greedy(self):
+        """Cross real model steps, coordinator routing, and two independent clients."""
+        config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=513,
+            max_prompt_length=514,
+            num_tokens_to_generate=128,
+            num_gap_steps=0,
+            top_k=1,
+            context_max_requests=4,
+            context_max_tokens=256,
+            context_block_size_tokens=256,
+            enable_chunked_prefill=True,
+            enable_prefix_caching=True,
+        )
+        env = self._build_test_env(config)
+        env.engine.controller.tokenizer = _StreamingTransportTokenizer()
+        shared_prefix = [3, 5, 7, 11] * 64
+        prompts = [
+            [*shared_prefix, *([13, 17, 19, 23] * 65)[:257]],
+            [*shared_prefix, *([29, 31, 37, 41, 43] * 52)[:258]],
+        ]
+        baseline_params = [
+            SamplingParams(
+                num_tokens_to_generate=128,
+                termination_id=-1,
+                top_k=1,
+                return_log_probs=True,
+                top_n_logprobs=2,
+                skip_prompt_log_probs=True,
+                return_prompt_tokens=True,
+            ),
+            SamplingParams(
+                num_tokens_to_generate=48, termination_id=-1, top_k=1, return_prompt_tokens=True
+            ),
+        ]
+        baseline_tokens = []
+        for prompt, params in zip(prompts, baseline_params, strict=True):
+            completed = env.engine.generate([prompt], params)[0]
+            baseline_tokens.append(list(completed.generated_tokens))
+        string_prompt = "serve"
+        string_baseline = env.engine.generate(
+            [string_prompt],
+            SamplingParams(
+                num_tokens_to_generate=24, termination_id=-1, top_k=1, return_prompt_tokens=True
+            ),
+        )[0]
+        env.engine.reset()
+        env.engine.generate(
+            [shared_prefix], SamplingParams(num_tokens_to_generate=1, termination_id=-1, top_k=1)
+        )
+        chunked_request_ids = []
+        schedule_chunked_prefill = env.engine.schedule_chunked_prefill
+
+        def observe_chunked_prefill():
+            schedule_chunked_prefill()
+            if env.engine.context.chunked_prefill_request_id >= 0:
+                chunked_request_ids.append(env.engine.context.chunked_prefill_request_id)
+
+        env.engine.schedule_chunked_prefill = observe_chunked_prefill
+
+        coordinator_addr = await env.engine.start_listening_to_data_parallel_coordinator(
+            hostname="127.0.0.1"
+        )
+        rank = torch.distributed.get_rank()
+        clients = []
+        primary_client = None
+        rank_zero_error = None
+        try:
+            if rank == 0:
+                primary_client = InferenceClient(coordinator_addr)
+                peer_client = InferenceClient(coordinator_addr)
+                clients = [primary_client, peer_client]
+                for client in clients:
+                    client.start(loop=asyncio.get_running_loop(), connect_timeout_seconds=30)
+
+                stream_params = [
+                    SamplingParams(
+                        num_tokens_to_generate=128,
+                        termination_id=-1,
+                        top_k=1,
+                        return_log_probs=True,
+                        top_n_logprobs=2,
+                        skip_prompt_log_probs=True,
+                        return_prompt_tokens=True,
+                        streaming_interval=2,
+                    ),
+                    SamplingParams(
+                        num_tokens_to_generate=48,
+                        termination_id=-1,
+                        top_k=1,
+                        return_prompt_tokens=True,
+                        streaming_interval=3,
+                    ),
+                ]
+                streams = [
+                    client.add_request_streaming(prompt, params)
+                    for client, prompt, params in zip(clients, prompts, stream_params, strict=True)
+                ]
+                assert [stream.request_id for stream in streams] == [0, 0]
+
+                async def collect(stream, expect_logprobs):
+                    partials = []
+                    final = None
+                    first_partial_was_live = False
+                    active_steps = []
+                    final_count = 0
+                    async for item in stream:
+                        if "partial" in item:
+                            partial = item["partial"]
+                            if not partials:
+                                first_partial_was_live = (
+                                    not stream.finished and env.engine.has_unfinished_requests()
+                                )
+                            active_steps.append(env.engine.context.step_count)
+                            assert partial["new_tokens"]
+                            if expect_logprobs:
+                                assert len(partial["new_tokens"]) == len(partial["new_log_probs"])
+                                assert len(partial["new_tokens"]) == len(
+                                    partial["new_top_n_logprobs"]
+                                )
+                            else:
+                                assert "new_log_probs" not in partial
+                                assert "new_top_n_logprobs" not in partial
+                            partials.append(partial)
+                        else:
+                            final_count += 1
+                            final = item["final"]
+                    assert first_partial_was_live
+                    assert len(partials) >= 2
+                    assert final_count == 1
+                    assert final is not None
+                    streamed_prefix = []
+                    histories = []
+                    for partial in partials:
+                        streamed_prefix.extend(partial["new_tokens"])
+                        histories.append(list(streamed_prefix))
+                    final_tokens = list(final["generated_tokens"])
+                    assert all(final_tokens[: len(history)] == history for history in histories)
+                    assert len(set(active_steps)) >= 2
+                    return partials, final
+
+                collected = await asyncio.wait_for(
+                    asyncio.gather(collect(streams[0], True), collect(streams[1], False)),
+                    timeout=120,
+                )
+                partials, finals = zip(*collected, strict=True)
+                assert [list(final["generated_tokens"]) for final in finals] == baseline_tokens
+                assert partials[0][0]["request_id"] != partials[1][0]["request_id"]
+                for request_partials, final in zip(partials, finals, strict=True):
+                    assert {partial["request_id"] for partial in request_partials} == {
+                        final["request_id"]
+                    }
+                assert len(finals[0]["generated_log_probs"]) == len(finals[0]["generated_tokens"])
+                assert len(finals[0]["generated_top_n_logprobs"]) == len(
+                    finals[0]["generated_tokens"]
+                )
+                assert env.engine.context.async_sched_step_count > 0
+                assert env.engine._prefill_tokens_skipped >= len(shared_prefix)
+                assert any(final["num_cached_tokens"] >= len(shared_prefix) for final in finals)
+                assert chunked_request_ids
+                streamed_global_ids = {
+                    partial["request_id"]
+                    for request_partials in partials
+                    for partial in request_partials
+                }
+                assert streamed_global_ids.intersection(chunked_request_ids)
+                for client in clients:
+                    assert client.streams == {}
+                    assert client.request_submission_times == {}
+
+                class CurrentLoopBridge:
+                    def __init__(self, loop):
+                        self.loop = loop
+
+                    async def run_async(self, coroutine):
+                        return await coroutine
+
+                    def run_sync(self, coroutine):
+                        return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result()
+
+                def high_level(cls):
+                    llm = cls.__new__(cls)
+                    llm._is_primary_rank = True
+                    llm._use_coordinator = True
+                    llm._shutdown_called = False
+                    llm._loop_manager = CurrentLoopBridge(asyncio.get_running_loop())
+                    llm._coord_runtime = types.SimpleNamespace(client=primary_client)
+                    return llm
+
+                high_level_params = SamplingParams(
+                    num_tokens_to_generate=24, termination_id=-1, top_k=1, return_prompt_tokens=True
+                )
+                async_result = await high_level(MegatronAsyncLLM).generate(
+                    prompts[0], high_level_params
+                )
+                sync_llm = high_level(MegatronLLM)
+                # The sync facade blocks while its bridge schedules on the client loop.
+                [sync_result] = await asyncio.to_thread(
+                    sync_llm.generate,
+                    string_prompt,
+                    SamplingParams(
+                        num_tokens_to_generate=24,
+                        termination_id=-1,
+                        top_k=1,
+                        return_prompt_tokens=True,
+                    ),
+                )
+                assert list(async_result["generated_tokens"]) == baseline_tokens[0][:24]
+                assert list(sync_result["generated_tokens"]) == list(
+                    string_baseline.generated_tokens
+                )
+
+                cancelled_stream = primary_client.add_request_streaming(
+                    prompts[1],
+                    SamplingParams(
+                        num_tokens_to_generate=128, termination_id=-1, top_k=1, streaming_interval=1
+                    ),
+                )
+                survivor_stream = peer_client.add_request_streaming(
+                    prompts[0],
+                    SamplingParams(
+                        num_tokens_to_generate=128, termination_id=-1, top_k=1, streaming_interval=2
+                    ),
+                )
+                first_cancelled_item = await asyncio.wait_for(anext(cancelled_stream), timeout=30)
+                assert "partial" in first_cancelled_item
+                cancel_ack = primary_client.abort_request_and_wait(cancelled_stream.request_id)
+
+                async def drain_cancelled():
+                    with pytest.raises(InferenceRequestAborted):
+                        async for _ in cancelled_stream:
+                            pass
+
+                cancel_results = await asyncio.wait_for(
+                    asyncio.gather(cancel_ack, drain_cancelled(), collect(survivor_stream, False)),
+                    timeout=120,
+                )
+                _, survivor_result = cancel_results[2]
+                assert list(survivor_result["generated_tokens"]) == baseline_tokens[0]
+                assert cancelled_stream.request_id not in primary_client.streams
+                assert cancelled_stream.request_id not in primary_client.request_submission_times
+                assert cancelled_stream.request_id not in primary_client._pending_source_requests
+        except BaseException as error:
+            rank_zero_error = error
+        finally:
+            if rank == 0 and primary_client is not None:
+                primary_client.pause_engines()
+            await asyncio.wait_for(env.engine.wait_until(EngineState.PAUSED), timeout=30)
+            if rank == 0 and primary_client is not None:
+                primary_client.stop_engines()
+            await asyncio.wait_for(asyncio.shield(env.engine.engine_loop_task), timeout=30)
+            if rank == 0 and primary_client is not None:
+                primary_client.shutdown_coordinator()
+                for client in clients:
+                    client.stop()
+                process = env.engine.inference_coordinator_process
+                process.join(timeout=10)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+
+        if rank_zero_error is not None:
+            raise rank_zero_error
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -6206,6 +6505,146 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         )
         env = self._build_test_env(test_config)
         engine = env.engine
+
+        for i in range(2):
+            prompt_tokens = torch.randint(
+                0,
+                test_config.vocab_size - 1,
+                (PROMPT_LEN,),
+                dtype=torch.int64,
+                device=torch.cuda.current_device(),
+            )
+            engine._add_request(
+                DynamicInferenceRequest(
+                    request_id=i,
+                    prompt_tokens=prompt_tokens,
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=NUM_TOKENS, termination_id=-1
+                    ),
+                )
+            )
+
+        def set_epoch(epoch):
+            """Simulate receiving a SET_GENERATION_EPOCH signal."""
+            engine._generation_epoch = epoch
+            for entry in engine.requests.values():
+                request = entry.record[-1]
+                total = len(request.prompt_tokens) + len(request.generated_tokens)
+                if total > 0:
+                    boundary = (total - 1, epoch)
+                    if request.policy_epoch is None:
+                        request.policy_epoch = [(0, epoch)]
+                    else:
+                        request.policy_epoch.append(boundary)
+                    if request.kv_cache_epoch is None:
+                        request.kv_cache_epoch = [(0, epoch)]
+                    else:
+                        request.kv_cache_epoch.append(boundary)
+
+        def capture_epoch_boundaries(epoch):
+            """Capture the expected boundary at the instant an epoch is changed."""
+            return {
+                request_id: (
+                    len(entry.record[-1].prompt_tokens)
+                    + len(entry.record[-1].generated_tokens)
+                    - 1,
+                    epoch,
+                )
+                for request_id, entry in engine.requests.items()
+            }
+
+        # Steps without a generation epoch set — no stamps.
+        engine.step_modern()
+        for entry in engine.requests.values():
+            assert entry.record[-1].policy_epoch is None
+            assert entry.record[-1].kv_cache_epoch is None
+
+        # Generation epoch 0: stamps all active requests at their current length.
+        set_epoch(0)
+        for _ in range(2):
+            engine.step_modern()
+
+        for entry in engine.requests.values():
+            ps = entry.record[-1].policy_epoch
+            ks = entry.record[-1].kv_cache_epoch
+            assert ps == ks == [(0, 0)]
+
+        # Generation epoch 1: boundary at current length, before next step.
+        epoch_1_boundaries = capture_epoch_boundaries(1)
+        set_epoch(1)
+        for _ in range(3):
+            engine.step_modern()
+
+        for request_id, entry in engine.requests.items():
+            ps = entry.record[-1].policy_epoch
+            ks = entry.record[-1].kv_cache_epoch
+            assert ps == ks == [(0, 0), epoch_1_boundaries[request_id]]
+
+        # Simulate RECOMPUTE — checkpoint clears kv_cache so the engine's
+        # stamping logic will recreate it fresh on the next epoch signal.
+        if use_checkpoint:
+            for entry in engine.requests.values():
+                old_req = entry.record[-1]
+                event_add_engine = old_req.event_add_engine
+                entry.record.checkpoint()
+                # Prevent TTFT crash due to missing _add_request in test.
+                entry.record[-1].event_add_engine = event_add_engine
+
+            for entry in engine.requests.values():
+                assert entry.record[-1].kv_cache_epoch is None
+
+        # Generation epoch 2: stamp then generate remaining tokens.
+        epoch_2_boundaries = capture_epoch_boundaries(2)
+        set_epoch(2)
+
+        finished_requests = []
+        while engine.has_unfinished_requests():
+            result = engine.step_modern()
+            finished_requests.extend(result["finished_requests"])
+
+        for finished_request in finished_requests:
+            expected_policy_epoch = [
+                (0, 0),
+                epoch_1_boundaries[finished_request.request_id],
+                epoch_2_boundaries[finished_request.request_id],
+            ]
+            assert finished_request.policy_epoch == expected_policy_epoch
+
+            if use_checkpoint:
+                # KV cache was cleared by checkpoint; stamping logic recreated it at epoch 2.
+                assert finished_request.kv_cache_epoch == [(0, 2)]
+            else:
+                assert finished_request.kv_cache_epoch == expected_policy_epoch
+
+        # Verify checkpoint clears kv_cache_epoch and preserves policy.
+        finished_request = finished_requests[0]
+        record = DynamicInferenceRequestRecord.from_request(finished_request)
+        record.checkpoint()
+        expected_policy_epoch = [
+            (0, 0),
+            epoch_1_boundaries[finished_request.request_id],
+            epoch_2_boundaries[finished_request.request_id],
+        ]
+        assert record[-1].policy_epoch == expected_policy_epoch
+        assert record[-1].kv_cache_epoch is None
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_streamed_partials_follow_generation_epoch_messages(self):
+        """Epoch control messages stamp live requests, and streamed partials follow them."""
+        PROMPT_LEN = 8
+        NUM_TOKENS = 8
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=PROMPT_LEN,
+            max_prompt_length=PROMPT_LEN,
+            num_tokens_to_generate=NUM_TOKENS,
+        )
+        env = self._build_test_env(test_config)
+        engine = env.engine
         engine.use_coordinator = True
         engine.is_mp_coordinator = True
         engine.socket_for_receiving_requests = mock.MagicMock()
@@ -6265,103 +6704,27 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             ]
             assert engine.schedule_requests() == 1
             assert engine._generation_epoch == epoch
+            current_epoch[0] = epoch
 
-        def capture_epoch_boundaries(epoch):
-            """Capture the expected boundary at the instant an epoch is changed."""
-            return {
-                request_id: (
-                    len(entry.record[-1].prompt_tokens)
-                    + len(entry.record[-1].generated_tokens)
-                    - 1,
-                    epoch,
-                )
-                for request_id, entry in engine.requests.items()
-            }
-
-        # Steps without a generation epoch set — no stamps.
         step_and_capture()
-        for entry in engine.requests.values():
-            assert entry.record[-1].policy_epoch is None
-            assert entry.record[-1].kv_cache_epoch is None
-
-        # Generation epoch 0: stamps all active requests at their current length.
-        set_epoch(0)
-        current_epoch[0] = 0
-        for _ in range(2):
-            step_and_capture()
-
-        for entry in engine.requests.values():
-            ps = entry.record[-1].policy_epoch
-            ks = entry.record[-1].kv_cache_epoch
-            assert ps == ks == [(0, 0)]
-
-        # Generation epoch 1: boundary at current length, before next step.
-        epoch_1_boundaries = capture_epoch_boundaries(1)
-        set_epoch(1)
-        current_epoch[0] = 1
-        for _ in range(3):
-            step_and_capture()
-
-        for request_id, entry in engine.requests.items():
-            ps = entry.record[-1].policy_epoch
-            ks = entry.record[-1].kv_cache_epoch
-            assert ps == ks == [(0, 0), epoch_1_boundaries[request_id]]
-
-        # Simulate RECOMPUTE — checkpoint clears kv_cache so the engine's
-        # stamping logic will recreate it fresh on the next epoch signal.
-        if use_checkpoint:
-            for entry in engine.requests.values():
-                old_req = entry.record[-1]
-                event_add_engine = old_req.event_add_engine
-                entry.record.checkpoint()
-                # Prevent TTFT crash due to missing _add_request in test.
-                entry.record[-1].event_add_engine = event_add_engine
-
-            for entry in engine.requests.values():
-                assert entry.record[-1].kv_cache_epoch is None
-
-        # Generation epoch 2: stamp then generate remaining tokens.
-        epoch_2_boundaries = capture_epoch_boundaries(2)
-        set_epoch(2)
-        current_epoch[0] = 2
-
         finished_requests = []
-        while engine.has_unfinished_requests():
-            result = step_and_capture()
-            finished_requests.extend(result["finished_requests"])
+        for epoch, steps in ((0, 2), (1, 3), (2, None)):
+            set_epoch(epoch)
+            while steps is None or steps > 0:
+                if not engine.has_unfinished_requests():
+                    break
+                finished_requests.extend(step_and_capture()["finished_requests"])
+                steps = None if steps is None else steps - 1
 
         assert set(partial_epochs) == {
             (request_id, epoch) for request_id in streaming_history for epoch in (0, 1, 2)
         }
-
+        assert len(finished_requests) == 2
         for finished_request in finished_requests:
-            expected_policy_epoch = [
-                (0, 0),
-                epoch_1_boundaries[finished_request.request_id],
-                epoch_2_boundaries[finished_request.request_id],
-            ]
-            assert finished_request.policy_epoch == expected_policy_epoch
-
-            if use_checkpoint:
-                # KV cache was cleared by checkpoint; stamping logic recreated it at epoch 2.
-                assert finished_request.kv_cache_epoch == [(0, 2)]
-            else:
-                assert finished_request.kv_cache_epoch == expected_policy_epoch
+            assert [epoch for _, epoch in finished_request.policy_epoch] == [0, 1, 2]
             history = streaming_history[finished_request.request_id]
             assert history == finished_request.generated_tokens[: len(history)]
             assert len(history) < len(finished_request.generated_tokens)
-
-        # Verify checkpoint clears kv_cache_epoch and preserves policy.
-        finished_request = finished_requests[0]
-        record = DynamicInferenceRequestRecord.from_request(finished_request)
-        record.checkpoint()
-        expected_policy_epoch = [
-            (0, 0),
-            epoch_1_boundaries[finished_request.request_id],
-            epoch_2_boundaries[finished_request.request_id],
-        ]
-        assert record[-1].policy_epoch == expected_policy_epoch
-        assert record[-1].kv_cache_epoch is None
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"

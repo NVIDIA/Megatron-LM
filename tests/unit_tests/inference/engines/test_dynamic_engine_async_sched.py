@@ -1433,6 +1433,9 @@ def _instrument_scenario_runtime(env, scenario, runtime):
         or name in {"ColumnParallelLinear", "RowParallelLinear"},
     }
     active_tags = set(scenario.signals) & watched_modules.keys()
+    # Expert-tensor-parallel layers may not shrink their weight shape; accept TP
+    # partition metadata as the witness only for those scenarios.
+    partition_metadata_witness = "etp" in scenario.signals
     model = controller.inference_wrapped_model.model
     for module in model.modules():
         class_name = type(module).__name__
@@ -1496,7 +1499,8 @@ def _instrument_scenario_runtime(env, scenario, runtime):
                                 and (
                                     weight.shape[0] * size == output_size
                                     or (
-                                        getattr(weight, "tensor_model_parallel", False)
+                                        partition_metadata_witness
+                                        and getattr(weight, "tensor_model_parallel", False)
                                         and getattr(weight, "partition_dim", None) == 0
                                     )
                                 )
@@ -1511,7 +1515,8 @@ def _instrument_scenario_runtime(env, scenario, runtime):
                                 and (
                                     weight.shape[1] * size == input_size
                                     or (
-                                        getattr(weight, "tensor_model_parallel", False)
+                                        partition_metadata_witness
+                                        and getattr(weight, "tensor_model_parallel", False)
                                         and getattr(weight, "partition_dim", None) == 1
                                     )
                                 )
@@ -1601,13 +1606,18 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
     """Shared real-engine runner for the async pair owners."""
 
     @classmethod
-    def _run_scenario_mode(cls, scenario, mode, stop_tokens=None, termination_token=None):
+    def _run_scenario_mode(
+        cls, scenario, mode, stop_tokens=None, termination_token=None, streaming=False
+    ):
+        # Streaming runs the async engine behind a mocked coordinator socket and checks
+        # every partial reply; the default async run matches main's non-streaming path.
+        streaming = streaming and mode == AsyncScheduleMode.ASYNC
         config = dict(_BASE_PAIR_CONFIG)
         config.update(scenario.config)
         config["async_sched_mode"] = mode
         env = cls._build_test_env(_DynamicEngineTestConfig(**config))
         refit_source = None
-        if "suspend-resume" in scenario.signals:
+        if streaming and "suspend-resume" in scenario.signals:
             model = env.engine.controller.inference_wrapped_model.model
             refit_env = cls._build_test_env(_DynamicEngineTestConfig(**config))
             refit_source = refit_env.engine.controller.inference_wrapped_model.model
@@ -1619,12 +1629,13 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         )
         runtime = Counter()
         if mode == AsyncScheduleMode.ASYNC:
+            _instrument_scenario_runtime(env, scenario, runtime)
+        if streaming:
             runtime["streaming-counter-steps"] = {}
             runtime["streaming-live-request-ids"] = set()
             runtime["streaming-partial-steps"] = set()
             runtime["suspend-resume-streamed-request-ids"] = set()
             runtime["streaming-token-history"] = {}
-            _instrument_scenario_runtime(env, scenario, runtime)
             for request in env.requests:
                 request.sampling_params.streaming = True
                 request.sampling_params.streaming_interval = 1
@@ -1653,7 +1664,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             prefix_skipped_before = env.engine._prefill_tokens_skipped
             sent_before = (
                 len(env.engine.socket_for_receiving_requests.send_multipart.call_args_list)
-                if mode == AsyncScheduleMode.ASYNC and env.engine.is_mp_coordinator
+                if streaming and env.engine.is_mp_coordinator
                 else 0
             )
             runtime["max_active"] = max(
@@ -1672,7 +1683,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             if env.engine._prefill_tokens_skipped > prefix_skipped_before:
                 counter_steps.setdefault("prefix-hit", set()).add(step_id)
             runtime["max_paused"] = max(runtime["max_paused"], context.paused_request_count)
-            if mode == AsyncScheduleMode.ASYNC and env.engine.is_mp_coordinator:
+            if streaming and env.engine.is_mp_coordinator:
                 for call in env.engine.socket_for_receiving_requests.send_multipart.call_args_list[
                     sent_before:
                 ]:
@@ -1734,18 +1745,21 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 memory_ptr = env.engine.context.memory_buffer.data_ptr()
                 pending_before_suspend = env.engine.controller._async_sched_forward.is_valid
                 runtime["pending-before-suspend"] += int(pending_before_suspend)
-                # Mirror the coordinator's stable states around the real lifecycle methods.
-                env.engine.state = EngineState.PAUSED
+                if refit_source is not None:
+                    # Mirror the coordinator's stable states around the real lifecycle methods.
+                    env.engine.state = EngineState.PAUSED
                 env.engine.suspend()
-                env.engine.state = EngineState.SUSPENDED
-                swap_model_weights(refit_source, model, "nccl")
-                assert torch.equal(next(refit_source.parameters()), next(model.parameters()))
-                runtime["weight-refit"] += 1
+                if refit_source is not None:
+                    env.engine.state = EngineState.SUSPENDED
+                    swap_model_weights(refit_source, model, "nccl")
+                    assert torch.equal(next(refit_source.parameters()), next(model.parameters()))
+                    runtime["weight-refit"] += 1
                 runtime["pending-after-suspend"] += int(
                     env.engine.controller._async_sched_forward.is_valid
                 )
                 env.engine.resume()
-                env.engine.state = EngineState.RUNNING
+                if refit_source is not None:
+                    env.engine.state = EngineState.RUNNING
                 for request_id in env.engine.resume_request_ids:
                     env.requests[request_id] = env.engine.get_request(request_id)
                 runtime["pending-after-resume"] += int(
@@ -1760,7 +1774,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             step()
             assert runtime["steps"] < 400, f"{scenario.name} did not converge"
 
-        if mode == AsyncScheduleMode.ASYNC and env.engine.is_mp_coordinator:
+        if streaming and env.engine.is_mp_coordinator:
             partial_steps = runtime["streaming-partial-steps"]
             histories = runtime["streaming-token-history"]
             assert partial_steps
@@ -1783,7 +1797,9 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         return env, runtime
 
     @staticmethod
-    def _assert_runtime_signals(env, scenario, runtime, stop_tokens, termination_token):
+    def _assert_runtime_signals(
+        env, scenario, runtime, stop_tokens, termination_token, streaming=False
+    ):
         context = env.engine.context
         controller = env.engine.controller
         model_config = controller.inference_wrapped_model.model.config
@@ -1830,7 +1846,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert context.static_kv_memory_pointers
         if "suspend-resume" in signals:
             assert runtime["suspend-resume"] == runtime["pending-before-suspend"] == 1
-            assert runtime["weight-refit"] == 1
+            if streaming:
+                assert runtime["weight-refit"] == 1
             if "recompute" in signals:
                 assert runtime["pending-after-suspend"] == 0
                 assert runtime["pending-after-resume"] == 0
@@ -2133,7 +2150,14 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 assert runtime["pipeline-logits-broadcasts"] > 0
         if "moe" in signals:
             assert model_config.num_moe_experts is not None
-            assert runtime["module-forward:moe"] > 0
+            if "nvfp4" in signals or "etp" in signals:
+                assert runtime["module-forward:moe"] > 0
+            else:
+                assert context._nccl_ep_dispatcher
+                # Inference MoE may dispatch through split execution helpers that
+                # bypass nn.Module forward hooks. The live dispatcher calls below
+                # are the feature-owning runtime boundary.
+                assert runtime["nccl-token-dispatches"] > 0
         if "etp" in signals:
             assert model_config.expert_tensor_parallel_size > 1
             assert parallel_state.get_expert_tensor_parallel_world_size() == 2
@@ -2149,7 +2173,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["nccl-dispatch-inflight"] == 0
 
     @classmethod
-    def _assert_scenario_pair(cls, scenario):
+    def _assert_scenario_pair(cls, scenario, streaming=False):
         stop_tokens = None
         termination_token = None
         if scenario.request_profile.startswith("stop"):
@@ -2186,6 +2210,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             AsyncScheduleMode.ASYNC,
             stop_tokens=stop_tokens,
             termination_token=termination_token,
+            streaming=streaming,
         )
         _assert_request_parity(
             async_env.requests,
@@ -2195,7 +2220,9 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             exact_numerics=scenario.parity == "exact",
             exact_top_n=scenario.parity == "exact" and scenario.exact_top_n,
         )
-        cls._assert_runtime_signals(async_env, scenario, runtime, stop_tokens, termination_token)
+        cls._assert_runtime_signals(
+            async_env, scenario, runtime, stop_tokens, termination_token, streaming=streaming
+        )
         if scenario.parity == "reproducible" or not scenario.exact_top_n:
             async_expected = _snapshot_requests(async_env.requests)
             del async_env
@@ -2207,6 +2234,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 AsyncScheduleMode.ASYNC,
                 stop_tokens=stop_tokens,
                 termination_token=termination_token,
+                streaming=streaming,
             )
             _assert_request_parity(
                 repeat_env.requests,
@@ -2216,7 +2244,12 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 exact_top_n=True,
             )
             cls._assert_runtime_signals(
-                repeat_env, scenario, repeat_runtime, stop_tokens, termination_token
+                repeat_env,
+                scenario,
+                repeat_runtime,
+                stop_tokens,
+                termination_token,
+                streaming=streaming,
             )
 
 
@@ -2266,6 +2299,31 @@ class TestAsyncSchedulePairwise(_AsyncPairwiseHarness):
             delete_cuda_graphs()
             torch.cuda.empty_cache()
 
+    @pytest.mark.parametrize("scenario", _ASYNC_PAIR_SCENARIOS, ids=lambda case: case.name)
+    @torch.inference_mode()
+    def test_async_streaming_matches_legacy_for_owned_pair(self, scenario):
+        """Coordinator streaming partials stay live and consistent with each owned feature."""
+        _check_scenario_prerequisite(scenario)
+        try:
+            self._assert_scenario_pair(scenario, streaming=True)
+        finally:
+            gc.collect()
+            delete_cuda_graphs()
+            torch.cuda.empty_cache()
+
+    @pytest.mark.parametrize(
+        "scenario", _ASYNC_SUSPEND_RESUME_SCENARIOS, ids=lambda case: case.name
+    )
+    @torch.inference_mode()
+    def test_async_streaming_survives_suspend_refit_resume(self, scenario):
+        """Streaming continues across a real suspend, weight refit, and resume."""
+        try:
+            self._assert_scenario_pair(scenario, streaming=True)
+        finally:
+            gc.collect()
+            delete_cuda_graphs()
+            torch.cuda.empty_cache()
+
 
 @pytest.mark.internal
 @pytest.mark.skipif(
@@ -2277,6 +2335,15 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
     @pytest.mark.parametrize("scenario", _ASYNC_PARALLEL_SCENARIOS, ids=lambda case: case.name)
     @torch.inference_mode()
     def test_async_matches_legacy_for_parallel_pair(self, scenario):
+        self._run_parallel_pair(scenario, streaming=False)
+
+    @pytest.mark.parametrize("scenario", _ASYNC_PARALLEL_SCENARIOS, ids=lambda case: case.name)
+    @torch.inference_mode()
+    def test_async_streaming_matches_legacy_for_parallel_pair(self, scenario):
+        """Coordinator streaming partials stay consistent under each distributed topology."""
+        self._run_parallel_pair(scenario, streaming=True)
+
+    def _run_parallel_pair(self, scenario, *, streaming):
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         if scenario.name == "tp2-pp2-sp-dp2" and world_size != 8:
             pytest.skip("the TP2/PP2/DP2 owner requires exactly eight GPUs")
@@ -2305,7 +2372,7 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
             )
             if scenario.name == "tp2-pp2-sp-dp2":
                 assert parallel_state.get_data_parallel_world_size() == 2
-            self._assert_scenario_pair(scenario)
+            self._assert_scenario_pair(scenario, streaming=streaming)
         finally:
             gc.collect()
             delete_cuda_graphs()

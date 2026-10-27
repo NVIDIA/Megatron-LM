@@ -440,6 +440,13 @@ _COMPLETIONS_DEFAULTS = {
             _CHAT_DEFAULTS,
             id="chat-non-dict-stream-options-ignored",
         ),
+        pytest.param(
+            COMPLETIONS_PATH,
+            {"stream_options": ["include_usage"]},
+            {},
+            _COMPLETIONS_DEFAULTS,
+            id="completions-non-dict-stream-options-ignored",
+        ),
     ],
 )
 async def test_sampling_params_are_parsed_from_the_request(path, body, app_config, expected_fields):
