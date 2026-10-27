@@ -46,7 +46,7 @@ def test_disable_mtp_shortcuts_preserves_decoder(monkeypatch, is_mtp_layer, disa
     grouped_configs = []
 
     class FakeLayer(torch.nn.Module):
-        def __init__(self, config, layer_number, **kwargs):
+        def __init__(self, config, layer_number, **kwargs) -> None:
             super().__init__()
             self.config = config
             self.layer_number = layer_number
