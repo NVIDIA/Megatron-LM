@@ -99,6 +99,22 @@ def test_moe_norm_flag_reaches_transformer_config():
     assert config.moe_use_norm_before_up_proj is True
 
 
+@pytest.mark.parametrize(
+    ('cli_args', 'expected'),
+    [([], None), (['--store-param-remainders'], True), (['--no-store-param-remainders'], False)],
+)
+def test_store_param_remainders_flag_is_tri_state(cli_args, expected):
+    """Unset must stay None so OptimizerConfig can pick the default for the configuration."""
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+
+    args = parser.parse_args(cli_args)
+
+    assert args.store_param_remainders is expected
+    # get_megatron_optimizer_config forwards args to OptimizerConfig by field name.
+    assert 'store_param_remainders' in OptimizerConfig.__dataclass_fields__
+
+
 @pytest.mark.parametrize('explicit_hash_vocab_size', [None, 100007])
 def test_hash_moe_vocab_is_initialized_before_config_conversion(
     monkeypatch, explicit_hash_vocab_size

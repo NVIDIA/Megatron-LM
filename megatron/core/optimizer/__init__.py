@@ -578,9 +578,9 @@ def _get_megatron_optimizer_based_on_param_groups(
                         "exp_avg_sq_dtype": config.exp_avg_sq_dtype,
                     }
                 )
-                # Master weight is managed by MCore when main_params_dtype is fp32. This is
-                # because we want to use fp8 primary weight with precision aware optimizer.
-                # Otherwise, master weight will be managed by TransformerEngine.
+                # TransformerEngine manages the master weights unless they are FP32 and the
+                # model params are quantized with a non-delayed FP8 recipe, in which case MCore
+                # manages them (see OptimizerConfig._te_fused_adam_main_weight_and_decoupled_grad).
                 # Delayed scaling is an exception because casting as well as the computation
                 # of the scaling factor can be conducted in the adam kernel.
                 if config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 and not isinstance(
@@ -595,7 +595,9 @@ def _get_megatron_optimizer_based_on_param_groups(
                     )
 
                 if is_te_min_version("2.1.0.dev0"):
-                    kwargs.update({"store_param_remainders": config.store_param_remainders})
+                    kwargs.update(
+                        {"store_param_remainders": config.resolved_store_param_remainders}
+                    )
 
             optimizer = adam_cls(**kwargs)
 
@@ -1078,6 +1080,13 @@ def get_megatron_optimizer(
         ), "MimoModel does not support virtual pipeline parallelism (multiple model chunks)"
         return get_mimo_optimizer(model_chunks[0], config)
 
+    # Inherit the DDP config's fp8_param_gather flag into the optimizer config.
+    ddp_fp8_param_gather = getattr(
+        getattr(model_chunks[0], 'ddp_config', None), 'fp8_param_gather', None
+    )
+    if ddp_fp8_param_gather is not None:
+        config = config.resolve_fp8_param_gather(ddp_fp8_param_gather)
+
     # None → apply standard defaults. To extend defaults with custom overrides,
     # start from get_standard_config_overrides(config) and merge yours in.
     if config_overrides is None:
@@ -1214,7 +1223,10 @@ def get_megatron_optimizer(
                 # main weights, complete waste of memory as the optimizer step is still
                 # applied to the Megatron-FSDP main weight and extended to FusedAdam
                 # main weights. Override this here.
+                # NOTE(@CarlosGomes98): Param remainders are part of FusedAdam's main weights,
+                # so there are none either.
                 setattr(optimizer_part.optimizer, "master_weights", False)
+                setattr(optimizer_part.optimizer, "store_param_remainders", False)
                 # Megatron-FSDP always uses a decoupled gradient when using FusedAdam.
                 setattr(optimizer_part.optimizer, "use_decoupled_grad", True)
 

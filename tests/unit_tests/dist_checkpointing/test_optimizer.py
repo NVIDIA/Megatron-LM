@@ -1220,7 +1220,11 @@ class TestDistributedOptimizer:
 
             # We test only the `plain_state_dict_B` keys because of decreasing PP
             for key in list(plain_state_dict_B.keys()):
-                if 'per_bucket_numel' in key or 'param_state_sharding_type' in key:
+                if (
+                    'per_bucket_numel' in key
+                    or 'param_state_sharding_type' in key
+                    or 'param_state_param_remainders' in key
+                ):
                     del plain_state_dict_A[key]
                     del plain_state_dict_B[key]
                     continue

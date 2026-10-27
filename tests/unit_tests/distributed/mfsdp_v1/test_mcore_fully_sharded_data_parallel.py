@@ -27,6 +27,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version, is_torch_min_version
+from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.distributed.mfsdp_v1.utils import (
     make_gpt_mock_data_iterator,
     make_moe_args_model_and_optimizer,
@@ -749,6 +750,16 @@ def ref_cache():
     return {}
 
 
+def _skip_if_fp8_recipe_unsupported(fp8_recipe):
+    """Skip when the GPU or TE cannot run ``fp8_recipe`` (MXFP8: Blackwell, blockwise: Hopper)."""
+    if fp8_recipe == "mxfp8" and (
+        torch.cuda.get_device_capability()[0] < 10 or not HAVE_TE_MXFP8TENSOR
+    ):
+        pytest.skip("Requires PyTorch & CUDA device with TE MXFP8Tensor support")
+    if fp8_recipe == "blockwise" and get_device_arch_version() != 9:
+        pytest.skip("blockwise is only supported on Hopper architecture")
+
+
 class TestMegatronFSDPE2E:
 
     @staticmethod
@@ -773,6 +784,8 @@ class TestMegatronFSDPE2E:
                 - expert_model_parallel_size (int): Expert model parallel size for MoE. Default: 1.
                 - expert_tensor_parallel_size (int): Expert tensor parallel size for MoE. Default: 1.
                 - num_distributed_optimizer_instances (int): Number of distributed optimizer instances. Default: 1.
+                - inspect_optimizer (callable): Called as inspect_optimizer(optim, model_chunks)
+                  after the last step, before model-parallel teardown. Not forwarded as an argument.
         Returns:
             list: A list of length train_iters containing the per-step language-model loss values
             (the value appended from output[-1] each iteration). Loss objects are returned as produced
@@ -789,6 +802,8 @@ class TestMegatronFSDPE2E:
         Raises:
             ValueError: If batch-size arithmetic or other setup assumptions (e.g., divisibility) are violated.
         """
+        inspect_optimizer = kwargs.pop("inspect_optimizer", None)
+
         # Configuration parameters with defaults
         VOCAB_SIZE = kwargs.get("vocab_size", 100)
         MAX_SEQ_LEN = kwargs.get("seq_length", 128)
@@ -883,6 +898,9 @@ class TestMegatronFSDPE2E:
             # Collect loss
             outputs.append(output[-1])
 
+        if inspect_optimizer is not None:
+            inspect_optimizer(optim, model_chunks)
+
         Utils.destroy_model_parallel()
 
         return outputs
@@ -940,6 +958,30 @@ class TestMegatronFSDPE2E:
             ),
             pytest.param(
                 dict(
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    megatron_fsdp_main_params_dtype=torch.float32,
+                    use_precision_aware_optimizer=True,
+                    fp8="e4m3",
+                    fp8_recipe="mxfp8",
+                    fp8_param_gather=False,
+                    bf16=True,
+                ),
+                id="optim_grads_params_fused_adam_bf16_params_mxfp8",
+            ),
+            pytest.param(
+                dict(
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    megatron_fsdp_main_params_dtype=torch.float32,
+                    use_precision_aware_optimizer=True,
+                    fp8="e4m3",
+                    fp8_recipe="blockwise",
+                    fp8_param_gather=False,
+                    bf16=True,
+                ),
+                id="optim_grads_params_fused_adam_bf16_params_blockwise",
+            ),
+            pytest.param(
+                dict(
                     data_parallel_sharding_strategy="optim_grads_params", fsdp_double_buffer=False
                 ),
                 id="optim_grads_params_no_double_buffer",
@@ -959,10 +1001,7 @@ class TestMegatronFSDPE2E:
         ],
     )
     def test_compatible_with_nd_parallel(self, ref_cache, nd_topology, spec_configs):
-        if spec_configs.get("fp8_recipe") == "mxfp8" and (
-            torch.cuda.get_device_capability()[0] < 10 or not HAVE_TE_MXFP8TENSOR
-        ):
-            pytest.skip("Requires PyTorch & CUDA device with TE MXFP8Tensor support")
+        _skip_if_fp8_recipe_unsupported(spec_configs.get("fp8_recipe"))
 
         nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
         if nd_topology_str not in ref_cache:
@@ -1000,6 +1039,69 @@ class TestMegatronFSDPE2E:
                         f", Compare = {compare_losses(loss.item(), ref_loss.item())}"
                     ),
                 )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Test needs to be updated for torch >= 2.4.0"
+    )
+    @pytest.mark.parametrize("fp8_recipe", ["mxfp8", "blockwise"])
+    def test_precision_aware_optimizer_with_bf16_params_and_fp8_compute(self, fp8_recipe):
+        """Megatron-FSDP + FusedAdam with BF16 params and non-delayed FP8 compute.
+
+        --use-precision-aware-optimizer with BF16 params (no --fp8-param-gather) and the
+        MXFP8/blockwise recipes selects the TE-owned master weights path (decoupled grads, and
+        FP32 masters or int16 remainders inside FusedAdam) for DistributedOptimizer. Megatron-FSDP
+        owns its FP32 main weights, so none of that may reach FusedAdam: it must still hold no
+        master weights, read decoupled grads, and keep no master_param or remainder state.
+        """
+        _skip_if_fp8_recipe_unsupported(fp8_recipe)
+
+        def check_optimizer(optim, model_chunks):
+            # The combination under test: TE owns the master weights of BF16 params (for the
+            # distributed optimizer).
+            assert optim.config.fp8_param_gather is False
+            assert optim.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+
+            fused_adam = optim.optimizer
+            assert not fused_adam.master_weights
+            assert not fused_adam.store_param_remainders
+            assert fused_adam.use_decoupled_grad
+
+            # FusedAdam steps FSDP's FP32 main weights directly.
+            for group in fused_adam.param_groups:
+                for param in group["params"]:
+                    assert param.dtype == torch.float32, f"Unexpected FusedAdam param {param.dtype}"
+
+            # FusedAdam creates an empty state entry for params that received no gradient.
+            states = [state for state in fused_adam.state.values() if state]
+            assert states, "FusedAdam has no state, so it never stepped."
+            for state in states:
+                assert {"exp_avg", "exp_avg_sq"} <= set(state)
+                assert "master_param" not in state
+
+        outputs = TestMegatronFSDPE2E._training_loop(
+            # Dense MLP and MoE layers only: this is about the optimizer, so don't require
+            # mamba-ssm like the default hybrid pattern does.
+            hybrid_layer_pattern="-E-E/-E",
+            use_megatron_fsdp=True,
+            init_model_with_meta_device=True,
+            ckpt_format="fsdp_dtensor",
+            gradient_accumulation_fusion=False,
+            data_parallel_sharding_strategy="optim_grads_params",
+            megatron_fsdp_main_params_dtype=torch.float32,
+            use_precision_aware_optimizer=True,
+            fp8="e4m3",
+            fp8_recipe=fp8_recipe,
+            fp8_param_gather=False,
+            bf16=True,
+            inspect_optimizer=check_optimizer,
+        )
+
+        for step, output in enumerate(outputs):
+            assert torch.isfinite(output["lm loss"]).all(), f"Non-finite loss at step {step}"
 
         gc.collect()
         torch.cuda.empty_cache()
