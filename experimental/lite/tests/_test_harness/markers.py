@@ -18,12 +18,15 @@ ENVIRONMENT_VARIABLES = {"CUDA_DEVICE_MAX_CONNECTIONS"}
 MARKER_DESCRIPTIONS = (
     "gpus(count, min_architecture='hopper'): request count GPUs and declare the minimum "
     "supported GPU architecture; an absent marker means a CPU test",
+    "gpu: legacy alias for gpus(1), requesting one Hopper-or-newer GPU",
     "env(**variables): set an allowlisted per-test environment variable to a string, or "
     "use None to explicitly unset it",
     "timeout(seconds=600): set the positive per-suite timeout in seconds; the marker is "
     "optional and defaults to 600 seconds; add an override only when measured runtime "
     "evidence shows the default is insufficient",
     "optional: exclude a test from the standard run_tests.sh workflow",
+    "mlite: label a test as Megatron Lite owned",
+    "smoke: label a broad integration or acceptance test",
 )
 
 
@@ -57,20 +60,26 @@ def register(config) -> None:
 
 def _gpus_marker(item) -> tuple[int, str | None]:
     marker = next(item.iter_markers(name="gpus"), None)
-    if marker is None:
-        return 0, None
-    if len(marker.args) != 1 or set(marker.kwargs) - {"min_architecture"}:
-        raise MarkerError(
-            "gpus requires one positional count and optional min_architecture keyword"
-        )
-    count = marker.args[0]
-    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
-        raise MarkerError("gpus count must be a positive integer")
-    architecture = marker.kwargs.get("min_architecture", DEFAULT_MIN_ARCHITECTURE)
-    if architecture not in ARCHITECTURE_ORDER:
-        supported = ", ".join(ARCHITECTURE_ORDER)
-        raise MarkerError(f"min_architecture must be one of: {supported}")
-    return count, architecture
+    if marker is not None:
+        if len(marker.args) != 1 or set(marker.kwargs) - {"min_architecture"}:
+            raise MarkerError(
+                "gpus requires one positional count and optional min_architecture keyword"
+            )
+        count = marker.args[0]
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise MarkerError("gpus count must be a positive integer")
+        architecture = marker.kwargs.get("min_architecture", DEFAULT_MIN_ARCHITECTURE)
+        if architecture not in ARCHITECTURE_ORDER:
+            supported = ", ".join(ARCHITECTURE_ORDER)
+            raise MarkerError(f"min_architecture must be one of: {supported}")
+        return count, architecture
+
+    legacy = next(item.iter_markers(name="gpu"), None)
+    if legacy is not None:
+        if legacy.args or legacy.kwargs:
+            raise MarkerError("gpu is a no-argument legacy alias for gpus(1)")
+        return 1, DEFAULT_MIN_ARCHITECTURE
+    return 0, None
 
 
 def _environment_markers(item) -> tuple[tuple[str, str | None], ...]:
@@ -82,7 +91,9 @@ def _environment_markers(item) -> tuple[tuple[str, str | None], ...]:
             raise MarkerError("env accepts keyword arguments only")
         unknown = set(marker.kwargs) - ENVIRONMENT_VARIABLES
         if unknown:
-            raise MarkerError("env contains unsupported variables: " + ", ".join(sorted(unknown)))
+            raise MarkerError(
+                "env contains unsupported variables: " + ", ".join(sorted(unknown))
+            )
         for name, value in marker.kwargs.items():
             if value is not None and not isinstance(value, str):
                 raise MarkerError(f"env value for {name} must be a string or None")

@@ -667,6 +667,14 @@ def test_vision_rope_wrapper_forwards_max_seqlen_to_thd(monkeypatch):
     config = SimpleNamespace(
         rotary_interleaved=False,
         multi_latent_attention=False,
+        # ``mrope_section=None`` makes rope_utils treat these freqs as
+        # materialized regardless of their raw-looking shape
+        # (``_is_raw_mrope_freqs_thd`` short-circuits on it), and
+        # ``apply_rope_fusion=False`` then selects the unfused THD branch that
+        # this test monkeypatches.  Both are read directly off the config on the
+        # common path, so the stub must carry them as a real TransformerConfig does.
+        mrope_section=None,
+        apply_rope_fusion=False,
     )
     t = torch.zeros(6, 2, 8, dtype=torch.bfloat16)
     freqs = torch.zeros(3, 1, 1, 8, dtype=torch.float32)

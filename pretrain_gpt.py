@@ -9,14 +9,12 @@ _PROGRAM_START_TIME = time.time()
 
 import json
 
-# Suppress warnings on all ranks but rank 0.
-import os
-import warnings
+from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
 
-rank = int(os.environ.get('RANK', 0))
-if rank != 0:
-    warnings.filterwarnings("ignore", category=UserWarning)
-    warnings.filterwarnings("ignore", category=FutureWarning)
+# Quiet the duplicate warnings before the heavy imports below: torch raises its
+# own deprecations while it is being imported, so a filter installed any later
+# cannot reach them.
+suppress_duplicate_logs_off_rank0()
 
 from functools import lru_cache, partial
 from typing import Any, List, Optional, Tuple
@@ -25,7 +23,6 @@ import torch
 
 from gpt_builders import gpt_builder
 from megatron.core import mpu
-from megatron.core.context_parallel_layout import finalize_packed_seq_params
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -53,25 +50,39 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.argument_utils import (
+    gpt_config_from_args,
+    pretrain_cfg_container_from_args,
+)
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
+from megatron.training.global_vars import (
+    get_run_config,
+    set_run_config,
+)
+from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
+    prepare_packed_seq_params,
 )
 from model_provider import model_provider
 
 try:
     from megatron.post_training.arguments import add_modelopt_args
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
+    from megatron.post_training.model_builder import ModelOptModelConfig
+    from megatron.post_training.utils import maybe_enable_modelopt
 
     has_nvidia_modelopt = True
-except ImportError:
+except ImportError as error:
+    missing_module = error.name or ""
+    if missing_module != "modelopt" and not missing_module.startswith("modelopt."):
+        raise
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
@@ -141,7 +152,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             dynamic_cp=args.dynamic_context_parallel,
             config=config,
         )
-        finalize_packed_seq_params(batch[5])
+        prepare_packed_seq_params(batch[5], config)
         return batch
 
     # TODO: this is pretty hacky, find a better way
@@ -184,16 +195,9 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             max_seqlen_kv=int(max_seqlen[0].item()),
             qkv_format='thd',
         )
-        finalize_packed_seq_params(packed_seq_params)
-        return (
-            None,
-            None,
-            None,
-            None,
-            None,
-            packed_seq_params,
-            None,
-        )
+        # Middle stages receive raw boundaries for physically padded hidden states.
+        prepare_packed_seq_params(packed_seq_params, config, capacity=args.seq_length)
+        return (None, None, None, None, None, packed_seq_params, None)
 
     thd_tail_padding_policy = resolve_thd_tail_padding_policy(config)
     if cu_seqlens is None:
@@ -244,7 +248,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         if 'position_ids' in batch:
             batch['position_ids'] = position_ids
 
-    finalize_packed_seq_params(packed_seq_params)
+    prepare_packed_seq_params(packed_seq_params, config)
 
     # Unpack explicitly to avoid relying on dict insertion order.
     return (
@@ -264,7 +268,7 @@ SPIKY_LOSS_FACTOR = 10
 
 @lru_cache(maxsize=1)
 def _build_cached_logits_loss_func(
-    logprobs_dir, decode_threads, prefetch_factor, msc_prefetch_depth, kd_loss_alpha, ignore_errors
+    logprobs_dir, decode_threads, msc_prefetch_depth, kd_loss_alpha, ignore_errors, ignore_hash
 ):
     """Build (once) the offline knowledge-distillation loss callable for cached logits.
 
@@ -276,10 +280,10 @@ def _build_cached_logits_loss_func(
     return LossFuncCallable(
         logprobs_dir=logprobs_dir,
         decode_threads=decode_threads,
-        prefetch_factor=prefetch_factor,
         msc_prefetch_depth=msc_prefetch_depth,
         kd_loss_alpha=kd_loss_alpha,
         ignore_errors=ignore_errors,
+        ignore_hash=ignore_hash,
     )
 
 
@@ -306,10 +310,10 @@ def loss_func(
         loss_func_cached_logits = _build_cached_logits_loss_func(
             logprobs_dir=args.logits_load_dir,
             decode_threads=args.logits_load_decode_threads,
-            prefetch_factor=args.logits_load_prefetch_factor,
             msc_prefetch_depth=args.logits_load_msc_prefetch_depth,
             kd_loss_alpha=args.logits_load_kd_loss_alpha,
             ignore_errors=args.logits_load_ignore_errors,
+            ignore_hash=args.logits_load_ignore_hash,
         )
         loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
     elif has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
@@ -375,6 +379,26 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params, padding_mask = (
             get_batch(data_iterator, vp_stage)
         )
+
+        # Offline logits KD: record this microbatch's global (un-CP-sharded)
+        # document boundaries so the saver can persist them alongside the
+        # logits _forward_hook is about to capture -- required for
+        # document-aware CP reassembly of packed (--sft) sequences. get_batch
+        # carries them in packed_seq_params (cu_seqlens_q_padded, falling back
+        # to cu_seqlens_q); the sequence-packing scheduler path records None.
+        from megatron.training.distillation.logits_saver import get_logits_saver
+
+        saver = get_logits_saver()
+        if saver is not None:
+            cu_seqlens_for_saver = None
+            if args.sequence_packing_scheduler is None and packed_seq_params is not None:
+                cu_seqlens_for_saver = (
+                    packed_seq_params.cu_seqlens_q_padded
+                    if packed_seq_params.cu_seqlens_q_padded is not None
+                    else packed_seq_params.cu_seqlens_q
+                )
+            saver.set_current_cu_seqlens(cu_seqlens_for_saver)
+
     timers('batch-generator').stop()
 
     with stimer:
@@ -412,6 +436,10 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
+    elif getattr(args, 'sequence_packing_scheduler', None) is not None:
+        # The scheduler sends packing metadata to middle PP stages itself and requires that
+        # only the first and last stages hold a data iterator.
+        return is_first_or_last_pipeline_stage(vp_stage)
     elif is_packed_sequence or (
         getattr(args, 'use_varlen_dataset', False)
         and getattr(args, 'varlen_sbhd_validation', False)
@@ -425,6 +453,8 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
 
 
 def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
+    """Build the GPT (or FIM) dataset config from parsed CLI args."""
+    cfg = get_run_config()
     tokenizer = build_tokenizer(args)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
@@ -438,13 +468,13 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
             sequences_per_dataset = json.load(f)
 
     data_args = {
-        "random_seed": args.seed,
+        "random_seed": cfg.rng.seed,
         "sequence_length": args.seq_length,
         "blend": blend,
         "blend_per_split": blend_per_split,
         "split": args.split,
-        "multiple_validation_sets": args.multiple_validation_sets,
-        "full_validation": args.full_validation,
+        "multiple_validation_sets": cfg.validation.multiple_validation_sets,
+        "full_validation": cfg.validation.full_validation,
         "num_dataset_builder_threads": args.num_dataset_builder_threads,
         "path_to_cache": args.data_cache_path,
         "mmap_bin_files": args.mmap_bin_files,
@@ -453,6 +483,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "reset_attention_mask": args.reset_attention_mask,
         "eod_mask_loss": args.eod_mask_loss,
         "create_attention_mask": args.create_attention_mask_in_dataloader,
+        "inter_document_masking": args.dataloader_inter_document_masking,
         "object_storage_cache_path": args.object_storage_cache_path,
         "mid_level_dataset_surplus": args.mid_level_dataset_surplus,
         "allow_ambiguous_pad_tokens": args.allow_ambiguous_pad_tokens,
@@ -511,7 +542,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         is_packed_sequence = True  # SFT always uses packed sequence
     elif args.use_varlen_dataset:
         # Variable-length packed (THD) dataset, independent of --sft.
-        # Reuses SFTDataset's THD/dynamic-cp packing internally but is gated
+        # Reuses SFTDataset's THD packing internally but is gated
         # by its own top-level flag.
         if args.mock_data:
             dataset_type = MockVarlenDataset
@@ -574,7 +605,16 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
-    full_config = pretrain_cfg_container_from_args(args)
+    if has_nvidia_modelopt:
+        maybe_enable_modelopt(args)
+    if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
+        model_cfg = gpt_config_from_args(
+            args, model_config_cls=ModelOptModelConfig, vocab_size_from_tokenizer=True
+        )
+    else:
+        model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
+    set_run_config(full_config)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,

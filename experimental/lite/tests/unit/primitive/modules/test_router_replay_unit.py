@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -116,7 +117,7 @@ def test_r3_mask_replays_every_causal_row_except_last():
         input_ids=torch.arange(8),
         labels=torch.arange(8),
         seq_lens=lengths,
-        loss_mask=torch.tensor([0, 1, 1, 0, 0, 1, 1, 1], dtype=torch.float32),
+        r3_replay_mask=torch.tensor([True, True, False, True, True, True, True, False]),
     )
     model = SimpleNamespace(ps=ParallelState())
     mask = pack_r3_replay_mask(model, batch)
@@ -129,8 +130,42 @@ def test_r3_mask_replays_every_causal_row_except_last():
     assert torch.equal(mask, expected)
 
 
-def test_ds4_replay_roots_exclude_mtp_layers():
-    from megatron.lite.model.deepseek_v4.lite.protocol import router_replay_roots
+def test_r3_mask_requires_upstream_replay_mask():
+    from megatron.lite.model.protocol_utils import pack_r3_replay_mask
+    from megatron.lite.primitive.parallel import ParallelState
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    batch = PackedBatch(
+        input_ids=torch.arange(3), labels=torch.arange(3), seq_lens=torch.tensor([3])
+    )
+    model = SimpleNamespace(ps=ParallelState())
+
+    with pytest.raises(ValueError, match="r3_replay_mask"):
+        pack_r3_replay_mask(model, batch)
+
+
+def test_r3_mask_does_not_replay_sequence_without_response_tokens():
+    from megatron.lite.model.protocol_utils import pack_r3_replay_mask
+    from megatron.lite.primitive.parallel import ParallelState
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    batch = PackedBatch(
+        input_ids=torch.arange(7),
+        labels=torch.arange(7),
+        seq_lens=torch.tensor([4, 3]),
+        # VERL's build_r3_replay_mask emits an all-false row when response_len=0.
+        r3_replay_mask=torch.tensor([True, True, True, False, False, False, False]),
+    )
+    model = SimpleNamespace(ps=ParallelState())
+
+    assert torch.equal(
+        pack_r3_replay_mask(model, batch),
+        torch.tensor([True, True, True, False, False, False, False]),
+    )
+
+
+def test_replay_roots_exclude_mtp_layers():
+    from megatron.lite.model.protocol_utils import router_replay_roots
 
     main_layers = nn.ModuleDict({"0": nn.Linear(2, 2), "1": nn.Linear(2, 2)})
     mtp_layers = nn.ModuleList([nn.Linear(2, 2)])
@@ -141,6 +176,43 @@ def test_ds4_replay_roots_exclude_mtp_layers():
     chunk.model = model
 
     assert router_replay_roots(chunk) == list(main_layers.values())
+
+
+@pytest.mark.parametrize(
+    "protocol_name",
+    ["qwen3_moe", "qwen3_5", "deepseek_v4", "glm5", "kimi_k2"],
+)
+def test_supported_moe_protocols_expose_mtp_safe_replay_roots(protocol_name):
+    from pathlib import Path
+
+    protocol_path = (
+        Path(__file__).parents[4]
+        / "megatron"
+        / "lite"
+        / "model"
+        / protocol_name
+        / "lite"
+        / "protocol.py"
+    )
+    source = protocol_path.read_text()
+    assert "router_replay_roots" in source
+    if protocol_name in {"deepseek_v4", "glm5"}:
+        assert "def pack_r3_replay_mask" in source
+
+
+def test_r3_driver_begin_fails_loudly_when_model_has_no_moe_router():
+    from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
+
+    chunk = nn.Sequential(nn.Linear(2, 2), nn.ReLU())
+    handle = SimpleNamespace(
+        _model=chunk,
+        _extras={"model_chunks": [chunk], "protocol": None},
+    )
+    driver = RouterReplayDriver.maybe_create(handle, {"action": "replay"})
+    assert driver is not None
+
+    with pytest.raises(RuntimeError, match="no MoE routers"):
+        driver.begin()
 
 
 def test_r3_driver_replays_layer_order_and_causal_rows_end_to_end():
@@ -172,6 +244,7 @@ def test_r3_driver_replays_layer_order_and_causal_rows_end_to_end():
         labels=torch.arange(5),
         seq_lens=torch.tensor([3, 2]),
         loss_mask=torch.tensor([0, 1, 1, 0, 1], dtype=torch.float32),
+        r3_replay_mask=torch.tensor([True, True, False, True, False]),
         routed_experts=torch.nested.as_nested_tensor(
             [
                 torch.tensor(
@@ -246,6 +319,7 @@ def test_r3_driver_accepts_next_token_routes_without_final_input_row():
         labels=torch.arange(5),
         seq_lens=torch.tensor([3, 2]),
         loss_mask=torch.tensor([0, 1, 1, 0, 1], dtype=torch.float32),
+        r3_replay_mask=torch.tensor([True, True, False, True, False]),
         routed_experts=torch.nested.as_nested_tensor(
             [
                 torch.tensor([[[10, 11]], [[12, 13]]]),

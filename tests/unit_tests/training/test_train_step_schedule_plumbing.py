@@ -6,8 +6,17 @@ import inspect
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 from megatron.core.enums import ModelType
 from megatron.training import training as training_mod
+from megatron.training.state import TrainState
+
+
+@pytest.fixture(autouse=True)
+def training_config(run_config):
+    run_config.train.micro_batch_size = 1
+    run_config.train.global_batch_size = 1
 
 
 class _Rerun:
@@ -23,7 +32,7 @@ class _Rerun:
         return False, True, 0  # (checkpoint, exit, code)
 
 
-def _run(**kwargs):
+def _run(*, args_overrides=None, model=None, optimizer=None, return_result=False, **kwargs):
     args = SimpleNamespace(
         save_params_interval=None,
         save_activations_interval=None,
@@ -38,8 +47,11 @@ def _run(**kwargs):
         decoder_seq_length=None,
         empty_unused_memory_level=0,
     )
+    for name, value in (args_overrides or {}).items():
+        setattr(args, name, value)
     captured = {}
-    model = [SimpleNamespace(force_all_reduce=False, zero_grad_buffer=lambda: None)]
+    model = model or [SimpleNamespace(force_all_reduce=False, zero_grad_buffer=lambda: None)]
+    optimizer = optimizer or SimpleNamespace(zero_grad=lambda: None, chained_optimizers=[])
     with (
         mock.patch.object(training_mod, "get_args", return_value=args),
         mock.patch.object(training_mod, "get_timers", return_value=mock.MagicMock()),
@@ -47,18 +59,27 @@ def _run(**kwargs):
         mock.patch.object(training_mod, "get_num_microbatches", return_value=1),
         mock.patch.object(training_mod, "has_nvidia_modelopt", False),
     ):
-        training_mod.train_step(
+        result = training_mod.train_step(
             forward_step_func=lambda *a, **k: None,
             data_iterator=iter([]),
             model=model,
-            optimizer=SimpleNamespace(zero_grad=lambda: None),
+            optimizer=optimizer,
             opt_param_scheduler=None,
             config=SimpleNamespace(),
             forward_backward_func=lambda **kw: captured.update(kw) or [],
             iteration=0,
             **kwargs,
         )
-    return captured
+    return result if return_result else captured
+
+
+def test_train_step_early_exit_keeps_normal_result_field_order():
+    result = _run(return_result=True)
+    assert len(result) == 12
+    assert result[:5] == ({}, True, False, True, 0)
+    assert result[5:8] == (None, None, None)
+    assert result[8] == 1  # num_microbatches, not an exit-path placeholder
+    assert result[11] is None  # samples_seen is not computed before early exit
 
 
 def test_train_step_forwards_schedule_plumbing():
@@ -239,6 +260,10 @@ def test_mxfp8_staging_delegates_master_restore_to_distributed_optimizer():
     events = []
 
     class FakeDistributedOptimizer:
+        ddp_config = SimpleNamespace(
+            reuse_grad_buf_for_mxfp8_param_ag=True, overlap_param_gather=True
+        )
+
         def ensure_master_weights_for_param_sync(self):
             raise AssertionError("train_step must not restore DistOpt masters separately")
 
@@ -482,13 +507,22 @@ def test_train_step_wraps_sequence_packing_after_rerun_check():
     wrap_data_iterator.assert_called_once_with(original_iterator, config, 1)
     assert forwarded_iterators == [packed_iterator, packed_iterator]
     assert captured["num_microbatches"] == 3
-    assert result[-3:] == (3, 12.0, 34.0)
+    assert len(result) == 12
+    assert result[8:] == (3, 12.0, 34.0, None)
 
 
-def test_config_container_forwards_layer_wise_optimizer_to_model_builder():
+@pytest.mark.parametrize(
+    ("dsa_indexer_loss_coeff", "expect_tracker_init"), [(0.1, True), (None, False)]
+)
+@pytest.mark.parametrize("ddp_layout", [False, True])
+def test_config_container_forwards_layer_wise_optimizer_to_model_builder(
+    dsa_indexer_loss_coeff, expect_tracker_init, ddp_layout
+):
     """The config-container path must preserve Muon's layer-wise DDP routing flag."""
     args = SimpleNamespace(
         skip_train=True,
+        freeze_all_layers=False,
+        freeze_base_model_for_mtp=False,
         perform_rl_step=False,
         no_load_optim=True,
         logits_save_dir=None,
@@ -497,9 +531,11 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder():
         load=None,
         pretrained_checkpoint=None,
         data_parallel_size=1,
+        gtp_weight_remat_size=1,
         micro_batch_size=1,
         fp16=False,
         ckpt_convert_format=None,
+        dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
     )
     builder = mock.Mock()
     wrapped_model = mock.Mock()
@@ -511,24 +547,30 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder():
     cfg = SimpleNamespace(
         model=model_config,
         profiling=mock.Mock(),
-        ddp=mock.Mock(),
+        ddp=SimpleNamespace(use_layer_wise_param_layout=ddp_layout, use_megatron_fsdp=False),
         optimizer=SimpleNamespace(
             overlap_param_gather_with_optimizer_step=False,
             use_layer_wise_distributed_optimizer=True,
+            use_layer_wise_param_layout=False,
         ),
         dist=SimpleNamespace(use_megatron_fsdp=False, use_torch_fsdp2=False),
         rng=SimpleNamespace(data_parallel_random_init=False),
+        rl=SimpleNamespace(perform_rl_step=False),
+        validation=SimpleNamespace(skip_train=True),
     )
     pg_collection = mock.Mock()
 
     with (
         mock.patch.object(training_mod, "get_args", return_value=args),
+        mock.patch("megatron.post_training.checkpointing.get_args", return_value=args),
         mock.patch.object(training_mod, "get_timers", return_value=mock.Mock()),
         mock.patch.object(training_mod, "get_one_logger", return_value=None),
+        mock.patch.object(training_mod, "get_train_state", return_value=TrainState()),
         mock.patch.object(training_mod, "unwrap_model", return_value=[unwrapped_model]),
         mock.patch.object(training_mod, "get_num_microbatches", return_value=1),
         mock.patch.object(training_mod, "get_current_global_batch_size", return_value=1),
         mock.patch.object(training_mod.mpu, "model_parallel_is_initialized", return_value=False),
+        mock.patch.object(training_mod, "initialize_dsa_metric_tracker") as initialize_tracker,
         mock.patch("megatron.training.utils.start_memory_history_recording"),
     ):
         model, optimizer, scheduler = training_mod.setup_model_and_optimizer(
@@ -538,6 +580,10 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder():
     assert model == [wrapped_model]
     assert optimizer is None
     assert scheduler is None
+    if expect_tracker_init:
+        initialize_tracker.assert_called_once_with([unwrapped_model], pg_collection)
+    else:
+        initialize_tracker.assert_not_called()
     builder_cls.assert_called_once_with(model_config)
     builder.build_distributed_models.assert_called_once_with(
         pg_collection=pg_collection,
@@ -616,3 +662,65 @@ def test_dynamic_cp_cuda_graph_upper_bound_uses_dp_cp_and_sp_padding():
 
     # ceil(1000 / (DP=8 * CP=4 * 2 * SP=2)) * 128
     assert training_mod._get_thd_sequence_length_upper_bound(args) == 1024
+
+
+def test_train_step_uses_optimizer_ddp_config_for_mxfp8_staging():
+    class _DistributedOptimizer:
+        def __init__(self, overlap_param_gather):
+            self.ddp_config = SimpleNamespace(
+                reuse_grad_buf_for_mxfp8_param_ag=True, overlap_param_gather=overlap_param_gather
+            )
+            self._copy_main_params_to_param_buffer = mock.Mock()
+
+    overlapped = _DistributedOptimizer(overlap_param_gather=True)
+    nonoverlapped = _DistributedOptimizer(overlap_param_gather=False)
+    optimizer = SimpleNamespace(
+        zero_grad=lambda: None, chained_optimizers=[overlapped, nonoverlapped]
+    )
+    model = [
+        SimpleNamespace(
+            force_all_reduce=False,
+            zero_grad_buffer=lambda: None,
+            remove_forward_pre_hook_handles={object(): object()},
+        )
+    ]
+
+    with mock.patch.object(training_mod, "DistributedOptimizer", _DistributedOptimizer):
+        # Global args intentionally disagree; the optimizer DDP config is authoritative.
+        _run(
+            args_overrides={
+                "reuse_grad_buf_for_mxfp8_param_ag": False,
+                "overlap_param_gather": False,
+            },
+            model=model,
+            optimizer=optimizer,
+        )
+
+    overlapped._copy_main_params_to_param_buffer.assert_called_once_with()
+    nonoverlapped._copy_main_params_to_param_buffer.assert_not_called()
+
+
+def test_train_step_supports_bare_distributed_optimizer_for_mxfp8_staging():
+    class _DistributedOptimizer:
+        def __init__(self):
+            self.ddp_config = SimpleNamespace(
+                reuse_grad_buf_for_mxfp8_param_ag=True, overlap_param_gather=True
+            )
+            self._copy_main_params_to_param_buffer = mock.Mock()
+
+        def zero_grad(self):
+            pass
+
+    optimizer = _DistributedOptimizer()
+    model = [
+        SimpleNamespace(
+            force_all_reduce=False,
+            zero_grad_buffer=lambda: None,
+            remove_forward_pre_hook_handles={object(): object()},
+        )
+    ]
+
+    with mock.patch.object(training_mod, "DistributedOptimizer", _DistributedOptimizer):
+        _run(model=model, optimizer=optimizer)
+
+    optimizer._copy_main_params_to_param_buffer.assert_called_once_with()

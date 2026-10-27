@@ -13,15 +13,16 @@ from megatron.lite.primitive.config import load_hf_config_dict
 _HF_FIELDS = frozenset(
     {
         "attention_dropout",
-        "calculate_per_token_loss",
-        "dsa_indexer_loss_coeff",
-        "dsa_indexer_use_sparse_loss",
         "first_k_dense_replace",
         "head_dim",
         "hidden_size",
         "index_head_dim",
         "index_n_heads",
+        "index_share_for_mtp_iteration",
+        "index_skip_topk_offset",
         "index_topk",
+        "index_topk_freq",
+        "indexer_types",
         "indexer_layer_norm_eps",
         "indexer_rope_interleave",
         "indexer_rope_first",
@@ -59,6 +60,33 @@ _HF_FIELDS = frozenset(
 )
 
 
+_INDEXER_TYPES = frozenset({"full", "shared"})
+
+
+def _infer_dsa_indexer_type(layer_number: int, *, topk_freq: int, skip_topk_offset: int) -> str:
+    if topk_freq <= 1:
+        return "full"
+    skip_topk = (max(layer_number - skip_topk_offset, 0) % topk_freq) != 0
+    return "shared" if skip_topk else "full"
+
+
+def _source_dsa_compute_layer(layer_number: int, *, topk_freq: int, skip_topk_offset: int) -> int:
+    if (
+        _infer_dsa_indexer_type(
+            layer_number, topk_freq=topk_freq, skip_topk_offset=skip_topk_offset
+        )
+        == "full"
+    ):
+        return layer_number
+    source_layer = layer_number - (max(layer_number - skip_topk_offset, 0) % topk_freq)
+    if source_layer < 1:
+        raise ValueError(
+            "DSA IndexShare schedule makes layer "
+            f"{layer_number} shared before any full source layer."
+        )
+    return source_layer
+
+
 @dataclass
 class Glm5Config:
     """Pure GLM-5 MoE + MLA + DSA architecture parameters."""
@@ -84,13 +112,14 @@ class Glm5Config:
     index_head_dim: int = 128
     index_n_heads: int = 32
     index_topk: int = 2048
+    index_topk_freq: int = 1
+    index_skip_topk_offset: int = 0
+    indexer_types: list[str] | None = None
+    index_share_for_mtp_iteration: bool = False
     indexer_layer_norm_eps: float = 1e-6
     indexer_rope_interleave: bool = False
     indexer_rope_first: bool = True
     indexer_use_hadamard: bool = False
-    dsa_indexer_loss_coeff: float = 0.0
-    dsa_indexer_use_sparse_loss: bool = False
-    calculate_per_token_loss: bool = False
     rope_interleave: bool = False
     rope_theta: float = 1_000_000.0
     latent_rms_norm_eps: float = 1e-6
@@ -122,6 +151,34 @@ class Glm5Config:
             return self.mlp_layer_types[layer_idx] == "sparse"
         return layer_idx >= self.first_k_dense_replace
 
+    @property
+    def uses_dsa_index_share(self) -> bool:
+        return self.index_topk_freq > 1
+
+    def dsa_indexer_type(self, layer_idx: int) -> str:
+        if layer_idx < 0:
+            raise ValueError(f"layer_idx must be non-negative, got {layer_idx}")
+        if layer_idx < self.num_hidden_layers and self.indexer_types is not None:
+            return self.indexer_types[layer_idx]
+        return _infer_dsa_indexer_type(
+            layer_idx + 1,
+            topk_freq=self.index_topk_freq,
+            skip_topk_offset=self.index_skip_topk_offset,
+        )
+
+    def builds_dsa_indexer(self, layer_idx: int) -> bool:
+        return self.dsa_indexer_type(layer_idx) == "full"
+
+    def dsa_indexer_source_layer(self, layer_idx: int) -> int:
+        return (
+            _source_dsa_compute_layer(
+                layer_idx + 1,
+                topk_freq=self.index_topk_freq,
+                skip_topk_offset=self.index_skip_topk_offset,
+            )
+            - 1
+        )
+
     def _validate(self) -> None:
         errors: list[str] = []
 
@@ -141,7 +198,11 @@ class Glm5Config:
             self.index_head_dim >= self.qk_rope_head_dim,
             "index_head_dim must be >= qk_rope_head_dim",
         )
-        check(self.dsa_indexer_loss_coeff >= 0.0, "dsa_indexer_loss_coeff must be >= 0")
+        check(self.index_topk_freq >= 1, "index_topk_freq must be >= 1")
+        check(
+            self.index_skip_topk_offset >= 0,
+            "index_skip_topk_offset must be >= 0",
+        )
         check(
             self.num_key_value_heads == self.num_attention_heads,
             "initial GLM5 native path expects MLA heads to be ungrouped",
@@ -169,6 +230,42 @@ class Glm5Config:
                     layer_type in {"dense", "sparse"},
                     f"mlp_layer_types[{idx}] must be 'dense' or 'sparse'",
                 )
+
+        if self.indexer_types is not None:
+            check(
+                len(self.indexer_types) == self.num_hidden_layers,
+                "len(indexer_types) must equal num_hidden_layers",
+            )
+            for idx, indexer_type in enumerate(self.indexer_types):
+                check(
+                    indexer_type in _INDEXER_TYPES,
+                    f"indexer_types[{idx}] must be 'full' or 'shared'",
+                )
+
+        if self.index_topk_freq >= 1 and self.index_skip_topk_offset >= 0:
+            layer_count = self.num_hidden_layers + self.num_nextn_predict_layers
+            for layer_idx in range(layer_count):
+                try:
+                    _source_dsa_compute_layer(
+                        layer_idx + 1,
+                        topk_freq=self.index_topk_freq,
+                        skip_topk_offset=self.index_skip_topk_offset,
+                    )
+                except ValueError as exc:
+                    check(False, str(exc))
+
+            if self.indexer_types is not None and len(self.indexer_types) == self.num_hidden_layers:
+                for idx, indexer_type in enumerate(self.indexer_types):
+                    expected = _infer_dsa_indexer_type(
+                        idx + 1,
+                        topk_freq=self.index_topk_freq,
+                        skip_topk_offset=self.index_skip_topk_offset,
+                    )
+                    check(
+                        indexer_type == expected,
+                        f"indexer_types[{idx}]={indexer_type!r} does not match "
+                        f"index_topk_freq/index_skip_topk_offset schedule {expected!r}",
+                    )
 
         if errors:
             raise ValueError(

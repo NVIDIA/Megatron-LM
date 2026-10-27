@@ -7,6 +7,7 @@ from functools import lru_cache
 from typing import Optional
 
 from megatron.core import parallel_state
+from megatron.core._rank_utils import safe_get_rank
 from megatron.core.transformer.enums import LayerType
 
 logger = logging.getLogger(__name__)
@@ -264,13 +265,12 @@ class PipelineParallelLayerLayout:
         """Parse the pipeline model parallel layout from a string."""
         parsed_layout = PipelineParallelLayerLayout(layout, pipeline_model_parallel_size)
         # Pretty print the layout distribution.
-        from megatron.core.utils import log_single_rank
-
-        log_single_rank(
-            logger,
-            logging.INFO,
-            f"Parse pipeline model parallel layout {layout} to:\n" + parsed_layout.pretty_repr(),
-        )
+        if logger.isEnabledFor(logging.INFO) and safe_get_rank() == 0:
+            logger.info(
+                "Parse pipeline model parallel layout %s to:\n%s",
+                layout,
+                parsed_layout.pretty_repr(),
+            )
         return parsed_layout
 
     @staticmethod

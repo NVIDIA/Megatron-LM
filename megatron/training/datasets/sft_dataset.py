@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 import atexit
+import csv
 import math
 from collections import Counter
 from typing import Any, Dict, List, Optional, Union
@@ -62,6 +63,8 @@ class SFTDataset(MegatronDataset):
         config: GPTDatasetConfig,
     ) -> None:
         super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
+        # Pre-calculate padding divisor to avoid redundant computation in get_item
+        self.padding_divisor = self._calculate_padding_divisor()
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: LowLevelDataset) -> int:
@@ -148,7 +151,7 @@ class SFTDataset(MegatronDataset):
             assert not self.config.reset_position_ids
             pack_positions.extend(range(len(tokens_list)))
 
-            pad_granularity = self._calculate_padding_divisor()
+            pad_granularity = self.padding_divisor
             mod_token_count = len(pack_tokens) % pad_granularity
             if mod_token_count != 0:
                 pad_len = pad_granularity - mod_token_count
@@ -227,6 +230,8 @@ class MockSFTLowLevelDataset:
 
     Args:
         mode (str): One of 'file', 'distribution', or 'verification'.
+        vocab_size (Optional[int]): Tokenizer vocabulary size. Required for the generated
+            'file' and 'distribution' modes and ignored by 'verification' mode.
         **kwargs: Additional arguments depending on mode.
             For mode='file': path (str) - path to a CSV file with sequence lengths.
             For mode='distribution': type (str), min_seq_len (int), max_seq_len (int),
@@ -245,14 +250,34 @@ class MockSFTLowLevelDataset:
     size: int = 1000000
     """The hard-coded number of sequence to generate"""
 
-    def __init__(self, mode: str, **kwargs) -> None:
+    def __init__(self, mode: str, vocab_size: Optional[int] = None, **kwargs) -> None:
         np.random.seed(self.seed)
         self.format = kwargs.get("format", "thd")
+        self.vocab_size = vocab_size
+
+        if mode in ("file", "distribution") and (vocab_size is None or vocab_size < 2):
+            raise ValueError(
+                "Generated mock data requires vocab_size >= 2. If tokenizer.vocab_size is "
+                "unavailable, set vocab_size in the mock dataset config JSON; "
+                f"got {vocab_size}."
+            )
 
         if mode == "file":
-            import pandas as pd
-
-            self.sequence_lengths = np.array(pd.read_csv(kwargs["path"])).flatten()
+            # One sequence length per CSV line; non-numeric cells (e.g. a
+            # header row) are skipped. Stdlib csv keeps pandas out of the
+            # package's import-time dependencies.
+            lengths = []
+            with open(kwargs["path"], newline="") as f:
+                for row in csv.reader(f):
+                    for cell in row:
+                        cell = cell.strip()
+                        if not cell:
+                            continue
+                        try:
+                            lengths.append(int(float(cell)))
+                        except ValueError:
+                            continue
+            self.sequence_lengths = np.array(lengths)
             self.size = len(self.sequence_lengths)
         elif mode == "distribution":
             min_seq_len = kwargs["min_seq_len"]
@@ -317,7 +342,13 @@ class MockSFTLowLevelDataset:
             assert len(sample) == target
             return sample.astype(np.int64)
         else:
-            return np.arange(1, length, dtype=np.int64)
+            assert self.vocab_size is not None and self.vocab_size >= 2
+            sample = np.arange(1, length, dtype=np.int64)
+            # Preserve the original positive-token invariant while bounding IDs to the
+            # tokenizer vocabulary. In particular, do not synthesize token 0, which is
+            # commonly used as EOD/padding and therefore masked out of the loss.
+            sample = (sample - 1) % (self.vocab_size - 1) + 1
+            return sample
 
 
 class MockSFTDataset(SFTDataset):
@@ -347,6 +378,7 @@ class MockSFTDataset(SFTDataset):
             }
         else:
             mock_config = load_json_arg(config.sft_mock_dataset_config_json)
+        mock_config.setdefault("vocab_size", getattr(config.tokenizer, "vocab_size", None))
         return MockSFTLowLevelDataset(**mock_config)
 
     def __len__(self) -> int:

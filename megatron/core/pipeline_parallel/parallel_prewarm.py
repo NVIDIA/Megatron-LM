@@ -77,8 +77,13 @@ def _build_packed_seq_params(config, kwargs):
     if 'cu_seqlens_q' not in kwargs:
         return
 
+    from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+    graph_dynamic_plan = cp_balanced_indexer.pop_graph_dynamic_plan_from_kwargs(
+        kwargs, config.context_parallel_size, config.max_seqlen_per_dp_cp_rank
+    )
     max_seqlen = config.max_seqlen_per_dp_cp_rank * config.context_parallel_size
-    kwargs['packed_seq_params'] = PackedSeqParams(
+    packed_seq_params = PackedSeqParams(
         qkv_format='thd',
         cp_partition_mode=config.cp_partition_mode,
         cu_seqlens_q=kwargs.pop('cu_seqlens_q'),
@@ -89,6 +94,11 @@ def _build_packed_seq_params(config, kwargs):
         max_seqlen_kv=max_seqlen,
         pad_between_seqs=True,
     )
+    # Balanced DSA consumes this route in eager mode too. Raw graph kwargs must not
+    # reach layer.forward(), so preserve their plan on the reconstructed metadata.
+    if graph_dynamic_plan is not None:
+        cp_balanced_indexer.attach_graph_dynamic_plan(packed_seq_params, graph_dynamic_plan)
+    kwargs['packed_seq_params'] = packed_seq_params
 
 
 def _build_layer_inputs(

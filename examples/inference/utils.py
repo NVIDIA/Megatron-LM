@@ -20,6 +20,7 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer.module import MegatronModule
 from megatron.training import get_args
+from megatron.training.global_vars import get_run_config
 
 
 def get_default_sampling_params(termination_id: int = None):
@@ -34,10 +35,24 @@ def get_default_sampling_params(termination_id: int = None):
 
 
 def get_curr_time(do_broadcast: bool = True) -> float:
-    """Get synchronized time across ranks."""
+    """Get the current time, optionally synchronized across distributed ranks.
+
+    Args:
+        do_broadcast (bool): Whether multi-rank callers require a rank-zero
+            timestamp broadcast.
+
+    Returns:
+        float: Current time in seconds.
+    """
+    if (
+        not do_broadcast
+        or not torch.distributed.is_initialized()
+        or torch.distributed.get_world_size() == 1
+    ):
+        return time.time_ns() / 10**9
+
     curr_time = torch.cuda.LongTensor([time.time_ns()])
-    if torch.distributed.is_initialized() and do_broadcast:
-        torch.distributed.broadcast(curr_time, src=0)
+    torch.distributed.broadcast(curr_time, src=0)
     return curr_time.item() / 10**9
 
 
@@ -140,8 +155,9 @@ def get_cli_requests(
 ) -> list[Request]:
 
     # Get time offsets.
+    cfg = get_run_config()
     t_offsets = get_time_offsets(
-        args.seed,
+        cfg.rng.seed,
         args.incoming_requests_per_step,
         args.incoming_requests_per_sec,
         len(args.prompts),
@@ -156,10 +172,11 @@ def get_synthetic_requests(
     args: Namespace, tokenizer: Any, sampling_params: Optional[SamplingParams] = None
 ) -> list[Request]:
     """Get example requests."""
+    cfg = get_run_config()
 
     # Get time offsets.
     time_offsets = get_time_offsets(
-        args.seed,
+        cfg.rng.seed,
         args.incoming_requests_per_step,
         args.incoming_requests_per_sec,
         int(args.incoming_requests_per_sec * args.incoming_requests_duration),
@@ -191,6 +208,7 @@ def get_requests_from_file(
     args: Namespace, tokenizer: Any, sampling_params: Optional[SamplingParams] = None
 ) -> list[Request]:
     """Get requests from a file."""
+    cfg = get_run_config()
     if not args.prompt_file:
         raise ValueError("Prompt file is required to read requests from a file.")
 
@@ -215,7 +233,7 @@ def get_requests_from_file(
 
     # Get time offsets.
     time_offsets: list[float] = get_time_offsets(
-        args.seed, args.incoming_requests_per_step, args.incoming_requests_per_sec, len(prompts)
+        cfg.rng.seed, args.incoming_requests_per_step, args.incoming_requests_per_sec, len(prompts)
     )
 
     # Init requests.
@@ -305,7 +323,7 @@ def build_dynamic_engine_setup_prefix(
     # Buffer limits config
     buffer_limits_str = (
         f"bf: {get_mem_size_str(args.inference_dynamic_batching_buffer_size_gb*1024**3)}, "
-        f"{context.kv_block_allocator.active_count} chunks "
+        f"{context.kv_block_allocator.pool_size - 1} usable chunks "
         f"[r {context.max_requests}, t {context.max_tokens}]"
     )
 
@@ -335,7 +353,7 @@ def escape_str(s: str) -> str:
 def print_unique_prompts_and_outputs(results: List["DynamicInferenceRequest"]) -> None:
     """Print unique prompts and their outputs in gpt_dynamic_inference.py format.
 
-    Reads from the high-level API's ``DynamicInferenceRequest`` records returned
+    Reads from the high-level API's completed ``DynamicInferenceRequest`` objects returned
     by ``MegatronLLM.generate`` / ``MegatronAsyncLLM.generate``.
     """
     print("~~~~ Unique prompts + outputs. ~~~~")
@@ -345,7 +363,10 @@ def print_unique_prompts_and_outputs(results: List["DynamicInferenceRequest"]) -
         unique_prompt_map[req.prompt].append(idx)
 
     for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
-        prompt_len = len(results[request_idxs[0]].prompt_tokens)
+        request = results[request_idxs[0]]
+        prompt_len = request.prompt_length
+        if prompt_len is None and request.prompt_tokens is not None:
+            prompt_len = len(request.prompt_tokens)
         print(
             f"\n{unique_idx+1}/{len(unique_prompt_map)}"
             f"[n {len(request_idxs)}, l {prompt_len}] {escape_str(prompt_text)}"
@@ -387,9 +408,9 @@ def dump_inference_results_to_json(
 ) -> None:
     """JSON dump of per-request results matching legacy gpt_dynamic_inference.py shape.
 
-    Reads from the high-level API's ``DynamicInferenceRequest`` records.
+    Reads from the high-level API's completed ``DynamicInferenceRequest`` objects.
     Note: ``latency`` is currently always ``None`` in direct mode because the
-    low-level engine doesn't populate it on ``DynamicInferenceRequest.merge()``;
+    low-level engine doesn't populate it when completing a request;
     will be populated once that field is wired up upstream.
 
     Args:
@@ -401,7 +422,9 @@ def dump_inference_results_to_json(
         lifetime_prefill_token_count (int): Total prefill tokens processed.
         async_sched_step_count (int): Number of async scheduling decode steps.
         async_sched_compaction_step_count (int): Number of async scheduling decode
-            steps where post-forward compaction discarded finished rows.
+            steps that discarded speculative rows for finished requests. This
+            includes identity-prefix and all-finished cases that require no GPU
+            gather.
     """
     if not args.output_path:
         return
@@ -442,9 +465,7 @@ def dump_inference_results_to_json(
     json_results.update(peak_mem_stats)
     json_results["lifetime_prefill_token_count"] = lifetime_prefill_token_count
     json_results["async_sched_step_count"] = async_sched_step_count
-    json_results["async_sched_compaction_step_count"] = (
-        async_sched_compaction_step_count
-    )
+    json_results["async_sched_compaction_step_count"] = async_sched_compaction_step_count
 
     print(f' Saving results to {args.output_path}')
     with open(args.output_path, "w") as fp:

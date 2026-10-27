@@ -15,12 +15,13 @@ try:
 except ImportError:
     use_http2 = False
 
-from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.inference_client import InferenceClient
+from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.utils import log_single_rank
-from megatron.training.global_vars import get_args, get_tokenizer
+from megatron.core.utils import get_pg_size, log_single_rank
+from megatron.training.global_vars import get_args, get_run_config, get_tokenizer
+from megatron.training.utils import print_rank_0
 
 from ..inference.inference_interface import (
     InferenceRequest,
@@ -29,11 +30,55 @@ from ..inference.inference_interface import (
     ReturnsRaw,
     ReturnsTokens,
 )
-from ..rollout_granularity import get_rl_parallel_generation_tasks
 from ..server.api import InferenceServer
 
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+def resolve_generation_lag(
+    generation_lag: float | None,
+    *,
+    prompts_per_step: int,
+    group_size: int,
+    dp_size: int,
+    max_requests: int,
+) -> float:
+    """Return the generation lag to run with. An unset `generation_lag` autotunes.
+
+    This local DP/capacity estimate is inaccurate for disaggregated inference:
+    it does not aggregate the capacities of the built decode engines. See #8200
+    and #7138; an explicit lag avoids relying on this estimate for run-ahead.
+    """
+    max_effective_groups = dp_size * max_requests // group_size
+    max_effective_lag = max_effective_groups / prompts_per_step - 1
+    if generation_lag is None:
+        generation_lag = max_effective_lag
+        print_rank_0(
+            f"Autotuned rl-generation-lag={max_effective_lag:.2f} "
+            f"(DP={dp_size}, max_requests={max_requests}, G={group_size}, P={prompts_per_step})."
+        )
+    else:
+        print_rank_0(
+            f"Using rl-generation-lag={generation_lag} "
+            f"(max effective lag={max_effective_lag:.2f}; "
+            f"DP={dp_size}, max_requests={max_requests}, G={group_size}, P={prompts_per_step})."
+        )
+    groups_in_flight = (generation_lag + 1) * prompts_per_step
+    if groups_in_flight > max_effective_groups + 1e-6:
+        print_rank_0(
+            f"WARNING: {groups_in_flight:.1f} groups in flight oversubscribes the "
+            f"inference engine (max effective lag is {max_effective_lag:.2f}). "
+            f"Additional run-ahead beyond that point has no benefit."
+        )
+    if max_effective_lag < 0:
+        print_rank_0(
+            f"WARNING: max effective lag is {max_effective_lag:.2f} (negative) — the "
+            f"inference engine cannot hold even one training step's worth of rollouts "
+            f"({max_effective_groups} groups < P={prompts_per_step}). Even fully-synchronous GRPO "
+            f"would oversubscribe. Consider scaling up inference resources."
+        )
+    return generation_lag
 
 
 class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
@@ -44,12 +89,17 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     _client: InferenceClient = PrivateAttr(None)
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
-    _rl_kv_cache_management_mode: KVCacheManagementMode = PrivateAttr(None)
+    _generation_lag: float = PrivateAttr(None)
     _openai_client: AsyncOpenAI = PrivateAttr(None)
+
+    @property
+    def generation_lag(self) -> float:
+        """Trainer batches of rollout generation to run ahead with."""
+        return self._generation_lag
 
     async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
         tokenizer = get_tokenizer()
-        args = get_args()
+        cfg = get_run_config()
 
         # Use the shared, optimized client instead of spinning up a new one
         client = self._openai_client
@@ -57,16 +107,23 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         # Things that may be problematic when doing this switch
         # - Add BOS token
         # - Skip prompt logprobs
+        temperature = request.generation_args.temperature
         response = await client.chat.completions.create(
             model="",
             messages=[message.model_dump() for message in request.prompt],
-            temperature=request.generation_args.temperature or 1.0,
+            temperature=1.0 if temperature is None else temperature,
             top_p=request.generation_args.top_p or 0.0,
             n=1,
             logprobs=True,
             extra_body={
                 "skip_prompt_log_probs": True,
-                "add_BOS": (not args.rl_skip_bos_token and tokenizer.bos is not None),
+                "add_BOS": (not cfg.rl.rl_skip_bos_token and tokenizer.bos is not None),
+                # TODO: These are non-standard fields that add significant memory overheads to the
+                # chat completions payload. return_raw_text also wastes a lot of CPU cycles
+                # detokenizing prompt tokens, especially expensive for long prompts in agentic RL.
+                # Set to False if not needed in MRL.
+                "return_tokenized_data": True,
+                "return_raw_text": True,
             },
         )
 
@@ -75,14 +132,12 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         return InferenceResponse(
             # TODO: Handle tool calls and reasoning in LLMChatMessage
             response=LLMChatMessage(**choice.message.model_dump(include={'role', 'content'})),
-            raw_text=choice.raw_text,
-            token_ids=choice.prompt_token_ids + choice.generation_token_ids,
-            logprobs=choice.generation_log_probs,
+            raw_text=choice.message.raw_text,
+            token_ids=choice.message.prompt_token_ids + choice.message.generation_token_ids,
+            logprobs=choice.message.generation_log_probs,
             finish_reason=choice.finish_reason,
-            prompt_length=len(choice.prompt_token_ids),
-            policy_epoch=choice.message.policy_epoch,
-            kv_cache_epoch=choice.message.kv_cache_epoch,
-            num_evictions=choice.message.num_evictions,
+            prompt_length=len(choice.message.prompt_token_ids),
+            completion_id=response.id,
         )
 
     @classmethod
@@ -91,6 +146,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         from megatron.inference.utils import get_dynamic_inference_engine
 
         args = get_args()
+        cfg = get_run_config()
         tokenizer = get_tokenizer()
 
         if tokenizer.bos is None:
@@ -105,6 +161,23 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         args.skip_prompt_log_probs = True
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(model=model)
+        inference_engine.local_metadata_ledger_enabled = True
+        if inference_engine.context.config.disaggregation_shards is not None:
+            print_rank_0(
+                "WARNING: disaggregated RL generation-lag autotuning and HTTP concurrency "
+                "limits use local shard capacity, not aggregate decode capacity. "
+                "Set --rl-generation-lag explicitly when using partial rollouts; "
+                "capacity aggregation is tracked in Megatron-LM #8200 / #7138."
+            )
+        generation_lag = cfg.rl.rl_generation_lag
+        if cfg.rl.rl_partial_rollouts:
+            generation_lag = resolve_generation_lag(
+                generation_lag,
+                prompts_per_step=cfg.rl.grpo_prompts_per_step,
+                group_size=cfg.rl.grpo_group_size,
+                dp_size=get_pg_size(inference_engine.pg_collection.dp),
+                max_requests=inference_engine.context.max_requests,
+            )
         dp_addr = await inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=41521, launch_inference_coordinator=True
         )
@@ -122,8 +195,11 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 tokenizer=inference_engine.controller.tokenizer,
                 rank=dist.get_rank(),
                 server_port=kwargs.get('port', 8294),
-                parsers=args.rl_inference_parsers,
+                parsers=cfg.rl.rl_inference_parsers,
                 verbose=kwargs.get('verbose', False),
+                multimodal_prompt_config=(
+                    inference_engine.controller.inference_wrapped_model.multimodal_prompt_config
+                ),
             )
         else:
             client = None
@@ -131,14 +207,10 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         launched_server = cls(**kwargs)
         launched_server._client = client
         launched_server._inference_engine = inference_engine
-        launched_server._rl_kv_cache_management_mode = KVCacheManagementMode(
-            args.rl_kv_cache_management_mode
-        )
+        launched_server._generation_lag = generation_lag
 
         concurrency_limit = (
-            args.grpo_prompts_per_step
-            * args.grpo_group_size
-            * get_rl_parallel_generation_tasks(args)
+            get_pg_size(inference_engine.pg_collection.dp) * inference_engine.context.max_requests
         )
         custom_limits = httpx.Limits(
             max_connections=concurrency_limit, max_keepalive_connections=concurrency_limit
@@ -174,7 +246,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
                 stop_text_gen_server,
             )
-
             stop_text_gen_server()
 
     def set_generation_epoch(self, generation_epoch: int):
@@ -189,6 +260,20 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         if dist.get_rank() == 0:
             self._client.suspend_engines()
         await self._inference_engine.wait_until(EngineState.SUSPENDED)
+
+    def merge_global_request_ledgers(self) -> dict[str, FinishedRequestRecord]:
+        """Union every engine's local-metadata ledger and clear them."""
+        engine = self._inference_engine
+        local, engine.local_metadata_ledger = engine.local_metadata_ledger, {}
+        shards = [None] * dist.get_world_size()
+        dist.all_gather_object(shards, local)
+        merged: dict[str, FinishedRequestRecord] = {}
+        for shard in shards:
+            merged.update(shard)
+        assert len(merged) == sum(
+            len(shard) for shard in shards
+        ), "finished-request ledger: duplicate uids across engine ledgers"
+        return merged
 
     async def resume(self):
         if self._inference_engine._state_events[EngineState.RUNNING].is_set():

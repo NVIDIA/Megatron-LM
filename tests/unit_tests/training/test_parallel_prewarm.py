@@ -19,8 +19,13 @@ def test_pipeline_prewarm_cli_flag():
 @pytest.mark.parametrize('prewarm', [False, True])
 @pytest.mark.parametrize('fsdp', [None, 'use_megatron_fsdp', 'use_torch_fsdp2'])
 def test_training_rejects_prewarm_with_fsdp_before_initialization(monkeypatch, prewarm, fsdp):
-    args = SimpleNamespace(**({fsdp: True} if fsdp is not None else {}))
-    monkeypatch.setattr(training, 'get_args', lambda: args)
+    # FSDP settings now come from the run config, independently of legacy args.
+    monkeypatch.setattr(training, 'get_args', SimpleNamespace)
+    cfg = SimpleNamespace(
+        ddp=SimpleNamespace(use_megatron_fsdp=fsdp == 'use_megatron_fsdp'),
+        dist=SimpleNamespace(use_torch_fsdp2=fsdp == 'use_torch_fsdp2'),
+    )
+    monkeypatch.setattr(training, 'get_run_config', lambda: cfg)
 
     class InitializationReached(Exception):
         pass

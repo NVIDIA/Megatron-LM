@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 import inspect
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -11,7 +12,10 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import (
     _allreduce_non_tensor_model_parallel_grads,
     _allreduce_word_embedding_grads,
+    _update_router_expert_bias,
+    _update_router_qb_beta,
     finalize_model_grads,
+    reset_model_temporary_tensors,
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -34,6 +38,30 @@ class _RouterExpertBiasModel(torch.nn.Module):
     def finish_grad_sync(self, force_all_reduce=False):
         del force_all_reduce
         self.finish_grad_sync_calls += 1
+
+
+class _HashRouterWithoutExpertBias(torch.nn.Module):
+    """Match hash-router layers, which intentionally do not own expert-bias state."""
+
+    def __init__(self):
+        super().__init__()
+        self.expert_bias = None
+        self.local_tokens_per_expert = None
+
+
+def test_hash_router_without_expert_bias_is_ignored():
+    router = _HashRouterWithoutExpertBias()
+    config = SimpleNamespace(
+        moe_router_enable_expert_bias=True,
+        moe_router_load_balancing_type="none",
+        moe_router_bias_update_rate=0.25,
+    )
+
+    reset_model_temporary_tensors(config, [router])
+    _update_router_expert_bias([router], config)
+
+    assert router.expert_bias is None
+    assert router.local_tokens_per_expert is None
 
 
 def _router_expert_bias_config():
@@ -120,6 +148,7 @@ class TestFinalizeModelGradsMoEExpertBias:
 class TestAllReduceLNGrads:
 
     def init_model(self, share_embeddings_and_output_weights: bool = False):
+        qk_layernorm = True
         self.transformer_config = TransformerConfig(
             num_layers=2,
             hidden_size=12,
@@ -127,13 +156,15 @@ class TestAllReduceLNGrads:
             use_cpu_initialization=True,
             tensor_model_parallel_size=self.tp_size,
             pipeline_model_parallel_size=self.pp_size,
-            qk_layernorm=True,
+            qk_layernorm=qk_layernorm,
             pipeline_dtype=torch.float32,
         )
 
         self.model = GPTModel(
             config=self.transformer_config,
-            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(qk_layernorm=True),
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
+                qk_layernorm=qk_layernorm
+            ),
             vocab_size=100,
             max_sequence_length=4,
             share_embeddings_and_output_weights=share_embeddings_and_output_weights,

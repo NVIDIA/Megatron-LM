@@ -70,6 +70,7 @@ __all__ = [
     'is_fused_mrope_available',
     'mrope_freqs_to_rotary_emb',
     'get_pos_emb_on_this_cp_rank',
+    'should_use_fused_mla_rope',
 ]
 
 
@@ -135,6 +136,26 @@ def _warn_rope_fusion_fallback_once(key: str, message: str) -> None:
         return
     _ROPE_FUSION_FALLBACK_WARNINGS.add(key)
     warnings.warn(message, stacklevel=2)
+
+
+def should_use_fused_mla_rope(config: TransformerConfig) -> bool:
+    """Return whether MLA's custom fused RoPE kernels support this configuration.
+
+    Standard RoPE can rotate only a prefix of the positional channels when
+    ``rotary_percent < 1``. The custom MLA kernels currently rotate the full
+    positional slice, so partial rotary embeddings must retain the unfused path
+    that preserves the trailing pass-through channels.
+    """
+    if not config.apply_rope_fusion:
+        return False
+    if config.rope_type == "rope" and config.rotary_percent < 1.0:
+        _warn_rope_fusion_fallback_once(
+            "mla-partial-standard-rope",
+            "MLA/DSA RoPE fusion requires rotary_percent=1.0 for standard RoPE; "
+            f"got rotary_percent={config.rotary_percent}. Falling back to the unfused path.",
+        )
+        return False
+    return True
 
 
 def _fused_mrope_unavailable_warning_key(reason: str, thd: bool = False) -> str:
@@ -331,17 +352,19 @@ def _apply_rotary_pos_emb_thd(
     multi_latent_attention: Optional[bool] = None,
     max_seqlen: Optional[int] = None,
 ) -> Tensor:
-    """Apply RoPE for `thd` format using pure CUDA ops (CUDA Graph compatible).
+    """Apply RoPE for `thd` format using vectorized CUDA operations.
 
-    Replaces the original Python-loop + .tolist() implementation with vectorized
-    CUDA operations. No GPU->CPU syncs, compatible with CUDA Graph capture.
+    When ``max_seqlen`` is supplied, this path performs no GPU-to-CPU sync and is
+    compatible with CUDA Graph capture. The compatibility path for legacy callers
+    that omit ``max_seqlen`` retains one GPU-to-CPU sync.
 
     Args:
         t (Tensor): Input tensor of shape [total_tokens, h, d]
         cu_seqlens (Tensor): Cumulative sequence lengths, shape [num_seqs + 1], int32.
         freqs (Tensor): RoPE frequencies, shape [max_s, 1, 1, d] or [total_tokens, 1, 1, d]
         cp_group: Context parallel group
-        max_seqlen: Global max sequence length for this packed batch when known.
+        max_seqlen: Global max sequence length for this packed batch when known. Supplying it
+            avoids the compatibility-path host sync used by legacy callers.
 
     Returns:
         Tensor: Shape [total_tokens, h, d]. Input with RoPE applied.
@@ -396,11 +419,13 @@ def _apply_rotary_pos_emb_thd(
     else:
         freq_pos = local_pos.to(torch.int64)
 
-    assert max_seqlen is not None, (
-        "max_seqlen must be provided for THD RoPE so packed-frequency offset "
-        "detection does not silently depend on tensor shape heuristics."
-    )
-    exact_packed_freqs = freqs.dim() >= 1 and freqs.size(0) > max_seqlen
+    if max_seqlen is None:
+        # Backward compatibility for callers that predate ``max_seqlen``. This retains
+        # the old packed-frequency semantics at the cost of a GPU-to-CPU sync. Updated
+        # training paths pass ``max_seqlen`` and stay CUDA-graph safe.
+        exact_packed_freqs = freqs.dim() >= 1 and freqs.size(0) == int(cu_seqlens[-1].item())
+    else:
+        exact_packed_freqs = freqs.dim() >= 1 and freqs.size(0) > max_seqlen
     if exact_packed_freqs:
         # `freqs` covers all positions across all sequences (used for non-1D
         # RoPE / VLMs); shift by the per-sequence start offset so each token

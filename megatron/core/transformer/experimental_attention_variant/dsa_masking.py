@@ -17,6 +17,7 @@ __all__ = [
     "build_dsattention_forward_mask",
     "build_fused_indexer_varlen_bounds",
     "build_valid_mask_from_starts_ends",
+    "can_prove_all_topk_rows_nonempty",
     "extract_query_valid_rows_from_packed_seq_params",
     "gather_sparse_topk_validity_and_bias",
     "generate_varlen_mask_params",
@@ -29,7 +30,48 @@ __all__ = [
     "prepare_additive_mask",
     "prepare_sparse_mask_context",
     "scatter_topk_into_index_mask",
+    "sort_topk_by_index",
 ]
+
+
+def can_prove_all_topk_rows_nonempty(
+    *,
+    computes_topk: bool,
+    indexer_topk: int,
+    kv_sequence_length: int,
+    attention_mask: Optional[torch.Tensor],
+    query_valid_rows: Optional[torch.Tensor],
+    varlen_is_plain_causal: bool,
+    use_local_indexer_varlen: bool,
+    varlen_starts: Optional[torch.Tensor],
+    varlen_ends: Optional[torch.Tensor],
+    key_positions: Optional[torch.Tensor],
+) -> bool:
+    """Return a host-side certificate that every query row has a selected key.
+
+    The packed-local branch is provenance-based: its bounds must come from DSA's internal
+    packed self-attention layout. Selected cumulative lengths (padded when available),
+    synthetic tail positions, and reordered KV cover every physical query row; checking
+    tensor values here would introduce a device sync. This proves geometric non-emptiness
+    only; real-token masking remains a separate concern.
+
+    Backend callers may pass their normalized plain-causal layout as
+    ``varlen_is_plain_causal=True`` after dropping the equivalent explicit bounds.
+    """
+    if (
+        not computes_topk
+        or indexer_topk <= 0
+        or kv_sequence_length <= 0
+        or attention_mask is not None
+        or query_valid_rows is not None
+    ):
+        return False
+    return varlen_is_plain_causal or (
+        use_local_indexer_varlen
+        and varlen_starts is not None
+        and varlen_ends is not None
+        and key_positions is None
+    )
 
 
 def build_causal_mask_from_positions(
@@ -96,6 +138,37 @@ def build_valid_mask_from_starts_ends(
     return (key_positions.unsqueeze(0) >= starts.unsqueeze(-1)) & (
         key_positions.unsqueeze(0) < ends.unsqueeze(-1)
     )
+
+
+def sort_topk_by_index(
+    topk_indices: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    sk: int,
+    topk_scores: Optional[torch.Tensor] = None,
+    invalid_score: float = float("-inf"),
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Sort valid top-k slots by key index while preserving aligned scores.
+
+    Backends define validity explicitly: TileLang uses ``index >= 0`` sentinels,
+    while cuDNN consumes a compact prefix described by ``topk_length``.
+    """
+    if valid_mask.dtype != torch.bool or valid_mask.shape != topk_indices.shape:
+        raise ValueError("valid_mask must be boolean and match topk_indices")
+    if topk_scores is not None and topk_scores.shape != topk_indices.shape:
+        raise ValueError("topk_scores must match topk_indices")
+
+    sort_key = torch.where(valid_mask, topk_indices, torch.full_like(topk_indices, sk))
+    order = sort_key.argsort(dim=-1)
+    sorted_valid = torch.gather(valid_mask, dim=-1, index=order)
+    sorted_indices = torch.gather(topk_indices, dim=-1, index=order)
+    sorted_indices = sorted_indices.masked_fill(~sorted_valid, -1).contiguous()
+    if topk_scores is None:
+        return sorted_indices, None
+
+    sorted_scores = torch.gather(topk_scores, dim=-1, index=order)
+    sorted_scores = sorted_scores.masked_fill(~sorted_valid, invalid_score).contiguous()
+    return sorted_indices, sorted_scores
 
 
 def apply_starts_ends_mask_to_scores(

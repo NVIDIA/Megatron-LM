@@ -13,7 +13,12 @@ import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
 from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
-from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.extensions.transformer_engine import HAVE_TE_GDN, TEGatedDeltaNetAttention
+from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
+from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
+    tensor_masked_update,
+)
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -27,10 +32,49 @@ from megatron.core.ssm.gated_delta_net.common import (
     get_parameter_local_cp,
     l2norm,
 )
+from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
+from megatron.core.ssm.ops.common.causal_conv1d_varlen import (
+    causal_conv1d_varlen_carry_states,
+    causal_conv1d_varlen_fn,
+)
+from megatron.core.ssm.ops.gdp import (
+    chunk_gated_delta_product_varlen,
+    fused_recurrent_gated_delta_rule_update,
+)
+from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 
-class GatedDeltaNet(_GDNBase):
+def get_parameter_local_cp_headwise(
+    param: torch.Tensor,
+    dim: int,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    split_sections: Optional[list[int]] = None,
+) -> torch.Tensor:
+    """Get the local parameter slice for headwise context parallelism."""
+
+    cp_size = cp_group.size() if cp_group is not None else 1
+
+    if cp_size == 1:
+        return param
+
+    cp_rank = cp_group.rank()
+
+    if split_sections is not None:
+        inputs = torch.split(param, split_sections, dim=dim)
+        outputs = []
+        for p in inputs:
+            p = get_parameter_local_cp_headwise(p, dim, cp_group)
+            outputs.append(p)
+        return torch.cat(outputs, dim=dim)
+
+    slices = [slice(None)] * param.dim()
+    dim_size = param.size(dim=dim)
+    slices[dim] = slice(cp_rank * dim_size // cp_size, (cp_rank + 1) * dim_size // cp_size)
+    return param[slices]
+
+
+class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
     """Gated DeltaNet with a head-wise scalar memory-decay gate."""
 
     def _setup_variant_attrs(self):
@@ -59,11 +103,56 @@ class GatedDeltaNet(_GDNBase):
         )
         self.dt_bias_dim = self.num_v_heads_local_tp
         self.a_log_dim = self.num_v_heads_local_tp
+        self.feat_dim_split = self._get_feat_dim_split(
+            self.cp_size if self.config.linear_cp_mode == "headwise" else 1
+        )
+        self.chunk_size = 64
+        # GDN is GDP with one Householder update. Advertise this to the inference
+        # context so it owns persistent chunk descriptors for graph replay.
+        self.num_householder = 1
 
-        if self.config.deterministic_mode:
+        backend = self.config.gdn_kernel_backend
+        if backend == "transformer_engine" and (
+            self.config.dynamic_context_parallel
+            or (self.cp_size > 1 and self.config.linear_cp_mode != "headwise")
+        ):
+            raise ValueError(
+                "Transformer Engine GDN requires static headwise context parallelism; "
+                "use gdn_kernel_backend='fla' for chunkwise or dynamic CP."
+            )
+        if self.config.deterministic_mode and backend != "torch":
+            raise ValueError(
+                "deterministic_mode=True requires gdn_kernel_backend='torch' for " "Gated DeltaNet."
+            )
+
+        if backend == "torch":
+            self.gdn_backend = "torch"
             self.gated_delta_rule = torch_chunk_gated_delta_rule
-        else:
+            return
+
+        if backend == "fla":
+            self.gdn_backend = "fla"
             self.gated_delta_rule = chunk_gated_delta_rule
+            return
+
+        if not HAVE_TE_GDN:
+            raise ImportError(
+                "gdn_kernel_backend='transformer_engine' requires TransformerEngine's "
+                "GatedDeltaNetAttention (GDN) support."
+            )
+
+        # Q/K are expanded to the value-head count by
+        # `_prepare_input_for_gated_delta_rule`, so this DPA instance operates on
+        # the local head shard produced by the TP/CP all-to-all plumbing above.
+        self.gdn_backend = "transformer_engine"
+        num_local_heads = self.num_v_heads_local_tp // self.cp_size
+        self.core_attention = TEGatedDeltaNetAttention(
+            num_attention_heads=num_local_heads,
+            qk_head_dim=self.key_head_dim,
+            value_head_dim=self.value_head_dim,
+            layer_number=self.layer_number,
+        )
+        self.gated_delta_rule = self.core_attention
 
     def _get_feat_dim_split(self, cp_size_headwise: int) -> tuple[int, int, int, int]:
         """Return GDN1 qkv/z/beta/alpha split sizes for a runtime headwise CP size."""
@@ -90,8 +179,20 @@ class GatedDeltaNet(_GDNBase):
         beta = beta.float().sigmoid()
         return g, {"beta": beta.contiguous()}
 
+    def _apply_gated_norm(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """Normalize and gate the recurrence output, validating every fused call."""
+        if self.config.gdn_gated_output_norm_fusion:
+            from megatron.core.fusions.fused_gated_norm import fused_gated_norm, validate_gated_norm
+
+            validate_gated_norm(self, x, gate)
+            return fused_gated_norm(
+                x, gate, self.out_norm.weight, self.out_norm.eps, self.out_norm.zero_centered_gamma
+            )
+        return self._apply_gated_norm_unfused(x, gate)
+
     @jit_fuser
-    def _apply_gated_norm(self, x, gate):
+    def _apply_gated_norm_unfused(self, x, gate):
+        """Preserve the projection-backed gate view in the unfused output path."""
         # Output norm. X is contiguous, so flattening it preserves a view.
         x_dtype = x.dtype
         original_shape = x.shape
@@ -105,6 +206,350 @@ class GatedDeltaNet(_GDNBase):
         return y
 
     def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        inference_context: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[int] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Dispatch inference, then use the atomic CP/recompute-aware training path.
+
+        ``ssm_dynamic_inference`` applies the output projection itself, so its result already
+        satisfies this method's ``(output, bias)`` contract and is returned directly. It cannot
+        live in ``forward_pre_attn_and_core_attn``, whose contract is the tensor *before* that
+        projection, because the base ``forward`` would then project it a second time.
+
+        Return:
+            tuple[torch.Tensor, torch.Tensor | None]: GDN output and bias.
+        """
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        if inference_context is not None:
+            if inference_context.is_dynamic_batching():
+                if self.gdn_backend != "fla":
+                    raise ValueError(
+                        "GDN dynamic inference requires gdn_kernel_backend='fla' because "
+                        "only the FLA recurrent kernels are supported."
+                    )
+                assert (
+                    not self.config.batch_invariant_mode
+                ), "GDN dynamic inference does not support batch-invariant mode."
+                assert (
+                    self.cp_size == 1
+                ), "Context parallelism is not supported for GDN dynamic inference."
+                assert (
+                    inference_context.num_speculative_tokens == 0
+                ), "GDN dynamic inference does not support speculative decoding."
+                assert (
+                    not inference_context.enable_prefix_caching
+                ), "GDN dynamic inference does not support prefix caching."
+                return self.ssm_dynamic_inference(hidden_states, inference_context)
+            assert inference_context.is_static_batching()
+            assert not self.config.sequence_parallel
+            raise NotImplementedError("GDN static-batching inference is not supported.")
+
+        return self._forward_training(
+            hidden_states,
+            attention_mask,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            **kwargs,
+        )
+
+    def forward_pre_attn_and_core_attn(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        inference_context: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[int] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        packed_sequence_cp_metadata=None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Run GDN through its normalized recurrence output, before output projection.
+
+        Return:
+            torch.Tensor: Normalized recurrence output.
+        """
+        assert (
+            self.supports_two_stage_attention()
+        ), "This GDN configuration requires the atomic forward path."
+        assert (
+            packed_sequence_cp_metadata is None
+        ), "GDN does not support packed-sequence chunkwise CP metadata."
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+        # Training-only. Inference is dispatched by forward() before this stage, because
+        # ssm_dynamic_inference already applies the output projection while this method must
+        # return the tensor before it. Both conditions are checked: a stray context would be
+        # ignored here, and an inference run that never threads one would silently take the
+        # training path.
+        assert (
+            inference_context is None and not InferenceMode.is_active()
+        ), "Two-stage GDN execution is training-only; inference is dispatched by forward()."
+
+        seq_len, batch, _ = hidden_states.shape
+        seq_len = seq_len * self.sp_size * self.cp_size
+
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            assert batch == 1, "Packed sequence expects batch dimension to be 1"
+            assert (
+                not self.config.deterministic_mode
+            ), "Packed sequence does not support deterministic mode."
+
+            # Resolve cu_seqlens with alignment padding handling.
+            cu_seqlens_q = self._resolve_cu_seqlens(
+                packed_seq_params.cu_seqlens_q_padded,
+                packed_seq_params.cu_seqlens_q,
+                seq_len,
+                "cu_seqlens_q",
+                cp_size=self.cp_size,
+            )
+            cu_seqlens_kv = self._resolve_cu_seqlens(
+                packed_seq_params.cu_seqlens_kv_padded,
+                packed_seq_params.cu_seqlens_kv,
+                seq_len,
+                "cu_seqlens_kv",
+                cp_size=self.cp_size,
+            )
+            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
+                "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
+                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
+            )
+            num_packed_seqs = cu_seqlens_q.shape[0] - 1
+            assert num_packed_seqs > 0, (
+                "Number of packed sequences must be greater than 0, "
+                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
+            )
+        else:
+            cu_seqlens_q = None
+            cu_seqlens_kv = None
+
+        # Input projection
+        nvtx_range_push(suffix="in_proj")
+        qkvzba, _ = self.in_proj(hidden_states)
+        nvtx_range_pop(suffix="in_proj")
+
+        qkvzba, thd_cp_a2a_inv = a2a_cp_to_hp(
+            qkvzba,
+            self.in_proj_split_sections,
+            self.cp_size,
+            self.pg_collection.cp,
+            cu_seqlens_q,
+            seq_len,
+            packed_seq_params,
+        )
+
+        if self.gdn_pre_gated_delta_rule_fusion:
+            nvtx_range_push(suffix="fused_streamed_pre_gated_delta_rule")
+            seq_idx = (
+                packed_seq_params.seq_idx
+                if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+                else None
+            )
+            query, key, value, gate, beta, g = self._fused_streamed_pre_gated_delta_rule(
+                qkvzba,
+                cu_seqlens_q=cu_seqlens_q,
+                seq_idx=seq_idx,
+                cp_group_headwise=self.pg_collection.cp,
+            )
+            kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
+            nvtx_range_pop(suffix="fused_streamed_pre_gated_delta_rule")
+        else:
+            nvtx_range_push(suffix="pre_gated_delta_rule")
+            query, key, value, gate, beta, g = self.pre_gated_delta_rule(
+                qkvzba,
+                batch,
+                seq_len,
+                self.cp_size,
+                self.pg_collection.cp,
+                cu_seqlens_q,
+                packed_seq_params=packed_seq_params,
+            )
+            kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
+            nvtx_range_pop(suffix="pre_gated_delta_rule")
+
+        nvtx_range_push(suffix="gated_delta_rule")
+        core_attn_out, _ = self.gated_delta_rule(
+            **kernel_inputs,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=cu_seqlens_q,
+        )
+        nvtx_range_pop(suffix="gated_delta_rule")
+
+        if self.recompute_norm_out:
+            self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            norm_func = partial(
+                self._gated_norm_and_a2a,
+                thd_cp_a2a_inv=thd_cp_a2a_inv,
+                batch=batch,
+                seq_len=seq_len,
+                packed_seq_params=packed_seq_params,
+            )
+            norm_out = self.norm_out_checkpoint.checkpoint(norm_func, core_attn_out, gate)
+        else:
+            norm_out = self._gated_norm_and_a2a(
+                core_attn_out, gate, thd_cp_a2a_inv, batch, seq_len, packed_seq_params
+            )
+
+        return norm_out
+
+    def _split_projection(
+        self, projected: torch.Tensor, batch: int, seq_len: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Split the fused projection into qkv, output gate, beta, and alpha."""
+        qkv, gate, beta, alpha = torch.split(projected, self.feat_dim_split, dim=-1)
+        gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
+        return qkv, gate, beta, alpha
+
+    def _prepare_inference_inputs(
+        self, qkv: torch.Tensor, beta: torch.Tensor, alpha: torch.Tensor, batch: int, seq_len: int
+    ) -> dict[str, torch.Tensor]:
+        """Prepare raw FLA inputs while leaving normalization and gates fused in-kernel."""
+        query_key, value = torch.split(qkv, [2 * self.qk_dim_local_tp, self.v_dim_local_tp], dim=-1)
+        query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
+        query, key = torch.chunk(query_key, 2, dim=2)
+        value = value.reshape(batch, seq_len, -1, self.value_head_dim)
+        return {
+            "q": query.contiguous(),
+            "k": key.contiguous(),
+            "v": value.contiguous(),
+            "g": alpha.contiguous(),
+            "beta": beta.contiguous(),
+        }
+
+    def mamba_state_shapes_per_request(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """Return the TP-local convolution and delta-rule cache shapes."""
+        return (
+            (self.conv_dim_local_tp, self.conv_kernel_dim),
+            (self.num_v_heads_local_tp, self.key_head_dim, self.value_head_dim),
+        )
+
+    def ssm_decode(
+        self,
+        projected: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+        batch_indices: torch.Tensor,
+        intermediate_conv_state: torch.Tensor | None = None,
+        intermediate_ssm_state: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run one CUDA-graph-compatible GDN decode token per request.
+
+        Both kernels read and write the state caches in place at `batch_indices`;
+        a `-1` (padding) row gets a zero output without reading inputs or state.
+        """
+        batch, seq_len, _ = projected.shape
+        assert seq_len == 1, "GDN speculative decoding is not supported."
+        assert (
+            intermediate_conv_state is None and intermediate_ssm_state is None
+        ), "GDN speculative decoding state capture is not supported."
+
+        qkv, gate, beta, alpha = self._split_projection(projected, batch, seq_len)
+        qkv = causal_conv1d_update(
+            qkv.to(conv_state.dtype),
+            conv_state,
+            self.conv1d.weight.squeeze(1).to(conv_state.dtype),
+            self.conv1d.bias.to(conv_state.dtype) if self.conv1d.bias is not None else None,
+            self.activation,
+            conv_state_indices=batch_indices,
+        ).to(qkv.dtype)
+
+        kernel_inputs = self._prepare_inference_inputs(qkv, beta, alpha, batch, seq_len)
+        core_attn_out, _ = fused_recurrent_gated_delta_rule_update(
+            **kernel_inputs,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            state=ssm_state,
+            state_indices=batch_indices,
+            use_qk_l2norm_in_kernel=self.use_qk_l2norm,
+            use_beta_sigmoid_in_kernel=True,
+        )
+        return self._apply_gated_norm(core_attn_out, gate).reshape(batch, seq_len, -1)
+
+    def ssm_prefill(
+        self,
+        projected: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+        context: DynamicInferenceContext,
+    ) -> torch.Tensor:
+        """Run graph-safe GDN prefill using the single-update GDP recurrence.
+
+        Chunk descriptors belong to the inference context and are refreshed in
+        place before replay. Their padded capacity fixes every workspace and
+        launch grid independently of the lengths used during graph capture.
+        """
+        assert (
+            not context.is_chunked_prefill_enabled()
+        ), "GDN dynamic inference does not support chunked prefill."
+        metadata = context.mamba_metadata
+        cu_seqlens = metadata.cu_seqlens
+        batch_indices = metadata.batch_indices_prefill
+        token_count = projected.shape[0]
+
+        projected = projected.transpose(0, 1).contiguous()
+        qkv, gate, beta, alpha = self._split_projection(projected, 1, token_count)
+        read_indices = batch_indices.clamp(min=0)
+
+        qkv_dtype = qkv.dtype
+        conv_input = qkv.squeeze(0).to(conv_state.dtype).contiguous()
+        previous_conv_state = conv_state[read_indices]
+        final_conv_state = causal_conv1d_varlen_carry_states(
+            conv_input, cu_seqlens, previous_conv_state
+        )
+        qkv = causal_conv1d_varlen_fn(
+            x=conv_input,
+            weight=self.conv1d.weight.squeeze(1).to(conv_state.dtype),
+            bias=self.conv1d.bias.to(conv_state.dtype) if self.conv1d.bias is not None else None,
+            activation=self.activation,
+            initial_states=previous_conv_state[:, :, 1:],
+            cu_seqlens=cu_seqlens,
+            precomputed_seq_idx=metadata.conv_seq_idx,
+            precomputed_seq_start=metadata.conv_seq_start,
+        )
+        qkv = qkv.unsqueeze(0).to(qkv_dtype)
+        tensor_masked_update(conv_state, batch_indices, final_conv_state)
+
+        kernel_inputs = self._prepare_inference_inputs(qkv, beta, alpha, 1, token_count)
+        # GDP expects matching Q/K/V head counts and already-transformed gates.
+        # Preserve the fp32 gate arithmetic of FLA's fused GDN inference path.
+        query, key, value = kernel_inputs["q"], kernel_inputs["k"], kernel_inputs["v"]
+        head_repeats = value.shape[2] // query.shape[2]
+        if head_repeats != 1:
+            query = query.repeat_interleave(head_repeats, dim=2)
+            key = key.repeat_interleave(head_repeats, dim=2)
+        g = -self.A_log.float().exp() * F.softplus(alpha.float() + self.dt_bias.float())
+        beta = beta.float().sigmoid()
+        core_attn_out, _ = chunk_gated_delta_product_varlen(
+            q=query,
+            k=key,
+            v=value,
+            g=g,
+            beta=beta,
+            num_householder=self.num_householder,
+            initial_state=ssm_state[read_indices],
+            state=ssm_state,
+            state_indices=batch_indices,
+            use_qk_l2norm_in_kernel=self.use_qk_l2norm,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=metadata.gdp_chunk_indices,
+            chunk_indices_dp=metadata.gdp_chunk_indices_dp,
+            chunk_offsets=metadata.gdp_chunk_offsets,
+        )
+        y = self._apply_gated_norm(core_attn_out, gate)
+        return y.reshape(1, token_count, -1).transpose(0, 1).contiguous()
+
+    def _forward_training(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -221,6 +666,11 @@ class GatedDeltaNet(_GDNBase):
             cu_seqlens_kv = None
 
         if cp_size_chunkwise > 1:
+            if build_cp_context is None:
+                raise ImportError(
+                    "FLA chunkwise context parallelism requires fla.ops.cp.build_cp_context. "
+                    "Install an FLA build that provides the CP extension, or use CP=1/headwise CP."
+                )
             if cu_seqlens_q is None:
                 cache_key = (seq_len_global, batch)
                 cached = self._chunkwise_cp_context_cache.get(cache_key)
@@ -264,7 +714,21 @@ class GatedDeltaNet(_GDNBase):
                     chunkwise_cp_context,
                 )
 
-            out, out_bias = tensor_parallel.checkpoint(_checkpointed_compute, False, hidden_states)
+            if self.config.fp8 or self.config.fp4:
+                # Import here to avoid a circular dependency.
+                from megatron.core.extensions.transformer_engine import te_checkpoint
+
+                out, out_bias = te_checkpoint(
+                    _checkpointed_compute,
+                    False,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    self.pg_collection.tp,
+                    hidden_states,
+                )
+            else:
+                out, out_bias = tensor_parallel.checkpoint(
+                    _checkpointed_compute, False, hidden_states
+                )
         else:
             out, out_bias = self._forward_compute(
                 hidden_states,
@@ -383,7 +847,7 @@ class GatedDeltaNet(_GDNBase):
             output_final_state=False,
             use_qk_l2norm_in_kernel=False,
             cu_seqlens=cu_seqlens_q,
-            cp_context=chunkwise_cp_context,
+            **({"cp_context": chunkwise_cp_context} if self.gdn_backend == "fla" else {}),
         )
         nvtx_range_pop(suffix="gated_delta_rule")
 
@@ -648,6 +1112,7 @@ def torch_chunk_gated_delta_rule(
     cu_seqlens=None,
     cp_context=None,
     scale=None,
+    **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     # pylint: disable=line-too-long
     '''
@@ -711,7 +1176,7 @@ def torch_chunk_gated_delta_rule(
     v = attn @ v_beta
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
     last_recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(v)
+        v.new_zeros((batch_size, num_heads, k_head_dim, v_head_dim))
         if initial_state is None
         else initial_state.to(v)
     )

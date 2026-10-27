@@ -68,7 +68,6 @@ from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.transformer.enums import ModelType
 from megatron.core.utils import unwrap_model
 from tests.unit_tests.models.mimo.test_mimo_1f1b_schedule import (
-    build_no_sync_func,
     create_all_embedding_groups,
     create_hypercomm_grid,
     destroy_all_grids,
@@ -167,7 +166,7 @@ def _set_deterministic_env():
 
 
 def _wire_training_hooks(mimo_model, module_to_grid_map, language_pg, vision_pg):
-    """Attach no_sync plus the production grad-sync hooks to a MimoModel.
+    """Attach the production no-sync and grad-sync hooks to a MimoModel.
 
     Delegates the finalize/grad-scale wiring to ``configure_grad_sync`` (the real
     examples/mimo path), so this test's dp1-reference assertions validate that
@@ -175,7 +174,6 @@ def _wire_training_hooks(mimo_model, module_to_grid_map, language_pg, vision_pg)
     mean: all-reduce ``total_num_tokens`` over the LLM DP group to get ``N_global``,
     finalize each submodule over its own group, then ``scale_gradients(1/N_global)``.
     """
-    mimo_model.config.no_sync_func = build_no_sync_func(mimo_model)
     topology = SimpleNamespace(
         grids=module_to_grid_map,
         module_pgs={
@@ -183,7 +181,9 @@ def _wire_training_hooks(mimo_model, module_to_grid_map, language_pg, vision_pg)
             **{name: vision_pg for name in mimo_model.modality_submodules},
         },
     )
-    configure_grad_sync(SimpleNamespace(), mimo_model, topology)
+    configure_grad_sync(
+        SimpleNamespace(overlap_grad_reduce=True, align_grad_reduce=False), mimo_model, topology
+    )
 
 
 def _generate_and_broadcast_global_batches(
@@ -195,6 +195,7 @@ def _generate_and_broadcast_global_batches(
     num_batches,
     image_token_id=50257,
     mask_pattern="uniform",
+    modality_dtype=torch.float32,
 ):
     """Generate global batches on rank 0 and broadcast so every rank sees
     identical data. Dist pre-slices per rank; ref consumes the full batch.
@@ -220,7 +221,7 @@ def _generate_and_broadcast_global_batches(
     for batch_idx in range(num_batches):
         if rank == 0:
             encoder_hidden_states = torch.randn(
-                image_seq_length, global_mbs, hidden_size, device='cuda', dtype=torch.float32
+                image_seq_length, global_mbs, hidden_size, device='cuda', dtype=modality_dtype
             )
             image_tokens = torch.full(
                 (global_mbs, image_seq_length), image_token_id, dtype=torch.long, device='cuda'
@@ -231,7 +232,7 @@ def _generate_and_broadcast_global_batches(
             input_ids = torch.cat([image_tokens, text_tokens], dim=1)
         else:
             encoder_hidden_states = torch.empty(
-                image_seq_length, global_mbs, hidden_size, device='cuda', dtype=torch.float32
+                image_seq_length, global_mbs, hidden_size, device='cuda', dtype=modality_dtype
             )
             input_ids = torch.empty(global_mbs, seq_length, dtype=torch.long, device='cuda')
 

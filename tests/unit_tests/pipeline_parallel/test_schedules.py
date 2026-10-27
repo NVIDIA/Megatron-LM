@@ -8,24 +8,55 @@ import pytest
 import torch
 import torch.distributed as dist
 from packaging import version
-from pytest_mock import mocker
 
-import megatron.core.pipeline_parallel.hybrid_cp_schedule as hybrid_cp_schedule
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import (
     convert_schedule_table_to_order,
     get_overlap_moe_expert_parallel_comm_order,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
+
+
+@pytest.fixture(autouse=True)
+def reset_dsa_loss_scale():
+    yield
+    DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+
+
+def test_reset_activation_offload_uses_language_model_group(mocker):
+    reset = mocker.patch.object(schedule.off_interface, "reset")
+    language_group = object()
+    collection = MultiModuleProcessGroupCollection(
+        module_pgs={
+            "encoder_1": object(),
+            "encoder_2": object(),
+            "llm": SimpleNamespace(tp_dp_cp=language_group),
+        },
+        language_model_module_name="llm",
+    )
+    schedule._reset_activation_offload(collection)
+    reset.assert_called_once_with(process_group=language_group)
+
+    reset.reset_mock()
+    collection = MultiModuleProcessGroupCollection(
+        module_pgs={"encoder_1": object(), "encoder_2": object()}
+    )
+    schedule._reset_activation_offload(collection)
+    reset.assert_not_called()
 
 
 def _populate_embedding_and_position_groups(pp_group):
@@ -82,220 +113,113 @@ def test_deallocate_output_tensor():
     assert out.nelement() == 6
 
 
+def _packing_test_group(rank=0, size=1):
+    return SimpleNamespace(rank=lambda: rank, size=lambda: size)
+
+
+def test_deallocate_output_tensor_rejects_view():
+    """The view guard is back: pseudo-freeing a view reclaims nothing."""
+    base = torch.arange(6.0, requires_grad=True)
+    out = base.view(2, 3)
+    assert out._base is base
+    with pytest.raises(AssertionError, match="counter-productive"):
+        schedule.deallocate_output_tensor(out, deallocate_pipeline_outputs=True)
+
+
 @contextmanager
 def _no_sync():
     yield
 
 
-def _patch_hybrid_cp_parallel_state(monkeypatch, *, is_first_tp_rank):
+def test_dynamic_context_parallel_forward_batch_has_tp_schema(monkeypatch):
+    """The current packing consumer bridges flat scheduled samples to TP's 2D schema."""
+    from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: [0])
+    monkeypatch.setattr(torch.distributed, "broadcast", lambda *args, **kwargs: None)
+    group = _packing_test_group()
     monkeypatch.setattr(
-        hybrid_cp_schedule.parallel_state,
-        "get_data_parallel_rank",
-        lambda with_context_parallel=False: 0,
+        schedule.parallel_state,
+        "get_dynamic_data_context_parallel_groups",
+        lambda group_size: group,
     )
-    monkeypatch.setattr(
-        hybrid_cp_schedule.parallel_state,
-        "get_tensor_model_parallel_rank",
-        lambda: 0 if is_first_tp_rank else 1,
-    )
-    monkeypatch.setattr(
-        hybrid_cp_schedule.parallel_state, "get_tensor_model_parallel_src_rank", lambda: 0
-    )
-    monkeypatch.setattr(
-        hybrid_cp_schedule.parallel_state, "get_tensor_model_parallel_group", lambda: "tp_group"
-    )
-    monkeypatch.setattr(
-        hybrid_cp_schedule.parallel_state,
-        "get_data_parallel_group",
-        lambda with_context_parallel=False: "dp_cp_group",
-    )
-
-
-def _patch_hybrid_cp_cpu_tensors(monkeypatch):
-    original_tensor = torch.tensor
-
-    def cpu_tensor(*args, **kwargs):
-        if kwargs.get("device") == "cuda":
-            kwargs["device"] = "cpu"
-        return original_tensor(*args, **kwargs)
-
-    monkeypatch.setattr(hybrid_cp_schedule.torch, "tensor", cpu_tensor)
-    monkeypatch.setattr(
-        hybrid_cp_schedule.torch.cuda, "current_device", lambda: torch.device("cpu")
-    )
-
-
-def test_hybrid_context_parallel_forward_backward_passes_local_cp_size(monkeypatch):
-    _patch_hybrid_cp_cpu_tensors(monkeypatch)
-    _patch_hybrid_cp_parallel_state(monkeypatch, is_first_tp_rank=True)
-
-    monkeypatch.setattr(
-        hybrid_cp_schedule.torch.distributed, "broadcast", lambda *args, **kwargs: None
-    )
-    barrier_groups = []
-    monkeypatch.setattr(
-        hybrid_cp_schedule.torch.distributed,
-        "barrier",
-        lambda group=None: barrier_groups.append(group),
-    )
-
-    batch = [{"id": 0}, {"id": 1}, {"id": 2}]
-    sample_id_groups = [[[0], [0], []], [[1, 2], [1], [1, 2]]]
-    forward_calls = []
-
-    def fake_forward_step(
-        forward_step_func,
-        data_iterator,
-        model,
-        num_microbatches,
-        input_tensor,
-        forward_data_store,
-        config,
-        cp_group_size,
-        **kwargs,
-    ):
-        assert isinstance(data_iterator, RerunDataIterator)
-        sample = next(data_iterator)
-        forward_calls.append(
-            {
-                "sample_id": sample["id"],
-                "local_cp_size": int(sample["local_cp_size"].item()),
-                "local_cp_size_dtype": sample["local_cp_size"].dtype,
-                "cp_group_size": cp_group_size,
-                "current_microbatch": kwargs["current_microbatch"],
-                "is_first_microbatch": kwargs["is_first_microbatch"],
-            }
-        )
-        return torch.tensor(float(kwargs["current_microbatch"])), torch.tensor(10)
-
-    backward_calls = []
-
-    def fake_backward_step(input_tensor, output_tensor, output_tensor_grad, config):
-        backward_calls.append((input_tensor, output_tensor.item(), output_tensor_grad, config))
-
-    monkeypatch.setattr(schedule, "forward_step", fake_forward_step)
-    monkeypatch.setattr(schedule, "backward_step", fake_backward_step)
-
-    config = SimpleNamespace()
-    forward_data_store, total_num_tokens = (
-        hybrid_cp_schedule.hybrid_context_parallel_forward_backward(
-            forward_step_func=None,
-            data_iterator=iter([(batch, sample_id_groups)]),
-            model="model",
-            num_microbatches=3,
-            input_tensor="input",
-            output_tensor_grad="grad",
-            forward_data_store=[],
-            config=config,
-            collect_non_loss_data=False,
-            first_val_step=True,
-            forward_only=False,
-            no_sync_func=_no_sync,
-            total_num_tokens=0,
-            check_first_val_step=lambda first_val_step, forward_only, is_first: is_first,
-            model_type="unused",
+    sample = {
+        "tokens": torch.arange(4, dtype=torch.int64),
+        "labels": torch.arange(1, 5, dtype=torch.int64),
+        "loss_mask": torch.ones(4),
+        "position_ids": torch.arange(4, dtype=torch.int64),
+        "cu_seqlens": torch.tensor([0, 4], dtype=torch.int32),
+        "cu_seqlens_padded": torch.tensor([0, 4], dtype=torch.int32),
+        "max_seqlen": torch.tensor(4, dtype=torch.int32),
+        "local_cp_size": torch.tensor(1, dtype=torch.int32),
+    }
+    tokens, labels, loss_mask, attention_mask, position_ids, params, padding_mask = (
+        get_batch_on_this_rank_for_sequence_packing(
+            iter([sample]),
+            dynamic_cp=True,
+            pg_collection=SimpleNamespace(tp=group, pp=group, cp=group),
         )
     )
-
-    assert forward_data_store == []
-    assert total_num_tokens == 30
-    assert forward_calls == [
-        {
-            "sample_id": 0,
-            "local_cp_size": 2,
-            "local_cp_size_dtype": torch.int32,
-            "cp_group_size": 2,
-            "current_microbatch": 0,
-            "is_first_microbatch": True,
-        },
-        {
-            "sample_id": 1,
-            "local_cp_size": 3,
-            "local_cp_size_dtype": torch.int32,
-            "cp_group_size": 3,
-            "current_microbatch": 1,
-            "is_first_microbatch": False,
-        },
-        {
-            "sample_id": 2,
-            "local_cp_size": 2,
-            "local_cp_size_dtype": torch.int32,
-            "cp_group_size": 2,
-            "current_microbatch": 2,
-            "is_first_microbatch": False,
-        },
-    ]
-    assert [(call[0], call[1], call[2]) for call in backward_calls] == [
-        ("input", 0.0, "grad"),
-        ("input", 1.0, "grad"),
-        ("input", 2.0, "grad"),
-    ]
-    assert all(call[3] is config for call in backward_calls)
-    assert "dp_cp_group" in barrier_groups
+    for value in (tokens, labels, loss_mask, position_ids, padding_mask):
+        assert value.shape == (1, 4)
+    assert tokens.dtype == labels.dtype == position_ids.dtype == torch.int64
+    assert padding_mask.dtype == torch.bool and not padding_mask.any()
+    assert attention_mask is None
+    assert params.cu_seqlens_q.tolist() == [0, 4]
+    assert params.cu_seqlens_q.dtype == torch.int32
+    assert params.max_seqlen_q == 4
+    assert params.local_cp_size == 1 and params.cp_group is None
+    assert params.cp_singleton_group is group
 
 
-def test_hybrid_context_parallel_non_first_tp_rank_uses_broadcast_cp_size(monkeypatch):
-    _patch_hybrid_cp_parallel_state(monkeypatch, is_first_tp_rank=False)
+def test_dynamic_context_parallel_non_source_tp_receives_batch_metadata(monkeypatch):
+    """Non-source TP ranks receive local shape, fields and the runtime CP width."""
+    from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: [0, 1])
+    tp_group = _packing_test_group(rank=1, size=2)
+    cp_group = _packing_test_group(size=2)
+    pp_group = _packing_test_group()
     monkeypatch.setattr(
-        hybrid_cp_schedule.torch.cuda, "current_device", lambda: torch.device("cpu")
+        schedule.parallel_state,
+        "get_dynamic_data_context_parallel_groups",
+        lambda group_size: cp_group if group_size == 2 else pytest.fail("wrong CP width"),
     )
-    monkeypatch.setattr(hybrid_cp_schedule.torch.distributed, "barrier", lambda group=None: None)
-
-    broadcast_values = [
-        torch.tensor([1], dtype=torch.int64),
-        torch.tensor([1], dtype=torch.int32),
-        torch.tensor([7], dtype=torch.int32),
+    payloads = [
+        torch.tensor([2, 4], dtype=torch.int32),
+        torch.arange(4, dtype=torch.int64).view(1, 4),
+        torch.arange(4, dtype=torch.int64).view(1, 4),
+        torch.arange(1, 5, dtype=torch.int64).view(1, 4),
+        torch.ones(1, 4),
+        torch.zeros(1, 4, dtype=torch.bool),
+        torch.tensor([0, 8], dtype=torch.int32),
+        torch.tensor([0, 8], dtype=torch.int32),
+        torch.tensor([8], dtype=torch.int32),
+        torch.tensor([2], dtype=torch.int32),
     ]
 
-    def fake_broadcast(item, src, group=None):
-        item.copy_(broadcast_values.pop(0))
+    def receive(tensor, src, group):
+        assert group is tp_group and src == 0
+        value = payloads.pop(0)
+        assert tensor.dtype == value.dtype and tensor.numel() == value.numel()
+        tensor.copy_(value.reshape_as(tensor))
 
-    monkeypatch.setattr(hybrid_cp_schedule.torch.distributed, "broadcast", fake_broadcast)
-
-    forward_calls = []
-
-    def fake_forward_step(
-        forward_step_func,
-        data_iterator,
-        model,
-        num_microbatches,
-        input_tensor,
-        forward_data_store,
-        config,
-        cp_group_size,
-        **kwargs,
-    ):
-        forward_calls.append((data_iterator, cp_group_size, kwargs["current_microbatch"]))
-        return torch.tensor(0.0), torch.tensor(4)
-
-    monkeypatch.setattr(schedule, "forward_step", fake_forward_step)
-    monkeypatch.setattr(
-        schedule,
-        "backward_step",
-        lambda input_tensor, output_tensor, output_tensor_grad, config: None,
+    monkeypatch.setattr(torch.distributed, "broadcast", receive)
+    result = get_batch_on_this_rank_for_sequence_packing(
+        None, dynamic_cp=True, pg_collection=SimpleNamespace(tp=tp_group, pp=pp_group, cp=cp_group)
     )
-
-    _, total_num_tokens = hybrid_cp_schedule.hybrid_context_parallel_forward_backward(
-        forward_step_func=None,
-        data_iterator=None,
-        model="model",
-        num_microbatches=1,
-        input_tensor="input",
-        output_tensor_grad="grad",
-        forward_data_store=[],
-        config=SimpleNamespace(),
-        collect_non_loss_data=False,
-        first_val_step=True,
-        forward_only=True,
-        no_sync_func=_no_sync,
-        total_num_tokens=0,
-        check_first_val_step=lambda first_val_step, forward_only, is_first: is_first,
-        model_type="unused",
-    )
-
-    assert forward_calls == [(None, 7, 0)]
-    assert total_num_tokens == 4
-    assert broadcast_values == []
+    assert not payloads
+    tokens, labels, loss_mask, attention_mask, position_ids, params, padding_mask = result
+    assert tokens.tolist() == [[0, 1, 2, 3]]
+    assert labels.tolist() == [[1, 2, 3, 4]]
+    assert position_ids.tolist() == [[0, 1, 2, 3]]
+    assert loss_mask.tolist() == [[1.0, 1.0, 1.0, 1.0]]
+    assert attention_mask is None and not padding_mask.any()
+    assert params.cu_seqlens_q.tolist() == [0, 8]
+    assert params.max_seqlen_q == 8
+    assert params.local_cp_size == 2 and params.cp_group is cp_group
 
 
 @pytest.mark.parametrize("calculate_per_token_loss,expected_scale", [(False, 6.0), (True, 3.0)])
@@ -377,7 +301,8 @@ def test_dsa_indexer_loss_scale_accepts_dict_output_tensor():
     )
 
 
-def test_dsa_indexer_loss_scale_defaults_from_variant_without_mutating_config():
+@pytest.mark.parametrize("variant", ["dsa", "dsv4_hybrid"])
+def test_indexer_loss_scale_defaults_from_variant_without_mutating_config(variant):
     from megatron.core.transformer.experimental_attention_variant.dsa import (
         DSAIndexerLossAutoScaler,
     )
@@ -385,7 +310,7 @@ def test_dsa_indexer_loss_scale_defaults_from_variant_without_mutating_config():
     config = SimpleNamespace(
         calculate_per_token_loss=True,
         experimental_attention_variant_loss_scale_func=None,
-        experimental_attention_variant='dsa',
+        experimental_attention_variant=variant,
         grad_scale_func=lambda tensor: tensor * 7.0,
         num_moe_experts=None,
         mtp_num_layers=None,
@@ -567,6 +492,126 @@ def test_forward_backward_func_without_pipeline_parallel(mocker):
     for i, j in zip(losses_reduced, loss_reduced_expected):
         assert i['loss_reduced'] == j['loss_reduced']
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize(
+    "communicator_base,module_first_stage,pipeline_stages",
+    [
+        (P2PCommunicator, None, 1),
+        (MultiModulePipelineCommunicator, True, 1),
+        (MultiModulePipelineCommunicator, True, 2),
+    ],
+)
+def test_schedule_enables_grad_sync_on_first_stage(
+    monkeypatch, communicator_base, module_first_stage, pipeline_stages
+):
+    events = []
+
+    @contextmanager
+    def no_sync():
+        events.append("enter_no_sync")
+        try:
+            yield
+        finally:
+            events.append("exit_no_sync")
+
+    config = SimpleNamespace(
+        overlap_p2p_comm=False,
+        variable_seq_lengths=True,
+        pipeline_p2p_fixed_shape=False,
+        finalize_model_grads_func=None,
+        timers=None,
+        no_sync_func=no_sync,
+        num_microbatches_with_partial_activation_checkpoints=None,
+        deallocate_pipeline_outputs=False,
+        grad_sync_func=lambda _parameters: events.append("grad_sync"),
+        calculate_per_token_loss=False,
+    )
+    model = SimpleNamespace(config=config, parameters=lambda: [])
+
+    is_multimodule = communicator_base is MultiModulePipelineCommunicator
+
+    class FakeCommunicator(communicator_base):
+        total_stages = pipeline_stages
+        current_stage = 0
+        is_pp_first_stage = not is_multimodule
+        is_pp_last_stage = True
+
+        def __init__(self):
+            self.config = config
+            if is_multimodule:
+                self.rank_module_map = {"llm": SimpleNamespace(bridge_comms_as_dest_module=[])}
+
+        def is_module_pp_first_stage(self, _module_name):
+            return module_first_stage
+
+        @staticmethod
+        def recv_forward(*_args):
+            return {"llm": None} if is_multimodule else None
+
+        @staticmethod
+        def send_forward_recv_backward(*_args):
+            return None
+
+        @staticmethod
+        def send_forward(*_args):
+            return None
+
+        @staticmethod
+        def recv_backward(*_args):
+            return None
+
+        @staticmethod
+        def send_backward(*_args):
+            return None
+
+    monkeypatch.setattr(
+        schedule,
+        "forward_step",
+        lambda *_args, **_kwargs: (
+            {"llm": torch.tensor(1.0)} if is_multimodule else torch.tensor(1.0),
+            torch.tensor(0),
+        ),
+    )
+    monkeypatch.setattr(
+        schedule, "backward_step", lambda *_args, **_kwargs: events.append("backward") or None
+    )
+    monkeypatch.setattr(
+        schedule,
+        "backward_step_multimodule",
+        lambda *_args, **_kwargs: events.append("backward") or {"llm": None},
+    )
+    monkeypatch.setattr(schedule, "deallocate_output_tensor", lambda *_args: None)
+    real_zeros = torch.zeros
+    monkeypatch.setattr(
+        schedule.torch,
+        "zeros",
+        lambda *args, **kwargs: real_zeros(
+            *args, **{key: value for key, value in kwargs.items() if key != "device"}
+        ),
+    )
+
+    if is_multimodule:
+        pg_collection = SimpleNamespace(
+            has_language_model=lambda: False, language_model_module_name=None
+        )
+    else:
+        pg_collection = ProcessGroupCollection()
+        pg_collection.tp = SimpleNamespace(size=lambda: 1)
+        pg_collection.cp = SimpleNamespace(size=lambda: 1)
+
+    schedule.forward_backward_pipelining_without_interleaving(
+        forward_step_func=None,
+        data_iterator=None,
+        model=model,
+        num_microbatches=1,
+        seq_length=1,
+        micro_batch_size=1,
+        p2p_communicator=FakeCommunicator(),
+        pg_collection=pg_collection,
+    )
+
+    assert events == ["enter_no_sync", "exit_no_sync", "backward"]
 
 
 def test_forward_backward_func_with_pipeline_parallel(mocker):

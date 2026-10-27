@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import enum
 
@@ -9,9 +9,11 @@ class ModelType(enum.Enum):
     """Model Type
 
     encoder_or_decoder for bert, gpt etc
+    encoder_and_decoder is retained for checkpoint backward compatibility
     """
 
     encoder_or_decoder = 1
+    encoder_and_decoder = 2
 
 
 class LayerType(enum.Enum):
@@ -67,7 +69,7 @@ class CudaGraphModule(enum.Enum):
 
     attn = 1  # Captures attention layers
     mlp = 2  # Captures MLP layers (dense layers only)
-    moe = 3  # Captures MoE layers (drop-and-pad MoE layers only)
+    moe = 3  # Captures drop-and-pad or sync-free HybridEP MoE layers
     moe_router = 4  # Captures MoE router part
     moe_preprocess = 5  # Captures MoE preprocessing part (requires moe_router)
     mamba = 6  # Captures Mamba layers

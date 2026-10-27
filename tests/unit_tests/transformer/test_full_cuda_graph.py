@@ -2,14 +2,19 @@
 
 import contextlib
 import gc
+import warnings
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
+from megatron.core.full_cuda_graph import (
+    FullCudaGraphWrapper,
+    StaticBufferLoader,
+    get_shared_capture_stream,
+)
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
@@ -19,10 +24,13 @@ from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
+    prime_cuda_rng_states_for_graph_capture,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import is_te_min_version, is_torch_min_version
+from megatron.training.models.dist_utils import _ddp_wrap
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
@@ -41,13 +49,151 @@ def reset_full_cuda_graph_state():
     """Keep the full-iteration wrapper's class state isolated per test."""
     _reset_full_cuda_graph_state()
     MTPLossLoggingHelper.tracker = {}
+    DSAIndexerLossLoggingHelper.tracker = {}
     yield
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     _reset_full_cuda_graph_state()
     MTPLossLoggingHelper.tracker = {}
+    DSAIndexerLossLoggingHelper.tracker = {}
     Utils.destroy_model_parallel()
     gc.collect()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="StaticBufferLoader stages inputs on the GPU"
+)
+def test_static_buffer_loader_isolates_cached_batch_structure():
+    loader = StaticBufferLoader()
+    first_inputs = {
+        'tokens': torch.ones(2, 4),
+        'labels': torch.ones(2, 4),
+        'loss_mask': torch.ones(2, 4),
+    }
+
+    first_batch = loader(first_inputs, 'training', 0)
+    cached_batch = StaticBufferLoader.static_buffers['training'][0]
+
+    assert first_batch is not cached_batch
+    assert first_batch['labels'] is cached_batch['labels']
+    assert first_batch['loss_mask'] is cached_batch['loss_mask']
+
+    # Pipeline stages replace unused fields in place. This must not replace the
+    # corresponding tensors in the loader's static buffer.
+    first_batch['labels'] = None
+    first_batch['loss_mask'] = None
+
+    second_inputs = {
+        'tokens': torch.full((2, 4), 2.0),
+        'labels': torch.full((2, 4), 3.0),
+        'loss_mask': torch.full((2, 4), 4.0),
+    }
+    second_batch = loader(second_inputs, 'training', 0)
+
+    assert second_batch is not cached_batch
+    assert second_batch['labels'] is cached_batch['labels']
+    assert second_batch['loss_mask'] is cached_batch['loss_mask']
+    torch.testing.assert_close(second_batch['tokens'], second_inputs['tokens'].cuda())
+    torch.testing.assert_close(second_batch['labels'], second_inputs['labels'].cuda())
+    torch.testing.assert_close(second_batch['loss_mask'], second_inputs['loss_mask'].cuda())
+
+
+def test_ddp_grad_accumulators_share_full_cuda_graph_stream():
+    """Retained DDP AccumulateGrad nodes must use the full-iteration capture stream."""
+
+    class RetainingDataParallel(torch.nn.Module):
+        """Minimal DDP wrapper that retains parameter AccumulateGrad nodes."""
+
+        def __init__(self, *, module, **_):
+            super().__init__()
+            self.module = module
+            self.grad_accumulators = []
+            for param in module.parameters():
+                expanded_param = param.expand_as(param)
+                grad_accumulator = expanded_param.grad_fn.next_functions[0][0]
+                grad_accumulator.register_hook(lambda *_: None)
+                self.grad_accumulators.append(grad_accumulator)
+
+        def forward(self, inputs):
+            """Run the wrapped module."""
+            return self.module(inputs)
+
+    assert torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch is not None
+    model = torch.nn.Linear(4, 4, device="cuda")
+    model.config = Mock(cuda_graph_impl="full_iteration")
+    ddp_config = Mock(
+        num_buckets=None,
+        bucket_size=1024,
+        overlap_grad_reduce=True,
+        use_distributed_optimizer=False,
+    )
+    process_groups = Mock()
+    with patch(
+        "megatron.training.models.dist_utils.DistributedDataParallel", RetainingDataParallel
+    ):
+        wrapped_model = _ddp_wrap(
+            [model],
+            data_parallel_random_init=False,
+            ddp_config=ddp_config,
+            overlap_param_gather_with_optimizer_step=False,
+            pg_collection=process_groups,
+        )[0]
+
+    capture_stream = get_shared_capture_stream()
+    current_stream = torch.cuda.current_stream()
+    capture_stream.wait_stream(current_stream)
+    static_input = torch.ones(2, 4, device="cuda")
+
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        with torch.cuda.stream(capture_stream):
+            wrapped_model(static_input).sum().backward()
+            wrapped_model.zero_grad(set_to_none=False)
+
+            cuda_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(cuda_graph, stream=capture_stream):
+                wrapped_model(static_input).sum().backward()
+
+    cuda_graph.replay()
+    torch.cuda.synchronize()
+
+    stream_mismatch_warnings = [
+        warning
+        for warning in caught_warnings
+        if "AccumulateGrad node's stream does not match" in str(warning.message)
+    ]
+    assert not stream_mismatch_warnings
+    assert all(param.grad is not None for param in wrapped_model.parameters())
+
+
+@pytest.mark.skipif(
+    not is_torch_min_version("2.14.0a0"),
+    reason="Generator capture state is created lazily only on PyTorch >= 2.14",
+)
+def test_prime_cuda_rng_states_for_graph_capture():
+    """The first RNG use in a capture must not poll an event on a newly captured stream."""
+    side_stream = torch.cuda.Stream()
+    pending = torch.empty(1024, device="cuda")
+    # Recorded before capture, so the allocator still holds this use when the block is freed.
+    pending.record_stream(side_stream)
+
+    cuda_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(
+        cuda_graph, stream=torch.cuda.Stream(), capture_error_mode="thread_local"
+    ):
+        prime_cuda_rng_states_for_graph_capture()
+        # side_stream is not captured yet, so the allocator defers this free.
+        del pending
+        # side_stream joins the capture, as an NCCL stream does on a pipeline recv.
+        side_stream.wait_stream(torch.cuda.current_stream())
+        # Unprimed, this RNG use creates its capture state on the default stream; that allocation
+        # records and queries an event on side_stream and fails with cudaErrorCapturedEvent.
+        sample = torch.rand(8, device="cuda")
+        torch.cuda.current_stream().wait_stream(side_stream)
+
+    cuda_graph.replay()
+    torch.cuda.synchronize()
+    assert bool(((sample >= 0) & (sample < 1)).all())
 
 
 @pytest.mark.skipif(
@@ -57,8 +203,8 @@ def reset_full_cuda_graph_state():
 def test_forward_backward_func_with_full_cuda_graph(mocker):
     from megatron.core.pipeline_parallel import get_forward_backward_func
 
-    initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
     Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
+    model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
 
     def forward_step_func(data_iterator, model):
         import os
@@ -122,6 +268,61 @@ def test_forward_backward_func_with_full_cuda_graph(mocker):
         print(losses_reduced)
         assert i['loss_reduced'] == j['loss_reduced']
     Utils.destroy_model_parallel()
+
+
+def test_full_cuda_graph_capture_counts_dsa_metric_once():
+    """Capture records the DSA write; replay preserves prior state and executes it once."""
+    initialize_rng_tracker(force_reset=True)
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+
+    values = torch.full((1,), 7.0, device="cuda")
+    DSAIndexerLossLoggingHelper.tracker = {
+        "values": values,
+        "agreed_size": 1,
+        "reduce_group": None,
+        "avg_group": None,
+    }
+    reduce_group = object()
+    avg_group = object()
+
+    def forward_backward_func(**kwargs):
+        del kwargs
+        DSAIndexerLossLoggingHelper.tracker["reduce_group"] = reduce_group
+        DSAIndexerLossLoggingHelper.tracker["avg_group"] = avg_group
+        DSAIndexerLossLoggingHelper.tracker["values"].add_(1.0)
+        return [DSAIndexerLossLoggingHelper.tracker["values"]]
+
+    model = torch.nn.Linear(1, 1).cuda()
+    model.logs_dsa_indexer_loss = True
+    model.layer_number = 1
+    wrapped = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=0)
+    result = wrapped(
+        data_iterator=[iter([{"tokens": torch.ones(1)}])],
+        model=[model],
+        num_microbatches=1,
+        seq_length=1,
+        forward_only=True,
+    )
+
+    assert DSAIndexerLossLoggingHelper.tracker["values"] is values
+    torch.testing.assert_close(values, torch.full_like(values, 8.0))
+    torch.testing.assert_close(result[0], torch.full_like(result[0], 8.0))
+    assert DSAIndexerLossLoggingHelper.tracker["reduce_group"] is reduce_group
+    assert DSAIndexerLossLoggingHelper.tracker["avg_group"] is avg_group
+
+
+def test_full_cuda_graph_capture_requires_initialized_dsa_tracker():
+    """A custom full-iteration caller cannot lazily allocate storage during capture."""
+    model = torch.nn.Module()
+    model.logs_dsa_indexer_loss = True
+    model.layer_number = 1
+    wrapped = FullCudaGraphWrapper(lambda **_kwargs: pytest.fail("capture started"), 0)
+    wrapped.data_read = lambda *_args: []
+
+    with pytest.raises(RuntimeError, match="initialized before CUDA Graph capture"):
+        wrapped(
+            data_iterator=[], model=[model], num_microbatches=1, seq_length=1, forward_only=True
+        )
 
 
 @pytest.mark.skipif(

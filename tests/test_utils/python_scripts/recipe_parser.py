@@ -97,18 +97,14 @@ def resolve_cluster_config(cluster: str) -> str:
         return "eos"
     if cluster == "dgxgb200_oci-hsg":
         return "oci-hsg"
-    if cluster == "dgxa100_dracooci":
-        return "draco-oci-iad"
-    if cluster == "dgxa100_dracooci-ord":
-        return "draco-oci-ord"
+    if cluster == "dgxgb300_oci-jhb":
+        return "oci-jhb"
     if cluster == "dgxh100_coreweave":
         return "coreweave"
     if cluster == "cpu_eos":
         return "eos-cpu"
     if cluster == "cpu_coreweave":
         return "coreweave-cpu"
-    if cluster == "cpu_dracooci":
-        return "draco-oci-iad-cpu"
     if cluster == "cpu_oci-hsg":
         return "oci-hsg-cpu"
     if cluster == "ghci":
@@ -387,6 +383,9 @@ def load_workloads(
     workloads: List[dotdict] = []
     build_workloads: List = []
     for file in list(recipes_dir.glob("**/*.yaml")) + list(local_dir.glob("**/*.yaml")):
+        # Keep existing platformless lookups unambiguous for duplicated GB300 cases.
+        if platform is None and file.parent == recipes_dir / "gb300":
+            continue
         workloads += load_and_flatten(config_path=str(file))
         if file.stem.startswith("_build"):
             build_workloads.append(load_config(config_path=str(file)))
@@ -429,7 +428,8 @@ def load_workloads(
                 workloads.append(build_workload)
 
         workload.spec["n_repeat"] = n_repeat
-        workload.spec["time_limit"] = time_limit
+        # Explicit per-workload overrides take precedence over the shared CI limit.
+        workload.spec["time_limit"] = workload.spec.pop("time_limit_override", time_limit)
         workload.spec["artifacts"] = {
             key: value.replace(r"{platforms}", workload.spec["platforms"])
             for key, value in (

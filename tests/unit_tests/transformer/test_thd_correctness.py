@@ -20,6 +20,7 @@ Check Levels
 - similarity:  All parallelism configs, real TE attention, similarity checks
 """
 
+import gc
 import os
 from dataclasses import dataclass
 from typing import List
@@ -60,6 +61,16 @@ except ImportError:
 # =============================================================================
 
 SIMILARITY_THRESHOLD = 0.999
+
+
+@pytest.fixture(autouse=True)
+def nonblocking_cp_communicators(monkeypatch):
+    """Allow every CP peer communicator to finalize before waiting for its peers."""
+    # These eager CP comparisons create multiple peer communicators per group;
+    # blocking finalization can visit them in different orders and hang at exit.
+    # Scope this to these tests: globally enabling nonblocking NCCL also affects
+    # CUDA Graph capture and stalls the partial-attention graph regression.
+    monkeypatch.setenv("TORCH_NCCL_USE_COMM_NONBLOCKING", "1")
 
 
 # =============================================================================
@@ -594,6 +605,11 @@ def assert_close(name, a, b, bitwise):
 @pytest.mark.parametrize("tc", TEST_CASES, ids=lambda tc: tc.name)
 def test_thd_format(tc: TestCase):
     """Compare THD vs SBHD format outputs and gradients."""
+    # Keep this large parametrized test independent of allocator state left by
+    # earlier CUDA-graph tests in the shared transformer unit-test process.
+    gc.collect()
+    torch.cuda.empty_cache()
+
     H, seqlens = tc.hidden_size, tc.seqlens
     tp_size, cp_size, sp = tc.tp_size, tc.cp_size, tc.sp_enabled
     B = len(seqlens)

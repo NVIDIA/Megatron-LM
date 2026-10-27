@@ -1,16 +1,27 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for experimental Megatron-FSDP runtime contexts."""
+"""Unit tests for experimental Megatron-FSDP runtime contexts.
 
+Test prefetch-order construction here; test communication/computation overlap
+in ``test_overlap.py``.
+"""
+
+from unittest.mock import Mock
+from weakref import ref
+
+import pytest
 import torch
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-    Flat,
     Placements,
     fully_shard,
+    fully_shard_context,
+    microbatch,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpContext
 
 
 class NestedModel(nn.Module):
@@ -27,7 +38,7 @@ class NestedModel(nn.Module):
 
 
 class MultiChildModel(nn.Module):
-    """Model with direct parameters and multiple child FSDP units."""
+    """Model with direct parameters and multiple child FsdpModules."""
 
     def __init__(self, dim: int, num_children: int) -> None:
         super().__init__()
@@ -42,19 +53,62 @@ class MultiChildModel(nn.Module):
         return x
 
 
-def _flat_placements() -> Placements:
-    return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
+class BranchModel(nn.Module):
+    """Nested branch with its own child FsdpModule."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.bias = nn.Parameter(torch.ones(dim))
+        self.inner = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the nested branch."""
+        return torch.relu(self.inner(x) + self.bias)
+
+
+class NestedSiblingModel(nn.Module):
+    """Model with a nested left subtree and a right sibling."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.bias = nn.Parameter(torch.ones(dim))
+        self.left = BranchModel(dim)
+        self.right = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the nested subtree before the right sibling."""
+        return self.right(self.left(x) + self.bias)
+
+
+def _default_placements() -> Placements:
+    return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
+
+
+def test_context_defaults_to_current_cuda_device(distributed_setup):
+    """Omitting the device should create the stream on the current CUDA device."""
+    assert FsdpContext().allgather_stream.device == torch.device(
+        "cuda", torch.cuda.current_device()
+    )
+
+
+def test_context_rejects_non_cuda_device(distributed_setup):
+    """The context constructor should reject non-CUDA devices."""
+    with pytest.raises(ValueError, match="CUDA device"):
+        FsdpContext(device=torch.device("cpu"))
 
 
 def test_child_then_parent_share_one_context(distributed_setup):
-    """A parent FSDP unit should lazily create one context for its subtree."""
+    """Modules constructed together should eagerly share one context."""
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = NestedModel().to(device)
+    model = NestedModel()
 
-    fully_shard(model.inner, mesh=mesh, placements=_flat_placements())
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device) as context:
+        fully_shard(model.inner, mesh=mesh, placements=_default_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+        assert model.context is context
+        assert model.inner.context is context
 
     with torch.no_grad():
         model(torch.ones(2, 4, device=device))
@@ -64,16 +118,37 @@ def test_child_then_parent_share_one_context(distributed_setup):
     assert not model.inner.is_root()
 
 
-def test_two_child_subtrees_then_parent_collapse_to_one_context(distributed_setup):
-    """Sharding a parent should lazily assign one context across child subtrees."""
+def test_context_does_not_keep_modules_alive(distributed_setup):
+    """Keeping a finalized context alive must not retain its roots or descendants."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = NestedModel().to(device)
+
+    with fully_shard_context(device=device) as context:
+        fully_shard(model.inner, mesh=mesh, placements=_default_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+
+    model_ref = ref(model)
+    child_ref = ref(model.inner)
+    del model
+
+    assert model_ref() is None
+    assert child_ref() is None
+    assert list(context.forward_order) == []
+    assert list(context.backward_order) == []
+
+
+def test_two_child_subtrees_then_parent_share_one_context(distributed_setup):
+    """One construction scope should assign one context across child subtrees."""
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=2).to(device)
 
-    fully_shard(model.layers[0], mesh=mesh, placements=_flat_placements())
-    fully_shard(model.layers[1], mesh=mesh, placements=_flat_placements())
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
+        fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
 
     with torch.no_grad():
         model(torch.ones(2, 4, device=device))
@@ -82,19 +157,177 @@ def test_two_child_subtrees_then_parent_collapse_to_one_context(distributed_setu
     assert model.layers[1].context is model.context
 
 
-def test_sibling_roots_without_parent_keep_separate_contexts(distributed_setup):
-    """Independent FSDP roots should not share runtime scheduling state."""
+def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
+    """Independent roots should share streams and follow construction order."""
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=2).to(device)
 
-    fully_shard(model.layers[0], mesh=mesh, placements=_flat_placements())
-    fully_shard(model.layers[1], mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
+        fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
 
     with torch.no_grad():
         model(torch.ones(2, 4, device=device))
 
-    assert model.layers[0].context is not model.layers[1].context
+    context = model.layers[0].context
+    assert model.layers[1].context is context
     assert model.layers[0].is_root()
     assert model.layers[1].is_root()
+    assert list(context.forward_order) == [model.layers[0], model.layers[1]]
+    assert list(context.backward_order) == [model.layers[1], model.layers[0]]
+
+
+def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(distributed_setup, monkeypatch):
+    """Sibling roots should share one final wait across accumulated microbatches."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=2).to(device)
+
+    with fully_shard_context(device=device) as context:
+        fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
+        fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
+
+    finish_grad_sync = Mock(wraps=context.finish_grad_sync)
+    monkeypatch.setattr(context, "finish_grad_sync", finish_grad_sync)
+
+    with microbatch(context, is_last=False):
+        model(torch.ones(2, 4, device=device)).sum().backward()
+    finish_grad_sync.assert_not_called()
+
+    model(torch.ones(2, 4, device=device)).sum().backward()
+
+    finish_grad_sync.assert_called_once_with()
+
+
+def test_nested_prefetch_orders_use_dfs(distributed_setup):
+    """Nested FsdpModules should use DFS orders for one-step prefetch."""
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = NestedSiblingModel(dim=4).to(device)
+
+    with fully_shard_context(device=device):
+        fully_shard(model.left.inner, mesh=mesh, placements=_default_placements())
+        fully_shard(model.left, mesh=mesh, placements=_default_placements())
+        fully_shard(model.right, mesh=mesh, placements=_default_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+
+    with torch.no_grad():
+        model(torch.ones(2, 4, device=device))
+
+    context = model.context
+    assert list(context.forward_order) == [model, model.left, model.left.inner, model.right]
+    assert list(context.backward_order) == [model, model.right, model.left, model.left.inner]
+
+
+def test_register_post_backward_hook_handles_parameterless_module(distributed_setup):
+    """A parameterless FSDP unit should invoke the external scheduler callback."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Identity().to(device)
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_default_placements(), register_hooks=False)
+
+    callback_modules = []
+    model.register_post_backward_hook(callback_modules.append)
+    model(torch.ones(2, 4, device=device, requires_grad=True)).sum().backward()
+
+    assert callback_modules == [model]
+
+
+def test_nested_and_sibling_roots_use_cross_root_orders(distributed_setup):
+    """Context orders should concatenate nested roots at construction boundaries."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = NestedSiblingModel(dim=4).to(device)
+
+    with fully_shard_context(device=device):
+        fully_shard(model.left.inner, mesh=mesh, placements=_default_placements())
+        fully_shard(model.left, mesh=mesh, placements=_default_placements())
+        fully_shard(model.right, mesh=mesh, placements=_default_placements())
+
+    context = model.left.context
+    assert model.left.is_root()
+    assert model.right.is_root()
+    assert not model.left.inner.is_root()
+    assert list(context.forward_order) == [model.left, model.left.inner, model.right]
+    assert list(context.backward_order) == [model.right, model.left, model.left.inner]
+
+
+def test_fully_shard_requires_context(distributed_setup):
+    """fully_shard should reject construction without an active context."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Linear(4, 4, bias=False).to(device)
+
+    with pytest.raises(RuntimeError, match="inside fully_shard_context"):
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+
+
+def test_forward_requires_finalized_context(distributed_setup):
+    """Forward should be unavailable until construction scope exit."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Linear(4, 4, bias=False).to(device)
+    x = torch.ones(2, 4, device=device)
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+        with pytest.raises(RuntimeError, match="Exit fully_shard_context"):
+            model(x)
+
+    model(x)
+
+
+def test_fully_shard_context_rejects_nesting(distributed_setup):
+    """A construction scope should reject an ambiguous nested context."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(2)]).to(device)
+
+    with fully_shard_context(device=device):
+        fully_shard(model[0], mesh=mesh, placements=_default_placements())
+        outer_context = model[0].context
+        with pytest.raises(RuntimeError, match="does not support nesting"):
+            with fully_shard_context(device=device):
+                pass
+        fully_shard(model[1], mesh=mesh, placements=_default_placements())
+
+    assert model[0].context is outer_context
+    assert model[1].context is outer_context
+
+
+def test_fully_shard_rejects_child_from_another_context(distributed_setup):
+    """A parent cannot join a context different from an FSDP child context."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = NestedModel()
+
+    with fully_shard_context(device=device) as first_context:
+        fully_shard(model.inner, mesh=mesh, placements=_default_placements())
+
+    with fully_shard_context(device=device):
+        with pytest.raises(ValueError, match="another fully_shard_context"):
+            fully_shard(model, mesh=mesh, placements=_default_placements())
+
+    assert model.inner.context is first_context
+
+
+def test_microbatch_scopes_context(distributed_setup):
+    """microbatch() should scope state on the supplied FSDP context."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = nn.Sequential(nn.Linear(1, 1, bias=False), nn.Linear(1, 1, bias=False)).to(device)
+    with fully_shard_context(device=device) as context:
+        for layer in model:
+            fully_shard(layer, mesh=mesh, placements=_default_placements())
+
+    with microbatch(context, is_last=False):
+        assert not context.is_last_microbatch
+
+    assert context.is_last_microbatch

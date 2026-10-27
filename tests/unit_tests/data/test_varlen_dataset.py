@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Unit tests for :mod:`megatron.training.datasets.varlen_dataset`.
 
@@ -12,6 +12,7 @@ ValueError on unsupported shapes).
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -20,12 +21,19 @@ import torch
 # Import via the public module path so this test gets discovered through the
 # regular pytest entry point. The functions under test are pure Python and do
 # not require torch.distributed.
-from megatron.training.datasets.sft_dataset import IGNORE_INDEX
+from megatron.training.datasets.sft_dataset import (
+    IGNORE_INDEX,
+    MockSFTDataset,
+    MockSFTLowLevelDataset,
+)
 from megatron.training.datasets.varlen_dataset import (
+    ChatTemplateSample,
     MockVarlenDataset,
     VarlenDataset,
     VarlenLowLevelDataset,
     _alpaca_to_messages,
+    _ensure_list_field,
+    _is_eval_split,
     _looks_like_hf_id,
     _messages_passthrough,
     _raw_text_loader,
@@ -148,14 +156,16 @@ def test_sharegpt_role_map(speaker, expected_role):
 
 
 def test_messages_passthrough_prepends_system_when_missing():
-    out = _messages_passthrough(
+    sample = _messages_passthrough(
         {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]}
     )
+    out = sample.messages
     assert [m["role"] for m in out] == ["system", "user", "assistant"]
+    assert sample.chat_template_kwargs == {}
 
 
 def test_messages_passthrough_keeps_existing_system():
-    out = _messages_passthrough(
+    sample = _messages_passthrough(
         {
             "messages": [
                 {"role": "system", "content": "be terse"},
@@ -164,23 +174,261 @@ def test_messages_passthrough_keeps_existing_system():
             ]
         }
     )
+    out = sample.messages
     assert [m["role"] for m in out] == ["system", "user", "assistant"]
     assert out[0]["content"] == "be terse"
 
 
-def test_messages_passthrough_strips_extra_keys():
-    """OpenAI-style messages may carry ``name`` / ``tool_calls`` etc.;
-    chat-template input only wants ``role`` and ``content``."""
-    out = _messages_passthrough(
+def test_messages_passthrough_preserves_math_v3_template_fields():
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "stateful_python_code_exec", "parameters": {"type": "object"}},
+        }
+    ]
+    sample = _messages_passthrough(
+        {
+            "tools": tools,
+            "messages": [
+                {"role": "user", "content": "solve"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "I should calculate this.",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "stateful_python_code_exec",
+                                "arguments": '{"code":"1 + 1"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "name": "stateful_python_code_exec",
+                    "tool_call_id": "call-1",
+                    "content": "2",
+                },
+            ],
+        }
+    )
+    assert sample.chat_template_kwargs == {"tools": tools}
+    assert sample.messages[2]["content"] == ""
+    assert sample.messages[2]["reasoning_content"] == "I should calculate this."
+    assert sample.messages[2]["tool_calls"][0]["function"]["name"] == "stateful_python_code_exec"
+    assert sample.messages[3]["name"] == "stateful_python_code_exec"
+    assert sample.messages[3]["tool_call_id"] == "call-1"
+
+
+def test_messages_passthrough_rejects_non_list_tools():
+    with pytest.raises(ValueError, match="field 'tools' must be a list"):
+        _messages_passthrough(
+            {"messages": [{"role": "user", "content": "hi"}], "tools": {"name": "bad"}}
+        )
+
+
+def test_messages_passthrough_decodes_json_encoded_parquet_columns():
+    messages = [
+        {"role": "user", "content": "solve"},
+        {"role": "assistant", "content": "2", "reasoning_content": "1 + 1"},
+    ]
+    tools = [{"type": "function", "function": {"name": "python"}}]
+    sample = _messages_passthrough({"messages": json.dumps(messages), "tools": json.dumps(tools)})
+    assert sample.messages == [{"role": "system", "content": ""}, *messages]
+    assert sample.chat_template_kwargs == {"tools": tools}
+
+
+def test_messages_passthrough_decodes_swe_v3_tool_calls():
+    tool_calls = [
+        {
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "execute_bash", "arguments": '{"command":"ls"}'},
+        }
+    ]
+    sample = _messages_passthrough(
         {
             "messages": [
-                {"role": "user", "content": "hi", "name": "alice"},
-                {"role": "assistant", "content": "hi alice", "tool_calls": [{"function": "foo"}]},
+                {"role": "user", "content": "inspect"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "I should inspect the repository.",
+                    "tool_calls": json.dumps(tool_calls),
+                },
             ]
         }
     )
-    for m in out:
-        assert set(m.keys()) == {"role", "content"}
+    assert sample.messages[2]["tool_calls"] == tool_calls
+
+
+def test_messages_passthrough_normalizes_opencode_tools_and_results():
+    sample = _messages_passthrough(
+        {
+            "tools": [
+                {
+                    "id": "shell",
+                    "description": "Run a command",
+                    "inputSchema": {
+                        "jsonSchema": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                        }
+                    },
+                }
+            ],
+            "messages": [
+                {"role": "user", "content": "list files"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "shell", "arguments": '{"command":"ls"}'},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "content": [
+                        {
+                            "type": "tool-result",
+                            "toolCallId": "call-1",
+                            "toolName": "shell",
+                            "output": {"type": "text", "value": "a.txt"},
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+    assert sample.chat_template_kwargs["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "Run a command",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+            },
+        }
+    ]
+    assert sample.messages[3]["content"] == "a.txt"
+    assert sample.messages[3]["tool_call_id"] == "call-1"
+    assert sample.messages[3]["name"] == "shell"
+
+
+def test_messages_passthrough_normalizes_legacy_roles_and_function_call():
+    sample = _messages_passthrough(
+        {
+            "messages": [
+                {"role": "developer", "content": "Use tools."},
+                {"role": "user", "content": "calculate"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "function_call": {"name": "python", "arguments": '{"code":"1+1"}'},
+                },
+            ]
+        }
+    )
+    assert [message["role"] for message in sample.messages] == ["system", "user", "assistant"]
+    assert sample.messages[2]["tool_calls"] == [
+        {"type": "function", "function": {"name": "python", "arguments": '{"code":"1+1"}'}}
+    ]
+
+
+@pytest.mark.parametrize("result_role", ["function", "ipython"])
+def test_messages_passthrough_maps_legacy_tool_results_to_tool(result_role):
+    sample = _messages_passthrough(
+        {
+            "messages": [
+                {"role": "user", "content": "calculate"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "function_call": {"name": "python", "arguments": '{"code":"1+1"}'},
+                },
+                {"role": result_role, "name": "python", "content": "2"},
+                {"role": "assistant", "content": "2"},
+            ]
+        }
+    )
+    assert [message["role"] for message in sample.messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert sample.messages[3]["name"] == "python"
+
+
+def test_messages_passthrough_drops_arrow_none_placeholders():
+    # Arrow pads every message with the fields any message has, set to None.
+    padding = {"tool_calls": None, "name": None, "tool_call_id": None}
+    tool_call = {"type": "function", "function": {"name": "f", "arguments": "{}"}}
+    result = {"type": "tool-result", "toolCallId": "call-1", "toolName": "f", "output": "ok"}
+    sample = _messages_passthrough(
+        {
+            "messages": [
+                {"role": "user", "content": "q", **padding},
+                {**padding, "role": "assistant", "content": None, "tool_calls": [tool_call]},
+                {"role": "tool", "content": [result], **padding},
+            ],
+            "chat_template_kwargs": {"thinking": True, "unused": None},
+        }
+    )
+    assert set(sample.messages[1]) == {"role", "content"}
+    assert sample.messages[2] == {"role": "assistant", "content": "", "tool_calls": [tool_call]}
+    # Tool-result metadata now fills the keys Arrow had set to None.
+    assert sample.messages[3]["tool_call_id"] == "call-1"
+    assert sample.messages[3]["name"] == "f"
+    assert sample.chat_template_kwargs == {"thinking": True}
+
+
+def test_low_level_jsonl_messages_keep_only_present_fields(tmp_path):
+    pytest.importorskip("datasets")
+    pytest.importorskip("pandas")
+    tool_call = {"type": "function", "function": {"name": "f", "arguments": "{}"}}
+    path = _write_jsonl(
+        tmp_path,
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "q"},
+                    {"role": "assistant", "content": "", "tool_calls": [tool_call]},
+                ]
+            }
+        ],
+    )
+    sample = VarlenLowLevelDataset(path)[0]
+    assert set(sample.messages[1]) == {"role", "content"}
+    assert sample.messages[2]["tool_calls"][0]["function"]["name"] == "f"
+
+
+def test_messages_passthrough_rejects_unknown_role():
+    with pytest.raises(ValueError, match="unsupported messages"):
+        _messages_passthrough({"messages": [{"role": "narrator", "content": "x"}]})
+
+
+def test_messages_passthrough_preserves_agentic_chat_template_kwargs():
+    sample = _messages_passthrough(
+        {
+            "messages": [{"role": "user", "content": "search"}],
+            "chat_template_kwargs": json.dumps({"thinking": True}),
+        }
+    )
+    assert sample.chat_template_kwargs == {"thinking": True}
+
+
+def test_ensure_list_field_rejects_invalid_json():
+    with pytest.raises(ValueError, match="contains invalid JSON"):
+        _ensure_list_field("[broken", "messages")
 
 
 # ----------------------------------------------------------------------------
@@ -188,8 +436,8 @@ def test_messages_passthrough_strips_extra_keys():
 # ----------------------------------------------------------------------------
 
 
-def test_messages_rejects_list_content():
-    with pytest.raises(ValueError, match="must be a string"):
+def test_messages_rejects_multimodal_list_content():
+    with pytest.raises(ValueError, match="unsupported.*type 'image'"):
         _messages_passthrough(
             {"messages": [{"role": "user", "content": [{"type": "image", "url": "x.png"}]}]}
         )
@@ -210,9 +458,10 @@ def test_sharegpt_rejects_list_value():
 # ----------------------------------------------------------------------------
 
 
-def test_raw_text_loader_returns_string():
-    """``text``-column samples are returned as plain strings (not messages)."""
-    out = _raw_text_loader({"text": "Once upon a time...", "id": "doc-1"})
+@pytest.mark.parametrize("field", ["text", "raw_content", "content"])
+def test_raw_text_loader_returns_string(field):
+    """Recognized pretraining columns are returned as plain strings (not messages)."""
+    out = _raw_text_loader({field: "Once upon a time...", "id": "doc-1"})
     assert isinstance(out, str)
     assert out == "Once upon a time..."
 
@@ -222,9 +471,15 @@ def test_raw_text_loader_handles_empty():
     assert _raw_text_loader({}) == ""
 
 
-def test_raw_text_rejects_non_string():
-    with pytest.raises(ValueError, match="must be a string"):
-        _raw_text_loader({"text": [1, 2, 3]})
+def test_raw_text_loader_uses_first_non_empty_alias():
+    sample = {"text": "", "raw_content": "RP2 body", "content": "CodeForge body"}
+    assert _raw_text_loader(sample) == "RP2 body"
+
+
+@pytest.mark.parametrize("field", ["text", "raw_content", "content"])
+def test_raw_text_rejects_non_string(field):
+    with pytest.raises(ValueError, match=rf"field '{field}' must be a string"):
+        _raw_text_loader({field: [1, 2, 3]})
 
 
 # ----------------------------------------------------------------------------
@@ -290,15 +545,30 @@ def test_select_converter_pretrain_text_with_metadata():
     assert name == "pretrain-text"
 
 
-def test_select_converter_alpaca_beats_pretrain_text():
-    """When both ``instruction``/``output`` and ``text`` are present (rare),
-    the alpaca schema is more specific and should win."""
-    fn, name = _select_converter(["text", "instruction", "output"])
+@pytest.mark.parametrize(
+    "columns",
+    [
+        ["raw_content", "doc_id", "meta", "quality_signals"],
+        ["content", "commit_id", "rel_path", "language"],
+    ],
+)
+def test_select_converter_pretrain_text_dataset_aliases(columns):
+    """RP2 and CodeForge expose non-canonical names for their document bodies."""
+    fn, name = _select_converter(columns)
+    assert name == "pretrain-text"
+    assert fn is _raw_text_loader
+
+
+@pytest.mark.parametrize("raw_text_field", ["text", "raw_content", "content"])
+def test_select_converter_alpaca_beats_pretrain_text(raw_text_field):
+    """Alpaca fields are more specific than any raw pretraining-text alias."""
+    fn, name = _select_converter([raw_text_field, "instruction", "output"])
     assert name == "alpaca"
 
 
-def test_select_converter_messages_beats_pretrain_text():
-    fn, name = _select_converter(["text", "messages"])
+@pytest.mark.parametrize("raw_text_field", ["text", "raw_content", "content"])
+def test_select_converter_messages_beats_pretrain_text(raw_text_field):
+    fn, name = _select_converter([raw_text_field, "messages"])
     assert name == "openai-messages"
 
 
@@ -317,7 +587,6 @@ def _write_jsonl(tmp_path: Path, rows):
 
 def test_low_level_loads_jsonl_alpaca(tmp_path):
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     path = _write_jsonl(
         tmp_path,
         [
@@ -336,7 +605,6 @@ def test_low_level_loads_jsonl_alpaca(tmp_path):
 
 def test_low_level_loads_jsonl_sharegpt(tmp_path):
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     path = _write_jsonl(
         tmp_path,
         [
@@ -355,7 +623,6 @@ def test_low_level_loads_jsonl_sharegpt(tmp_path):
 
 def test_low_level_loads_jsonl_messages(tmp_path):
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     path = _write_jsonl(
         tmp_path,
         [
@@ -370,14 +637,14 @@ def test_low_level_loads_jsonl_messages(tmp_path):
     ll = VarlenLowLevelDataset(path)
     assert ll.schema_name == "openai-messages"
     sample = ll[0]
-    assert [m["role"] for m in sample] == ["system", "user", "assistant"]
+    assert isinstance(sample, ChatTemplateSample)
+    assert [m["role"] for m in sample.messages] == ["system", "user", "assistant"]
 
 
 def test_low_level_jsonl_heterogeneous_columns(tmp_path):
     """Real datasets often mix rows that have / lack an optional field. Our
-    pandas-based loader must accept the union schema without ``CastError``."""
+    loader must accept the union schema without ``CastError``."""
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     rows = [{"instruction": "a", "output": "x"}] * 100 + [
         {"instruction": "b", "output": "y", "file": "extra"}
     ] * 100
@@ -391,7 +658,6 @@ def test_low_level_jsonl_heterogeneous_columns(tmp_path):
 
 def test_low_level_rejects_unknown_schema(tmp_path):
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     path = _write_jsonl(tmp_path, [{"foo": "bar"}])
     with pytest.raises(ValueError, match="cannot infer schema"):
         VarlenLowLevelDataset(path)
@@ -401,7 +667,6 @@ def test_low_level_loads_jsonl_pretrain_text(tmp_path):
     """Pretrain-text corpora (Dolma / OLMo midtraining) typically have
     ``text`` + extra fields like ``id`` / ``url`` / ``metadata``."""
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     path = _write_jsonl(
         tmp_path,
         [
@@ -415,6 +680,250 @@ def test_low_level_loads_jsonl_pretrain_text(tmp_path):
     # Each item is a raw string, NOT a messages list.
     assert ll[0] == "Doc one body..."
     assert ll[1] == "Doc two body..."
+
+
+@pytest.mark.parametrize(
+    "rows,expected",
+    [
+        (
+            [
+                {
+                    "raw_content": "RP2 document one",
+                    "doc_id": "rp2-1",
+                    "meta": "{}",
+                    "quality_signals": "{}",
+                },
+                {
+                    "raw_content": "RP2 document two",
+                    "doc_id": "rp2-2",
+                    "meta": "{}",
+                    "quality_signals": "{}",
+                },
+            ],
+            ["RP2 document one", "RP2 document two"],
+        ),
+        (
+            [
+                {
+                    "content": "CodeForge source one",
+                    "commit_id": "abc1234",
+                    "rel_path": "one.py",
+                    "language": "Python",
+                },
+                {
+                    "content": "CodeForge source two",
+                    "commit_id": "def5678",
+                    "rel_path": "two.cpp",
+                    "language": "C++",
+                },
+            ],
+            ["CodeForge source one", "CodeForge source two"],
+        ),
+    ],
+)
+def test_low_level_loads_jsonl_pretrain_text_dataset_aliases(tmp_path, rows, expected):
+    pytest.importorskip("datasets")
+    pytest.importorskip("pandas")
+    low_level = VarlenLowLevelDataset(_write_jsonl(tmp_path, rows))
+    assert low_level.schema_name == "pretrain-text"
+    assert [low_level[index] for index in range(len(low_level))] == expected
+
+
+class _FakeHubDataset:
+    def __init__(self, rows):
+        self.rows = rows
+        self.column_names = list(dict.fromkeys(key for row in rows for key in row))
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, index):
+        return self.rows[index]
+
+
+def test_low_level_hub_loads_all_configs_and_thematic_splits(monkeypatch):
+    datasets = pytest.importorskip("datasets")
+    calls = []
+
+    monkeypatch.setattr(datasets, "get_dataset_config_names", lambda path: ["cfg-a", "cfg-b"])
+    monkeypatch.setattr(datasets, "get_dataset_default_config_name", lambda path: None)
+    monkeypatch.setattr(
+        datasets,
+        "get_dataset_split_names",
+        lambda path, config: ["train", "validation"] if config == "cfg-a" else ["python", "cpp"],
+    )
+
+    def fake_load_dataset(path, name, split):
+        calls.append((path, name, split))
+        return _FakeHubDataset([{"messages": [{"role": "user", "content": f"{name}/{split}"}]}])
+
+    monkeypatch.setattr(datasets, "load_dataset", fake_load_dataset)
+    low_level = VarlenLowLevelDataset("nvidia/Nemotron-SFT-Test")
+
+    assert calls == [
+        ("nvidia/Nemotron-SFT-Test", "cfg-a", "train"),
+        ("nvidia/Nemotron-SFT-Test", "cfg-b", "python"),
+        ("nvidia/Nemotron-SFT-Test", "cfg-b", "cpp"),
+    ]
+    assert len(low_level) == 3
+    assert low_level[0].messages[1]["content"] == "cfg-a/train"
+    assert low_level[1].messages[1]["content"] == "cfg-b/python"
+    assert low_level[-1].messages[1]["content"] == "cfg-b/cpp"
+    with pytest.raises(IndexError):
+        low_level[3]
+
+
+def test_low_level_hub_loads_only_the_declared_default_config(monkeypatch):
+    datasets = pytest.importorskip("datasets")
+    calls = []
+
+    # fineweb-edu layout: ``default`` holds every row, the others are subsets of it.
+    monkeypatch.setattr(
+        datasets,
+        "get_dataset_config_names",
+        lambda path: ["default", "sample-10BT", "CC-MAIN-2024-10"],
+    )
+    monkeypatch.setattr(datasets, "get_dataset_default_config_name", lambda path: "default")
+    monkeypatch.setattr(datasets, "get_dataset_split_names", lambda path, config: ["train"])
+
+    def fake_load_dataset(path, name, split):
+        calls.append((path, name, split))
+        return _FakeHubDataset([{"text": f"{name}/{split}"}])
+
+    monkeypatch.setattr(datasets, "load_dataset", fake_load_dataset)
+    low_level = VarlenLowLevelDataset("HuggingFaceFW/fineweb-edu")
+
+    assert calls == [("HuggingFaceFW/fineweb-edu", "default", "train")]
+    assert len(low_level) == 1
+
+
+def test_low_level_hub_interleaves_components_with_seed(monkeypatch):
+    datasets = pytest.importorskip("datasets")
+    monkeypatch.setattr(datasets, "get_dataset_config_names", lambda path: ["cfg-a", "cfg-b"])
+    monkeypatch.setattr(datasets, "get_dataset_default_config_name", lambda path: None)
+    monkeypatch.setattr(datasets, "get_dataset_split_names", lambda path, config: ["train"])
+    monkeypatch.setattr(
+        datasets,
+        "load_dataset",
+        lambda path, name, split: _FakeHubDataset([{"text": f"{name}/{i}"} for i in range(50)]),
+    )
+    rows = [VarlenLowLevelDataset("owner/two-configs", shuffle_seed=1234)[i] for i in range(100)]
+
+    assert sorted(rows) == sorted(f"cfg-{c}/{i}" for c in "ab" for i in range(50))
+    # The last 10% (a --split validation range) mixes both components.
+    assert {row.split("/")[0] for row in rows[90:]} == {"cfg-a", "cfg-b"}
+    # Same seed, same order on every rank; VarlenDataset passes the config's random seed.
+    same_seed = VarlenDataset.build_low_level_dataset(
+        "owner/two-configs", SimpleNamespace(random_seed=1234)
+    )
+    assert [same_seed[i] for i in range(100)] == rows
+
+
+def test_low_level_single_component_keeps_row_order_with_seed(tmp_path):
+    pytest.importorskip("datasets")
+    pytest.importorskip("pandas")
+    path = _write_jsonl(tmp_path, [{"text": f"row {i}"} for i in range(5)])
+    low_level = VarlenLowLevelDataset(path, shuffle_seed=1234)
+    assert [low_level[i] for i in range(5)] == [f"row {i}" for i in range(5)]
+
+
+@pytest.mark.parametrize(
+    ("split", "is_eval"),
+    [
+        ("test", True),
+        ("test_sft", True),
+        ("validation", True),
+        ("val", True),
+        ("dev", True),
+        ("eval-2024", True),
+        ("train_sft", False),
+        ("python", False),
+        ("text_to_sql", False),
+        ("stem_de", False),
+        ("reasoning_on", False),
+    ],
+)
+def test_is_eval_split(split, is_eval):
+    assert _is_eval_split(split) is is_eval
+
+
+def _patch_single_config_hub(monkeypatch, datasets, splits, calls):
+    monkeypatch.setattr(datasets, "get_dataset_config_names", lambda path: ["default"])
+    monkeypatch.setattr(datasets, "get_dataset_default_config_name", lambda path: "default")
+    monkeypatch.setattr(datasets, "get_dataset_split_names", lambda path, config: splits)
+
+    def fake_load_dataset(path, name, split):
+        calls.append((path, name, split))
+        return _FakeHubDataset([{"messages": [{"role": "user", "content": split}]}])
+
+    monkeypatch.setattr(datasets, "load_dataset", fake_load_dataset)
+
+
+def test_low_level_hub_skips_evaluation_splits(monkeypatch):
+    datasets = pytest.importorskip("datasets")
+    calls = []
+    # ultrachat_200k layout: no ``train`` split, evaluation splits next to training ones.
+    _patch_single_config_hub(
+        monkeypatch, datasets, ["train_sft", "test_sft", "train_gen", "test_gen"], calls
+    )
+    low_level = VarlenLowLevelDataset("HuggingFaceH4/ultrachat_200k")
+
+    assert calls == [
+        ("HuggingFaceH4/ultrachat_200k", "default", "train_sft"),
+        ("HuggingFaceH4/ultrachat_200k", "default", "train_gen"),
+    ]
+    assert len(low_level) == 2
+
+
+def test_low_level_hub_rejects_repo_with_only_evaluation_splits(monkeypatch):
+    datasets = pytest.importorskip("datasets")
+    _patch_single_config_hub(monkeypatch, datasets, ["validation", "test"], [])
+    with pytest.raises(ValueError, match="no config/split was found"):
+        VarlenLowLevelDataset("owner/eval-only")
+
+
+def test_low_level_hub_falls_back_to_raw_json_payload(monkeypatch, tmp_path):
+    datasets = pytest.importorskip("datasets")
+    from datasets.exceptions import DatasetGenerationError
+
+    raw_path = _write_jsonl(
+        tmp_path,
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer"},
+                ]
+            },
+            {"messages": [{"role": "user", "content": "not selected"}]},
+        ],
+    )
+    monkeypatch.setattr(datasets, "get_dataset_config_names", lambda path: ["default"])
+    monkeypatch.setattr(datasets, "get_dataset_default_config_name", lambda path: "default")
+    monkeypatch.setattr(datasets, "get_dataset_split_names", lambda path, config: ["train"])
+    monkeypatch.setattr(
+        datasets,
+        "load_dataset_builder",
+        lambda path, name: SimpleNamespace(
+            config=SimpleNamespace(data_files={"train": [raw_path]})
+        ),
+    )
+
+    def fake_load_dataset(path, name, split):
+        raise DatasetGenerationError("incompatible nested JSON schema")
+
+    def fake_from_generator(generator, features, gen_kwargs):
+        assert list(features) == ["__varlen_json_payload__"]
+        assert isinstance(gen_kwargs["data_files"], list)
+        return _FakeHubDataset(list(generator(**gen_kwargs)))
+
+    monkeypatch.setattr(datasets, "load_dataset", fake_load_dataset)
+    monkeypatch.setattr(datasets.Dataset, "from_generator", staticmethod(fake_from_generator))
+
+    low_level = VarlenLowLevelDataset("nvidia/Nemotron-SFT-Math-v4")
+    assert len(low_level) == 2
+    assert low_level.schema_name == "json-payload"
+    assert low_level[0].messages[2]["content"] == "answer"
 
 
 # ----------------------------------------------------------------------------
@@ -436,9 +945,11 @@ class _FakeTokenizer:
     with ``IGNORE_INDEX`` in the targets.
     """
 
-    def __init__(self, eod: int = 0, pad=None):
+    def __init__(self, eod: int = 0, pad=None, vocab_size: int | None = 128):
         self._eod = eod
         self._pad = pad
+        self._vocab_size = vocab_size
+        self.last_chat_template_kwargs = None
 
     @property
     def eod(self):
@@ -448,10 +959,17 @@ class _FakeTokenizer:
     def pad(self):
         return self._pad
 
+    @property
+    def vocab_size(self):
+        return self._vocab_size
+
     def tokenize(self, text):
         return [ord(c) % 100 + 1 for c in text]  # always >= 1, never eod (0)
 
-    def tokenize_conversation(self, messages, return_target=True, add_generation_prompt=False):
+    def tokenize_conversation(
+        self, messages, return_target=True, add_generation_prompt=False, chat_template_kwargs=None
+    ):
+        self.last_chat_template_kwargs = chat_template_kwargs
         tokens, targets = [], []
         for m in messages:
             ids = self.tokenize(m["content"])
@@ -492,6 +1010,101 @@ def _make_mock_varlen(token_arrays, config):
     return ds
 
 
+@pytest.mark.parametrize(
+    ("dataset_cls", "mock_config_attr"),
+    [
+        (MockSFTDataset, "sft_mock_dataset_config_json"),
+        (MockVarlenDataset, "varlen_mock_dataset_config_json"),
+    ],
+)
+def test_generated_mock_tokens_stay_within_tokenizer_vocab(
+    monkeypatch, dataset_cls, mock_config_attr
+):
+    """Long generated mock sequences must wrap before exceeding the tokenizer vocabulary."""
+    monkeypatch.setattr(MockSFTLowLevelDataset, "size", 1)
+    tokenizer = _FakeTokenizer(eod=0, pad=None, vocab_size=8)
+    config = _make_config(tokenizer, seq_length=20)
+    setattr(
+        config,
+        mock_config_attr,
+        json.dumps(
+            {
+                "mode": "distribution",
+                "type": "lognormal",
+                "min_seq_len": 20,
+                "max_seq_len": 20,
+                "mean_seq_len": 20,
+                "lognormal_sigma": 1.1,
+            }
+        ),
+    )
+
+    low_level_dataset = dataset_cls.build_low_level_dataset("", config)
+    tokens = low_level_dataset[0]
+
+    assert tokens.size == 19
+    assert tokens.min() >= 1
+    assert tokens.max() < tokenizer.vocab_size
+    assert tokens[:9].tolist() == [1, 2, 3, 4, 5, 6, 7, 1, 2]
+
+
+@pytest.mark.parametrize(
+    ("dataset_cls", "mock_config_attr"),
+    [
+        (MockSFTDataset, "sft_mock_dataset_config_json"),
+        (MockVarlenDataset, "varlen_mock_dataset_config_json"),
+    ],
+)
+@pytest.mark.parametrize("tokenizer_vocab_size", [None, 32])
+def test_mock_config_vocab_size_takes_precedence(
+    monkeypatch, dataset_cls, mock_config_attr, tokenizer_vocab_size
+):
+    """An explicit JSON vocabulary works without, and overrides, the tokenizer value."""
+    monkeypatch.setattr(MockSFTLowLevelDataset, "size", 1)
+    tokenizer = _FakeTokenizer(eod=0, pad=None, vocab_size=tokenizer_vocab_size)
+    config = _make_config(tokenizer, seq_length=20)
+    setattr(
+        config,
+        mock_config_attr,
+        json.dumps(
+            {
+                "mode": "distribution",
+                "type": "lognormal",
+                "min_seq_len": 20,
+                "max_seq_len": 20,
+                "mean_seq_len": 20,
+                "lognormal_sigma": 1.1,
+                "vocab_size": 8,
+            }
+        ),
+    )
+
+    tokens = dataset_cls.build_low_level_dataset("", config)[0]
+
+    assert tokens.min() >= 1
+    assert tokens.max() < 8
+    assert tokens[:9].tolist() == [1, 2, 3, 4, 5, 6, 7, 1, 2]
+
+
+def test_generated_mock_data_requires_available_vocab_size():
+    """Missing tokenizer and JSON vocabulary values produce an actionable error."""
+    tokenizer = _FakeTokenizer(eod=0, pad=None, vocab_size=None)
+    config = _make_config(tokenizer, seq_length=20)
+    config.sft_mock_dataset_config_json = json.dumps(
+        {
+            "mode": "distribution",
+            "type": "lognormal",
+            "min_seq_len": 20,
+            "max_seq_len": 20,
+            "mean_seq_len": 20,
+            "lognormal_sigma": 1.1,
+        }
+    )
+
+    with pytest.raises(ValueError, match="set vocab_size in the mock dataset config JSON"):
+        MockSFTDataset.build_low_level_dataset("", config)
+
+
 def test_getitem_thd_pretrain_text_keys_and_shapes():
     tok = _FakeTokenizer(eod=0, pad=7)
     ds = _make_varlen(["hello world"], _make_config(tok, seq_length=64))
@@ -528,6 +1141,22 @@ def test_getitem_thd_sft_prompt_is_masked():
     assert loss_mask.sum() > 0  # assistant span still contributes
 
 
+def test_getitem_forwards_openai_chat_template_kwargs():
+    tok = _FakeTokenizer(eod=0, pad=7)
+    tools = [{"type": "function", "function": {"name": "python"}}]
+    item = ChatTemplateSample(
+        messages=[
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer", "reasoning_content": "reason"},
+        ],
+        chat_template_kwargs={"tools": tools},
+    )
+    ds = _make_varlen([item], _make_config(tok, seq_length=64))
+    out = ds[0]
+    assert tok.last_chat_template_kwargs == {"tools": tools}
+    assert out["tokens"].numel() > 0
+
+
 def test_getitem_thd_pad_masked_by_position_keeps_real_eod():
     """Regression: with pad falling back to eod, the real end-of-document EOD
     target must stay in the loss (masked by position, not by value)."""
@@ -562,6 +1191,55 @@ def test_getitem_thd_empty_text_does_not_crash():
     assert out["tokens"].numel() >= 1
     assert out["labels"].numel() == out["tokens"].numel()
     assert out["loss_mask"].numel() == out["tokens"].numel()
+
+
+class _ArrayTokenizer(_FakeTokenizer):
+    """Returns preset token / target ids for a conversation, keyed by its first message."""
+
+    def __init__(self, conversations, eod: int = 0, pad=None):
+        super().__init__(eod=eod, pad=pad)
+        self._conversations = conversations
+
+    def tokenize_conversation(
+        self, messages, return_target=True, add_generation_prompt=False, chat_template_kwargs=None
+    ):
+        tokens, targets = self._conversations[messages[0]["content"]]
+        return torch.tensor(tokens, dtype=torch.int64), torch.tensor(targets, dtype=torch.int64)
+
+
+@pytest.mark.parametrize(
+    ("tokens", "targets", "expected_tokens", "expected_labels", "expected_loss_mask"),
+    [
+        # The cut (sequence_length + 1 ids) ends on a non-EOD id: it becomes EOD
+        # in both tokens and targets.
+        ([5, 6, 7, 8, 9, 10], [-100, 6, 7, 8, 9, 10], [5, 6, 7, 8], [6, 7, 8, 0], [1, 1, 1, 1]),
+        # The cut ends on EOD: kept as is, including an ignored target there.
+        (
+            [5, 6, 7, 8, 0, 10],
+            [-100, 6, 7, 8, -100, 10],
+            [5, 6, 7, 8],
+            [6, 7, 8, -100],
+            [1, 1, 1, 0],
+        ),
+    ],
+)
+def test_getitem_thd_truncates_to_sequence_length(
+    tokens, targets, expected_tokens, expected_labels, expected_loss_mask
+):
+    tok = _ArrayTokenizer({"conversation": (tokens, targets)})
+    ds = _make_varlen(
+        [[{"role": "user", "content": "conversation"}]], _make_config(tok, seq_length=4)
+    )
+    out = ds[0]
+    assert out["tokens"].tolist() == expected_tokens
+    assert out["labels"].tolist() == expected_labels
+    assert out["loss_mask"].tolist() == expected_loss_mask
+    assert int(out["original_seq_len"].item()) == int(out["padded_seq_len"].item()) == 4
+    # Every output owns a contiguous storage; labels is not a view of the tokens buffer.
+    for value in out.values():
+        assert value.is_contiguous() and value.storage_offset() == 0
+        assert value.untyped_storage().nbytes() == value.numel() * value.element_size()
+    assert out["tokens"].untyped_storage().data_ptr() != out["labels"].untyped_storage().data_ptr()
 
 
 def test_getitem_sbhd_pads_to_seq_length_and_masks_tail():
@@ -601,6 +1279,7 @@ def test_sbhd_padding_mask_is_partitioned_with_tokens(monkeypatch):
 def test_sbhd_get_batch_returns_dataset_padding_mask(monkeypatch):
     """The dataset padding mask must survive the pretrain_gpt batch handoff."""
     import pretrain_gpt
+    from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
 
     padding_mask = torch.tensor([[False, False, True, True]], dtype=torch.bool)
     source_batch = {
@@ -634,9 +1313,12 @@ def test_sbhd_get_batch_returns_dataset_padding_mask(monkeypatch):
 
     monkeypatch.setattr(pretrain_gpt, "get_batch_on_this_tp_rank", get_batch_on_this_tp_rank)
     monkeypatch.setattr(pretrain_gpt, "get_batch_on_this_cp_rank", lambda batch: batch)
+    prebuild = MagicMock()
+    monkeypatch.setattr(cp_balanced_indexer, "prebuild_balanced_layouts", prebuild)
 
     *_, returned_padding_mask = pretrain_gpt.get_batch(iter(()))
     assert torch.equal(returned_padding_mask, padding_mask)
+    prebuild.assert_not_called()
 
 
 def test_sbhd_dataset_is_built_on_intermediate_pipeline_stage(monkeypatch):
@@ -670,6 +1352,17 @@ def test_mock_getitem_thd_keys_and_pad_fallback():
     n = out["tokens"].numel()
     assert out["labels"].numel() == n and out["loss_mask"].numel() == n
     assert int(out["padded_seq_len"].item()) % 4 == 0
+
+
+def test_mock_getitem_truncates_long_sample():
+    tok = _FakeTokenizer(eod=0, pad=None)
+    ds = _make_mock_varlen([np.arange(1, 10, dtype=np.int64)], _make_config(tok, seq_length=4))
+    out = ds[0]
+    # Keeps sequence_length - 1 ids plus EOD, then applies the next-token shift.
+    assert out["tokens"].tolist() == [1, 2, 3]
+    assert out["labels"].tolist() == [2, 3, 0]
+    assert out["loss_mask"].tolist() == [1.0, 1.0, 1.0]
+    assert int(out["original_seq_len"].item()) == int(out["padded_seq_len"].item()) == 3
 
 
 # ----------------------------------------------------------------------------
@@ -763,21 +1456,21 @@ def _build_varlen_for_loader(items, config, num_samples):
     return ds
 
 
-def _loader_args(*, use_varlen, sbhd, scheduler, mbs, dynamic_cp=False, gbs=None):
+def _loader_args(*, use_varlen, sbhd, scheduler, mbs, dynamic_cp=False, gbs=None, num_workers=0):
     return SimpleNamespace(
         dataloader_type='single',
         micro_batch_size=mbs,
         global_batch_size=mbs if gbs is None else gbs,
         full_validation=False,
         dynamic_context_parallel=dynamic_cp,
-        num_workers=0,
+        num_workers=num_workers,
         use_varlen_dataset=use_varlen,
         varlen_sbhd_validation=sbhd,
         sequence_packing_scheduler=scheduler,
     )
 
 
-def test_sbhd_validation_dataloader_uses_default_collate():
+def test_sbhd_validation_dataloader_uses_default_collate(run_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
@@ -787,6 +1480,8 @@ def test_sbhd_validation_dataloader_uses_default_collate():
     try:
         tok = _FakeTokenizer(eod=0, pad=7)
         seq_len, mbs = 16, 2
+        run_config.train.micro_batch_size = mbs
+        run_config.train.global_batch_size = mbs
         # One global batch needs micro_batch_size * data_parallel_size samples;
         # size the dataset off the runtime DP world size so this passes under
         # any --nproc-per-node (the CI default is 8 ranks -> dp=8).
@@ -809,7 +1504,7 @@ def test_sbhd_validation_dataloader_uses_default_collate():
         Utils.destroy_model_parallel()
 
 
-def test_thd_dataloader_uses_identity_collate():
+def test_thd_dataloader_uses_identity_collate(run_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
@@ -819,6 +1514,8 @@ def test_thd_dataloader_uses_identity_collate():
     try:
         tok = _FakeTokenizer(eod=0, pad=7)
         mbs = 2
+        run_config.train.micro_batch_size = mbs
+        run_config.train.global_batch_size = mbs
         dp = parallel_state.get_data_parallel_world_size()
         n = mbs * dp * 4
         cfg = _make_config(tok, seq_length=64, sbhd=False)
@@ -838,7 +1535,7 @@ def test_thd_dataloader_uses_identity_collate():
         Utils.destroy_model_parallel()
 
 
-def test_dcp_dataloader_yields_microbatches_for_scheduler():
+def test_dcp_dataloader_yields_microbatches_for_scheduler(run_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
@@ -851,6 +1548,8 @@ def test_dcp_dataloader_yields_microbatches_for_scheduler():
         num_microbatches = 3
         dp = parallel_state.get_data_parallel_world_size()
         gbs = mbs * dp * num_microbatches
+        run_config.train.micro_batch_size = mbs
+        run_config.train.global_batch_size = gbs
         n = gbs * 2
         cfg = _make_config(tok, seq_length=64, dp=dp, cp=1, dynamic_cp=True)
         variable = ["a", "abcdef", "xy", "qwerty"]
@@ -874,6 +1573,91 @@ def test_dcp_dataloader_yields_microbatches_for_scheduler():
         assert isinstance(batch, list)
         assert len(batch) == mbs
         assert "padded_seq_len" in batch[0]
+    finally:
+        destroy_global_vars()
+        Utils.destroy_model_parallel()
+
+
+def test_packing_scheduler_dataloader_yields_microbatches(run_config):
+    from megatron.core import parallel_state
+    from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+    from megatron.training.global_vars import destroy_global_vars, set_args
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        tok = _FakeTokenizer(eod=0, pad=7)
+        mbs = 2
+        num_microbatches = 3
+        dp = parallel_state.get_data_parallel_world_size()
+        gbs = mbs * dp * num_microbatches
+        run_config.train.micro_batch_size = mbs
+        run_config.train.global_batch_size = gbs
+        n = gbs * 2
+        cfg = _make_config(tok, seq_length=64, dp=dp, cp=1)
+        variable = ["a", "abcdef", "xy", "qwerty"]
+        items = [variable[i % len(variable)] for i in range(n)]
+        ds = _build_varlen_for_loader(items, cfg, num_samples=n)
+        set_args(
+            _loader_args(use_varlen=True, sbhd=False, scheduler="dp_balanced", mbs=mbs, gbs=gbs)
+        )
+        loader = build_pretraining_data_loader(ds, consumed_samples=0)
+        batch = next(iter(loader))
+        # The packing scheduler calls next(data_iterator) num_microbatches times;
+        # each loader step must therefore be one local microbatch, not all
+        # local samples from the global batch.
+        assert isinstance(batch, list)
+        assert len(batch) == mbs
+        assert "padded_seq_len" in batch[0]
+    finally:
+        destroy_global_vars()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize(
+    ("scheduler", "expected_prefetch_factor"),
+    [("dp_balanced", 5), ("default_dynamic_cp", 5), (None, 2)],
+)
+def test_packing_scheduler_dataloader_prefetches_next_global_batch(
+    scheduler, expected_prefetch_factor, run_config
+):
+    from megatron.core import parallel_state
+    from megatron.core.datasets.utils import Split
+    from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+    from megatron.training.global_vars import destroy_global_vars, set_args
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        tok = _FakeTokenizer(eod=0, pad=7)
+        mbs, num_microbatches, num_workers = 2, 9, 2
+        dp = parallel_state.get_data_parallel_world_size()
+        gbs = mbs * dp * num_microbatches
+        run_config.train.micro_batch_size = mbs
+        run_config.train.global_batch_size = gbs
+        run_config.validation.eval_micro_batch_size = mbs
+        dynamic_cp = scheduler == "default_dynamic_cp"
+        cfg = _make_config(tok, seq_length=64, dp=dp, dynamic_cp=dynamic_cp)
+        ds = _build_varlen_for_loader(["abc"] * gbs * 2, cfg, num_samples=gbs * 2)
+        set_args(
+            _loader_args(
+                use_varlen=True,
+                sbhd=False,
+                scheduler=scheduler,
+                mbs=mbs,
+                dynamic_cp=dynamic_cp,
+                gbs=gbs,
+                num_workers=num_workers,
+            )
+        )
+        # A packing scheduler pulls num_microbatches items at the start of every
+        # step, so the workers keep the next step's ceil(9 / 2) items per worker
+        # in flight; without a scheduler the PyTorch default (2) is kept.
+        loader = build_pretraining_data_loader(ds, consumed_samples=0)
+        assert loader.prefetch_factor == expected_prefetch_factor
+        # Evaluation loaders keep the default.
+        ds.index_split = Split.valid
+        assert build_pretraining_data_loader(ds, consumed_samples=0).prefetch_factor == 2
     finally:
         destroy_global_vars()
         Utils.destroy_model_parallel()

@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from typing import List, Optional, Set, Tuple, Union
+from typing import List, Optional, Sequence, Set, Tuple, Union
 
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 
@@ -22,8 +22,86 @@ ALLOWED_INFERENCE_SCOPES: dict[str, Set[InferenceCudaGraphScope]] = {
 }
 
 
+def is_whole_moe_cuda_graph_scope(cuda_graph_modules: Sequence[CudaGraphModule]) -> bool:
+    """Whether a per-layer CUDA graph scope captures the complete MoE module.
+
+    An empty normalized scope represents whole-layer capture, while an explicit
+    ``CudaGraphModule.moe`` captures the complete MoE submodule.
+    """
+
+    return not cuda_graph_modules or CudaGraphModule.moe in cuda_graph_modules
+
+
+def validate_moe_cuda_graph_support(config) -> None:
+    """Validate backend support when the capture includes a whole-MoE module."""
+
+    if (
+        config.num_moe_experts is None
+        or config.num_moe_experts <= 1
+        or not is_whole_moe_cuda_graph_scope(config.cuda_graph_modules)
+        or (
+            config.moe_expert_capacity_factor is not None
+            and config.moe_pad_expert_input_to_capacity
+        )
+    ):
+        return
+
+    assert (
+        config.cuda_graph_impl == "transformer_engine"
+        and config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend == "hybridep"
+        and config.moe_expert_rank_capacity_factor is not None
+        and config.moe_paged_stash
+        and config.use_transformer_engine_op_fuser
+    ), (
+        "moe cuda graph is only supported with drop-padding MoE or transformer_engine "
+        "sync-free HybridEP with rank capacity and paged stash."
+    )
+
+
+PACKED_DSA_CP_CUDA_GRAPH_WARNING = (
+    "CUDA graph capture for packed DSA with context parallelism is experimental and not "
+    "fully supported. Some capture paths may fail during warmup or replay; set "
+    "cuda_graph_impl='none' to use the supported eager path."
+)
+
+
+def is_packed_dsa_cp_cuda_graph_experimental(
+    *,
+    experimental_attention_variant: Optional[str],
+    sequence_packing_scheduler: Optional[str],
+    dynamic_context_parallel: bool,
+    context_parallel_size: int,
+    cuda_graph_impl: str,
+) -> bool:
+    """Whether packed DSA context parallelism is combined with CUDA graphs."""
+
+    static_packing = (
+        sequence_packing_scheduler == "dp_balanced"
+        and not dynamic_context_parallel
+        and context_parallel_size > 1
+    )
+    dynamic_packing = (
+        sequence_packing_scheduler == "default_dynamic_cp" and dynamic_context_parallel
+    )
+    return (
+        experimental_attention_variant == "dsa"
+        and cuda_graph_impl != "none"
+        and (static_packing or dynamic_packing)
+    )
+
+
+def cuda_graph_captures_attention(config) -> bool:
+    """Return whether the normalized training graph scope includes attention."""
+    impl = getattr(config, "cuda_graph_impl", "none")
+    modules = getattr(config, "cuda_graph_modules", None)
+    return impl == "full_iteration" or (
+        impl in ("local", "transformer_engine") and (not modules or CudaGraphModule.attn in modules)
+    )
+
+
 def normalize_cuda_graph_modules(
-    scopes: Optional[Union[str, CudaGraphModule, List[Union[str, CudaGraphModule]]]]
+    scopes: Optional[Union[str, CudaGraphModule, List[Union[str, CudaGraphModule]]]],
 ) -> Tuple[List[CudaGraphModule], List[Tuple[str, str, object]], bool]:
     """Normalize mixed CUDA graph scope inputs into enum values plus deprecation metadata."""
 

@@ -11,7 +11,6 @@ a real 2-process gloo PP2 proof (NEW sizes-from-wire green; OLD fixed-buffer red
 
 from __future__ import annotations
 
-import multiprocessing
 import os
 from types import SimpleNamespace
 
@@ -153,7 +152,7 @@ def _dynamic_shape_worker(rank, world, port, results):
                 expect = _pp_hidden(i, s)
                 detail.append((s, tuple(fwd_buf.shape) == (s, 1, _PP_H),
                                bool(torch.equal(fwd_buf.detach().float(), expect.float()))))
-        results.append((rank, detail))
+        results.put((rank, detail))
     finally:
         dist.destroy_process_group()
 
@@ -173,16 +172,21 @@ def _fixed_buffer_worker(rank, world, port, results):
             fixed_buf = torch.empty(first_len, 1, _PP_H, dtype=torch.float32)  # only fits S=5
             pl._send_recv_pipeline(None, None, True, False, ps, (first_len, 1, _PP_H),
                                    fwd_recv_buf=fixed_buf, batch_p2p=False, dynamic_shape=False)
-        results.append((rank, "no_abort"))  # reaching here without abort is the bug
+        results.put((rank, "no_abort"))  # reaching here without abort is the bug
     finally:
         dist.destroy_process_group()
 
 
 def test_dynamic_shape_variable_len_recv_gloo():  # NEW: recv sized from wire, 0 mismatch
     import torch.multiprocessing as mp
-    results = multiprocessing.Manager().list()
+
+    # ``Manager`` starts a separate TCP listener before the real Gloo ranks.
+    # That extra socket is unnecessary for two fixed results and is rejected by
+    # restricted test containers.  A spawn-compatible pipe keeps the proof's
+    # only network surface the Gloo group under test.
+    results = mp.get_context("spawn").SimpleQueue()
     mp.spawn(_dynamic_shape_worker, args=(2, 29663, results), nprocs=2, join=True)
-    by_rank = dict(results)
+    by_rank = dict(results.get() for _ in range(2))
     assert set(by_rank) == {0, 1}, f"missing ranks: {list(by_rank)}"
     recv_detail = by_rank[1]  # last stage recorded every fwd recv
     assert len(recv_detail) == len(_PP_VARLEN), recv_detail
@@ -193,6 +197,6 @@ def test_dynamic_shape_variable_len_recv_gloo():  # NEW: recv sized from wire, 0
 
 def test_fixed_buffer_truncates_variable_len_gloo():  # OLD: fixed buffer overflows -> abort
     import torch.multiprocessing as mp
-    results = multiprocessing.Manager().list()
+    results = mp.get_context("spawn").SimpleQueue()
     with pytest.raises(Exception):  # gloo aborts the receiver -> spawn failure
         mp.spawn(_fixed_buffer_worker, args=(2, 29664, results), nprocs=2, join=True)

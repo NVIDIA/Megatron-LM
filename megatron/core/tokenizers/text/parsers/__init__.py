@@ -2,11 +2,19 @@
 from megatron.core.tokenizers.text.parsers.deepseek_r1_reasoning_parser import (
     DeepSeekR1ReasoningParser,
 )
-from megatron.core.tokenizers.text.parsers.qwen3_coder_tool_parser import Qwen3CoderToolParser
+from megatron.core.tokenizers.text.parsers.nemotron_v3_reasoning_parser import (
+    NemotronV3ReasoningParser,
+)
+from megatron.core.tokenizers.text.parsers.qwen3_coder_tool_parser import (
+    Qwen3CoderToolCombinedParser,
+    Qwen3CoderToolParser,
+)
 
 PARSER_MAPPING = {
     "deepseek-r1-reasoning": DeepSeekR1ReasoningParser,
     "qwen3-coder-tool": Qwen3CoderToolParser,
+    "qwen3-coder-tool-combined": Qwen3CoderToolCombinedParser,
+    "nemotron-v3-reasoning": NemotronV3ReasoningParser,
 }
 
 __all__ = ["PARSER_MAPPING"]

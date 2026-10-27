@@ -21,7 +21,6 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.abspath(os.path.join(_SCRIPT_DIR, "../../../")))
 
 import modelopt.torch.quantization as mtq
-from modelopt.recipe import ModelOptPTQRecipe, load_recipe
 from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.quantization.config import _default_disabled_quantizer_cfg
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
@@ -59,12 +58,13 @@ from megatron.core import parallel_state
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.utils import get_batch_on_this_cp_rank, unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import print_distributed_quant_summary, report_current_memory_info
 from megatron.training import get_args, get_model, initialize_megatron
+from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.checkpointing import save_checkpoint
+from megatron.training.checkpointing import load_checkpoint, save_checkpoint
+from megatron.training.global_vars import set_run_config
 from megatron.training.utils import print_rank_0
 from model_provider import model_provider
 
@@ -250,9 +250,7 @@ def check_arguments():
             )
             args.export_quant_cfg = None
         if args.recipe is not None:
-            print_rank_0(
-                "WARNING: --auto-quantize-bits overrides --recipe; the latter is ignored."
-            )
+            print_rank_0("WARNING: --auto-quantize-bits overrides --recipe; the latter is ignored.")
             args.recipe = None
         if args.pipeline_model_parallel_size > 1:
             raise ValueError(
@@ -267,32 +265,32 @@ def check_arguments():
                 )
 
 
+def _add_quant_cfg_entry(quant_cfg, quantizer_name, config):
+    if isinstance(quant_cfg, dict):
+        quant_cfg[quantizer_name] = {**config.get("cfg", {}), "enable": config["enable"]}
+    else:
+        quant_cfg.append({"quantizer_name": quantizer_name, **config})
+
+
+def _megatron_prefill_for_calibration(model, input_ids):
+    prefill_kwargs = {}
+    if "skip_return_logits" in inspect.signature(megatron_prefill).parameters:
+        prefill_kwargs["skip_return_logits"] = True
+    return megatron_prefill(model, input_ids, **prefill_kwargs)
+
+
 def get_modelopt_torch_quantization_config():
     """Return a quantization config."""
     args = get_args()
-
-    if args.recipe is not None:
-        # YAML recipe is authoritative: skip predefined-config customizations and KV
-        # cache override; the recipe encodes quant_cfg + algorithm + KV cache directly.
-        print_rank_0(f"Use recipe {args.recipe} for quantization")
-        recipe = load_recipe(args.recipe)
-        if not isinstance(recipe, ModelOptPTQRecipe):
-            raise TypeError(
-                f"Expected PTQ recipe, but got {type(recipe).__name__} from {args.recipe}"
-            )
-        if args.export_kv_cache_quant != "none":
-            print_rank_0(
-                f"Ignoring --export-kv-cache-quant={args.export_kv_cache_quant} since you passed in a YAML recipe."
-            )
-        return recipe.quantize.model_dump()
 
     if args.export_quant_cfg not in QUANT_CFG_CHOICES:
         raise ValueError(f"Unsupported quantization config {args.export_quant_cfg}.")
     mtq_config = QUANT_CFG_CHOICES[args.export_quant_cfg]
 
     if isinstance(mtq_config["quant_cfg"], dict):
-        # Normalize old dict format to new list format
-        mtq_config["quant_cfg"] = mtq.normalize_quant_cfg_list(mtq_config["quant_cfg"])
+        normalize_quant_cfg_list = getattr(mtq, "normalize_quant_cfg_list", None)
+        if normalize_quant_cfg_list is not None:
+            mtq_config["quant_cfg"] = normalize_quant_cfg_list(mtq_config["quant_cfg"])
 
     fp8_config = {"enable": True, "cfg": {"num_bits": (4, 3), "axis": None}}
     fp4_config = {
@@ -305,10 +303,10 @@ def get_modelopt_torch_quantization_config():
     }
     if args.export_quant_cfg == "FP8_DEFAULT_CFG":
         # Enable Medusa heads and kv-cache quantization
-        mtq_config["quant_cfg"].append({"quantizer_name": "*medusa_heads**", **fp8_config})
+        _add_quant_cfg_entry(mtq_config["quant_cfg"], "*medusa_heads**", fp8_config)
     if "FP4" in args.export_quant_cfg:
         # Enable Medusa heads and kv-cache quantization
-        mtq_config["quant_cfg"].append({"quantizer_name": "*medusa_heads**", **fp4_config})
+        _add_quant_cfg_entry(mtq_config["quant_cfg"], "*medusa_heads**", fp4_config)
     if "AWQ" in args.export_quant_cfg:
         try:
             weight_quantizer = mtq.find_quant_cfg_entry_by_path(
@@ -319,7 +317,7 @@ def get_modelopt_torch_quantization_config():
             weight_quantizer = None
     # Customization
     if args.disable_qkv_quant:
-        mtq_config["quant_cfg"].append({"quantizer_name": "*self_attention*", "enable": False})
+        _add_quant_cfg_entry(mtq_config["quant_cfg"], "*self_attention*", {"enable": False})
 
     # KV Cache Quantization
     enable_quant_kv_cache = args.export_kv_cache_quant != "none"
@@ -331,7 +329,7 @@ def get_modelopt_torch_quantization_config():
 
     # Weight Only Quantization
     if args.weight_only:
-        mtq_config["quant_cfg"].append({"quantizer_name": "*input_quantizer", "enable": False})
+        _add_quant_cfg_entry(mtq_config["quant_cfg"], "*input_quantizer", {"enable": False})
     return mtq_config
 
 
@@ -347,7 +345,7 @@ def get_calib_dataloader(
 
     Supports either a local path (.jsonl) or a HuggingFace dataset name.
     """
-    if os.path.isfile(dataset_path_or_name):
+    if os.path.isfile(dataset_path_or_name) and dataset_path_or_name.endswith(".jsonl"):
         # Local file
         print_rank_0(f"Loading calibration dataset from local file: {dataset_path_or_name}")
         all_texts = []
@@ -442,10 +440,7 @@ def auto_quantize_model(unwrapped_model, tokenizer):
         return megatron_prefill(model, batch["input_ids"])
 
     def forward_backward_step(model, batch):
-        lm_batch = build_lm_batch_from_input_ids(
-            batch,
-            cp_group=get_context_parallel_group(),
-        )
+        lm_batch = build_lm_batch_from_input_ids(batch, cp_group=get_context_parallel_group())
         loss = model.forward(
             input_ids=lm_batch["tokens"],
             position_ids=lm_batch["position_ids"],
@@ -463,7 +458,9 @@ def auto_quantize_model(unwrapped_model, tokenizer):
         if "parent_class" not in entry
     ]
 
-    dp_world_size = parallel_state.get_data_parallel_world_size() if torch.distributed.is_initialized() else 1
+    dp_world_size = (
+        parallel_state.get_data_parallel_world_size() if torch.distributed.is_initialized() else 1
+    )
     num_calib_steps = len(calib_dataloader)
     score_samples_per_step = max(dp_world_size * args.calib_batch_size, 1)
     num_score_steps = min(
@@ -497,13 +494,15 @@ def auto_quantize_model(unwrapped_model, tokenizer):
         os.makedirs(args.save, exist_ok=True)
         torch.save(
             search_state,
-            os.path.join(args.save, f"auto_quantize_search_state_rank_{torch.distributed.get_rank()}.pth"),
+            os.path.join(
+                args.save, f"auto_quantize_search_state_rank_{torch.distributed.get_rank()}.pth"
+            ),
         )
     return search_state
 
 
 if __name__ == "__main__":
-    parse_and_validate_args(
+    args = parse_and_validate_args(
         extra_args_provider=add_text_generate_ptq_args,
         args_defaults={
             "tokenizer_type": "HuggingFaceTokenizer",
@@ -511,7 +510,10 @@ if __name__ == "__main__":
             "no_load_optim": True,
         },
     )
-    initialize_megatron()
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_megatron(training=False)
 
     check_arguments()
 
@@ -526,7 +528,7 @@ if __name__ == "__main__":
     report_current_memory_info()
 
     if args.load is not None:
-        load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
+        load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
 
     if args.pretrained_model_path is not None:
@@ -539,6 +541,10 @@ if __name__ == "__main__":
         import_kwargs = {"dtype": import_dtype}
         if "trust_remote_code" in inspect.signature(import_mcore_gpt_from_hf).parameters:
             import_kwargs.update({"trust_remote_code": args.trust_remote_code})
+        if "moe_router_dtype" in inspect.signature(import_mcore_gpt_from_hf).parameters and getattr(
+            args, "moe_router_dtype", None
+        ):
+            import_kwargs.update({"moe_router_dtype": args.moe_router_dtype})
         import_mcore_gpt_from_hf(
             unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
         )
@@ -589,7 +595,7 @@ if __name__ == "__main__":
                 sample = get_batch_on_this_cp_rank(
                     sample, is_hybrid_cp=False, cp_group=get_context_parallel_group()
                 )
-                megatron_prefill(model, sample["input_ids"], skip_return_logits=True)
+                _megatron_prefill_for_calibration(model, sample["input_ids"])
 
     unwrapped_model = unwrap_model(model)[0]
 

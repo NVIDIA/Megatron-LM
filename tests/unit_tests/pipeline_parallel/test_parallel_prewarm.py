@@ -9,7 +9,9 @@ import torch
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context, get_fp8_recipe
+from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.pipeline_parallel.parallel_prewarm import (
+    _build_layer_inputs,
     _build_packed_seq_params,
     prewarm_pipeline_model_parallel,
 )
@@ -18,7 +20,7 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
-from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.enums import AttnMaskType, CudaGraphModule
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
@@ -52,6 +54,7 @@ def _make_static_layer(**overrides):
     layer.config = SimpleNamespace(**config)
     layer.self_attention = SimpleNamespace(attn_mask_type=AttnMaskType.causal)
     layer.is_moe_layer = False
+    layer._padding_mask_shape_seen = None
     return layer
 
 
@@ -120,6 +123,93 @@ def test_sbhd_prewarm_omits_mask_when_disabled(monkeypatch):
     assert inputs['hidden_states'].shape == (8, 2, 4)
     assert 'attention_mask' not in inputs
     assert 'cu_seqlens_q' not in inputs
+
+
+@pytest.mark.parametrize('prewarm', [False, True])
+@pytest.mark.parametrize('packed', [False, True])
+def test_linear_attention_omits_mask_but_keeps_thd_metadata(monkeypatch, prewarm, packed):
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: torch.device('cpu'))
+    layer = _make_static_layer(
+        cuda_graph_impl='local',
+        sequence_packing_scheduler=object() if packed else None,
+        create_attention_mask_in_dataloader=True,
+    )
+    # Linear attention has no attn_mask_type, but still consumes THD sequence boundaries.
+    layer.self_attention = SimpleNamespace(uses_attention_mask=False)
+    inputs = layer.get_layer_static_inputs(8, 2, for_pipeline_prewarm=prewarm)
+    assert 'attention_mask' not in inputs
+    assert ('cu_seqlens_q' in inputs) == packed
+
+
+@pytest.mark.parametrize('prewarm', [False, True])
+def test_hash_router_ids_follow_local_sbhd_tokens(monkeypatch, prewarm):
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: torch.device('cpu'))
+    layer = _make_static_layer(
+        context_parallel_size=2,
+        tensor_model_parallel_size=2,
+        sequence_parallel=True,
+        sequence_packing_scheduler=None,
+    )
+    layer.is_moe_layer = True
+    layer.mlp = SimpleNamespace(router=SimpleNamespace(is_hash_layer=True))
+    inputs = layer.get_layer_static_inputs(8, 2, for_pipeline_prewarm=prewarm)
+    assert inputs['hidden_states'].shape == (2, 2, 4)
+    assert inputs['input_ids'].shape == (2, 2)
+
+
+@pytest.mark.parametrize('cp_rank', [0, 1])
+def test_dynamic_dsa_route_is_preserved_in_eager_prewarm_metadata(monkeypatch, cp_rank):
+    from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: torch.device('cpu'))
+    layer = _make_static_layer(
+        cuda_graph_impl='transformer_engine',
+        context_parallel_size=2,
+        dsa_cp_balance_indexer_graph_dynamic_packs=True,
+    )
+    layer.self_attention.indexer = object()
+    layer.pg_collection = SimpleNamespace(cp=SimpleNamespace(size=lambda: 2, rank=lambda: cp_rank))
+    graph_inputs = layer.get_layer_static_inputs(16, 1)
+    _, prewarm_inputs = _build_layer_inputs(layer, SimpleNamespace(), layer.config, 16, 1, {})
+    for key in ('dsa_cp_graph_layout_buffer', 'dsa_cp_graph_route_buffer'):
+        assert torch.is_tensor(graph_inputs[key])
+        assert key not in prewarm_inputs
+    packed = prewarm_inputs['packed_seq_params']
+    assert packed.cu_seqlens_q.tolist() == [0, 16, 16]
+    assert packed.cu_seqlens_q is packed.cu_seqlens_kv
+    assert packed.cu_seqlens_q_padded is packed.cu_seqlens_kv_padded
+    plan = cp_balanced_indexer.get_graph_dynamic_plan(packed)
+    assert plan is not None
+    assert (plan['cp_size'], plan['l_local']) == (2, 8)
+    # Tensor-only reconstruction omits the host cp_rank tag. The route consumed by
+    # eager dispatch must still match the plan built for this layer's explicit CP rank.
+    expected = cp_balanced_indexer.build_graph_dynamic_plan(
+        packed.cu_seqlens_q_padded, layer.pg_collection.cp, 16
+    )
+    for key in ('validated_cu', 'pos_head', 'pos_tail', 'src_slot', 'relay_perm', 'dst_slot'):
+        assert torch.equal(plan[key], expected[key])
+
+
+@pytest.mark.parametrize('split_attention', [False, True])
+def test_hybrid_mhc_prewarm_uses_full_residual_streams(monkeypatch, split_attention):
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: torch.device('cpu'))
+    inner = _make_static_layer(
+        cuda_graph_impl='transformer_engine',
+        cuda_graph_modules=[CudaGraphModule.attn],
+        mhc_recompute_attn_cuda_graph_split=split_attention,
+        recompute_granularity='selective',
+        recompute_modules=['mhc'],
+        num_residual_streams=4,
+    )
+    layer = object.__new__(HyperConnectionHybridLayer)
+    torch.nn.Module.__init__(layer)
+    layer.inner_layer = inner
+    layer.config = inner.config
+    graph_inputs = layer.get_layer_static_inputs(8, 2)
+    prewarm_inputs = layer.get_layer_static_inputs(8, 2, for_pipeline_prewarm=True)
+    assert graph_inputs['hidden_states'].shape == (8, 1, 4 if split_attention else 16)
+    assert prewarm_inputs['hidden_states'].shape == (8, 1, 16)
+    assert prewarm_inputs['cu_seqlens_q'] is prewarm_inputs['cu_seqlens_kv']
 
 
 def test_prewarm_requires_multiple_pipeline_stages():

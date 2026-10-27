@@ -6,12 +6,11 @@ import os
 import pathlib
 import re
 import signal
-import subprocess
 import sys
 import time
 import uuid
 import zipfile
-from typing import Dict, List, Optional
+from typing import Callable, Iterator, List, Optional
 
 import click
 import jetclient
@@ -31,44 +30,6 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
-
-
-def send_slack_alert(test_case: str, context: str, n_iteration: int, n_attempts: int) -> None:
-    """Send a Slack alert via notify.py for the current release pipeline state.
-
-    Args:
-        test_case: Name of the release test case being run.
-        context: Human-readable context string appended to the pipeline context label.
-        n_iteration: Current training iteration (pipeline relaunch count).
-        n_attempts: Current attempt count within this iteration.
-    """
-    pipeline_id = os.getenv("PARENT_PIPELINE_ID")
-    pipeline_created_at = os.getenv("CI_PIPELINE_CREATED_AT", "")
-
-    if not pipeline_id or not pipeline_created_at:
-        logger.info("Missing PARENT_PIPELINE_ID or CI_PIPELINE_CREATED_AT, skipping Slack alert.")
-        return
-
-    pipeline_context = f"{test_case} | iteration={n_iteration} | attempt={n_attempts} | {context}"
-
-    try:
-        subprocess.run(
-            [
-                sys.executable,
-                str(BASE_PATH / "notify.py"),
-                "--pipeline-id",
-                pipeline_id,
-                "--check-for",
-                "functional-tests",
-                "--pipeline-context",
-                pipeline_context,
-                "--pipeline-created-at",
-                pipeline_created_at,
-            ],
-            check=False,
-        )
-    except Exception as e:
-        logger.warning("Failed to send Slack alert: %s", e)
 
 
 def register_pipeline_terminator(pipeline: jetclient.JETPipeline):
@@ -299,56 +260,52 @@ def download_job_assets(logs: List[jet_log.JETLog], iteration: int = 0) -> Optio
     return assets_base_path
 
 
-def extract_torchrunlogs_to_string(logs_path: pathlib.Path) -> Dict[int, List[str]]:
-    logs_dict = {}
+def iter_torchrun_logs(logs_path: pathlib.Path) -> Iterator[str]:
+    """Yield the content of every per-rank stdout/stderr log, one file at a time.
 
+    The per-rank logs of a single job can add up to hundreds of MB (e.g. one warning line per
+    CUDA-graph capture and generator). Holding all of them in memory at once, as lists of lines
+    plus their concatenation, got this launcher OOM-killed on the GitLab runner (exit code 137)
+    after the JET pipeline itself had already succeeded. Stream them instead.
+    """
     # Iterate through all restart folders
-    for restart_dir in logs_path.glob("restart=*"):
-        # Find all stdout.log files
-        for stdout_file in restart_dir.glob("assets/basic/*/logs/*/*/attempt_0/*/std*.log"):
-            # Extract rank from path
-            rank = int(stdout_file.parent.name)
-
-            # Read log file
+    for restart_dir in sorted(logs_path.glob("restart=*")):
+        # Find all stdout.log / stderr.log files
+        for log_file in sorted(restart_dir.glob("assets/basic/*/logs/*/*/attempt_0/*/std*.log")):
             try:
-                with open(stdout_file) as f:
-                    log_content = f.readlines()
-                    if rank not in logs_dict:
-                        logs_dict[rank] = log_content
-                    else:
-                        logs_dict[rank] += log_content
+                with open(log_file, errors="replace") as f:
+                    yield f.read()
             except Exception as e:
-                logger.error(f"Error reading log file {stdout_file}: {e}")
+                logger.error(f"Error reading log file {log_file}: {e}")
                 continue
-    return logs_dict
 
 
-def extract_main_log_to_string(logs_path: pathlib.Path) -> List[str]:
+def any_torchrun_log_matches(logs_path: pathlib.Path, predicate: Callable[[str], bool]) -> bool:
+    """True if `predicate` holds for the content of at least one per-rank log file."""
+    return any(predicate(log) for log in iter_torchrun_logs(logs_path))
+
+
+def extract_main_log_to_string(logs_path: pathlib.Path) -> str:
     logs = []
 
     # Iterate through all restart folders
-    for restart_dir in logs_path.glob("restart=*"):
+    for restart_dir in sorted(logs_path.glob("restart=*")):
         # Find all stdout.log files
         for stdout_file in restart_dir.glob(
             "assets/basic/*/jet_assets/output_logs/output_script-0.log"
         ):
             # Read log file
             try:
-                with open(stdout_file) as f:
-                    log_content = f.readlines()
-                    logs += log_content
+                with open(stdout_file, errors="replace") as f:
+                    logs.append(f.read())
             except Exception as e:
                 logger.error(f"Error reading log file {stdout_file}: {e}")
                 continue
-    return logs
+    return "".join(logs)
 
 
-def parse_failed_job(logs: List[str]) -> Optional[bool]:
-    for log_row in logs[::-1]:
-        match = re.search(r"Job finished with status 'FAILED'", log_row)
-        if match is not None:
-            return True
-    return False
+def parse_failed_job(log: str) -> bool:
+    return "Job finished with status 'FAILED'" in log
 
 
 def telemetrics_and_exit(
@@ -414,6 +371,8 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "free(): corrupted unsorted chunks" in concat_allranks_logs
         or "Segfault encountered" in concat_allranks_logs
         or "Fatal glibc error" in concat_allranks_logs
+        or "Disk quota exceeded" in concat_allranks_logs
+        or "basic_ios::clear: iostream error" in concat_allranks_logs
     )
 
 
@@ -540,8 +499,10 @@ def main(
                 if assets_base_path is None:
                     no_log = True
                     break
-                allranks_logs = extract_torchrunlogs_to_string(logs_path=assets_base_path)
-                mainrank_log = extract_main_log_to_string(logs_path=assets_base_path)
+                has_rank_logs = any_torchrun_log_matches(
+                    assets_base_path, lambda log: log.strip() != ""
+                )
+                concat_mainrank_log = extract_main_log_to_string(logs_path=assets_base_path)
                 no_log = False
                 break
             except (
@@ -567,11 +528,7 @@ def main(
             n_attempts += 1
             continue
 
-        concat_allranks_logs = "\n".join(
-            ["\n".join(log_lines) for log_lines in allranks_logs.values()]
-        )
-        concat_mainrank_log = "\n".join(mainrank_log)
-        if concat_allranks_logs.strip() == "" and concat_mainrank_log.strip() == "":
+        if not has_rank_logs and concat_mainrank_log.strip() == "":
             logger.error("No logs found. Try again.")
             n_attempts += 1
             continue
@@ -597,7 +554,7 @@ def main(
         logger.info("Pipeline terminated with status %s", status.name)
 
         if test_type == "unit_test":
-            if not success and is_flaky_failure(concat_allranks_logs):
+            if not success and any_torchrun_log_matches(assets_base_path, is_flaky_failure):
                 logger.error("Detected flaky failure, attempt restart.")
                 n_attempts += 1
                 continue
@@ -614,7 +571,7 @@ def main(
                     is_integration_test=enable_lightweight_mode,
                 )
 
-            if is_flaky_failure(concat_allranks_logs):
+            if any_torchrun_log_matches(assets_base_path, is_flaky_failure):
                 if n_attempts < 9:
                     logger.error("Detected flaky failure, attempt restart.")
                 n_attempts += 1
@@ -638,39 +595,24 @@ def main(
             )
 
         if test_type == "release":
-            if (
-                "StopIteration" in concat_allranks_logs
-                or "after training is done" in concat_allranks_logs
-                or "exiting program at iteration" in concat_allranks_logs
+            if any_torchrun_log_matches(
+                assets_base_path,
+                lambda log: (
+                    "StopIteration" in log
+                    or "after training is done" in log
+                    or "exiting program at iteration" in log
+                ),
             ):
                 logger.info("Release training finished")
-                send_slack_alert(
-                    test_case=test_case,
-                    context="training finished",
-                    n_iteration=n_iteration,
-                    n_attempts=n_attempts,
-                )
                 sys.exit(int(not success))  # invert for exit 0
 
-            if not success or parse_failed_job(logs=mainrank_log):
+            if not success or parse_failed_job(concat_mainrank_log):
                 logger.error("Release pipeline finished with status %s, retrying.", status.name)
-                send_slack_alert(
-                    test_case=test_case,
-                    context=f"pipeline finished with status {status.name}, retrying",
-                    n_iteration=n_iteration,
-                    n_attempts=n_attempts,
-                )
                 n_attempts += 1
                 continue
 
             n_iteration += 1
 
-    send_slack_alert(
-        test_case=test_case,
-        context="max attempts exhausted",
-        n_iteration=n_iteration,
-        n_attempts=n_attempts,
-    )
     telemetrics_and_exit(
         success=False,
         test_case=test_case,

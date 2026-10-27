@@ -13,8 +13,8 @@ from contextlib import nullcontext
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import transformer_engine.pytorch as te
 
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts, swiglu_with_probs
@@ -50,6 +50,7 @@ _SP_GRAD_SUFFIXES: tuple[str, ...] = (
     ".full_attn.k_norm.weight",
     ".linear_attn.in_proj.linear.layer_norm_weight",
     ".linear_attn.norm.weight",
+    ".mlp.gate_up.linear.layer_norm_weight",
     ".mlp_norm.weight",
     ".moe.router.gate.weight",
     ".moe.shared_expert.shared_gate.weight",
@@ -78,6 +79,27 @@ def _qwen_mrope_section(config: Qwen35Config) -> list[int]:
     rotary_half = max(int(config.rotary_dim // 2), 1)
     base = rotary_half // 3
     return [base, base, rotary_half - 2 * base]
+
+
+class DenseMLP(nn.Module):
+    def __init__(self, config: Qwen35Config, ps: ParallelState):
+        super().__init__()
+        assert config.intermediate_size is not None
+        self.gate_up = ColumnParallelLinear(
+            config.hidden_size,
+            config.intermediate_size * 2,
+            ps,
+            bias=False,
+            normalization="RMSNorm",
+            eps=config.rms_norm_eps,
+            zero_centered_gamma=True,
+        )
+        self.down = RowParallelLinear(
+            config.intermediate_size, config.hidden_size, ps, bias=False
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down(_swiglu(self.gate_up(x)))
 
 
 class SharedExpert(nn.Module):
@@ -274,21 +296,27 @@ class Qwen35Layer(nn.Module):
                 deterministic=deterministic,
                 cp_mode=gdn_cp_mode,
             )
-        self.mlp_norm = te.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, zero_centered_gamma=True
-        )
-        self.moe = MoELayer(
-            config,
-            ps,
-            use_deepep=use_deepep,
-            router_bias_rate=router_bias_rate,
-            fp8=fp8,
-            moe_act_recompute=moe_act_recompute,
-            router_dtype=torch.float32,
-            preserve_3d_graph=deterministic,
-            shared_expert_plain_te=deterministic,
-            moe_permute_fusion=True,
-        )
+        if config.is_moe:
+            self.mlp_norm: nn.Module | None = te.RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps, zero_centered_gamma=True
+            )
+            self.moe: MoELayer | None = MoELayer(
+                config,
+                ps,
+                use_deepep=use_deepep,
+                router_bias_rate=router_bias_rate,
+                fp8=fp8,
+                moe_act_recompute=moe_act_recompute,
+                router_dtype=torch.float32,
+                preserve_3d_graph=deterministic,
+                shared_expert_plain_te=deterministic,
+                moe_permute_fusion=True,
+            )
+            self.mlp: DenseMLP | None = None
+        else:
+            self.mlp_norm = None
+            self.moe = None
+            self.mlp = DenseMLP(config, ps)
 
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
@@ -301,8 +329,11 @@ class Qwen35Layer(nn.Module):
             h = self.linear_attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
         x = residual + h
         residual = x
-        x = residual + self.moe(self.mlp_norm(x))
-        return x
+        if self.moe is not None:
+            assert self.mlp_norm is not None
+            return residual + self.moe(self.mlp_norm(x))
+        assert self.mlp is not None
+        return residual + self.mlp(x)
 
 
 def _temperature_to_float(temperature: float | torch.Tensor) -> float:
@@ -729,6 +760,7 @@ def _build_native_vision_model(hf_path: str) -> nn.Module | None:
 
 
 __all__ = [
+    "DenseMLP",
     "FullAttention",
     "GatedDeltaNet",
     "MoELayer",

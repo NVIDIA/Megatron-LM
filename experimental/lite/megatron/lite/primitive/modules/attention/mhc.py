@@ -11,9 +11,14 @@ class MultiHeadHyperConnectionHead(nn.Module):
         self.hc_mult = hc_mult
         self.eps = eps
         self.hc_fn = nn.Parameter(torch.empty(hc_mult, hc_mult * hidden_size, dtype=torch.float32))
-        self.hc_base = nn.Parameter(torch.zeros(hc_mult, dtype=torch.float32))
-        self.hc_scale = nn.Parameter(torch.ones(1, dtype=torch.float32))
+        self.hc_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
+        self.hc_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
         nn.init.xavier_uniform_(self.hc_fn)
+        nn.init.zeros_(self.hc_base)
+        nn.init.ones_(self.hc_scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 3:

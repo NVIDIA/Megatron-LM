@@ -29,14 +29,21 @@ class PackedSeqParams:
     cu_seqlens_kv_padded: Tensor = None
     max_seqlen_q: int = None
     max_seqlen_kv: int = None
+    # Runtime dynamic context parallelism, set per microbatch by the packing scheduler.
+    # When local_cp_size is set, cp_group is the matching runtime group,
+    # including a singleton group when CP is disabled for this microbatch.
     local_cp_size: int = None
     cp_group: dist.ProcessGroup = None
+    # TE represents CP-off as cp_group=None, while layout/RoPE helpers still need
+    # the actual singleton group when the build-time CP group is larger.
+    cp_singleton_group: Optional[dist.ProcessGroup] = None
     total_tokens: int = None
     seq_idx: Tensor = None
     pad_between_seqs: Optional[bool] = None
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     tokens_per_sample: int = None
     cp_partition_route: Optional["ThdCpRoute"] = None
+    cp_scatter_cache: object = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
@@ -80,14 +87,23 @@ class PackedSeqParams:
 
 
 def resolve_cp_group(
-    static_cp_group: dist.ProcessGroup, packed_seq_params: PackedSeqParams = None
-) -> dist.ProcessGroup:
-    """Return the dynamic CP group from packed_seq_params when available, else the static one.
-
-    Dynamic CP assigns a per-microbatch CP group that may differ from the
-    process-group stored at model construction time.  This helper centralises
-    the resolution logic used by GPTModel, GatedDeltaNet, and MTP layers.
-    """
+    static_cp_group: Optional[dist.ProcessGroup], packed_seq_params: PackedSeqParams = None
+) -> Optional[dist.ProcessGroup]:
+    """Resolve the runtime CP group without mutating packed metadata."""
+    if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+        runtime_group = packed_seq_params.cp_group
+        # Compatibility for the previous dev CP-off metadata representation.
+        # Main's TE adapter now translates the singleton to None only inside TE.
+        if runtime_group is None and packed_seq_params.local_cp_size == 1:
+            runtime_group = packed_seq_params.cp_singleton_group
+        assert (
+            runtime_group is not None
+        ), "packed_seq_params.cp_group must be set when local_cp_size is provided"
+        assert runtime_group.size() == packed_seq_params.local_cp_size, (
+            "packed_seq_params.cp_group size must match local_cp_size: "
+            f"{runtime_group.size()} != {packed_seq_params.local_cp_size}"
+        )
+        return runtime_group
     if packed_seq_params is not None and packed_seq_params.cp_group is not None:
         return packed_seq_params.cp_group
     return static_cp_group
@@ -152,6 +168,36 @@ def _pad_cu_seqlens(cu_seqlens: Optional[Tensor], target_entries: int) -> Option
     )
     padded[:actual_entries] = cu_seqlens
     return padded
+
+
+def _same_tensor_view(a: Optional[Tensor], b: Optional[Tensor]) -> bool:
+    """Return whether two real tensors describe the same logical view."""
+    if not isinstance(a, Tensor) or not isinstance(b, Tensor):
+        return False
+    if a is b:
+        return type(a) is Tensor and not a.is_meta and a.numel() > 0
+    # Distinct tensor subclasses and meta/empty tensors do not provide a
+    # reliable physical-storage identity. Fail closed instead of comparing
+    # sentinel pointers or invoking unsupported storage accessors.
+    if type(a) is not Tensor or type(b) is not Tensor or a.is_meta or b.is_meta:
+        return False
+    if a.numel() == 0 or b.numel() == 0:
+        return False
+    try:
+        if (
+            a.dtype != b.dtype
+            or a.device != b.device
+            or a.shape != b.shape
+            or a.stride() != b.stride()
+            or a.storage_offset() != b.storage_offset()
+        ):
+            return False
+        a_data_ptr = a.data_ptr()
+        b_data_ptr = b.data_ptr()
+    except (RuntimeError, NotImplementedError):
+        # Some nonstandard tensor backends do not expose storage/data pointers.
+        return False
+    return a_data_ptr != 0 and a_data_ptr == b_data_ptr
 
 
 def _append_dummy_seq(cu_seqlens: Optional[Tensor], dummy_end: int) -> Optional[Tensor]:
@@ -570,6 +616,8 @@ def pad_sequence_for_thd(
     cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
     cu_seqlens_q_padded = packed_seq_params.cu_seqlens_q_padded
     cu_seqlens_kv_padded = packed_seq_params.cu_seqlens_kv_padded
+    qkv_valid_share_view = _same_tensor_view(cu_seqlens_q, cu_seqlens_kv)
+    qkv_padded_share_view = _same_tensor_view(cu_seqlens_q_padded, cu_seqlens_kv_padded)
 
     # Represent post-pack padding either as a dummy sequence or as physical
     # padding attached to the final real sequence.
@@ -634,11 +682,21 @@ def pad_sequence_for_thd(
             cu_seqlens_q_padded = cu_seqlens_q
         if cu_seqlens_kv_padded is None:
             cu_seqlens_kv_padded = cu_seqlens_kv
+        # Missing padded metadata inherits the valid-coordinate source. Re-evaluate
+        # the relationship after that inheritance so self-attention Q/K aliases are
+        # not split by the two allocating transforms below.
+        qkv_padded_share_view = qkv_padded_share_view or _same_tensor_view(
+            cu_seqlens_q_padded, cu_seqlens_kv_padded
+        )
         assert (
             cu_seqlens_q_padded is not None or cu_seqlens_kv_padded is not None
         ), "Non-dummy THD tail padding requires metadata for at least one real sequence."
         cu_seqlens_q_padded = _extend_last_padded_sequence(cu_seqlens_q_padded, global_target_len)
-        cu_seqlens_kv_padded = _extend_last_padded_sequence(cu_seqlens_kv_padded, global_target_len)
+        cu_seqlens_kv_padded = (
+            cu_seqlens_q_padded
+            if qkv_padded_share_view
+            else _extend_last_padded_sequence(cu_seqlens_kv_padded, global_target_len)
+        )
         last_padded_q_len = _last_padded_sequence_length(cu_seqlens_q_padded)
         last_padded_kv_len = _last_padded_sequence_length(cu_seqlens_kv_padded)
 
@@ -648,6 +706,14 @@ def pad_sequence_for_thd(
         cu_seqlens_kv = _pad_cu_seqlens(cu_seqlens_kv, target_cu_entries)
         cu_seqlens_q_padded = _pad_cu_seqlens(cu_seqlens_q_padded, target_cu_entries)
         cu_seqlens_kv_padded = _pad_cu_seqlens(cu_seqlens_kv_padded, target_cu_entries)
+
+    # The packing scheduler intentionally supplies Q/K metadata as matching
+    # views. Preserve that contract across transforms that allocate new tensors,
+    # while keeping independently supplied metadata independent.
+    if qkv_valid_share_view:
+        cu_seqlens_kv = cu_seqlens_q
+    if qkv_padded_share_view:
+        cu_seqlens_kv_padded = cu_seqlens_q_padded
 
     # Rebuild PackedSeqParams with the padded tensor and metadata shapes.
     padded_params = PackedSeqParams(
@@ -676,6 +742,7 @@ def pad_sequence_for_thd(
         ),
         local_cp_size=packed_seq_params.local_cp_size,
         cp_group=packed_seq_params.cp_group,
+        cp_singleton_group=packed_seq_params.cp_singleton_group,
         cp_partition_mode=packed_seq_params.cp_partition_mode,
         total_tokens=local_target_len if target_cu_entries is None else None,
         pad_between_seqs=(

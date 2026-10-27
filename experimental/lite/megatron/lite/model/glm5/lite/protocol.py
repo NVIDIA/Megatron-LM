@@ -27,13 +27,27 @@ from megatron.lite.model.glm5.config import Glm5Config
 from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
-    pack_thd_forward_kwargs,
+    nested_from_packed,
+    pack_r3_replay_mask as _pack_r3_replay_mask,
+    pack_routed_experts as _pack_routed_experts,
+    router_replay_roots as router_replay_roots,
     set_cross_entropy_fusion,
-    unpack_thd_forward_output,
 )
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
+from megatron.lite.primitive.parallel.cp import contiguous_slice_for_cp
+from megatron.lite.primitive.parallel.thd import (
+    pack_nested_thd,
+    parallel_state_from_model,
+    thd_pack_meta,
+    unpack_thd_to_nested,
+)
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
+from megatron.lite.primitive.quantization import (
+    QATSpec,
+    apply_qat_to_chunks,
+    normalize_qat_spec,
+)
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
 
@@ -94,6 +108,10 @@ class ImplConfig:
     cross_entropy_fusion: bool = False
     hf_path: str = ""
     attention_backend_override: str | None = None
+    dsa_cp_mode: str = "native"
+    dsa_indexer_loss_coeff: float = 0.0
+    dsa_indexer_use_sparse_loss: bool = False
+    calculate_per_token_loss: bool = False
     router_aux_loss_coef: float | None = None
     router_bias_rate: float = 0.0
     deterministic: bool = True
@@ -103,6 +121,16 @@ class ImplConfig:
     mtp_detach_encoder: bool = False
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_repeated_layer: bool | None = None
+    qat: QATSpec | dict | None = None
+
+    def __post_init__(self) -> None:
+        if self.dsa_cp_mode not in {"native", "legacy_gather_all"}:
+            raise ValueError(
+                "dsa_cp_mode must be 'native' or 'legacy_gather_all', "
+                f"got {self.dsa_cp_mode!r}"
+            )
+        if self.dsa_indexer_loss_coeff < 0.0:
+            raise ValueError("dsa_indexer_loss_coeff must be >= 0")
 
 
 def build_model_config(source: str | Path | dict, **overrides) -> Glm5Config:
@@ -116,15 +144,72 @@ def build_model_config(source: str | Path | dict, **overrides) -> Glm5Config:
     return cfg
 
 
+def _pack_glm5_thd_forward_kwargs(
+    model: nn.Module, batch: PackedBatch
+) -> dict[str, Any]:
+    """Pack GLM5 THD inputs in sequential allgather-CP layout."""
+    ps = parallel_state_from_model(model) or ParallelState()
+    seq_lens = batch.seq_lens
+    packed = pack_nested_thd(
+        nested_from_packed(batch.input_ids, seq_lens),
+        tp_size=ps.tp_size,
+        cp_size=ps.cp_size,
+        cp_rank=ps.cp_rank,
+        cp_group=ps.cp_group if ps.cp_size > 1 else None,
+        split_cp=False,
+        labels=nested_from_packed(batch.labels, seq_lens),
+        roll_labels=batch.labels is not None,
+        loss_mask=nested_from_packed(batch.loss_mask, seq_lens),
+        roll_loss_mask=batch.loss_mask is not None,
+    )
+    kwargs: dict[str, Any] = {
+        "input_ids": packed.input_ids,
+        "labels": packed.labels,
+        "loss_mask": packed.loss_mask,
+        "position_ids": packed.position_ids,
+        "packed_seq_params": packed.packed_seq_params,
+    }
+    kwargs["packed_seq_params"].cp_layout = "contiguous"
+    if ps.cp_size > 1:
+        for key in ("input_ids", "labels", "loss_mask", "position_ids"):
+            tensor = kwargs[key]
+            if tensor is not None:
+                kwargs[key] = contiguous_slice_for_cp(
+                    tensor, ps.cp_rank, ps.cp_size, seq_dim=1
+                )
+    return kwargs
+
+
 def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
-    kwargs = pack_thd_forward_kwargs(model, batch)
+    kwargs = _pack_glm5_thd_forward_kwargs(model, batch)
     add_loss_context_kwargs(kwargs)
     add_cross_entropy_fusion(kwargs, model)
     return model(**kwargs)
 
 
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
-    return unpack_thd_forward_output(model, batch, output)
+    """Reconstruct sequential CP shards and drop GLM5 THD padding."""
+    ps = parallel_state_from_model(model) or ParallelState()
+    meta = thd_pack_meta(
+        batch.seq_lens,
+        tp_size=ps.tp_size,
+        cp_size=ps.cp_size,
+        cp_group=ps.cp_group if ps.cp_size > 1 else None,
+        contiguous=True,
+    )
+    return unpack_thd_to_nested(output, meta, contiguous=True)
+
+
+def pack_routed_experts(model: nn.Module, batch: PackedBatch, routed_experts):
+    """Pack R3 routes using GLM-5's contiguous CP token layout."""
+
+    return _pack_routed_experts(model, batch, routed_experts, contiguous=True)
+
+
+def pack_r3_replay_mask(model: nn.Module, batch: PackedBatch) -> torch.Tensor:
+    """Pack the causal R3 mask using GLM-5's contiguous CP token layout."""
+
+    return _pack_r3_replay_mask(model, batch, contiguous=True)
 
 
 def _make_aux_loss_hook():
@@ -163,7 +248,9 @@ def _validate_parallel_scope(p: ParallelConfig) -> None:
 def _build_dist_opt_optimizer(
     chunks, model_cfg: Glm5Config, impl_cfg: ImplConfig, ps: ParallelState
 ):
-    from megatron.lite.primitive.optimizers.megatron_wrap import build_dist_opt_training_optimizer
+    from megatron.lite.primitive.optimizers.megatron_wrap import (
+        build_dist_opt_training_optimizer,
+    )
 
     return build_dist_opt_training_optimizer(
         chunks,
@@ -188,7 +275,9 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     mtp_enable_train = mtp_enable and bool(impl_cfg.mtp_enable_train)
     if mtp_enable:
         if model_cfg.num_nextn_predict_layers <= 0:
-            raise ValueError("mtp_enable=True but HF config has no num_nextn_predict_layers.")
+            raise ValueError(
+                "mtp_enable=True but HF config has no num_nextn_predict_layers."
+            )
         model_cfg.mtp_loss_scaling_factor = impl_cfg.mtp_loss_scaling_factor
         if impl_cfg.mtp_use_repeated_layer is not None:
             model_cfg.mtp_use_repeated_layer = impl_cfg.mtp_use_repeated_layer
@@ -210,6 +299,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         use_deepep=impl_cfg.use_deepep,
         fp8=False,
         recompute_modules=recompute_spec,
+        offload_modules=list(impl_cfg.offload),
         deterministic=impl_cfg.deterministic,
     )
     model_kwargs: dict[str, Any] = dict(
@@ -217,13 +307,21 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         use_thd=impl_cfg.use_thd,
         hf_path=impl_cfg.hf_path,
         attention_backend_override=impl_cfg.attention_backend_override,
+        dsa_cp_mode=impl_cfg.dsa_cp_mode,
+        dsa_indexer_loss_coeff=impl_cfg.dsa_indexer_loss_coeff,
+        dsa_indexer_use_sparse_loss=impl_cfg.dsa_indexer_use_sparse_loss,
+        calculate_per_token_loss=impl_cfg.calculate_per_token_loss,
         mtp_enable=mtp_enable,
         mtp_enable_train=mtp_enable_train,
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
     )
 
     if vpp is None:
-        chunks = [Glm5Model(model_cfg, train_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()]
+        chunks = [
+            Glm5Model(model_cfg, train_cfg, ps, **model_kwargs)
+            .to(torch.bfloat16)
+            .cuda()
+        ]
     else:
         chunks = [
             Glm5Model(
@@ -249,12 +347,17 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         for chunk in chunks:
             apply_offload(chunk.layers, impl_cfg.offload, MODULE_MAP)
 
+    # Parametrize before optimizer construction so it captures the BF16 master.
+    apply_qat_to_chunks(chunks, normalize_qat_spec(impl_cfg.qat))
+
     optimizer = None
     finalize_grads = None
     post_model_load_hook = None
     optimizer_backend = "none"
     if impl_cfg.optimizer == "dist_opt":
-        optimizer, finalize_grads = _build_dist_opt_optimizer(chunks, model_cfg, impl_cfg, ps)
+        optimizer, finalize_grads = _build_dist_opt_optimizer(
+            chunks, model_cfg, impl_cfg, ps
+        )
         from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
         from megatron.lite.runtime.megatron_utils import register_training_hooks
 
@@ -268,7 +371,9 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
 
         def _post_model_load_hook():
             from megatron.lite.model.glm5.lite.model import Glm5Layer
-            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
+            from megatron.lite.primitive.optimizers.fsdp2 import (
+                build_fsdp2_training_optimizer,
+            )
 
             return {
                 "optimizer": build_fsdp2_training_optimizer(
@@ -313,12 +418,16 @@ def load_hf_weights(
 
 
 def export_hf_weights(chunks, model_cfg: Glm5Config, ps: ParallelState, **kwargs):
-    from megatron.lite.model.glm5.lite.checkpoint import export_hf_weights as export_impl
+    from megatron.lite.model.glm5.lite.checkpoint import (
+        export_hf_weights as export_impl,
+    )
 
     yield from export_impl(chunks, model_cfg, ps, **kwargs)
 
 
-def save_hf_weights(chunks, path: str, model_cfg: Glm5Config, ps: ParallelState, **kwargs):
+def save_hf_weights(
+    chunks, path: str, model_cfg: Glm5Config, ps: ParallelState, **kwargs
+):
     from megatron.lite.model.glm5.lite.checkpoint import save_hf_weights as save_impl
 
     save_impl(chunks, path, model_cfg, ps, **kwargs)

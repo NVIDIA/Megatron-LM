@@ -1,6 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 import logging
+import math
+import warnings
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -8,6 +12,7 @@ import pytest
 import torch
 
 import megatron.core.parallel_state as parallel_state
+from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     _validate_dsa_index_share_pipeline_split,
     get_dsa_module_spec_for_backend,
@@ -16,7 +21,8 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.cuda_graph_config import is_packed_dsa_cp_cuda_graph_experimental
+from megatron.core.transformer.enums import AttnMaskType, CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.experimental_attention_variant import dsa_indexer_loss, dsa_kernels
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
@@ -28,8 +34,11 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
     FusedDSAIndexerLoss,
+    _compute_indexer_teacher_probabilities,
+    _normalize_indexer_teacher_target,
     _run_sparse_attention,
     _validate_nonpacked_cp_uniform_length,
+    bwd_fused_indexer_loss_naive,
     compute_dsa_indexer_loss,
     fused_qk_topk_naive,
     is_dsa_skip_topk_layer,
@@ -38,8 +47,11 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     unfused_dsa_fn,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+    build_packed_allgather_cp_all_rank_positions,
     build_packed_allgather_cp_local_positions,
+    build_packed_allgather_cp_local_positions_from_host,
     build_packed_allgather_cp_query_positions_and_key_reorder,
+    build_packed_allgather_cp_query_positions_and_key_reorder_from_host,
     build_zigzag_allgather_cp_key_reorder,
     extract_query_positions_from_position_ids,
     get_cp_positions_from_layout,
@@ -48,8 +60,11 @@ from megatron.core.transformer.experimental_attention_variant.dsa_masking import
     build_causal_mask_from_positions,
     build_dsattention_forward_mask,
     build_fused_indexer_varlen_bounds,
+    can_prove_all_topk_rows_nonempty,
+    extract_query_valid_rows_from_packed_seq_params,
     generate_varlen_mask_params_for_positions,
     masked_log_softmax,
+    masked_softmax,
     scatter_topk_into_index_mask,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -315,6 +330,146 @@ class _FakeCPGroup:
         return self._rank
 
 
+@pytest.mark.parametrize(
+    ("configured_cp_size", "effective_cp_size", "cp_rank"),
+    [(1, 2, 0), (1, 2, 1), (2, 1, 0), (2, 2, 0), (2, 2, 1), (1, 1, 0)],
+)
+@pytest.mark.parametrize("sequence_lengths", [(8,), (8, 4)])
+@pytest.mark.parametrize("recompute_up_proj", [False, True])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for packed MLA RoPE")
+def test_absorbed_mla_qkv_rope_uses_microbatch_cp_group(
+    monkeypatch, configured_cp_size, effective_cp_size, cp_rank, sequence_lengths, recompute_up_proj
+):
+    """Packed positions and deferred QKV replay must use the forward microbatch's CP group."""
+    Utils.initialize_distributed()
+    torch.manual_seed(1234)
+    effective_group = _FakeCPGroup(effective_cp_size, cp_rank)
+
+    # Explicit per-sequence zigzag positions, independent of the production layout helpers.
+    if effective_cp_size == 1:
+        positions = list(range(8)) + (list(range(4)) if len(sequence_lengths) == 2 else [])
+    else:
+        positions = [0, 1, 6, 7] if cp_rank == 0 else [2, 3, 4, 5]
+        if len(sequence_lengths) == 2:
+            positions += [0, 3] if cp_rank == 0 else [1, 2]
+    positions = torch.tensor(positions, device="cuda")
+    cu_seqlens = (
+        torch.tensor([0, *sequence_lengths], dtype=torch.int32, device="cuda").cumsum(0).int()
+    )
+    packed = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        max_seqlen_q=8,
+        max_seqlen_kv=8,
+        local_cp_size=effective_cp_size,
+        cp_group=effective_group,
+    )
+
+    class TupleLinear(torch.nn.Linear):
+        def forward(self, x):
+            return super().forward(x), None
+
+    class DeferredCheckpoint:
+        """Retain the real QKV closure to test its lifetime without CUDA checkpoint machinery."""
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def checkpoint(self, run_function, *args):
+            self.run_function, self.args = run_function, args
+            return run_function(*args)
+
+    monkeypatch.setattr(
+        "megatron.core.transformer.experimental_attention_variant.absorbed_mla."
+        "tensor_parallel.CheckpointWithoutOutput",
+        DeferredCheckpoint,
+    )
+
+    def make_config(cp_size, dynamic):
+        return MLATransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=2,
+            q_lora_rank=8,
+            kv_lora_rank=8,
+            qk_head_dim=4,
+            qk_pos_emb_head_dim=4,
+            v_head_dim=4,
+            rope_type="rope",
+            context_parallel_size=cp_size,
+            dynamic_context_parallel=dynamic,
+            max_seqlen_per_dp_cp_rank=sum(sequence_lengths) if dynamic else None,
+            cp_comm_type="all_gather",
+            apply_rope_fusion=False,
+            use_cpu_initialization=True,
+        )
+
+    k_up_weight = torch.randn(2, 4, 8, device="cuda")
+    rotary = RotaryEmbedding(
+        4, rotary_percent=1.0, use_cpu_initialization=True, cp_group=effective_group
+    )
+    # Only the surrounding projections are lightweight stand-ins. The QKV and RoPE
+    # implementations under test, including their packed metadata, are the real methods.
+    attention = SimpleNamespace(
+        config=make_config(configured_cp_size, configured_cp_size != effective_cp_size),
+        pg_collection=SimpleNamespace(cp=effective_group),
+        tp_group=_FakeCPGroup(1),
+        use_rope=True,
+        rotary_pos_emb=rotary,
+        _mla_projection_context=lambda **_: nullcontext(),
+        linear_q_down_proj=TupleLinear(16, 8, bias=False).cuda(),
+        linear_kv_down_proj=TupleLinear(16, 12, bias=False).cuda(),
+        linear_q_up_proj=TupleLinear(8, 16, bias=False).cuda(),
+        q_layernorm=torch.nn.Identity(),
+        kv_layernorm=torch.nn.Identity(),
+        num_attention_heads_per_partition=2,
+        q_head_dim=8,
+        _get_kv_up_weights=lambda: (k_up_weight, None),
+        recompute_up_proj=recompute_up_proj,
+        cache_mla_latents=False,
+    )
+    reference = copy.copy(attention)
+    reference.config = make_config(effective_cp_size, False)
+    reference.pg_collection = SimpleNamespace(cp=effective_group)
+    reference.recompute_up_proj = False
+    full_freqs = rotary(8, packed_seq=True)
+    calls = []
+
+    def checked_apply(t, freqs, **kwargs):
+        assert kwargs["cp_group"] is effective_group
+        assert int(positions.max()) < freqs.size(0), "valid packed RoPE positions were truncated"
+        torch.testing.assert_close(freqs[positions], full_freqs[positions], rtol=0, atol=0)
+        calls.append(kwargs["cp_group"])
+        return apply_rotary_pos_emb(t, freqs, **kwargs)
+
+    monkeypatch.setattr(
+        "megatron.core.transformer.experimental_attention_variant.absorbed_mla."
+        "apply_rotary_pos_emb",
+        checked_apply,
+    )
+    hidden_states = torch.randn(len(positions), 1, 16, device="cuda")
+    expected = AbsorbedMLASelfAttention.get_query_key_value_tensors(
+        reference, hidden_states, packed_seq_params=packed
+    )
+    actual = AbsorbedMLASelfAttention.get_query_key_value_tensors(
+        attention, hidden_states, packed_seq_params=packed
+    )
+    for observed, baseline in zip(actual, expected):
+        torch.testing.assert_close(observed, baseline, rtol=0, atol=0)
+
+    if recompute_up_proj:
+        # Forward restores the caller's group, and a later microbatch can replace it.
+        restored_group = _FakeCPGroup(1 if effective_cp_size == 2 else 2)
+        attention.pg_collection.cp = restored_group
+        checkpoint = attention.qkv_up_checkpoint
+        replayed = checkpoint.run_function(*checkpoint.args)
+        for observed, baseline in zip(replayed, expected[:2]):
+            torch.testing.assert_close(observed, baseline, rtol=0, atol=0)
+        assert attention.pg_collection.cp is restored_group
+    assert len(calls) == (6 if recompute_up_proj else 4)
+
+
 @pytest.fixture(autouse=True)
 def patch_hadamard_if_needed():
     """Automatically patch hadamard_transform in dsa module if not installed."""
@@ -353,6 +508,13 @@ def test_dsa_kernel_backend_selects_optional_kernel_module():
         == "megatron.core.transformer.experimental_attention_variant.dsa_cudnn_kernels"
     )
 
+    # The DSA-over-GQA backends load no module, so they behave like "none" here.
+    for backend in ("reference", "min-memory-torch", "min-memory-triton"):
+        config.dsa_kernel_backend = backend
+        assert dsa_kernels._get_backend_module_name(config) is None
+        assert not dsa_kernels.use_fused_dsa_kernels(config)
+
+    config.dsa_kernel_backend = "cudnn"
     config.attention_backend = "unfused"
     assert not dsa_kernels.use_fused_dsa_kernels(config)
 
@@ -397,6 +559,128 @@ def test_dsa_kernel_backend_loader_cache_and_import_errors(monkeypatch):
     monkeypatch.setattr(dsa_kernels, "import_module", fail_import_module)
     with pytest.raises(RuntimeError, match="Failed to import DSA kernel backend"):
         dsa_kernels._load_backend(Config)
+
+
+def test_dsa_all_topk_rows_nonempty_certificate():
+    common = {
+        "computes_topk": True,
+        "indexer_topk": 2,
+        "kv_sequence_length": 4,
+        "attention_mask": None,
+        "query_valid_rows": None,
+        "varlen_is_plain_causal": True,
+        "use_local_indexer_varlen": False,
+        "varlen_starts": None,
+        "varlen_ends": None,
+        "key_positions": None,
+    }
+    assert can_prove_all_topk_rows_nonempty(**common)
+
+    packed_local = {
+        **common,
+        "varlen_is_plain_causal": False,
+        "use_local_indexer_varlen": True,
+        "varlen_starts": torch.tensor([0, 0]),
+        "varlen_ends": torch.tensor([1, 2]),
+    }
+    assert can_prove_all_topk_rows_nonempty(**packed_local)
+
+    unsupported = [
+        {"computes_topk": False},
+        {"indexer_topk": 0},
+        {"kv_sequence_length": 0},
+        {"attention_mask": torch.zeros((1, 1, 2, 4), dtype=torch.bool)},
+        {"query_valid_rows": torch.ones((1, 2), dtype=torch.bool)},
+        {"varlen_is_plain_causal": False},
+        {**packed_local, "key_positions": torch.arange(4)},
+        {**packed_local, "varlen_ends": None},
+    ]
+    for override in unsupported:
+        assert not can_prove_all_topk_rows_nonempty(**{**common, **override})
+
+
+def test_dsa_packed_cp_padding_preserves_nonempty_local_varlen_rows():
+    """Padded THD rows still have causal KV coverage without a real-token mask."""
+    device = torch.device("cpu")
+    cp_size = 2
+    global_rows = 12
+    local_rows = global_rows // cp_size
+    cu_seqlens = torch.tensor([0, 3, 7], dtype=torch.int32, device=device)
+    cu_seqlens_padded = torch.tensor([0, 4, 12], dtype=torch.int32, device=device)
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=8,
+        max_seqlen_kv=8,
+        pad_between_seqs=True,
+    )
+    query_valid_rows = extract_query_valid_rows_from_packed_seq_params(
+        packed_seq_params, b=1, sq=local_rows, device=device
+    )
+    assert query_valid_rows is None
+
+    padding_positions = torch.tensor([3, 8, 9, 10, 11], device=device)
+    all_query_positions = []
+    for cp_rank in range(cp_size):
+        query_positions = build_packed_allgather_cp_local_positions(
+            cu_seqlens_padded,
+            cp_size,
+            cp_rank,
+            device,
+            output_size=local_rows,
+            cu_seqlens_cover_output=True,
+        )
+        all_query_positions.append(query_positions)
+        float_mask, varlen_params, varlen_is_plain_causal = build_dsattention_forward_mask(
+            sq=local_rows,
+            skv=global_rows,
+            b=1,
+            device=device,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            cp_comm_type="allgather",
+            cp_group=None,
+            attn_mask_type=AttnMaskType.causal,
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=packed_seq_params,
+            packed_query_positions=query_positions,
+        )
+        assert float_mask is None
+        assert not varlen_is_plain_causal
+        assert varlen_params is not None
+        starts, ends, key_positions = varlen_params
+        assert key_positions is None
+
+        physical_key_positions = torch.arange(global_rows, device=device)
+        row_has_key = (
+            (physical_key_positions.unsqueeze(0) >= starts.unsqueeze(1))
+            & (physical_key_positions.unsqueeze(0) < ends.unsqueeze(1))
+        ).any(dim=1)
+        assert torch.all(row_has_key)
+        assert torch.any((query_positions.unsqueeze(1) == padding_positions).any(dim=1))
+        assert can_prove_all_topk_rows_nonempty(
+            computes_topk=True,
+            indexer_topk=2,
+            kv_sequence_length=global_rows,
+            attention_mask=None,
+            query_valid_rows=query_valid_rows,
+            varlen_is_plain_causal=varlen_is_plain_causal,
+            use_local_indexer_varlen=True,
+            varlen_starts=starts,
+            varlen_ends=ends,
+            key_positions=key_positions,
+        )
+
+    torch.testing.assert_close(
+        torch.cat(all_query_positions).sort().values,
+        torch.arange(global_rows, device=device),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_dsa_kernel_hooks_return_none_without_backend_function(monkeypatch):
@@ -485,7 +769,9 @@ def test_dsa_kernel_hooks_log_declined_backend(monkeypatch, caplog):
         is None
     )
     assert (
-        dsa_kernels.run_fused_absorbed_sparse_attention(Config, q, q, starts.view(1, 1, 1), 1.0, 1)
+        dsa_kernels.run_fused_absorbed_sparse_attention(
+            Config, q, q, starts.view(1, 1, 1), 1.0, 1, all_topk_rows_nonempty=True
+        )
         is None
     )
     assert (
@@ -549,8 +835,9 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
         seen["loss_kwargs"] = kwargs
         return expected_topk_loss
 
-    def run_fused_absorbed_sparse_attention(*args):
+    def run_fused_absorbed_sparse_attention(*args, all_topk_rows_nonempty=False):
         seen["sparse_args"] = args
+        seen["all_topk_rows_nonempty"] = all_topk_rows_nonempty
         return expected_sparse
 
     def run_fused_dsa_attention(**kwargs):
@@ -584,7 +871,9 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
         is expected_topk
     )
     assert seen["topk_kwargs"]["use_local_indexer_varlen"] is False
-    assert seen["topk_kwargs"]["single_packed_thd_sequence"] is True
+    assert seen["topk_kwargs"]["single_packed_thd_sequence"] is False
+    assert seen["topk_kwargs"]["packed_thd_causal_identity_layout"] is False
+    assert seen["topk_kwargs"]["packed_thd_single_sequence"] is True
     assert seen["topk_kwargs"]["local_packed_cp_rank"] == 3
     assert (
         dsa_kernels.run_fused_qk_topk_with_loss(
@@ -610,18 +899,21 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
     )
     assert seen["loss_kwargs"]["config"] is Config
     assert seen["loss_kwargs"]["calculate_per_token_loss"] is True
-    assert seen["loss_kwargs"]["use_local_indexer_varlen"] is True
-    assert seen["loss_kwargs"]["single_packed_thd_sequence"] is True
+    assert seen["loss_kwargs"]["use_local_indexer_varlen"] is False
+    assert seen["loss_kwargs"]["single_packed_thd_sequence"] is False
+    assert seen["loss_kwargs"]["packed_thd_causal_identity_layout"] is True
+    assert seen["loss_kwargs"]["packed_thd_single_sequence"] is True
     assert seen["loss_kwargs"]["local_packed_cp_rank"] == 2
 
     topk_length = torch.ones((1, 1), dtype=torch.int32)
     assert (
         dsa_kernels.run_fused_absorbed_sparse_attention(
-            Config, q, k, topk_indices, 1.0, 1, topk_length
+            Config, q, k, topk_indices, 1.0, 1, topk_length, all_topk_rows_nonempty=True
         )
         is expected_sparse
     )
     assert seen["sparse_args"][-1] is topk_length
+    assert seen["all_topk_rows_nonempty"] is True
 
     assert (
         dsa_kernels.run_fused_dsa_attention(
@@ -655,6 +947,8 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
     assert seen["full_kwargs"]["varlen_starts"] is starts
     assert seen["full_kwargs"]["use_relu"] is False
     assert seen["full_kwargs"]["varlen_is_plain_causal"] is True
+    assert seen["full_kwargs"]["use_local_indexer_varlen"] is False
+    assert seen["full_kwargs"]["packed_thd_causal_identity_layout"] is True
 
 
 def test_dsa_kernel_dependency_validation(monkeypatch):
@@ -1668,6 +1962,140 @@ class TestRotateActivation:
             rotate_activation(x)
 
 
+def test_indexer_teacher_probability_matches_full_softmax_oracle():
+    """External mass changes the denominator but not the compressed-key support."""
+    attention_scores = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]])
+    valid_mask = torch.ones((1, 2, 2), dtype=torch.bool)
+    non_compressed_lse = torch.tensor([[[0.5, 1.5]]])
+
+    actual = _compute_indexer_teacher_probabilities(
+        attention_scores, valid_mask, non_compressed_lse
+    )
+    expected_denominator = torch.logaddexp(
+        torch.logsumexp(attention_scores, dim=-1), non_compressed_lse
+    )
+    expected = torch.exp(attention_scores - expected_denominator.unsqueeze(-1))
+    torch.testing.assert_close(actual, expected)
+
+    normalized = _normalize_indexer_teacher_target(actual.sum(dim=1), non_compressed_lse)
+    torch.testing.assert_close(normalized.sum(dim=-1), torch.ones((1, 2)))
+
+
+def test_indexer_teacher_probability_rescales_underflowed_external_mass():
+    """A huge external LSE preserves the relative compressed-key teacher target."""
+    attention_scores = torch.tensor([[[[0.0, -1.0]], [[-2.0, 1.0]]]], dtype=torch.float32)
+    valid_mask = torch.ones((1, 1, 2), dtype=torch.bool)
+    non_compressed_lse = torch.tensor([[[1000.0], [1002.0]]], dtype=torch.float32)
+
+    probabilities = _compute_indexer_teacher_probabilities(
+        attention_scores, valid_mask, non_compressed_lse
+    )
+    normalized = _normalize_indexer_teacher_target(probabilities.sum(dim=1), non_compressed_lse)
+
+    scores64 = attention_scores.double()
+    compressed_lse64 = torch.logsumexp(scores64, dim=-1)
+    full_lse64 = torch.logaddexp(non_compressed_lse.double(), compressed_lse64)
+    log_probabilities64 = scores64 - full_lse64.unsqueeze(-1)
+    expected = torch.softmax(torch.logsumexp(log_probabilities64, dim=1), dim=-1).float()
+
+    assert torch.isfinite(probabilities).all()
+    torch.testing.assert_close(normalized.sum(dim=-1), torch.ones((1, 1)))
+    torch.testing.assert_close(normalized, expected)
+
+
+def test_indexer_teacher_probability_keeps_fully_masked_rows_zero():
+    """A fully masked compressed row remains finite and exactly zero."""
+    attention_scores = torch.tensor([[[[1.0, 2.0]]]], requires_grad=True)
+    valid_mask = torch.zeros((1, 1, 2), dtype=torch.bool)
+    non_compressed_lse = torch.full((1, 1, 1), float("-inf"))
+
+    target = _compute_indexer_teacher_probabilities(
+        attention_scores, valid_mask, non_compressed_lse
+    )
+    assert torch.isfinite(target).all()
+    torch.testing.assert_close(target, torch.zeros_like(target))
+
+    normalized = _normalize_indexer_teacher_target(target.sum(dim=1), non_compressed_lse)
+    assert torch.isfinite(normalized).all()
+    torch.testing.assert_close(normalized, torch.zeros_like(normalized))
+    target.sum().backward()
+    assert torch.isfinite(attention_scores.grad).all()
+    torch.testing.assert_close(attention_scores.grad, torch.zeros_like(attention_scores))
+
+
+def test_indexer_teacher_probability_preserves_legacy_path():
+    """Without external mass, probability and target normalization stay unchanged."""
+    attention_scores = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]])
+    valid_mask = torch.tensor([[[True, False], [False, False]]])
+    expanded_valid_mask = valid_mask.unsqueeze(1)
+
+    actual = _compute_indexer_teacher_probabilities(attention_scores, valid_mask)
+    expected = masked_softmax(attention_scores.float(), expanded_valid_mask, dim=-1)
+    torch.testing.assert_close(actual, expected)
+
+    actual_normalized = _normalize_indexer_teacher_target(actual.sum(dim=1), None)
+    expected_normalized = dsa_indexer_loss.normalize_indexer_target(expected.sum(dim=1))
+    torch.testing.assert_close(actual_normalized, expected_normalized)
+
+
+def test_indexer_teacher_valid_zero_mass_has_zero_manual_gradient():
+    """A valid row with zero teacher mass has zero manual KL gradient."""
+    q = torch.ones((1, 1, 1, 1), dtype=torch.float32)
+    weights = torch.ones((1, 1, 1), dtype=torch.float32)
+    k = torch.ones((1, 1, 1), dtype=torch.float32)
+    query = torch.ones((1, 1, 1, 1), dtype=torch.float32)
+    key = torch.ones((1, 1, 1, 1), dtype=torch.float32)
+
+    grad_q, grad_weights, grad_k = bwd_fused_indexer_loss_naive(
+        q=q,
+        weights=weights,
+        k=k,
+        query=query,
+        key=key,
+        topk_indices=torch.zeros((1, 1, 1), dtype=torch.long),
+        softmax_scale=1.0,
+        loss_coeff=1.0,
+        sparse_loss=False,
+        mask=torch.zeros((1, 1), dtype=torch.float32),
+        grad_loss=torch.tensor(1.0),
+        pg_collection=SimpleNamespace(tp=SimpleNamespace(size=lambda: 1)),
+        non_compressed_lse=torch.full((1, 1, 1), float("inf"), dtype=torch.float32),
+    )
+
+    torch.testing.assert_close(grad_q, torch.zeros_like(grad_q))
+    torch.testing.assert_close(grad_weights, torch.zeros_like(grad_weights))
+    torch.testing.assert_close(grad_k, torch.zeros_like(grad_k))
+
+
+def test_indexer_loss_empty_query_returns_zero_key_gradient():
+    """An empty query batch must not return an empty-shaped key gradient."""
+    q = torch.empty((0, 1, 1, 2), dtype=torch.float32)
+    weights = torch.empty((0, 1, 1), dtype=torch.float32)
+    k = torch.ones((3, 1, 2), dtype=torch.float32)
+    query = torch.empty((0, 1, 1, 2), dtype=torch.float32)
+    key = torch.ones((3, 1, 1, 2), dtype=torch.float32)
+
+    grad_q, grad_weights, grad_k = bwd_fused_indexer_loss_naive(
+        q=q,
+        weights=weights,
+        k=k,
+        query=query,
+        key=key,
+        topk_indices=torch.empty((1, 0, 1), dtype=torch.long),
+        softmax_scale=1.0,
+        loss_coeff=1.0,
+        sparse_loss=False,
+        mask=torch.empty((0, 3), dtype=torch.float32),
+        grad_loss=torch.tensor(1.0),
+        pg_collection=SimpleNamespace(tp=SimpleNamespace(size=lambda: 1)),
+    )
+
+    assert grad_q.shape == q.shape
+    assert grad_weights.shape == weights.shape
+    assert grad_k.shape == k.shape
+    torch.testing.assert_close(grad_k, torch.zeros_like(k))
+
+
 @pytest.mark.parametrize("seqlen_and_topk", [[16, 32], [64, 32]])
 class TestComputeDSAIndexerLoss:
     """Test compute_dsa_indexer_loss function."""
@@ -1869,6 +2297,11 @@ class TestDSAIndexerLossAutoScaler:
         )
         yield
         Utils.destroy_model_parallel()
+
+    @pytest.fixture(autouse=True)
+    def reset_loss_scale(self):
+        yield
+        DSAIndexerLossAutoScaler.main_loss_backward_scale = None
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_forward_pass(self):
@@ -2301,6 +2734,71 @@ class TestDSAIndexer:
         assert self.indexer.index_head_dim == 64
         assert self.indexer.index_topk == 32
         assert self.indexer.k_norm.eps == pytest.approx(1e-6)
+        assert all(not param.requires_grad for param in self.indexer.parameters())
+
+    def test_kpool_projection_precision_and_backward(self, seqlen):
+        self.indexer.cuda()
+        x = torch.randn(seqlen, 1, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        qr = torch.randn(seqlen, 1, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        gate = torch.nn.Parameter(torch.randn(64, 256, device="cuda", dtype=torch.bfloat16))
+        with (
+            patch.object(self.indexer, "index_kpool", 4),
+            patch.object(self.indexer, "index_kpool_compress_gate", gate),
+            patch.object(self.config, "dsa_indexer_rotate_activation", False),
+        ):
+            q, k, weights = self.indexer.forward_before_topk(x, qr)
+            gate_score = self.indexer._kpool_gate_score
+            assert q.dtype == k.dtype == gate_score.dtype == torch.bfloat16
+            torch.testing.assert_close(gate_score, torch.nn.functional.linear(x, gate))
+            (
+                q.float().sum() + k.float().sum() + weights.sum() + gate_score.float().sum()
+            ).backward()
+            assert torch.isfinite(x.grad).all()
+            assert torch.isfinite(qr.grad).all()
+            assert torch.isfinite(gate.grad).all()
+
+    @pytest.mark.parametrize("zero_centered", [False, True])
+    def test_k_norm_fp32_honors_zero_centered_gamma(self, seqlen, zero_centered):
+        """The explicit FP32 LayerNorm path must match TE's zero-centered gamma contract."""
+        del seqlen
+        self.indexer.cuda()
+        x = torch.randn(4, 1, 256, device="cuda", dtype=torch.bfloat16)
+        qr = torch.randn(4, 1, 64, device="cuda", dtype=torch.bfloat16)
+        original_weight = self.indexer.k_norm.weight.detach().clone()
+        original_bias = self.indexer.k_norm.bias.detach().clone()
+        original_fp32 = self.config.dsa_indexer_k_norm_fp32
+        original_zero_centered = self.config.layernorm_zero_centered_gamma
+        original_rotate = self.config.dsa_indexer_rotate_activation
+        try:
+            self.config.dsa_indexer_k_norm_fp32 = True
+            self.config.layernorm_zero_centered_gamma = zero_centered
+            self.config.dsa_indexer_rotate_activation = False
+            with torch.no_grad():
+                # TE stores gamma - 1 when zero-centered gamma is enabled.
+                self.indexer.k_norm.weight.fill_(0.0 if zero_centered else 1.0)
+                self.indexer.k_norm.bias.zero_()
+            with self.indexer._projection_quantization_context():
+                k_linear, _ = self.indexer.linear_wk(x)
+            with patch.object(
+                self.indexer, "_apply_rope", side_effect=lambda value, *args, **kwargs: value
+            ):
+                _, k, _ = self.indexer.forward_before_topk(x, qr)
+            expected = torch.nn.functional.layer_norm(
+                k_linear.float(),
+                (self.indexer.index_head_dim,),
+                torch.ones(self.indexer.index_head_dim, device="cuda"),
+                torch.zeros(self.indexer.index_head_dim, device="cuda"),
+                self.indexer.k_norm.eps,
+            ).to(dtype=k.dtype)
+            torch.testing.assert_close(k, expected)
+            assert torch.count_nonzero(k).item() > 0
+        finally:
+            with torch.no_grad():
+                self.indexer.k_norm.weight.copy_(original_weight)
+                self.indexer.k_norm.bias.copy_(original_bias)
+            self.config.dsa_indexer_k_norm_fp32 = original_fp32
+            self.config.layernorm_zero_centered_gamma = original_zero_centered
+            self.config.dsa_indexer_rotate_activation = original_rotate
 
     @pytest.mark.parametrize("interleaved", [False, True])
     def test_dsa_indexer_rope_interleave_follows_config(self, seqlen, interleaved):
@@ -2372,6 +2870,150 @@ class TestDSAIndexer:
         _assert_topk_indices_in_bounds_or_invalid(topk_indices, seqlen)
         # Make sure no duplicate indices are selected
         _assert_valid_topk_indices_unique(topk_indices)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("packed", [False, True], ids=["sbhd", "thd"])
+    @pytest.mark.parametrize("rotary_percent", [1.0, 0.5], ids=["full", "partial-fallback"])
+    def test_dsa_indexer_fused_rope_matches_unfused(self, seqlen, packed, rotary_percent):
+        """Fused leading-channel RoPE or fallback must preserve values and all gradients."""
+        from megatron.core.extensions.transformer_engine import TELinear, TENorm
+        from megatron.core.transformer.spec_utils import ModuleSpec
+
+        def build_indexer(apply_rope_fusion):
+            config = copy.deepcopy(self.config)
+            config.apply_rope_fusion = apply_rope_fusion
+            config.rotary_percent = rotary_percent
+            config.dsa_indexer_rope_interleaved = True
+            config.dsa_indexer_k_norm_fp32 = True
+            config.dsa_indexer_rotate_activation = False
+            # Keep the indexer projections trainable so parameter gradients are compared.
+            config.dsa_indexer_loss_coeff = 1.0
+            submodules = DSAIndexerSubmodules(
+                linear_wq_b=ModuleSpec(module=TELinear),
+                linear_wk=ModuleSpec(module=TELinear),
+                k_norm=ModuleSpec(module=TENorm),
+                linear_weights_proj=ModuleSpec(module=TELinear),
+            )
+            return DSAIndexer(config, submodules, self.pg_collection).cuda()
+
+        unfused_indexer = build_indexer(False)
+        fused_indexer = build_indexer(True)
+        fused_indexer.load_state_dict(unfused_indexer.state_dict())
+        batch_size = 1
+        x_values = torch.randn(
+            seqlen, batch_size, self.config.hidden_size, dtype=torch.bfloat16, device="cuda"
+        )
+        qr_values = torch.randn(
+            seqlen, batch_size, self.config.q_lora_rank, dtype=torch.bfloat16, device="cuda"
+        )
+        q_grad = torch.randn(
+            seqlen,
+            batch_size,
+            unfused_indexer.index_n_heads,
+            unfused_indexer.index_head_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        k_grad = torch.randn(
+            seqlen, batch_size, unfused_indexer.index_head_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        weights_grad = torch.randn(
+            seqlen, batch_size, unfused_indexer.index_n_heads, dtype=torch.bfloat16, device="cuda"
+        )
+        packed_seq_params = None
+        if packed:
+            first_seqlen = seqlen // 4
+            cu_seqlens = torch.tensor([0, first_seqlen, seqlen], dtype=torch.int32, device="cuda")
+            packed_seq_params = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=seqlen - first_seqlen,
+                max_seqlen_kv=seqlen - first_seqlen,
+            )
+
+        def run(indexer):
+            x = x_values.detach().clone().requires_grad_(True)
+            qr = qr_values.detach().clone().requires_grad_(True)
+            q, k, weights = indexer.forward_before_topk(x, qr, packed_seq_params)
+            torch.autograd.backward((q, k, weights), (q_grad, k_grad, weights_grad))
+            parameter_grads = {
+                name: parameter.grad.detach().clone()
+                for name, parameter in indexer.named_parameters()
+                if parameter.grad is not None
+            }
+            return (
+                (q.detach().clone(), k.detach().clone(), weights.detach().clone()),
+                (x.grad.detach().clone(), qr.grad.detach().clone()),
+                parameter_grads,
+            )
+
+        unfused = run(unfused_indexer)
+        fused = run(fused_indexer)
+
+        for actual, expected in zip(fused[0], unfused[0]):
+            torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=5e-2)
+        for actual, expected in zip(fused[1], unfused[1]):
+            torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=5e-2)
+        assert fused[2].keys() == unfused[2].keys()
+        for name in fused[2]:
+            actual = fused[2][name].float()
+            expected = unfused[2][name].float()
+            relative_l2_error = torch.linalg.vector_norm(
+                actual - expected
+            ) / torch.linalg.vector_norm(expected).clamp_min(torch.finfo(torch.float32).tiny)
+            assert relative_l2_error < 1e-2, (
+                f"gradient relative L2 mismatch for {name}: "
+                f"{relative_l2_error.item():.6e} >= 1e-2"
+            )
+            torch.testing.assert_close(
+                actual,
+                expected,
+                rtol=2e-2,
+                # Parameter gradients reduce over the sequence dimension. Scale the
+                # near-zero absolute tolerance with the square root of the reduction
+                # length, while the relative-L2 check above bounds aggregate error.
+                atol=5e-2 * math.sqrt(seqlen),
+                msg=lambda msg: f"gradient mismatch for {name}: {msg}",
+            )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_kpool_gate_score_released_after_selection(self, seqlen):
+        """KPool selection must not retain its token-aligned gate activation."""
+        self.indexer.cuda()
+        x = torch.randn(seqlen, 1, self.config.hidden_size, dtype=torch.bfloat16, device="cuda")
+        qr = torch.randn(seqlen, 1, self.config.q_lora_rank, dtype=torch.bfloat16, device="cuda")
+        gate = torch.nn.Parameter(
+            torch.randn(
+                self.indexer.index_head_dim,
+                self.config.hidden_size,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+        )
+        seen_gate = []
+
+        def fake_kpool(*args, **kwargs):
+            del kwargs
+            seen_gate.append(args[5])
+            return (
+                torch.zeros(1, seqlen, seqlen, device="cuda", dtype=torch.float32),
+                torch.zeros(1, seqlen, 8, device="cuda", dtype=torch.long),
+            )
+
+        with (
+            patch.object(self.indexer, "index_kpool", 4),
+            patch.object(self.indexer, "index_topk", 8),
+            patch.object(self.indexer, "index_kpool_compress_gate", gate),
+            patch(
+                "megatron.core.transformer.experimental_attention_variant.dsa.fused_qk_topk_kpool",
+                side_effect=fake_kpool,
+            ),
+        ):
+            self.indexer.forward_with_scores(x, qr)
+
+        assert seen_gate and seen_gate[0] is not None
+        assert self.indexer._kpool_gate_score is None
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_dsa_indexer_forward_with_scores(self, seqlen):
@@ -2634,6 +3276,79 @@ class TestDSAttention:
         assert output is expected_output
         assert seen["loss_coeff"] == 0.0
 
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize(
+        ("attn_mask_type", "with_attention_mask"),
+        [(AttnMaskType.causal, False), (AttnMaskType.causal, True), (None, True)],
+        ids=["causal-no-tensor", "causal-with-tensor", "explicit-empty-row"],
+    )
+    def test_split_attention_certifies_normalized_mask(
+        self, monkeypatch, attn_mask_type, with_attention_mask
+    ):
+        """Split attention certifies effective causal masks and preserves explicit empty rows."""
+        seq_len = 4
+        batch_size = 1
+        num_heads = self.config.num_attention_heads
+        latent_dim = self.config.kv_lora_rank
+        head_dim = latent_dim + self.config.qk_pos_emb_head_dim
+        attention_mask = None
+        if with_attention_mask:
+            attention_mask = torch.ones((batch_size, 1, seq_len, seq_len), dtype=torch.bool).triu(1)
+            if attn_mask_type is None:
+                attention_mask[:, :, 0, :] = True
+        seen = {}
+
+        def fake_forward_before_topk(_x, _qr, _packed_seq_params):
+            return (
+                torch.ones(seq_len, batch_size, 2, 4),
+                torch.ones(seq_len, batch_size, 4),
+                torch.ones(seq_len, batch_size, 2),
+            )
+
+        def decline_full_attention(**_kwargs):
+            seen["full_attention_declined"] = True
+            return None
+
+        def fake_sparse_attention(_config, query, _key, topk_indices, _scale, v_channels, **kwargs):
+            seen["certificate"] = kwargs["all_topk_rows_nonempty"]
+            seen["first_row_topk"] = topk_indices[:, 0, :]
+            return query.new_zeros((seq_len, batch_size, num_heads, v_channels))
+
+        monkeypatch.setattr(self.config, "attention_backend", "auto")
+        monkeypatch.setattr(self.config, "dsa_kernel_backend", "cudnn")
+        monkeypatch.setattr(
+            self.sparse_attention.indexer, "forward_before_topk", fake_forward_before_topk
+        )
+        monkeypatch.setattr(dsa_kernels, "run_fused_dsa_attention", decline_full_attention)
+        monkeypatch.setattr(dsa_kernels, "run_fused_qk_topk", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(
+            dsa_kernels, "run_fused_absorbed_sparse_attention", fake_sparse_attention
+        )
+
+        was_training = self.sparse_attention.training
+        self.sparse_attention.eval()
+        try:
+            output = self.sparse_attention(
+                query=torch.randn(seq_len, batch_size, num_heads, head_dim),
+                key=torch.randn(seq_len, batch_size, 1, head_dim),
+                value=None,
+                up_v_weight=torch.randn(num_heads, self.config.v_head_dim, latent_dim),
+                x=torch.randn(seq_len, batch_size, self.config.hidden_size),
+                qr=torch.randn(seq_len, batch_size, self.config.q_lora_rank),
+                attention_mask=attention_mask,
+                attn_mask_type=attn_mask_type,
+            )
+        finally:
+            self.sparse_attention.train(was_training)
+
+        assert output.shape == (seq_len, batch_size, num_heads * self.config.v_head_dim)
+        assert seen["full_attention_declined"]
+        assert seen["certificate"] is (attn_mask_type == AttnMaskType.causal)
+        if attn_mask_type is None:
+            assert torch.all(seen["first_row_topk"] == -1)
+        else:
+            assert torch.any(seen["first_row_topk"] == 0)
+
     def test_packed_dense_indexer_loss_uses_local_varlen_on_fused_path(self, monkeypatch):
         """Packed dense indexer loss should keep local varlen and be owned by the backend."""
         seq_len = 4
@@ -2812,6 +3527,118 @@ class TestDSAttention:
         assert seen["use_local_indexer_varlen"] is True
         assert seen["single_packed_thd_sequence"] is True
         assert seen["local_packed_cp_rank"] == cp_rank
+
+    def test_packed_layout_reuses_non_sp_reorder_for_sequence_parallel(self, monkeypatch):
+        """The sequence-parallel KV gather reuses the packed layout built without SP."""
+        local_seq_len = 4
+        tp_size = 2
+        cp_size = 2
+        tp_rank = 1
+        cp_rank = 1
+        cp_local_seq_len = local_seq_len * tp_size
+        global_seq_len = cp_local_seq_len * cp_size
+        batch_size = 1
+        num_heads = self.config.num_attention_heads
+        head_dim = self.config.hidden_size // num_heads
+        tp_group = _FakeCPGroup(tp_size, tp_rank)
+        cp_group = _FakeCPGroup(cp_size, cp_rank)
+        reorder_builds = []
+
+        def _counted_host_reorder(*args, **kwargs):
+            reorder_builds.append(
+                (
+                    kwargs["local_output_size"],
+                    kwargs["key_local_output_size"],
+                    kwargs["global_output_size"],
+                    kwargs["query_cu_seqlens_cover_output"],
+                    kwargs["key_cu_seqlens_cover_output"],
+                )
+            )
+            return build_packed_allgather_cp_query_positions_and_key_reorder_from_host(
+                *args, **kwargs
+            )
+
+        def _fake_forward_before_topk(_x, _qr, _packed_seq_params):
+            return (
+                torch.randn(cp_local_seq_len, batch_size, 2, 4),
+                torch.randn(cp_local_seq_len, batch_size, 4),
+                torch.ones(cp_local_seq_len, batch_size, 2),
+            )
+
+        def _fake_gather_from_sequence_parallel_region(tensor, group):
+            assert group is tp_group or group is cp_group
+            return torch.cat([tensor, tensor], dim=0)
+
+        def _fake_run_fused_attention(**kwargs):
+            return (
+                torch.zeros(
+                    kwargs["query"].size(0),
+                    batch_size,
+                    self.config.hidden_size,
+                    dtype=kwargs["query"].dtype,
+                    device=kwargs["query"].device,
+                ),
+                None,
+            )
+
+        monkeypatch.setattr(self.config, "attention_backend", "auto")
+        monkeypatch.setattr(self.config, "dsa_kernel_backend", "cudnn")
+        monkeypatch.setattr(self.config, "dsa_indexer_loss_coeff", 0.0)
+        monkeypatch.setattr(self.config, "sequence_parallel", False)
+        monkeypatch.setattr(self.sparse_attention, "cp_comm_type", "allgather")
+        monkeypatch.setattr(self.sparse_attention.pg_collection, "tp", tp_group)
+        monkeypatch.setattr(self.sparse_attention.pg_collection, "cp", cp_group)
+        monkeypatch.setattr(
+            self.sparse_attention.indexer, "forward_before_topk", _fake_forward_before_topk
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa." "_cp_reorder_from_host",
+            _counted_host_reorder,
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa."
+            "gather_from_sequence_parallel_region",
+            _fake_gather_from_sequence_parallel_region,
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa."
+            "dsa_kernels.run_fused_dsa_attention",
+            _fake_run_fused_attention,
+        )
+
+        cu_seqlens = torch.tensor([0, global_seq_len], dtype=torch.int32)
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens.clone(),
+            cu_seqlens_kv_padded=cu_seqlens.clone(),
+            max_seqlen_q=global_seq_len,
+            max_seqlen_kv=global_seq_len,
+        )
+        packed_seq_params.thd_cp_host_cu_seqlens_q = [0, global_seq_len]
+        packed_seq_params.thd_cp_host_cu_seqlens_kv = [0, global_seq_len]
+
+        def _forward(seq_len):
+            return self.sparse_attention(
+                query=torch.randn(seq_len, batch_size, num_heads, head_dim),
+                key=torch.randn(seq_len, batch_size, num_heads, head_dim),
+                value=torch.randn(seq_len, batch_size, num_heads, head_dim),
+                x=torch.randn(seq_len, batch_size, self.config.hidden_size),
+                qr=torch.randn(seq_len, batch_size, self.config.q_lora_rank),
+                attention_mask=None,
+                attn_mask_type=AttnMaskType.causal,
+                packed_seq_params=packed_seq_params,
+            )
+
+        expected_build = (cp_local_seq_len, cp_local_seq_len, global_seq_len, True, True)
+
+        _forward(cp_local_seq_len)
+        assert reorder_builds == [expected_build]
+        self.config.sequence_parallel = True
+        _forward(local_seq_len)
+
+        assert reorder_builds == [expected_build]
 
     def test_packed_cp_gathers_local_indexer_key_with_global_attention_kv(self, monkeypatch):
         """A pre-gathered attention KV still requires gathering the local indexer key."""
@@ -3175,6 +4002,7 @@ class TestIndexerTensorParallel:
             dsa_indexer_n_heads=8,
             dsa_indexer_head_dim=64,
             dsa_indexer_topk=32,
+            dsa_indexer_loss_coeff=1.0,
         )
 
     def _create_indexer(self, config, pg_collection):
@@ -3876,12 +4704,427 @@ class TestDSAModuleSpecDispatch:
         with pytest.raises(ValueError, match="requires add_bias_linear=False"):
             self._make_dsa_config(experimental_attention_variant="dsa", add_bias_linear=True)
 
+    def test_dsa_accepts_fused_standard_rope(self):
+        """DSA can use the absorbed-MLA fused path with standard RoPE."""
+        config = self._make_dsa_config(experimental_attention_variant="dsa", apply_rope_fusion=True)
+        assert config.apply_rope_fusion
+
     def test_dsa_cp_requires_allgather_cp_comm_type(self):
         """DSA context parallelism should fail early for unsupported CP communication."""
         with pytest.raises(AssertionError, match="allgather"):
             self._make_dsa_config(
                 experimental_attention_variant="dsa", context_parallel_size=2, cp_comm_type="p2p"
             )
+
+    def _make_packed_dsa_graph_config(self, monkeypatch, **overrides):
+        monkeypatch.setattr(
+            "megatron.core.transformer.transformer_config."
+            "_validate_dsa_kernel_backend_dependencies",
+            lambda _backend: None,
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.transformer_config.is_te_min_version", lambda _version: True
+        )
+        kwargs = {
+            "experimental_attention_variant": "dsa",
+            "dsa_kernel_backend": "cudnn",
+            "sequence_packing_scheduler": "dp_balanced",
+            "max_seqlen_per_dp_cp_rank": 128,
+            "pad_packed_seq_alignment": "max",
+            "thd_max_packed_sequences": 4,
+            "context_parallel_size": 2,
+            "cp_comm_type": "allgather",
+            "cuda_graph_impl": "local",
+            "cuda_graph_modules": [CudaGraphModule.attn],
+        }
+        kwargs.update(overrides)
+        return self._make_dsa_config(**kwargs)
+
+    @pytest.mark.parametrize(
+        ("context_parallel_size", "cuda_graph_impl", "cuda_graph_modules"),
+        [
+            (2, "local", []),
+            (2, "local", [CudaGraphModule.attn]),
+            (2, "local", [CudaGraphModule.attn, CudaGraphModule.attn]),
+            (2, "local", [CudaGraphModule.mlp]),
+            (2, "local", [CudaGraphModule.mlp, CudaGraphModule.mlp]),
+            (2, "local", [CudaGraphModule.attn, CudaGraphModule.mlp]),
+            (2, "local", [CudaGraphModule.attn, CudaGraphModule.mamba]),
+            (2, "transformer_engine", [CudaGraphModule.attn]),
+            (2, "transformer_engine", [CudaGraphModule.attn, CudaGraphModule.attn]),
+            (2, "transformer_engine", []),
+            (2, "transformer_engine", [CudaGraphModule.attn, CudaGraphModule.mlp]),
+            (4, "local", []),
+            (4, "local", [CudaGraphModule.attn]),
+            (4, "local", [CudaGraphModule.mlp]),
+            (4, "transformer_engine", [CudaGraphModule.attn]),
+            (4, "transformer_engine", []),
+        ],
+        ids=[
+            "cp2_local_whole_layer",
+            "cp2_local_attention",
+            "cp2_local_attention_repeated",
+            "cp2_local_mlp_only",
+            "cp2_local_mlp_only_repeated",
+            "cp2_local_attention_mlp",
+            "cp2_local_attention_mamba",
+            "cp2_te_attention",
+            "cp2_te_attention_repeated",
+            "cp2_te_whole_layer",
+            "cp2_te_attention_mlp",
+            "cp4_local_whole_layer",
+            "cp4_local_attention",
+            "cp4_local_mlp_only",
+            "cp4_te_attention",
+            "cp4_te_whole_layer",
+        ],
+    )
+    def test_previously_rejected_packed_cudnn_dsa_cp_graph_configs_now_warn(
+        self, monkeypatch, context_parallel_size, cuda_graph_impl, cuda_graph_modules
+    ):
+        with pytest.warns(UserWarning, match="experimental and not fully supported"):
+            config = self._make_packed_dsa_graph_config(
+                monkeypatch,
+                context_parallel_size=context_parallel_size,
+                cuda_graph_impl=cuda_graph_impl,
+                cuda_graph_modules=cuda_graph_modules,
+            )
+        assert isinstance(config, MLATransformerConfig)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {
+                "cuda_graph_impl": "none",
+                "enable_cuda_graph": True,
+                "cuda_graph_modules": [CudaGraphModule.attn],
+            },
+            {
+                "cuda_graph_impl": "none",
+                "external_cuda_graph": True,
+                "cuda_graph_modules": [CudaGraphModule.attn],
+            },
+            {"cuda_graph_impl": "local", "cuda_graph_modules": "attn"},
+            {"cuda_graph_impl": "local", "cuda_graph_modules": "attn,attn"},
+        ],
+        ids=[
+            "deprecated_local_flag",
+            "deprecated_te_flag",
+            "string_scope",
+            "repeated_string_scope",
+        ],
+    )
+    def test_packed_cudnn_dsa_cp_graph_warning_follows_normalized_legacy_inputs(
+        self, monkeypatch, overrides
+    ):
+        with pytest.warns(UserWarning, match="experimental and not fully supported"):
+            config = self._make_packed_dsa_graph_config(monkeypatch, **overrides)
+        assert isinstance(config, MLATransformerConfig)
+
+    @pytest.mark.parametrize(
+        ("overrides", "expected_warning"),
+        [
+            ({"context_parallel_size": 1, "cp_comm_type": None}, False),
+            ({"experimental_attention_variant": None}, False),
+            (
+                {
+                    "sequence_packing_scheduler": None,
+                    "max_seqlen_per_dp_cp_rank": None,
+                    "pad_packed_seq_alignment": None,
+                    "thd_max_packed_sequences": None,
+                },
+                False,
+            ),
+            ({"cuda_graph_impl": "none"}, False),
+            (
+                {
+                    "cuda_graph_impl": "transformer_engine",
+                    "cuda_graph_modules": [CudaGraphModule.mlp],
+                },
+                True,
+            ),
+            (
+                {
+                    "sequence_packing_scheduler": "default_dynamic_cp",
+                    "dynamic_context_parallel": True,
+                    "cuda_graph_impl": "transformer_engine",
+                    "cuda_graph_modules": [CudaGraphModule.mlp],
+                },
+                True,
+            ),
+            (
+                {
+                    "context_parallel_size": 1,
+                    "cp_comm_type": "all_gather",
+                    "sequence_packing_scheduler": "default_dynamic_cp",
+                    "dynamic_context_parallel": True,
+                },
+                True,
+            ),
+            ({"context_parallel_size": 3}, True),
+            (
+                {
+                    "context_parallel_size": 4,
+                    "cuda_graph_impl": "transformer_engine",
+                    "cuda_graph_modules": [CudaGraphModule.mlp],
+                },
+                True,
+            ),
+            (
+                {
+                    "context_parallel_size": 4,
+                    "cuda_graph_modules": [CudaGraphModule.attn, CudaGraphModule.mlp],
+                },
+                True,
+            ),
+            (
+                {
+                    "context_parallel_size": 4,
+                    "dsa_kernel_backend": "none",
+                    "cuda_graph_modules": [CudaGraphModule.attn],
+                },
+                True,
+            ),
+            ({"sequence_packing_scheduler": "default_dynamic_cp"}, False),
+            (
+                {
+                    "cuda_graph_modules": [],
+                    "inference_cuda_graph_scope": InferenceCudaGraphScope.block,
+                },
+                True,
+            ),
+            ({"cuda_graph_impl": "local", "cuda_graph_modules": [CudaGraphModule.mamba]}, True),
+            ({"cuda_graph_impl": "full_iteration", "cuda_graph_modules": []}, True),
+        ],
+        ids=[
+            "cp1",
+            "non_dsa",
+            "nonpacked",
+            "cuda_graph_disabled",
+            "te_mlp",
+            "dynamic_te_mlp",
+            "dynamic_configured_cp1",
+            "configured_cp3",
+            "configured_cp4_te_mlp",
+            "configured_cp4_combined",
+            "configured_cp4_unfused",
+            "dynamic_scheduler_without_dynamic_cp",
+            "block_inference_whole_scope",
+            "local_mamba",
+            "full_iteration",
+        ],
+    )
+    def test_packed_dsa_cp_cuda_graph_warning_boundary(
+        self, monkeypatch, overrides, expected_warning
+    ):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            config = self._make_packed_dsa_graph_config(monkeypatch, **overrides)
+        graph_warnings = [
+            warning
+            for warning in caught
+            if "packed DSA with context parallelism" in str(warning.message)
+        ]
+        assert bool(graph_warnings) is expected_warning
+        assert isinstance(config, MLATransformerConfig)
+
+    def test_packed_cudnn_dsa_preserves_legacy_block_inference_scope(self, monkeypatch):
+        """The deprecated spelling is normalized before the graph warning is evaluated."""
+        with pytest.warns(DeprecationWarning, match="full_iteration_inference"):
+            config = self._make_packed_dsa_graph_config(
+                monkeypatch, cuda_graph_impl="local", cuda_graph_modules="full_iteration_inference"
+            )
+        assert config.cuda_graph_modules == []
+        assert config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"dsa_kernel_backend": "none"},
+            {
+                "dsa_kernel_backend": "none",
+                "cuda_graph_modules": [CudaGraphModule.attn, CudaGraphModule.attn],
+            },
+            {"sequence_packing_scheduler": "default_dynamic_cp", "dynamic_context_parallel": True},
+            {
+                "sequence_packing_scheduler": "default_dynamic_cp",
+                "dynamic_context_parallel": True,
+                "cuda_graph_modules": [],
+            },
+            {
+                "sequence_packing_scheduler": "default_dynamic_cp",
+                "dynamic_context_parallel": True,
+                "cuda_graph_modules": [CudaGraphModule.mlp],
+            },
+            {
+                "sequence_packing_scheduler": "default_dynamic_cp",
+                "dynamic_context_parallel": True,
+                "cuda_graph_impl": "transformer_engine",
+            },
+            {
+                "sequence_packing_scheduler": "default_dynamic_cp",
+                "dynamic_context_parallel": True,
+                "cuda_graph_impl": "transformer_engine",
+                "cuda_graph_modules": [],
+            },
+        ],
+        ids=[
+            "static_unfused_local_attention",
+            "static_unfused_local_attention_repeated",
+            "dynamic_cudnn_local_attention",
+            "dynamic_cudnn_local_whole_layer",
+            "dynamic_cudnn_local_mlp",
+            "dynamic_cudnn_te_attention",
+            "dynamic_cudnn_te_whole_layer",
+        ],
+    )
+    def test_additional_previously_rejected_packed_dsa_cp_graph_configs_now_warn(
+        self, monkeypatch, overrides
+    ):
+        with pytest.warns(UserWarning, match="experimental and not fully supported"):
+            config = self._make_packed_dsa_graph_config(monkeypatch, **overrides)
+        assert isinstance(config, MLATransformerConfig)
+
+    @pytest.mark.parametrize(
+        (
+            "context_parallel_size",
+            "dsa_kernel_backend",
+            "sequence_packing_scheduler",
+            "dynamic_context_parallel",
+            "cuda_graph_impl",
+            "cuda_graph_modules",
+        ),
+        [
+            (2, "none", "dp_balanced", False, "local", []),
+            (2, "none", "dp_balanced", False, "local", [CudaGraphModule.mlp]),
+            (2, "none", "dp_balanced", False, "transformer_engine", [CudaGraphModule.attn]),
+            (2, "none", "default_dynamic_cp", True, "local", [CudaGraphModule.attn]),
+            (4, "none", "dp_balanced", False, "local", [CudaGraphModule.attn]),
+            (2, "tilelang", "dp_balanced", False, "local", [CudaGraphModule.attn]),
+            (
+                2,
+                "cudnn",
+                "dp_balanced",
+                False,
+                "local",
+                [CudaGraphModule.mlp, CudaGraphModule.mamba],
+            ),
+            (
+                4,
+                "cudnn",
+                "dp_balanced",
+                False,
+                "local",
+                [CudaGraphModule.attn, CudaGraphModule.mlp],
+            ),
+            (2, "cudnn", "dp_balanced", False, "local", [CudaGraphModule.mamba]),
+            (2, "cudnn", "dp_balanced", False, "transformer_engine", [CudaGraphModule.mlp]),
+            (2, "cudnn", "dp_balanced", False, "full_iteration", []),
+        ],
+        ids=[
+            "cp2_backend_none_whole_layer",
+            "cp2_backend_none_mlp",
+            "cp2_backend_none_te_attention",
+            "cp2_backend_none_dynamic_attention",
+            "cp4_backend_none_attention",
+            "cp2_backend_tilelang",
+            "cp2_local_mlp_mamba_combined",
+            "cp4_local_attention_mlp_combined",
+            "cp2_local_mamba",
+            "cp2_te_mlp",
+            "cp2_full_iteration",
+        ],
+    )
+    def test_packed_dsa_cp_cuda_graph_warning_is_independent_of_backend_and_scope(
+        self,
+        monkeypatch,
+        context_parallel_size,
+        dsa_kernel_backend,
+        sequence_packing_scheduler,
+        dynamic_context_parallel,
+        cuda_graph_impl,
+        cuda_graph_modules,
+    ):
+        with pytest.warns(UserWarning, match="experimental and not fully supported"):
+            config = self._make_packed_dsa_graph_config(
+                monkeypatch,
+                context_parallel_size=context_parallel_size,
+                dsa_kernel_backend=dsa_kernel_backend,
+                sequence_packing_scheduler=sequence_packing_scheduler,
+                dynamic_context_parallel=dynamic_context_parallel,
+                cuda_graph_impl=cuda_graph_impl,
+                cuda_graph_modules=cuda_graph_modules,
+            )
+        assert isinstance(config, MLATransformerConfig)
+
+    @pytest.mark.parametrize(
+        (
+            "context_parallel_size",
+            "sequence_packing_scheduler",
+            "dynamic_context_parallel",
+            "expected",
+        ),
+        [
+            (3, "dp_balanced", False, True),
+            (3, "default_dynamic_cp", True, True),
+            (4, "default_dynamic_cp", True, True),
+            (2, "dp_balanced", True, False),
+            (2, "default_dynamic_cp", False, False),
+        ],
+        ids=[
+            "static_cp3",
+            "dynamic_cp3",
+            "dynamic_cp4",
+            "dynamic_flag_static_scheduler",
+            "dynamic_scheduler_without_flag",
+        ],
+    )
+    def test_packed_dsa_cuda_graph_predicate_scheduler_boundary(
+        self, context_parallel_size, sequence_packing_scheduler, dynamic_context_parallel, expected
+    ):
+        assert (
+            is_packed_dsa_cp_cuda_graph_experimental(
+                experimental_attention_variant="dsa",
+                sequence_packing_scheduler=sequence_packing_scheduler,
+                dynamic_context_parallel=dynamic_context_parallel,
+                context_parallel_size=context_parallel_size,
+                cuda_graph_impl="local",
+            )
+            is expected
+        )
+
+    @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine", "full_iteration"])
+    def test_packed_dsa_cuda_graph_predicate_accepts_all_graph_implementations(
+        self, cuda_graph_impl
+    ):
+        assert is_packed_dsa_cp_cuda_graph_experimental(
+            experimental_attention_variant="dsa",
+            sequence_packing_scheduler="dp_balanced",
+            dynamic_context_parallel=False,
+            context_parallel_size=2,
+            cuda_graph_impl=cuda_graph_impl,
+        )
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"experimental_attention_variant": None},
+            {"cuda_graph_impl": "none"},
+            {"context_parallel_size": 1},
+            {"sequence_packing_scheduler": None},
+        ],
+        ids=["not_dsa", "graphs_disabled", "static_cp1", "not_packed"],
+    )
+    def test_packed_dsa_cuda_graph_predicate_negative_boundaries(self, overrides):
+        kwargs = {
+            "experimental_attention_variant": "dsa",
+            "sequence_packing_scheduler": "dp_balanced",
+            "dynamic_context_parallel": False,
+            "context_parallel_size": 2,
+            "cuda_graph_impl": "local",
+        }
+        kwargs.update(overrides)
+        assert not is_packed_dsa_cp_cuda_graph_experimental(**kwargs)
 
     def test_get_dsa_module_spec_for_backend(self):
         """get_dsa_module_spec_for_backend returns the correct full spec structure."""
@@ -3908,3 +5151,264 @@ class TestDSAModuleSpecDispatch:
         config = self._make_dsa_config(qk_l2_norm=True)
         with pytest.raises(AssertionError, match="qk_l2_norm is not supported"):
             get_dsa_module_spec_for_backend(config, backend=None)
+
+
+class TestPackedCPAllRankPositions:
+    """The batched CP position builder must match the per-rank loop exactly."""
+
+    @staticmethod
+    def _cu_seqlens(seq_lens, cp_size):
+        """Pad each sequence to a multiple of 2 * cp_size and return cu_seqlens."""
+        multiple = 2 * cp_size
+        padded = [0 if s == 0 else -(-s // multiple) * multiple for s in seq_lens]
+        offsets = [0]
+        for p in padded:
+            offsets.append(offsets[-1] + p)
+        return torch.tensor(offsets, dtype=torch.int32)
+
+    @pytest.mark.parametrize("cp_size", [2, 4, 8, 16, 64])
+    @pytest.mark.parametrize(
+        "seq_lens", [[512], [512, 1024], [256, 256, 512], [128, 384, 640, 896], [1024, 0, 2048]]
+    )
+    @pytest.mark.parametrize("cover", [True, False])
+    def test_matches_per_rank_loop(self, cp_size, seq_lens, cover):
+        """Row r of the batched build equals the single-rank build for cp_rank=r."""
+        device = torch.device("cpu")
+        cu_seqlens = self._cu_seqlens(seq_lens, cp_size)
+        total = int(cu_seqlens[-1])
+        if total == 0:
+            pytest.skip("degenerate all-empty case")
+        output_size = total // cp_size
+
+        expected = torch.stack(
+            [
+                build_packed_allgather_cp_local_positions(
+                    cu_seqlens,
+                    cp_size,
+                    rank,
+                    device,
+                    output_size=output_size,
+                    cu_seqlens_cover_output=cover,
+                )
+                for rank in range(cp_size)
+            ],
+            dim=0,
+        )
+        actual = build_packed_allgather_cp_all_rank_positions(
+            cu_seqlens, cp_size, device, output_size=output_size, cu_seqlens_cover_output=cover
+        )
+        assert actual.shape == expected.shape
+        assert torch.equal(actual, expected)
+
+    @pytest.mark.parametrize("cp_size", [2, 4, 8])
+    def test_padded_output_size(self, cp_size):
+        """Rows still match when output_size exceeds the packed token count."""
+        device = torch.device("cpu")
+        cu_seqlens = self._cu_seqlens([512, 1024], cp_size)
+        output_size = int(cu_seqlens[-1]) // cp_size + 2 * cp_size
+        expected = torch.stack(
+            [
+                build_packed_allgather_cp_local_positions(
+                    cu_seqlens, cp_size, rank, device, output_size=output_size
+                )
+                for rank in range(cp_size)
+            ],
+            dim=0,
+        )
+        actual = build_packed_allgather_cp_all_rank_positions(
+            cu_seqlens, cp_size, device, output_size=output_size
+        )
+        assert torch.equal(actual, expected)
+
+    @pytest.mark.parametrize("cp_size", [2, 4, 16])
+    def test_key_reorder_unchanged(self, cp_size):
+        """The public reorder index is unchanged by the batched build."""
+        device = torch.device("cpu")
+        cu_seqlens = self._cu_seqlens([512, 1024], cp_size)
+        total = int(cu_seqlens[-1])
+        output_size = total // cp_size
+
+        _, key_reorder_idx = build_packed_allgather_cp_query_positions_and_key_reorder(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cp_size=cp_size,
+            cp_rank=0,
+            device=device,
+            local_output_size=output_size,
+            key_local_output_size=output_size,
+            global_output_size=total,
+        )
+        reference = torch.argsort(
+            torch.cat(
+                [
+                    build_packed_allgather_cp_local_positions(
+                        cu_seqlens, cp_size, rank, device, output_size=output_size
+                    )
+                    for rank in range(cp_size)
+                ],
+                dim=0,
+            )
+        )
+        assert torch.equal(key_reorder_idx, reference)
+
+
+class TestHostSidePackedCpLayoutBuilders:
+    """The host builders must be bit-equal to the device builders they replace.
+
+    The host path consumes the compacted cu_seqlens list that
+    prebuild_thd_cp_partition_routes stores on PackedSeqParams; the device path
+    consumes the raw device tensor. e2e loss cannot discriminate here (the
+    training workload is not run-to-run reproducible), so bit equality of the
+    produced tables is the correctness contract.
+    """
+
+    @staticmethod
+    def _cu_seqlens(seq_lens, cp_size):
+        multiple = 2 * cp_size
+        padded = [0 if s == 0 else -(-s // multiple) * multiple for s in seq_lens]
+        offsets = [0]
+        for p in padded:
+            offsets.append(offsets[-1] + p)
+        return torch.tensor(offsets, dtype=torch.int32)
+
+    @staticmethod
+    def _host_list(cu_seqlens):
+        """Compacted host list, matching _compact_thd_cu_seqlens_to_list semantics."""
+        values = cu_seqlens.tolist()
+        compact = [values[0]]
+        for v in values[1:]:
+            if v != compact[-1]:
+                compact.append(v)
+        return compact
+
+    @pytest.mark.parametrize("cp_size", [1, 2, 4, 8, 16])
+    @pytest.mark.parametrize(
+        "seq_lens", [[512], [512, 1024], [256, 256, 512], [128, 384, 640, 896], [1024, 0, 2048]]
+    )
+    @pytest.mark.parametrize("cover", [True, False])
+    def test_local_positions_match_device_builder(self, cp_size, seq_lens, cover):
+        """Every rank's host-built positions equal the device builder's output."""
+        device = torch.device("cpu")
+        cu_seqlens = self._cu_seqlens(seq_lens, cp_size)
+        total = int(cu_seqlens[-1])
+        if total == 0:
+            pytest.skip("degenerate all-empty case")
+        output_size = total // cp_size
+        host_cu = self._host_list(cu_seqlens)
+        for rank in range(cp_size):
+            expected = build_packed_allgather_cp_local_positions(
+                cu_seqlens,
+                cp_size,
+                rank,
+                device,
+                output_size=output_size,
+                cu_seqlens_cover_output=cover,
+            )
+            actual = build_packed_allgather_cp_local_positions_from_host(
+                host_cu,
+                cp_size,
+                rank,
+                device,
+                output_size=output_size,
+                cu_seqlens_cover_output=cover,
+            )
+            assert torch.equal(actual, expected), f"rank {rank} differs"
+
+    @pytest.mark.parametrize("cp_size", [2, 4, 8])
+    @pytest.mark.parametrize("seq_lens", [[512], [256, 256, 512], [1024, 0, 2048]])
+    def test_padded_local_positions_match_device_builder(self, cp_size, seq_lens):
+        """Rows still match when output_size exceeds the packed token count."""
+        device = torch.device("cpu")
+        cu_seqlens = self._cu_seqlens(seq_lens, cp_size)
+        total = int(cu_seqlens[-1])
+        output_size = total // cp_size + 64
+        host_cu = self._host_list(cu_seqlens)
+        for rank in range(cp_size):
+            expected = build_packed_allgather_cp_local_positions(
+                cu_seqlens, cp_size, rank, device, output_size=output_size
+            )
+            actual = build_packed_allgather_cp_local_positions_from_host(
+                host_cu, cp_size, rank, device, output_size=output_size
+            )
+            assert torch.equal(actual, expected), f"rank {rank} differs"
+
+    @pytest.mark.parametrize("seq_lens", [[5], [7, 3], [1]])
+    def test_cp1_odd_lengths_match_device_identity(self, seq_lens):
+        """cp_size=1 has no zigzag halving, so odd lengths must stay identity.
+
+        The span form floors seq_len // 2 and would silently drop the middle token;
+        the builders take a dedicated identity path instead, mirroring the device
+        builder's cp_size <= 1 branch.
+        """
+        device = torch.device("cpu")
+        offsets = [0]
+        for length in seq_lens:
+            offsets.append(offsets[-1] + length)
+        cu_seqlens = torch.tensor(offsets, dtype=torch.int32)
+        host_cu = offsets
+        total = offsets[-1]
+        expected = build_packed_allgather_cp_local_positions(
+            cu_seqlens, 1, 0, device, output_size=total
+        )
+        actual = build_packed_allgather_cp_local_positions_from_host(
+            host_cu, 1, 0, device, output_size=total
+        )
+        assert torch.equal(actual, expected)
+        _, reorder = build_packed_allgather_cp_query_positions_and_key_reorder_from_host(
+            host_cu,
+            host_cu,
+            cp_size=1,
+            cp_rank=0,
+            device=device,
+            local_output_size=total,
+            key_local_output_size=total,
+        )
+        assert torch.equal(reorder, torch.arange(total, dtype=torch.int64))
+
+    @pytest.mark.parametrize("cp_size", [2, 4])
+    def test_non_divisible_lengths_raise_on_host(self, cp_size):
+        """Host builders reject lengths not divisible by 2*cp_size instead of
+        silently dropping tokens; the check is free on host integers."""
+        bad_cu = [0, 2 * cp_size + 1]
+        with pytest.raises(ValueError, match="divisible"):
+            build_packed_allgather_cp_local_positions_from_host(
+                bad_cu, cp_size, 0, torch.device("cpu")
+            )
+
+    @pytest.mark.parametrize("cp_size", [2, 4, 8, 16])
+    @pytest.mark.parametrize("seq_lens", [[512], [512, 1024], [256, 256, 512], [1024, 0, 2048]])
+    @pytest.mark.parametrize("pad", [0, 64])
+    def test_query_and_reorder_match_device_wrapper(self, cp_size, seq_lens, pad):
+        """The host wrapper (direct inverse, no argsort) equals the device wrapper."""
+        device = torch.device("cpu")
+        cu_seqlens = self._cu_seqlens(seq_lens, cp_size)
+        total = int(cu_seqlens[-1])
+        if total == 0:
+            pytest.skip("degenerate all-empty case")
+        local = total // cp_size + pad
+        host_cu = self._host_list(cu_seqlens)
+        for rank in range(cp_size):
+            expected_q, expected_r = build_packed_allgather_cp_query_positions_and_key_reorder(
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                cp_size=cp_size,
+                cp_rank=rank,
+                device=device,
+                local_output_size=local,
+                key_local_output_size=local,
+                global_output_size=local * cp_size,
+            )
+            actual_q, actual_r = (
+                build_packed_allgather_cp_query_positions_and_key_reorder_from_host(
+                    host_cu,
+                    host_cu,
+                    cp_size=cp_size,
+                    cp_rank=rank,
+                    device=device,
+                    local_output_size=local,
+                    key_local_output_size=local,
+                    global_output_size=local * cp_size,
+                )
+            )
+            assert torch.equal(actual_q, expected_q), f"rank {rank} query positions differ"
+            assert torch.equal(actual_r, expected_r), f"rank {rank} key reorder differs"

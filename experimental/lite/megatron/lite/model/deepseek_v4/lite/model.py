@@ -36,8 +36,8 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-import transformer_engine.pytorch as te
 
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.lite.moe import DeepseekV4MoE
 from megatron.lite.primitive.modules.attention.csa import CompressedSparseAttention

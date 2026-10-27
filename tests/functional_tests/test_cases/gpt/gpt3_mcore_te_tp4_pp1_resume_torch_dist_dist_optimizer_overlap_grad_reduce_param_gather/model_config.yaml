@@ -55,7 +55,6 @@ MODEL_ARGS:
   --bf16: true
   --log-memory-to-tensorboard: true
   --async-save: true
-  --async-strategy: mcore
   --use-persistent-ckpt-worker: true
   --async-ckpt-use-cpu-shm: true
 TEST_TYPE: ckpt-resume

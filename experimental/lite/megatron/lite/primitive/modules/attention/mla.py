@@ -8,7 +8,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import transformer_engine.pytorch as te
+
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.utils.rope import (
     _apply_rotary_pos_emb_bshd,
     _apply_rotary_pos_emb_thd,

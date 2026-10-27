@@ -58,15 +58,6 @@ def _make_valid_mhc_overlap_config(**overrides):
     return TransformerConfig(**kwargs)
 
 
-@pytest.mark.parametrize(
-    "cuda_graph_kwargs",
-    ({"cuda_graph_impl": "local"}, {"enable_cuda_graph": True}, {"external_cuda_graph": True}),
-)
-def test_mhc_overlap_recompute_rejects_cuda_graphs(cuda_graph_kwargs):
-    with pytest.raises(ValueError, match="explicit schedule-owned recompute barrier"):
-        _make_valid_mhc_overlap_config(**cuda_graph_kwargs)
-
-
 def test_mhc_overlap_recompute_accepts_full_iteration_cuda_graph():
     config = _make_valid_mhc_overlap_config(
         cuda_graph_impl="full_iteration",
@@ -111,7 +102,7 @@ class _RecordingLayer:
         # belongs to no RecomputeSegment and the segment hooks are skipped.
         self.recompute_segment = None
 
-    def get_fp8_context(self):
+    def get_low_precision_context(self):
         return nullcontext()
 
     def release_state(self):
@@ -125,8 +116,12 @@ class _RecordingChunk:
         self.pre_process = _RecordingNode(calls, "chunk.pre_process")
         self.post_process = None
         self.vp_stage = 0
+        # Match TransformerModelChunkSchedulePlan's optional release interface.
+        self.tensor_release = None
         # Read by run() only on the post_process path, which this chunk does not take.
         self.recompute_full = False
+        # Match TransformerModelChunkSchedulePlan's model state read by run().
+        self._model_chunk_state = SimpleNamespace(model=None)
 
     def record_current_stream(self):
         self.calls.append("chunk.record_current_stream")
@@ -235,7 +230,9 @@ def test_model_chunk_builds_independent_two_layer_recompute_groups(monkeypatch):
     captured_extra_args = []
 
     class _CapturedLayerPlan:
-        def __init__(self, layer, event, state, comp_stream, comm_stream, extra_args):
+        def __init__(
+            self, layer, event, state, comp_stream, comm_stream, extra_args, tensor_release=None
+        ):
             captured_extra_args.append(dict(extra_args))
 
     monkeypatch.setattr(
@@ -246,6 +243,7 @@ def test_model_chunk_builds_independent_two_layer_recompute_groups(monkeypatch):
     plan._event = object()
     plan._model_chunk_state = object()
     plan._transformer_layers = []
+    plan._tensor_release = None
     config = SimpleNamespace(
         enable_hyper_connections=True,
         recompute_granularity="selective",
@@ -419,11 +417,25 @@ def _assert_close_grads(overlap_gradients, reference_gradients, rtol=5e-3, atol=
             reference_gradients[name],
             rtol=rtol,
             atol=atol,
-            msg=f"Gradient mismatch for {name}",
+            msg=lambda detail, parameter_name=name: (
+                f"Gradient mismatch for {parameter_name}:\n{detail}"
+            ),
         )
 
 
 class TestMhcA2AOverlapNumerics:
+    @pytest.fixture(autouse=True)
+    def _isolated_compiler_cache(self):
+        # Previous graph/shape cases can exhaust Dynamo's specialization budget.
+        # A partially compiled BF16 reference then has different fusion/rounding
+        # from a fresh scheduled model. Isolate cases without disabling compilation
+        # or increasing its limit; both paths retain the original numeric checks.
+        torch.compiler.reset()
+        try:
+            yield
+        finally:
+            torch.compiler.reset()
+
     def setup_method(self, method):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1,
@@ -546,14 +558,19 @@ class TestMhcA2AOverlapNumerics:
         _assert_close_grads(overlap_gradients, reference_gradients)
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    def test_cuda_graph_replay_receives_padding_mask(self):
-        # The attention-only CUDA-graph split runs the MoE routing tail itself, so
-        # it has to receive the same padding_mask the eager callable reads off
-        # node.chunk_state. The schedule reaches it through _te_cuda_graph_replay
-        # rather than TransformerLayer.__call__, so nothing else puts the mask in
-        # kwargs. Losing it is silent -- the router would take the unpadded branch
-        # for the z-loss mean, dropless gating, and the aux-loss-free load counters
-        # -- so pin the argument at the boundary instead of the numerics.
+    @pytest.mark.parametrize("split_switch", [True, False], ids=["split", "whole-attn"])
+    def test_cuda_graph_replay_receives_padding_mask(self, split_switch):
+        # Every replay path that runs the MoE routing tail itself -- the split and
+        # the non-split overlap branch alike -- has to receive the same
+        # padding_mask the eager callable reads off node.chunk_state. The schedule
+        # reaches it through _te_cuda_graph_replay rather than
+        # TransformerLayer.__call__, so nothing else puts the mask in kwargs.
+        # Losing it is silent -- the router would take the unpadded branch for the
+        # z-loss mean, dropless gating, and the aux-loss-free load counters -- so
+        # pin the argument at the boundary for both switch settings. The manager
+        # attribute is pinned alongside it: the non-split overlap tail registers
+        # its MLP-side checkpoints through layer._mhc_recompute_manager, and the
+        # schedule installs it just before the replay entry point.
         from megatron.core.transformer.enums import CudaGraphModule
 
         config = _make_mhc_numerical_config()
@@ -570,14 +587,14 @@ class TestMhcA2AOverlapNumerics:
             for layer in model.decoder.layers:
                 # Make submodule_attn_forward take the CUDA-graph replay branch
                 # without capturing anything: the branch is gated on a truthy
-                # cuda_graphs attribute, and the padding_mask threading below it
-                # on _uses_mhc_recompute_attn_cuda_graph_split(), which needs the
-                # TE impl and attn scope as well as the mHC recompute modules the
-                # config already carries. Setting only the modules would describe
-                # a configuration that is not the attention-only split.
+                # cuda_graphs attribute. padding_mask threading now applies to
+                # every hyper-connection layer under replay; the split predicate
+                # additionally needs the switch, the TE impl and the attn scope
+                # set here so the replay dispatch routes into the split.
                 layer.cuda_graphs = [object()]
                 layer.config.cuda_graph_impl = "transformer_engine"
                 layer.config.cuda_graph_modules = [CudaGraphModule.attn]
+                layer.config.mhc_recompute_attn_cuda_graph_split = split_switch
                 layer.set_te_cuda_graph_backward_dw_wrapper = lambda: None
 
                 def _record(*args, **kwargs):
@@ -603,6 +620,14 @@ class TestMhcA2AOverlapNumerics:
         # sequence parallelism before it lands on the chunk state.
         assert forwarded is not None
         assert int((~forwarded).sum()) == 4
+        assert any(
+            getattr(layer, "_mhc_recompute_manager", None) is not None
+            for layer in model.decoder.layers
+        ), (
+            "the schedule must install the recompute manager on the layer before "
+            "the replay entry point; the non-split overlap tail registers its "
+            "MLP-side mHC checkpoints through it"
+        )
 
     def test_mtp_builder_tracks_callable_tuple_width(self):
         # The MTP builder wraps build_transformer_layer_callables and re-unpacks its

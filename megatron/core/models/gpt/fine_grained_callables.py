@@ -9,11 +9,16 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.fusions.fused_moe_residual_add import (
+    can_use_fused_moe_residual_add,
+    fused_moe_residual_add,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
+from megatron.core.pipeline_parallel.utils import ScheduleNode, StageDispatchBwdGrad, make_viewless
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -333,6 +338,7 @@ class TransformerLayerNode(ScheduleNode):
         name="default",
         bwd_dw_callables=None,
         extra_args={},
+        tensor_release=None,
     ):
         """Initialize a transformer layer node.
 
@@ -365,6 +371,8 @@ class TransformerLayerNode(ScheduleNode):
             weak_method(self.backward_impl),
             free_input=free_input,
             name=name,
+            tensor_release=tensor_release,
+            ncclep_zero_copy=config.moe_ncclep_zero_copy,
         )
         self.layer_state = layer_state
         self.chunk_state = chunk_state
@@ -630,10 +638,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             layer.set_te_cuda_graph_backward_dw_wrapper()
             # The fine-grained schedule calls _te_cuda_graph_replay directly,
             # bypassing TransformerLayer.__call__ where _mhc_recompute_manager is
-            # normally set. Thread it here so the attention-only split replay can
-            # bind its fixed-address recompute arena slot (see
-            # HyperConnectionTransformerLayer._te_cuda_graph_replay_mhc_attention_split_overlap).
-            if is_hyper_connection_layer and layer._uses_mhc_recompute_attn_cuda_graph_split():
+            # normally set. Thread it here for every hyper-connection layer: the
+            # split replay binds its fixed-address arena slot through it, and the
+            # non-split overlap replay registers its MLP-side mHC checkpoints
+            # through it. Without mHC recompute the manager is None and the
+            # assignment is a no-op, matching __call__'s pop default.
+            if is_hyper_connection_layer:
                 layer._mhc_recompute_manager = mhc_recompute_manager
             forward_func = layer._te_cuda_graph_replay
         else:
@@ -647,6 +657,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 packed_seq_params: Optional[PackedSeqParams] = None,
                 sequence_len_offset: Optional[Tensor] = None,
                 mhc_recompute_manager=None,
+                padding_mask: Optional[Tensor] = None,
             ):
                 attention_kwargs = dict(
                     hidden_states=hidden_states,
@@ -656,6 +667,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                     rotary_pos_sin=rotary_pos_sin,
                     packed_seq_params=packed_seq_params,
                     sequence_len_offset=sequence_len_offset,
+                    padding_mask=padding_mask,
                 )
                 if is_hyper_connection_layer:
                     attention_kwargs["mhc_recompute_manager"] = mhc_recompute_manager
@@ -665,7 +677,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 if is_mhc_layer:
                     nvtx_range_push(suffix="mlp_hyper_connection")
                     hidden_states, mlp_h_res, mlp_hc_h_post, residual = layer.mlp_hyper_connection(
-                        hidden_states, mhc_recompute_manager=mhc_recompute_manager
+                        hidden_states,
+                        mhc_recompute_manager=mhc_recompute_manager,
+                        return_residual=True,
                     )
                     nvtx_range_pop(suffix="mlp_hyper_connection")
                 else:
@@ -678,7 +692,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 )
                 if checkpoint_pre_mlp_layernorm:
                     layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                        ckpt_manager=mhc_recompute_manager
+                        ckpt_manager=mhc_recompute_manager,
+                        retain_input_tensors=layer._pre_mlp_layernorm_returns_residual,
                     )
                     with mlp_norm_manager as hidden_states:
                         pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
@@ -693,23 +708,19 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 # When using fused residual norm (e.g. TEFusedResidualRMSNorm),
                 # the layernorm returns (normalized_output, residual). Unpack
                 # and use the fused residual for the downstream BDA connection.
-                if isinstance(pre_mlp_layernorm_output, tuple):
-                    if len(pre_mlp_layernorm_output) != 2:
-                        raise ValueError(
-                            f"When the output of pre_mlp_layernorm is a tuple, it is "
-                            f"expected to have 2 elements (output, residual), but "
-                            f"got {len(pre_mlp_layernorm_output)}"
-                        )
+                if layer._pre_mlp_layernorm_returns_residual:
                     pre_mlp_layernorm_output, hidden_states = pre_mlp_layernorm_output
                     if not is_mhc_layer:
                         residual = hidden_states
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
+                # Same routing inputs as the eager MoELayer.forward path: the padding mask is
+                # consumed by the router (dropless HybridEP excludes padded tokens).
                 probs, routing_map = layer.mlp.route(
-                    pre_mlp_layernorm_output, padding_mask=node.chunk_state.padding_mask
+                    pre_mlp_layernorm_output, padding_mask, packed_seq_params=packed_seq_params
                 )
                 local_tokens, probs = layer.mlp.preprocess(
-                    pre_mlp_layernorm_output, probs, routing_map
+                    pre_mlp_layernorm_output, probs, routing_map, padding_mask
                 )
                 if is_mhc_layer:
                     return (
@@ -730,23 +741,24 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             rotary_pos_sin=node.chunk_state.rotary_pos_sin,
             packed_seq_params=node.chunk_state.packed_seq_params,
             sequence_len_offset=node.chunk_state.sequence_len_offset,
+            padding_mask=getattr(node.chunk_state, "padding_mask", None),
         )
         if is_hyper_connection_layer and (
             not using_cuda_graph_replay
             or CudaGraphModule.attn not in layer.config.cuda_graph_modules
         ):
             forward_kwargs["mhc_recompute_manager"] = mhc_recompute_manager
-        elif is_hyper_connection_layer and layer._uses_mhc_recompute_attn_cuda_graph_split():
-            # The attention-only split replay runs the MoE routing tail itself, so
-            # it needs the padding_mask that the eager branch above reads straight
-            # off node.chunk_state; without it the graphed path routes as if the
-            # batch were unpadded. The guard is the split predicate, not merely
-            # "hyper-connection layer": hyper connections with TE attention graphs
-            # but without mHC recompute are a supported configuration, and they
-            # fall through to GraphableMegatronModule._te_cuda_graph_replay, which
-            # copies **kwargs straight to TE. padding_mask only enters sample_kwargs
-            # on the THD path, so on SBHD it was never a capture-time argument and
-            # passing it breaks replay -- including when it is None.
+        elif is_hyper_connection_layer:
+            # Replay paths that run the MoE routing tail themselves -- the split
+            # (dense and overlap variants) and the non-split overlap branch --
+            # need the padding_mask the eager branch above reads straight off
+            # node.chunk_state; without it the graphed path routes as if the
+            # batch were unpadded. It must never reach TE, though: padding_mask
+            # only enters sample_kwargs on the THD path, so on SBHD it was never
+            # a capture-time argument and forwarding it breaks replay, None
+            # included -- on THD it IS a captured kwarg and must stay in kwargs,
+            # while on SBHD TE reads only the keys it captured and ignores the
+            # rest, so leaving it in kwargs is safe on both layouts.
             forward_kwargs["padding_mask"] = node.chunk_state.padding_mask
         forward_outputs = forward_func(**forward_kwargs)
         if is_mhc_layer:
@@ -783,6 +795,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             token_dispatcher._comm_manager.token_probs = probs
 
         dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs)
+
+        if enable_ncclep and layer.config.moe_ncclep_zero_copy:
+            # Insert an identity node as the sole consumer of the dispatch output, so the
+            # dispatch-backward gets the symm buffer instead of a non-symm AccumulateGrad clone.
+            # Must stay inside this node's graph segment (before the next node detaches it).
+            dispatched_tokens = StageDispatchBwdGrad.apply(dispatched_tokens, token_dispatcher)
 
         # `dispatched_probs` is needed by backward pass of swiglu, therefore it's
         # passed to moe_forward within `layer_state` to avoid the free_input process
@@ -830,7 +848,22 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         residual = node.layer_state.residual
         shared_expert_output = getattr(node.layer_state, 'shared_expert_output', None)
         output = layer.mlp.combine(output)
-        output = layer.mlp.postprocess(output, shared_expert_output)
+        # Without dropout, the shared-expert add of `postprocess` and the residual add of
+        # `mlp_bda` run as one kernel that is bit-identical to the two adds.
+        fuse_residual_add = (
+            not is_mhc_layer
+            and shared_expert_output is not None
+            and layer.mlp_bda is get_bias_dropout_add
+            and (layer.hidden_dropout == 0.0 or not layer.training)
+        )
+        output = layer.mlp.postprocess(output, None if fuse_residual_add else shared_expert_output)
+        # Check the kernel's requirements on the postprocessed output: `postprocess` restores the
+        # token order and the [s, b, h] shape of the combined tokens.
+        should_fuse_residual_add = fuse_residual_add and can_use_fused_moe_residual_add(
+            output, shared_expert_output, residual
+        )
+        if fuse_residual_add and not should_fuse_residual_add:
+            output = output + shared_expert_output
 
         if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
             layer.mlp.cudagraph_tensor_store.clear()
@@ -852,10 +885,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
         mlp_output_with_bias = (output, None)
         with layer.bias_dropout_add_exec_handler():
-            hidden_states = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
-                mlp_output_with_bias, residual, layer.hidden_dropout
-            )
-
+            if should_fuse_residual_add:
+                hidden_states = fused_moe_residual_add(output, shared_expert_output, residual)
+            else:
+                hidden_states = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
+                    (output, None), residual, layer.hidden_dropout
+                )
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
         mlp_norm_manager = getattr(node.layer_state, 'mlp_norm_manager', None)
@@ -995,19 +1030,23 @@ def build_mtp_layer_callables(layer):
             else:
                 hidden_states = node.chunk_state.mtp_hidden_states[offset]
 
-        input_ids, position_ids, padding_mask, decoder_input, hidden_states = layer._get_embeddings(
-            input_ids=node.chunk_state.input_ids,
-            position_ids=node.chunk_state.position_ids,
-            embedding=node.chunk_state.model.embedding,
-            hidden_states=hidden_states,
-            packed_seq_params=node.chunk_state.packed_seq_params,
-            padding_mask=node.chunk_state.padding_mask,
+        input_ids, position_ids, padding_mask, mtp_input_mask, decoder_input, hidden_states = (
+            layer._get_embeddings(
+                input_ids=node.chunk_state.input_ids,
+                position_ids=node.chunk_state.position_ids,
+                embedding=node.chunk_state.model.embedding,
+                hidden_states=hidden_states,
+                packed_seq_params=node.chunk_state.packed_seq_params,
+                padding_mask=node.chunk_state.padding_mask,
+                mtp_input_mask=getattr(node.chunk_state, "mtp_input_mask", None),
+            )
         )
         node.chunk_state.input_ids = input_ids
         node.chunk_state.position_ids = position_ids
         node.chunk_state.padding_mask = padding_mask
 
         # MTP Layer Preprocess
+        node.chunk_state.mtp_input_mask = mtp_input_mask
         # norm, linear projection and transformer
         assert (
             node.chunk_state.context is None

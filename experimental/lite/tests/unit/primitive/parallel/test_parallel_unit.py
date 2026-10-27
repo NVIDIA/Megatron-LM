@@ -164,6 +164,75 @@ def test_auto_layout_is_legal_and_balanced(model, pp, mtp):
     assert max(cells) - min(cells) <= 1
 
 
+def _glm52_index_share_groups(num_layers: int = 78) -> list[list[int]]:
+    from megatron.lite.primitive.modules.attention.dsa import (
+        dsa_indexer_type_for_layer,
+        source_dsa_compute_layer,
+    )
+
+    groups: list[list[int]] = []
+    current: list[int] = []
+    current_source: int | None = None
+    for layer_idx in range(num_layers):
+        layer_number = layer_idx + 1
+        if dsa_indexer_type_for_layer(layer_number, skip_topk_offset=3, topk_freq=4) == "shared":
+            source_idx = source_dsa_compute_layer(layer_number, skip_topk_offset=3, topk_freq=4) - 1
+        else:
+            source_idx = layer_idx
+        if current and source_idx != current_source:
+            groups.append(current)
+            current = []
+        current.append(layer_idx)
+        current_source = source_idx
+    if current:
+        groups.append(current)
+    return groups
+
+
+def test_grouped_pp_layout_keeps_glm52_indexshare_groups_inside_stage():
+    from megatron.lite.primitive.modules.attention.dsa import (
+        validate_dsa_index_share_pipeline_split,
+    )
+
+    chunks = [
+        build_pipeline_chunk_layout(
+            78,
+            ps,
+            num_mtp_layers=1,
+            decoder_layer_groups=_glm52_index_share_groups(),
+        )
+        for ps in _ranks(8)
+    ]
+    indices = [chunk.layer_indices for chunk in chunks]
+
+    _assert_full_contiguous_cover(indices, 78)
+    assert chunks[-1].has_mtp is True
+    assert [chunk.has_mtp for chunk in chunks[:-1]] == [False] * 7
+    for stage_indices in indices:
+        validate_dsa_index_share_pipeline_split(
+            stage_indices,
+            topk_freq=4,
+            skip_topk_offset=3,
+            indexer_types=None,
+        )
+
+
+def test_ungrouped_glm52_auto_layout_would_trip_indexshare_guard():
+    from megatron.lite.primitive.modules.attention.dsa import (
+        validate_dsa_index_share_pipeline_split,
+    )
+
+    bad_indices = _layout_indices(78, 8, num_mtp_layers=1)
+    with pytest.raises(ValueError, match="DSA IndexShare cannot cross pipeline stages"):
+        for stage_indices in bad_indices:
+            validate_dsa_index_share_pipeline_split(
+                stage_indices,
+                topk_freq=4,
+                skip_topk_offset=3,
+                indexer_types=None,
+            )
+
+
 def test_pp_layout_custom_string_mode_is_used_verbatim():
     # Advanced users pin an explicit mcore layout string (custom mode) instead of the
     # auto split. "Ettt|t|t|tL" front-loads 3 decoders onto stage 0; mcore parses

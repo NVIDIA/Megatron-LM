@@ -33,6 +33,8 @@ class ModelHandle:
 
     @property
     def dp_rank(self) -> int:
+        if "logical_dp_rank" in self._extras:
+            return self._extras["logical_dp_rank"]
         ps = self._parallel_state
         if ps is None:
             return 0
@@ -40,6 +42,8 @@ class ModelHandle:
 
     @property
     def dp_size(self) -> int:
+        if "logical_dp_size" in self._extras:
+            return self._extras["logical_dp_size"]
         ps = self._parallel_state
         if ps is None:
             return 1
@@ -47,10 +51,19 @@ class ModelHandle:
 
     @property
     def dp_group(self):
+        if "logical_dp_group" in self._extras:
+            return self._extras["logical_dp_group"]
         ps = self._parallel_state
         if ps is None:
             return None
         return getattr(ps, "dp_group", None)
+
+    @property
+    def metric_group(self):
+        """Process group that owns training-wide metric reductions."""
+        if "metric_group" in self._extras:
+            return self._extras["metric_group"]
+        return self.dp_group
 
     @property
     def cp_range(self) -> tuple[int, int]:

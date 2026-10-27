@@ -14,6 +14,11 @@ expected consequence of different padding/masking strategies.
 
 Usage::
 
+    # As a pytest module (this is what CI runs; any world size works,
+    # every rank runs the same single-rank comparison):
+    torchrun --nproc_per_node=1 -m pytest -q \\
+        examples/multimodal_dev/tests/test_thd_correctness.py
+
     # Single GPU (flash attention):
     torchrun --nproc_per_node=1 \\
         examples/multimodal_dev/tests/test_thd_correctness.py
@@ -28,6 +33,7 @@ import argparse
 import os
 import sys
 
+import pytest
 import torch
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
@@ -41,6 +47,22 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+# Proxy-model / data sizes and tolerances. Shared by the pytest tests below
+# and by the CLI defaults in ``main`` so the two entry points cannot drift.
+DEFAULTS = dict(
+    batch_size=4,
+    seq_len=128,
+    vocab_size=1024,
+    hidden_size=256,
+    num_layers=2,
+    num_heads=4,
+    num_kv_heads=2,
+    ffn_hidden_size=512,
+    seed=42,
+    atol_loss=1e-5,
+    rtol_grad=1e-3,
+)
 
 
 def _samples_from_bshd(input_ids, labels, loss_mask, seq_lengths=None):
@@ -79,6 +101,24 @@ def _thd_position_ids(seq_lengths, device):
 # ===================================================================
 # Helpers
 # ===================================================================
+
+
+def _build_config(num_layers, hidden_size, ffn_hidden_size, num_heads, num_kv_heads):
+    """TransformerConfig for the tiny proxy language model."""
+    return TransformerConfig(
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        ffn_hidden_size=ffn_hidden_size,
+        num_attention_heads=num_heads,
+        num_query_groups=num_kv_heads,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        tensor_model_parallel_size=1,
+        sequence_parallel=False,
+    )
 
 
 def _build_model(cfg, vocab_size, max_seq_len):
@@ -258,6 +298,54 @@ def run_variable_length_smoke_test(model, vocab_size, seed):
 
 
 # ===================================================================
+# pytest entry points
+# ===================================================================
+
+
+@pytest.fixture(scope="module")
+def thd_model():
+    """Tiny bf16 GPTModel, shared by both tests in this module.
+
+    Every rank runs the identical single-rank comparison (TP=1, so the
+    TP broadcast inside ``pack_or_pad_batch`` is a no-op), which makes
+    the module world-size agnostic.
+    """
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    model_parallel_cuda_manual_seed(DEFAULTS["seed"])
+    config = _build_config(
+        DEFAULTS["num_layers"],
+        DEFAULTS["hidden_size"],
+        DEFAULTS["ffn_hidden_size"],
+        DEFAULTS["num_heads"],
+        DEFAULTS["num_kv_heads"],
+    )
+    model = _build_model(config, DEFAULTS["vocab_size"], DEFAULTS["seq_len"])
+    yield model
+    Utils.destroy_model_parallel()
+
+
+def test_equal_length_bshd_matches_thd(thd_model):
+    """Equal-length BSHD and THD batches must give the same loss and grads."""
+    m = run_equal_length_test(
+        model=thd_model,
+        batch_size=DEFAULTS["batch_size"],
+        seq_len=DEFAULTS["seq_len"],
+        vocab_size=DEFAULTS["vocab_size"],
+        seed=DEFAULTS["seed"],
+        atol_loss=DEFAULTS["atol_loss"],
+        rtol_grad=DEFAULTS["rtol_grad"],
+    )
+    assert m["loss_ok"], f"loss diff {m['loss_diff']:.2e} >= {DEFAULTS['atol_loss']:.2e}: {m}"
+    assert m["grad_ok"], f"grad rel diff {m['grad_rel']:.2e} >= {DEFAULTS['rtol_grad']:.2e}: {m}"
+
+
+def test_variable_length_thd_smoke(thd_model):
+    """Variable-length packing runs forward+backward with finite, non-zero grads."""
+    v = run_variable_length_smoke_test(thd_model, DEFAULTS["vocab_size"], DEFAULTS["seed"])
+    assert v["passed"], v
+
+
+# ===================================================================
 # Main
 # ===================================================================
 
@@ -271,39 +359,38 @@ def _print_banner(title):
 def main():
     """CLI entry: run the equal-length parity test + variable-length smoke test."""
     parser = argparse.ArgumentParser(description="BSHD vs THD correctness test")
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--seq-len", type=int, default=128)
-    parser.add_argument("--vocab-size", type=int, default=1024)
-    parser.add_argument("--hidden-size", type=int, default=256)
-    parser.add_argument("--num-layers", type=int, default=2)
-    parser.add_argument("--num-heads", type=int, default=4)
-    parser.add_argument("--num-kv-heads", type=int, default=2)
-    parser.add_argument("--ffn-hidden-size", type=int, default=512)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--batch-size", type=int, default=DEFAULTS["batch_size"])
+    parser.add_argument("--seq-len", type=int, default=DEFAULTS["seq_len"])
+    parser.add_argument("--vocab-size", type=int, default=DEFAULTS["vocab_size"])
+    parser.add_argument("--hidden-size", type=int, default=DEFAULTS["hidden_size"])
+    parser.add_argument("--num-layers", type=int, default=DEFAULTS["num_layers"])
+    parser.add_argument("--num-heads", type=int, default=DEFAULTS["num_heads"])
+    parser.add_argument("--num-kv-heads", type=int, default=DEFAULTS["num_kv_heads"])
+    parser.add_argument("--ffn-hidden-size", type=int, default=DEFAULTS["ffn_hidden_size"])
+    parser.add_argument("--seed", type=int, default=DEFAULTS["seed"])
     parser.add_argument(
-        "--atol-loss", type=float, default=1e-5, help="Absolute tolerance for loss comparison"
+        "--atol-loss",
+        type=float,
+        default=DEFAULTS["atol_loss"],
+        help="Absolute tolerance for loss comparison",
     )
     parser.add_argument(
-        "--rtol-grad", type=float, default=1e-3, help="Relative tolerance for grad norm comparison"
+        "--rtol-grad",
+        type=float,
+        default=DEFAULTS["rtol_grad"],
+        help="Relative tolerance for grad norm comparison",
     )
     args = parser.parse_args()
 
     Utils.initialize_model_parallel(tensor_model_parallel_size=1)
     model_parallel_cuda_manual_seed(args.seed)
 
-    config = TransformerConfig(
-        num_layers=args.num_layers,
-        hidden_size=args.hidden_size,
-        ffn_hidden_size=args.ffn_hidden_size,
-        num_attention_heads=args.num_heads,
-        num_query_groups=args.num_kv_heads,
-        bf16=True,
-        params_dtype=torch.bfloat16,
-        pipeline_dtype=torch.bfloat16,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-        tensor_model_parallel_size=1,
-        sequence_parallel=False,
+    config = _build_config(
+        args.num_layers,
+        args.hidden_size,
+        args.ffn_hidden_size,
+        args.num_heads,
+        args.num_kv_heads,
     )
 
     model = _build_model(config, args.vocab_size, args.seq_len)

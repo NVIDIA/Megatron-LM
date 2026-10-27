@@ -46,12 +46,40 @@ def test_verl_sft_script_maps_offload_env_to_backend_args(tmp_path):
     assert "engine.param_offload=True" in command
     assert "engine.optimizer_offload=True" in command
     assert "+optim.override_optimizer_config.offload_fraction=0.75" in command
-    assert "+optim.override_optimizer_config.use_precision_aware_optimizer=True" in command
+    assert (
+        "+optim.override_optimizer_config.use_precision_aware_optimizer=True" in command
+    )
 
 
 def test_verl_sft_script_does_not_emit_optimizer_state_offload_when_disabled(tmp_path):
-    command = _run_verl_sft_dry_run(tmp_path, PARAM_OFFLOAD="False", OPTIMIZER_OFFLOAD="False")
+    command = _run_verl_sft_dry_run(
+        tmp_path, PARAM_OFFLOAD="False", OPTIMIZER_OFFLOAD="False"
+    )
 
     assert "engine.param_offload=False" in command
     assert "engine.optimizer_offload=False" in command
     assert "override_optimizer_config.offload_fraction" not in command
+
+
+def test_verl_sft_script_emits_explicit_dynamic_cp_switch_when_disabled(tmp_path):
+    command = _run_verl_sft_dry_run(tmp_path, DYNAMIC_CONTEXT_PARALLEL="False")
+
+    assert (
+        "+engine.impl_cfg.runtime_plugins.dynamic_context_parallel.enabled=False"
+        in command
+    )
+
+
+def test_verl_sft_dynamic_cp_acceptance_requires_full_cp_size_coverage(tmp_path):
+    command = _run_verl_sft_dry_run(
+        tmp_path, DYNAMIC_CONTEXT_PARALLEL="True", MAX_SEQLEN_PER_DP_CP_RANK="4096"
+    )
+
+    assert (
+        "+engine.impl_cfg.runtime_plugins.dynamic_context_parallel."
+        "require_full_cp_size_coverage=True"
+    ) in command
+    assert (
+        "+engine.impl_cfg.runtime_plugins.dynamic_context_parallel.enabled=True"
+        in command
+    )

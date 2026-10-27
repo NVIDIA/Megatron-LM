@@ -6,10 +6,7 @@ Encapsulates all Qwen3.5-VL-specific logic needed by ``pretrain_multimodal.py``
 so that the training entry point remains model-agnostic.
 """
 
-from examples.multimodal_dev.models.qwen35_vl.configuration import (
-    MROPE_SECTION,
-    VISION_KWARGS,
-)
+from examples.multimodal_dev.models.qwen35_vl.configuration import MROPE_SECTION, VISION_KWARGS
 
 
 def post_language_config(language_config, args):
@@ -17,15 +14,37 @@ def post_language_config(language_config, args):
 
     Called after ``core_transformer_config_from_args`` to inject model-specific
     fields that cannot be expressed via CLI args alone.
+
+    ``mrope_section`` is deliberately not set here: it is a ``TransformerConfig``
+    field fed by ``--mrope-section``, so overriding it would let the recipe and
+    the constructed model disagree. :func:`build_model` checks the value the
+    recipe supplied against the architecture constant instead.
+
+    ``mrope_interleaved`` goes the other way. ``--mrope-interleaved`` also exists
+    as a generated flag, but it is ``store_true`` with a ``False`` default, so a
+    recipe that forgot it would silently build a non-interleaved decoder.
+    Qwen3.5 always interleaves the T/H/W sections, so it is pinned here as an
+    architectural constant, alongside ``ROTARY_PERCENT`` / ``ROTARY_BASE`` in
+    ``model.py``. ``mrope_section`` cannot get the same treatment because
+    ``validate_args`` requires it on the CLI before the model is built.
     """
-    language_config.mrope_section = list(MROPE_SECTION)
     language_config.mrope_interleaved = True
 
 
 def set_vision_flops_metadata(args, language_config, vision_config):
-    """Expose Qwen3.5-VL vision-model dimensions for FLOPs estimation."""
+    """Expose Qwen3.5-VL vision-model dimensions for FLOPs estimation.
+
+    ``pretrain_multimodal.py:model_provider`` calls
+    ``megatron.training.training.validate_vision_flops_metadata(args)`` right
+    after invoking this function, so the fields set here are validated (and
+    derived scalars precomputed) centrally -- this function does not need to
+    call it itself.
+    """
     args.count_vision_model_flops = True
-    args.vision_flops_variant = "qwen35_vl_v2"
+    # No "v1"/"v2" versioning exists for this variant; matches the
+    # "qwen35_vl" model-arch registry key used everywhere else in
+    # examples/multimodal_dev.
+    args.vision_flops_variant = "qwen35_vl"
     args.vision_num_layers = vision_config.num_layers
     args.vision_hidden_size = vision_config.hidden_size
     args.vision_ffn_hidden_size = vision_config.ffn_hidden_size
@@ -38,48 +57,55 @@ def set_vision_flops_metadata(args, language_config, vision_config):
     args.vision_out_hidden_size = language_config.hidden_size
 
 
-def build_model(args, language_config, vision_config, **kwargs):
+def build_model(
+    args,
+    language_config,
+    vision_config,
+    pre_process: bool = True,
+    post_process: bool = True,
+    **kwargs,
+):
     """Build a complete Qwen3.5-VL model instance.
 
-    Handles language spec construction, optional MTP block spec, and
-    model instantiation with Qwen3.5-VL-specific parameters.
+    Selects the HybridModel stack spec and instantiates the model with the
+    unified decoder/MTP layer pattern parsed from the CLI.
 
     Args:
         args: Megatron parsed arguments.
         language_config: ``TransformerConfig`` for the language decoder
             (already post-processed by :func:`post_language_config`).
         vision_config: ``TransformerConfig`` for the vision encoder.
+        pre_process: First PP stage flag — vision encoder + embedding live here.
+        post_process: Last PP stage flag — output projection + loss live here.
         **kwargs: Extra keyword arguments (e.g. ``vp_stage``).
 
     Returns:
         A :class:`Qwen35VLModel` instance.
     """
-    from megatron.core.models.gpt.gpt_layer_specs import (
-        get_gpt_mtp_block_spec,
-    )
+    vp_stage = kwargs.get("vp_stage", None)
+
+    hybrid_layer_pattern = getattr(args, "hybrid_layer_pattern", None)
+    if hybrid_layer_pattern is None:
+        raise ValueError(
+            "Qwen3.5-VL uses HybridModel and requires --hybrid-layer-pattern. "
+            "Use GEGEGE*E per four MoE blocks (or G-G-G-*- for dense blocks), "
+            "and append /*E or /*- for each MTP depth."
+        )
+
+    # The T/H/W split is architectural, not a tuning knob: it is tied to
+    # kv_channels and ROTARY_PERCENT. A section with the right total width but
+    # the wrong partition builds an incompatible rotary layout that trains to a
+    # plausible loss, so check the recipe value rather than documenting it.
+    mrope_section = getattr(language_config, "mrope_section", None)
+    if list(mrope_section or []) != list(MROPE_SECTION):
+        raise ValueError(
+            f"Qwen3.5-VL requires --mrope-section {' '.join(str(s) for s in MROPE_SECTION)}, "
+            f"but got {mrope_section}. The section split is tied to kv_channels and "
+            f"ROTARY_PERCENT; a mismatch silently misplaces the T/H/W channel boundaries."
+        )
 
     from examples.multimodal_dev.models.qwen35_vl.model import Qwen35VLModel
-    from examples.multimodal_dev.models.qwen35_vl.specs import (
-        get_qwen35_vl_language_spec,
-    )
-
-    language_spec = get_qwen35_vl_language_spec(
-        config=language_config,
-        vp_stage=kwargs.get("vp_stage", None),
-        pp_rank=None,
-    )
-
-    mtp_block_spec = None
-    if getattr(args, "mtp_num_layers", None):
-        mtp_block_spec = get_gpt_mtp_block_spec(
-            config=language_config,
-            spec=language_spec,
-            use_transformer_engine=(
-                args.transformer_impl == "transformer_engine"
-            ),
-            vp_stage=kwargs.get("vp_stage", None),
-            pp_rank=None,
-        )
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 
     # When --untie-embeddings-and-output-weights is NOT passed, Megatron
     # defaults to tied embeddings (share_embeddings_and_output_weights=True).
@@ -90,12 +116,16 @@ def build_model(args, language_config, vision_config, **kwargs):
 
     return Qwen35VLModel(
         language_config=language_config,
-        language_spec=language_spec,
+        hybrid_stack_spec=hybrid_stack_spec,
+        hybrid_layer_pattern=hybrid_layer_pattern,
         vision_config=vision_config,
         vocab_size=args.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         image_token_id=getattr(args, "image_token_id", 248056),
-        mtp_block_spec=mtp_block_spec,
+        position_embedding_type=args.position_embedding_type,
         parallel_output=True,
         share_embeddings_and_output_weights=share_embeddings,
+        pre_process=pre_process,
+        post_process=post_process,
+        vp_stage=vp_stage,
     )
