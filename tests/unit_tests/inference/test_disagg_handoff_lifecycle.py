@@ -1953,7 +1953,7 @@ def test_hybrid_handoff_uses_mirrored_slots_without_request_collectives():
 class _CoordinatorLoopPrefillEngine(DisaggDynamicInferenceEngine):
     """Prefill engine shell that drives the real coordinator loop on scripted work."""
 
-    def __init__(self, *, ep_world_size, peer_work, iterations, dummy_forward):
+    def __init__(self, *, ep_world_size, peer_work, iterations, dummy_forward) -> None:
         self._initialize_disaggregation_state()
         self._kv_transfer_role = "prefill"
         self.state = EngineState.RUNNING
