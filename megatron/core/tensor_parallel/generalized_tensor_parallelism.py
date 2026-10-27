@@ -540,8 +540,16 @@ def update_gtp_config(**kwargs):
         setattr(GTP_CONFIG, key, value)
 
 
-def _num_microbatches_can_change() -> bool:
-    """True when num_microbatches can change mid-run (--step-batch-size-schedule)."""
+def _num_microbatches_can_change(model=None) -> bool:
+    """Whether the number of executed microbatches can change between steps."""
+    # Packing changes execution rounds even with a constant global batch size.
+    # The output-head accumulation window learns its length from the previous
+    # step, so it must not predict the final backward from that count here.
+    while model is not None:
+        config = getattr(model, "config", None)
+        if getattr(config, "sequence_packing_scheduler", None) is not None:
+            return True
+        model = getattr(model, "module", None)
     # Lazy: a module-scope import here can silently flip HAVE_GTP to False.
     from megatron.core import num_microbatches_calculator as nmb
 
@@ -558,7 +566,7 @@ def tag_gtp_params_with_names(model):
     """
     # Off under a stepped batch schedule: a rising consume count double-fires grad-ready and
     # drops a contribution (see _is_last_expected_consume).
-    accum_ok = not _num_microbatches_can_change()
+    accum_ok = not _num_microbatches_can_change(model)
     for name, param in model.named_parameters():
         if is_gtp_param(param):
             param._debug_name = name
@@ -2974,6 +2982,11 @@ class GTPEmbeddingWeight(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Reduce-scatter the gradient back to this rank's vocab-dim shard."""
         (weight,) = ctx.saved_tensors
+        # Embedding backward returns the weight dtype (typically BF16). Match
+        # DDP's accumulation dtype before reducing across GTP peers, otherwise
+        # the collective rounds once more before adding to an FP32 main_grad.
+        if grad_output.dtype != weight.main_grad.dtype:
+            grad_output = grad_output.to(weight.main_grad.dtype)
         return weight.wgrad_reduce_scatter(grad_output)
 
 

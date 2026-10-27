@@ -93,3 +93,97 @@ def test_deprecated_hybrid_context_parallel_flag_warns_and_maps(monkeypatch):
         validate_args(args)
     assert args.dynamic_context_parallel
     assert not args.hybrid_context_parallel
+
+
+@pytest.mark.parametrize("world_size,gtp_size", [(4, 1), (4, 2), (8, 2)])
+def test_dynamic_cp_accepts_full_data_domain_minimum(monkeypatch, world_size, gtp_size):
+    args = _hybrid_cp_args(
+        monkeypatch,
+        world_size=world_size,
+        context_parallel_size=2,
+        tensor_parallel_num_weight_shards=gtp_size,
+        global_batch_size=world_size,
+        min_dynamic_context_parallel_size=world_size,
+    )
+    validate_args(args)
+    assert args.batch_parallel_size * args.context_parallel_size == world_size
+    assert args.data_parallel_size == world_size // (2 * gtp_size)
+
+
+def test_dynamic_cp_rejects_minimum_larger_than_full_data_domain(monkeypatch):
+    args = _hybrid_cp_args(
+        monkeypatch,
+        world_size=4,
+        context_parallel_size=2,
+        tensor_parallel_num_weight_shards=2,
+        global_batch_size=4,
+        min_dynamic_context_parallel_size=8,
+    )
+    with pytest.raises(ValueError, match="invalid for DPxCP size 4"):
+        validate_args(args)
+
+
+@pytest.mark.parametrize(
+    "world_size,tp_size,pp_size,cp_size,gtp_size,sequence_shards",
+    [
+        (4, 1, 1, 2, 1, None),
+        (4, 1, 1, 2, 2, None),
+        (8, 1, 1, 2, 2, None),
+        (8, 2, 1, 2, 2, None),
+        (8, 1, 2, 2, 2, None),
+        # Normalized static CP already includes GTP sequence shards; do not
+        # multiply those coordinates twice when computing DCP capacity.
+        (4, 1, 1, 1, 2, 2),
+    ],
+)
+def test_dynamic_cp_packed_capacity_includes_full_data_domain(
+    monkeypatch, world_size, tp_size, pp_size, cp_size, gtp_size, sequence_shards
+):
+    capacity = world_size // (tp_size * pp_size) * 1024
+    args = _hybrid_cp_args(
+        monkeypatch,
+        world_size=world_size,
+        tensor_model_parallel_size=tp_size,
+        pipeline_model_parallel_size=pp_size,
+        context_parallel_size=cp_size,
+        tensor_parallel_num_weight_shards=tp_size * gtp_size,
+        tensor_parallel_num_sequence_shards=sequence_shards,
+        global_batch_size=world_size,
+        seq_length=capacity,
+        max_position_embeddings=capacity,
+    )
+    validate_args(args)
+    assert args.batch_parallel_size * args.context_parallel_size * 1024 == capacity
+    assert args.sequence_packing_scheduler == "default_dynamic_cp"
+
+
+@pytest.mark.parametrize(
+    "dynamic,seq_length,valid,sequence_shards",
+    [
+        (True, 4096, True, None),
+        (True, 4100, False, None),
+        (False, 2048, True, None),
+        (False, 4096, False, None),
+        (True, 4100, False, 2),
+    ],
+)
+def test_packed_capacity_rejects_excess_without_expanding_static_cp(
+    monkeypatch, dynamic, seq_length, valid, sequence_shards
+):
+    args = _hybrid_cp_args(
+        monkeypatch,
+        world_size=4,
+        context_parallel_size=1 if sequence_shards == 2 else 2,
+        tensor_parallel_num_weight_shards=2,
+        tensor_parallel_num_sequence_shards=sequence_shards,
+        global_batch_size=4,
+        dynamic_context_parallel=dynamic,
+        sequence_packing_scheduler="default_dynamic_cp" if dynamic else "dp_balanced",
+        seq_length=seq_length,
+        max_position_embeddings=seq_length,
+    )
+    if valid:
+        validate_args(args)
+    else:
+        with pytest.raises(AssertionError, match="Packed sequence buffer size"):
+            validate_args(args)

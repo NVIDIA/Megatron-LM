@@ -502,6 +502,9 @@ def wrap_data_iterator(
         pg_collection: Caller-owned process groups; must define dp_cp, dp, tp, and pp.
     """
 
+    has_gtp = getattr(config, 'gtp_weight_remat_size', 1) > 1
+    if has_gtp and config.gtp_remat_num_sequence_shards != 1:
+        raise ValueError("Sequence packing does not support GTP sequence sharding")
     # GTP_remat peers consume distinct samples, so packing must span them like the rest of DP.
     dp_cp_group = pg_collection.dp_cp_gtp_remat or pg_collection.dp_cp
     dp_group = pg_collection.dp_gtp_remat or pg_collection.dp

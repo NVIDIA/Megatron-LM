@@ -493,7 +493,9 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "sequences_per_dataset": sequences_per_dataset,
         "defer_npy_index_mmap": args.dataloader_defer_npy_index_mmap,
         "context_parallel_size": args.context_parallel_size,
-        "data_parallel_size": args.data_parallel_size,
+        # Dataset alignment covers all independent sample owners, including
+        # GTP weight peers; it is not the optimizer's parameter replica count.
+        "data_parallel_size": args.batch_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
         "dynamic_context_parallel": args.dynamic_context_parallel,
         "inter_document_masking": args.dataloader_inter_document_masking,

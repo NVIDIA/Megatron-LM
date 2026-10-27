@@ -456,8 +456,12 @@ class VocabParallelEmbedding(torch.nn.Module):
         """Whether the backward adds the weight gradient into ``main_grad`` itself.
 
         With ``gradient_accumulation_fusion``, for a weight whose ``main_grad`` is owned by
-        Megatron's DDP (not Megatron-FSDP, GTP or ``zero_out_wgrad``, which mixes the gradients
-        of a weight shared on one stage through ``param.grad``).
+        Megatron's DDP (not Megatron-FSDP or a materialized GTP weight).
+        Shared weights may retain ``zero_out_wgrad``: this backward returns a zero
+        placeholder, so DDP can still add real ``param.grad`` contributions from
+        other consumers without adding the fused embedding gradient twice. Each
+        embedding use accumulates directly in ``main_grad`` rather than first
+        summing shared-use gradients in the parameter dtype.
         """
         return (
             self.config.gradient_accumulation_fusion
@@ -466,7 +470,6 @@ class VocabParallelEmbedding(torch.nn.Module):
             and torch.is_grad_enabled()
             and hasattr(weight, "main_grad")
             and hasattr(weight, "grad_added_to_main_grad")
-            and not getattr(weight, "zero_out_wgrad", False)
             and not hasattr(weight, "__fsdp_param__")
         )
 

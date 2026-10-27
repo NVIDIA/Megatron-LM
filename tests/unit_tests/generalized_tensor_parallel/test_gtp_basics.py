@@ -2399,7 +2399,7 @@ class TestWgradAccumBatchScheduleGate:
     consume (see _is_last_expected_consume). CPU-only: the gate is decided at tagging time.
     """
 
-    def _tag_output_layer(self, monkeypatch, schedule):
+    def _tag_output_layer(self, monkeypatch, schedule, packing=None, wrapped=False):
         """Enabled flag for one output_layer param, under the calculator production builds."""
         from types import SimpleNamespace
 
@@ -2418,9 +2418,13 @@ class TestWgradAccumBatchScheduleGate:
         monkeypatch.setattr(gtp_module, "is_gtp_param", lambda p: True)
         param = SimpleNamespace()
         try:
-            gtp_module.tag_gtp_params_with_names(
-                SimpleNamespace(named_parameters=lambda: [("module.output_layer.weight", param)])
+            model = SimpleNamespace(
+                config=SimpleNamespace(sequence_packing_scheduler=packing),
+                named_parameters=lambda: [("module.output_layer.weight", param)],
             )
+            if wrapped:
+                model = SimpleNamespace(module=model, named_parameters=model.named_parameters)
+            gtp_module.tag_gtp_params_with_names(model)
         finally:
             nmb.destroy_num_microbatches_calculator()
         return param._wgrad_accum_enabled
@@ -2433,3 +2437,10 @@ class TestWgradAccumBatchScheduleGate:
     )
     def test_gate(self, monkeypatch, schedule, enabled):
         assert self._tag_output_layer(monkeypatch, schedule) is enabled
+
+    @pytest.mark.parametrize("packing", ["dp_balanced", "default_dynamic_cp"])
+    @pytest.mark.parametrize("wrapped", [False, True])
+    def test_packing_changes_execution_count_with_constant_global_batch(
+        self, monkeypatch, packing, wrapped
+    ):
+        assert not self._tag_output_layer(monkeypatch, None, packing, wrapped)
