@@ -954,7 +954,7 @@ class TestMoEModules:
             moe_router_score_function="sigmoid",
             moe_router_enable_expert_bias=True,
             moe_router_topk_scaling_factor=scaling_factor,
-            inference_moe_triton_router=True,
+            inference_moe_router_backend="triton",
         )
         router = InferenceTopKRouter(
             config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()

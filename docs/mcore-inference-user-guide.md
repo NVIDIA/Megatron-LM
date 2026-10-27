@@ -499,8 +499,9 @@ than `InferenceConfig`, because they must be set when you build the model:
 `batch_invariant_mode` (and `batch_invariant_backend` /
 `batch_invariant_collective`), `inference_moe_token_dispatcher_type` (`nvls` by
 default, or `nccl`), `inference_grouped_gemm_backend` (`vllm` by default, or
-`torch` / `flashinfer`), `quant_recipe`, `moe_enable_routing_replay`, and
-`window_size` for sliding-window attention.
+`torch` / `flashinfer`), `inference_moe_router_backend` (`triton` by default, or
+`torch`), `quant_recipe`, `moe_enable_routing_replay`, and `window_size` for
+sliding-window attention.
 
 ### Reading Results
 

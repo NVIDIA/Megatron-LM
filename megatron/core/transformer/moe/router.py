@@ -1393,7 +1393,7 @@ class InferenceTopKRouter(TopKRouter):
     ) -> bool:
         """Whether this inference call uses the fused sigmoid top-k kernel.
 
-        It is opt-in through config.inference_moe_triton_router and covers sigmoid
+        It is selected by config.inference_moe_router_backend='triton' and covers sigmoid
         scores with an expert bias, fp32 logits and supported shapes, without
         group-limited routing, router replay, precomputed indices or TE's fused
         router; batch-invariant mode keeps its uncompiled reference path. forward()
@@ -1403,7 +1403,7 @@ class InferenceTopKRouter(TopKRouter):
         probability can differ from it in the last bit.
         """
         return (
-            self.config.inference_moe_triton_router
+            self.config.inference_moe_router_backend == 'triton'
             and HAVE_SIGMOID_TOPK_KERNEL
             and logits.is_cuda
             and logits.dtype == torch.float32

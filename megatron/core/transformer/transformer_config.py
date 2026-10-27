@@ -1454,14 +1454,15 @@ class TransformerConfig(ModelParallelConfig):
     fp8_recipe='mxfp8' with inference_grouped_gemm_backend='torch' or 'vllm'. Set to
     True to disable fusion and use separate kernel launches (useful for debugging)."""
 
-    inference_moe_triton_router: bool = False
-    """Route sigmoid MoE inference with Triton top-k kernels instead of the compiled
-    PyTorch router. Applies to InferenceTopKRouter in inference mode, with or without
-    gradients enabled, for sigmoid scores, an expert bias and fp32 logits; group-limited
-    routing, router replay, moe_router_fusion and batch-invariant mode keep the compiled
-    path. The kernel's outputs carry no autograd graph. Top-k up to 32
-    runs as one fused kernel; probabilities match the compiled path bitwise for top-k
-    below eight and to within the last fp32 bit otherwise. Off by default."""
+    inference_moe_router_backend: Literal['torch', 'triton'] = 'triton'
+    """Backend for InferenceTopKRouter top-k routing in inference mode.
+    - 'torch': torch.compile'd PyTorch routing.
+    - 'triton': A fused Triton sigmoid top-k kernel for sigmoid scores with an expert
+      bias, fp32 logits and top-k up to 32, with or without gradients enabled; its
+      outputs carry no autograd graph. Probabilities match 'torch' bitwise for top-k
+      below eight and to within the last fp32 bit otherwise. Other score functions,
+      group-limited routing, router replay, moe_router_fusion and batch-invariant mode
+      use the 'torch' path. Default."""
 
     inference_flashinfer_mxfp8_token_capacity: int | None = None
     """Optional fixed token-row capacity for FlashInfer routed MXFP8 MoE.
@@ -2081,6 +2082,11 @@ class TransformerConfig(ModelParallelConfig):
             self.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.from_config(
                 self.inference_grouped_gemm_backend
             )
+            if self.inference_moe_router_backend not in ('torch', 'triton'):
+                raise ValueError(
+                    "inference_moe_router_backend must be 'torch' or 'triton', "
+                    f"got {self.inference_moe_router_backend!r}"
+                )
 
             mxfp8_enabled = bool(self.fp8) and self.fp8_recipe == Fp8Recipe.mxfp8
             if self.expert_tensor_parallel_size > 1:
