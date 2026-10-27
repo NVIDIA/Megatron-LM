@@ -4644,6 +4644,22 @@ def checkpoint_and_decide_exit(
     return False
 
 
+def is_batch_size_transition(
+    num_microbatches: int, global_batch_size: int, has_step_batch_size_schedule: bool
+) -> bool:
+    """Return whether the last unchecked microbatch update moved to a new batch size.
+
+    With a step batch-size schedule, compare the global batch size too: the unchecked
+    update rounds the number of microbatches down, so a new batch size that the current
+    data-parallel size does not divide (e.g., 8192 -> 12288 at 8192 ranks) can leave it
+    unchanged. RL without sequence packing resizes the global batch every step, so the
+    comparison is limited to the schedule.
+    """
+    if get_num_microbatches() != num_microbatches:
+        return True
+    return has_step_batch_size_schedule and get_current_global_batch_size() != global_batch_size
+
+
 def train(
     forward_step_func,
     model,
@@ -5113,21 +5129,11 @@ def train(
         # to make sure training configuration is still valid.
         # Standard microbatch update (sequence packing overrides this in rl_utils.py)
         update_num_microbatches(train_state.consumed_train_samples, consistency_check=False, verbose=True)
-        # With a step batch-size schedule, compare the global batch size too: the unchecked
-        # update rounds the number of microbatches down, so a new batch size that the current
-        # data-parallel size does not divide (e.g., 8192 -> 12288 at 8192 ranks) can leave it
-        # unchanged. RL without sequence packing resizes the global batch every step, so the
-        # comparison is limited to the schedule.
-        is_num_microbatches_changed = get_num_microbatches() != num_microbatches
-        is_global_batch_size_changed = (
-            cfg.train.step_batch_size_schedule is not None
-            and get_current_global_batch_size() != global_batch_size
-        )
         # Skip automatic checkpoint on microbatch changes when sequence packing is active
         # as it intentionally reconfigures microbatches
-        if (
-            is_num_microbatches_changed or is_global_batch_size_changed
-        ) and iteration != 0:
+        if iteration != 0 and is_batch_size_transition(
+            num_microbatches, global_batch_size, cfg.train.step_batch_size_schedule is not None
+        ):
             if cfg.rl.rl_use_sequence_packing:
                 print_rank_0(
                     f"[Sequence Packing] Skipping automatic checkpoint at iteration {iteration} "
