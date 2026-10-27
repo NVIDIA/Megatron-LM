@@ -129,28 +129,44 @@ def test_fused_router_only_forwards_supported_topk_indices(monkeypatch, supports
     reason="TE fused router ops not available",
 )
 @pytest.mark.parametrize("dense_te_indices", [False, True])
-@pytest.mark.parametrize("topk", [1, 2])
+@pytest.mark.parametrize("topk", [1, 2, 4])
 @pytest.mark.parametrize(
-    "score_function,use_pre_softmax", [("softmax", False), ("softmax", True), ("sigmoid", False)]
+    "score_function,use_pre_softmax,expert_bias,scaling_factor",
+    [
+        ("softmax", False, False, None),
+        ("softmax", True, False, None),
+        ("sigmoid", False, False, None),
+        ("sigmoid", False, True, 2.5),
+    ],
+    ids=["softmax", "pre_softmax", "sigmoid", "sigmoid_bias_scaled"],
 )
 def test_fused_dense_routing_matches_unfused(
-    monkeypatch, score_function, use_pre_softmax, topk, dense_te_indices
+    monkeypatch,
+    score_function,
+    use_pre_softmax,
+    expert_bias,
+    scaling_factor,
+    topk,
+    dense_te_indices,
 ):
     """fused=True honours dense_output: [num_tokens, topk] probs and int64 expert IDs equal to
-    the unfused routing, with or without TE's dense index output."""
+    the unfused routing, with or without TE's dense index output. Enough tokens for many
+    blocks of TE's kernels; 8 experts, as the inference config-matrix models use."""
     if dense_te_indices and not HAVE_DENSE_ROUTER_FUSION:
         pytest.skip("TE dense fused router output is not available")
     monkeypatch.setattr(
         moe_utils, "fused_topk_with_score_function_supports_topk_indices", dense_te_indices
     )
     torch.manual_seed(123)
-    num_tokens, num_experts = 32, 16
+    num_tokens, num_experts = 1000, 8
     logits = torch.randn(num_tokens, num_experts, device="cuda")
-    kwargs = dict(score_function=score_function, use_pre_softmax=use_pre_softmax, dense_output=True)
-    if score_function == "sigmoid":
-        kwargs.update(
-            expert_bias=0.05 * torch.randn(num_experts, device="cuda"), scaling_factor=2.5
-        )
+    kwargs = dict(
+        score_function=score_function,
+        use_pre_softmax=use_pre_softmax,
+        scaling_factor=scaling_factor,
+        expert_bias=0.05 * torch.randn(num_experts, device="cuda") if expert_bias else None,
+        dense_output=True,
+    )
 
     ref_probs, ref_indices = topk_routing_with_score_function(logits, topk, **kwargs)
     probs, indices = topk_routing_with_score_function(logits, topk, fused=True, **kwargs)

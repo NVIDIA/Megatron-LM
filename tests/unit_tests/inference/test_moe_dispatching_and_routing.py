@@ -172,6 +172,12 @@ class TestInferenceTopKRouter:
     def teardown_class(cls):
         Utils.destroy_model_parallel()
 
+    @pytest.fixture(autouse=True)
+    def _compile_every_routing_variant(self, monkeypatch):
+        # These tests compile more routing variants (top-k, fusion, bias, token-count shapes)
+        # than Dynamo's default recompile limit; past it the router silently runs eagerly.
+        monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 64)
+
     def _make_router(self, **config_overrides):
         from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
         from megatron.core.transformer.moe.router import InferenceTopKRouter
@@ -320,15 +326,48 @@ class TestInferenceTopKRouter:
         inference_map = torch.zeros_like(training_map).scatter(1, top_indices, True)
         assert torch.equal(inference_map, training_map)
 
+    @requires_te_fused_router
+    @pytest.mark.parametrize("topk,expert_bias", [(1, False), (2, False), (4, False), (1, True)])
+    def test_fused_matches_unfused_across_token_counts(self, topk, expert_bias):
+        """Sigmoid routing over the token counts of an engine run, which drive the compiled
+        router through static, dynamic and size-1 shapes: the fused and unfused routers pick
+        the same experts with the same probs. Without expert bias and scaling, this is how the
+        inference config-matrix models route."""
+        router = self._make_router(
+            moe_router_topk=topk,
+            moe_router_enable_expert_bias=expert_bias,
+            moe_router_topk_scaling_factor=2.5 if expert_bias else None,
+            init_method_std=0.1,
+        )
+        hidden_size = NANOV3_BASE["hidden_size"]
+        with torch.no_grad():
+            # A training forward keeps the expert bias in fp32, as the fused router requires.
+            router(torch.randn(4, 1, hidden_size, device="cuda", dtype=torch.bfloat16))
+            if expert_bias:
+                router.expert_bias.copy_(0.05 * torch.randn_like(router.expert_bias))
+        for num_tokens in (320, 7, 520, 1):
+            hidden = torch.randn(num_tokens, 1, hidden_size, device="cuda", dtype=torch.bfloat16)
+            routes = {}
+            for fusion in (True, False):
+                router.config.moe_router_fusion = fusion
+                with torch.inference_mode(), InferenceMode.active():
+                    probs, top_indices = router(hidden)
+                order = top_indices.argsort(dim=1)
+                routes[fusion] = (top_indices.gather(1, order), probs.gather(1, order))
+            assert torch.equal(routes[True][0], routes[False][0]), f"{num_tokens} tokens"
+            torch.testing.assert_close(routes[True][1], routes[False][1])
+
     @requires_te
     @pytest.mark.parametrize(
         "backend", ["vllm", pytest.param("torch", marks=requires_torch_grouped_mm)]
     )
-    @pytest.mark.parametrize("topk", [1, 2])
+    @pytest.mark.parametrize("expert_bias", [False, True], ids=["plain", "bias_scaled"])
+    @pytest.mark.parametrize("topk", [1, 2, 4])
     @pytest.mark.parametrize("fusion", ROUTER_FUSION)
-    def test_moe_layer_matches_training(self, fusion, topk, backend):
+    def test_moe_layer_matches_training(self, fusion, topk, expert_bias, backend):
         """The inference MoE layer consumes the inference routing for every router fusion
-        setting and top-k: at EP=1 its output matches the same layer's training path."""
+        setting, top-k and sigmoid variant (plain, or expert bias and scaling): at EP=1 its
+        output matches the same layer's training path."""
         from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
         from megatron.core.transformer.moe.token_dispatcher_inference import (
             InferenceAllGatherDispatcherBase,
@@ -340,10 +379,14 @@ class TestInferenceTopKRouter:
         config = _make_base_config(
             moe_router_topk=topk,
             moe_router_fusion=fusion,
+            moe_router_enable_expert_bias=expert_bias,
+            moe_router_topk_scaling_factor=2.5 if expert_bias else None,
             moe_shared_expert_intermediate_size=None,
             inference_grouped_gemm_backend=backend,
         )
         layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        if expert_bias:
+            layer.router.expert_bias.copy_(0.05 * torch.randn_like(layer.router.expert_bias))
         # Standalone layer without a dynamic context: no symmetric buffers or padding mask.
         NVLSAllGatherVDispatcher._delete_buffers()
         InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
