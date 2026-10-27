@@ -1981,7 +1981,7 @@ class TextGenerationController(MTPControllerMixin):
                 finished_request_ids=finished_request_ids,
                 sample=sampled_tokens_cpu,
                 accepted_tokens=(
-                    self._accepted_tokens_per_request
+                    self._accepted_tokens_per_request[:active_request_count]
                     if self.num_speculative_tokens > 0 and context.num_decode_requests > 0
                     else None
                 ),
@@ -3539,7 +3539,10 @@ class TextGenerationController(MTPControllerMixin):
             num_decode_requests = context.num_decode_requests
             if self.num_speculative_tokens > 0:
                 # Prefill-only batches must not have any accepted speculative tokens.
-                assert num_decode_requests > 0 or (self._accepted_tokens_per_request == -1).all()
+                assert (
+                    num_decode_requests > 0
+                    or (self._accepted_tokens_per_request[:active_request_count] == -1).all()
+                )
 
             if skip_bookkeeping:
                 # _transfer_samples_to_cpu wasn't invoked on this path, so do
@@ -3559,8 +3562,8 @@ class TextGenerationController(MTPControllerMixin):
 
             ret = {
                 "accepted_tokens": (
-                    # Clone needed: .fill_(-1) below would corrupt the returned value.
-                    self._accepted_tokens_per_request.clone()
+                    # Clone needed: the next step's verification rewrites this buffer.
+                    self._accepted_tokens_per_request[:active_request_count].clone()
                     if self.num_speculative_tokens > 0 and num_decode_requests > 0
                     else None
                 ),
@@ -3568,9 +3571,6 @@ class TextGenerationController(MTPControllerMixin):
                 "top_n_logprobs": top_n_logprobs,
                 "cuda_graph_request_count": cuda_graph_request_count,
             }
-            if self.num_speculative_tokens > 0:
-                self._accepted_tokens_per_request.fill_(-1)
-                self._accepted_token_counts_per_request.fill_(0)
             ret.update(request_bookkeeping)
             return DynamicBatchControllerStepResult(
                 decode_only=DecodeOnly(consumed=is_decode_only, launched=is_decode_only), output=ret

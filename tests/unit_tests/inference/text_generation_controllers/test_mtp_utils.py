@@ -446,7 +446,8 @@ class TestPrepareNextForwardPass:
         return output_tokens, required_logit_indices, input_tokens, accepted_mask, last_one_indices
 
     @pytest.mark.parametrize(
-        "num_decode,num_prefill,num_spec", [(1, 0, 2), (3, 0, 2), (3, 2, 2), (0, 3, 2), (5, 3, 4)]
+        "num_decode,num_prefill,num_spec",
+        [(1, 0, 2), (3, 0, 2), (3, 2, 2), (0, 3, 2), (5, 3, 4), (3, 0, 3), (2, 2, 3)],
     )
     def test_basic(self, num_decode, num_prefill, num_spec):
         output_tokens, required_logit_indices, input_tokens, accepted_mask, last_one_indices = (
@@ -457,9 +458,12 @@ class TestPrepareNextForwardPass:
 
         ref_sampled = torch.zeros(active, device=DEVICE, dtype=torch.int64)
         ref_last_seq = torch.zeros(active, device=DEVICE, dtype=torch.int64)
-        # Start from stale values: the kernel must rewrite every active row.
-        ref_accepted = torch.randint(0, 1000, (active, num_spec), device=DEVICE, dtype=torch.int64)
-        ref_counts = torch.randint(0, num_spec + 1, (active,), device=DEVICE, dtype=torch.int64)
+        # Start from stale values: the kernel must rewrite every active row. The spare row past
+        # the active ones must stay untouched, also when num_spec is not a power of two.
+        ref_accepted = torch.randint(
+            0, 1000, (active + 1, num_spec), device=DEVICE, dtype=torch.int64
+        )
+        ref_counts = torch.randint(0, num_spec + 1, (active + 1,), device=DEVICE, dtype=torch.int64)
 
         tri_sampled, tri_last_seq, tri_accepted, tri_counts = _clone_tensors(
             ref_sampled, ref_last_seq, ref_accepted, ref_counts
