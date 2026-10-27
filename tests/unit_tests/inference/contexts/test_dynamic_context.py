@@ -4802,6 +4802,35 @@ def test_flashinfer_filtered_log_probs_match_torch_filters():
     torch.testing.assert_close(log_probs[kept], reference[kept], rtol=0, atol=1e-5)
 
 
+@pytest.mark.parametrize("has_switch", [True, False])
+def test_flashinfer_log_probs_request_deterministic_top_p(monkeypatch, has_switch):
+    """Top-p renorm gets `is_deterministic=True` exactly when FlashInfer's signature has it."""
+    seen = []
+
+    def renorm_with_switch(probs, top_p, is_deterministic=False):
+        seen.append(is_deterministic)
+        return probs
+
+    def renorm_without_switch(probs, top_p):
+        seen.append(None)
+        return probs
+
+    fake = mock.MagicMock()
+    fake.sampling.top_k_mask_logits.side_effect = lambda logits, top_k: logits
+    fake.sampling.top_p_renorm_probs = renorm_with_switch if has_switch else renorm_without_switch
+    monkeypatch.setattr("megatron.core.inference.sampling.flashinfer_sampling.flashinfer", fake)
+
+    context = SimpleNamespace(
+        gpu_view=SimpleNamespace(
+            temperature=torch.ones(2), top_k=torch.zeros(2, dtype=torch.int32), top_p=torch.ones(2)
+        ),
+        active_sampling_filter_flags=lambda count=None: (True, False),
+    )
+    backend = FlashInferSampling(16, torch.Generator())
+    backend.log_probs_kernel(torch.randn(2, 16), context)
+    assert seen == ([True] if has_switch else [None])
+
+
 @pytest.mark.parametrize(
     "no_top_k,no_top_p,top_k,top_p,expected_kernel",
     [

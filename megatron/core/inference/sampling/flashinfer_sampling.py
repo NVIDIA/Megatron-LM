@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import inspect
 from typing import Any, Optional
 
 import torch
@@ -16,7 +17,6 @@ from megatron.core.inference.sampling_params import (
     is_no_op_top_k,
     is_no_op_top_p,
 )
-from megatron.core.utils import is_flashinfer_min_version
 
 
 class FlashInferSampling(Sampling):
@@ -44,12 +44,14 @@ class FlashInferSampling(Sampling):
         del config, enable_cuda_graph
         self._vocab_size = vocab_size
         self._rng = rng
-        # From 0.6.7, FlashInfer renormalizes top-p with a radix kernel whose default float
-        # atomic histograms pick the kept set in a run-dependent order; request its integer
-        # accumulation. Older versions use a one-block-per-row kernel, deterministic as is.
-        self._top_p_renorm_kwargs = (
-            {"is_deterministic": True} if is_flashinfer_min_version("0.6.7") else {}
+        # FlashInfer's radix top-p renorm (0.6.7+) has float atomic histograms by default, which
+        # pick the kept set in a run-dependent order; request its integer accumulation where the
+        # switch exists. Without it, top-p renorm is a one-block-per-row kernel, deterministic.
+        has_switch = flashinfer is not None and (
+            "is_deterministic"
+            in inspect.signature(flashinfer.sampling.top_p_renorm_probs).parameters
         )
+        self._top_p_renorm_kwargs = {"is_deterministic": True} if has_switch else {}
 
     def sample_kernel(
         self,
