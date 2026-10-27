@@ -1346,9 +1346,12 @@ class TransformerConfig(ModelParallelConfig):
     moe_hybridep_preserve_route_precision: bool = False
     """Keep HybridEP expert routes separate until a final FP32 forward/dgrad reduction.
 
-    This removes rank-layout-dependent intermediate BF16 rounding. It increases communication
-    and metadata capacity by up to router top-k. Use the same setting for baseline and scheduler
-    comparisons. Requires the compact-index HybridEP path and excludes pad-to-capacity routing.
+    This removes rank-layout-dependent intermediate BF16 rounding. The final forward and input
+    gradient sums sort contributions per feature before FP32 accumulation, making them invariant
+    to physical route order without retaining sorting indices for backward. This adds temporary
+    sorting storage/work and increases communication/metadata capacity by up to router top-k.
+    It does not make partitioned expert weight gradients bitwise identical. Use matching code and
+    settings for baseline/scheduler comparisons. Requires compact indices; excludes pad-to-capacity.
     """
 
     moe_hybridep_pad_variable_tokens: bool = False

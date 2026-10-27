@@ -1037,6 +1037,32 @@ class HybridEPExpertDispatch(torch.autograd.Function):
         return None, None, None, None, None, None, None, None, *grad_list
 
 
+def _canonical_route_sum(routes):
+    """Accumulate a route multiset in a placement-independent FP32 order.
+
+    Logical-to-physical remapping can reorder routes. Even an FP32 sum of BF16
+    contributions may land on opposite sides of a BF16 rounding boundary. Sort
+    the values for each feature before reducing; neither expert IDs nor their
+    physical ownership then affect this reduction. This is the opt-in precision
+    path, with additional temporary sorting storage and work.
+    """
+    return routes.sort(dim=1).values.sum(dim=1, dtype=torch.float32).to(routes.dtype)
+
+
+class _HybridEPRouteReduce(torch.autograd.Function):
+    """Sum routes without retaining sort indices for the backward pass."""
+
+    @staticmethod
+    def forward(ctx, routes):
+        ctx.topk = routes.shape[1]
+        return _canonical_route_sum(routes)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # A sum has the same derivative for every route, regardless of sorting.
+        return grad_output.unsqueeze(1).expand(-1, ctx.topk, -1)
+
+
 class _HybridEPRouteExpand(torch.autograd.Function):
     """Keep route gradients separate until one FP32 input-gradient reduction."""
 
@@ -1049,7 +1075,7 @@ class _HybridEPRouteExpand(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_hidden):
         grad_hidden = grad_hidden.reshape(ctx.num_tokens, ctx.topk, ctx.hidden_size)
-        return grad_hidden.sum(dim=1, dtype=torch.float32).to(grad_hidden.dtype), None
+        return _canonical_route_sum(grad_hidden), None
 
 
 class _HybridEPRouteHandle(tuple):
@@ -1147,7 +1173,7 @@ if HAVE_HYBRIDEP:
             num_of_experts (int, optional):
                 Total number of experts. Required when topk_idx is provided.
             preserve_route_precision (bool):
-                Keep each expert route separate through communication, then sum in FP32.
+                Keep expert routes separate through communication, then sum in canonical FP32 order.
                 Avoids layout-dependent intermediate BF16 rounding in forward and dgrad;
                 increases token communication/metadata capacity by up to router top-k.
         '''
@@ -1212,7 +1238,7 @@ if HAVE_HYBRIDEP:
         result = HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple, fused)
         if isinstance(handle, _HybridEPRouteHandle):
             result = result.reshape(handle.num_tokens, handle.topk, result.shape[-1])
-            result = result.sum(dim=1, dtype=torch.float32).to(result.dtype)
+            result = _HybridEPRouteReduce.apply(result)
         return result
 
 else:

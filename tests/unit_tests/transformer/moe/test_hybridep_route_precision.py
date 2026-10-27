@@ -101,3 +101,43 @@ def test_route_precision_rejects_incompatible_config(overrides):
     args.update(overrides)
     with pytest.raises(ValueError, match="moe_hybridep_preserve_route_precision requires"):
         TransformerConfig(**args)
+
+
+@pytest.mark.parametrize("topk", [6, 10])
+def test_route_reduction_is_invariant_to_route_order(distributed_world, topk):
+    device = torch.device("cuda", torch.cuda.current_device())
+    # The two tiny terms together cross a BF16 rounding midpoint. Summing them
+    # separately after the leading1 loses them in FP32, reproducing the old bug.
+    values = torch.tensor(
+        [1.0, 2**-8, 2**-24, 2**-24] + [0.0] * (topk - 4), dtype=torch.bfloat16, device=device
+    )
+    routes = values.reshape(1, topk, 1).expand(32, -1, 64).clone()
+    expected = routes.double().sum(1).bfloat16()
+    generator = torch.Generator(device=device).manual_seed(317)
+    upstream = torch.randn(32, 64, device=device, dtype=torch.bfloat16, generator=generator)
+    for _ in range(8):
+        permutation = torch.randperm(topk, device=device, generator=generator)
+        permuted = routes[:, permutation].detach().requires_grad_()
+        actual = fused_a2a._HybridEPRouteReduce.apply(permuted)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        actual.backward(upstream)
+        torch.testing.assert_close(
+            permuted.grad, upstream[:, None].expand_as(routes), atol=0, rtol=0
+        )
+        hidden = torch.zeros(32, 64, device=device, dtype=torch.bfloat16, requires_grad=True)
+        expanded = fused_a2a._HybridEPRouteExpand.apply(hidden, topk)
+        expanded.backward(permuted.detach().reshape_as(expanded))
+        torch.testing.assert_close(hidden.grad, expected, atol=0, rtol=0)
+
+
+def test_route_reduction_does_not_retain_sort_indices(distributed_world):
+    saved = []
+    device = torch.device("cuda", torch.cuda.current_device())
+    routes = torch.randn(32, 10, 64, device=device, dtype=torch.bfloat16, requires_grad=True)
+    with torch.autograd.graph.saved_tensors_hooks(
+        lambda tensor: saved.append(tensor) or tensor, lambda tensor: tensor
+    ):
+        output = fused_a2a._HybridEPRouteReduce.apply(routes)
+    assert saved == []
+    output.sum().backward()
+    torch.testing.assert_close(routes.grad, torch.ones_like(routes), atol=0, rtol=0)
