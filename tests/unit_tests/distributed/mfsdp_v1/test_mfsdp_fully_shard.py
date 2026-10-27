@@ -89,7 +89,7 @@ def test_all_gather_pipeline_prefetch_size():
 
 
 def _recompute_prefetch_pipeline(extended_buckets, double_buffer=False):
-    """Three buckets, of which 0 and 1 have a transpose buffer. `_all_gather_params` is
+    """Three buckets, of which 0 and 1 have a transpose buffer. `_all_gather_bucket_window` is
     replaced by a recorder that returns `extended_buckets`."""
     params = [object() for _ in range(3)]
     pipeline = AllGatherPipeline.__new__(AllGatherPipeline)
@@ -115,7 +115,7 @@ def _recompute_prefetch_pipeline(extended_buckets, double_buffer=False):
         calls.append(([pipeline.buffer.param_to_param_group[p] for p in params], prefetch, bwd))
         return extended_buckets
 
-    pipeline._all_gather_params = all_gather
+    pipeline._all_gather_bucket_window = all_gather
     return pipeline, params, calls
 
 

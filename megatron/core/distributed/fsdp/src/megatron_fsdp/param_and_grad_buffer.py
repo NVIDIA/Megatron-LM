@@ -4815,10 +4815,10 @@ class AllGatherPipeline:
             bwd (bool, optional):
                 Whether to all-gather column-wise parameters instead of row-wise parameters
                 for the backward pass for formats that require a transpose buffer like MXFP8.
-            recompute (bool, optional): Whether the row-wise params are gathered for an
-                activation-recompute forward during the backward pass. Buckets with a
-                transpose buffer gathered this way are recorded, and later backward gathers
-                also gather their row-wise weights when they are in the gathered set.
+            recompute (bool, optional): Whether this is a row-wise (`bwd=False`) gather for
+                the forward that activation recompute re-runs during the backward pass. The
+                gathered buckets that have a transpose buffer are recorded, and later backward
+                gathers also gather the row-wise weights of recorded buckets in their window.
         """
         if len(params) == 0:
             return
@@ -4829,37 +4829,45 @@ class AllGatherPipeline:
             async_param_gather=async_param_gather,
             outer_fsdp_group_param_gather=outer_fsdp_group_param_gather,
         )
-        ag_buckets = self._all_gather_params(params, prefetch=prefetch, bwd=bwd, **gather_kwargs)
+        window = self._all_gather_bucket_window(params, prefetch=prefetch, bwd=bwd, **gather_kwargs)
+        if recompute:
+            self._record_recompute_buckets(window)
+        elif bwd:
+            self._gather_recompute_buckets(window, gather_kwargs)
+
+    def _record_recompute_buckets(self, bucket_ids: List[int]) -> None:
+        """Record the buckets whose row-wise weights a recomputed forward re-gathered.
+        Buckets without a transpose buffer use the same weights in forward and backward.
+        Nothing is recorded with double buffering, whose pool holds at most two FSDP units."""
         if self.buffer.ddp_config.fsdp_double_buffer:
             return
+        parameter_groups = self.buffer.parameter_groups
+        self.recompute_buckets.update(
+            bucket_id
+            for bucket_id in bucket_ids
+            if parameter_groups[bucket_id].transpose_weight_buffer is not None
+        )
 
-        if recompute and not bwd:
-            self.recompute_buckets.update(
-                bucket_id
-                for bucket_id in ag_buckets
-                if self.buffer.parameter_groups[bucket_id].transpose_weight_buffer is not None
-            )
-        elif bwd and self.recompute_buckets:
-            recompute_buckets = [
-                bucket_id
-                for bucket_id in ag_buckets
-                if bucket_id in self.recompute_buckets
-                and self.bucket_status[self.get_bucket_key(bucket_id, bwd=False)]
-                in (BucketStatus.EMPTY, BucketStatus.PRESERVED)
-            ]
-            if recompute_buckets:
-                self._all_gather_params(
-                    [
-                        param
-                        for bucket_id in recompute_buckets
-                        for param in self.buffer.parameter_groups[bucket_id].params
-                    ],
-                    prefetch=False,
-                    bwd=False,
-                    **gather_kwargs,
-                )
+    def _gather_recompute_buckets(self, bucket_ids: List[int], gather_kwargs: dict) -> None:
+        """Gather the row-wise weights of the recorded buckets among `bucket_ids` that are
+        not already gathered, so that their recomputed forward does not wait on them."""
+        pending = [
+            bucket_id
+            for bucket_id in bucket_ids
+            if bucket_id in self.recompute_buckets
+            and self.bucket_status[self.get_bucket_key(bucket_id, bwd=False)]
+            in (BucketStatus.EMPTY, BucketStatus.PRESERVED)
+        ]
+        if not pending:
+            return
+        params = [
+            param
+            for bucket_id in pending
+            for param in self.buffer.parameter_groups[bucket_id].params
+        ]
+        self._all_gather_bucket_window(params, prefetch=False, bwd=False, **gather_kwargs)
 
-    def _all_gather_params(
+    def _all_gather_bucket_window(
         self,
         params: List[torch.Tensor],
         prefetch: bool = False,
@@ -4869,8 +4877,9 @@ class AllGatherPipeline:
         outer_fsdp_group_param_gather: bool = False,
         bwd: bool = False,
     ) -> List[int]:
-        """All-gather the params as described in `all_gather_params`, and return the
-        requested buckets extended by prefetch."""
+        """All-gather the buckets of `params` and, if `prefetch`, the buckets prefetched after
+        them, as described in `all_gather_params`. Return all of these bucket IDs, including
+        those that were already gathered."""
         ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
         parameter_groups = self.buffer.parameter_groups

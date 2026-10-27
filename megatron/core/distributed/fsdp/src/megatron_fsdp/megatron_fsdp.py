@@ -517,6 +517,10 @@ class MegatronFSDP(torch.nn.Module):
         """
         All-gather parameters across the data parallel group and wait for
         the all-gather operation to complete.
+
+        `prefetch`, `prefetch_order`, `bwd` and `recompute` are passed through to
+        `AllGatherPipeline.all_gather_params`, which documents them. If
+        `wait_bucket_ready`, block until the buckets of `params` are gathered.
         """
         if all_sharding_strategies_in(self.ddp_config, ["no_shard"]):
             return
