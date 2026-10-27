@@ -38,6 +38,9 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
 from megatron.core.transformer.mlp import (
     MLP,
     MLPSubmodules,
@@ -89,8 +92,13 @@ try:
     from flashinfer.fused_moe.core import ActivationType
 
     HAVE_FLASHINFER = True
+    # cutlass_fused_moe accepts use_fused_finalize from FlashInfer 0.6.15 on.
+    HAVE_FLASHINFER_UNFUSED_FINALIZE = (
+        "use_fused_finalize" in inspect.signature(fused_moe.cutlass_fused_moe).parameters
+    )
 except ImportError:
     HAVE_FLASHINFER = False
+    HAVE_FLASHINFER_UNFUSED_FINALIZE = False
 
 from megatron.core.inference.moe import ActivationType as McoreActivationType
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
@@ -1732,6 +1740,20 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 use_bounded_rows=InferenceMode.use_bounded_mxfp8_rows(),
             )
             return output, None
+        # FlashInfer's autotuner may select a GEMM2 tactic with a fused finalize, which
+        # accumulates each token's top-k routes with output-dtype atomics in no fixed order.
+        # use_fused_finalize=False rules those tactics out; the separate finalize kernel
+        # reduces each token's routes in order.
+        finalize_kwargs = {}
+        if torch.are_deterministic_algorithms_enabled() or is_batch_invariant_mode_enabled():
+            if not HAVE_FLASHINFER_UNFUSED_FINALIZE:
+                raise RuntimeError(
+                    "Deterministic or batch-invariant BF16 FlashInfer MoE requires "
+                    "flashinfer-python >= 0.6.15, whose cutlass_fused_moe accepts "
+                    "use_fused_finalize=False. Upgrade flashinfer-python or select "
+                    "inference_grouped_gemm_backend 'torch' or 'vllm'."
+                )
+            finalize_kwargs["use_fused_finalize"] = False
         output = fused_moe.cutlass_fused_moe(
             hidden_states,
             routing_map.int(),
@@ -1747,6 +1769,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             # NVLS reduce-scatter buffer is FP32. Let the kernel return BF16;
             # token_combine() copies it into the symmetric FP32 buffer.
             output=None,
+            **finalize_kwargs,
         )[0]
         return output, None
 

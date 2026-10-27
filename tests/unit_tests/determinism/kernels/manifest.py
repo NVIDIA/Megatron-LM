@@ -385,7 +385,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/transformer/moe/experts.py",),
         tests=(K + "test_moe_kernels.py",),
         kind="te-wrapper",
-        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
+        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert. "
+        "Inference BF16 experts on FlashInfer cutlass_fused_moe pass use_fused_finalize=False "
+        "under deterministic algorithms or batch_invariant_mode, since fused-finalize GEMM2 "
+        "tactics sum the top-k routes with BF16 atomics; every GEMM2 tactic the autotuner can "
+        "select is replayed and checked for batch invariance (needs FlashInfer >= 0.6.15 on "
+        "Hopper or newer).",
     ),
     KernelEntry(
         name="moe_fused_a2a",
