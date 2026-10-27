@@ -117,7 +117,7 @@ def calc_params_l2_norm(
                     continue
                 if isinstance(param, DTensor):
                     mesh, placements = param.device_mesh, param.placements
-                    local_param = param._local_tensor
+                    local_param = param.to_local()
                 else:
                     group = get_containing_parameter_group(param)
                     if group is None:
