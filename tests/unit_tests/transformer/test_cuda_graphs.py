@@ -1257,6 +1257,72 @@ class TestTECudaGraphHelper:
         # Note: _unique_buffer_counts is intentionally NOT cleared here so we can
         # compare values across parametrized test runs
 
+    def test_mrope_replay_uses_current_positions(self):
+        """Graph replay must preserve position-dependent mRoPE forward and gradients."""
+        Utils.initialize_model_parallel()
+        init_num_microbatches_calculator(
+            rank=0,
+            global_batch_size=1,
+            micro_batch_size=1,
+            data_parallel_size=1,
+            decrease_batch_size_if_needed=False,
+        )
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            cuda_graph_impl="transformer_engine",
+            use_te_rng_tracker=True,
+            mrope_section=[2, 3, 3],
+        )
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(123)
+        current_stream = torch.cuda.current_stream()
+        init_stream = torch.cuda.Stream()
+        init_stream.wait_stream(current_stream)
+        with torch.cuda.stream(init_stream):
+            raw_model = GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=128,
+                max_sequence_length=128,
+                position_embedding_type="mrope",
+            ).cuda()
+            model = DistributedDataParallel(
+                config, DistributedDataParallelConfig(grad_reduce_in_fp32=True), raw_model
+            )
+        current_stream.wait_stream(init_stream)
+        tokens = torch.arange(128, device="cuda").unsqueeze(0)
+        positions = tokens.unsqueeze(0).expand(3, -1, -1).contiguous()
+        shifted = positions * torch.tensor([1, 2, 3], device="cuda").view(3, 1, 1)
+
+        def train_step(position_ids):
+            model.zero_grad_buffer()
+            model.set_is_first_microbatch()
+            losses = model(tokens, position_ids, None, labels=tokens)
+            losses.mean().backward()
+            model.finish_grad_sync()
+            return losses.detach().clone(), [p.main_grad.clone() for p in model.parameters()]
+
+        eager = [train_step(position_ids) for position_ids in (positions, shifted)]
+        assert not torch.equal(eager[0][0], eager[1][0])
+        helper = TECudaGraphHelper(
+            model=[model], config=config, seq_length=128, micro_batch_size=1, optimizers=[]
+        )
+        try:
+            helper.create_cudagraphs()
+            assert helper.graphs_created()
+            replay = [train_step(position_ids) for position_ids in (positions, shifted)]
+            for expected, actual in zip(eager, replay):
+                torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        finally:
+            if helper.graphs_created():
+                helper.delete_cuda_graphs()
+
     @pytest.mark.parametrize("num_microbatches", [16, 64, 256])
     @pytest.mark.parametrize("pp_size", [1, 2, 4])
     @pytest.mark.parametrize("vpp_size", [None, 2])

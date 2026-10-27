@@ -2455,6 +2455,19 @@ class TECudaGraphHelper:
 
             def get_rotary_pos_emb(transformer_module, transformer_input):
                 if (
+                    transformer_module.position_embedding_type == 'mrope'
+                    and not self.config.multi_latent_attention
+                ):
+                    # Capture the tensor input; replay provides the actual position embeddings.
+                    position_ids = torch.zeros(
+                        (3, self.micro_batch_size, self.seq_length),
+                        device=transformer_input.device,
+                        dtype=torch.long,
+                    )
+                    return transformer_module.rotary_pos_emb(
+                        position_ids, transformer_module.mrope_section
+                    )
+                if (
                     transformer_module.position_embedding_type == 'rope'
                     and not self.config.multi_latent_attention
                 ):
