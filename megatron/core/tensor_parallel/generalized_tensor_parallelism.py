@@ -31,7 +31,7 @@ from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
 import torch
 from packaging.version import Version
@@ -141,12 +141,109 @@ _GTP_REMAT_GROUPED_FC1 = f"{_GTP_REMAT_GROUPED_PREFIX}fc1"
 _GTP_REMAT_GROUPED_FC2 = f"{_GTP_REMAT_GROUPED_PREFIX}fc2"
 
 
+@dataclass(frozen=True)
+class _RegisteredPrefetchChain:
+    """Runtime metadata; a logical chain does not own a communication stream."""
+
+    grouped: bool
+    graphed: bool
+    group_id: int
+
+
+_REGISTERED_PREFETCH_CHAINS: Dict[str, _RegisteredPrefetchChain] = {}
+
+
+def register_prefetch_chain(name: str, weights: Iterable[torch.Tensor]) -> None:
+    """Assign already-sharded weights to a named prefetch chain before classification.
+
+    Call after GTP wrapping (and any parameter-replacing wrappers), before
+    ``classify_gtp_remat_chains`` and the first forward. Registration selects membership,
+    not execution order: warmup discovers forward/backward and recompute links. It does
+    not enable sharding, change collective grouping, or allocate a communication stream.
+    Unregistered weights retain the default name-based classification.
+
+    Args:
+        name: Logical chain name, containing letters, digits, underscores, dots or hyphens.
+        weights: GTP-sharded weights. For a grouped projection, pass its leading weight
+            (``weight0``); all local-expert weights in its existing ``weight_list`` are
+            assigned together. Passing the complete group is also supported. An empty
+            selection is a no-op, e.g. when an optional sharding policy is disabled.
+
+    Raises:
+        ValueError: Invalid name, conflicting membership, mixed dense/grouped weights,
+            different process groups, or an incomplete grouped projection.
+        TypeError: A supplied weight is not GTP-sharded.
+        RuntimeError: Classification or warmup has already started for a selected weight.
+
+    All ranks must register the same logical schedule. Registered chains inherit the
+    existing CUDA-graph scope classification and are split at captured/eager boundaries.
+    Dense chains share the default dense streams; grouped chains share the expert streams,
+    each still keyed by process group and capture state. Registration is not a new
+    operator integration: consumers must already implement the DistributedWeight protocol.
+    """
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+        raise ValueError("Prefetch chain name must contain only letters, digits, '_', '.' or '-'")
+    selected = {}
+    for weight in weights:
+        if not is_gtp_param(weight):
+            raise TypeError("Prefetch chains accept only already GTP-sharded weights")
+        selected[id(weight)] = weight
+    # A grouped projection is one consumer. Never split its local-expert collective.
+    for weight in tuple(selected.values()):
+        if weight.weight_list is not None:
+            for member in weight.weight_list:
+                selected[id(member)] = member
+    leaders = {
+        id(member)
+        for weight in selected.values()
+        if weight.weight_list is not None
+        for member in weight.weight_list
+    }
+    kinds = set()
+    groups = set()
+    for weight in selected.values():
+        if weight.is_routed_expert and id(weight) not in leaders:
+            raise ValueError("Register a grouped projection through its leading weight (weight0)")
+        if (
+            getattr(weight, "_gtp_chain_classified", False)
+            or weight.prefetch_initialized
+            or weight._recompute_initialized
+        ):
+            raise RuntimeError("Register prefetch chains before classification and warmup")
+        previous = getattr(weight, "_gtp_prefetch_chain_name", name)
+        if previous != name:
+            raise ValueError(f"Weight already belongs to prefetch chain {previous!r}")
+        kinds.add(weight.is_routed_expert)
+        groups.add(id(weight.group))
+    if len(kinds) > 1 or len(groups) > 1:
+        raise ValueError("A prefetch chain must have one weight kind and one process group")
+    # Validate the entire request before mutating parameters.
+    for weight in selected.values():
+        weight._gtp_prefetch_chain_name = name
+
+
+def _registered_chain_id(param, default_chain: str) -> str:
+    """Resolve explicit membership while retaining the default capture boundary."""
+    name = getattr(param, "_gtp_prefetch_chain_name", None)
+    if name is None:
+        return default_chain
+    graphed = _chain_is_graphed(default_chain)
+    chain_id = f"GTP_registered_{name}_{_graphness_suffix(graphed)}"
+    metadata = _RegisteredPrefetchChain(param.is_routed_expert, graphed, id(param.group))
+    previous = _REGISTERED_PREFETCH_CHAINS.get(chain_id)
+    if previous is not None and previous != metadata:
+        raise ValueError(f"Prefetch chain {name!r} mixes weight kinds or process groups")
+    _REGISTERED_PREFETCH_CHAINS[chain_id] = metadata
+    return chain_id
+
+
 def get_graphed_chain_ids() -> tuple[str, ...]:
     """Return the currently classified captured chain IDs for diagnostics."""
     return (
         GTPChain.GRAPHED.value,
         f"{_GTP_REMAT_GROUPED_FC1}_{_graphness_suffix(True)}",
         f"{_GTP_REMAT_GROUPED_FC2}_{_graphness_suffix(True)}",
+        *(name for name, metadata in _REGISTERED_PREFETCH_CHAINS.items() if metadata.graphed),
     )
 
 
@@ -157,6 +254,9 @@ def _graphness_suffix(graphed: bool) -> str:
 
 def _chain_is_grouped(chain_id: str) -> bool:
     """True for the separate grouped-expert FC1 and FC2 chains."""
+    metadata = _REGISTERED_PREFETCH_CHAINS.get(chain_id)
+    if metadata is not None:
+        return metadata.grouped
     return chain_id.startswith(_GTP_REMAT_GROUPED_PREFIX)
 
 
@@ -266,11 +366,12 @@ def classify_gtp_chains(model) -> None:
     for name, param in model.named_parameters():
         if not is_gtp_param(param):
             continue
-        target = _classify_param_chain(name)
+        target = _registered_chain_id(param, _classify_param_chain(name))
         if param.prefetch_initialized and param.chain_id != target:
             conflicts.append((name, param.chain_id, target))
             continue
         param.chain_id = target
+        param._gtp_chain_classified = True
 
         if _FULL_ITERATION and not param.prefetch_initialized:
             # All producers and consumers belong to one graph. Internal events expose
@@ -435,6 +536,10 @@ def _stream_key(chain_id: str, group) -> tuple:
     """
     if _chain_is_grouped(chain_id):
         chain_id = _GTP_REMAT_GROUPED_PREFIX + _graphness_suffix(_chain_is_graphed(chain_id))
+    elif chain_id in _REGISTERED_PREFETCH_CHAINS:
+        chain_id = (
+            GTPChain.GRAPHED.value if _chain_is_graphed(chain_id) else GTPChain.UNGRAPHED.value
+        )
     return (chain_id, id(group) if group is not None else 0)
 
 
@@ -1372,6 +1477,10 @@ class GTPShardedParam(torch.nn.Parameter):
         """
 
         scheduling_domain = _stream_key(self.chain_id, self.group)
+        if self.chain_id in _REGISTERED_PREFETCH_CHAINS:
+            # Sharing a stream does not serialize consumers on independent chains.
+            # Their materialized views can be live simultaneously.
+            scheduling_domain = (scheduling_domain, self.chain_id)
 
         if not isinstance(dtype, torch.dtype):
             key = (
@@ -2985,6 +3094,7 @@ def reset_gtp_state():
     inherit stale last_weight pointers / flushed link tables. Call once before the per-chunk
     classify_gtp_chains loop (never inside it — chains span chunks). No-op on a fresh process.
     """
+    _REGISTERED_PREFETCH_CHAINS.clear()
     GTPShardedParam._chain_state.clear()
     GTPShardedParam._recompute_chain_state.clear()
     GTPShardedParam._link_tables_flushed = False

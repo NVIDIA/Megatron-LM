@@ -158,7 +158,7 @@ def _worker_adjacent_nodes_use_distinct_buffers(rank, world_size, port):
     assert len(set(addrs)) == 2, f"want 2 alternating buffers, got {len(set(addrs))}: {addrs}"
 
 
-def _worker_recompute_matches_no_recompute(rank, world_size, port):
+def _worker_recompute_matches_no_recompute(rank, world_size, port, registered=False):
     """Recompute is pure rematerialization: same input grad and same weight grads.
 
     End-to-end sanity check over the real CheckpointWithoutOutput path. It does not reliably
@@ -168,7 +168,12 @@ def _worker_recompute_matches_no_recompute(rank, world_size, port):
     torch.manual_seed(0)
     gtp_module.reset_gtp_state()
     layers = _build_layers(world_size)
-    recomputed = layers[0]
+    recomputed, spacers = layers
+    if registered:
+        all_layers = recomputed + [m for pair in spacers for m in pair]
+        gtp_module.register_prefetch_chain("recomputed", [m.weight for m in recomputed])
+        gtp_module.register_prefetch_chain("spacers", [m.weight for pair in spacers for m in pair])
+        gtp_module.classify_gtp_remat_chains(torch.nn.ModuleList(all_layers))
 
     x = torch.randn(8, HIDDEN, dtype=DTYPE, device="cuda", requires_grad=True)
     dist.broadcast(x, src=0)
@@ -204,9 +209,10 @@ class TestGTPRecomputeChainBuffers:
 
 
 class TestGTPRecomputeCorrectness:
-    def test_recompute_matches_no_recompute(self):
+    @pytest.mark.parametrize("registered", [False, True])
+    def test_recompute_matches_no_recompute(self, registered):
         _requires_multi_gpu(4)
-        _run_distributed(_worker_recompute_matches_no_recompute, 4)
+        _run_distributed(_worker_recompute_matches_no_recompute, 4, registered)
 
 
 # ---------------------------------------------------------------------------

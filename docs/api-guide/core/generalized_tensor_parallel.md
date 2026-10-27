@@ -732,6 +732,50 @@ A weight can be kept **out** of a chain by setting `weight.prefetch_initialized 
 
 **Rule of thumb:** any change that creates/replaces params at runtime, makes forward order data-dependent, runs GTP_remat concurrently, or builds multiple GTP models per process must be checked against the table above. When in doubt, exclude the affected weights so they fall back to synchronous, chain-free all-gather.
 
+#### Explicit chain registration
+
+`register_prefetch_chain(name, weights)` separates **which weights are sharded** from
+**which weights prefetch one another**. Apply the sharding policy and parameter wrappers
+first; register only the resulting GTP weights before `classify_gtp_remat_chains` and
+warmup. Registration never turns on sharding for an excluded or optional weight.
+
+```python
+from megatron.core.tensor_parallel.gtp_api import (
+    classify_gtp_remat_chains,
+    is_gtp_param,
+    register_prefetch_chain,
+)
+
+# Candidate collections come from the model integration. Excluded weights stay replicated.
+register_prefetch_chain("dense", [w for w in dense_candidates if is_gtp_param(w)])
+register_prefetch_chain("expert_fc1", [op.weight0 for op in expert_fc1_ops
+                                       if is_gtp_param(op.weight0)])
+register_prefetch_chain("expert_fc2", [op.weight0 for op in expert_fc2_ops
+                                       if is_gtp_param(op.weight0)])
+classify_gtp_remat_chains(model, cuda_graph_impl="full_iteration")
+```
+
+For a grouped projection, `weight0` represents its existing local-expert weight group;
+registration includes the entire group without changing collective coalescing. Empty
+selections are allowed. Replicated weights, conflicting membership, mixed dense/grouped
+consumers, and mixed process groups are rejected. Registration after classification or
+warmup is rejected. Use distinct names for independent schedules; a shared weight can
+belong to only one logical chain.
+
+Registration specifies **membership, not list order**. The existing warmup observes
+forward order, backward uses the corresponding reverse links, and recompute-forward
+builds its own links. Existing repeated-consumer handling and readiness events remain
+unchanged. Unregistered weights retain the default model-name classification.
+
+Logical chains do not imply separate streams. Registered dense chains share the default
+dense streams, and registered grouped chains share the expert streams, each keyed by
+process group and capture state. The existing capture-scope classifier still splits a
+logical chain at eager/captured boundaries; registration does not declare new graph
+scopes for custom modules. Independent chains retain separate gathered-buffer ownership,
+so adding chains can increase live materialization memory. Registration does not add
+DistributedWeight support to operators that lack it. Register the same schedule on all
+participating ranks.
+
 #### Grouped-expert chains (one-block-ahead)
 
 *Problem.* A chain gives every all-gather exactly **one consume-step of runway** — layer *i*'s AG hides behind layer *i−1*'s GEMM — which suffices only while the transfer stays inside the NVLink domain. Routed-expert weights fail that test twice over: by **volume**, a block gathers `2 × num_experts / EP` expert weights — NCCL-coalesced into just **two** all-gathers, one for FC1 and one for FC2 — so those two transfers carry most of the block's bytes; by **distance**, `EGTP_remat` is the group that leaves the NVLink domain. The expert transfer therefore stays partly exposed in **every** MoE block, and the exposure grows as expert count rises and per-GEMM time falls.
