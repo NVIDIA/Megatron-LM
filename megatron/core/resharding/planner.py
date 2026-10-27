@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 import os
@@ -494,6 +495,25 @@ def _global_shape_for_mesh(metadata: ParameterMetadata, mesh: tuple[int, ...]) -
     return tuple(shape)
 
 
+def _strided_as_packed(metadata: ParameterMetadata) -> ParameterMetadata:
+    """Describe a strided TP shard (e.g. GLU fc1, stride 2) as equal packed components.
+
+    With ``partition_stride=s`` each TP rank stores ``s`` equal blocks along the
+    partition dim, block ``j`` being the rank's shard of global component ``j``
+    (for GLU: ``[gate_i; up_i]``). That is exactly the packed layout described by
+    ``partition_sizes=[local/s] * s``, which native resharding already handles.
+    """
+    stride = metadata.partition_stride
+    if stride <= 1 or metadata.partition_sizes is not None:
+        return metadata
+    local = metadata.shape[metadata.partition_dim]
+    if local % stride:
+        return metadata
+    return dataclasses.replace(
+        metadata, partition_stride=1, partition_sizes=[local // stride] * stride
+    )
+
+
 def _validate_native_mesh_metadata(
     resolved_name: str,
     side: str,
@@ -669,7 +689,9 @@ def _build_tensor_reshard_specs(
         dst_metadata = dst_by_rank[dst_mesh[0]]
         selected_src = select_src_metadata_balanced(src_meta_list, dst_metadata, dst_mesh[0])
         src_mesh = _tensor_mesh(selected_src)
-        src_by_rank = src_groups[src_mesh]
+        src_by_rank = {r: _strided_as_packed(m) for r, m in src_groups[src_mesh].items()}
+        dst_by_rank = {r: _strided_as_packed(m) for r, m in dst_by_rank.items()}
+        dst_metadata = dst_by_rank[dst_mesh[0]]
 
         error = _validate_native_mesh_metadata(
             resolved_name, "source", src_mesh, src_by_rank

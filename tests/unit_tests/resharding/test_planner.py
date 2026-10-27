@@ -1046,29 +1046,98 @@ class TestTensorReshardSpecs:
             ((2, 3), (5,)),
         ]
 
-    def test_strided_layout_records_reason(self):
-        src_metadata = _meta(
-            shape=(8, 4),
-            is_tp=True,
-            partition_dim=1,
-            partition_stride=2,
-            owner_rank=0,
-            tp_ranks=[0, 1],
-            dp_ranks=[0],
-        )
-        src_peer = _meta(
-            shape=(8, 4),
-            is_tp=True,
-            partition_dim=1,
-            partition_stride=2,
-            owner_rank=1,
-            tp_ranks=[0, 1],
-            dp_ranks=[1],
-        )
+    def test_strided_glu_shard_becomes_packed_component_specs(self):
+        """A stride-2 TP shard ``[gate_i; up_i]`` is resharded as two components."""
+        src_mesh = [0, 1]
+        src = {
+            "weight": [
+                _meta(
+                    shape=(8, 4),
+                    is_tp=True,
+                    partition_dim=1,
+                    partition_stride=2,
+                    owner_rank=rank,
+                    tp_ranks=src_mesh,
+                    dp_ranks=[rank],
+                )
+                for rank in src_mesh
+            ]
+        }
         dst_metadata = _meta(shape=(8, 8), owner_rank=2, tp_ranks=[2], dp_ranks=[2])
 
         specs, error = _build_tensor_reshard_specs(
-            {2: {"weight": dst_metadata}}, {"weight": [src_metadata, src_peer]}, my_global_rank=0
+            {2: {"weight": dst_metadata}}, src, my_global_rank=2
+        )
+
+        assert error is None
+        assert [spec.global_shape for spec in specs] == [(8, 4), (8, 4)]
+        assert [spec.src_local_shape for spec in specs] == [(8, 2), (8, 2)]
+        assert [spec.dst_local_shape for spec in specs] == [(8, 4), (8, 4)]
+        assert [spec.part_index for spec in specs] == [0, 1]
+        assert all(spec.part_count == 2 for spec in specs)
+        assert [spec.src_slice[1] for spec in specs] == [slice(0, 2), slice(2, 4)]
+        assert [spec.dst_slice[1] for spec in specs] == [slice(0, 4), slice(4, 8)]
+
+    def test_strided_tp_to_strided_tp_keeps_component_layout(self):
+        """GLU TP2 -> TP4: both sides are described as two packed components."""
+        src = {
+            "weight": [
+                _meta(
+                    shape=(8, 8),
+                    is_tp=True,
+                    partition_dim=1,
+                    partition_stride=2,
+                    owner_rank=rank,
+                    tp_ranks=[0, 1],
+                    dp_ranks=[rank],
+                )
+                for rank in (0, 1)
+            ]
+        }
+        dst_mesh = [2, 3, 4, 5]
+        dst = {
+            rank: {
+                "weight": _meta(
+                    shape=(8, 4),
+                    is_tp=True,
+                    partition_dim=1,
+                    partition_stride=2,
+                    owner_rank=rank,
+                    tp_ranks=dst_mesh,
+                    dp_ranks=[rank],
+                )
+            }
+            for rank in dst_mesh
+        }
+
+        specs, error = _build_tensor_reshard_specs(dst, src, my_global_rank=3)
+
+        assert error is None
+        assert [spec.global_shape for spec in specs] == [(8, 8), (8, 8)]
+        assert [spec.src_local_shape for spec in specs] == [(8, 4), (8, 4)]
+        assert [spec.dst_local_shape for spec in specs] == [(8, 2), (8, 2)]
+        assert [spec.dst_slice[1] for spec in specs] == [slice(0, 2), slice(2, 4)]
+        assert all(spec.src_shard_dim == spec.dst_shard_dim == 1 for spec in specs)
+
+    def test_indivisible_strided_layout_records_reason(self):
+        src = {
+            "weight": [
+                _meta(
+                    shape=(8, 3),
+                    is_tp=True,
+                    partition_dim=1,
+                    partition_stride=2,
+                    owner_rank=rank,
+                    tp_ranks=[0, 1],
+                    dp_ranks=[rank],
+                )
+                for rank in (0, 1)
+            ]
+        }
+        dst_metadata = _meta(shape=(8, 6), owner_rank=2, tp_ranks=[2], dp_ranks=[2])
+
+        specs, error = _build_tensor_reshard_specs(
+            {2: {"weight": dst_metadata}}, src, my_global_rank=0
         )
 
         assert specs is None
