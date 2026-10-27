@@ -172,6 +172,59 @@ def get_param_group_identifier_tuple(param_group: Dict) -> tuple:
     )
 
 
+_IS_DSA_INDEXER_INDEX = param_group_identifier_keys.index('is_dsa_indexer')
+
+_PRE_SPLIT_CHECKPOINT_HINT = (
+    "\n\nThis looks like a checkpoint written before the DSA indexer was given its own "
+    "parameter group: it has one group where there are now two, so the indexer group "
+    "matches nothing. The distributed optimizer loads these by letting both of today's "
+    "groups inherit the single saved one; this optimizer cannot, because it also takes the "
+    "saved group's parameter *ordering*, and the saved ordering interleaves indexer and "
+    "backbone parameters that are now partitioned. Load with --use-distributed-optimizer, "
+    "or start from fresh optimizer state."
+)
+
+
+def _is_dsa_indexer_identifier(identifier: tuple) -> bool:
+    """Whether this identifier names the indexer half of the DSA parameter-group split."""
+    return bool(identifier[_IS_DSA_INDEXER_INDEX])
+
+
+def _missing_param_group_message(identifier: tuple, saved_groups: Dict[tuple, Dict]) -> str:
+    """The 'no such group' error, listing what the checkpoint did contain."""
+    available_keys = '\n'.join(str(k) for k in saved_groups.keys())
+    return (
+        f"Could not find parameter group with key {identifier} in loaded checkpoint.\n"
+        f"Available keys:\n{available_keys}\n"
+        f"Parameter group key definition: {param_group_identifier_keys}"
+    )
+
+
+def find_saved_param_group(identifier: tuple, saved_groups: Dict[tuple, Dict]) -> Optional[Dict]:
+    """Find the saved group for ``identifier``, falling back across the DSA indexer split.
+
+    A checkpoint written before the indexer had its own parameter group holds one group where
+    there are now two. Both of today's groups were carved out of that one and had identical
+    settings by construction, so either may inherit it -- including ``step``, which the
+    distributed optimizer asserts is uniform and which a group matched to nothing would
+    otherwise restart from zero.
+
+    Returns None when there is no match even after the fallback, leaving the caller to raise;
+    the parameters themselves are never taken from here, only the group's settings.
+    """
+    group = saved_groups.get(identifier)
+    if group is not None:
+        return group
+    if _is_dsa_indexer_identifier(identifier):
+        pre_split = (
+            identifier[:_IS_DSA_INDEXER_INDEX]
+            + (False,)
+            + identifier[_IS_DSA_INDEXER_INDEX + 1 :]
+        )
+        return saved_groups.get(pre_split)
+    return None
+
+
 MTP_GRAD_NORM_GROUP = 'mtp'
 GRAD_NORM_GROUP_ATTR = 'grad_norm_group'
 SEPARATE_GRAD_NORM_GROUPS = (MTP_GRAD_NORM_GROUP,)
@@ -746,8 +799,14 @@ class MegatronOptimizer(ABC):
                 elif f"pre_{key}" in group:
                     out.append(group[f"pre_{key}"])
                 else:
-                    # Treat missing and explicit None identifier values as equivalent.
-                    out.append(None)
+                    # Defer to the shared accessor, which the distributed optimizer also uses,
+                    # so the two paths cannot disagree about what a key absent from the
+                    # checkpoint means. It still treats a missing value as None in general --
+                    # but ``is_dsa_indexer`` reads as False, matching the group that has it
+                    # False. Returning None here instead meant every checkpoint written before
+                    # that key existed stopped matching on this path, including checkpoints of
+                    # models with no indexer at all, while matching fine on the other.
+                    out.append(get_param_group_identifier_value(group, key))
             return tuple(out)
 
         needed_groups = [_identifier_for(g) for g in current_groups]
@@ -760,15 +819,30 @@ class MegatronOptimizer(ABC):
         # ``test_filter_reorder_distinguishes_groups_by_max_lr``.
         loaded_groups_map = {_identifier_for(group): group for group in state_dict_groups}
 
+        # The zip below pairs current groups with saved ones positionally, so a checkpoint
+        # with FEWER groups than the optimizer silently drops the surplus and returns a short
+        # list -- which torch then rejects, several frames away, with "loaded state dict has a
+        # different number of parameter groups" and no clue as to which group or why. A
+        # checkpoint with MORE groups is fine and intended: this filters down to the ones the
+        # current optimizer has.
+        if len(state_dict_groups) < len(current_groups):
+            message = (
+                f"Checkpoint has {len(state_dict_groups)} parameter group(s) but this "
+                f"optimizer has {len(current_groups)}.\n"
+                f"Parameter group key definition: {param_group_identifier_keys}"
+            )
+            if any(_is_dsa_indexer_identifier(key) for key in needed_groups):
+                message += _PRE_SPLIT_CHECKPOINT_HINT
+            raise ValueError(message)
+
         final_groups = []
         for key, params in zip(needed_groups, params_in_state_dict_order):
             if key not in loaded_groups_map:
-                available_keys = '\n'.join(str(k) for k in loaded_groups_map.keys())
-                raise ValueError(
-                    f"Could not find parameter group with key {key} in loaded checkpoint.\n"
-                    f"Available keys:\n{available_keys}\n"
-                    f"Parameter group key definition: {param_group_identifier_keys}"
-                )
+                message = _missing_param_group_message(key, loaded_groups_map)
+                if _is_dsa_indexer_identifier(key):
+                    # The distributed optimizer grandfathers this case; this path cannot.
+                    message += _PRE_SPLIT_CHECKPOINT_HINT
+                raise ValueError(message)
 
             # Update group's parameters to preserve state dict ordering
             group = loaded_groups_map[key]

@@ -67,8 +67,10 @@ from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
     MixedPrecisionOptimizer,
+    _missing_param_group_message,
     _zero_grad_group_helper,
     copy_optimizer_param_metadata,
+    find_saved_param_group,
     get_param_group_identifier_tuple,
 )
 from .optimizer_config import OptimizerConfig
@@ -1086,8 +1088,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         state_dict_param_groups = []
         for inner_param_group in inner_state_dict["param_groups"]:
             needed_groups = make_needed_groups(inner_param_group)
+            # Grandfathers checkpoints written before the DSA indexer split
+            saved_param_group = find_saved_param_group(needed_groups, param_groups_map)
+            if saved_param_group is None:
+                raise ValueError(_missing_param_group_message(needed_groups, param_groups_map))
             state_dict_param_groups.append(
-                {**param_groups_map[needed_groups], "params": inner_param_group['params']}
+                {**saved_param_group, "params": inner_param_group['params']}
             )
 
         # Allocate or retrieve optimizer state (i.e., tensors).
