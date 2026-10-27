@@ -457,6 +457,25 @@ class TestRatchet(unittest.TestCase):
         self.assertEqual(json.loads(self.allowlist.read_text())["total"], 1)
         self.assertEqual(self.run_check(), 0)
 
+    def test_new_function_use_points_to_its_own_replacement(self):
+        # A new stage predicate, virtual-pipeline or memory-buffer call has no group to accept
+        # instead, so its error names the other replacements; a new group read's error does not.
+        hint = "A 'function' use has a replacement of its own"
+        cases = {
+            "parallel_state.set_virtual_pipeline_model_parallel_rank(0)": True,
+            "parallel_state.get_global_memory_buffer()": True,
+            CALL: False,
+        }
+        for call, has_hint in cases.items():
+            with self.subTest(call=call):
+                self.write_baseline("")
+                self.source.write_text(IMPORT + call, encoding="utf-8")
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(checker.main([]), 1)
+                self.assertIn("1 new use(s) of global parallel_state", output.getvalue())
+                self.assertEqual(hint in output.getvalue(), has_hint)
+
     def test_stats_does_not_hide_new_calls_in_check_mode(self):
         self.source.write_text(IMPORT + CALL + "; " + CALL, encoding="utf-8")
         self.assertEqual(self.run_check("--stats"), 0)
@@ -471,7 +490,7 @@ class TestRatchet(unittest.TestCase):
             self.assertEqual(checker.main(["--stats"]), 0)
         lines = output.getvalue().splitlines()
         self.assertEqual(
-            lines[0], "2 global process-group read(s) across 1 file(s) in megatron/core"
+            lines[0], "2 use(s) of global parallel_state across 1 file(s) in megatron/core"
         )
         self.assertEqual(
             [line.split() for line in lines[1:]],
