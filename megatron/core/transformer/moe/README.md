@@ -626,6 +626,7 @@ target is unsupported.
 |------|---------------------|
 | GPU architecture | NVIDIA Blackwell SM100/SM103; upstream integration validated on GB300 |
 | Routed precision | BF16, or MXFP8 with `fp8_param=True` and native TE rowwise/columnwise payloads and scales |
+| Router precision | `moe_router_dtype=None` or `"fp32"`; FP64 routing/weighted averaging is unsupported |
 | Shared experts | Required; BF16; same intermediate size as routed experts; optional BF16 sigmoid output gate via `moe_shared_expert_gate` |
 | Activation | SwiGLU, without a linear offset or tanh clamp |
 | Routed weight layout | Per-expert non-single weights, or single-grouped weights with `moe_use_grouped_tensor=True` and Transformer Engine 2.14+ |

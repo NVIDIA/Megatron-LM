@@ -68,6 +68,8 @@ def test_mxfp8_shared_expert_config_expresses_bf16_module(monkeypatch, recwarn):
             "variable_seq_lengths": True,
         },
         {"moe_shared_expert_gate": True},
+        {"moe_router_dtype": None},
+        {"moe_router_dtype": "fp32"},
         {"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": True, "moe_shared_expert_gate": True},
         {
             "fp8": "hybrid",
@@ -81,6 +83,11 @@ def test_mxfp8_shared_expert_config_expresses_bf16_module(monkeypatch, recwarn):
 )
 def test_mok_accepts_key_supported_configurations(overrides):
     assert _mok_transformer_config(**overrides).moe_megakernel_backend == "mok"
+
+
+def test_native_moe_still_accepts_fp64_router():
+    config = _mok_transformer_config(moe_megakernel_backend=None, moe_router_dtype="fp64")
+    assert config.moe_router_dtype == "fp64"
 
 
 @pytest.mark.skipif(not is_te_min_version("2.14.0"), reason="single grouped weights need TE>=2.14")
@@ -101,6 +108,7 @@ def test_native_single_grouped_weights_do_not_require_op_fuser():
         ({"bf16": False, "fp16": True}, "FP32, FP16, and FP4 are not supported"),
         ({"fp4": "e2m1"}, "FP32, FP16, and FP4 are not supported"),
         ({"moe_grouped_gemm": False}, "moe_grouped_gemm=True"),
+        ({"moe_router_dtype": "fp64"}, "MOK does not support moe_router_dtype='fp64'"),
         ({"moe_virtual_expert_load_balance": True}, "MOK does not support MoonEP"),
         ({"use_transformer_engine_op_fuser": True}, "use_transformer_engine_op_fuser=False"),
         (

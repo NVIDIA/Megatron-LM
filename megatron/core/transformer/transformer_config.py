@@ -2607,6 +2607,8 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.moe_megakernel_backend == "mok":
+            if self.moe_router_dtype == "fp64":
+                raise ValueError("MOK does not support moe_router_dtype='fp64'; use 'fp32' instead")
             if self.use_transformer_engine_op_fuser:
                 raise ValueError("MOK requires use_transformer_engine_op_fuser=False")
             if not self.gradient_accumulation_fusion:
