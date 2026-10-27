@@ -672,7 +672,6 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/communication/torch_symm_triton/kernel_config.py",
             "megatron/core/inference/communication/torch_symm_triton/multimem_asm.py",
             "megatron/core/inference/communication/torch_symm_triton/utils.py",
-            "megatron/core/inference/communication/torch_symm_triton/variable_collectives.py",
             "megatron/core/inference/moe/metadata.py",
             "megatron/core/inference/symmetric_memory.py",
         ),
@@ -680,6 +679,22 @@ KERNELS: Tuple[KernelEntry, ...] = (
         training_path=False,
         exempt_reason="Multi-rank NVLS multimem collectives over torch symmetric memory; the in-switch reduction "
         "order is hardware defined and needs an NVLink peer group. Batch-invariant mode routes around them.",
+    ),
+    KernelEntry(
+        name="inference_nvls_variable_collectives",
+        sources=(
+            "megatron/core/inference/communication/torch_symm_triton/variable_collectives.py",
+            "megatron/core/transformer/moe/token_dispatcher_inference.py",
+        ),
+        tests=(
+            K + "test_nvls_dispatcher.py",
+            "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
+        ),
+        kind="triton",
+        training_path=False,
+        notes="NVLS dispatch/combine replay on an NVLink peer group, fused bf16 epilogue "
+        "bit-exactness, and preservation of both batch-invariant collective paths. "
+        "NCCL dispatcher coverage is unchanged.",
     ),
     KernelEntry(
         name="unified_memory_allocator",
