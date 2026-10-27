@@ -274,6 +274,7 @@ def mxfp8_quantize_rows(
     clamped to ``M`` on device, so the result is then exactly ``mxfp8_quantize(x)``.
     """
     assert x.is_cuda and x.dim() == 2
+    assert x.is_contiguous(), "x must be contiguous: the kernel addresses row r at r * K"
     assert x.dtype in (torch.bfloat16, torch.float16, torch.float32)
     assert n_rows.is_cuda and n_rows.numel() == 1
     M, K = x.shape
