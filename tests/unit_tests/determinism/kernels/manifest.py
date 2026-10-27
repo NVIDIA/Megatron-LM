@@ -732,13 +732,20 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/multi_latent_attention.py",
             "megatron/core/transformer/experimental_attention_variant/absorbed_mla.py",
         ),
-        tests=(K + "test_fused_triton_kernels.py", K + "test_te_wrappers.py"),
+        tests=(
+            K + "test_fused_triton_kernels.py",
+            K + "test_te_wrappers.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_absorbed_mla.py",
+        ),
         kind="dispatch",
         notes="Calls the Triton MLA YaRN RoPE kernels (fused_apply_mla_rope_for_q / _kv, replayed in "
         "test_fused_triton_kernels.py), TE fused RoPE and TE's fused MLA key/value RoPE + MXFP8 "
         "quantization (fused_mla_kv_rope_mxfp8, use_fused_mla_kv_rope_quant), both replayed in "
         "test_te_wrappers.py. The TE attention replay there also covers the config-derived "
-        "softmax_scale MultiLatentAttention hands to its core attention. The TE FusedMLAQUpProj "
+        "softmax_scale MultiLatentAttention hands to its core attention. "
+        "test_absorbed_mla.py covers quantized Q up-projection and RoPE selective recompute "
+        "with exact output and parameter-gradient parity across FP8/FP4 recipes and SBHD/THD layouts. "
+        "The TE FusedMLAQUpProj "
         "GEMM path and mxfp8_quantize_only are not replayed.",
     ),
     KernelEntry(
