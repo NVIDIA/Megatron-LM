@@ -772,9 +772,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 local_state_dict[key] = value.to_local()
         if hasattr(state_dict, "_metadata"):
             local_state_dict._metadata = state_dict._metadata
-        result = self.module.load_state_dict(local_state_dict, strict=strict)
+        super().load_state_dict(local_state_dict, strict=strict)
         sync_model_weights_from_main_weights(self.module.parameters())
-        return result
 
     @staticmethod
     def _validate_config(
