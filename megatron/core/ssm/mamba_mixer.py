@@ -1235,7 +1235,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
                 dt = repeat(dt, "b h -> b (h p)", p=self.headdim)
                 dt_bias = repeat(self.dt_bias, "h -> (h p)", p=self.headdim)
                 A = repeat(A, "h -> (h p) n", p=self.headdim, n=self.d_state)
-                D = repeat(self.D, "h -> (h p)", p=self.headdim)
+                D = self.D if self.D_has_hdim else repeat(self.D, "h -> (h p)", p=self.headdim)
 
                 dt = F.softplus(dt + dt_bias.to(dtype=dt.dtype))
                 dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
@@ -1262,7 +1262,12 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
                 dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
                 ssm_state.copy_(ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
                 y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), C)
-                y = y + rearrange(self.D.to(dtype), "h -> h 1") * x
+                D = (
+                    rearrange(self.D, "(h p) -> h p", p=self.headdim)
+                    if self.D_has_hdim
+                    else rearrange(self.D, "h -> h 1")
+                )
+                y = y + D.to(dtype) * x
                 y = rearrange(y, "b h p -> b (h p)")
                 if not self.rmsnorm:
                     y = y * self.act(z)  # (B D)
@@ -1274,7 +1279,11 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             # Incorporate sequence dimension in einops rearrengements
             dt = repeat(dt, "b s h -> b s h p", p=self.headdim)
             dt_bias = repeat(self.dt_bias, "h -> h p", p=self.headdim)
-            D = repeat(self.D, "h -> h p", p=self.headdim)
+            D = (
+                rearrange(self.D, "(h p) -> h p", p=self.headdim)
+                if self.D_has_hdim
+                else repeat(self.D, "h -> h p", p=self.headdim)
+            )
             B = rearrange(B, "b s (g n) -> b s g n", g=self.ngroups_local_tp)
             C = rearrange(C, "b s (g n) -> b s g n", g=self.ngroups_local_tp)
             x_reshaped = rearrange(x, "b s (h p) -> b s h p", p=self.headdim)

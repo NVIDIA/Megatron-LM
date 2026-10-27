@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.inference.utils import InferenceMode
@@ -160,3 +161,96 @@ class TestMambaMixerErrorChecks:
                 pg_collection=pg_collection,
             )
         Utils.destroy_model_parallel()
+
+
+class TestMambaMixerDecode:
+    """``ssm_decode`` against a float64 Mamba-2 decode step written from the recurrence."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def reference_decode_step(mixer, zxBCdt, conv_state, ssm_state):
+        """One decode token for batch-first ``zxBCdt`` of shape (b, 1, proj), in float64.
+
+        Returns the output and the updated conv and SSM states; the inputs are not modified.
+        """
+        d_inner, G, N = mixer.d_inner_local_tp, mixer.ngroups_local_tp, mixer.d_state
+        H, P = mixer.nheads_local_tp, mixer.headdim
+        b = zxBCdt.shape[0]
+        z, xBC, dt = torch.split(zxBCdt[:, 0].double(), [d_inner, d_inner + 2 * G * N, H], dim=-1)
+
+        # Causal depthwise conv over the rolling window: shift left, append the new input.
+        conv_state = torch.cat([conv_state.double()[:, :, 1:], xBC.unsqueeze(-1)], dim=-1)
+        weight = mixer.conv1d_weight.double()[:, 0, :]
+        xBC = F.silu((conv_state * weight).sum(-1) + mixer.conv1d_bias.double())
+        x, B, C = torch.split(xBC, [d_inner, G * N, G * N], dim=-1)
+        x = x.reshape(b, H, P)
+        B = B.reshape(b, G, N).repeat_interleave(H // G, dim=1)
+        C = C.reshape(b, G, N).repeat_interleave(H // G, dim=1)
+
+        # h' = exp(dt * A) h + dt * B x, then y = (C h' + D x) * silu(z).
+        dt = F.softplus(dt + mixer.dt_bias.double())
+        dA = torch.exp(dt * -torch.exp(mixer.A_log.double()))  # (b, H)
+        dBx = (dt[..., None] * x)[..., None] * B[:, :, None, :]  # (b, H, P, N)
+        ssm_state = ssm_state.double() * dA[..., None, None] + dBx
+        D = mixer.D.double().reshape(H, P) if mixer.D_has_hdim else mixer.D.double()[:, None]
+        y = ((ssm_state * C[:, :, None, :]).sum(-1) + D * x) * F.silu(z.reshape(b, H, P))
+        return y.reshape(b, 1, H * P), conv_state, ssm_state
+
+    @pytest.mark.parametrize(
+        "D_has_hdim, uniform_D",
+        [(False, False), (True, True), (True, False)],
+        ids=["per_head_D", "per_channel_uniform_D", "per_channel_D"],
+    )
+    def test_decode_matches_reference(self, D_has_hdim, uniform_D):
+        config = TransformerConfig(
+            hidden_size=256, num_layers=1, num_attention_heads=1, use_cpu_initialization=True
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        # Without rmsnorm the z gate is applied inside the decode kernel, so the reference
+        # needs no norm.
+        mixer = MambaMixer(
+            config,
+            hybrid_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
+            config.hidden_size,
+            D_has_hdim=D_has_hdim,
+            rmsnorm=False,
+            layer_number=1,
+            pg_collection=pg_collection,
+        )
+        mixer.cuda().eval()
+        H, P = mixer.nheads_local_tp, mixer.headdim
+        assert mixer.D.shape == ((H * P,) if D_has_hdim else (H,))
+
+        # The default all-ones D would hide a mis-indexed D.
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        with torch.no_grad():
+            if uniform_D:
+                mixer.D.fill_(0.37)
+            else:
+                mixer.D.copy_(torch.randn(mixer.D.shape, generator=generator, device="cuda"))
+
+        batch = 2
+        proj = 2 * mixer.d_inner_local_tp + 2 * mixer.ngroups_local_tp * mixer.d_state + H
+        conv_shape, ssm_shape = mixer.mamba_state_shapes_per_request()
+        zxBCdt = torch.randn(batch, 1, proj, generator=generator, device="cuda")
+        conv_state = torch.randn(batch, *conv_shape, generator=generator, device="cuda")
+        ssm_state = 0.1 * torch.randn(batch, *ssm_shape, generator=generator, device="cuda")
+        y_ref, conv_state_ref, ssm_state_ref = self.reference_decode_step(
+            mixer, zxBCdt, conv_state, ssm_state
+        )
+
+        with torch.no_grad(), InferenceMode.active():
+            y = mixer.ssm_decode(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
+
+        # fp32 kernels against the float64 reference.
+        torch.testing.assert_close(conv_state.double(), conv_state_ref, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(ssm_state.double(), ssm_state_ref, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(y.double(), y_ref, atol=1e-4, rtol=1e-4)
