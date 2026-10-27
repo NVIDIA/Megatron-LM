@@ -1046,7 +1046,13 @@ def _canonical_route_sum(routes):
     physical ownership then affect this reduction. This is the opt-in precision
     path, with additional temporary sorting storage and work.
     """
-    return routes.sort(dim=1).values.sum(dim=1, dtype=torch.float32).to(routes.dtype)
+    ordered = routes.sort(dim=1).values
+    # A parallel sum may use several interleaved accumulators, losing small
+    # values even after sorting. Explicit additions preserve the chosen order.
+    total = torch.zeros_like(ordered[:, 0], dtype=torch.float32)
+    for contribution in ordered.unbind(dim=1):
+        total = total + contribution.float()
+    return total.to(routes.dtype)
 
 
 class _HybridEPRouteReduce(torch.autograd.Function):
