@@ -317,12 +317,6 @@ def _build_tokenizer(cfg, args):
         tp_size = args.tensor_model_parallel_size
 
     _GLOBAL_TOKENIZER = build_tokenizer_and_pad_vocab_size(cfg.tokenizer, make_vocab_size_divisible_by, tp_size)
-
-    # TODO (@maanug): remove this WAR once all reads from args.padded_vocab_size 
-    # have been updated to read from cfg.tokenizer.padded_vocab_size
-    if getattr(args, "padded_vocab_size", None) is None:
-        args.padded_vocab_size = cfg.tokenizer.padded_vocab_size
-
     # Resolve the declared model field once, before any args-to-config conversion.
     # The tokenizer includes added tokens; padded_vocab_size also includes TP padding.
     if (
