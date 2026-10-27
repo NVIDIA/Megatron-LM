@@ -814,8 +814,8 @@ async def test_failed_requests_are_reported(path, replies, expected_by_path):
 class TextDetokenizer:
     """Stands in for the incremental detokenizer, which only accepts HF fast tokenizers."""
 
-    def __init__(self, tokenizer, prompt_tokens):
-        del prompt_tokens
+    def __init__(self, tokenizer, prompt_tokens, *, remove_eos=True):
+        del prompt_tokens, remove_eos
         self._tokenizer = tokenizer
         self.text = ""
 

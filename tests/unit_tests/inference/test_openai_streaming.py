@@ -15,6 +15,7 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endp
 )
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.incremental_detokenizer import (
     HuggingFaceFastIncrementalDetokenizer,
+    detokenize_generated_tokens,
 )
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.openai_streaming import (
     JSON_SAFE_LOGPROB_FLOOR,
@@ -206,6 +207,67 @@ async def test_openai_stream_echoes_completion_prompt_before_generated_text():
     assert generated["choices"][0]["text"] == "a"
     assert generated["choices"][0]["logprobs"]["text_offset"] == [2]
     assert finished["choices"][0]["finish_reason"] == "stop"
+    assert records[-1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.parametrize("drop,suffix", [(False, "<|im_end|>"), (True, "")], ids=("keep", "drop"))
+@pytest.mark.asyncio
+async def test_openai_stream_echo_follows_trailing_eos_policy(drop, suffix):
+    tokenizer, huggingface_tokenizer = _with_chat_markers(eos_marker="<|im_end|>")
+    token_ids = huggingface_tokenizer.encode("a<|im_end|>", add_special_tokens=False)
+    stream = AsyncStream(request_id=1, cancel=lambda: None)
+    stream.put(
+        {
+            "partial": {
+                "request_id": 1,
+                "new_tokens": token_ids,
+                "new_log_probs": [-0.1, -0.2],
+                "new_top_n_logprobs": [{"a": -0.01}, {"<|im_end|>": -0.02}],
+                "prompt_log_probs": [NEG_INF],
+                "prompt_top_n_logprobs": [{"z": -0.04}],
+            }
+        }
+    )
+    stream.put(
+        {
+            "final": {
+                "prompt_tokens": [26, 26],
+                "generated_tokens": token_ids,
+                "generated_log_probs": [-0.1, -0.2],
+                "generated_top_n_logprobs": [{"a": -0.01}, {"<|im_end|>": -0.02}],
+                "sampling_params": {"num_tokens_to_generate": 3},
+            }
+        }
+    )
+    stream.finish()
+
+    records = [
+        record
+        async for record in openai_stream(
+            [stream],
+            _Tokenizer(),
+            [HuggingFaceFastIncrementalDetokenizer(tokenizer, [], remove_eos=drop)],
+            chat=False,
+            return_log_probs=True,
+            echo_prompts=["zz"],
+            prompt_token_ids=[[26, 26]],
+        )
+    ]
+    payloads = [json.loads(record.removeprefix("data: ")) for record in records[:-1]]
+
+    echoed, generated, *_, finished = payloads
+    assert echoed["choices"][0]["text"] == "zz"
+    assert echoed["choices"][0]["logprobs"] == {
+        "tokens": ["z", "z"],
+        "token_logprobs": [None, JSON_SAFE_LOGPROB_FLOOR],
+        "top_logprobs": [None, {"z": -0.04}],
+        "text_offset": [0, 1],
+    }
+    assert generated["choices"][0]["text"] == "a"
+    assert generated["choices"][0]["logprobs"]["text_offset"] == [2, 3]
+    assert finished["choices"][0]["finish_reason"] == "stop"
+    assert "".join(payload["choices"][0]["text"] for payload in payloads[1:-1]) == "a" + suffix
+    assert finished["choices"][0]["generated_text"] == "a" + suffix
     assert records[-1] == "data: [DONE]\n\n"
 
 
@@ -442,6 +504,22 @@ def test_huggingface_fast_incremental_detokenizer_uses_prompt_context():
     assert streamed_text == full_text[len(prompt_text) :]
 
 
+def test_completed_generation_uses_streaming_prompt_context():
+    backend = Tokenizer(models.WordPiece(vocab={"[UNK]": 0, "hello": 1, "world": 2}))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    backend.decoder = decoders.WordPiece(prefix="##", cleanup=False)
+    huggingface_tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend)
+    tokenizer = SimpleNamespace(
+        _tokenizer=SimpleNamespace(tokenizer=huggingface_tokenizer, include_special_tokens=True),
+        detokenize=huggingface_tokenizer.decode,
+    )
+
+    text = detokenize_generated_tokens(tokenizer, [1], [2])
+
+    assert huggingface_tokenizer.decode([2]) == "world"
+    assert text == " world"
+
+
 def test_huggingface_fast_incremental_detokenizer_skips_special_tokens():
     tokenizer = _make_byte_level_fast_tokenizer()
     huggingface_tokenizer = tokenizer._tokenizer.tokenizer
@@ -501,6 +579,21 @@ def test_huggingface_fast_incremental_detokenizer_drops_eos_and_special_map_toke
     streamed_text = "".join(detokenizer.update([token_id]) for token_id in token_ids)
 
     assert streamed_text == "<think>x</think>ab"
+
+
+@pytest.mark.parametrize("remove_eos", [False, True])
+def test_huggingface_fast_incremental_detokenizer_matches_trailing_eos_policy(remove_eos):
+    tokenizer, huggingface_tokenizer = _with_chat_markers(eos_marker="<|im_end|>")
+    huggingface_tokenizer.add_special_tokens({"additional_special_tokens": ["<special>"]})
+    token_ids = huggingface_tokenizer.encode(
+        "a<special><|im_end|>b<|im_end|>", add_special_tokens=False
+    )
+    detokenizer = HuggingFaceFastIncrementalDetokenizer(tokenizer, [], remove_eos=remove_eos)
+
+    streamed_text = detokenizer.update(token_ids) + detokenizer.finish()
+    expected_tokens = token_ids[:-1] if remove_eos else token_ids
+
+    assert streamed_text == _non_streaming_text(huggingface_tokenizer, expected_tokens)
 
 
 def test_incremental_detokenizer_rejects_unsupported_tokenizer():
