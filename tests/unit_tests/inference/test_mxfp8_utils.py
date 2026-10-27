@@ -414,19 +414,19 @@ class TestMXFP8Tensor:
         with pytest.raises(TypeError, match="MXFP8 scales must use"):
             ensure_mxfp8_scale_dtype(torch.ones(16, dtype=torch.bfloat16))
 
-    def test_validate_swizzled_scale_geometry(self):
+    def test_validate_unswizzled_2d_scale_geometry(self):
         from megatron.core.inference.quantization.mxfp8_tensor import (
             MXFP8Tensor,
             validate_mxfp8_tensor,
         )
 
         data = torch.empty((64, 128), dtype=torch.float8_e4m3fn, device="cuda")
-        scale = torch.empty(128 * 4, dtype=torch.uint8, device="cuda")
+        scale = torch.empty((64, 4), dtype=torch.uint8, device="cuda")
 
         validate_mxfp8_tensor(MXFP8Tensor(data, scale, dtype=torch.bfloat16, backend="flashinfer"))
 
-        invalid = MXFP8Tensor(data, scale[:-1], dtype=torch.bfloat16, backend="flashinfer")
-        with pytest.raises(ValueError, match="swizzled scale storage"):
+        invalid = MXFP8Tensor(data, scale[:63], dtype=torch.bfloat16, backend="flashinfer")
+        with pytest.raises(ValueError, match="2D scale has shape"):
             validate_mxfp8_tensor(invalid)
 
     def test_missing_backend_error_is_actionable(self):
