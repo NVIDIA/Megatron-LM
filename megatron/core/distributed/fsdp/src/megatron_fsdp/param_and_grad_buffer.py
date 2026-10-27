@@ -4710,24 +4710,18 @@ class AllGatherPipeline:
                 return 0
             return parameter_groups[bucket_id].model_weight_buffer.bucket_index.size
 
-        base_all_gather_size = sum(all_gather_size(bucket_id) for bucket_id in result)
+        prefetched_size = 0
         bucket_id = next_bucket_id()
-        while bucket_id is not None:
-            prefetched_size = (
-                sum(all_gather_size(result_bucket_id) for result_bucket_id in result)
-                - base_all_gather_size
-            )
-            if prefetched_size >= suggested_prefetch_size:
-                break
-
+        while bucket_id is not None and prefetched_size < suggested_prefetch_size:
             if self.buffer.ddp_config.fsdp_double_buffer:
                 fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
                 double_buffer_units.add(fsdp_unit_id)
                 if len(double_buffer_units) > 2:
                     break
 
-            result.extend(self.buffer.bucket_to_bucket_group[bucket_id])
-            result = list(sorted(set(result)))
+            new_bucket_ids = set(self.buffer.bucket_to_bucket_group[bucket_id]) - set(result)
+            prefetched_size += sum(all_gather_size(new_id) for new_id in new_bucket_ids)
+            result = sorted(set(result) | new_bucket_ids)
             bucket_id = next_bucket_id()
 
         return result
