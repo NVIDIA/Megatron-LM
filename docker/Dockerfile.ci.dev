@@ -121,10 +121,10 @@ COPY megatron/core/package_info.py /workspace/megatron/core/
 ARG IMAGE_TYPE=dev
 ENV IMAGE_TYPE=${IMAGE_TYPE}
 ENV NVTE_BUILD_NUM_PHILOX_ROUNDS=3
-# cuDNN Frontend is replaced after the sync below with this ref of NVIDIA/cudnn-frontend
-# (feat/1.29.0-megatron). Docker-only: outside pyproject.toml and uv.lock. Set empty to keep the
-# locked PyPI wheel. Skipped for the LTS image.
-ARG CUDNN_FRONTEND_GIT_REF=8924d4b41fd678ba1b98cd7f98bb78b222637573
+# Use the locked cuDNN Frontend wheel by default, including its shutdown-lifetime fix.
+# Optional runtime override; this does not change the headers used to build TE below.
+# Skipped for the LTS image.
+ARG CUDNN_FRONTEND_GIT_REF=
 # Preserve Ampere support unless a caller selects narrower TE build targets.
 ARG NVTE_CUDA_ARCHS="80;90;100"
 # TE compiles each source's GPU targets one after another by default (nvcc --threads 1), so
@@ -132,8 +132,9 @@ ARG NVTE_CUDA_ARCHS="80;90;100"
 # --build-arg NVTE_BUILD_THREADS_PER_JOB=<n> to compile up to n targets of one source
 # concurrently; the uv sync below then caps concurrent sources to keep the compiler budget.
 ARG NVTE_BUILD_THREADS_PER_JOB
-# Keep compiled wheels separate when the CPU or TE GPU targets change.
-RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS},target=/root/.cache/uv \
+# Keep compiled wheels separate when the CPU or TE GPU targets change. The frontend
+# suffix forces TE to rebuild against the fixed 1.32 headers rather than reuse an old wheel.
+RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS}-cudnn-fe-1.32,target=/root/.cache/uv \
     bash -ex <<"EOF"
     export TMS_CUDA_MAJOR="$("${CUDA_HOME:-/usr/local/cuda}"/bin/nvcc --version | sed -n 's/.*release \([0-9][0-9]*\).*/\1/p' | head -1)"
     test -n "$TMS_CUDA_MAJOR"
