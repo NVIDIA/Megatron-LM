@@ -112,6 +112,7 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
+    warn_global_process_group_fallback,
 )
 from megatron.core.rerun_state_machine import (
     RerunDataIterator,
@@ -2802,6 +2803,59 @@ def get_optimizer_param_scheduler(optimizer):
     return opt_param_scheduler
 
 
+def _get_data_parallel_group(pg_collection, *, with_context_parallel, owner):
+    """Return the data-parallel group of ``pg_collection`` that spans the GTP weight-remat axis.
+
+    This is the group that ``parallel_state.get_data_parallel_group(with_context_parallel=...)``
+    returns by default: ``dp_cp_gtp_remat`` with the context-parallel ranks and ``dp_gtp_remat``
+    without them. These groups hold every rank that reads distinct data. When the GTP-inclusive
+    field is not set, the replicate group ``dp_cp`` or ``dp`` serves instead:
+
+    - A collection that sets ``gtp_remat`` to None, or to a group of one rank, has no GTP
+      weight-remat axis, so the replicate group is the same group.
+    - A collection that does not set ``gtp_remat`` does not say whether it has that axis. It
+      gets the replicate group with a ProcessGroupFallbackWarning; this is deprecated.
+
+    Args:
+        pg_collection: Process groups to take the group from. Omitting it is deprecated: the
+            global parallel state is used instead, with a ProcessGroupFallbackWarning.
+        with_context_parallel: Whether the group includes the context-parallel ranks.
+        owner: Name of the function that needs the group, used in the warnings and errors.
+
+    Raises:
+        ValueError: ``pg_collection`` does not set the GTP-inclusive group and either sets
+            ``gtp_remat`` to a group of more than one rank, so that the replicate group misses
+            ranks that read distinct data, or does not set the replicate group either.
+    """
+    if pg_collection is None:
+        warn_global_process_group_fallback(owner, deprecated_in="0.21", removed_in="0.23")
+        return mpu.get_data_parallel_group(with_context_parallel=with_context_parallel)
+    if with_context_parallel:
+        name, replicate_name = "dp_cp_gtp_remat", "dp_cp"
+    else:
+        name, replicate_name = "dp_gtp_remat", "dp"
+    # vars() tells a field that was never set from one set to None; attribute access reads
+    # both as None.
+    groups = vars(pg_collection)
+    if groups.get(name) is not None:
+        return groups[name]
+    if "gtp_remat" in groups and get_pg_size(groups["gtp_remat"]) > 1:
+        raise ValueError(
+            f"{owner} requires pg_collection to set {name}: with GTP weight remat, "
+            f"{replicate_name} does not hold every rank that reads distinct data"
+        )
+    if groups.get(replicate_name) is None:
+        raise ValueError(
+            f"{owner} requires pg_collection to set {name}, or {replicate_name} without GTP "
+            "weight remat"
+        )
+    if "gtp_remat" not in groups:
+        warn_global_process_group_fallback(
+            owner, f"pg_collection.{name}", deprecated_in="0.21", removed_in="0.23"
+        )
+    return groups[replicate_name]
+
+
 def _reduce_sum_across_data_parallel_group(
     stat: float | None,
     with_context_parallel: bool = False,
@@ -2809,17 +2863,15 @@ def _reduce_sum_across_data_parallel_group(
 ) -> float | None:
     """Sum an optional scalar across the data-parallel group, optionally including CP.
 
-    The group spans the GTP weight-remat axis and comes from ``pg_collection``, or from the
-    global parallel state when it is None.
+    The group spans the GTP weight-remat axis (see ``_get_data_parallel_group``) and comes from
+    ``pg_collection``. Omitting it is deprecated: the global parallel state is used instead,
+    with a ProcessGroupFallbackWarning.
     """
-    if pg_collection is None:
-        group = mpu.get_data_parallel_group(with_context_parallel=with_context_parallel)
-    else:
-        group = (
-            pg_collection.dp_cp_gtp_remat if with_context_parallel else pg_collection.dp_gtp_remat
-        )
-        if group is None:
-            raise ValueError("pg_collection must define dp_gtp_remat and dp_cp_gtp_remat")
+    group = _get_data_parallel_group(
+        pg_collection,
+        with_context_parallel=with_context_parallel,
+        owner="_reduce_sum_across_data_parallel_group",
+    )
     value = 0.0 if stat is None else stat
     value = torch.tensor([value], dtype=torch.float32, device=torch.cuda.current_device())
     torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM, group=group)
@@ -3309,9 +3361,9 @@ def _get_samples_seen_in_iteration(losses_reduced, args, pg_collection):
 
     if is_last_stage and local_samples_seen is not None:
         # The ranks that read distinct samples, which spans the GTP weight-remat axis.
-        sample_group = pg_collection.dp_gtp_remat
-        if sample_group is None:
-            raise ValueError("pg_collection must define dp_gtp_remat to count samples")
+        sample_group = _get_data_parallel_group(
+            pg_collection, with_context_parallel=False, owner="train_step"
+        )
         samples_seen = (
             torch.as_tensor(local_samples_seen).detach().to(dtype=torch.int64).view(1)
         )
@@ -3561,8 +3613,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         log_max_attention_logit = clip_qk(
             model,
             log_max_only=not args.qk_clip,
-            dp_cp_group=getattr(model_pg_collection, 'dp_cp_gtp_remat', None)
-            or model_pg_collection.dp_cp,
+            dp_cp_group=_get_data_parallel_group(
+                model_pg_collection, with_context_parallel=True, owner="train_step"
+            ),
         )
 
     timers('optimizer').stop()
@@ -3580,7 +3633,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     mp_group = pg_collection.mp
     # gtp_remat-inclusive: the reported global per-token loss must cover gtp_remat peers' distinct
     # tokens (replicate dp_cp would report a 1/gtp_remat subsample -> per-step noisy). Display-only.
-    dp_cp_group = getattr(pg_collection, 'dp_cp_gtp_remat', None) or pg_collection.dp_cp
+    dp_cp_group = _get_data_parallel_group(
+        pg_collection, with_context_parallel=True, owner="train_step"
+    )
     is_last_stage = is_pp_last_stage(pg_collection.pp)
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
@@ -5826,7 +5881,9 @@ def evaluate(
     # the reduction must cover every distinct-data rank. Reducing over the replicate dp_cp would
     # average a 1/gtp_remat subsample of the eval batch (768 sequences read, 12 averaged at
     # dp=6/gtp_remat=64) while consumed_valid_samples still books the full eval_batch_size.
-    eval_dp_cp_group = getattr(eval_pgc, 'dp_cp_gtp_remat', None) or eval_pgc.dp_cp
+    eval_dp_cp_group = _get_data_parallel_group(
+        eval_pgc, with_context_parallel=True, owner="evaluate"
+    )
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
@@ -6305,21 +6362,6 @@ def build_train_valid_test_data_loaders(
     return train_dataloader, valid_dataloaders, test_dataloader
 
 
-def _data_parallel_group_with_cp(pg_collection):
-    """Return the data-parallel group with context-parallel ranks of ``pg_collection``.
-
-    The group includes the GTP weight-remat axis, like the global
-    ``get_data_parallel_group(with_context_parallel=True)``. Collections that predate the GTP
-    weight-remat fields carry only the replicate group. None reads the global parallel state.
-    """
-    if pg_collection is None:
-        return mpu.get_data_parallel_group(with_context_parallel=True)
-    group = pg_collection.dp_cp_gtp_remat or pg_collection.dp_cp
-    if group is None:
-        raise ValueError("pg_collection requires dp_cp_gtp_remat or dp_cp")
-    return group
-
-
 def build_train_valid_test_data_iterators(
     build_train_valid_test_datasets_provider, pg_collection=None
 ):
@@ -6378,7 +6420,11 @@ def build_train_valid_test_data_iterators(
                     torch.distributed.all_reduce(
                         eval_iters_tensor,
                         op=torch.distributed.ReduceOp.MAX,
-                        group=_data_parallel_group_with_cp(pg_collection),
+                        group=_get_data_parallel_group(
+                            pg_collection,
+                            with_context_parallel=True,
+                            owner="build_train_valid_test_data_iterators",
+                        ),
                     )
                     cfg.validation.eval_iters = eval_iters_tensor.tolist()
             else:
@@ -6387,7 +6433,11 @@ def build_train_valid_test_data_iterators(
                 torch.distributed.all_reduce(
                     eval_iters_tensor,
                     op=torch.distributed.ReduceOp.MAX,
-                    group=_data_parallel_group_with_cp(pg_collection),
+                    group=_get_data_parallel_group(
+                        pg_collection,
+                        with_context_parallel=True,
+                        owner="build_train_valid_test_data_iterators",
+                    ),
                 )
                 cfg.validation.eval_iters = eval_iters_tensor.item()
 
