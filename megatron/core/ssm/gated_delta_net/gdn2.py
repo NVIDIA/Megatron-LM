@@ -63,6 +63,13 @@ class GatedDeltaNet2(_GDNBase):
         # q/k/v/z sections the base class already accounts for.
         # TODO: for now, output gate is forced for GDN2.
         # We may remove this restriction in the future.
+        if self.chunkwise_context_parallel:
+            # GDN2 has no chunkwise CP kernel path: it always shards heads over CP and
+            # expects the zigzag layout, which chunkwise mode replaces with contiguous.
+            raise ValueError(
+                "GDN2 supports only headwise context parallelism; "
+                "linear_cp_mode='chunkwise' with context parallelism is not supported."
+            )
         self.in_proj_extra_dim = self.qk_dim * 2 + self.v_dim
 
         # Per-section sizes (and names) of the in_proj output, local to this TP rank.
@@ -96,8 +103,8 @@ class GatedDeltaNet2(_GDNBase):
             raise ValueError(
                 "deterministic_mode=True requires gdn_kernel_backend='torch' for GDN2."
             )
-        if backend == "transformer_engine":
-            raise ValueError("GDN2 does not support gdn_kernel_backend='transformer_engine'.")
+        if backend in ("transformer_engine", "cudnn", "internal"):
+            raise ValueError(f"GDN2 does not support gdn_kernel_backend={backend!r}.")
         if backend == "torch":
             self.gdn_backend = "torch"
             self.gated_delta_rule = torch_chunk_gdn2

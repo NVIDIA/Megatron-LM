@@ -41,12 +41,17 @@ from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
+from megatron.core.transformer.gated_residual import GatedResidualModule
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     learned_output_contract,
 )
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
+from megatron.core.transformer.module import (
+    MegatronModule,
+    convert_module_to_dtype_except_fp32_marked,
+    mark_keep_in_fp32,
+)
 from megatron.core.transformer.residual_recompute import (
     build_residual_stream_recompute_plan,
     residual_stream_recompute_enabled,
@@ -68,7 +73,13 @@ from megatron.core.transformer.wide_residual_layer import (
     expand_wide_residual_stream,
 )
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+from megatron.core.utils import (
+    WrappedTensor,
+    deprecate_inference_params,
+    make_viewless_tensor,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 
 @dataclass
@@ -86,6 +97,8 @@ class HybridStackSubmodules:
     csa_qk_layernorm_layer: ModuleSpec | type | None = None
     mla_layer: Union[ModuleSpec, type] = IdentityOp
     mla_fused_down_proj_layer: ModuleSpec | None = None
+    qsa_layer: ModuleSpec | type | None = None
+    qsa_qk_layernorm_layer: ModuleSpec | type | None = None
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
@@ -310,6 +323,28 @@ class HybridStack(MegatronModule):
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
                     )
+                elif type(layer_config) is layer_utils.QSALayerConfig:
+                    # Qwen Sparse Attention (GQA + block-sparse indexer mask).
+                    qsa_layer_spec = (
+                        submodules.qsa_qk_layernorm_layer
+                        if layer_config.qk_layernorm
+                        else submodules.qsa_layer
+                    )
+                    assert qsa_layer_spec is not None, (
+                        "Hybrid pattern contains a 'Q' (QSA) layer but the stack spec does not "
+                        "provide a QSA layer spec. Use a stack spec that wires qsa_layer / "
+                        "qsa_qk_layernorm_layer."
+                    )
+                    layer = build_module(
+                        qsa_layer_spec,
+                        config=layer_config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
                 elif type(layer_config) is layer_utils.MLPLayerConfig:
                     layer = build_module(
                         submodules.mlp_layer,
@@ -383,7 +418,7 @@ class HybridStack(MegatronModule):
             else None
         )
 
-        if self.post_process and self.post_layer_norm:
+        if self.post_process and self.post_layer_norm and not self._gated_residual_exit():
             # Final layer norm before output.
             self.final_norm = TENorm(
                 config=self.config,
@@ -392,16 +427,27 @@ class HybridStack(MegatronModule):
             )
 
         if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
-            hc_mult = self.config.mhc_num_residual_streams
-            hc_dim = self.config.hidden_size * hc_mult
-            self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
-            self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
-            self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
-            nn.init.xavier_uniform_(self.hc_head_fn)
-            if self.config.sequence_parallel:
-                setattr(self.hc_head_fn, 'sequence_parallel', True)
-                setattr(self.hc_head_base, 'sequence_parallel', True)
-                setattr(self.hc_head_scale, 'sequence_parallel', True)
+            if self._gated_residual_exit():
+                # Qwen4-Exp exit contract: same low-rank per-channel read gate +
+                # mean as the per-layer modules (use_combine=False).
+                self.hc_exit_contract = GatedResidualModule(
+                    self.config, layer_number=0, use_combine=False
+                )
+                if self.config.params_dtype is not None:
+                    convert_module_to_dtype_except_fp32_marked(
+                        self.hc_exit_contract, self.config.params_dtype
+                    )
+            else:
+                hc_mult = self.config.mhc_num_residual_streams
+                hc_dim = self.config.hidden_size * hc_mult
+                self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
+                self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
+                self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
+                nn.init.xavier_uniform_(self.hc_head_fn)
+                if self.config.sequence_parallel:
+                    setattr(self.hc_head_fn, 'sequence_parallel', True)
+                    setattr(self.hc_head_base, 'sequence_parallel', True)
+                    setattr(self.hc_head_scale, 'sequence_parallel', True)
 
         self._execution_layer_indices = list(range(len(self.layers)))
         if self.config.moe_shortcut_connection:
@@ -464,6 +510,12 @@ class HybridStack(MegatronModule):
         router = getattr(getattr(inner_layer, "mlp", None), "router", None)
         return bool(getattr(router, "is_hash_layer", False))
 
+    @staticmethod
+    def _uses_engram(layer: torch.nn.Module) -> bool:
+        """Return whether a (possibly mHC-wrapped) TransformerLayer owns an Engram memory."""
+        inner_layer = getattr(layer, "inner_layer", layer)
+        return getattr(inner_layer, "engram", None) is not None
+
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
 
@@ -504,6 +556,19 @@ class HybridStack(MegatronModule):
                         return state_shapes
                 return layer.self_attention.mamba_state_shapes_per_request()
         return None
+
+    def _gated_residual_exit(self) -> bool:
+        """Whether the stack ends with the gated-residual exit contract instead of a final norm.
+
+        Qwen4-Exp (HF ``Qwen4ExpTextModel``) has no final RMSNorm: ``hyper_connection_mixer``
+        (whose group norm already normalizes every stream) feeds ``lm_head`` directly, and the
+        released checkpoint carries no ``norm.weight``. Building a ``final_norm`` here would add
+        a layer the reference model does not have.
+        """
+        return bool(
+            self.config.enable_mhc_connections
+            and self.config.mhc_connection_variant == "gated_residual"
+        )
 
     def _compute_mhc_block_end_plan(self) -> Tuple[bool, ...]:
         """Compute deterministic per-layer mHC recompute block boundaries."""
@@ -689,6 +754,11 @@ class HybridStack(MegatronModule):
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                 )
             else:
+                layer_types = self.layer_type_list
+                # A layer whose TE CUDA graph also covers the next layer (an mHC attention
+                # wrapper grouped with the following MoE router prefix) returns that layer's
+                # output; the grouped layer is then skipped here.
+                grouped_tail_to_skip = None
                 for layer_idx, (physical_layer_idx, layer_config, layer) in enumerate(
                     zip(
                         self._execution_layer_indices,
@@ -697,6 +767,13 @@ class HybridStack(MegatronModule):
                         strict=True,
                     )
                 ):
+                    if layer is grouped_tail_to_skip:
+                        grouped_tail_to_skip = None
+                        if cp_layout_state is not None:
+                            hidden_states = cp_layout_state.finalize_layer(
+                                physical_layer_idx, hidden_states
+                            )
+                        continue
                     layer_packed_seq_params = packed_seq_params
                     residual_stream_recompute_context = residual_stream_recompute_plan[
                         physical_layer_idx
@@ -749,6 +826,13 @@ class HybridStack(MegatronModule):
                         inner_quant_context = get_inner_quant_context(
                             layer_config, layer.layer_number - 1
                         )
+                        # One range per layer at the call site: it stays on the host when the
+                        # layer's submodules are CUDA-graphed, so graph replays project onto it.
+                        layer_range = (
+                            f"hybrid.layer{layer.layer_number:02d}."
+                            f"{layer_types[physical_layer_idx]}"
+                        )
+                        nvtx_range_push(layer_range)
                         with inner_quant_context:
                             if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
                                 layer_kwargs = dict(
@@ -760,6 +844,11 @@ class HybridStack(MegatronModule):
                                     packed_seq_params=layer_packed_seq_params,
                                     padding_mask=layer_padding_mask,
                                 )
+                                if input_ids is not None and self._uses_engram(layer):
+                                    # Engram hashes raw token IDs; thread them only to the
+                                    # layers that own a memory so the others keep their exact
+                                    # kwarg set (TE CUDA graphs fix it at capture).
+                                    layer_kwargs["input_ids"] = input_ids
                                 if layer_cp_metadata is not None:
                                     layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
                                 if residual_stream_recompute_context is not None:
@@ -809,6 +898,10 @@ class HybridStack(MegatronModule):
                                     inference_context=inference_context,
                                     packed_seq_params=layer_packed_seq_params,
                                 )
+                        nvtx_range_pop(layer_range)
+                        grouped_tail_to_skip = getattr(
+                            layer, "_get_active_te_cuda_graph_group_tail", lambda: None
+                        )()
 
                         if isinstance(hidden_states, tuple):
                             hidden_states = hidden_states[0]
@@ -833,17 +926,21 @@ class HybridStack(MegatronModule):
         if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
             if (self.config.mtp_num_layers or 0) > 0:
                 mhc_multistream = hidden_states
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.mhc_num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
+            if self._gated_residual_exit():
+                hidden_states = self.hc_exit_contract(hidden_states)
+            else:
+                hidden_states = learned_output_contract(
+                    hidden_states,
+                    self.hc_head_fn,
+                    self.hc_head_base,
+                    self.hc_head_scale,
+                    self.config.mhc_num_residual_streams,
+                    self.config.layernorm_epsilon,
+                )
 
-        # Final layer norm.
-        if self.post_process and self.post_layer_norm:
+        # Final layer norm (absent for the gated-residual variant: the exit contract's group
+        # norm is the last normalization, as in HF Qwen4-Exp).
+        if self.post_process and self.post_layer_norm and not self._gated_residual_exit():
             hidden_states = self.final_norm(hidden_states)
 
         # Ensure that the tensor passed between pipeline parallel stages is

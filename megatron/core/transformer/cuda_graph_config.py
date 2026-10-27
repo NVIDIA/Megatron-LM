@@ -22,8 +22,34 @@ ALLOWED_INFERENCE_SCOPES: dict[str, Set[InferenceCudaGraphScope]] = {
 }
 
 
+def cuda_graph_captures_attention(config) -> bool:
+    """Return whether the normalized training graph scope includes attention."""
+    impl = getattr(config, "cuda_graph_impl", "none")
+    modules = getattr(config, "cuda_graph_modules", None)
+    return impl == "full_iteration" or (
+        impl in ("local", "transformer_engine") and (not modules or CudaGraphModule.attn in modules)
+    )
+
+
+def cuda_graph_uses_static_thd_inputs(config) -> bool:
+    """Return whether training CUDA graphs are captured with static packed (THD) inputs.
+
+    Packed microbatches reach the model on two paths. A sequence-packing scheduler implies
+    THD. The SFT packed path (``--sft``) does not use a scheduler, so it declares a static
+    THD contract by setting ``thd_max_packed_sequences``: that knob only has meaning for
+    packed inputs, and it is the static ``cu_seqlens`` capacity a THD graph is captured
+    with. Without one of the two, layers are captured with SBHD static inputs.
+    """
+    if getattr(config, "cuda_graph_impl", "none") == "none":
+        return False
+    return (
+        getattr(config, "sequence_packing_scheduler", None) is not None
+        or getattr(config, "thd_max_packed_sequences", None) is not None
+    )
+
+
 def normalize_cuda_graph_modules(
-    scopes: Optional[Union[str, CudaGraphModule, List[Union[str, CudaGraphModule]]]]
+    scopes: Optional[Union[str, CudaGraphModule, List[Union[str, CudaGraphModule]]]],
 ) -> Tuple[List[CudaGraphModule], List[Tuple[str, str, object]], bool]:
     """Normalize mixed CUDA graph scope inputs into enum values plus deprecation metadata."""
 

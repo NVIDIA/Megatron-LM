@@ -11,6 +11,7 @@ from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.transformer.cuda_graph_config import cuda_graph_uses_static_thd_inputs
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -274,6 +275,60 @@ class GraphableMegatronModule(MegatronModule):
             return
         self.cuda_graphs[cg_index].backward_dw()
 
+    def is_cuda_graph_capturable(self) -> bool:
+        """Whether per-layer CUDA graph capture may take this layer.
+
+        ``_layer_is_graphable`` consults this before applying the configured
+        ``cuda_graph_modules`` scope, so a layer that returns ``False`` stays eager under
+        every per-layer scope while the rest of the model is still captured. Layers
+        override it to aggregate what their submodules declare; the decision belongs to
+        the modules that know about their own host synchronizations and data-dependent
+        shapes, not to the graph-discovery code.
+        """
+        return True
+
+    def _is_thd_cuda_graph(self):
+        """Check if THD format with CUDA Graph is being used."""
+        return cuda_graph_uses_static_thd_inputs(self.config)
+
+    def _attention_in_cuda_graph(self) -> bool:
+        """Whether this layer's captured graph contains attention (consumes THD metadata)."""
+        return False
+
+    def _thd_graph_cu_seqlens_kwargs(self, packed_seq_params) -> dict:
+        """Return the THD sequence-boundary tensors a captured graph is replayed with.
+
+        A graph that contains attention must have been captured with static THD inputs to be
+        replayed on packed data. Otherwise its attention was captured in the SBHD layout, and
+        Transformer Engine silently drops replay kwargs it did not capture, so every pack
+        would be treated as a single sequence. That is refused here rather than at capture
+        time because only the replay sees the packed batch.
+
+        A missing ``*_padded`` boundary means the pack has no padding between sequences, so
+        the unpadded boundaries are substituted: the captured graph takes all four as inputs.
+        """
+        if not self._is_thd_cuda_graph() and self._attention_in_cuda_graph():
+            raise RuntimeError(
+                "Packed (THD) inputs reached a CUDA graph whose attention was captured with "
+                "SBHD static inputs, which would treat every pack as one sequence. Set "
+                "--thd-max-packed-sequences (with --pad-packed-seq-alignment max) so the "
+                "graph is captured with static THD inputs."
+            )
+        cu_seqlens_q = packed_seq_params.cu_seqlens_q
+        cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+        cu_seqlens_q_padded = packed_seq_params.cu_seqlens_q_padded
+        cu_seqlens_kv_padded = packed_seq_params.cu_seqlens_kv_padded
+        return {
+            'cu_seqlens_q': cu_seqlens_q,
+            'cu_seqlens_kv': cu_seqlens_kv,
+            'cu_seqlens_q_padded': (
+                cu_seqlens_q if cu_seqlens_q_padded is None else cu_seqlens_q_padded
+            ),
+            'cu_seqlens_kv_padded': (
+                cu_seqlens_kv if cu_seqlens_kv_padded is None else cu_seqlens_kv_padded
+            ),
+        }
+
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
         Get the static inputs for the layer.
@@ -281,21 +336,35 @@ class GraphableMegatronModule(MegatronModule):
         from the seq_length, micro_batch_size, and parallel config.
         Override this method if the module has other inputs.
 
+        For THD + CUDA Graph, hidden_states uses the padded max sequence length with
+        micro_batch_size=1 (packed sequence format).
+
         Returns:
             Dict[str, torch.Tensor]: A dictionary containing the static inputs for the layer.
         """
         # Calculate data shape related values.
         context_parallel_size = self.config.context_parallel_size
-        slen_per_cp = seq_length // context_parallel_size
         sequence_parallel = self.config.sequence_parallel
         tensor_model_parallel_size = self.config.tensor_model_parallel_size
+
+        if self._is_thd_cuda_graph():
+            # THD + CUDA Graph: pre-padded packed-sequence buffer, batch dim = 1.
+            assert (
+                self.config.max_seqlen_per_dp_cp_rank is not None
+            ), "max_seqlen_per_dp_cp_rank must be set when using THD format with CUDA Graph."
+            slen_per_cp = self.config.max_seqlen_per_dp_cp_rank
+            batch = 1
+        else:
+            # SBHD path: per-rank seq is split by CP and (optionally) by TP under SP.
+            slen_per_cp = seq_length // context_parallel_size
+            batch = micro_batch_size
         slen_per_cptp = (
             slen_per_cp // tensor_model_parallel_size if sequence_parallel else slen_per_cp
         )
 
         static_inputs = {}
         static_inputs["hidden_states"] = torch.ones(
-            (slen_per_cptp, micro_batch_size, self.config.hidden_size),
+            (slen_per_cptp, batch, self.config.hidden_size),
             dtype=torch.bfloat16,
             requires_grad=True,
             device=torch.cuda.current_device(),
@@ -349,7 +418,17 @@ class GraphableMegatronModule(MegatronModule):
                 v, torch.Tensor
             ), "CUDA graph accepts only Tensor inputs."
 
-        cg_index = getattr(self, 'current_microbatch', 0) % len(self.cuda_graphs)
+        microbatch_idx = getattr(self, 'current_microbatch', 0)
+        if (
+            getattr(self.config, "cuda_graph_dynamic_microbatches", False)
+            and self.config.pipeline_model_parallel_size > 1
+        ):
+            if microbatch_idx >= len(self.cuda_graphs):
+                raise RuntimeError(
+                    "Packed microbatch count exceeds the captured source-batch bound; "
+                    "recapture CUDA graphs before increasing the source batch size."
+                )
+        cg_index = microbatch_idx % len(self.cuda_graphs)
         cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(*args, **kwargs)
 
         for hook, hook_args in self.cuda_graph_manual_hooks:

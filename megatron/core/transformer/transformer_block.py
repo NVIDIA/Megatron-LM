@@ -536,6 +536,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         extract_layer_indices: Optional[Set[int]] = None,
+        input_ids: Optional[Tensor] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         dynamic_inference_decode_only: Optional[bool] = None,
@@ -704,6 +705,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     padding_mask=padding_mask,
                     extract_layer_indices=extract_layer_indices,
                     layer_offset=layer_offset,
+                    # Engram layers hash the token IDs inside the recomputed region.
+                    input_ids=input_ids if self.config.engram_enabled else None,
                 )
                 # Handle return value from _checkpointed_forward
                 if len(extract_layer_indices) > 0:
@@ -743,6 +746,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     extra_layer_kwargs = (
                         {"mhc_recompute_manager": mhc_manager} if mhc_manager is not None else {}
                     )
+                    # Engram needs the raw token IDs at every layer that owns a memory
+                    # module. Thread it only there: plain layers reject unrecognized
+                    # non-tensor kwargs in their CUDA-graph machinery.
+                    if input_ids is not None and getattr(layer, "engram", None) is not None:
+                        extra_layer_kwargs["input_ids"] = input_ids
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
@@ -842,6 +850,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             non_homogeneous_layers = True
 
         if self.config.heterogeneous_block_specs:
+            non_homogeneous_layers = True
+
+        # Engram is present only at selected global layers, so layer-numbered checkpoint keys
+        # avoid representing absent modules as holes in a homogeneous stacked tensor.
+        if self.config.engram_enabled:
             non_homogeneous_layers = True
 
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)

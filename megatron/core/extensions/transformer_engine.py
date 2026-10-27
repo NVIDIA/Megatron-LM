@@ -2579,6 +2579,19 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             if packed_seq_params is not None
             else {}
         )
+        if (
+            packed_seq_kwargs.get("qkv_format") == "thd"
+            and packed_seq_kwargs.get("pad_between_seqs") is False
+        ):
+            # Megatron represents end padding as dummy THD sequences. TE DPA
+            # sizes THD outputs from cu_seqlens_q/kv, so pass padded
+            # boundaries as the effective attention boundaries while keeping
+            # the original PackedSeqParams metadata intact for downstream
+            # loss/routing paths.
+            if packed_seq_kwargs.get("cu_seqlens_q_padded") is not None:
+                packed_seq_kwargs["cu_seqlens_q"] = packed_seq_kwargs["cu_seqlens_q_padded"]
+            if packed_seq_kwargs.get("cu_seqlens_kv_padded") is not None:
+                packed_seq_kwargs["cu_seqlens_kv"] = packed_seq_kwargs["cu_seqlens_kv_padded"]
         qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
 
         attention_bias_kwargs = {}
@@ -4190,3 +4203,24 @@ try:
     from transformer_engine.pytorch.float8_tensor import Float8Tensor
 except ImportError:
     Float8Tensor = None
+
+
+def get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank):
+    """Get partitioned indices for THD format data in context parallel.
+
+    Args:
+        cu_seqlens: Cumulative sequence lengths tensor.
+        total_tokens: Total number of tokens.
+        cp_size: Context parallel world size.
+        cp_rank: Context parallel rank.
+
+    Returns:
+        Partitioned indices tensor.
+    """
+    assert is_te_min_version("1.10.0"), (
+        "Please update Transformer Engine to >= 1.10 to use "
+        "Context Parallel with THD format data"
+    )
+    import transformer_engine_torch as tex
+
+    return tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)

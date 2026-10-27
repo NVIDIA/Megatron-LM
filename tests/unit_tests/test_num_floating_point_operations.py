@@ -1516,3 +1516,92 @@ class TestDSAKPool:
             )
             == 0
         )
+
+
+def _make_qsa_hybrid_args(*, pattern="Q", qsa_indexer_loss_coeff=0.01):
+    """Minimal GQA + output-gate QSA dimensions for hybrid FLOPs tests."""
+    args = _make_hybrid_args(num_layers=1, hidden_size=512, num_attention_heads=8, seq_length=1024)
+    args.hybrid_layer_pattern = pattern
+    args.group_query_attention = True
+    args.num_query_groups = 2
+    args.kv_channels = 64
+    args.attention_output_gate = True
+    args.qsa_indexer_n_heads = 4
+    args.qsa_indexer_head_dim = 32
+    args.qsa_indexer_budget = 256
+    args.qsa_indexer_compress_ratio = 4
+    args.qsa_indexer_loss_coeff = qsa_indexer_loss_coeff
+    return args
+
+
+class TestQSAHybrid:
+    """QSA ('Q') layers are counted with the DSA-consistent convention: GQA
+    projections (incl. the output gate), sparse core attention over the causal
+    effective length ``min(i, budget)``, and the indexer projection (2x) plus
+    block scoring (3x). The indexer loss and top-k selection are not counted."""
+
+    @staticmethod
+    def _hand_flops(batch_size, loss_on=True):
+        # Every number below is written out by hand for _make_qsa_hybrid_args().
+        h, L, vocab = 512, 1024, 32000
+        tokens = batch_size * L
+        seq_sq = batch_size * L * L
+        # GQA projections: Q (h->512) + O (512->h) = 2*h*512, K+V (h->2*2*64=256) = h*256,
+        # elementwise output gate (h->512) = h*512; x2 FMA, x3 fwd+bwd.
+        proj = 3 * 2 * tokens * (2 * h * 512 + h * 256 + h * 512)
+        # Sparse core: budget 256 of L=1024 -> attended keys per query
+        # 256 * (1 - 256 / 2048) = 224 vs dense L/2 = 512 -> scale 0.4375.
+        # Dense causal core is 2 * sum(L^2) * (heads * kv) (FMA x2 and causal /2 cancel
+        # against QK^T + PV), then x3 fwd+bwd.
+        core = 3 * 2 * seq_sq * 512 * 0.4375
+        # Indexer projection h -> (4 + 1) * 32 = 160: fwd + wgrad (x2) with FMA x2.
+        idx_proj = (2 if loss_on else 1) * 2 * tokens * h * 160
+        # Block scoring: 4 heads * 32 dims against L/4 pooled blocks, causal /2:
+        # 128 / 8 = 16 per L^2, x2 FMA, fwd + dq + dk (x3).
+        idx_score = (3 if loss_on else 1) * 2 * seq_sq * 16
+        logits = 3 * 2 * tokens * h * vocab
+        return proj + core + idx_proj + idx_score + logits
+
+    def test_single_qsa_layer_matches_hand_value(self):
+        args = _make_qsa_hybrid_args()
+        assert num_floating_point_operations(args, 2) == pytest.approx(
+            self._hand_flops(2), rel=1e-12
+        )
+
+    def test_indexer_without_loss_is_forward_only(self):
+        args = _make_qsa_hybrid_args(qsa_indexer_loss_coeff=None)
+        assert num_floating_point_operations(args, 2) == pytest.approx(
+            self._hand_flops(2, loss_on=False), rel=1e-12
+        )
+
+    def test_qsa_layers_add_exactly_their_own_term(self):
+        """Adding Q layers to a model leaves every other layer's term unchanged."""
+        args = _make_qsa_hybrid_args(pattern="M-M-")
+        without_q = num_floating_point_operations(args, 2)
+        args.hybrid_layer_pattern = "MQ-MQ-"
+        with_q = num_floating_point_operations(args, 2)
+        logits = 3 * 2 * 2 * 1024 * 512 * 32000
+        assert with_q - without_q == pytest.approx(2 * (self._hand_flops(2) - logits), rel=1e-12)
+
+    def test_models_without_qsa_are_unchanged(self):
+        """QSA fields on args do not affect '*' / GDN / MoE models without 'Q' layers."""
+        args = _make_hybrid_args()
+        reference = num_floating_point_operations(args, 4)
+        args.qsa_indexer_n_heads = 4
+        args.qsa_indexer_head_dim = 128
+        args.qsa_indexer_budget = 16
+        args.qsa_indexer_compress_ratio = 4
+        args.qsa_indexer_loss_coeff = 0.01
+        assert num_floating_point_operations(args, 4) == reference
+
+    def test_budget_beyond_sequence_is_dense(self):
+        """A budget covering the whole sequence makes QSA core attention dense."""
+        args = _make_qsa_hybrid_args()
+        args.qsa_indexer_budget = 4096
+        dense = _make_qsa_hybrid_args()
+        dense.hybrid_layer_pattern = "*"
+        # Q == '*' + indexer when nothing is pruned.
+        idx = 2 * 2 * (2 * 1024) * 512 * 160 + 3 * 2 * (2 * 1024 * 1024) * 16
+        assert num_floating_point_operations(args, 2) == pytest.approx(
+            num_floating_point_operations(dense, 2) + idx, rel=1e-12
+        )

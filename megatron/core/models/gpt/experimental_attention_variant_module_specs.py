@@ -10,6 +10,7 @@ from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.experimental_attention_variant import (
     deepseek_v4_hybrid_attention_module_specs as dsv4_hybrid_specs,
 )
+from megatron.core.transformer.experimental_attention_variant import qsa_module_specs as qsa_specs
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
@@ -148,6 +149,8 @@ def get_experimental_attention_variant_module_spec(
         return dsv4_hybrid_specs.get_dsv4_hybrid_module_spec_for_backend(
             config=config, backend=backend
         )
+    elif config.experimental_attention_variant == "qsa":
+        return qsa_specs.get_qsa_module_spec_for_backend(config=config, backend=backend)
     else:
         raise ValueError(
             f"Invalid experimental attention variant: {config.experimental_attention_variant}"
@@ -307,6 +310,18 @@ def get_transformer_block_with_experimental_attention_variant_spec(
         Currently only supports transformer_engine backend. Kitchen backend can be used as a
         wrapper with TE fallback for unsupported operations.
     """
+
+    if (
+        is_gated_delta_net_variant(config.experimental_attention_variant)
+        and config.linear_cp_mode == "chunkwise"
+        and config.context_parallel_size > 1
+    ):
+        # Chunkwise CP needs the GDN layers in the contiguous CP layout while softmax
+        # attention stays zigzag. Only HybridStack converts between the two per layer.
+        raise ValueError(
+            "Gated DeltaNet with linear_cp_mode='chunkwise' is supported only in HybridModel, "
+            "which converts layers between attention_cp_layout and linear_cp_layout."
+        )
 
     backend = _get_backend_spec_provider(config=config)
 

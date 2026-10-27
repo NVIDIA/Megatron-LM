@@ -55,7 +55,9 @@ def _assert_relative_rms_close(
     ), f"{name} relative RMS error {relative_rms:.4g} exceeds tolerance {tolerance}"
 
 
-def _make_gdn_variant_stub(backend: str, *, deterministic_mode: bool = False) -> SimpleNamespace:
+def _make_gdn_variant_stub(
+    backend: str, *, deterministic_mode: bool = False, chunkwise_context_parallel: bool = False
+) -> SimpleNamespace:
     """Build the minimal state needed to exercise GDN backend selection."""
     stub = SimpleNamespace(
         config=SimpleNamespace(
@@ -67,7 +69,9 @@ def _make_gdn_variant_stub(backend: str, *, deterministic_mode: bool = False) ->
         qk_dim_local_tp=64,
         v_dim_local_tp=128,
         tp_size=1,
-        cp_size=1,
+        cp_size=2 if chunkwise_context_parallel else 1,
+        chunkwise_context_parallel=chunkwise_context_parallel,
+        cp_size_headwise=1,
         num_v_heads_local_tp=2,
         key_head_dim=64,
         value_head_dim=64,
@@ -129,6 +133,28 @@ def test_gdn_selects_explicit_torch_backend():
 
     assert gdn.gdn_backend == "torch"
     assert gdn.gated_delta_rule is torch_chunk_gated_delta_rule
+
+
+@pytest.mark.parametrize("backend", ["transformer_engine", "torch"])
+def test_gdn_chunkwise_cp_requires_fla_backend(backend):
+    """Chunkwise CP runs FLA kernels with a CP context; other backends are rejected."""
+    gdn = _make_gdn_variant_stub(
+        backend, deterministic_mode=backend == "torch", chunkwise_context_parallel=True
+    )
+
+    with pytest.raises(ValueError, match="requires gdn_kernel_backend='fla'"):
+        GatedDeltaNet._setup_variant_attrs(gdn)
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+def test_gdn_chunkwise_cp_keeps_heads_local():
+    """Chunkwise CP selects FLA and does not split the post-projection features over CP."""
+    gdn = _make_gdn_variant_stub("fla", chunkwise_context_parallel=True)
+
+    GatedDeltaNet._setup_variant_attrs(gdn)
+
+    assert gdn.gdn_backend == "fla"
+    assert gdn.feat_dim_split == (64 * 2 + 128, 128, 2, 2)
 
 
 @pytest.mark.parametrize("backend", ["transformer_engine", "fla"])

@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, ClassVar, Literal, override
 
@@ -8,11 +9,14 @@ import torch
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
+from megatron.core.models.engram import EngramConfig, apply_engram_to_hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import (
+    gated_residual_hybrid_stack_spec,
+    is_gated_residual_norm_free,
     wide_residual_hybrid_inference_stack_spec,
     wide_residual_hybrid_stack_spec,
 )
@@ -51,6 +55,8 @@ class HybridModelConfig(ModelConfig):
 
     builder: ClassVar[str] = "megatron.training.models.hybrid.HybridModelBuilder"
     transformer: TransformerConfig
+    engram_config: EngramConfig | None = None
+    """Hashed n-gram memory (Engram / Qwen PLE) attached to the configured global layers."""
     fp16_lm_cross_entropy: bool = False
     logit_dtype: torch.dtype | None = None
     parallel_output: bool = True
@@ -120,7 +126,25 @@ class HybridModelConfig(ModelConfig):
 
 def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
     """Return the configured stack spec, or the default one for the transformer config."""
+    uses_gated_residual = (
+        model_config.transformer.enable_mhc_connections
+        and model_config.transformer.mhc_connection_variant == "gated_residual"
+    )
     if model_config.hybrid_stack_spec is not None:
+        if uses_gated_residual and not is_gated_residual_norm_free(model_config.hybrid_stack_spec):
+            # An explicit spec wins by design, but the gated-residual architecture
+            # has no pre-sublayer norms: a spec that keeps them (e.g. the default
+            # hybrid_stack_spec) normalizes the streams twice. Specs built by
+            # gated_residual_hybrid_stack_spec mark themselves norm-free and are exempt.
+            warnings.warn(
+                "mhc_connection_variant='gated_residual' with an explicitly provided "
+                "hybrid_stack_spec: make sure the spec is norm-free (see "
+                "gated_residual_hybrid_stack_spec) — fused input layernorms in the "
+                "layer specs would normalize the residual streams twice on top of the "
+                "gated-residual group norm.",
+                UserWarning,
+                stacklevel=2,
+            )
         return model_config.hybrid_stack_spec
     use_wide_residual = model_config.transformer.wide_residual is not None
     if model_config.transformer.transformer_impl == "inference_optimized":
@@ -136,6 +160,10 @@ def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
                 "do not statically construct wide-residual layer classes."
             )
         return get_hybrid_stack_modelopt_spec(local_core_attention=False, remap_te_layernorm=False)
+    if uses_gated_residual:
+        # Norm-free layer specs: the gated-residual group norm replaces
+        # the per-sublayer input layernorms.
+        return gated_residual_hybrid_stack_spec
     return wide_residual_hybrid_stack_spec if use_wide_residual else default_hybrid_stack_spec
 
 
@@ -190,6 +218,19 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             )
         else:
             padded_vocab_size = self._model_config.vocab_size
+
+        engram_config = self._model_config.engram_config
+        if engram_config is not None:
+            # The padded vocabulary is only known here; the stack spec carries the memory to
+            # every transformer layer type, and TransformerLayer builds it only for the
+            # configured global layer numbers.
+            engram_config.validate_vocabulary(padded_vocab_size)
+            hybrid_stack_spec = apply_engram_to_hybrid_stack_spec(
+                hybrid_stack_spec,
+                engram_config,
+                self._model_config.hybrid_layer_pattern,
+                self._model_config.transformer,
+            )
 
         pre_process = (
             pre_process if pre_process is not None else is_pp_first_stage(pg_collection.pp)

@@ -286,6 +286,8 @@ class TransformerLayerSubmodules:
             after the MLP.
         sharded_state_dict_keys_map (Dict[str, str]): Mapping for sharded tensor keys to be applied
             in the `sharded_state_dict` method.
+        engram (Union[ModuleSpec, type]): Optional residual injection before attention. Kept last
+            to preserve the established positional constructor order.
     """
 
     input_layernorm: LayerNormBuilder = IdentityOp
@@ -305,6 +307,10 @@ class TransformerLayerSubmodules:
 
     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
+
+    # Keep extension points after the established positional fields for backward compatibility.
+    # Engram consumes the real multi-stream residual before native mHC applies H_pre.
+    engram: Union[ModuleSpec, type] = IdentityOp
 
 
 class BaseTransformerLayer(ABC):
@@ -393,6 +399,24 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
         self.is_mtp_layer = is_mtp_layer
+
+        self.engram = None
+        if submodules.engram is not IdentityOp and not is_mtp_layer:
+            # MTP layers use their own local layer numbering, which would collide with the
+            # decoder's global Engram layer IDs; Engram never attaches to MTP layers.
+            if not isinstance(submodules.engram, ModuleSpec):
+                raise TypeError("The Engram composition point must be a ModuleSpec or IdentityOp.")
+            engram_spec = submodules.engram
+            engram_config = engram_spec.params.get("engram_config")
+            if engram_config is None:
+                raise ValueError("The Engram ModuleSpec must provide engram_config.")
+            if self.layer_number in engram_config.layer_ids:
+                self.engram = build_module(
+                    engram_spec,
+                    config=self.config,
+                    layer_number=self.layer_number,
+                    pg_collection=pg_collection,
+                )
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
@@ -785,6 +809,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
         *,
         inference_params: Optional[Any] = None,
+        skip_engram: bool = False,
     ):
         """
         Perform a forward pass through the attention layer and the layernorms before and after
@@ -807,10 +832,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             sequence_len_offset (Tensor, optional): Offset along sequence dimension
                 during inference.
             input_ids (Tensor, optional): Token IDs retained in the shared layer-forward
-                signature for the MLP phase. Self-attention does not consume them; hash-routed
+                signature for the MLP phase. Self-attention does not consume them; an Engram
+                memory on this layer hashes them before the input layernorm, and hash-routed
                 MoE layers use them later in ``_forward_mlp``.
             residual_stream_recompute_context (ResidualStreamRecomputeContext, optional):
                 Call-local ordered replay state for configured residual connections.
+            skip_engram (bool): Set by an outer hyper-connection wrapper that already added the
+                Engram memory to its n-stream tensor.
 
         Returns:
             Tuple[Tensor, Tensor]: A tuple containing:
@@ -823,6 +851,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             # Whole-layer batch-first mask shape, taken before MLP chunking splits the mask, so TE
             # CUDA graph capture reserves (and replay passes) a mask of the layer's input shape.
             self._padding_mask_shape_seen = tuple(padding_mask.shape)
+
+        if not skip_engram:
+            # skip_engram=True means an outer hyper-connection wrapper already added the memory
+            # residual to the n-stream tensor, before its read gate.
+            hidden_states = self._maybe_apply_engram(hidden_states, input_ids, packed_seq_params)
+
         if residual_stream_recompute_context is None:
             input_layernorm_output, residual, attn_state = self._run_input_layernorm(hidden_states)
         else:
@@ -879,6 +913,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
     ):
         """Run the training path through pre-attention and core attention."""
         assert self.supports_two_stage_attention()
+        assert self.engram is None, (
+            "Engram is not wired into the two-stage attention path (fine-grained 1F1B / "
+            "attention-MLP overlap). Running it here would silently drop the Engram residual."
+        )
 
         input_layernorm_output, residual, attn_state = self._run_input_layernorm(
             hidden_states, residual_stream_recompute_context=residual_stream_recompute_context
@@ -1122,6 +1160,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             )
 
         return hidden_states, context
+
+    def _maybe_apply_engram(self, hidden_states, input_ids, packed_seq_params=None):
+        """Add the Engram residual for the layers that carry an Engram module.
+
+        Unsupported inputs are rejected by GPTModel.forward, which every pipeline stage
+        executes; raising here would only fire on the stages that own an Engram layer and
+        would hang the remaining stages in their pipeline collectives.
+        """
+        engram = getattr(self, "engram", None)
+        if engram is None:
+            return hidden_states
+        return hidden_states + engram(hidden_states, input_ids, packed_seq_params)
 
     @copy_signature(_forward_attention)
     def forward(self, *args, **kwargs):
@@ -1732,20 +1782,91 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         """
         return self.self_attention.linear_qkv.layer_norm_weight.data
 
+    def is_cuda_graph_capturable(self) -> bool:
+        """Whether per-layer CUDA graph capture may take this layer.
+
+        A layer that hosts an Engram module is never capturable: its hashed lookup and the
+        lookup's all-to-all have data-dependent shapes and host synchronizations. Otherwise
+        the layer defers to its attention and MLP submodules, each of which may declare
+        itself uncapturable through an ``is_cuda_graph_capturable()`` method of its own;
+        submodules that do not define one are assumed capturable.
+        """
+        if self.engram is not None:
+            return False
+        return self.submodules_are_cuda_graph_capturable()
+
+    def submodules_are_cuda_graph_capturable(self) -> bool:
+        """Whether the attention and MLP submodules allow per-layer CUDA graph capture.
+
+        This is ``is_cuda_graph_capturable`` without the Engram rule. A caller that runs the
+        Engram lookup itself, outside the layer's graph (``HyperConnectionHybridLayer`` with
+        ``cuda_graph_capture_engram_host``), consults it for the remaining part of the layer.
+        """
+        for submodule in (self.self_attention, self.cross_attention, self.mlp):
+            predicate = getattr(submodule, "is_cuda_graph_capturable", None)
+            if predicate is not None and not predicate():
+                return False
+        return True
+
+    def _moe_cuda_graph_outputs_shared_expert(self) -> bool:
+        """Whether a ``moe_router`` partial CUDA graph of this MoE layer outputs the shared
+        expert's result.
+
+        True when the shared expert runs inside the graph: it exists and is not overlapped
+        with the expert-parallel communication. A megakernel backend fuses the shared expert
+        into the eager megakernel, so its graph has no shared-expert output.
+        """
+        return (
+            self.config.moe_shared_expert_intermediate_size is not None
+            and not self.config.moe_shared_expert_overlap
+            and getattr(self.mlp, "megakernel_experts", None) is None
+        )
+
+    def _attention_in_cuda_graph(self) -> bool:
+        """Whether this layer's attention is inside the configured capture scope."""
+        return not isinstance(self.self_attention, IdentityOp) and (
+            not self.config.cuda_graph_modules
+            or CudaGraphModule.attn in self.config.cuda_graph_modules
+        )
+
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
         Get the static inputs for the transformer layer. Besides the hidden_states that is
         generated in GraphableMegatronModule, we also add the attention_mask.
+
+        For THD + CUDA Graph: generates static cu_seqlens tensors instead of attention_mask.
 
         Returns:
             Dict[str, torch.Tensor]: A dictionary containing the static inputs for the layer.
         """
         static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
 
-        if not isinstance(self.self_attention, IdentityOp) and (
-            not self.config.cuda_graph_modules
-            or CudaGraphModule.attn in self.config.cuda_graph_modules
-        ):
+        # Captured forward needs attention-side static input only when this
+        # layer's attention is inside the captured scope.
+        attn_in_graph = self._attention_in_cuda_graph()
+
+        if self._is_thd_cuda_graph():
+            if attn_in_graph:
+                # Static cu_seqlens shaped [thd_max_packed_sequences + 1]. We seed it as
+                # one full-length sequence (covers the worst case at capture):
+                #   cu_seqlens = [0, max_T, max_T, ..., max_T]
+                # which represents a single packed sequence followed by zero-length
+                # entries. cu_seqlens_q / kv / *_padded all share this layout.
+                max_T = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+                cu_seqlens = torch.zeros(
+                    self.config.thd_max_packed_sequences + 1,
+                    dtype=torch.int32,
+                    device=static_inputs["hidden_states"].device,
+                )
+                cu_seqlens[1:] = max_T
+                for name in (
+                    'cu_seqlens_q',
+                    'cu_seqlens_kv',
+                    'cu_seqlens_q_padded',
+                    'cu_seqlens_kv_padded',
+                ):
+                    static_inputs[name] = cu_seqlens.clone()
+        elif attn_in_graph:
             slen_per_cp = seq_length // self.config.context_parallel_size
             static_inputs["attention_mask"] = (
                 ~(torch.tril(torch.ones((slen_per_cp, seq_length))).bool())
@@ -1754,8 +1875,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 .tile(micro_batch_size, 1, 1, 1)
             )
         if self.is_moe_layer and getattr(self.mlp.router, 'is_hash_layer', False):
+            # [batch, seq] of the static hidden states; THD graphs use a single packed row.
             static_inputs["input_ids"] = torch.zeros(
-                (micro_batch_size, static_inputs["hidden_states"].shape[0]),
+                (static_inputs["hidden_states"].shape[1], static_inputs["hidden_states"].shape[0]),
                 dtype=torch.long,
                 device=torch.cuda.current_device(),
             )
@@ -1828,12 +1950,57 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             submodules += [self.pre_mlp_layernorm, self.mlp]
         elif self.is_moe_layer and CudaGraphModule.moe_router in self.config.cuda_graph_modules:
             submodules += [self.pre_mlp_layernorm, self.mlp.router]
-            if (
-                self.config.moe_shared_expert_intermediate_size is not None
-                and not self.config.moe_shared_expert_overlap
-            ):
+            if self._moe_cuda_graph_outputs_shared_expert():
                 submodules += [self.mlp.shared_experts]
         return submodules
+
+    def _decompose_packed_seq_params_to_kwargs(self, kwargs):
+        """Decompose PackedSeqParams into individual tensor kwargs for CUDA graph.
+
+        CUDA graph requires all inputs to be tensors. This extracts the cu_seqlens
+        tensor fields from PackedSeqParams into individual kwargs. max_seqlen_q/kv
+        are omitted because they are static and reading them from a CUDA tensor is
+        forbidden during graph capture. They are restored from config in
+        _reconstruct_packed_seq_params_from_kwargs.
+        """
+        packed_seq_params = kwargs.pop('packed_seq_params', None)
+        if packed_seq_params is None:
+            return
+        for name, offsets in self._thd_graph_cu_seqlens_kwargs(packed_seq_params).items():
+            if offsets is None or offsets.numel() != self.config.thd_max_packed_sequences + 1:
+                raise ValueError(
+                    "Packed CUDA graph inputs must use the configured metadata capacity."
+                )
+            kwargs[name] = offsets
+
+    def _reconstruct_packed_seq_params_from_kwargs(self, kwargs):
+        """Reconstruct PackedSeqParams from individual tensor kwargs (CUDA graph path).
+
+        During CUDA graph capture/replay, PackedSeqParams fields are decomposed into
+        individual cu_seqlens tensor kwargs. This method reassembles them into a
+        PackedSeqParams. max_seqlen_q/kv are taken from config since they are always
+        the padded static value and cannot be read from CUDA tensors during graph capture.
+        pad_between_seqs is conservatively enabled because its Python value is not a
+        graph input and inferring it from CUDA tensors would synchronize during capture.
+        """
+        if 'cu_seqlens_q' not in kwargs:
+            return
+        max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+        kwargs['packed_seq_params'] = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=kwargs.pop('cu_seqlens_q'),
+            cu_seqlens_kv=kwargs.pop('cu_seqlens_kv'),
+            cu_seqlens_q_padded=kwargs.pop('cu_seqlens_q_padded'),
+            cu_seqlens_kv_padded=kwargs.pop('cu_seqlens_kv_padded'),
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            # CUDA graph inputs do not carry this Python bool. Sequence-packing
+            # metadata may contain valid/physical gaps, so use the conservative
+            # graph-static value instead of asking TE to infer it with a CUDA
+            # tensor comparison during capture. This restricts TE backend
+            # selection for THD to cuDNN fused attention.
+            pad_between_seqs=True,
+        )
 
     def _te_cuda_graph_capture(self, *args, **kwargs):
         """
@@ -1843,6 +2010,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
            attribute can be set to control the scope of the CUDA graph.
         2. If context is None, it cannot be returned as output.
         """
+        self._reconstruct_packed_seq_params_from_kwargs(kwargs)
+
         # Record the backward event on cuda graph stream in backward pass.
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
         # and overlaps with the H2D transfer on reload stream.
@@ -1855,6 +2024,30 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 hidden_states = kwargs.pop("hidden_states")
                 hidden_states = self.off_interface.backward_record(hidden_states)
                 kwargs["hidden_states"] = hidden_states
+
+        cuda_graph_outputs = self._te_cuda_graph_capture_impl(*args, **kwargs)
+
+        # Record the forward event on cuda graph stream for cuda graph capture.
+        # This is to ensure the main stream waits for computing on cuda graph stream to complete,
+        # and overlaps with the D2H transfer on offloading stream.
+        if self.offload_module_in_cuda_graph:
+            self.off_interface.forward_record()
+        return cuda_graph_outputs
+
+    def _te_cuda_graph_capture_impl(self, *args, **kwargs):
+        """Capture this layer's graph-safe body without offload boundary events.
+
+        The public capture entry owns the graph boundary. Outer graphable wrappers
+        (``HyperConnectionHybridLayer``) call this implementation when they capture the
+        TransformerLayer body as part of a larger callable, avoiding nested events in the
+        middle of that graph. ``packed_seq_params`` must already be reconstructed by the
+        boundary owner.
+        """
+        assert 'cu_seqlens_q' not in kwargs, (
+            "TransformerLayer CUDA graph capture body received raw THD sequence tensors. "
+            "The outer capture boundary must reconstruct PackedSeqParams first."
+        )
+
         context = None
         if (
             not self.config.cuda_graph_modules
@@ -1890,11 +2083,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             cuda_graph_outputs = list(hidden_states)
         if context is not None:
             cuda_graph_outputs.append(context)
-        # Record the forward event on cuda graph stream for cuda graph capture.
-        # This is to ensure the main stream waits for computing on cuda graph stream to complete,
-        # and overlaps with the D2H transfer on offloading stream.
-        if self.offload_module_in_cuda_graph:
-            self.off_interface.forward_record()
         return tuple(cuda_graph_outputs)
 
     def _te_cuda_graph_replay(self, *args, **kwargs):
@@ -1919,6 +2107,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             if input_ids is not None:
                 kwargs["input_ids"] = input_ids
 
+        packed = kwargs.get('packed_seq_params')
+        if packed is not None and self._is_thd_cuda_graph():
+            kwargs = dict(kwargs)
+            self._decompose_packed_seq_params_to_kwargs(kwargs)
+
         assert (kwargs.get('inference_context') is None) and (
             kwargs.get('packed_seq_params') is None
         ), (
@@ -1927,6 +2120,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             "For inference cuda graph, please use cuda_graph_impl=local instead."
         )
 
+        kwargs["packed_seq_params"] = packed
         if self.config.delay_offload_until_cuda_graph:
             self.off_interface.enter_replay()
 
@@ -1936,11 +2130,67 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             if self.config.delay_offload_until_cuda_graph:
                 self.off_interface.exit_replay()
 
+    def resume_moe_experts_after_partial_cudagraph(self, cuda_graph_output, padding_mask=None):
+        """Resume the eager MoE *expert* compute after a partial (moe_router[/moe_preprocess])
+        CUDA graph and return the raw ``mlp_output_with_bias`` (NOT the post-residual layer
+        output). ``cuda_graph_output`` is the list of captured router/preprocess intermediates,
+        with any outer (e.g. mHC) state already stripped by the caller.
+
+        Used by the mHC hybrid wrapper (``HyperConnectionHybridLayer``): the wrapper's n-stream
+        BDA owns the residual combine, so the inner layer's own MLP BDA is intentionally
+        skipped here. EP-overlap is not supported on this path.
+        """
+        assert not self.config.overlap_moe_expert_parallel_comm, (
+            "HyperConnectionHybridLayer MoE CUDA-graph capture requires "
+            "overlap_moe_expert_parallel_comm=False."
+        )
+        shared_expert_output, routing_map = None, None
+        # The inner residual is the last captured element; the mHC wrapper does not use it
+        # (the n-stream BDA combines the residual), so drop it.
+        cuda_graph_output.pop()
+        if self._moe_cuda_graph_outputs_shared_expert():
+            shared_expert_output = cuda_graph_output.pop()
+
+        if CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules:
+            (hidden_states, probs), attr_outputs = cuda_graph_output[:2], cuda_graph_output[2:]
+            valid_cudagraph_attrs = self.mlp.token_dispatcher.valid_cudagraph_attrs
+            assert len(attr_outputs) == len(
+                valid_cudagraph_attrs
+            ), f"attr_outputs: {len(attr_outputs)} != {len(valid_cudagraph_attrs)}"
+            for i, attr_name in enumerate(valid_cudagraph_attrs):
+                hier_attr_name = attr_name.split('.')
+                attr = self.mlp.token_dispatcher
+                for name in hier_attr_name[:-1]:
+                    attr = getattr(attr, name)
+                setattr(attr, hier_attr_name[-1], attr_outputs[i])
+        else:
+            assert len(cuda_graph_output) == 3, (
+                "CUDA graph output should be [hidden_states, probs, routing_map], "
+                f"but got {len(cuda_graph_output)} elements"
+            )
+            hidden_states, probs, routing_map = cuda_graph_output
+
+        nvtx_range_push(suffix="mlp")
+        self.mlp.cudagraph_tensor_store.set(
+            hidden_states=hidden_states,
+            probs=probs,
+            routing_map=routing_map,
+            shared_expert_output=shared_expert_output,
+        )
+        # The cached router outputs are unmasked; eager preprocess needs the replay mask
+        # so the dispatcher can exclude padded rows.
+        mlp_output_with_bias = apply_module(self.mlp)(hidden_states, padding_mask=padding_mask)
+        self.mlp.cudagraph_tensor_store.clear()
+        nvtx_range_pop(suffix="mlp")
+        return mlp_output_with_bias
+
     def _te_cuda_graph_replay_impl(self, args, kwargs, context):
         """Implementation of _te_cuda_graph_replay, separated for replay mode cleanup."""
         # The graph only takes padding_mask when it was captured with that input; the eager MoE
         # steps after the graph keep using the caller's mask from `kwargs`.
-        graph_kwargs = {k: v for k, v in kwargs.items() if k != "padding_mask"}
+        graph_kwargs = {
+            k: v for k, v in kwargs.items() if k not in ("padding_mask", "packed_seq_params")
+        }
         hidden_states = args[0] if args else kwargs["hidden_states"]
         graph_padding_mask = self._te_cuda_graph_padding_mask(
             kwargs.get("padding_mask"), hidden_states.device
@@ -1974,10 +2224,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             shared_expert_output, routing_map = None, None
             # residual is the last element in the CUDA graph output.
             residual = cuda_graph_output.pop()
-            if (
-                self.config.moe_shared_expert_intermediate_size is not None
-                and not self.config.moe_shared_expert_overlap
-            ):
+            if self._moe_cuda_graph_outputs_shared_expert():
                 # The shared expert output is the last second element in the CUDA graph output.
                 shared_expert_output = cuda_graph_output.pop()
 
@@ -2058,6 +2305,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 *cuda_graph_output,
                 padding_mask=kwargs.get("padding_mask"),
                 input_ids=kwargs.get("input_ids", None),
+                packed_seq_params=kwargs.get("packed_seq_params"),
             )
         return output, context
 
@@ -2109,9 +2357,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 # The attention_mask can be None when there is no padding to the input sequence.
                 # However, an attention_mask Tensor must be passed into cudagraph for replay, so
                 # we create an equivalent zero Tensor as the attention_mask.
-                cudagraph_kwargs["attention_mask"] = get_zero_attention_mask(
-                    hidden_states.size(0), hidden_states.size(1)
-                )
+                if self._is_thd_cuda_graph():
+                    cudagraph_kwargs.pop("attention_mask")
+                else:
+                    cudagraph_kwargs["attention_mask"] = get_zero_attention_mask(
+                        hidden_states.size(0), hidden_states.size(1)
+                    )
         except ImportError:
             raise RuntimeError("CUDAGraph requires TransformerEngine, but not installed")
         return tuple(cudagraph_args), cudagraph_kwargs

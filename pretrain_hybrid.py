@@ -29,6 +29,11 @@ from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequ
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.packed_seq_params import (
+    get_thd_padding_kwargs,
+    pad_sequence_for_thd,
+    resolve_thd_tail_padding_policy,
+)
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -58,14 +63,18 @@ from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.global_vars import (
     get_run_config,
     set_run_config,
 )
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
-from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
+from megatron.training.utils import (
+    get_blend_and_blend_per_split,
+    get_pipeline_prefetched_tokens,
+    is_first_or_last_pipeline_stage,
+)
 from model_provider import model_provider
 
 try:
@@ -94,6 +103,36 @@ BATCH_KEYS = [
     "position_ids",
     "tokens",
 ]
+
+
+def _engram_tokens(data_iterator, tokens):
+    """Return this microbatch's n-gram memory tokens, distributed before the schedule.
+
+    Every pipeline stage needs the token IDs, including middle stages that own no batch, so
+    the tokens come from the pre-schedule broadcast rather than this rank's data iterator.
+    """
+    args = get_args()
+    prefetched_tokens = get_pipeline_prefetched_tokens(data_iterator)
+    if args.engram_verify_training and tokens is not None:
+        # This rank consumed its own iterator for labels; its tokens must match the batch
+        # broadcast from the first stage or the sampler states diverged. Packed rows are
+        # compared on the common prefix, since the local row is still unpadded here.
+        local_tokens = tokens.to(device=prefetched_tokens.device, dtype=prefetched_tokens.dtype)
+        common_length = min(local_tokens.shape[-1], prefetched_tokens.shape[-1])
+        assert torch.equal(
+            local_tokens[..., :common_length], prefetched_tokens[..., :common_length]
+        ), (
+            "Engram pipeline-prefetched tokens do not match this rank's own data iterator; "
+            "the data sampler state has diverged across pipeline stages."
+        )
+    if tokens is None:
+        # Middle stages never run pad_sequence_for_thd; use the full padded row so hash and
+        # hidden lengths match the fixed pipeline activation shape.
+        return prefetched_tokens
+    # Keep the batch's own unpadded length: pad_sequence_for_thd derives the local valid
+    # length from the token shape, so substituting the padded row would mark the dummy tail
+    # as valid for MoE routing statistics.
+    return prefetched_tokens[..., : tokens.shape[-1]]
 
 
 def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroupCollection] = None):
@@ -145,6 +184,14 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         and not mtp_on_this_rank
         and not has_cu_seqlens
     ):
+        if args.engram_enabled:
+            engram_batch = dict.fromkeys(BATCH_KEYS)
+            engram_batch["tokens"] = _engram_tokens(data_iterator, None)
+            return ContextParallelBatch(
+                boundary_layout=config.linear_cp_layout,
+                batches_by_layout={config.linear_cp_layout: engram_batch},
+                packed_seq_params_by_layout={config.linear_cp_layout: None},
+            )
         return ContextParallelBatch(
             boundary_layout=config.linear_cp_layout,
             batches_by_layout={config.linear_cp_layout: dict.fromkeys(BATCH_KEYS)},
@@ -178,6 +225,12 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
     )
 
+    if args.engram_enabled:
+        # Before flattening: flatten_batch_for_packed_sequences reshapes tokens together with
+        # labels and merges cu_seqlens, so substituting afterwards would restore the unflattened
+        # shape and silently misalign tokens against labels.
+        batch['tokens'] = _engram_tokens(data_iterator, batch.get('tokens'))
+
     batch = flatten_batch_for_packed_sequences(batch)
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
@@ -187,6 +240,8 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
             'cu_seqlens': batch['cu_seqlens'],
             'cu_seqlens_padded': batch['cu_seqlens_padded'],
             'max_seqlen': batch['max_seqlen'],
+            # Engram layers on middle stages consume the pipeline-prefetched tokens.
+            'tokens': batch['tokens'] if args.engram_enabled else None,
         }
 
     additional_layouts = set()
@@ -207,6 +262,78 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
             else None
         ),
         tokens_per_sample=args.seq_length,
+    )
+
+
+def _uses_static_thd_contract(config) -> bool:
+    """Whether packed SFT rows must be padded to the static THD capacity.
+
+    The sequence-packing scheduler path pads its packs inside the scheduler. The SFT packed
+    path has no scheduler, so it opts into the same fixed-capacity contract by setting both
+    ``--pad-packed-seq-alignment`` and ``--thd-max-packed-sequences``; THD CUDA graphs rely on
+    it because cu_seqlens and the token dimension are graph inputs with captured shapes.
+    """
+    return (
+        getattr(config, "sequence_packing_scheduler", None) is None
+        and getattr(config, "pad_packed_seq_alignment", None) is not None
+        and getattr(config, "thd_max_packed_sequences", None) is not None
+    )
+
+
+def _pad_packed_batch_to_static_thd(config, vp_stage, cp_batch: ContextParallelBatch):
+    """Pad an SFT packed microbatch to the static THD capacity.
+
+    Token-like tensors are padded to ``max_seqlen_per_dp_cp_rank`` (``max`` alignment) and all
+    four cu_seqlens tensors to ``thd_max_packed_sequences + 1`` entries, with the padding tail
+    represented by ``thd_tail_padding_policy`` (a dummy sequence by default). Returns a
+    ContextParallelBatch carrying the padded tensors, the rebuilt PackedSeqParams and the
+    padding mask (True at padded slots).
+    """
+    if not is_first_or_last_pipeline_stage(vp_stage):
+        # Middle stages carry neither token-like tensors nor a padding mask, and their
+        # hidden states already have the first stage's padded shape; padding only the
+        # boundaries there would need the first stage's padding decision.
+        raise NotImplementedError(
+            "The static THD contract (--pad-packed-seq-alignment with "
+            "--thd-max-packed-sequences) on the --sft path is not implemented for middle "
+            "pipeline stages."
+        )
+    if len(cp_batch.batches_by_layout) != 1 or cp_batch.thd_plan is not None:
+        # The padding is applied to the CP-local tensors of one layout; a second layout (for
+        # example GDN chunkwise CP's contiguous linear layout next to zigzag attention) would
+        # need the same tail in its own token order.
+        raise NotImplementedError(
+            "The static THD contract on the --sft path supports a single CP layout only; "
+            f"got layouts {sorted(cp_batch.batches_by_layout)}."
+        )
+    batch = dict(cp_batch.get_batch())
+    alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
+        config.pad_packed_seq_alignment,
+        config.max_seqlen_per_dp_cp_rank,
+        config.thd_max_packed_sequences,
+        config.cuda_graph_impl != "none",
+    )
+    (
+        batch["tokens"],
+        batch["labels"],
+        batch["loss_mask"],
+        batch["position_ids"],
+        packed_seq_params,
+        batch["padding_mask"],
+    ) = pad_sequence_for_thd(
+        batch.get("tokens"),
+        batch.get("labels"),
+        batch.get("loss_mask"),
+        batch.get("position_ids"),
+        cp_batch.get_packed_seq_params(),
+        alignment=alignment,
+        target_len=target_len,
+        max_num_seqs=max_num_seqs,
+        tail_padding_policy=resolve_thd_tail_padding_policy(config),
+        padding_mask=batch.get("padding_mask"),
+    )
+    return ContextParallelBatch.from_single_layout(
+        cp_batch.boundary_layout, batch, packed_seq_params
     )
 
 
@@ -328,6 +455,9 @@ def forward_step(data_iterator, model: HybridModel):
         cp_batch = get_batch(
             data_iterator, vp_stage, pg_collection=get_attr_wrapped_model(model, "pg_collection")
         )
+        config = get_attr_wrapped_model(model, "config")
+        if cp_batch.get_packed_seq_params() is not None and _uses_static_thd_contract(config):
+            cp_batch = _pad_packed_batch_to_static_thd(config, vp_stage, cp_batch)
         batch = cp_batch.get_batch()
         attention_mask = batch.get("attention_mask")
         cu_seqlens = batch.get("cu_seqlens")
@@ -430,6 +560,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         fast_cache_load=args.dataloader_fast_cache_load,
         sequences_per_dataset=sequences_per_dataset,
         defer_npy_index_mmap=args.dataloader_defer_npy_index_mmap,
+        sft_mock_dataset_config_json=args.sft_mock_dataset_config_json,
         context_parallel_size=args.context_parallel_size,
         data_parallel_size=args.data_parallel_size,
         sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,
@@ -451,7 +582,9 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
     is_packed_sequence = False
     if args.sft:
-        dataset_type = SFTDataset
+        # Mirror pretrain_gpt.py: --mock-data must select the mock packer, otherwise the
+        # packed path goes looking for a real SFT corpus on disk.
+        dataset_type = MockSFTDataset if args.mock_data else SFTDataset
         is_packed_sequence = True  # SFT always uses packed sequence
     elif args.use_varlen_dataset:
         # Variable-length packed (THD) dataset, independent of --sft.

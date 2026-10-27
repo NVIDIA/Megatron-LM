@@ -174,6 +174,24 @@ class ModelParallelConfig:
     Padding is represented as a masked dummy sequence.
     """
 
+    thd_tail_padding_policy: Optional[Literal["append_dummy_seq", "extend_last"]] = None
+    """Policy for representing the THD packed-sequence padding tail on paths that pad
+    after packing (``megatron.core.packed_seq_params.pad_sequence_for_thd``).
+
+    - append_dummy_seq: cover the post-pack padding tail with an ordinary
+      dummy sequence appended to the cu_seqlens metadata. Existing
+      valid/physical gaps between real sequences are preserved. This is the
+      default behavior.
+    - extend_last: keep valid cu_seqlens boundaries unchanged and extend the
+      final padded boundary so the tail is physical padding of the last
+      sequence. With context parallelism the extension is applied to the
+      global metadata before CP slicing.
+    - None (default): treated as append_dummy_seq.
+
+    When thd_max_packed_sequences is set, cu_seqlens tensors are padded to
+    that value + 1 entries in both eager and CUDA Graph modes.
+    """
+
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""
 
@@ -591,6 +609,12 @@ class ModelParallelConfig:
                 "dynamic_context_parallel=True"
             )
 
+        if self.thd_tail_padding_policy not in (None, "append_dummy_seq", "extend_last"):
+            raise ValueError(
+                "thd_tail_padding_policy must be 'append_dummy_seq', 'extend_last', or None, "
+                f"got {self.thd_tail_padding_policy!r}."
+            )
+
         if self.pad_packed_seq_alignment is not None:
             if self.pad_packed_seq_alignment != 'max':
                 try:
@@ -605,6 +629,17 @@ class ModelParallelConfig:
                 raise ValueError(
                     "max_seqlen_per_dp_cp_rank is required for packed sequence padding"
                 )
+            if self.pad_packed_seq_alignment == "max":
+                if self.sequence_parallel:
+                    assert (
+                        self.max_seqlen_per_dp_cp_rank % self.tensor_model_parallel_size == 0
+                    ), "Packed padding must preserve sequence-parallel TP divisibility."
+                assert (
+                    self.max_seqlen_per_dp_cp_rank % 2 == 0
+                ), "Packed padding must preserve zigzag CP alignment."
+            # Integer alignment is combined with TP/CP/MXFP8 requirements by
+            # get_packed_sequence_alignment, so the requested multiple need not
+            # itself be divisible by TP.
 
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:

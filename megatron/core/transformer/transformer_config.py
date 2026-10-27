@@ -19,6 +19,8 @@ from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
+    cuda_graph_captures_attention,
+    cuda_graph_uses_static_thd_inputs,
     get_deprecated_cuda_graph_modules_migration,
     normalize_cuda_graph_modules,
     normalize_inference_cuda_graph_scope,
@@ -280,6 +282,11 @@ class TransformerConfig(ModelParallelConfig):
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
 
+    engram_enabled: bool = False
+    """Whether Engram n-gram memory modules are attached to selected transformer layers.
+    Engram shards its lookup tables over the expert-parallel dimension, so enabling it
+    also permits expert parallelism without MoE experts."""
+
     rotary_interleaved: bool = False
     """True is rotate pairs of even and odd dimensions (RoFormer style), False is rotate pairs of
     first half and second half (LLaMa style). Default to False."""
@@ -339,9 +346,11 @@ class TransformerConfig(ModelParallelConfig):
     # attention variant
     ####################
     experimental_attention_variant: Optional[
-        Literal['gdn', 'gdn2', 'dsa', 'dsv4_hybrid', 'gated_delta_net']
+        Literal['gdn', 'gdn2', 'dsa', 'dsv4_hybrid', 'gated_delta_net', 'qsa']
     ] = None
-    """Type of attention variant to use. Supports gdn, gdn2, dsa, and dsv4_hybrid.
+    """Type of attention variant to use. Supports gdn, gdn2, dsa, dsv4_hybrid, and qsa.
+    'qsa' is the GQA-based Qwen Sparse Attention variant (streaming indexer + block-granular
+    sparse selection); it also selects the layer built for hybrid pattern symbol 'Q'.
     gdn2 selects the GDN2 (Gated DeltaNet-2) variant of the gated delta net layer, with
     channel-wise decay, erase and write gates; it requires flash-linear-attention >= 0.5.1.
     Both gdn and gdn2 also select the layer built for the hybrid layer pattern symbol 'G'.
@@ -483,6 +492,81 @@ class TransformerConfig(ModelParallelConfig):
     disabled."""
 
     ####################
+    # QSA (Qwen Sparse Attention)
+    ####################
+    qsa_indexer_n_heads: int = 4
+    """Number of QSA indexer query heads (MQA over one shared index key head)."""
+
+    qsa_indexer_head_dim: int = 128
+    """Dimension per QSA indexer head (query heads and the shared key head)."""
+
+    qsa_indexer_budget: int = 2048
+    """QSA token budget: number of KV tokens each query attends to through block
+    selection. Selected block count is ``qsa_indexer_budget // qsa_indexer_compress_ratio``.
+    Sequences no longer than the budget degenerate to dense causal attention."""
+
+    qsa_indexer_compress_ratio: int = 4
+    """QSA block size in tokens: index keys are mean-pooled (parameter-free) over
+    fixed, causal-prefix-aligned groups of this many tokens; selection is block-granular."""
+
+    qsa_indexer_loss_coeff: Optional[float] = None
+    """Coefficient for the QSA indexer sparse-KL distillation loss (teacher = the main
+    attention distribution aggregated to blocks, normalized over the selected block set
+    only). None or 0 disables indexer training."""
+
+    qsa_indexer_loss_chunk: int = 256
+    """Query-chunk size for the QSA indexer distillation loss.
+
+    Pure memory staging: the loss's softmax is over the token axis and its accumulator is
+    per-chunk, so this cannot change any result - it trades peak memory for kernel launches.
+    On the Qwen3.8-Flash-Next proxy shape, 1024 costs 0.8 GiB and 4096 costs 13.1 GiB more
+    peak memory than 256."""
+
+    qsa_indexer_loss_impl: Literal["reference", "layout", "fused"] = "fused"
+    """Implementation of the QSA indexer distillation loss (same loss definition for all).
+
+    ``reference``: the original eager path (materializes the gathered selected keys).
+    ``layout``: eager, bit-identical teacher targets without materializing the gathered
+    keys (one GEMM per query chunk over its causal key range, then a logit gather).
+    ``fused``: CuTe DSL teacher kernel (Blackwell, bf16) on the main path's q/k plus the
+    CuTe DSL sparse student; CUDA-graph capturable, deterministic indexer gradients."""
+
+    qsa_use_sparse_attention: bool = False
+    """Use the sparse GQA kernel path (gathered block-sparse attention over the selected
+    4-token blocks; supports BSHD and packed THD). The kernels are CuTe DSL kernels for
+    Blackwell (SM100-class) GPUs with bf16/fp16 inputs; building a QSA layer elsewhere
+    raises. When False, the dense-mask
+    bridge is used: the selection is materialized as a [b, s, s] bool mask fed to dense
+    core attention — functionally identical, no sparsity speedup, BSHD only."""
+
+    qsa_attn_backend: Optional[Literal["dense", "cute", "cudnn"]] = None
+    """QSA attention implementation.
+
+    ``dense``: the dense-mask bridge (see ``qsa_use_sparse_attention=False``). ``cute``: the
+    in-tree CuTe DSL sparse kernels (``qsa_use_sparse_attention=True``). ``cudnn``: the same
+    sparse path with cuDNN Frontend's QSA kernels (``cudnn.ops.qsa_forward``; backward chosen by
+    ``qsa_cudnn_bwd_impl``); bf16, head dim 256, 24 query / 2 KV or 12 / 1 heads per rank,
+    4-token blocks, SM100/SM103, no context parallelism. None (default) follows
+    ``qsa_use_sparse_attention``; any other value sets it (``dense`` -> False, else True)."""
+
+    qsa_cudnn_bwd_impl: Literal["qsa_api", "sparse_gqa"] = "sparse_gqa"
+    """Backward of ``qsa_attn_backend='cudnn'``. ``sparse_gqa`` (default): the index-list QSA
+    backward (``cudnn.sdpa.bwd.sparse_gqa_bwd_wrapper_sm100``), one launch per sequence; it needs
+    exactly 512 selected blocks, a GQA ratio of 12 or 16 with an even KV head count per rank, and
+    no CUDA-graph capture of packed (THD) inputs. ``qsa_api``: ``cudnn.ops.qsa_backward`` on the
+    forward's block bitmap; serves the rest (e.g. 12 query / 1 KV heads at TP2). ``sparse_gqa`` is
+    the default because its backward is faster than ``qsa_api`` at lower peak memory, single
+    sequence and packed THD alike."""
+
+    qsa_cp_packing_layout: Literal["per_document", "per_sequence"] = "per_document"
+    """How packed THD batches are zigzag-sharded across context-parallel ranks for QSA.
+    'per_document' splits every document independently into 2*cp chunks (each document
+    length must divide 2*cp); 'per_sequence' zigzags the flattened pack (what
+    per-sequence balancing / inter-document masking dataloaders produce). This is a
+    caller contract — both layouts are legal for the same cu_seqlens and cannot be
+    inferred. Ignored for cp=1 and for BSHD inputs."""
+
+    ####################
     # linear attention
     ####################
     linear_attention_freq: Optional[Union[int, List[int]]] = None
@@ -492,13 +576,44 @@ class TransformerConfig(ModelParallelConfig):
     - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
     - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
 
-    gdn_kernel_backend: Literal["transformer_engine", "fla", "torch"] = "fla"
+    gdn_kernel_backend: Literal["transformer_engine", "fla", "torch", "cudnn", "internal"] = "fla"
     """Kernel backend for Gated DeltaNet. The selected backend is required to be available;
-    there is no automatic fallback. ``torch`` selects the PyTorch-native reference
-    implementation and is required when deterministic mode is enabled."""
+    there is no automatic fallback between these values. ``torch`` selects the PyTorch-native
+    reference implementation and is required when deterministic mode is enabled.
+
+    ``cudnn`` uses cuDNN Frontend's FLA-compatible GDN adapter
+    (``cudnn.fla.accelerate_fla``), which keeps its own automatic fla fallback for
+    unsupported inputs; with context parallelism it supports only headwise CP, and with
+    attention CUDA-graph capture it requires ``cuda_graph_warmup_steps > 0``.
+
+    ``internal`` is the in-tree SM10x (Blackwell) CuTe DSL GDR backend in
+    ``ssm/gated_delta_net/internal_gdn_backend``: fused CuTe DSL forward and backward plus
+    CuTe DSL context-parallel boundary preprocessing for chunkwise CP. The
+    ``MCORE_GDN_INTERNAL_BACKEND`` environment variable sets its runtime dispatch: ``auto``
+    (default) runs CuTe DSL where the inputs are supported and fla otherwise (per call, and
+    for the backward separately: the fused CuTe backward serves bf16 H=64, D=128); ``cute``
+    raises instead of falling back; ``fla`` bypasses CuTe DSL. Layers whose attention is
+    captured into a CUDA graph with packed (THD) inputs use fla."""
+
+    gdn_gdr_recompute_h: bool = False
+    """Whether the internal GDR backward recomputes recurrent states instead of saving them.
+    Requires ``gdn_kernel_backend='internal'``."""
+
+    has_gated_delta_net_layers: bool = False
+    """Whether the model actually builds GatedDeltaNet layers. Set for hybrid models whose
+    layer pattern contains 'G'; a pure-GDN model instead signals this through
+    experimental_attention_variant='gdn'. A hybrid stack cannot use the variant name for this:
+    it is a single global value and a GDN+attention hybrid (Qwen3.8-Flash-Next is GDN+QSA)
+    must set it to the attention family so the right layer spec is composed."""
 
     linear_conv_kernel_dim: Optional[int] = 4
     """Conv kernel dimension for the gated delta net."""
+
+    gdn_output_gate_activation: Optional[Literal['silu', 'sigmoid']] = None
+    """Activation of the GDN output gate. ``None`` keeps the historical behaviour of reusing
+    the model-wide ``activation_func`` (silu for Qwen3-Next). Qwen3.8-Flash-Next specifies
+    ``sigmoid`` for the output gate only; this knob must not change the causal-conv
+    activation or the MLP activation."""
 
     linear_key_head_dim: Optional[int] = 128
     """Query and key head dimension for the gated delta net."""
@@ -907,6 +1022,18 @@ class TransformerConfig(ModelParallelConfig):
     num_moe_experts > 0. Mutually exclusive with moe_shared_expert_overlap and unsupported with
     full activation recomputation."""
 
+    moe_megakernel_backend: Optional[str] = None
+    """Optional backend that replaces MoE dispatch, expert computation, and combine.
+    Supported values: None and "mok". When set, the megakernel owns dispatch/combine;
+    moe_token_dispatcher_type and moe_flex_dispatcher_backend do not select its transport.
+    """
+
+    moe_megakernel_backend_config: Optional[dict] = None
+    """Backend options for moe_megakernel_backend.
+
+    For example, ``fwd_num_comm_sms`` is a valid MOK backend option.
+    """
+
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
     - An integer N: Represents a 1:N ratio, meaning one expert layer for every N-1 dense layers.
@@ -1264,7 +1391,13 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     linear_cp_mode: Literal["headwise", "chunkwise"] = "headwise"
-    """Context-parallel algorithm for recurrent and linear-attention layers."""
+    """Context-parallel algorithm for recurrent and linear-attention layers.
+    "headwise": scatter heads across the CP group with all-to-all (Ulysses-style); each rank
+    runs the kernel on the full sequence for a shard of heads.
+    "chunkwise": keep contiguous sequence shards on each CP rank and exchange the recurrent
+    state across ranks (Gated DeltaProduct and Gated DeltaNet; GDN uses FLA CP kernels and
+    runs in HybridModel, whose stack converts layers to ``linear_cp_layout='contiguous'``).
+    GDN2 supports only headwise CP."""
 
     linear_cp_layout: CPLayout = "zigzag"
     """CP layout for linear-attention layers."""
@@ -1316,6 +1449,20 @@ class TransformerConfig(ModelParallelConfig):
     cuda_graph_modules has no effect when cuda_graph_impl="none" and must be empty when
     cuda_graph_impl="full_iteration"."""
 
+    thd_max_packed_sequences: Optional[int] = None
+    """THD metadata capacity, including the dummy padding document.
+
+    Bounds real-document packing and fixes all four cumulative-offset tensor
+    shapes in eager and TE graph execution. Padding reserves one document slot.
+    """
+
+    cuda_graph_dynamic_microbatches: bool = False
+    """Allow TE graph replay when packing reduces the source microbatch count.
+
+    A fixed source global batch size bounds graph instances. Input slots stay
+    live until backward, independently of the number of packed microbatches.
+    """
+
     cuda_graph_modules: Union[str, CudaGraphModule, List[str], List[CudaGraphModule]] = "full"
     """Selects training capture coverage within per-layer CUDA graphs (local and
     transformer_engine implementations).
@@ -1333,6 +1480,16 @@ class TransformerConfig(ModelParallelConfig):
     Backward compatibility: "full" is deprecated but kept for backward compatibility; it is
     transformed to an empty list in __post_init__. The deprecated values "full_iteration" and
     "full_iteration_inference" are also accepted and migrated to the new API in __post_init__."""
+
+    cuda_graph_capture_engram_host: bool = False
+    """Capture the non-Engram part of each Engram-hosting layer under per-layer Transformer
+    Engine CUDA graphs. By default a layer that hosts an Engram module stays eager, because the
+    Engram hashed lookup and its all-to-all have data-dependent shapes. With this option the
+    hybrid hyper-connection wrapper (HybridStack with enable_mhc_connections) runs the Engram
+    lookup eagerly in front of the layer's graph and captures the rest of the layer (mHC
+    aggregate, attention, n-stream BDA, and a grouped MoE router prefix) like any other layer.
+    The math is unchanged: the Engram output is added to the n-stream input either way.
+    Requires cuda_graph_impl="transformer_engine" with the "attn" scope."""
 
     inference_cuda_graph_scope: Optional[InferenceCudaGraphScope] = field(
         default=None,
@@ -1373,6 +1530,23 @@ class TransformerConfig(ModelParallelConfig):
 
     mhc_num_residual_streams: int = 4
     """Number of residual streams (n in paper)."""
+
+    mhc_connection_variant: str = "mhc"
+    """Which hyper-connection mathematics to use when enable_mhc_connections=True.
+
+    "mhc": Manifold-Constrained Hyper-Connections (Sinkhorn doubly-stochastic
+    cross-stream mixing + per-stream scalar read gate). The default; existing
+    behaviour is unchanged.
+    "gated_residual": the Qwen4-Exp variant — low-rank per-channel read gate
+    over group-RMS-normalized streams, per-stream scalar write gate, identity
+    residual (no cross-stream mixing). Removes the per-sublayer pre-norms
+    (the gated-residual group norm takes over that role).
+    """
+
+    hc_lowrank: int = 320
+    """Bottleneck width of the gated-residual read gate's two projections
+    ((n*C) -> hc_lowrank -> (n*C)). Only used with
+    mhc_connection_variant="gated_residual"."""
 
     mhc_sinkhorn_iterations: int = 20
     """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
@@ -1891,10 +2065,33 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
-        if self.gdn_kernel_backend not in {"transformer_engine", "fla", "torch"}:
+        gdn_kernel_backends = ("transformer_engine", "fla", "torch", "cudnn", "internal")
+        if self.gdn_kernel_backend not in gdn_kernel_backends:
             raise ValueError(
-                "gdn_kernel_backend must be one of {'transformer_engine', 'fla', 'torch'}, "
+                f"gdn_kernel_backend must be one of {gdn_kernel_backends}, "
                 f"got {self.gdn_kernel_backend!r}."
+            )
+        if self.gdn_kernel_backend == "cudnn":
+            if not (
+                self.experimental_attention_variant == "gdn" or self.has_gated_delta_net_layers
+            ):
+                # Same predicate as gdn_pre_gated_delta_rule_fusion: the backend is read by the
+                # GatedDeltaNet module itself, so what matters is that GDN layers exist, not the
+                # global variant name (a GDN+QSA hybrid must set that to "qsa").
+                raise ValueError(
+                    "gdn_kernel_backend='cudnn' requires a model with GatedDeltaNet layers "
+                    "(experimental_attention_variant='gdn', or a hybrid layer pattern "
+                    "containing 'G')."
+                )
+            if self.context_parallel_size > 1 and self.linear_cp_mode != "headwise":
+                raise ValueError(
+                    "gdn_kernel_backend='cudnn' only supports "
+                    "linear_cp_mode='headwise' when context_parallel_size > 1."
+                )
+        if self.gdn_gdr_recompute_h and self.gdn_kernel_backend != "internal":
+            raise ValueError(
+                "gdn_gdr_recompute_h only applies to gdn_kernel_backend='internal', "
+                f"got gdn_kernel_backend={self.gdn_kernel_backend!r}."
             )
 
         if self.dsa_indexer_weights_proj_output_dtype not in ("bf16", "fp32"):
@@ -1922,6 +2119,22 @@ class TransformerConfig(ModelParallelConfig):
                 "weights tensor. KPool selection bypasses the cuDNN top-k path; use KPool or "
                 "dsa_kernel_backend='tilelang'/'none'."
             )
+
+        # qsa_attn_backend is the QSA attention switch; qsa_use_sparse_attention stays its
+        # backward-compatible alias ("sparse path"), derived from it whenever it is set. None
+        # keeps the alias in charge (dense when False, cute when True).
+        if self.qsa_attn_backend is not None:
+            if self.qsa_attn_backend not in ("dense", "cute", "cudnn"):
+                raise ValueError(
+                    "qsa_attn_backend must be one of 'dense', 'cute', 'cudnn', got "
+                    f"{self.qsa_attn_backend!r}."
+                )
+            if self.qsa_attn_backend == "dense" and self.qsa_use_sparse_attention:
+                raise ValueError(
+                    "qsa_attn_backend='dense' contradicts qsa_use_sparse_attention=True; set "
+                    "only qsa_attn_backend."
+                )
+            self.qsa_use_sparse_attention = self.qsa_attn_backend != "dense"
 
         if is_gated_delta_net_variant(self.experimental_attention_variant):
             if self.deterministic_mode and self.gdn_kernel_backend != "torch":
@@ -1959,15 +2172,25 @@ class TransformerConfig(ModelParallelConfig):
                 f"linear_num_key_heads ({self.linear_num_key_heads})."
             )
 
-            # Check tensor parallelism compatibility
-            tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
-            assert self.linear_num_key_heads % tp_cp_size == 0, (
+            chunkwise_cp = self.linear_cp_mode == "chunkwise" and self.context_parallel_size > 1
+            if chunkwise_cp and self.experimental_attention_variant == "gdn2":
+                raise ValueError(
+                    "experimental_attention_variant='gdn2' supports only headwise context "
+                    "parallelism; linear_cp_mode='chunkwise' is not supported."
+                )
+
+            # Check tensor parallelism compatibility. Headwise CP splits linear-attention heads
+            # across CP ranks; chunkwise CP keeps all TP-local heads on each CP rank.
+            linear_head_parallel_size = self.tensor_model_parallel_size
+            if not chunkwise_cp:
+                linear_head_parallel_size *= self.context_parallel_size
+            assert self.linear_num_key_heads % linear_head_parallel_size == 0, (
                 f"{self.linear_num_key_heads=} must be a multiple of "
-                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+                f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
             )
-            assert self.linear_num_value_heads % tp_cp_size == 0, (
+            assert self.linear_num_value_heads % linear_head_parallel_size == 0, (
                 f"{self.linear_num_value_heads=} must be a multiple of "
-                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+                f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
             )
         elif self.experimental_attention_variant == "dsa":
             _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
@@ -2060,11 +2283,97 @@ class TransformerConfig(ModelParallelConfig):
                     )
             self.hetereogenous_dist_checkpoint = True
 
-        if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant != "gdn":
+        elif self.experimental_attention_variant == "qsa":
+            if self.multi_latent_attention:
+                raise ValueError(
+                    "QSA is GQA-based and is incompatible with multi_latent_attention."
+                )
+            if self.qsa_indexer_compress_ratio < 1:
+                raise ValueError(
+                    "qsa_indexer_compress_ratio must be positive, got "
+                    f"{self.qsa_indexer_compress_ratio}."
+                )
+            if (
+                self.qsa_indexer_budget < 1
+                or self.qsa_indexer_budget % self.qsa_indexer_compress_ratio != 0
+            ):
+                raise ValueError(
+                    f"qsa_indexer_budget ({self.qsa_indexer_budget}) must be a positive "
+                    f"multiple of qsa_indexer_compress_ratio ({self.qsa_indexer_compress_ratio})."
+                )
+            if self.qsa_indexer_n_heads < 1 or self.qsa_indexer_head_dim < 1:
+                raise ValueError(
+                    "qsa_indexer_n_heads and qsa_indexer_head_dim must be positive, got "
+                    f"{self.qsa_indexer_n_heads} and {self.qsa_indexer_head_dim}."
+                )
+            if self.qsa_indexer_loss_chunk < 1:
+                raise ValueError(
+                    f"qsa_indexer_loss_chunk must be positive, got {self.qsa_indexer_loss_chunk}."
+                )
+            if self.qsa_indexer_loss_impl not in ("reference", "layout", "fused"):
+                raise ValueError(
+                    "qsa_indexer_loss_impl must be one of 'reference', 'layout', 'fused', "
+                    f"got {self.qsa_indexer_loss_impl!r}."
+                )
+            if self.qsa_indexer_loss_coeff is not None and self.qsa_indexer_loss_coeff < 0:
+                raise ValueError(
+                    f"qsa_indexer_loss_coeff must be non-negative, got "
+                    f"{self.qsa_indexer_loss_coeff}."
+                )
+            # Note: the indexer reuses the main attention's rotary frequencies. Their dim
+            # (kv_channels * rotary_percent, a model-level arg) must fit the indexer head
+            # dim; this is asserted at runtime in QSAIndexer.forward.
+            if self.qsa_cudnn_bwd_impl not in ("qsa_api", "sparse_gqa"):
+                raise ValueError(
+                    "qsa_cudnn_bwd_impl must be 'qsa_api' or 'sparse_gqa', got "
+                    f"{self.qsa_cudnn_bwd_impl!r}."
+                )
+            if self.qsa_attn_backend == "cudnn":
+                if self.context_parallel_size > 1:
+                    raise ValueError(
+                        "qsa_attn_backend='cudnn' does not support context parallelism: "
+                        "cudnn.ops.qsa_forward takes queries and keys in one token space, while "
+                        "QSA CP runs local queries against all-gathered keys. Use "
+                        "qsa_attn_backend='cute'."
+                    )
+            if self.qsa_cp_packing_layout not in ("per_document", "per_sequence"):
+                raise ValueError(
+                    "qsa_cp_packing_layout must be 'per_document' or 'per_sequence', got "
+                    f"{self.qsa_cp_packing_layout!r}."
+                )
+            if self.context_parallel_size > 1:
+                # QSA CP is allgather-only: the indexer all-gathers the shared raw index
+                # key head and the sparse path all-gathers K/V; queries stay local at
+                # their zigzag positions. Ring (p2p) attention is not implemented.
+                if not self.qsa_use_sparse_attention:
+                    raise ValueError(
+                        "QSA with context parallelism requires qsa_use_sparse_attention=True "
+                        "(the dense-mask bridge is single-rank only)."
+                    )
+                cp_comm_types = (
+                    self.cp_comm_type
+                    if isinstance(self.cp_comm_type, list)
+                    else [self.cp_comm_type]
+                )
+                if any(c not in (None, "all_gather", "allgather") for c in cp_comm_types):
+                    raise ValueError(
+                        "QSA context parallelism supports cp_comm_type='all_gather' only, "
+                        f"got {self.cp_comm_type!r}."
+                    )
+
+        if self.gdn_pre_gated_delta_rule_fusion and not (
+            self.experimental_attention_variant == "gdn" or self.has_gated_delta_net_layers
+        ):
+            # The fusion is a property of the GatedDeltaNet module, which reads
+            # gdn_pre_gated_delta_rule_fusion directly and never looks at
+            # experimental_attention_variant. What it needs is that GDN layers exist at all,
+            # so gate on that: either a pure-GDN model (variant 'gdn') or a hybrid stack whose
+            # layer pattern contains 'G' (has_gated_delta_net_layers).
             raise ValueError(
-                "gdn_pre_gated_delta_rule_fusion is only supported with "
+                "gdn_pre_gated_delta_rule_fusion requires a model with GatedDeltaNet layers: "
                 "experimental_attention_variant='gdn' "
-                "or deprecated alias experimental_attention_variant='gated_delta_net'."
+                "or deprecated alias experimental_attention_variant='gated_delta_net', "
+                "or a hybrid layer pattern containing 'G'."
             )
 
         if self.gdn_gated_output_norm_fusion and self.experimental_attention_variant != "gdn":
@@ -2072,6 +2381,14 @@ class TransformerConfig(ModelParallelConfig):
                 "gdn_gated_output_norm_fusion is only supported with "
                 "experimental_attention_variant='gdn' "
                 "or deprecated alias experimental_attention_variant='gated_delta_net'."
+            )
+        if self.gdn_gated_output_norm_fusion and self.gdn_output_gate_activation not in (
+            None,
+            "silu",
+        ):
+            raise ValueError(
+                "gdn_gated_output_norm_fusion fuses a SiLU output gate; it does not support "
+                f"gdn_output_gate_activation={self.gdn_output_gate_activation!r}."
             )
 
         if self.fp8:
@@ -2142,8 +2459,14 @@ class TransformerConfig(ModelParallelConfig):
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
-        if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
-            raise ValueError("num_moe_experts must be non None to use expert-parallel.")
+        if (
+            self.expert_model_parallel_size > 1
+            and self.num_moe_experts is None
+            and not self.engram_enabled
+        ):
+            raise ValueError(
+                "num_moe_experts must be non None to use expert-parallel unless Engram is enabled."
+            )
 
         if self.inference_moe_nvfp4_recipe is not None and (
             self.transformer_impl != "inference_optimized" or self.num_moe_experts is None
@@ -2484,6 +2807,8 @@ class TransformerConfig(ModelParallelConfig):
             ), "moe_shortcut_parallel requires MoE to be enabled (num_moe_experts > 0)"
 
         if self.moe_virtual_expert_load_balance:
+            if self.moe_megakernel_backend == "mok":
+                raise ValueError("MOK does not support MoonEP (moe_virtual_expert_load_balance)")
             MAX_VIRTUAL_EXPERT_EP_SIZE = 64
 
             def require(condition: bool, message: str) -> None:
@@ -2581,6 +2906,89 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     f"moe_shared_expert_overlap only works with alltoall or flex token dispatcher."
                 )
+
+        if self.moe_megakernel_backend not in (None, "mok"):
+            raise ValueError(
+                "moe_megakernel_backend must be None or 'mok', got "
+                f"{self.moe_megakernel_backend!r}"
+            )
+        if self.moe_megakernel_backend is None and self.moe_megakernel_backend_config:
+            raise ValueError(
+                "moe_megakernel_backend_config requires moe_megakernel_backend to be set"
+            )
+
+        if self.moe_megakernel_backend == "mok":
+            if self.use_transformer_engine_op_fuser:
+                raise ValueError("MOK requires use_transformer_engine_op_fuser=False")
+            if not self.gradient_accumulation_fusion:
+                raise ValueError("MOK currently requires gradient_accumulation_fusion=True")
+            if not self.moe_grouped_gemm:
+                raise ValueError("MOK currently requires moe_grouped_gemm=True")
+            if self.add_bias_linear:
+                raise ValueError("MOK requires add_bias_linear=False")
+            if self.moe_apply_probs_on_input:
+                raise ValueError("MOK does not support moe_apply_probs_on_input")
+            if self.glu_linear_offset != 0.0:
+                raise ValueError("MOK requires glu_linear_offset=0.0")
+            if self.activation_func_tanh_clamp_scale is not None:
+                raise ValueError("MOK does not support activation_func_tanh_clamp_scale")
+            mok_bf16 = (
+                self.bf16
+                and not self.fp16
+                and self.fp8 is None
+                and not self.fp8_param
+                and self.fp4 is None
+                and not self.fp4_param
+            )
+            mok_mxfp8 = (
+                self.fp8 is not None and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
+            )
+            if not (mok_bf16 or mok_mxfp8):
+                raise ValueError(
+                    "MOK routed experts require either bf16=True with no FP8/FP4 mode, "
+                    "or MXFP8 with fp8_param=True; FP32, FP16, and FP4 are not supported"
+                )
+            if self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "MOK does not support overlap_moe_expert_parallel_comm; the megakernel "
+                    "replaces MCore's dispatcher/expert/combine schedule"
+                )
+            if self.moe_shortcut_connection:
+                raise ValueError("MOK does not support moe_shortcut_connection")
+            if self.transformer_impl == "inference_optimized":
+                raise ValueError("MOK does not support inference_optimized layers")
+            if self.delay_wgrad_compute:
+                raise ValueError("MOK does not support delay_wgrad_compute")
+            if self.overlap_dispatch_backward_with_experts_wgrad:
+                raise ValueError(
+                    "MOK does not support overlap_dispatch_backward_with_experts_wgrad; "
+                    "the megakernel never runs the native dispatch path"
+                )
+            if self.tensor_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
+                raise ValueError("MOK currently requires TP=1 and expert TP=1")
+            if self.gtp_weight_remat_size != 1 or self.expert_gtp_weight_remat_size != 1:
+                raise ValueError(
+                    "MOK does not support GTP weight rematerialization; the megakernel "
+                    "bypasses native expert weight-gather hooks"
+                )
+            if self.expert_model_parallel_size not in (1, 4, 8, 16, 32, 64):
+                raise ValueError("MOK requires EP in {1, 4, 8, 16, 32, 64}")
+            if self.moe_shared_expert_intermediate_size is None:
+                raise ValueError("MOK requires a shared expert")
+            if self.moe_shared_expert_overlap:
+                raise ValueError("MOK does not support MCore shared-expert overlap")
+            if self.moe_latent_size is not None:
+                # Native latent MoE projects only the routed branch; its shared expert
+                # stays in the original hidden space. MOK currently fuses both branches.
+                raise ValueError("MOK does not support latent MoE")
+            if self.recompute_modules and "shared_experts" in self.recompute_modules:
+                raise ValueError(
+                    "MOK does not support recompute_modules=['shared_experts']; shared-expert "
+                    "computation is fused into the megakernel. Use whole-MoE recompute "
+                    "instead."
+                )
+            if not self.gated_linear_unit or self.activation_func != F.silu:
+                raise ValueError("MOK currently requires SwiGLU")
 
         if self.moe_router_load_balancing_type == ["quantile_balancing"]:
             assert (
@@ -2963,7 +3371,13 @@ class TransformerConfig(ModelParallelConfig):
         if self.mhc_fused_backend != "auto" and not self.use_fused_mhc:
             raise ValueError("mhc_fused_backend requires use_fused_mhc=True when set explicitly.")
 
-        if self.enable_mhc_connections and self.recompute_granularity == "full":
+        # The gated-residual variant exists only on the hybrid path, whose full-recompute
+        # checkpointed_forward runs the mHC wrapper like any other layer.
+        if (
+            self.enable_mhc_connections
+            and self.recompute_granularity == "full"
+            and self.mhc_connection_variant != "gated_residual"
+        ):
             raise NotImplementedError(
                 "enable_mhc_connections is not yet compatible with full activation recompute. "
                 "Use selective recompute with 'mhc' in recompute_modules, or disable "
@@ -3013,6 +3427,104 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "mhc_init_gating_factor must be non-negative, got "
                     f"{self.mhc_init_gating_factor}."
+                )
+
+        # Validation for mhc_connection_variant
+        if self.mhc_connection_variant not in ("mhc", "gated_residual"):
+            raise ValueError(
+                f"mhc_connection_variant must be 'mhc' or 'gated_residual', got "
+                f"{self.mhc_connection_variant!r}."
+            )
+        if self.mhc_connection_variant != "mhc" and not self.enable_mhc_connections:
+            warnings.warn(
+                f"mhc_connection_variant={self.mhc_connection_variant!r} has no "
+                "effect without enable_mhc_connections=True.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if self.enable_mhc_connections and self.mhc_connection_variant == "gated_residual":
+            if not self.is_hybrid_model:
+                raise ValueError(
+                    "mhc_connection_variant='gated_residual' is only implemented for the "
+                    "HybridModel architecture (set is_hybrid_model=True / pass "
+                    "--hybrid-layer-pattern). The GPT decoder path builds its own static "
+                    "output contract and per-sublayer norms, which the gated-residual "
+                    "variant replaces; wiring it there would silently take the wrong branch."
+                )
+            if (
+                not isinstance(self.hc_lowrank, int)
+                or isinstance(self.hc_lowrank, bool)
+                or (self.hc_lowrank < 1)
+            ):
+                raise ValueError("hc_lowrank must be a positive integer for gated_residual.")
+            if self.transformer_impl != "transformer_engine":
+                raise ValueError(
+                    "mhc_connection_variant='gated_residual' requires "
+                    "transformer_impl='transformer_engine': the norm-free layer specs are "
+                    "only built for the TE backend."
+                )
+            if self.use_fused_mhc:
+                raise ValueError(
+                    "use_fused_mhc applies only to mhc_connection_variant='mhc'; the "
+                    "gated-residual variant uses its own native kernels."
+                )
+            # The variant's h_res slot is None (GatedResidualModule.produces_h_res). The
+            # hybrid hyper-connection wrapper's TE per-layer capture keys on produces_h_res
+            # and omits the slot from its partial-MoE graph outputs, so that capture is
+            # supported. The `local` implementation and full-iteration capture have not been
+            # validated against the 4-tuple contract.
+            if (
+                self.cuda_graph_impl not in ("none", "transformer_engine")
+                or self.enable_cuda_graph
+                or self.external_cuda_graph
+            ):
+                raise ValueError(
+                    "CUDA graphs with mhc_connection_variant='gated_residual' are "
+                    "supported only as cuda_graph_impl='transformer_engine' partial "
+                    f"capture, got cuda_graph_impl={self.cuda_graph_impl!r}"
+                    f"{', enable_cuda_graph' if self.enable_cuda_graph else ''}"
+                    f"{', external_cuda_graph' if self.external_cuda_graph else ''}. "
+                    "Whole-layer and full-iteration capture have not been validated "
+                    "against the 4-tuple contract."
+                )
+            if self.cuda_graph_impl == "transformer_engine":
+                # ``attn`` captures each attention-type hybrid layer as one whole-wrapper
+                # graph (aggregate + inner attention + n-stream BDA). The output is the
+                # n-stream hidden state only, so the 4-tuple's None h_res slot never becomes
+                # a graph output there.
+                _gr_graphable_scopes = {
+                    CudaGraphModule.attn,
+                    CudaGraphModule.moe,
+                    CudaGraphModule.moe_router,
+                    CudaGraphModule.moe_preprocess,
+                }
+                # cuda_graph_modules entries may still be plain strings here: this guard runs
+                # before the generic CUDA-graph normalization, and only arguments.py converts
+                # the CLI values to enum members. Compare on names so both forms work.
+                _gr_graphable_names = {m.name for m in _gr_graphable_scopes}
+                _gr_modules = self.cuda_graph_modules
+                if isinstance(_gr_modules, str):
+                    # "full" (the default) is the deprecated spelling of whole-layer capture.
+                    _gr_modules = [] if _gr_modules == "full" else _gr_modules.split(",")
+                elif isinstance(_gr_modules, CudaGraphModule):
+                    _gr_modules = [_gr_modules]
+                _gr_scopes = {getattr(m, "name", m) for m in (_gr_modules or [])}
+                if not _gr_scopes or not _gr_scopes <= _gr_graphable_names:
+                    raise ValueError(
+                        "CUDA graphs with mhc_connection_variant='gated_residual' are "
+                        "validated only for cuda_graph_modules restricted to attn and the "
+                        "MoE scopes (moe / moe_router / moe_preprocess); "
+                        f"got {sorted(_gr_scopes) or 'all layers'}. Whole-layer capture "
+                        "and the mlp / mamba scopes are untested for this variant."
+                    )
+            if self.tensor_model_parallel_size > 1 and not self.sequence_parallel:
+                warnings.warn(
+                    "mhc_connection_variant='gated_residual' with tensor parallelism "
+                    "but without sequence_parallel duplicates the gated-residual "
+                    "computation (~10% of forward FLOPs) on every TP rank. Enable "
+                    "sequence_parallel so each rank processes s/TP of the sequence.",
+                    UserWarning,
+                    stacklevel=2,
                 )
 
         if self.fine_grained_activation_offloading:
@@ -3809,6 +4321,75 @@ class TransformerConfig(ModelParallelConfig):
             "full_iteration",
         ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
 
+        # Needs the normalized cuda_graph_modules, so it lives here rather than with the other
+        # QSA checks. Packed (THD) inputs reach the captured layers through the sequence-packing
+        # scheduler or through the static THD capacity (thd_max_packed_sequences).
+        if (
+            self.qsa_attn_backend == "cudnn"
+            and self.qsa_cudnn_bwd_impl == "sparse_gqa"
+            and cuda_graph_uses_static_thd_inputs(self)
+            and cuda_graph_captures_attention(self)
+        ):
+            raise ValueError(
+                "qsa_cudnn_bwd_impl='sparse_gqa' runs one backward per packed document from "
+                "host-side boundaries and cannot be captured into a CUDA graph with packed (THD) "
+                "inputs. Use qsa_cudnn_bwd_impl='qsa_api', or drop attn from --cuda-graph-modules."
+            )
+
+        if self.thd_max_packed_sequences is not None:
+            # Either the dp_balanced scheduler bounds packing with this capacity, or the caller
+            # pads already-packed THD batches to it with pad_sequence_for_thd.
+            assert self.sequence_packing_scheduler in (None, "dp_balanced")
+            assert not self.dynamic_context_parallel
+            pad_enabled = self.pad_packed_seq_alignment is not None or (
+                self.fp8 is not None and self.fp8_recipe == Fp8Recipe.mxfp8
+            )
+            # The scheduler always reserves the dummy slot when padding is enabled. Post-pack
+            # padding appends a dummy only when the pack falls short of the padding target,
+            # so a capacity of one fits packs that already fill it.
+            assert self.thd_max_packed_sequences >= (
+                2 if pad_enabled and self.sequence_packing_scheduler is not None else 1
+            ), "THD metadata capacity must leave room for the dummy padding document."
+            if self.sequence_packing_scheduler is None and self.cuda_graph_impl != "none":
+                # The SFT packed path opts into static THD graph inputs with
+                # thd_max_packed_sequences (see cuda_graph_uses_static_thd_inputs); its token
+                # dimension is a graph input too, so it must be padded to the static capacity.
+                assert self.pad_packed_seq_alignment in ("max", self.max_seqlen_per_dp_cp_rank), (
+                    "THD CUDA Graph requires --pad-packed-seq-alignment='max' "
+                    "or --pad-packed-seq-alignment equal to max_seqlen_per_dp_cp_rank "
+                    f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
+                )
+        # 'extend_last' THD tail padding with context parallelism requires the
+        # global metadata to be extended before CP slicing, which only the
+        # sequence-packing scheduler path performs. Restrict this combination.
+        if (
+            self.sequence_packing_scheduler is None
+            and self.pad_packed_seq_alignment is not None
+            and (self.thd_tail_padding_policy or 'append_dummy_seq') == 'extend_last'
+            and (self.context_parallel_size > 1 or self.dynamic_context_parallel)
+        ):
+            raise ValueError(
+                "thd_tail_padding_policy='extend_last' with context parallelism is only "
+                "supported together with a sequence_packing_scheduler. Either enable a "
+                "sequence_packing_scheduler, or use thd_tail_padding_policy='append_dummy_seq'."
+            )
+        if self.cuda_graph_dynamic_microbatches:
+            assert self.cuda_graph_impl == "transformer_engine"
+            assert self.sequence_packing_scheduler == "dp_balanced"
+            assert not self.overlap_moe_expert_parallel_comm and not self.delay_wgrad_compute
+            assert not self.moe_paged_stash
+        if (
+            self.sequence_packing_scheduler is not None
+            and self.cuda_graph_impl == "transformer_engine"
+        ):
+            assert self.pad_packed_seq_alignment in ("max", self.max_seqlen_per_dp_cp_rank)
+            assert self.thd_max_packed_sequences is not None
+            assert self.pipeline_model_parallel_size == 1 or self.cuda_graph_dynamic_microbatches
+            assert self.cuda_graph_modules == [
+                CudaGraphModule.attn
+            ], "Scheduler-produced THD CUDA graphs currently support attention capture only."
+            assert is_te_min_version("2.18.0"), "Packed TE graphs require TE >= 2.18.0."
+
         self.inference_cuda_graph_scope = normalize_inference_cuda_graph_scope(
             self.inference_cuda_graph_scope, self.cuda_graph_impl
         )
@@ -3821,6 +4402,98 @@ class TransformerConfig(ModelParallelConfig):
         assert not (
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
+
+        if self.moe_megakernel_backend == "mok":
+            if self.cuda_graph_impl in ("local", "transformer_engine"):
+                # Empty modules mean whole-layer capture here, not full_iteration.
+                # Per-layer replay needs per-microbatch ownership or recomputation
+                # of MOK's saved schedule/activations; this bridge has no stash integration.
+                if not self.cuda_graph_modules:
+                    raise ValueError(
+                        "MOK does not support per-layer whole-layer CUDA Graph capture"
+                    )
+                # The megakernel (dispatch, routed and shared experts, combine) has
+                # data-dependent work and is never captured, so 'moe' stays rejected.
+                # 'moe_preprocess' captures the native dispatcher's preprocessing, which MOK
+                # replaces. 'moe_router' is accepted for the Transformer Engine
+                # implementation only: the graph then ends after the router and the
+                # static-shape route compaction ([tokens, topk], no host synchronization),
+                # and the megakernel runs eagerly on the graph outputs
+                # (MoELayer._megakernel_capture_outputs). The local implementation drives
+                # MoE partial capture through MoETransformerLayer's intermediate-tensor
+                # protocol, which the megakernel path does not implement.
+                rejected_scopes = [CudaGraphModule.moe, CudaGraphModule.moe_preprocess]
+                if self.cuda_graph_impl == "local":
+                    rejected_scopes.append(CudaGraphModule.moe_router)
+                if any(scope in self.cuda_graph_modules for scope in rejected_scopes):
+                    raise ValueError(
+                        "MOK supports only the moe_router MoE scope, and only with "
+                        "cuda_graph_impl='transformer_engine'; per-layer CUDA Graph scopes "
+                        "containing moe/moe_preprocess (or moe_router with "
+                        "cuda_graph_impl='local') are not supported"
+                    )
+                if (
+                    CudaGraphModule.moe_router in self.cuda_graph_modules
+                    and self.recompute_granularity == "selective"
+                    and {"moe", "layernorm"} & set(self.recompute_modules or [])
+                ):
+                    # Neither combination has been validated with the megakernel graph
+                    # outputs: 'moe' would put the captured router inside the MoE
+                    # checkpoint, and the 'layernorm' recompute registers its hook on every
+                    # graph output, including the integer expert indices.
+                    raise ValueError(
+                        "MOK with the moe_router CUDA Graph scope does not support "
+                        "recompute_modules 'moe' or 'layernorm'"
+                    )
+            elif self.cuda_graph_impl not in ("none", "full_iteration"):
+                raise ValueError(f"MOK does not support cuda_graph_impl={self.cuda_graph_impl!r}")
+        if self.cuda_graph_capture_engram_host:
+            if not self.engram_enabled:
+                raise ValueError("cuda_graph_capture_engram_host requires Engram to be enabled")
+            if (
+                self.cuda_graph_impl != "transformer_engine"
+                or CudaGraphModule.attn not in self.cuda_graph_modules
+            ):
+                raise ValueError(
+                    "cuda_graph_capture_engram_host requires cuda_graph_impl="
+                    "'transformer_engine' with the 'attn' scope in cuda_graph_modules"
+                )
+            if not self.enable_mhc_connections:
+                # Only HyperConnectionHybridLayer moves the Engram lookup in front of the
+                # graph; plain TransformerLayer hosts would silently stay eager.
+                raise ValueError(
+                    "cuda_graph_capture_engram_host is implemented by the hybrid "
+                    "hyper-connection wrapper and requires enable_mhc_connections=True"
+                )
+            if self.recompute_granularity == "full" or (
+                self.recompute_granularity == "selective"
+                and "mhc" in (self.recompute_modules or [])
+            ):
+                # Not validated: these recompute modes re-run layers through their own
+                # schedule, and must replay the eager Engram lookup consistently.
+                raise ValueError(
+                    "cuda_graph_capture_engram_host does not support full recompute or the "
+                    "mhc selective recompute"
+                )
+        # local per-layer capture: CheckpointWithoutOutput.checkpoint() bypasses only under
+        # is_graph_warmup(), not is_graph_capturing(), so the local implementation records the
+        # mHC checkpoint bodies and their registration into the layer graph. Replays run no
+        # Python, so nothing re-registers while the group-end discard still runs eagerly --
+        # and the local backward graph captures torch.autograd.grad, so a recompute hook
+        # recorded there fires under stream capture, where the RNG rewind either raises or
+        # silently replays a different dropout mask. A captured checkpoint recovers no memory
+        # either way, so this combination has no upside to preserve.
+        if (
+            self.recompute_granularity == "selective"
+            and "mhc" in (self.recompute_modules or [])
+            and self.cuda_graph_impl == "local"
+        ):
+            raise ValueError(
+                "mHC recompute is not supported with cuda_graph_impl='local': the local "
+                "per-layer capture records the mHC checkpoints and their recompute hooks into "
+                "the layer graphs, where the backward-time RNG rewind cannot run. Use "
+                "cuda_graph_impl='transformer_engine', or disable CUDA graphs."
+            )
 
         assert not (
             self.moe_shortcut_connection
@@ -4574,6 +5247,27 @@ class TransformerConfig(ModelParallelConfig):
                     "Disable MoE capacity/expert padding."
                 )
 
+        # cudnn-frontend caches one execution graph (and its buffers) per input shape for
+        # the whole process, and that state does not reliably survive a released CUDA graph:
+        # after a captured GDN layer is freed, the next GDR call with the same shapes can
+        # fault with an illegal memory access. It reproduces deterministically when the
+        # first call for a shape happens inside graph construction (Transformer Engine's
+        # capture warmup or the capture itself), and intermittently even after an eager
+        # call. Training is safe as long as the cache entries are built in eager iterations
+        # before capture (cuda_graph_warmup_steps > 0) and the graphs live for the whole run;
+        # releasing and re-capturing graphs in one process is not supported with cuDNN GDR.
+        # Needs the normalized cuda_graph_modules, so it lives here.
+        if (
+            self.gdn_kernel_backend == "cudnn"
+            and cuda_graph_captures_attention(self)
+            and self.cuda_graph_warmup_steps <= 0
+        ):
+            raise ValueError(
+                "gdn_kernel_backend='cudnn' with attention CUDA-graph capture requires "
+                "cuda_graph_warmup_steps > 0, so cuDNN's per-shape GDR graphs are built in "
+                "eager iterations rather than during capture."
+            )
+
         # Scheduler-value, max-seqlen, and variable_seq_lengths handling live in
         # ModelParallelConfig.__post_init__ next to the field definitions; only the
         # transformer-stack requirements are validated here.
@@ -4604,7 +5298,8 @@ class TransformerConfig(ModelParallelConfig):
                     f"got '{self.moe_token_dispatcher_type}'"
                 )
                 if (
-                    self.moe_token_dispatcher_type == "flex"
+                    self.moe_megakernel_backend is None
+                    and self.moe_token_dispatcher_type == "flex"
                     and self.moe_flex_dispatcher_backend == "hybridep"
                     and not self.moe_hybridep_pad_uneven_dispatch_inputs
                 ):

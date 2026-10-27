@@ -194,6 +194,12 @@ class HyperConnectionModule(MegatronModule):
         layer_number: Current layer index for initialization
     """
 
+    produces_h_res: bool = True
+    """Whether ``forward``'s ``h_res`` slot carries a tensor. mHC mixes streams through a
+    Sinkhorn-projected H_res, so it does. Call sites that have to decide whether the slot is a
+    real value read this rather than testing the variant name; see
+    :class:`~megatron.core.transformer.gated_residual.GatedResidualModule`."""
+
     def __init__(self, config: TransformerConfig, layer_number: int):
         super().__init__(config)
         self.config = config

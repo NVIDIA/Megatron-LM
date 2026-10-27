@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 import logging
 import warnings
@@ -125,12 +125,44 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
 
     if config.decoupled_lr is not None:
         decoupled_lr_config: ParamGroupOverride = {"max_lr": config.decoupled_lr}
-        decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")
+        # Engram tables are embedding parameters but carry their own LR override; matching both
+        # here would make combine_param_group_overrides raise on a conflicting max_lr. Without
+        # Engram parameters this predicate is exactly the previous attribute match.
+        embedding_or_output_not_engram = ParamWithNamePredicate(
+            name="embedding_or_output_not_engram",
+            fn=lambda param, _: getattr(param, "is_embedding_or_output_parameter", False)
+            and not getattr(param, "is_engram_embedding", False),
+        )
+        decoupled_param_key = ParamKey(with_name_predicate=embedding_or_output_not_engram)
         if config.decoupled_min_lr is not None:
             decoupled_lr_config["min_lr"] = config.decoupled_min_lr
         config_overrides[decoupled_param_key] = decoupled_lr_config
 
     return config_overrides
+
+
+def get_engram_config_overrides(
+    config: OptimizerConfig, lr_multiplier: float = 5.0, weight_decay: float = 0.0
+) -> Dict[ParamKey, ParamGroupOverride]:
+    """Give EP-sharded Engram table weights their own LR schedule and weight decay.
+
+    The optimizer itself is not overridden: the tables are flagged
+    ``is_embedding_or_output_parameter``, so an emerging base optimizer such as Muon already
+    routes them to Adam through its own registered default_param_overrides.
+    """
+    if config.lr is None:
+        raise ValueError("Engram optimizer configuration requires a base maximum LR.")
+    if lr_multiplier <= 0:
+        raise ValueError("Engram embedding LR multiplier must be positive.")
+    if weight_decay < 0:
+        raise ValueError("Engram embedding weight decay must be nonnegative.")
+
+    override = ParamGroupOverride(
+        max_lr=config.lr * lr_multiplier, start_wd=weight_decay, end_wd=weight_decay, wd_mult=1.0
+    )
+    if config.min_lr is not None:
+        override["min_lr"] = config.min_lr * lr_multiplier
+    return {ParamKey(attr="is_engram_embedding"): override}
 
 
 def get_mup_config_overrides(
@@ -862,14 +894,20 @@ def _get_megatron_emerging_optimizer(
     )
     distopt_process_groups = None
     distopt_per_model_buffers = None
+    distopt_per_model_expert_buffers = None
     use_separate_distributed_optimizer = ddp_uses_distributed_optimizer and use_layer_wise
     if use_separate_distributed_optimizer:
         ddp_config = model_chunks[0].ddp_config
         assert ddp_config.num_distributed_optimizer_instances == 1, (
             "Layer-wise + DistributedOptimizer split path does not yet support "
             "num_distributed_optimizer_instances > 1: distributed_optimizer_instance_id "
-            "is hardcoded to 0 in this path. Disable use_layer_wise_param_layout to "
-            "fall back to the legacy LayerWise ping-pong path."
+            "is hardcoded to 0 in this path. Drop --use-distributed-optimizer to fall "
+            "back to the legacy LayerWise ping-pong path (that flag, not "
+            "use_layer_wise_param_layout, is what selects this path for an emerging "
+            "optimizer: see arguments.py, which turns it into "
+            "use_layer_wise_distributed_optimizer, and wrap_model_chunks_with_ddp, which "
+            "then forces ddp_config.use_distributed_optimizer=True regardless of the "
+            "layout flag)."
         )
     if use_separate_distributed_optimizer and any(
         # A separate DistributedOptimizer with byte-level sharding handles any group
@@ -888,18 +926,24 @@ def _get_megatron_emerging_optimizer(
         # DistOpt should only manage non-LayerWise buffers (those holding
         # embeddings, biases, layernorm, etc.). Filter out the LayerWise
         # shard-aligned buffers that the LayerWiseDistributedOptimizer owns.
+        # Dense and expert-parallel params live in different DDP buffer lists and
+        # shard over different DP groups, so keep them apart here too -- see the
+        # per-partition loop below.
         distopt_per_model_buffers = {}
+        distopt_per_model_expert_buffers = {}
         for model_chunk_idx, model_chunk in enumerate(model_chunks):
-            if not hasattr(model_chunk, 'buffers'):
-                continue
-            non_layer_wise_buffers = [
-                buffer
-                for buffer in model_chunk.buffers
-                if buffer.params
-                and not getattr(buffer.params[0], 'is_managed_by_layer_wise_optimizer', False)
-            ]
-            if non_layer_wise_buffers:
-                distopt_per_model_buffers[model_chunk_idx] = non_layer_wise_buffers
+            for buffer_attr, dest in (
+                ('buffers', distopt_per_model_buffers),
+                ('expert_parallel_buffers', distopt_per_model_expert_buffers),
+            ):
+                non_layer_wise_buffers = [
+                    buffer
+                    for buffer in getattr(model_chunk, buffer_attr, [])
+                    if buffer.params
+                    and not getattr(buffer.params[0], 'is_managed_by_layer_wise_optimizer', False)
+                ]
+                if non_layer_wise_buffers:
+                    dest[model_chunk_idx] = non_layer_wise_buffers
 
     # Build an optimizer for each (optimizer_name, is_expert) bucket and combine.
     # In layer-wise mode, emerging-optimizer (Muon) groups feed into LayerWise,
@@ -945,36 +989,64 @@ def _get_megatron_emerging_optimizer(
             if use_separate_distributed_optimizer:
                 # Route non-emerging params (adam/lion) through a real DistributedOptimizer
                 # (byte-level sharding) instead of stuffing them inside LayerWise.
-                for group in groups:
-                    assert not group['is_expert_parallel'], (
-                        "Non-emerging expert-parallel param groups are not yet "
-                        "supported on the layer-wise + DistributedOptimizer "
-                        "path: they need a separate DistOpt instance with the "
-                        "expert-DP process group, which is not wired up yet. "
-                        "Disable use_layer_wise_param_layout to fall back to "
-                        "the legacy LayerWise ping-pong path for MoE models."
-                    )
+                #
+                # Dense and expert-parallel params shard over different data-parallel groups
+                # and live in different DDP buffer lists, so they need one DistOpt instance
+                # each -- the same split the standard (non-layer-wise) path makes further
+                # down in ``get_megatron_optimizer``. An expert-parallel non-Muon group is
+                # not exotic: a hashed n-gram/PLE memory is EP-sharded (``allreduce=False``)
+                # *and* tagged ``is_embedding_or_output_parameter``, so it is expert-parallel
+                # and Adam-managed at the same time.
+                #
+                # The partition is made here rather than in the ``grouped_param_groups`` key
+                # above on purpose: that key also buckets the emerging optimizer's own groups,
+                # so splitting it there would move parameters between Muon's buckets.
                 fallback_config.use_distributed_optimizer = True
-                result = _get_megatron_optimizer_based_on_param_groups(
-                    config=fallback_config,
-                    model_chunks=model_chunks,
-                    param_groups=groups,
-                    per_model_buffers=distopt_per_model_buffers,
-                    model_parallel_group=distopt_process_groups['mp_group'],
-                    data_parallel_group=distopt_process_groups['intra_dp_cp_group'],
-                    data_parallel_group_gloo=distopt_process_groups['intra_dp_cp_group_gloo'],
-                    data_parallel_group_idx=get_pg_rank(distopt_process_groups['mp_group']),
-                    intra_dist_opt_group=distopt_process_groups['intra_dist_opt_group'],
-                    distributed_optimizer_instance_id=0,
-                    pg_collection=pg_collection,
-                    skip_megatron_wrapping=False,
+                partitions = (
+                    (
+                        [g for g in groups if not g['is_expert_parallel']],
+                        distopt_per_model_buffers,
+                        distopt_process_groups['mp_group'],
+                        distopt_process_groups['intra_dp_cp_group'],
+                        distopt_process_groups['intra_dp_cp_group_gloo'],
+                    ),
+                    (
+                        [g for g in groups if g['is_expert_parallel']],
+                        distopt_per_model_expert_buffers,
+                        distopt_process_groups['expt_tp_pp_group'],
+                        distopt_process_groups['intra_expt_dp_group'],
+                        distopt_process_groups['intra_expt_dp_group_gloo'],
+                    ),
                 )
-                # TODO(deyuf): ChainedOptimizer currently asserts all sub-optimizers
-                # share the same config. Reset to the top-level config so the
-                # assertion holds when DistOpt+LayerWise are chained.
-                if hasattr(result, 'config'):
-                    result.config = config
-                results.append(result)
+                for sub_groups, sub_buffers, sub_mp, sub_dp, sub_dp_gloo in partitions:
+                    if not sub_groups:
+                        continue
+                    assert sub_buffers, (
+                        "A non-emerging param group needs a DDP buffer that the layer-wise "
+                        "optimizer does not own, but none was found. This means DDP placed "
+                        "these params in a LayerWise-managed buffer; check the "
+                        "``is_managed_by_layer_wise_optimizer`` tagging."
+                    )
+                    result = _get_megatron_optimizer_based_on_param_groups(
+                        config=fallback_config,
+                        model_chunks=model_chunks,
+                        param_groups=sub_groups,
+                        per_model_buffers=sub_buffers,
+                        model_parallel_group=sub_mp,
+                        data_parallel_group=sub_dp,
+                        data_parallel_group_gloo=sub_dp_gloo,
+                        data_parallel_group_idx=get_pg_rank(sub_mp),
+                        intra_dist_opt_group=distopt_process_groups['intra_dist_opt_group'],
+                        distributed_optimizer_instance_id=0,
+                        pg_collection=pg_collection,
+                        skip_megatron_wrapping=False,
+                    )
+                    # TODO(deyuf): ChainedOptimizer currently asserts all sub-optimizers
+                    # share the same config. Reset to the top-level config so the
+                    # assertion holds when DistOpt+LayerWise are chained.
+                    if hasattr(result, 'config'):
+                        result.config = config
+                    results.append(result)
             else:
                 # Legacy ping-pong layer-wise path (use_layer_wise=True) or the
                 # non-layer-wise standard chain: keep ``use_distributed_optimizer``
@@ -1034,6 +1106,49 @@ def _clear_high_precision_initializers(model_chunks: List[MegatronModule]) -> No
                 clearer_fn()
 
 
+def _log_layer_wise_routing(model_chunks, config) -> None:
+    """Summarize which parameters the matrix optimizer (e.g. Muon) will own.
+
+    Emitted once, on rank 0, whenever a non-Adam/SGD optimizer is selected. The routing rule
+    (:func:`is_managed_by_layer_wise_optimizer`) is "2-D and not tagged
+    ``is_embedding_or_output_parameter``", which is easy to get silently wrong for a new module:
+    an untagged 2-D table would be handed to Newton-Schulz orthogonalization, which is both
+    meaningless for an embedding and very expensive. Printing the split makes that visible at
+    startup instead of in a loss curve.
+    """
+    from megatron.core.optimizer.layer_wise_optimizer import is_managed_by_layer_wise_optimizer
+
+    matrix_n = matrix_e = other_n = other_e = 0
+    suspicious = []
+    for chunk in model_chunks:
+        for name, param in chunk.named_parameters():
+            if not param.requires_grad:
+                continue
+            if is_managed_by_layer_wise_optimizer(param):
+                matrix_n += 1
+                matrix_e += param.numel()
+                # An embedding-shaped table reaching the matrix optimizer is a tagging bug.
+                if getattr(param, 'is_engram_embedding', False) or 'embedding' in name.lower():
+                    suspicious.append((name, tuple(param.shape)))
+            else:
+                other_n += 1
+                other_e += param.numel()
+    log_single_rank(
+        logger,
+        logging.INFO,
+        f"[optimizer routing] optimizer={config.optimizer!r}: "
+        f"matrix/layer-wise group {matrix_n} params ({matrix_e/1e6:.1f} M elems), "
+        f"scalar/embedding group {other_n} params ({other_e/1e6:.1f} M elems)",
+    )
+    if suspicious:
+        warnings.warn(
+            "Embedding-like parameters were routed to the matrix (Newton-Schulz) optimizer: "
+            f"{suspicious[:8]}. They are missing is_embedding_or_output_parameter.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+
 def get_megatron_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -1089,6 +1204,7 @@ def get_megatron_optimizer(
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
     if config.optimizer not in ('adam', 'sgd'):
+        _log_layer_wise_routing(model_chunks, config)
         optimizer = _get_megatron_emerging_optimizer(
             config=config,
             model_chunks=model_chunks,

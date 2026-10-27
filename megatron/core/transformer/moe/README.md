@@ -589,6 +589,78 @@ FP8 training provides benefits across all three performance walls:
 
 > **Note**: For blockwise and MXFP8 recipes with current scaling, training loss curves show negligible difference compared to BF16 baselines.
 
+### MoE Megakernel Backends
+
+#### MOK
+
+A megakernel backend replaces the native post-router dispatch, expert-compute, and combine path.
+Select MOK for a SwiGLU model with the following YAML configuration:
+
+```yaml
+bf16: true
+add_bias_linear: false
+moe_grouped_gemm: true
+moe_ffn_hidden_size: 3072
+gradient_accumulation_fusion: true
+moe_shared_expert_intermediate_size: 3072
+moe_megakernel_backend: mok
+moe_megakernel_backend_config:
+  fwd_num_comm_sms: 40
+  bwd_num_comm_sms: 28
+```
+
+The equivalent backend-specific CLI value is a JSON object:
+
+```bash
+--moe-megakernel-backend mok --moe-megakernel-backend-config '{"fwd_num_comm_sms": 40, "bwd_num_comm_sms": 28}'
+```
+
+MOK is an optional dependency, imported only when the backend is selected. The ARM64 development
+image already installs the supported
+[MCore integration snapshot](https://github.com/QiZhangNV/mixture-of-kittens/tree/7a8cfb7fdd96a1cfba506caf4756c6c86073399a)
+through `docker/common/install_mok.sh`. Use that image or its installation helper to retain the
+supported dependency and Blackwell build targets. The AMD64 image skips MOK because its H100
+target is unsupported.
+
+| Area | Current MOK support |
+|------|---------------------|
+| GPU architecture | NVIDIA Blackwell SM100/SM103; upstream integration validated on GB300 |
+| Routed precision | BF16, or MXFP8 with `fp8_param=True` and native TE rowwise/columnwise payloads and scales |
+| Shared experts | Required; BF16; same intermediate size as routed experts; optional BF16 sigmoid output gate via `moe_shared_expert_gate` |
+| Activation | SwiGLU, without a linear offset or tanh clamp |
+| Routed weight layout | Per-expert non-single weights, or single-grouped weights with `moe_use_grouped_tensor=True` and Transformer Engine 2.14+ |
+| Parallelism | TP=1, expert TP=1, EP in {1, 4, 8, 16, 32, 64}; each EP group must fit within one NVLink domain supporting PyTorch symmetric memory and multicast |
+| Shapes | Hidden and expert intermediate sizes divisible by 256; at least 512 local tokens per rank, divisible by 256; identical token, hidden, and top-k shapes across EP ranks |
+| Recomputation | Whole-MoE activation recompute |
+| CUDA Graph | Full-iteration capture |
+| Checkpointing | Save/resume with unchanged backend, weight layout, and parallel configuration |
+
+Wgrad GEMMs accumulate in FP32. The destination `main_grad` dtype selects the reduction-store
+precision: FP32 retains FP32 contributions, while BF16 rounds each contribution before adding it
+to the BF16 gradient buffer. This is independent of the BF16 shared-expert weight dtype.
+The pinned MOK entrypoint requires shared and routed expert main-grad buffers to use the same dtype.
+The optional shared output gate aliases the native shared-expert parameter and accumulates into
+its FP32 or BF16 `main_grad`. It supports Qwen3.5's gated shared-expert MoE without changing native
+parameter ownership or checkpoint keys; the GDN and attention layers retain their existing paths.
+
+With `reuse_grad_buf_for_mxfp8_param_ag`, MCore completes parameter all-gather, requantizes into
+native TE storage, and clears the staging buffer before MOK runs. Single-grouped MXFP8 parameters
+require this mode in the current MCore buffer implementation. MOK aliases the native payloads
+and refreshes its converted scale buffers once per optimizer iteration. The adapter requires
+both native weight layouts; TE's `post_all_gather_processing` is not an MXFP8 capability check.
+
+Per-layer whole-layer capture is distinct from `cuda_graph_impl=full_iteration`. Supporting
+per-layer MOK replay needs saved-state stashing or a recompute path for pending microbatches;
+static input token counts alone do not establish that lifecycle.
+
+The current backend requires grouped experts and fused gradient accumulation. It does not support
+linear biases, applying router probabilities to expert inputs, MCore EP 1F1B overlap or delayed
+wgrad, native shared-expert overlap, shared-expert-only
+recompute, latent MoE, GTP weight rematerialization, shortcut MoE, inference-optimized layers,
+partial MoE CUDA Graph replay, MCore expert-input
+capacity padding, FC1 GLU-interleaved weights, or checkpoint conversion between physical weight
+layouts.
+
 
 ### GLU Checkpoint Layout
 
