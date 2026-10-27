@@ -734,13 +734,16 @@ A weight can be kept **out** of a chain by setting `weight.prefetch_initialized 
 
 #### Explicit chain registration
 
-`register_prefetch_chain(name, weights)` separates **which weights are sharded** from
-**which weights prefetch one another**. Apply the sharding policy and parameter wrappers
-first; register only the resulting GTP weights before `classify_gtp_remat_chains` and
-warmup. That existing entry point now registers defaults and finalizes capture scopes;
-its name is retained for compatibility. Registration never turns on sharding for an
-excluded or optional weight. Standard training needs no user registration calls; the
-following example shows how an integration can explicitly choose chain membership.
+**One API selects which GTP-sharded weights prefetch one another:**
+`register_prefetch_chain(name, weights)`. See the
+[registration overview (PDF)](figures/gtp_prefetch_chain_api.pdf).
+
+**Production defaults require no user calls.** After DDP wrapping,
+`classify_gtp_remat_chains` registers dense, grouped-expert FC1, and grouped-expert FC2
+chains per process group, preserving explicit overrides and skipping replicated weights.
+Both Mamba projections stay in the dense chain.
+
+For a custom chain, register after parameter wrapping and before classification/warmup:
 
 ```python
 from megatron.core.tensor_parallel.gtp_api import (
@@ -749,41 +752,23 @@ from megatron.core.tensor_parallel.gtp_api import (
     register_prefetch_chain,
 )
 
-# Candidate collections come from the model integration. Excluded weights stay replicated.
-register_prefetch_chain("dense", [w for w in dense_candidates if is_gtp_param(w)])
-register_prefetch_chain("expert_fc1", [op.weight0 for op in expert_fc1_ops
-                                       if is_gtp_param(op.weight0)])
-register_prefetch_chain("expert_fc2", [op.weight0 for op in expert_fc2_ops
-                                       if is_gtp_param(op.weight0)])
+# attention_candidates is supplied by the model integration; skip unsharded weights.
+register_prefetch_chain("attention", [w for w in attention_candidates if is_gtp_param(w)])
 classify_gtp_remat_chains(model, cuda_graph_impl="full_iteration")
 ```
 
-For a grouped projection, `weight0` represents its existing local-expert weight group;
-registration includes the entire group without changing collective coalescing. Empty
-selections are allowed. Replicated weights, conflicting membership, mixed dense/grouped
-consumers, and mixed process groups are rejected. Registration after classification or
-warmup is rejected. Use distinct names for independent schedules; a shared weight can
-belong to only one logical chain.
+- **Membership and order:** warmup learns execution links; registration order does not
+  set prefetch order. Recompute-forward can visit a subset in a different order, within
+  the same registered chain boundaries.
+- **Grouped experts:** pass `weight0` to include the entire local-expert projection.
+  Coalescing is preserved. Empty selections are valid; conflicting assignments,
+  replicated weights, mixed dense/grouped weights, and mixed process groups are rejected.
+- **Runtime mapping:** classification splits captured/eager scopes. Chains can share
+  communication streams but maintain separate temporary weight buffers; more chains
+  can increase memory use.
 
-Registration specifies **membership, not list order**. The existing warmup observes
-forward order, backward uses the corresponding reverse links, and recompute-forward
-builds its own links. Existing repeated-consumer handling and readiness events remain
-unchanged. Production model initialization calls `classify_gtp_remat_chains` after
-DDP wrapping. It uses this API to register all remaining GTP weights into dense,
-grouped-expert FC1, and grouped-expert FC2 chains, separately per process group,
-then finalizes CUDA-graph scopes. Mamba input/output projections stay together in
-the dense chain. Explicit registrations override these defaults; replicated weights
-are skipped, so exclusions and disabled opt-ins never enter a chain. Recompute-forward
-inherits this membership and learns its own consumption order.
-
-Logical chains do not imply separate streams. Registered dense chains share the default
-dense streams, and registered grouped chains share the expert streams, each keyed by
-process group and capture state. The existing capture-scope classifier still splits a
-logical chain at eager/captured boundaries; registration does not declare new graph
-scopes for custom modules. Independent chains retain separate gathered-buffer ownership,
-so adding chains can increase live materialization memory. Registration does not add
-DistributedWeight support to operators that lack it. Register the same schedule on all
-participating ranks.
+Use the same registration on every participating rank. The API requires existing
+GTP operator integration; it does not enable sharding or add support to new operators.
 
 #### Grouped-expert chains (one-block-ahead)
 
