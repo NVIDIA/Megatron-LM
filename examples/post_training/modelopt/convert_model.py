@@ -14,9 +14,9 @@ import modelopt.torch.speculative as mtsp
 import torch
 from modelopt.torch.export import import_mcore_gpt_from_hf
 
-from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.parallel_state import destroy_model_parallel
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
@@ -78,9 +78,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     """Build the model."""
     args = get_args()
     args.model_type = model_type
-    pre_process = mpu.is_pipeline_first_stage()
-    post_process = mpu.is_pipeline_last_stage()
+    # initialize_megatron built the parallel grid. Collect its process groups once; they place
+    # the model on its pipeline stage and the model takes them explicitly.
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    pre_process = is_pp_first_stage(pg_collection.pp)
+    post_process = is_pp_last_stage(pg_collection.pp)
 
     if args.init_model_with_meta_device:
         with torch.device("meta"):
