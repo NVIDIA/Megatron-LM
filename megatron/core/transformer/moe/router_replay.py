@@ -391,9 +391,23 @@ class ChunkedRouterReplay:
             # set_target_indices appended the target as this micro-batch's entry.
             if chunks_recompute and backward_list and backward_list[-1] is target:
                 backward_list.pop()
+            self._check_num_rows(target)
             self.indices = self._pad(target, pad_tokens)
         elif self.action == RouterReplayAction.REPLAY_BACKWARD and self.replay.replay_backward_list:
-            self.indices = self._pad(self.replay.replay_backward_list.pop(0), pad_tokens)
+            entry = self.replay.replay_backward_list.pop(0)
+            self._check_num_rows(entry)
+            self.indices = self._pad(entry, pad_tokens)
+
+    def _check_num_rows(self, indices: Optional[torch.Tensor]) -> None:
+        """Require one replay row per real (non-dummy) token, as the unchunked gather does.
+
+        Slicing per chunk would otherwise ignore extra rows without an error.
+        """
+        if indices is not None and indices.shape[0] != self.real_tokens:
+            raise ValueError(
+                f"Routing replay indices have {indices.shape[0]} rows, but this MoE layer routes "
+                f"{self.real_tokens} tokens."
+            )
 
     @staticmethod
     def _pad(indices: Optional[torch.Tensor], pad_tokens: int) -> Optional[torch.Tensor]:

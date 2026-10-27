@@ -285,3 +285,24 @@ def test_quantile_balancing_rejects_padded_chunks():
     # A sequence of at least num_chunks tokens needs no padding and runs as before.
     _run_in_chunks(mlp, torch.randn(8, 2, H), None, 4)
     assert len(mlp.calls) == 4
+
+
+@pytest.mark.parametrize(
+    "action", [RouterReplayAction.REPLAY_FORWARD, RouterReplayAction.REPLAY_BACKWARD]
+)
+def test_replay_indices_must_match_the_token_count(action):
+    """Extra or missing rows raise, as the unchunked gather does, instead of being sliced off."""
+    rr = RouterReplay()
+    rr.set_router_replay_action(action)
+    for rows in (10, 6):
+        rr.clear_indices()
+        rr.set_target_indices(torch.randint(0, E, (rows, K)))
+        with pytest.raises(ValueError, match=f"have {rows} rows, but this MoE layer routes 8"):
+            ChunkedRouterReplay(rr, [4, 4])
+    rr.clear_indices()
+    rr.set_target_indices(torch.randint(0, E, (8, K)))
+    assert ChunkedRouterReplay(rr, [4, 4]).chunk_indices(1).shape == (4, K)
+    # Dummy tokens are not counted: 6 real tokens padded with 2.
+    rr.clear_indices()
+    rr.set_target_indices(torch.randint(0, E, (6, K)))
+    assert ChunkedRouterReplay(rr, [4, 4], pad_tokens=2).chunk_indices(1).shape == (4, K)
