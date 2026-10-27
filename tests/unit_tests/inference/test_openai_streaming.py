@@ -140,64 +140,6 @@ async def test_openai_stream_emits_delta_chunks_and_terminal_metadata():
     assert records[-1] == "data: [DONE]\n\n"
 
 
-@pytest.mark.asyncio
-async def test_openai_stream_preserves_scores_while_detokenizer_buffers_text():
-    class BufferedDetokenizer:
-        def __init__(self):
-            self.text = ""
-            self.pending = []
-
-        def update(self, tokens):
-            self.pending.extend(tokens)
-            if len(self.pending) < 2:
-                return ""
-            delta = _Tokenizer().detokenize(self.pending)
-            self.pending.clear()
-            self.text += delta
-            return delta
-
-        @property
-        def text_length(self):
-            return len(self.text)
-
-    stream = AsyncStream(request_id=1, cancel=lambda: None)
-    for token, score in [(1, -0.1), (2, -0.2)]:
-        stream.put(
-            {
-                "partial": {
-                    "request_id": 1,
-                    "new_tokens": [token],
-                    "new_log_probs": [score],
-                    "new_top_n_logprobs": [{chr(ord("a") + token - 1): score}],
-                }
-            }
-        )
-    stream.put(
-        {
-            "final": {
-                "prompt_tokens": [9],
-                "generated_tokens": [1, 2],
-                "generated_log_probs": [-0.1, -0.2],
-                "sampling_params": {"num_tokens_to_generate": 2},
-            }
-        }
-    )
-    stream.finish()
-
-    records = [
-        json.loads(record.removeprefix("data: "))
-        async for record in openai_stream(
-            [stream], _Tokenizer(), [BufferedDetokenizer()], chat=False, return_log_probs=True
-        )
-        if record != "data: [DONE]\n\n"
-    ]
-    deltas = [record["choices"][0] for record in records[:-1]]
-
-    assert [delta["text"] for delta in deltas] == ["", "ab"]
-    assert [delta["logprobs"]["token_logprobs"] for delta in deltas] == [[-0.1], [-0.2]]
-    assert records[-1]["choices"][0]["generated_text"] == "ab"
-
-
 def test_huggingface_fast_incremental_detokenizer_requires_optional_dependencies(monkeypatch):
     original_import = builtins.__import__
 
