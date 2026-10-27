@@ -200,8 +200,8 @@ def test_grouped_full_iteration_replay(expert_group, monkeypatch, mxfp8, registe
     if registered:
         for role in ("linear_fc1", "linear_fc2"):
             gtp.register_prefetch_chain(role, [getattr(b.mlp.experts, role).weight0 for b in model])
-    gtp.set_cuda_graph_modules([], cuda_graph_impl="full_iteration")
-    gtp.classify_gtp_chains(model)
+    gtp.classify_gtp_remat_chains(model, cuda_graph_impl="full_iteration")
+    assert all(hasattr(p, "_gtp_prefetch_chain_name") for p in model.parameters())
     params = _initialize_grads(model)
     assert len(params) == 16
     if mxfp8:
@@ -320,8 +320,7 @@ def test_grouped_local_graph_replay(expert_group, registered):
             gtp.register_prefetch_chain(
                 role, [getattr(b.unit.mlp.experts, role).weight0 for b in model]
             )
-    gtp.set_cuda_graph_modules(["moe"], cuda_graph_impl="local")
-    gtp.classify_gtp_chains(model)
+    gtp.classify_gtp_remat_chains(model, cuda_graph_modules=["moe"], cuda_graph_impl="local")
     params = _initialize_grads(model)
     inputs = [torch.randn(64, 128, device="cuda", dtype=torch.bfloat16) for _ in range(6)]
     initial = [p.detach().clone() for p in params]

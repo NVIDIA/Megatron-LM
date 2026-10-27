@@ -43,7 +43,8 @@ def test_empty_selection_and_replicated_weight_rejection():
         register_prefetch_chain("dense", [weight, replicated])
     assert not hasattr(weight, "_gtp_prefetch_chain_name")
     gtp.classify_gtp_remat_chains(_model(sharded=weight, replicated=replicated))
-    assert weight.chain_id == gtp.GTPChain.UNGRAPHED.value
+    assert weight._gtp_prefetch_chain_name == "default_dense"
+    assert not gtp._chain_is_graphed(weight.chain_id)
     assert not hasattr(replicated, "chain_id")
 
 
@@ -194,3 +195,62 @@ def test_registered_chain_buffers_do_not_alias():
         assert first._get_cache_key(
             torch.bfloat16, True, False, recompute
         ) != second._get_cache_key(torch.bfloat16, True, False, recompute)
+
+
+@pytest.mark.parametrize("impl,scope", [("none", []), ("local", ["mamba"]), ("full_iteration", [])])
+def test_model_initialization_registers_defaults_and_preserves_overrides(monkeypatch, impl, scope):
+    """Exercise the training entry point, not a separate test-only registration path."""
+    dense_group, expert_group = object(), object()
+    mamba_fc1, mamba_fc2 = _weight(dense_group), _weight(dense_group)
+    optional_enabled, custom = _weight(dense_group), _weight(dense_group)
+    replicated = torch.nn.Parameter(torch.zeros(4, device="cuda"))
+    fc1 = [_weight(expert_group, True) for _ in range(2)]
+    fc2 = [_weight(expert_group, True) for _ in range(2)]
+    fc1[0].weight_list, fc2[0].weight_list = fc1, fc2
+    register_prefetch_chain("custom", [custom])
+    calls = []
+    original = gtp.register_prefetch_chain
+
+    def record(name, weights):
+        calls.append(name)
+        return original(name, weights)
+
+    monkeypatch.setattr(gtp, "register_prefetch_chain", record)
+    # Two chunks/wrappers: grouping must span the complete model, not reset per chunk.
+    models = [
+        _model(
+            **{
+                "module.decoder.layers.0.mixer.in_proj.weight": mamba_fc1,
+                "module.decoder.layers.0.mixer.out_proj.weight": mamba_fc2,
+                "module.decoder.layers.0.mlp.experts.linear_fc1.weight0": fc1[0],
+                "module.decoder.layers.0.mlp.experts.linear_fc1.weight1": fc1[1],
+                "module.decoder.layers.0.mlp.experts.linear_fc2.weight0": fc2[0],
+                "module.decoder.layers.0.mlp.experts.linear_fc2.weight1": fc2[1],
+            }
+        ),
+        _model(optional_enabled=optional_enabled, excluded=replicated, custom=custom),
+    ]
+    gtp.classify_gtp_remat_chains(models, cuda_graph_impl=impl, cuda_graph_modules=scope)
+    assert set(calls) == {"default_dense", "default_expert_fc1", "default_expert_fc2"}
+    assert mamba_fc1.chain_id == mamba_fc2.chain_id
+    assert mamba_fc1._gtp_prefetch_chain_name == optional_enabled._gtp_prefetch_chain_name
+    assert custom._gtp_prefetch_chain_name == "custom"
+    assert not hasattr(replicated, "_gtp_prefetch_chain_name")
+    assert fc1[0].chain_id == fc1[1].chain_id
+    assert fc2[0].chain_id == fc2[1].chain_id
+    assert len({mamba_fc1.chain_id, fc1[0].chain_id, fc2[0].chain_id, custom.chain_id}) == 4
+    assert gtp._chain_is_graphed(mamba_fc1.chain_id) == (impl != "none")
+    assert gtp._chain_is_graphed(fc1[0].chain_id) == (impl == "full_iteration")
+
+
+def test_default_registration_keeps_process_groups_separate():
+    first, second = _weight(object()), _weight(object())
+    gtp.classify_gtp_remat_chains([_model(first=first), _model(second=second)])
+    assert first.chain_id != second.chain_id
+
+
+def test_default_registration_does_not_merge_with_user_chosen_name():
+    first, second = _weight(), _weight()
+    register_prefetch_chain("default_dense", [first])
+    gtp.classify_gtp_remat_chains(_model(first=first, second=second))
+    assert first.chain_id != second.chain_id

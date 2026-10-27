@@ -154,13 +154,13 @@ _REGISTERED_PREFETCH_CHAINS: Dict[str, _RegisteredPrefetchChain] = {}
 
 
 def register_prefetch_chain(name: str, weights: Iterable[torch.Tensor]) -> None:
-    """Assign already-sharded weights to a named prefetch chain before classification.
+    """Assign GTP-sharded weights to a named prefetch chain before runtime initialization.
 
     Call after GTP wrapping (and any parameter-replacing wrappers), before
     ``classify_gtp_remat_chains`` and the first forward. Registration selects membership,
     not execution order: warmup discovers forward/backward and recompute links. It does
     not enable sharding, change collective grouping, or allocate a communication stream.
-    Unregistered weights retain the default name-based classification.
+    Model initialization registers default chains for weights without an override.
 
     Args:
         name: Logical chain name, containing letters, digits, underscores, dots or hyphens.
@@ -531,8 +531,8 @@ def _stream_key(chain_id: str, group) -> tuple:
     Partitioned on two axes: chain_id (captured GRAPHED vs eager UNGRAPHED ops must not
     share a stream) and group (independent NCCL, e.g. GTP_remat vs EGTP_remat, no serialization).
 
-    Grouped fc1/fc2 are separate chains but must share ONE stream, so their gathers serialize
-    instead of splitting bandwidth: drop the role from the key, keep the capture suffix.
+    By default, grouped fc1/fc2 chains on the same group share one stream, so their gathers
+    serialize instead of splitting bandwidth: drop the role, keep the capture suffix.
     """
     if _chain_is_grouped(chain_id):
         chain_id = _GTP_REMAT_GROUPED_PREFIX + _graphness_suffix(_chain_is_graphed(chain_id))
@@ -698,11 +698,56 @@ def configure_gtp_remat_from_recipe(
         logger.info("> GTP_remat enabled. %s", GTP_CONFIG)
 
 
+def _register_default_prefetch_chains(models):
+    """Register model defaults after sharding/wrapping, preserving explicit overrides.
+
+    Dense operators (including both Mamba projections) share a chain. Routed-expert
+    FC1/FC2 projections have separate chains, with each local-expert group indivisible.
+    Different process groups must never be linked. Capture boundaries are resolved later.
+    """
+    weights = {}
+    for model in models:
+        for name, weight in model.named_parameters():
+            if is_gtp_param(weight):
+                weights.setdefault(id(weight), (name, weight))
+    used_names = {
+        weight._gtp_prefetch_chain_name
+        for _, weight in weights.values()
+        if hasattr(weight, "_gtp_prefetch_chain_name")
+    }
+    defaults = defaultdict(list)
+    for name, weight in weights.values():
+        if hasattr(weight, "_gtp_prefetch_chain_name"):
+            continue
+        role = "dense"
+        if weight.is_routed_expert:
+            # Register only the leader: the API includes every local-expert member.
+            if weight.weight_list is None:
+                continue
+            role = "expert"
+            if ".linear_fc1." in f".{name}":
+                role = "expert_fc1"
+            elif ".linear_fc2." in f".{name}":
+                role = "expert_fc2"
+        defaults[(role, id(weight.group))].append(weight)
+    for (role, _), members in defaults.items():
+        name = f"default_{role}"
+        suffix = 0
+        while name in used_names:
+            suffix += 1
+            name = f"default_{role}_{suffix}"
+        register_prefetch_chain(name, members)
+        used_names.add(name)
+
+
 def classify_gtp_remat_chains(
     model, *, cuda_graph_modules=None, moe_shared_expert_overlap=False, cuda_graph_impl="none"
 ):
     """
-    Tag and classify every GTP param's prefetch chain (GRAPHED vs UNGRAPHED).
+    Register default prefetch chains and finalize their captured/eager boundaries.
+
+    Explicit registrations take precedence. All other eligible weights use the same
+    registration API, with dense, expert-FC1 and expert-FC2 defaults per process group.
     Must be called once AFTER model build + DDP wrap and before the first forward (which
     lazily builds chain links).
     """
@@ -716,7 +761,9 @@ def classify_gtp_remat_chains(
     )
     # Clear stale process-global chain state so a rebuilt model starts fresh.
     reset_gtp_state()
-    for model_module in model if isinstance(model, list) else [model]:
+    models = model if isinstance(model, list) else [model]
+    _register_default_prefetch_chains(models)
+    for model_module in models:
         tag_gtp_params_with_names(model_module)
         classify_gtp_chains(model_module)
 

@@ -737,7 +737,10 @@ A weight can be kept **out** of a chain by setting `weight.prefetch_initialized 
 `register_prefetch_chain(name, weights)` separates **which weights are sharded** from
 **which weights prefetch one another**. Apply the sharding policy and parameter wrappers
 first; register only the resulting GTP weights before `classify_gtp_remat_chains` and
-warmup. Registration never turns on sharding for an excluded or optional weight.
+warmup. That existing entry point now registers defaults and finalizes capture scopes;
+its name is retained for compatibility. Registration never turns on sharding for an
+excluded or optional weight. Standard training needs no user registration calls; the
+following example shows how an integration can explicitly choose chain membership.
 
 ```python
 from megatron.core.tensor_parallel.gtp_api import (
@@ -765,7 +768,13 @@ belong to only one logical chain.
 Registration specifies **membership, not list order**. The existing warmup observes
 forward order, backward uses the corresponding reverse links, and recompute-forward
 builds its own links. Existing repeated-consumer handling and readiness events remain
-unchanged. Unregistered weights retain the default model-name classification.
+unchanged. Production model initialization calls `classify_gtp_remat_chains` after
+DDP wrapping. It uses this API to register all remaining GTP weights into dense,
+grouped-expert FC1, and grouped-expert FC2 chains, separately per process group,
+then finalizes CUDA-graph scopes. Mamba input/output projections stay together in
+the dense chain. Explicit registrations override these defaults; replicated weights
+are skipped, so exclusions and disabled opt-ins never enter a chain. Recompute-forward
+inherits this membership and learns its own consumption order.
 
 Logical chains do not imply separate streams. Registered dense chains share the default
 dense streams, and registered grouped chains share the expert streams, each keyed by

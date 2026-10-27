@@ -169,11 +169,11 @@ def _worker_recompute_matches_no_recompute(rank, world_size, port, registered=Fa
     gtp_module.reset_gtp_state()
     layers = _build_layers(world_size)
     recomputed, spacers = layers
+    all_layers = recomputed + [m for pair in spacers for m in pair]
     if registered:
-        all_layers = recomputed + [m for pair in spacers for m in pair]
         gtp_module.register_prefetch_chain("recomputed", [m.weight for m in recomputed])
         gtp_module.register_prefetch_chain("spacers", [m.weight for pair in spacers for m in pair])
-        gtp_module.classify_gtp_remat_chains(torch.nn.ModuleList(all_layers))
+    gtp_module.classify_gtp_remat_chains(torch.nn.ModuleList(all_layers))
 
     x = torch.randn(8, HIDDEN, dtype=DTYPE, device="cuda", requires_grad=True)
     dist.broadcast(x, src=0)
