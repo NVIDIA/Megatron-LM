@@ -416,11 +416,19 @@ def run_gpu_sniff_test(tag="", pg_collection=None):
 
     Args:
         tag: string included in the header (e.g. "iteration 100").
-        pg_collection: a ProcessGroupCollection. If None, one is built from mpu.
+        pg_collection: a ProcessGroupCollection whose EP, DP and TP groups are tested.
+            Omitting it is deprecated: one is then built from the global parallel state,
+            with a ProcessGroupFallbackWarning.
     """
     if pg_collection is None:
-        from megatron.core.process_groups_config import ProcessGroupCollection
+        from megatron.core.process_groups_config import (
+            ProcessGroupCollection,
+            warn_global_process_group_fallback,
+        )
 
+        warn_global_process_group_fallback(
+            "run_gpu_sniff_test", deprecated_in="0.21", removed_in="0.23"
+        )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(
             required_pgs=['ep', 'dp', 'tp'],
         )

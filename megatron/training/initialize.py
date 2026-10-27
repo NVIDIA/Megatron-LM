@@ -21,6 +21,7 @@ from megatron.core.parallel_state import create_group
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     enable_strict_process_group_fallbacks,
+    warn_global_process_group_fallback,
 )
 from megatron.core.rerun_state_machine import (
     RerunDiagnostic,
@@ -88,9 +89,9 @@ def initialize_megatron(
     `build_tokenizer` is False for workloads that provide their own tokenization.
     `seed_pg_collection` seeds the random number generators from the process
     groups of the model being trained. Without it, they are seeded from the
-    collection of the parallel grid that this function builds, or from the mpu
-    globals when it builds none (for example with `skip_model_parallel_init`,
-    or when the grid was initialized before this call).
+    collection of the parallel grid that this function builds or that was
+    initialized before this call, or from the mpu globals when there is no
+    grid (for example with `skip_model_parallel_init`).
     Returns a function to finalize distributed env initialization
     (optionally, only when cfg.dist.lazy_mpu_init == True)
     """
@@ -364,8 +365,8 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
     """Initialize torch.distributed and core model parallel.
 
     Returns the ProcessGroupCollection of the parallel grid that this call
-    builds, or None when it builds none: model-parallel setup is skipped, the
-    grid is already initialized, or no CUDA device is present.
+    builds, or of the grid that the caller already initialized. Returns None
+    when model-parallel setup is skipped or no CUDA device is present.
     """
     cfg = get_run_config()
     args = get_args()
@@ -466,6 +467,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
     if device_count > 0 and not skip_model_parallel_init:
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         else:
             if args.gtp_weight_remat_size > 1 or args.expert_gtp_weight_remat_size > 1:
                 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
@@ -551,7 +553,9 @@ def _set_random_seed(
     `pg_collection`, the process groups of the model being seeded, supplies
     every group that is not passed explicitly, and the mpu globals are not
     read. Its data-parallel group is `dp_gtp_remat`, the data-distribution
-    group that `mpu.get_data_parallel_rank()` uses by default.
+    group that `mpu.get_data_parallel_rank()` uses by default. Reading a rank
+    from the mpu globals, without the group or the collection, is deprecated
+    and warns with a ProcessGroupFallbackWarning.
     """
     if seed_ is not None and seed_ > 0:
         if pg_collection is not None:
@@ -564,6 +568,10 @@ def _set_random_seed(
                     "pg_collection must set pp, and dp_gtp_remat when "
                     "data_parallel_random_init is set, to seed the random number generators"
                 )
+        elif pp_group is None or (data_parallel_random_init and dp_group is None):
+            warn_global_process_group_fallback(
+                "_set_random_seed", deprecated_in="0.21", removed_in="0.23"
+            )
         # Ensure that different pipeline MP stages get different seeds.
         pp_rank = get_pg_rank(pp_group) if pp_group is not None else mpu.get_pipeline_model_parallel_rank()
         seed = seed_ + (100 * pp_rank)
@@ -616,7 +624,12 @@ def write_args_to_tensorboard():
 
 
 def set_jit_fusion_options(tp_size=None):
-    """Set PyTorch JIT layer fusion options."""
+    """Set PyTorch JIT layer fusion options.
+
+    tp_size: tensor-parallel size of the model, which sizes the sequence-parallel warmup
+        shapes. Omitting it is deprecated: with sequence parallelism, the size is then read
+        from the global parallel state, with a ProcessGroupFallbackWarning.
+    """
     # flags required to enable jit fusion kernels
     if is_torch_min_version("2.2.0a0"):
         pass  # we're using torch.compile for jit fusion
@@ -730,8 +743,12 @@ def _warmup_jit_function(tp_size=None):
     # dropout mask, and conditioning them would shift downstream determinism
     # relative to the historical behavior encoded in the golden values.
     if args.sequence_parallel:
-        # tp_size threaded by the caller (hetero MIMO language PGC); None -> mpu.
-        seq_length = args.seq_length // (tp_size or mpu.get_tensor_model_parallel_world_size())
+        if tp_size is None:
+            warn_global_process_group_fallback(
+                "set_jit_fusion_options", "tp_size", deprecated_in="0.21", removed_in="0.23"
+            )
+            tp_size = mpu.get_tensor_model_parallel_world_size()
+        seq_length = args.seq_length // tp_size
     else:
         seq_length = args.seq_length
     input = torch.rand(

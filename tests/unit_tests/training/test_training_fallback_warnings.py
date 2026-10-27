@@ -18,8 +18,11 @@ import torch
 
 from megatron.core import parallel_state, process_groups_config
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
-from megatron.training import arguments, training
+from megatron.training import arguments, gpu_sniff_test, initialize, training
+from megatron.training.distillation import utils as distillation_utils
+from megatron.training.logging import packed_sequence_stats
 from megatron.training.state import TrainState
+from megatron.training.utils import common_utils
 
 
 class _GlobalRead(Exception):
@@ -277,3 +280,183 @@ def test_data_loaders_without_a_collection_warn(monkeypatch, run_config):
         "build_train_valid_test_data_loaders",
         lambda: training.build_train_valid_test_data_loaders(lambda num_samples: None),
     )
+
+
+@pytest.mark.parametrize(
+    "owner, accessor, call",
+    [
+        (
+            "reduce_max_stat_across_model_parallel_group",
+            "get_model_parallel_group",
+            lambda: common_utils.reduce_max_stat_across_model_parallel_group(1.0),
+        ),
+        (
+            "logical_and_across_model_parallel_group",
+            "get_model_parallel_group",
+            lambda: common_utils.logical_and_across_model_parallel_group(True),
+        ),
+        (
+            "average_losses_across_data_parallel_group",
+            "get_data_parallel_group",
+            lambda: common_utils.average_losses_across_data_parallel_group([torch.ones(1)]),
+        ),
+        (
+            "calc_params_l2_norm",
+            "get_gtp_weight_remat_rank",
+            lambda: common_utils.calc_params_l2_norm([torch.nn.Linear(1, 1)]),
+        ),
+        (
+            "set_jit_fusion_options",
+            "get_tensor_model_parallel_world_size",
+            lambda: initialize._warmup_jit_function(),
+        ),
+        (
+            "_set_random_seed",
+            "get_pipeline_model_parallel_rank",
+            lambda: initialize._set_random_seed(1234),
+        ),
+        (
+            "update_packed_sequence_stats",
+            "is_pipeline_last_stage",
+            lambda: packed_sequence_stats.update_packed_sequence_stats(
+                torch.tensor([3]), torch.ones(3)
+            ),
+        ),
+        (
+            "_broadcast_without_pp",
+            "get_tensor_and_data_parallel_group",
+            lambda: distillation_utils._broadcast_without_pp(lambda: None),
+        ),
+    ],
+    ids=[
+        "reduce_max_stat",
+        "logical_and",
+        "average_losses",
+        "params_norm",
+        "jit_warmup",
+        "random_seed",
+        "packed_sequence_stats",
+        "distillation_listing",
+    ],
+)
+def test_utilities_warn_before_reading_the_global_grid(
+    monkeypatch, run_config, owner, accessor, call
+):
+    monkeypatch.setattr(parallel_state, accessor, _raise_global_read)
+    monkeypatch.setattr(parallel_state, "model_parallel_is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda *args: 2)
+    args = SimpleNamespace(
+        use_megatron_fsdp=False,
+        bf16=False,
+        fp16=False,
+        use_te_activation_func=False,
+        swiglu=False,
+        bias_gelu_fusion=False,
+        bias_swiglu_fusion=False,
+        sequence_parallel=True,
+        ffn_hidden_size=4,
+        tensor_model_parallel_size=1,
+        seq_length=4,
+        context_parallel_size=1,
+        hidden_size=4,
+    )
+    run_config.train.micro_batch_size = 1
+    monkeypatch.setattr(common_utils, "get_args", lambda: args)
+    monkeypatch.setattr(initialize, "get_args", lambda: args)
+    # The JIT warmup draws its tensors on the GPU; only their shapes matter here.
+    monkeypatch.setattr(
+        initialize.torch,
+        "rand",
+        lambda *size, **kwargs: torch.zeros(size[0] if len(size) == 1 else size),
+    )
+
+    _assert_warns_then_reads_global(owner, call)
+
+
+@pytest.mark.parametrize(
+    "owner, call",
+    [
+        ("run_gpu_sniff_test", lambda: gpu_sniff_test.run_gpu_sniff_test("tag")),
+        (
+            "LogitsSaverHooks",
+            lambda: distillation_utils.resolve_distillation_process_groups(
+                None, "LogitsSaverHooks"
+            ),
+        ),
+    ],
+    ids=["run_gpu_sniff_test", "distillation"],
+)
+def test_omitted_collection_warns_before_building_one(monkeypatch, owner, call):
+    monkeypatch.setattr(
+        ProcessGroupCollection, "use_mpu_process_groups", classmethod(_raise_global_read)
+    )
+    _assert_warns_then_reads_global(owner, call)
+
+
+def test_report_memory_without_a_group_warns(monkeypatch, run_config):
+    for name in (
+        "memory_allocated",
+        "max_memory_allocated",
+        "memory_reserved",
+        "max_memory_reserved",
+    ):
+        monkeypatch.setattr(torch.cuda, name, lambda: 0)
+    monkeypatch.setattr(parallel_state, "get_data_parallel_rank", _raise_global_read)
+
+    _assert_warns_then_reads_global("report_memory", lambda: common_utils.report_memory("x"))
+
+
+def test_jit_warmup_takes_the_tensor_parallel_size_it_is_given(monkeypatch, run_config):
+    args = SimpleNamespace(
+        bf16=False,
+        fp16=False,
+        use_te_activation_func=False,
+        swiglu=False,
+        bias_gelu_fusion=False,
+        sequence_parallel=True,
+        ffn_hidden_size=4,
+        tensor_model_parallel_size=1,
+        seq_length=8,
+        context_parallel_size=1,
+        hidden_size=4,
+    )
+    run_config.train.micro_batch_size = 1
+    monkeypatch.setattr(initialize, "get_args", lambda: args)
+    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_world_size", _raise_global_read)
+    shapes = []
+
+    def fake_rand(*size, **kwargs):
+        shape = size[0] if len(size) == 1 else size
+        shapes.append(shape)
+        return torch.zeros(shape)
+
+    monkeypatch.setattr(initialize.torch, "rand", fake_rand)
+    monkeypatch.setattr(initialize, "bias_dropout_add_fused_train", mock.Mock())
+    monkeypatch.setattr(initialize.torch.cuda, "empty_cache", mock.Mock())
+
+    with _record_fallbacks() as record:
+        initialize._warmup_jit_function(tp_size=2)
+
+    # The sequence-parallel input of the fused bias+dropout+add is split over 2 ranks.
+    assert (4, 1, 4) in shapes
+    assert _owners(record) == []
+
+
+def test_grid_initialized_before_initialize_megatron_is_returned_for_seeding(
+    monkeypatch, run_config
+):
+    # The seeding reads its groups from the returned collection, so it does not warn.
+    grid = ProcessGroupCollection()
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda *args: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda *args: 4)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(parallel_state, "model_parallel_is_initialized", lambda: True)
+    monkeypatch.setattr(
+        ProcessGroupCollection, "use_mpu_process_groups", classmethod(lambda cls: grid)
+    )
+    monkeypatch.setattr(initialize, "get_args", lambda: SimpleNamespace())
+
+    assert initialize._initialize_distributed(None, None, None) is grid

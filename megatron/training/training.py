@@ -1719,7 +1719,16 @@ def pretrain(
     if cfg_container.logger.log_progress:
         append_to_progress_log(args.save, "Starting job")
 
-    set_jit_fusion_options(tp_size=args.tensor_model_parallel_size)
+    # The JIT warmup builds the language model's sequence-parallel shapes. A multi-module run
+    # takes their tensor-parallel size from its arguments, which describe the language model on
+    # every rank, including ranks that carry only encoders.
+    set_jit_fusion_options(
+        tp_size=(
+            get_pg_size(pg_collection.tp)
+            if isinstance(pg_collection, ProcessGroupCollection)
+            else args.tensor_model_parallel_size
+        )
+    )
 
     # MIMO hands a per-module collection, which holds one ProcessGroupCollection
     # per module and has no tp of its own. The cross-entropy warmup is vocab

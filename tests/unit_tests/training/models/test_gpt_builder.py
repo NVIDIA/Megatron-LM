@@ -7,6 +7,8 @@ from unittest.mock import Mock, call, patch
 import pytest
 import torch
 
+from megatron.core import process_groups_config
+from megatron.core.process_groups_config import ProcessGroupFallbackWarning
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
@@ -123,7 +125,12 @@ class TestDefaultLayerSpecDispatch:
         config.restore_modelopt_state = True
         config.use_arbitrary_attention_mask = None
 
-        default_layer_spec(config, vp_stage=None)
+        # Without the builder's collection, the global grid decides, with a warning.
+        with (
+            patch.object(process_groups_config, "_warned_global_process_group_fallbacks", set()),
+            pytest.warns(ProcessGroupFallbackWarning, match="default_layer_spec"),
+        ):
+            default_layer_spec(config, vp_stage=None)
 
         # cp_world_size=4 → use_arbitrary_attention_mask=False
         assert mock_get_spec.call_args.kwargs["use_arbitrary_attention_mask"] is False
