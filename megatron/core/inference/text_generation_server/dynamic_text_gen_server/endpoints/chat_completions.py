@@ -1240,11 +1240,9 @@ def format_chat_response(batch_results, sampling_params, tokenizer, options, *, 
             # (post vision/video expansion).
             message["prompt_token_ids"] = result["prompt_tokens"]
             message["generation_token_ids"] = result["generated_tokens"]
+            message["generation_log_probs"] = result.get("generated_log_probs", [])
         if options.return_raw_text and not payload_offloaded:
             message["raw_text"] = tokenizer.detokenize(result["prompt_tokens"]) + text_output
-        if not payload_offloaded:
-            # Small RL/debug scalars (a few bytes each); harmless to keep for compatibility.
-            message["generation_log_probs"] = result.get("generated_log_probs", [])
 
         reason = generation_finish_reason(result)
         if reason == "stop" and normalized_tool_calls and not options.is_named_tool_choice:
