@@ -1282,7 +1282,8 @@ def test_real_media_prefill_replays_actual_cuda_graph_with_eager_parity(model_pa
         "image",
         model=graphed_model,
         num_cuda_graphs=-1,
-        max_requests=1,
+        # CUDA graphs need max_requests to be a multiple of the tensor-parallel size.
+        max_requests=parallel_state.get_tensor_model_parallel_world_size(),
         max_tokens=16,
         cuda_graph_all_prefills=True,
         cuda_graph_max_tokens=16,
