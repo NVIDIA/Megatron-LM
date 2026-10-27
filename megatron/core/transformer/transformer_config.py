@@ -2892,6 +2892,10 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         "gdn_core_attn offloading only supports Transformer Engine CUDA graphs."
                     )
+                if self.fp4 and self.cuda_graph_impl == "transformer_engine":
+                    raise ValueError(
+                        "gdn_core_attn offloading does not support FP4 with CUDA graphs."
+                    )
             if "attn_proj" in self.offload_modules and "core_attn" not in self.offload_modules:
                 raise ValueError(
                     "attn_proj cannot be set to offload_modules alone without core_attn "

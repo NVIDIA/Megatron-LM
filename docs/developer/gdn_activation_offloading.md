@@ -45,8 +45,11 @@ The recurrence and its offloaded tensors remain BF16/FP32 when Transformer Engin
 projections and MLPs use FP8 or NVFP4. Select these through the existing FP8/FP4
 training options. The local Qwen tool accepts `--precision fp8-delayed`,
 `--precision fp8-tensorwise` or `--precision fp4`; its default remains BF16.
-GDN2 and TE attention/whole-layer graphs reuse the same precision contexts and
-recipes as native Megatron training.
+GDN2 supports these recipes in eager training. TE attention/whole-layer graphs
+support FP8; FP4 with graph offloading remains rejected. Complete-model NVFP4
+graph baselines failed even with offloading disabled on the tested SM120 stack,
+so this combination is not qualified. No graph or quantization implementation is
+changed here.
 
 On RTX PRO 6000 (SM120), exact NVFP4 replay tests require
 `NVTE_NVFP4_DISABLE_RHT=1` and `NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING=1`

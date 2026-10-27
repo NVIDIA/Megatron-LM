@@ -54,12 +54,10 @@ from tests.unit_tests.test_utilities import Utils
         ("gdn2", False, False, True, False, 0.0, "bf16"),
         ("gdn", False, False, False, False, 1.0, "fp8-delayed"),
         ("gdn", False, True, True, True, 1.0, "fp8-tensorwise"),
-        ("gdn", False, False, True, False, 1.0, "fp4"),
         ("gdn2", False, True, True, True, 1.0, "fp8-delayed"),
         ("gdn2", False, False, False, False, 1.0, "fp8-tensorwise"),
-        ("gdn2", False, True, True, True, 1.0, "fp4"),
         ("gdn2", False, True, True, False, 0.0, "fp8-tensorwise"),
-        ("gdn2", False, True, False, False, 0.5, "fp4"),
+        ("gdn2", False, True, False, False, 0.5, "fp8-tensorwise"),
         ("gdn", True, False, True, False, 1.0, "fp8-tensorwise"),
     ],
 )
