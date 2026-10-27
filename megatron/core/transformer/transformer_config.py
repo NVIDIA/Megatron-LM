@@ -3873,6 +3873,15 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.overlap_moe_expert_parallel_comm:
                 raise NotImplementedError('mHC CUDA graphs do not yet support EP A2A overlap.')
+            if (
+                self.cuda_graph_impl == 'transformer_engine'
+                and self.sequence_packing_scheduler is not None
+                and not self.mhc_recompute_attn_cuda_graph_split
+            ):
+                raise NotImplementedError(
+                    'mHC TE graphs support scheduler-packed THD sequences only with '
+                    'mhc_recompute_attn_cuda_graph_split.'
+                )
             if self.cuda_graph_impl == 'transformer_engine' and self.mtp_use_repeated_layer:
                 raise NotImplementedError(
                     'mHC TE graphs require independent MTP layers; disable mtp_use_repeated_layer.'

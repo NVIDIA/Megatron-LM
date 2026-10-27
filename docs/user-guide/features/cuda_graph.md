@@ -107,9 +107,9 @@ fixed local token capacity; the source global batch size and micro-batch size 1
 must stay fixed. PP/VPP also requires `--cuda-graph-dynamic-microbatches`, which
 keeps graph inputs alive until their corresponding backward even when packing
 reduces the number of microbatches. Dynamic CP, EP communication overlap, delayed
-wgrad, and paged stash are outside this path. mHC wrappers and attention graph
-splitting require their separate graph integrations; these packing options do
-not enable mHC capture by themselves.
+wgrad, and paged stash are outside this path. For mHC models, scheduler-packed THD
+graphs additionally require the mHC attention graph split described under mHC
+training.
 
 ### Usage
 
@@ -235,8 +235,12 @@ wrappers run eagerly. Under a graph-safe RNG tracker, which CUDA graphs use, a r
 checkpoint restores copies of the forward generator states, so a recomputed
 bias-dropout-add applies its forward dropout mask.
 
+The split also accepts scheduler-packed THD batches with the packing options described
+above: its attention graph takes the fixed-capacity sequence offsets, while the eager
+mHC operations and MLP receive the batch's packed metadata.
+
 Activation offloading and expert-parallel communication overlap are rejected for
-these mHC graph modes. Packed THD input,
+these mHC graph modes. Packed THD input outside the attention graph split,
 dynamic context parallelism, and inference capture are outside this training
 support. The existing pipeline-parallel and MTP placement requirements still
 apply. Nonzero dropout requires the graph-safe RNG implementation used by the

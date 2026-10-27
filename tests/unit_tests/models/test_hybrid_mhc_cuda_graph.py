@@ -14,6 +14,7 @@ from functools import wraps
 import pytest
 import torch
 
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.fusions import fused_mhc_kernels
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -24,6 +25,8 @@ from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     init_num_microbatches_calculator,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.schedules import get_pp_rank_microbatches, get_schedule_table
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import random as tensor_parallel_random
 from megatron.core.tensor_parallel.random import (
@@ -35,9 +38,10 @@ from megatron.core.transformer.cuda_graphs import (
     TECudaGraphHelper,
     _get_mtp_te_layers,
     _layer_is_graphable,
+    convert_schedule_table_to_order,
     set_current_microbatch,
 )
-from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.enums import AttnBackend, CudaGraphModule
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.module import convert_module_to_dtype_except_fp32_marked
 from megatron.core.transformer.transformer_layer import (
@@ -623,6 +627,23 @@ def test_mhc_te_graphs_reject_mhc_recompute_without_the_split():
 
 
 @pytest.mark.launch_on_gb200
+def test_mhc_te_graphs_reject_scheduler_thd_without_the_split():
+    with pytest.raises(NotImplementedError, match='scheduler-packed THD'):
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            enable_mhc_connections=True,
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_modules=['attn'],
+            sequence_packing_scheduler='dp_balanced',
+            max_seqlen_per_dp_cp_rank=16,
+            pad_packed_seq_alignment='max',
+            thd_max_packed_sequences=4,
+        )
+
+
+@pytest.mark.launch_on_gb200
 def test_mhc_te_repeated_mtp_is_rejected():
     with pytest.raises(NotImplementedError, match='independent MTP layers'):
         TransformerConfig(
@@ -634,3 +655,229 @@ def test_mhc_te_repeated_mtp_is_rejected():
             mtp_num_layers=2,
             mtp_use_repeated_layer=True,
         )
+
+
+def _scheduler_thd_split_models(kind, chunks):
+    # One graphable attention layer per pipeline stage and chunk. Hybrid stages also
+    # carry an eager MLP wrapper, which ends their mHC recompute block.
+    config = TransformerConfig(
+        num_layers=(2 if kind == 'gpt' else 4) * chunks,
+        hidden_size=64,
+        ffn_hidden_size=128,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        enable_mhc_connections=True,
+        mhc_num_residual_streams=2,
+        mhc_sinkhorn_iterations=3,
+        cuda_graph_impl='transformer_engine',
+        cuda_graph_modules=[CudaGraphModule.attn],
+        thd_max_packed_sequences=4,
+        cuda_graph_dynamic_microbatches=True,
+        sequence_packing_scheduler='dp_balanced',
+        max_seqlen_per_dp_cp_rank=16,
+        pad_packed_seq_alignment='max',
+        cuda_graph_warmup_steps=1,
+        use_te_rng_tracker=True,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        pipeline_model_parallel_size=2,
+        context_parallel_size=2,
+        virtual_pipeline_model_parallel_size=chunks if chunks > 1 else None,
+        microbatch_group_size_per_vp_stage=2,
+        attention_backend=AttnBackend.fused,
+        deterministic_mode=True,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        is_hybrid_model=kind == 'hybrid',
+        **_ATTENTION_GRAPH_SPLIT,
+    )
+    pg = ProcessGroupCollection.use_mpu_process_groups()
+    models = []
+    for chunk in range(chunks):
+        kwargs = dict(
+            config=config,
+            vocab_size=128,
+            max_sequence_length=32,
+            position_embedding_type='rope',
+            pg_collection=pg,
+            vp_stage=chunk if chunks > 1 else None,
+        )
+        if kind == 'gpt':
+            spec = get_gpt_layer_with_transformer_engine_spec()
+            spec.module = HyperConnectionTransformerLayer
+            spec.submodules.self_attention_hyper_connection = HyperConnectionModule
+            spec.submodules.mlp_hyper_connection = HyperConnectionModule
+            model = GPTModel(transformer_layer_spec=spec, **kwargs)
+        else:
+            model = HybridModel(
+                hybrid_stack_spec=hybrid_stack_spec,
+                hybrid_layer_pattern='|'.join(['*-'] * 2 * chunks),
+                **kwargs,
+            )
+        models.append(
+            DistributedDataParallel(
+                config,
+                DistributedDataParallelConfig(),
+                model.cuda(),
+                disable_bucketing=True,
+                pg_collection=pg,
+            )
+        )
+    return config, models
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not is_te_min_version('2.18.0'), reason='Packed TE graphs require TE >= 2.18')
+@pytest.mark.parametrize('chunks', [1, 2])
+@pytest.mark.parametrize('kind', ['gpt', 'hybrid'])
+def test_attention_graph_split_scheduler_thd_replay(kind, chunks, monkeypatch):
+    """Scheduler-packed THD replay with mHC recompute matches eager mHC layers.
+
+    Each stage runs its whole mHC decoder, so the mHC recompute managers release and rebuild
+    their checkpoints around the replayed attention graphs, while packing changes both the
+    microbatch count and the valid sequence boundaries.
+    """
+    Utils.initialize_model_parallel(
+        pipeline_model_parallel_size=2,
+        context_parallel_size=2,
+        virtual_pipeline_model_parallel_size=chunks if chunks > 1 else None,
+    )
+    rebuilds = _count_recompute_rebuilds(monkeypatch)
+    helper = None
+    # Match training initialization: DDP keeps AccumulateGrad nodes alive, so construct
+    # and warm up on the non-default training stream.
+    training_stream = torch.cuda.Stream()
+    training_stream.wait_stream(torch.cuda.current_stream())
+    try:
+        with torch.cuda.stream(training_stream):
+            monkeypatch.setenv('NVTE_FLASH_ATTN', '0')
+            monkeypatch.setenv('NVTE_FUSED_ATTN', '1')
+            monkeypatch.setenv('NVTE_UNFUSED_ATTN', '0')
+            monkeypatch.setenv('NVTE_ALLOW_NONDETERMINISTIC_ALGO', '0')
+            model_parallel_cuda_manual_seed(321, te_rng_tracker=True, force_reset_rng=True)
+            init_num_microbatches_calculator(
+                rank=0,
+                global_batch_size=4,
+                micro_batch_size=1,
+                data_parallel_size=1,
+                decrease_batch_size_if_needed=False,
+            )
+            config, models = _scheduler_thd_split_models(kind, chunks)
+            helper = TECudaGraphHelper(models, config, 32, 1, optimizers=[])
+            for model, callables in zip(models, helper.callables_per_chunk):
+                assert callables == [
+                    layer
+                    for layer in model.module.decoder.layers
+                    if _layer_is_graphable(layer, config)
+                ]
+                assert len(callables) == 1
+            rotary = models[0].module.rotary_pos_emb(32, packed_seq=True)
+            physical = torch.tensor([0, 8, 16, 24, 32], dtype=torch.int32, device='cuda')
+            packed = []
+            for valid_end in (32, 24):
+                valid = physical.clone()
+                valid[-1] = valid_end
+                packed.append(
+                    PackedSeqParams(
+                        qkv_format='thd',
+                        cu_seqlens_q=valid,
+                        cu_seqlens_kv=valid.clone(),
+                        cu_seqlens_q_padded=physical,
+                        cu_seqlens_kv_padded=physical.clone(),
+                        max_seqlen_q=32,
+                        max_seqlen_kv=32,
+                        pad_between_seqs=True,
+                    )
+                )
+
+            def run_decoder(chunk, mb, hidden):
+                return models[chunk].module.decoder(
+                    hidden_states=hidden,
+                    attention_mask=None,
+                    rotary_pos_emb=rotary,
+                    packed_seq_params=packed[mb % 2],
+                )
+
+            def valid_tokens(mb):
+                return 12 if mb % 2 else 16
+
+            def parameter_grads(chunk):
+                return {
+                    name: param.main_grad.detach().clone()
+                    for name, param in models[chunk].module.decoder.named_parameters()
+                    if param.requires_grad
+                }
+
+            inputs, expected, expected_params = {}, {}, {}
+            for chunk in range(chunks):
+                for mb in range(4):
+                    hidden = torch.randn(
+                        16, 1, 64, dtype=torch.bfloat16, device='cuda', requires_grad=True
+                    )
+                    inputs[chunk, mb] = hidden.detach().clone()
+                    output = run_decoder(chunk, mb, hidden)
+                    value = output.detach().clone()
+                    output[: valid_tokens(mb)].float().sum().backward()
+                    expected[chunk, mb] = value, hidden.grad.detach().clone()
+                    if mb in (1, 3):
+                        expected_params[chunk, mb + 1] = parameter_grads(chunk)
+                models[chunk].zero_grad_buffer()
+            del hidden, output
+            assert rebuilds['rebuild'] > 0
+
+            helper.create_cudagraphs()
+            assert helper.graphs_created()
+            for count in (4, 2, 4):
+                _, _, warmup, _ = get_pp_rank_microbatches(
+                    count, chunks, 2, p2p_communicator=helper.p2p_communicator
+                )
+                order = convert_schedule_table_to_order(
+                    warmup, chunks, get_schedule_table(count, chunks, 2)
+                )
+                forwards, backwards, pending = [0] * chunks, [0] * chunks, {}
+                rebuilds.clear()
+                for entry in order:
+                    chunk = abs(entry) - 1
+                    if entry > 0:
+                        mb = forwards[chunk]
+                        forwards[chunk] += 1
+                        set_current_microbatch(models[chunk], mb)
+                        hidden = inputs[chunk, mb].clone().requires_grad_(True)
+                        output = run_decoder(chunk, mb, hidden)
+                        torch.testing.assert_close(
+                            output[: valid_tokens(mb)],
+                            expected[chunk, mb][0][: valid_tokens(mb)],
+                            msg=lambda m: f'output count={count} chunk={chunk} mb={mb}: {m}',
+                        )
+                        pending[chunk, mb] = hidden, output
+                    else:
+                        mb = backwards[chunk]
+                        backwards[chunk] += 1
+                        hidden, output = pending.pop((chunk, mb))
+                        output[: valid_tokens(mb)].float().sum().backward()
+                        torch.testing.assert_close(
+                            hidden.grad,
+                            expected[chunk, mb][1],
+                            msg=lambda m: f'input grad count={count} chunk={chunk} mb={mb}: {m}',
+                        )
+                assert not pending
+                # The mHC recompute regions around the replayed graphs re-ran in backward.
+                assert rebuilds['rebuild'] > 0
+                for chunk in range(chunks):
+                    actual = parameter_grads(chunk)
+                    assert actual.keys() == expected_params[chunk, count].keys()
+                    for name, grad in actual.items():
+                        torch.testing.assert_close(
+                            grad,
+                            expected_params[chunk, count][name],
+                            msg=lambda m: f'parameter {name} count={count} chunk={chunk}: {m}',
+                        )
+                    models[chunk].zero_grad_buffer()
+    finally:
+        torch.cuda.current_stream().wait_stream(training_stream)
+        if helper is not None and helper.graphs_created():
+            helper.delete_cuda_graphs()
+        destroy_num_microbatches_calculator()
+        Utils.destroy_model_parallel()
