@@ -161,11 +161,7 @@ class StreamingChatParser:
 
     def parse(self, text, *, finished=False):
         """Parse accumulated text and return zero or more structured deltas."""
-        try:
-            content, metadata = self._parse(text, finished=finished)
-        except Exception:
-            logger.exception("Failed to parse a streaming chat delta.")
-            return []
+        content, metadata = self._parse(text, finished=finished)
 
         content = content or ""
         metadata = metadata or {}
@@ -235,9 +231,12 @@ class StreamingChatParser:
 
     def finish_reason(self, result):
         """Return the OpenAI finish reason for this parsed choice."""
+        engine_reason = _finish_reason(result)
+        if engine_reason == "length":
+            return engine_reason
         if self.tools_streamed and not self._named_tool_choice:
             return "tool_calls"
-        return _finish_reason(result)
+        return engine_reason
 
 
 def _status_name(record):
@@ -287,6 +286,7 @@ async def openai_stream(
             top_log_probs=[],
             detokenizer=detokenizer,
             final=None,
+            terminal_sent=False,
             role_sent=False,
             echo_sent=False,
             parser=chat_parsers[index] if chat_parsers is not None else None,
@@ -432,34 +432,45 @@ async def openai_stream(
                             }
                         ]
                     )
-            elif new_tokens:
+            elif delta or logprobs is not None:
                 choice = {"index": index, "logprobs": logprobs, "finish_reason": None}
                 choice["delta" if chat else "text"] = {"content": delta} if chat else delta
                 yield sse([choice])
 
+            if is_final and not state["terminal_sent"]:
+                result = state["final"]
+                choice = {
+                    "index": index,
+                    "logprobs": None,
+                    "finish_reason": (
+                        parser.finish_reason(result)
+                        if parser is not None
+                        else _finish_reason(result)
+                    ),
+                    "generation_token_ids": list(state["tokens"]),
+                    "generation_log_probs": json_safe_logprobs(state["log_probs"]),
+                    "generated_text": state["detokenizer"].text,
+                    "generated_length": len(state["tokens"]),
+                }
+                choice["delta" if chat else "text"] = {} if chat else ""
+                yield sse([choice])
+                state["terminal_sent"] = True
+
+        missing_finals = [index for index, state in enumerate(states) if state["final"] is None]
+        if missing_finals:
+            message = f"Inference stream ended without a final record for choices {missing_finals}"
+            yield f"data: {json.dumps({'error': {'message': message}})}\n\n"
+            return
+
         prompt_tokens = completion_tokens = cached_token_count = 0
-        for index, state in enumerate(states):
-            result = state["final"] or {}
+        for state in states:
+            result = state["final"]
             prompt_len = result.get("prompt_length")
             if prompt_len is None:
                 prompt_len = len(result.get("prompt_tokens") or [])
             prompt_tokens = max(prompt_tokens, prompt_len)
             completion_tokens += len(result.get("generated_tokens") or [])
             cached_token_count = max(cached_token_count, result.get("num_cached_tokens", 0))
-            parser = state["parser"]
-            choice = {
-                "index": index,
-                "logprobs": None,
-                "finish_reason": (
-                    parser.finish_reason(result) if parser is not None else _finish_reason(result)
-                ),
-                "generation_token_ids": list(state["tokens"]),
-                "generation_log_probs": json_safe_logprobs(state["log_probs"]),
-                "generated_text": state["detokenizer"].text,
-                "generated_length": len(state["tokens"]),
-            }
-            choice["delta" if chat else "text"] = {} if chat else ""
-            yield sse([choice])
 
         if include_usage:
             yield sse(
@@ -475,5 +486,6 @@ async def openai_stream(
     finally:
         for task in tasks:
             task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         for stream in streams:
             await stream.aclose()
