@@ -440,13 +440,6 @@ _COMPLETIONS_DEFAULTS = {
             _CHAT_DEFAULTS,
             id="chat-non-dict-stream-options-ignored",
         ),
-        pytest.param(
-            COMPLETIONS_PATH,
-            {"stream_options": ["include_usage"]},
-            {},
-            _COMPLETIONS_DEFAULTS,
-            id="completions-non-dict-stream-options-ignored",
-        ),
     ],
 )
 async def test_sampling_params_are_parsed_from_the_request(path, body, app_config, expected_fields):
@@ -922,4 +915,18 @@ async def test_malformed_stream_options_is_rejected_before_submission(path, monk
     )
 
     assert response.status_code == 400
+    assert client.prompt_tokens == []
+
+
+@pytest.mark.asyncio
+@PATHS
+async def test_non_object_json_body_is_rejected_before_submission(path, monkeypatch):
+    """A JSON array is not a request object; reject it instead of failing with a 500."""
+    client = ReplyingClient()
+    app = build_streaming_app(path, client, monkeypatch)
+
+    response = await app.test_client().post(path, json=["not", "an", "object"])
+
+    assert response.status_code == 400
+    assert "Invalid or missing JSON body" in (await response.get_data(as_text=True))
     assert client.prompt_tokens == []
