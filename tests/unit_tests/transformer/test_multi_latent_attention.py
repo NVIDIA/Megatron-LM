@@ -1,6 +1,9 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import functools
 import os
+import subprocess
+import sys
 from dataclasses import replace
 from inspect import signature
 from unittest import mock
@@ -2522,24 +2525,36 @@ _LATENT_CACHE_FLASH_ATTENTION_VERSION = (
 )
 
 
+_FLASH_MLA_DECODE_PROBE = """
+import sys
+
+import torch
+from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+
+torch.cuda.set_device(int(sys.argv[1]))
+q = torch.zeros(1, 1, 16, 576, device="cuda", dtype=torch.bfloat16)
+kv_cache = torch.zeros(1, 64, 1, 576, device="cuda", dtype=torch.bfloat16)
+cache_seqlens = torch.ones(1, device="cuda", dtype=torch.int32)
+block_table = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
+metadata, num_splits = get_mla_metadata(cache_seqlens, 16, 1)
+flash_mla_with_kvcache(q, kv_cache, block_table, cache_seqlens, 512, metadata, num_splits)
+torch.cuda.synchronize()
+"""
+
+
+@functools.cache
 def _flash_mla_decode_runs() -> bool:
-    """Whether FlashMLA's dense decode kernel runs here: it needs SM90 and a FlashMLA build that
-    includes its SM90 kernels."""
+    """Whether FlashMLA's dense decode kernel runs here. It needs SM90 and a FlashMLA build with
+    its SM90 kernels. A build without them exits the process at the first launch, so the kernel
+    is probed in a subprocess."""
     if not (attention_module.HAVE_FMLA and torch.cuda.get_device_capability() == (9, 0)):
         return False
-    q = torch.zeros(1, 1, 16, 576, device="cuda", dtype=torch.bfloat16)
-    kv_cache = torch.zeros(1, 64, 1, 576, device="cuda", dtype=torch.bfloat16)
-    cache_seqlens = torch.ones(1, device="cuda", dtype=torch.int32)
-    block_table = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
-    try:
-        metadata, num_splits = attention_module.get_mla_metadata(cache_seqlens, 16, 1)
-        attention_module.flash_mla_with_kvcache(
-            q, kv_cache, block_table, cache_seqlens, 512, metadata, num_splits, causal=True
-        )
-        torch.cuda.synchronize()
-    except RuntimeError:
-        return False
-    return True
+    probe = subprocess.run(
+        [sys.executable, "-c", _FLASH_MLA_DECODE_PROBE, str(torch.cuda.current_device())],
+        capture_output=True,
+        timeout=600,
+    )
+    return probe.returncode == 0
 
 
 @pytest.mark.skipif(
@@ -2712,7 +2727,7 @@ class TestMLALatentCacheDecode:
         """Absorbed FlashMLA decode with a learnable sink matches the unabsorbed attention of a
         prefill with the same sink, and does not without the sink correction."""
         if not _flash_mla_decode_runs():
-            pytest.skip("requires FlashMLA's dense decode kernel (SM90)")
+            pytest.skip("requires FlashMLA's dense decode kernel (SM90 and a build with it)")
         attention = self._attention(softmax_type="learnable")
         heads = attention.num_attention_heads_per_partition
         with torch.no_grad():
