@@ -77,6 +77,7 @@ def _config(**kwargs: Any) -> TransformerConfig:
             {"fp4": "e2m1", "cuda_graph_impl": "transformer_engine"},
             "disable_parameter_transpose_cache=True",
         ),
+        ({"fp4": "e2m1", "external_cuda_graph": True}, "disable_parameter_transpose_cache=True"),
         (
             {
                 "experimental_attention_variant": "gdn2",
@@ -104,6 +105,7 @@ def test_reject_unsupported_gdn_offload(kwargs: dict[str, Any], match: str) -> N
             "cuda_graph_impl": "transformer_engine",
             "disable_parameter_transpose_cache": True,
         },
+        {"fp4": "e2m1", "external_cuda_graph": True, "disable_parameter_transpose_cache": True},
     ],
 )
 def test_gdn_offload_config(precision: dict[str, Any]) -> None:
@@ -111,6 +113,8 @@ def test_gdn_offload_config(precision: dict[str, Any]) -> None:
     for variant in ("gdn", "gated_delta_net"):
         config = _config(experimental_attention_variant=variant, **precision)
         assert config.experimental_attention_variant == "gdn"
+        if precision.get("external_cuda_graph"):
+            assert config.cuda_graph_impl == "transformer_engine"
     config = _config(recompute_granularity="selective", recompute_modules=["gdn_norm_out"])
     assert config.offload_modules == ["gdn_core_attn"]
     assert _config(experimental_attention_variant="gdn2", **precision).offload_modules == [

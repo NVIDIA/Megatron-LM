@@ -3061,7 +3061,7 @@ class TransformerConfig(ModelParallelConfig):
                     )
                 if (
                     self.fp4
-                    and self.cuda_graph_impl == "transformer_engine"
+                    and (self.cuda_graph_impl == "transformer_engine" or self.external_cuda_graph)
                     and not self.disable_parameter_transpose_cache
                 ):
                     raise ValueError(
