@@ -45,6 +45,7 @@ from megatron.core.transformer.mlp import (
     apply_swiglu_sharded_factory,
 )
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.ep_invariant_combine import num_leaf_blocks
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
@@ -1753,6 +1754,13 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """MCore grouped GEMM for Torch and the vLLM-selected MXFP8 fallback."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
+        ep_invariant_leaves = None
+        if self.config.moe_ep_invariant_combine:
+            # This rank's subtree of the EP-invariant combine tree; token_combine sums the
+            # rank partials over the rest of the tree.
+            ep_invariant_leaves = (
+                num_leaf_blocks(self.config.num_moe_experts) // self.ep_group.size()
+            )
         output = mcore_fused_moe(
             hidden_states,
             probs,
@@ -1766,6 +1774,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             activation_clamp_scale=self._activation_clamp_scale,
+            ep_invariant_leaves=ep_invariant_leaves,
         )
         return output, None
 
