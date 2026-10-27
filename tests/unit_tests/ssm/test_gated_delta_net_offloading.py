@@ -73,14 +73,17 @@ def _config(**kwargs: Any) -> TransformerConfig:
         ({"cuda_graph_impl": "local"}, "Transformer Engine CUDA graphs"),
         ({"cuda_graph_impl": "full_iteration"}, "Transformer Engine CUDA graphs"),
         ({"enable_cuda_graph": True}, "Transformer Engine CUDA graphs"),
-        ({"fp4": "e2m1", "cuda_graph_impl": "transformer_engine"}, "FP4 with CUDA graphs"),
+        (
+            {"fp4": "e2m1", "cuda_graph_impl": "transformer_engine"},
+            "disable_parameter_transpose_cache=True",
+        ),
         (
             {
                 "experimental_attention_variant": "gdn2",
                 "fp4": "e2m1",
                 "cuda_graph_impl": "transformer_engine",
             },
-            "FP4 with CUDA graphs",
+            "disable_parameter_transpose_cache=True",
         ),
     ],
 )
@@ -90,7 +93,19 @@ def test_reject_unsupported_gdn_offload(kwargs: dict[str, Any], match: str) -> N
         _config(**kwargs)
 
 
-@pytest.mark.parametrize("precision", [{}, {"fp8": "hybrid"}, {"fp4": "e2m1"}])
+@pytest.mark.parametrize(
+    "precision",
+    [
+        {},
+        {"fp8": "hybrid"},
+        {"fp4": "e2m1"},
+        {
+            "fp4": "e2m1",
+            "cuda_graph_impl": "transformer_engine",
+            "disable_parameter_transpose_cache": True,
+        },
+    ],
+)
 def test_gdn_offload_config(precision: dict[str, Any]) -> None:
     """Canonical and legacy GDN names accept the new opt-in module."""
     for variant in ("gdn", "gated_delta_net"):

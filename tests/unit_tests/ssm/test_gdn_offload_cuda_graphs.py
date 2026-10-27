@@ -59,6 +59,13 @@ from tests.unit_tests.test_utilities import Utils
         ("gdn2", False, True, True, False, 0.0, "fp8-tensorwise"),
         ("gdn2", False, True, False, False, 0.5, "fp8-tensorwise"),
         ("gdn", True, False, True, False, 1.0, "fp8-tensorwise"),
+        ("gdn", False, False, False, False, 1.0, "fp4"),
+        ("gdn", False, True, True, True, 1.0, "fp4"),
+        ("gdn2", False, True, True, True, 1.0, "fp4"),
+        ("gdn2", False, False, False, False, 1.0, "fp4"),
+        ("gdn2", False, True, True, False, 0.0, "fp4"),
+        ("gdn2", False, True, False, False, 0.5, "fp4"),
+        ("gdn", True, False, True, False, 1.0, "fp4"),
     ],
 )
 def test_gdn_offload_with_te_graphs(
@@ -98,7 +105,13 @@ def test_gdn_offload_with_te_graphs(
     try:
         groups = ProcessGroupCollection.use_mpu_process_groups()
         references = []
-        for enabled in (False, True):
+        # NVFP4 also needs an eager reference to detect stale cached graph weights.
+        arms = (
+            [(False, False), (True, False), (True, True)]
+            if precision == "fp4"
+            else [(True, False), (True, True)]
+        )
+        for capture_graphs, enabled in arms:
             # Each arm creates fresh modules; discard the previous arm's amax groups.
             FP8GlobalStateManager.reset()
             off_interface.reset_instance()
@@ -122,6 +135,7 @@ def test_gdn_offload_with_te_graphs(
                 cuda_graph_warmup_steps=3,
                 use_te_rng_tracker=True,
                 delay_offload_until_cuda_graph=delay,
+                disable_parameter_transpose_cache=precision == "fp4",
             )
             # Match native training: DDP's retained AccumulateGrad nodes must use a side stream.
             current_stream = torch.cuda.current_stream()
@@ -144,7 +158,7 @@ def test_gdn_offload_with_te_graphs(
             generator = torch.Generator().manual_seed(19 + groups.dp.rank())
             states = []
             for step in range(6):
-                if step == 3:
+                if step == 3 and capture_graphs:
                     helper = TECudaGraphHelper(
                         models, config, 128, 1, optimizers=[optimizer], pg_collection=groups
                     )
@@ -197,14 +211,16 @@ def test_gdn_offload_with_te_graphs(
             assert len(pool_checks) == 6
             if enabled:
                 assert (manager.offload_summary_total_bytes > 0) == (fraction > 0)
+            if references:
                 if fused:
                     torch.testing.assert_close(states, references, rtol=1e-5, atol=1e-8)
                 else:
                     assert not any(diff(references, states))
             else:
                 references = states
-            helper.delete_cuda_graphs()
-            helper = None
+            if helper is not None:
+                helper.delete_cuda_graphs()
+                helper = None
             del models, optimizer, states
             torch.cuda.synchronize()
     finally:

@@ -46,12 +46,14 @@ projections and MLPs use FP8 or NVFP4. Select these through the existing FP8/FP4
 training options. The local Qwen tool accepts `--precision fp8-delayed`,
 `--precision fp8-tensorwise` or `--precision fp4`; its default remains BF16.
 GDN2 supports these recipes in eager training. TE attention/whole-layer graphs
-support FP8; FP4 with graph offloading remains rejected. Complete-model NVFP4
-graph baselines failed even with offloading disabled on the tested SM120 stack,
-so this combination is not qualified. No graph or quantization implementation is
-changed here.
+support FP8 and NVFP4. NVFP4 graph offloading requires
+`TransformerConfig.disable_parameter_transpose_cache=True` through programmatic
+configuration. Graph capture honors this existing option, as do the native TE
+linear wrappers. Cached NVFP4 graph baselines failed even with offloading
+disabled on the tested SM120 stack; that combination remains rejected. Disabling
+the cache re-quantizes weights on each microbatch. No numerical kernels change.
 
-On RTX PRO 6000 (SM120), exact NVFP4 replay tests require
+On RTX PRO 6000 (SM120), exact NVFP4 training comparisons require
 `NVTE_NVFP4_DISABLE_RHT=1` and `NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING=1`
 before Python starts. These tests cover a constrained recipe, not full NVFP4
 or convergence. Hardware and recipe support remain Transformer Engine's
