@@ -18,6 +18,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+import megatron.core.extensions.transformer_engine as te_ext
 from megatron.core import parallel_state
 from megatron.core.activations import squared_relu
 from megatron.core.fp8_utils import get_fp8_context
@@ -908,17 +909,27 @@ class TestMoEModules:
         moe_utils.get_moe_metrics_tracker().clear()
 
     @pytest.mark.parametrize(
-        "balancing,score,expert_bias,hash_routing",
+        "balancing,score,expert_bias,hash_routing,per_token_loss",
         [
-            ("aux_loss", "softmax", False, False),
-            ("seq_aux_loss", "sigmoid", True, False),
-            ("sinkhorn", "softmax", False, False),
-            ("none", "sigmoid", False, True),
-            ("none", "softmax", False, True),
+            ("aux_loss", "softmax", False, False, False),
+            ("seq_aux_loss", "sigmoid", True, False, False),
+            ("sinkhorn", "softmax", False, False, False),
+            ("none", "sigmoid", False, True, False),
+            ("none", "softmax", False, True, False),
+            ("seq_aux_loss", "softmax", False, False, True),
         ],
-        ids=["aux_loss", "seq_aux_loss+sigmoid+bias", "sinkhorn", "hash+sigmoid", "hash+softmax"],
+        ids=[
+            "aux_loss",
+            "seq_aux_loss+sigmoid+bias",
+            "sinkhorn",
+            "hash+sigmoid",
+            "hash+softmax",
+            "seq_aux_loss+per_token_loss",
+        ],
     )
-    def test_topk_router_replays(self, balancing, score, expert_bias, hash_routing):
+    def test_topk_router_replays(
+        self, balancing, score, expert_bias, hash_routing, per_token_loss, monkeypatch
+    ):
         self._init()
         seeded()
         config = _moe_config(
@@ -931,11 +942,19 @@ class TestMoEModules:
             moe_aux_loss_coeff=0.0 if balancing in ("sinkhorn", "none") else 0.01,
             moe_num_hash_layers=int(hash_routing),
             hash_moe_vocab_size=128 if hash_routing else None,
+            calculate_per_token_loss=per_token_loss,
         )
         router = TopKRouter(
             config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
         ).cuda()
         router.set_layer_number(0)
+        if per_token_loss:
+            # Without a padding mask, seq aux loss uses the Python-int token-count branch.
+            monkeypatch.setattr(
+                moe_utils.MoEAuxLossAutoScaler,
+                "main_loss_backward_scale",
+                torch.ones((), device="cuda"),
+            )
         hidden = torch.randn(2048, 4, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         inputs = (hidden,)
         if expert_bias:
@@ -1064,10 +1083,26 @@ class TestMoEModules:
         assert grads["in[0]"].abs().sum() > 0
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
-    def test_te_grouped_mlp_replays_on_uneven_experts(self):
+    @pytest.mark.parametrize(
+        "use_grouped_tensor",
+        [
+            False,
+            pytest.param(
+                True,
+                marks=pytest.mark.skipif(
+                    not te_ext._TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR,
+                    reason="Installed TE GroupedLinear does not expose use_grouped_tensor",
+                ),
+            ),
+        ],
+        ids=["multi-stream", "device-initiated"],
+    )
+    def test_te_grouped_mlp_replays_on_uneven_experts(self, use_grouped_tensor):
         self._init()
         seeded()
-        config = _moe_config(hidden_size=2048, ffn_hidden_size=4096)
+        config = _moe_config(
+            hidden_size=2048, ffn_hidden_size=4096, moe_use_grouped_tensor=use_grouped_tensor
+        )
         spec = get_gpt_layer_with_transformer_engine_spec(num_experts=8, moe_grouped_gemm=True)
         experts = get_submodules(spec.submodules.mlp).experts(
             num_local_experts=8,
@@ -1085,7 +1120,7 @@ class TestMoEModules:
             (hidden, tokens_per_expert, probs),
             replays=3,
             contention=True,
-            what="TEGroupedMLP",
+            what=f"TEGroupedMLP[grouped_tensor={use_grouped_tensor}]",
         )
 
     @pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
