@@ -199,6 +199,10 @@ def attach_routed_mxfp8_writeback(
     Refit's quantize_/copy_ then requantizes with the canonical kernel and repacks into the
     routed stack in place (same bytes, same CUDA-graph addresses), so the canonical storage is
     released and replaced by broadcast placeholders: only the routed copy stays resident.
+
+    After this call weight.data and weight.scale no longer hold the weights: reading them
+    (dequantize, torch.stack, .contiguous(), ...) silently returns one uninitialized element
+    broadcast to the full shape. Read the routed stack instead.
     """
     if weight.writeback is not None:
         raise RuntimeError("expert weight already writes through; its storage was released")
