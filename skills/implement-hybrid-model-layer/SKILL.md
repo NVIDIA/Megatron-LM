@@ -22,4 +22,6 @@ Deviate as necessary; this recipe isn't set in stone, but it should provide guid
 
 Before you start the implementation, make sure you have all the necessary details. Ask the user to provide more information in case the request is not clear enough. Present questions important to resolve before starting implementation work to the user for discussion.
 
+While linking to online resources is fine, ensure that the code is understandable without external context, which includes the conversation context.
+
 When done, summarize your work to the user so they can review the new features and provide feedback. Make it easy for the user to understand trade-offs in the implementation.
