@@ -102,13 +102,22 @@ def _recording_provider(calls):
                 post_process=post_process,
                 vp_stage=vp_stage,
                 pg_collection=pg_collection,
-                pp_rank=None if pg_collection is None else pg_collection.pp.rank(),
-                tp_rank=None if pg_collection is None else pg_collection.tp.rank(),
+                ranks=None if pg_collection is None else _model_ranks(pg_collection),
             )
         )
         return torch.nn.Linear(1, 1)
 
     return model_provider
+
+
+def _model_ranks(pg_collection):
+    """The (pipeline, expert, tensor, expert tensor) ranks that the converter's groups report."""
+    return (
+        pg_collection.pp.rank(),
+        pg_collection.ep.rank(),
+        pg_collection.tp.rank(),
+        pg_collection.expt_tp.rank(),
+    )
 
 
 def _set_up_converter_parallel_state(tensor_parallel_size=1, pipeline_parallel_size=2):
@@ -138,12 +147,18 @@ def _make_loader(
     return loader
 
 
-def _make_saver(pg_collection, model_provider, tensor_parallel_size=1, pipeline_parallel_size=2):
+def _make_saver(
+    pg_collection,
+    model_provider,
+    tensor_parallel_size=1,
+    pipeline_parallel_size=2,
+    expert_parallel_size=1,
+):
     saver = MegatronCheckpointSaverBase(
         args=SimpleNamespace(
             target_tensor_parallel_size=tensor_parallel_size,
             target_pipeline_parallel_size=pipeline_parallel_size,
-            target_expert_parallel_size=1,
+            target_expert_parallel_size=expert_parallel_size,
         ),
         queue=None,
     )
@@ -169,7 +184,7 @@ def _save_local_models(saver):
     saved = []
 
     def save_checkpoint(iteration, models, optimizer, opt_param_scheduler, **kwargs):
-        saved.append(dict(kwargs, model=models[0]))
+        saved.append(dict(kwargs, model=models[0], ranks=_model_ranks(saver.pg_collection)))
 
     with (
         mock.patch.object(checkpointing, "save_checkpoint", save_checkpoint),
@@ -211,17 +226,44 @@ def no_global_process_groups():
     parallel_state.destroy_model_parallel()
 
 
+# The parallel_state setters that override the global ranks and sizes of the grid.
+_RANK_AND_SIZE_OVERRIDES = (
+    'set_tensor_model_parallel_rank',
+    'set_pipeline_model_parallel_rank',
+    'set_virtual_pipeline_model_parallel_rank',
+    'set_expert_model_parallel_rank',
+    'set_tensor_model_parallel_world_size',
+    'set_pipeline_model_parallel_world_size',
+    'set_virtual_pipeline_model_parallel_world_size',
+    'set_expert_model_parallel_world_size',
+)
+
+
+@pytest.fixture
+def no_rank_overrides(monkeypatch):
+    """Fail if the converter overrides a global rank or size of parallel_state."""
+
+    def forbidden(name):
+        def override(*args, **kwargs):
+            raise AssertionError(f"the converter must not call parallel_state.{name}")
+
+        return override
+
+    for name in _RANK_AND_SIZE_OVERRIDES:
+        monkeypatch.setattr(parallel_state, name, forbidden(name))
+
+
 @pytest.mark.parametrize("split", LAYER_SPLITS)
-def test_loader_builds_each_pipeline_stage(converter_parallel_state, split):
+def test_loader_builds_each_pipeline_stage(converter_parallel_state, no_rank_overrides, split):
     assert _loader_stage_layer_numbers(split, converter_parallel_state) == STAGE_LAYER_NUMBERS
 
 
 @pytest.mark.parametrize("split", LAYER_SPLITS)
-def test_saver_builds_each_pipeline_stage(converter_parallel_state, split):
+def test_saver_builds_each_pipeline_stage(converter_parallel_state, no_rank_overrides, split):
     assert _saver_stage_layer_numbers(split, converter_parallel_state) == STAGE_LAYER_NUMBERS
 
 
-def test_loader_builds_each_virtual_pipeline_chunk(converter_parallel_state):
+def test_loader_builds_each_virtual_pipeline_chunk(converter_parallel_state, no_rank_overrides):
     """Each virtual pipeline chunk holds its own layers, and only the first chunk of the first
     stage and the last chunk of the last stage pre- and post-process."""
     calls = []
@@ -244,8 +286,8 @@ def test_loader_builds_each_virtual_pipeline_chunk(converter_parallel_state):
     ]
 
 
-def test_loader_builds_models_on_its_collection(no_global_process_groups):
-    """The loader selects every rank on its collection and passes it to the model and loader."""
+def test_loader_builds_models_on_its_collection(no_global_process_groups, no_rank_overrides):
+    """The loader selects every model on its collection and passes it to the model and loader."""
     pg_collection = build_checkpoint_converter_process_groups(
         tensor_parallel_size=2, pipeline_parallel_size=2, expert_parallel_size=1
     )
@@ -253,73 +295,66 @@ def test_loader_builds_models_on_its_collection(no_global_process_groups):
     calls, loads = [], []
 
     def load_checkpoint(model, optimizer, opt_param_scheduler, **kwargs):
-        loads.append(dict(kwargs, pp_rank=pg_collection.pp.rank(), tp_rank=pg_collection.tp.rank()))
+        loads.append(dict(kwargs, ranks=_model_ranks(pg_collection)))
 
     _load_model_shards(loader, _recording_provider(calls), load_checkpoint)
 
-    stages = [(c["pre_process"], c["post_process"], c["pp_rank"], c["tp_rank"]) for c in calls]
+    # Ranks are (pipeline, expert, tensor, expert tensor).
+    models = [(0, 0, 0, 0), (0, 0, 1, 1), (1, 0, 0, 0), (1, 0, 1, 1)]
+    stages = [(c["pre_process"], c["post_process"], c["ranks"]) for c in calls]
     assert stages == [
-        (True, False, 0, 0),
-        (True, False, 0, 1),
-        (False, True, 1, 0),
-        (False, True, 1, 1),
+        (True, False, models[0]),
+        (True, False, models[1]),
+        (False, True, models[2]),
+        (False, True, models[3]),
     ]
     # Without a virtual pipeline, each stage is a single model built without a virtual stage.
     assert all(c["vp_stage"] is None for c in calls)
     assert all(c["pg_collection"] is pg_collection for c in calls)
-    assert [(load["pp_rank"], load["tp_rank"]) for load in loads] == [
-        (0, 0),
-        (0, 1),
-        (1, 0),
-        (1, 1),
-    ]
-    for load in loads:
-        assert load["tp_group"] is pg_collection.tp
-        assert load["pp_group"] is pg_collection.pp
-        assert load["dp_cp_group"] is pg_collection.dp_cp_gtp_remat
-        assert load["dp_group"] is pg_collection.dp
-        assert load["expt_dp_group"] is pg_collection.expt_dp
+    assert [load["ranks"] for load in loads] == models
+    assert all(load["pg_collection"] is pg_collection for load in loads)
 
 
-def test_saver_builds_models_on_its_collection(no_global_process_groups):
-    """The saver selects every stage on its collection and passes it to the model and saver."""
+def test_saver_builds_models_on_its_collection(no_global_process_groups, no_rank_overrides):
+    """The saver selects every model on its collection and passes it to the model and saver."""
     pg_collection = build_checkpoint_converter_process_groups(
-        tensor_parallel_size=2, pipeline_parallel_size=2, expert_parallel_size=1
+        tensor_parallel_size=2, pipeline_parallel_size=2, expert_parallel_size=2
     )
     calls = []
     saver = _make_saver(
-        pg_collection, _recording_provider(calls), tensor_parallel_size=2, pipeline_parallel_size=2
+        pg_collection,
+        _recording_provider(calls),
+        tensor_parallel_size=2,
+        pipeline_parallel_size=2,
+        expert_parallel_size=2,
     )
 
     saved = _save_local_models(saver)
 
-    stages = [(c["pre_process"], c["post_process"], c["pp_rank"]) for c in calls]
-    assert stages == [(True, False, 0), (True, False, 0), (False, True, 1), (False, True, 1)]
-    assert all(c["pg_collection"] is pg_collection for c in calls)
-    assert [(save["pipeline_rank"], save["tensor_rank"]) for save in saved] == [
-        (0, 0),
-        (0, 1),
-        (1, 0),
-        (1, 1),
+    # Ranks are (pipeline, expert, tensor, expert tensor), in the order the saver saves.
+    models = [(pp, ep, tp, tp) for pp in range(2) for ep in range(2) for tp in range(2)]
+    assert [(c["pre_process"], c["post_process"], c["ranks"]) for c in calls] == [
+        (ranks[0] == 0, ranks[0] == 1, ranks) for ranks in models
     ]
-    for save in saved:
-        assert save["tp_group"] is pg_collection.tp
-        assert save["pp_group"] is pg_collection.pp
-        assert save["cp_group"] is pg_collection.cp
-        assert save["dp_cp_group"] is pg_collection.dp_cp_gtp_remat
-        assert save["dp_group"] is pg_collection.dp
-        assert save["dp_gtp_remat_group"] is pg_collection.dp_gtp_remat
-        assert save["expt_dp_group"] is pg_collection.expt_dp
+    assert all(c["pg_collection"] is pg_collection for c in calls)
+    assert [
+        (save["pipeline_rank"], save["expert_rank"], save["tensor_rank"]) for save in saved
+    ] == [ranks[:3] for ranks in models]
+    assert [save["ranks"] for save in saved] == models
+    assert all(save["pg_collection"] is pg_collection for save in saved)
 
 
-def test_loader_reads_each_legacy_checkpoint_file():
-    """Legacy checkpoint files are named after the global ranks, which follow the collection."""
+def test_loader_reads_each_legacy_checkpoint_file(no_rank_overrides):
+    """Legacy checkpoint files are named after the ranks the loader selects on its collection."""
     pg_collection = _set_up_converter_parallel_state(tensor_parallel_size=2)
     loader = _make_loader(pg_collection, tensor_parallel_size=2, pipeline_parallel_size=2)
     checkpoint_names = []
 
     def load_checkpoint(model, optimizer, opt_param_scheduler, **kwargs):
-        checkpoint_names.append(checkpointing.get_checkpoint_name("ckpt", 7))
+        # load_checkpoint() names the file of a legacy checkpoint after its collection.
+        checkpoint_names.append(
+            checkpointing.get_checkpoint_name("ckpt", 7, pg_collection=kwargs["pg_collection"])
+        )
 
     try:
         _load_model_shards(loader, _recording_provider([]), load_checkpoint)
