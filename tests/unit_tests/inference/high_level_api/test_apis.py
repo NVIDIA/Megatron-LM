@@ -84,7 +84,8 @@ class _ShutdownLoopManager:
         coro.close()
         if self.stops:
             raise AssertionError("stopped runtime loop was reused")
-        await asyncio.wrap_future(self.teardown)
+        # Shield the shared teardown so a cancelled caller cannot cancel it.
+        await asyncio.shield(asyncio.wrap_future(self.teardown))
 
     def stop(self):
         self.stops += 1
