@@ -197,8 +197,34 @@ changes can change token routing:
 --moe-pad-expert-input-to-capacity
 ```
 
-Selective mHC recomputation, activation offloading, and expert-parallel
-communication overlap are rejected for these mHC graph modes. Packed THD input,
+Selective mHC recompute releases the outputs of the mHC aggregate and
+bias-dropout-add after the forward pass and rebuilds them eagerly in the backward
+pass. The graph modes above capture those operations, so they reject selective mHC
+recompute. To combine it with Transformer Engine graphs, capture only the input
+layernorm and self-attention of each mHC attention sublayer:
+
+```bash
+--enable-mhc-connections \
+--recompute-granularity selective \
+--recompute-modules mhc \
+--cuda-graph-impl transformer_engine \
+--cuda-graph-modules attn \
+--mhc-recompute-attn-cuda-graph-split
+```
+
+Each mHC attention sublayer computes its aggregate eagerly, replays its graph, and
+applies its mHC bias-dropout-add eagerly. TE copies the aggregate into the graph's
+static input and keeps that copy for the captured backward, so the aggregate is not
+checkpointed and no checkpoint output shares memory with the graph. The bias-dropout-add
+and the MLP sublayer are recomputed as in eager training; `mla_up_proj` may also be
+recomputed. The split applies to GPT layers built from `HyperConnectionTransformerLayer`
+and to Hybrid wrappers around attention-only layers. Hybrid MLP, MoE, GDN, and Mamba
+wrappers run eagerly. Under a graph-safe RNG tracker, which CUDA graphs use, a rebuilt
+checkpoint restores copies of the forward generator states, so a recomputed
+bias-dropout-add applies its forward dropout mask.
+
+Activation offloading and expert-parallel communication overlap are rejected for
+these mHC graph modes. Packed THD input,
 dynamic context parallelism, and inference capture are outside this training
 support. The existing pipeline-parallel and MTP placement requirements still
 apply. Nonzero dropout requires the graph-safe RNG implementation used by the

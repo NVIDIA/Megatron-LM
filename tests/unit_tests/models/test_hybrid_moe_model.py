@@ -207,6 +207,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "memory_efficient_layer_norm": False,
     "mhc_fused_backend": "auto",
     "mhc_init_gating_factor": 0.01,
+    "mhc_recompute_attn_cuda_graph_split": False,
     "mhc_recompute_layer_num": None,
     "mhc_sinkhorn_iterations": 20,
     "microbatch_group_size_per_vp_stage": 1,

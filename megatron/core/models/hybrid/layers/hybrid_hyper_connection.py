@@ -20,6 +20,7 @@ from megatron.core.transformer.module import (
 )
 from megatron.core.transformer.transformer_layer import (
     TransformerLayer,
+    _uses_mhc_attention_cuda_graph_split,
     _validate_mhc_te_graph_inputs,
 )
 
@@ -39,6 +40,13 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         super().__init__(config=config)
         self.inner_layer = layer
         self.layer_number = layer.layer_number
+        if self._is_attention_graph_split() and not (
+            isinstance(layer.mlp, IdentityOp) and isinstance(layer.cross_attention, IdentityOp)
+        ):
+            raise NotImplementedError(
+                'mhc_recompute_attn_cuda_graph_split requires attention-only inner layers. '
+                'Use separate attention and MLP layers in the Hybrid pattern.'
+            )
         if config.cuda_graph_impl == 'transformer_engine' and self._is_partial_moe_graph():
             if not isinstance(layer.self_attention, IdentityOp) or not isinstance(
                 layer.cross_attention, IdentityOp
@@ -62,11 +70,18 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         """
 
     def get_layer_static_inputs(self, seq_length: int, micro_batch_size: int) -> dict:
-        """Build static inputs with the wrapper's n-stream residual width."""
+        """Build static inputs with the wrapper's n-stream residual width.
+
+        The attention graph split starts from the aggregated single-stream input.
+        """
         if hasattr(self.inner_layer, 'get_layer_static_inputs'):
             inputs = self.inner_layer.get_layer_static_inputs(seq_length, micro_batch_size)
         else:
             inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
+        if self._is_attention_graph_split():
+            return {
+                name: inputs[name] for name in ('hidden_states', 'attention_mask') if name in inputs
+            }
         hidden = inputs['hidden_states']
         inputs['hidden_states'] = torch.ones(
             (*hidden.shape[:-1], self.config.mhc_num_residual_streams * self.config.hidden_size),
@@ -75,6 +90,14 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             requires_grad=hidden.requires_grad,
         )
         return inputs
+
+    def _is_attention_graph_split(self) -> bool:
+        """Whether this wrapper captures only its inner input layernorm and self-attention."""
+        return (
+            _uses_mhc_attention_cuda_graph_split(self.config)
+            and isinstance(self.inner_layer, TransformerLayer)
+            and not isinstance(self.inner_layer.self_attention, IdentityOp)
+        )
 
     def _is_partial_moe_graph(self) -> bool:
         return (
@@ -85,6 +108,16 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
 
     def _te_cuda_graph_capture(self, *args, **kwargs):
         """Capture the wrapper, or its deterministic MoE prefix, as tensor outputs."""
+        if self._is_attention_graph_split():
+            _validate_mhc_te_graph_inputs(kwargs, attention_graph_split=True)
+            hidden_states = args[0] if args else kwargs.pop('hidden_states')
+            # The graph starts from the aggregate and ends before the mHC bias-dropout-add.
+            (output, bias), _, _ = self.inner_layer._forward_self_attention_output_with_bias(
+                hidden_states,
+                attention_mask=kwargs.get('attention_mask'),
+                rotary_pos_emb=kwargs.get('rotary_pos_emb'),
+            )
+            return (output,) if bias is None else (output, bias)
         _validate_mhc_te_graph_inputs(kwargs)
         if self._is_partial_moe_graph():
             hidden_states = args[0] if args else kwargs.pop('hidden_states')
@@ -104,6 +137,8 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
 
     def _te_cuda_graph_replay(self, *args, **kwargs):
         """Replay captured work and restore the normal wrapper return contract."""
+        if self._is_attention_graph_split():
+            return self._replay_attention_graph_split(*args, **kwargs)
         _validate_mhc_te_graph_inputs(kwargs)
         outputs = list(super()._te_cuda_graph_replay(*args, **kwargs))
         if not self._is_partial_moe_graph():
@@ -124,6 +159,32 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         )
         return hidden_states, None
 
+    def _replay_attention_graph_split(self, *args, **kwargs):
+        """Run eager mHC aggregate, attention graph and eager mHC bias-dropout-add."""
+        mhc_recompute_manager = kwargs.pop('mhc_recompute_manager', None)
+        _validate_mhc_te_graph_inputs(kwargs, attention_graph_split=True)
+        # The attention-only inner layer has no MLP to consume these.
+        kwargs.pop('padding_mask', None)
+        kwargs.pop('input_ids', None)
+        hidden_states = args[0] if args else kwargs.pop('hidden_states')
+        # TE copies the aggregate into the graph's static input and keeps that copy for the
+        # graph's backward, so the aggregate is not checkpointed.
+        aggregated, h_res, h_post, residual = self.hyper_connection(
+            hidden_states, return_residual=True
+        )
+        outputs = super()._te_cuda_graph_replay(aggregated, **kwargs)
+        output_with_bias = (outputs[0], outputs[1] if len(outputs) > 1 else None)
+        hidden_states = self._apply_mhc_post(
+            h_res,
+            residual,
+            h_post,
+            output_with_bias,
+            dropout_prob=self.inner_layer.hidden_dropout,
+            bias_dropout_fusion=self.inner_layer.config.bias_dropout_fusion,
+            mhc_recompute_manager=mhc_recompute_manager,
+        )
+        return hidden_states, None
+
     def _get_te_cuda_graph_replay_args(self, *args, **kwargs):
         if isinstance(self.inner_layer, TransformerLayer):
             # Preserve TransformerLayer's None-mask normalization and TE version
@@ -136,6 +197,9 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         return super()._get_te_cuda_graph_replay_args(*args, **kwargs)
 
     def _get_submodules_under_cudagraphs(self):
+        if self._is_attention_graph_split():
+            # The hyper connection runs eagerly and triggers its own parameter hooks.
+            return self.inner_layer._get_submodules_under_cudagraphs()
         if self._is_partial_moe_graph():
             return [self.hyper_connection, *self.inner_layer._get_submodules_under_cudagraphs()]
         return [self]
@@ -318,6 +382,28 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                 f"vs {tuple(aggregated.shape)} input."
             )
 
+        hidden_states = self._apply_mhc_post(
+            h_res,
+            residual,
+            h_post,
+            layer_output_with_bias,
+            dropout_prob=dropout_prob,
+            bias_dropout_fusion=bias_dropout_fusion,
+            mhc_recompute_manager=mhc_recompute_manager,
+        )
+        return hidden_states, context
+
+    def _apply_mhc_post(
+        self,
+        h_res: Tensor,
+        residual: Tensor,
+        h_post: Tensor,
+        layer_output_with_bias: Tuple[Tensor, Optional[Tensor]],
+        dropout_prob: float,
+        bias_dropout_fusion: bool,
+        mhc_recompute_manager=None,
+    ) -> Tensor:
+        """Expand the branch output back to n streams with H_res, H_post and bias-dropout-add."""
         is_last_in_recompute_block = bool(
             mhc_recompute_manager is not None
             and getattr(mhc_recompute_manager, "is_last_layer_in_recompute_block", False)
@@ -339,4 +425,4 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             and hidden_states.dtype != self.config.params_dtype
         ):
             hidden_states = hidden_states.to(self.config.params_dtype)
-        return hidden_states, context
+        return hidden_states

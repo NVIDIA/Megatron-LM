@@ -2,8 +2,7 @@
 
 """TE mHC graph parity through real DDP and pipeline schedules.
 
-The default PP1 run is independent of the mHC pipeline-support PR. With both
-PRs present, run the identical checks through PP2/VPP2:
+The default runs PP1. Run the identical checks through PP2/VPP2 with:
 
     MHC_CG_PP_SIZE=2 MHC_CG_VP_SIZE=2 torchrun --nproc-per-node=4 -m pytest \
         tests/unit_tests/transformer/test_mhc_te_pipeline_training.py
@@ -22,6 +21,9 @@ batch split. Different DP replicas consume different deterministic token batches
 
 After three eager training warmups, capture real TE callables, then execute five
 changed-input replay steps with synchronized gradients and optimizer updates.
+
+The attention graph split cases add selective mHC recompute and compare against
+eager training without recompute, including nonzero hidden dropout.
 """
 
 from collections import Counter
@@ -32,8 +34,13 @@ import torch
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+from megatron.core.tensor_parallel import random as tensor_parallel_random
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.cuda_graphs import TECudaGraphHelper, _get_mtp_te_layers
+from megatron.core.transformer.cuda_graphs import (
+    TECudaGraphHelper,
+    _get_mtp_te_layers,
+    _layer_is_graphable,
+)
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import (
@@ -64,7 +71,7 @@ def _unwrap(model):
     return module.module if isinstance(module, Float16Module) else module
 
 
-def _run_te_pipeline_training(models, groups, pp_size, use_graph):
+def _run_te_pipeline_training(models, groups, pp_size, use_graph, recompute_rebuilds=None):
     parameters = _named_parameters(models)
     optimizer = torch.optim.SGD(list(parameters.values()), lr=0.02, momentum=0.1)
     forward_backward = get_forward_backward_func()
@@ -122,10 +129,17 @@ def _run_te_pipeline_training(models, groups, pp_size, use_graph):
         expected_layers, expected_mtp = [], []
         for model in models:
             module = _unwrap(model)
-            expected_layers.extend(module.decoder.layers)
-            expected_mtp.extend([False] * len(module.decoder.layers))
+            decoder_layers = [
+                layer for layer in module.decoder.layers if _layer_is_graphable(layer, config)
+            ]
+            expected_layers.extend(decoder_layers)
+            expected_mtp.extend([False] * len(decoder_layers))
             for depth in getattr(getattr(module, "mtp", None), "layers", []):
-                nested_layers = _get_mtp_te_layers(depth.mtp_model_layer)
+                nested_layers = [
+                    layer
+                    for layer in _get_mtp_te_layers(depth.mtp_model_layer)
+                    if _layer_is_graphable(layer, config)
+                ]
                 expected_layers.extend(nested_layers)
                 expected_mtp.extend([True] * len(nested_layers))
         assert graph_helper.flattened_callables == expected_layers and expected_layers
@@ -184,6 +198,9 @@ def _run_te_pipeline_training(models, groups, pp_size, use_graph):
                 pg_collection=groups,
             )
             torch.cuda.synchronize()
+            if recompute_rebuilds is not None:
+                recompute_rebuilds.append(_count_recompute_rebuilds.count)
+                _count_recompute_rebuilds.count = 0
             assert gradients_seen == parameters.keys(), (
                 f"Parameters without a gradient in iteration {iteration}: "
                 f"{parameters.keys() - gradients_seen}"
@@ -221,6 +238,111 @@ def _run_te_pipeline_training(models, groups, pp_size, use_graph):
             hook.remove()
         if helper is not None and helper.graphs_created():
             helper.delete_cuda_graphs()
+
+
+class _count_recompute_rebuilds:
+    """Count output-discarding checkpoint rebuilds, i.e. selective recompute regions run."""
+
+    count = 0
+
+    def __init__(self, monkeypatch):
+        rebuild = tensor_parallel_random._RecomputeRegion.rebuild
+
+        def counted_rebuild(region):
+            if region.state in (
+                tensor_parallel_random._RegionState.RECORDED,
+                tensor_parallel_random._RegionState.RELEASED,
+            ):
+                _count_recompute_rebuilds.count += 1
+            return rebuild(region)
+
+        _count_recompute_rebuilds.count = 0
+        monkeypatch.setattr(tensor_parallel_random._RecomputeRegion, "rebuild", counted_rebuild)
+
+
+def _copy_parameters(source_models, target_models):
+    source_parameters = _named_parameters(source_models)
+    target_parameters = _named_parameters(target_models)
+    assert source_parameters.keys() == target_parameters.keys()
+    with torch.no_grad():
+        for name, parameter in target_parameters.items():
+            parameter.copy_(source_parameters[name])
+
+
+def _train_eager_reference_and_candidate(model_kind, hidden_dropout, candidate_kwargs, monkeypatch):
+    """Train eager mHC without recompute and a candidate from the same initial state.
+
+    Attention dropout stays zero: hidden dropout is drawn eagerly in both runs, so they
+    consume identical random streams when recomputation replays its forward masks.
+    """
+    parallel_sizes = _initialize_test_parallelism(model_kind, torch.bfloat16)
+    pp_size = parallel_sizes["pp_size"]
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        torch.manual_seed(1234)
+        model_parallel_cuda_manual_seed(1234, te_rng_tracker=True, force_reset_rng=True)
+        common = dict(
+            dropout=hidden_dropout,
+            attention_dropout=0.0,
+            te_graph_modules=[CudaGraphModule.attn],
+            use_te_rng_tracker=True,
+            **parallel_sizes,
+        )
+        reference_models, groups = _build_models(model_kind, torch.bfloat16, "none", **common)
+        candidate_models, _ = _build_models(
+            model_kind, torch.bfloat16, **candidate_kwargs, **common
+        )
+        _copy_parameters(reference_models, candidate_models)
+        initial_rng = _snapshot_rng()
+        expected = _run_te_pipeline_training(reference_models, groups, pp_size, False)
+        _restore_rng(initial_rng)
+        rebuilds = []
+        _count_recompute_rebuilds(monkeypatch)
+        actual = _run_te_pipeline_training(
+            candidate_models,
+            groups,
+            pp_size,
+            candidate_kwargs["graph_impl"] == "transformer_engine",
+            recompute_rebuilds=rebuilds,
+        )
+        # Every training step, including each graph replay step, recomputes mHC regions.
+        assert len(rebuilds) == len(actual) and all(rebuilds), rebuilds
+        _assert_training_close(actual, expected, torch.bfloat16)
+        return candidate_models, groups, actual
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+        destroy_num_microbatches_calculator()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not is_te_min_version("2.10.0"), reason="TE graph reset requires TE >= 2.10")
+@pytest.mark.parametrize("hidden_dropout", [0.0, 0.1])
+@pytest.mark.parametrize(
+    "model_kind", ["gpt_dense", "gpt_moe", "hybrid_dense", "hybrid_mtp", "hybrid_moe_mtp"]
+)
+def test_mhc_te_attention_graph_split_recompute_training_parity(
+    model_kind, hidden_dropout, monkeypatch
+):
+    """Attention-only graphs with selective mHC recompute match eager mHC training."""
+    _train_eager_reference_and_candidate(
+        model_kind,
+        hidden_dropout,
+        dict(graph_impl="transformer_engine", mhc_recompute=True, mhc_attention_graph_split=True),
+        monkeypatch,
+    )
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("model_kind", ["gpt_dense", "hybrid_dense"])
+def test_mhc_recompute_replays_dropout_with_graph_safe_rng(model_kind, monkeypatch):
+    """Eager selective mHC recompute under a graph-safe RNG tracker replays its masks."""
+    _train_eager_reference_and_candidate(
+        model_kind, 0.1, dict(graph_impl="none", mhc_recompute=True), monkeypatch
+    )
 
 
 @pytest.mark.internal

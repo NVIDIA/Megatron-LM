@@ -2,8 +2,7 @@
 
 """Real mHC training parity for the full-iteration graph runner.
 
-The default runs PP1, independently of the mHC pipeline-support PR. After that
-PR is present, the same tests exercise PP2/VPP2 without changing validation:
+The default runs PP1. The same tests exercise PP2/VPP2 without changing validation:
 
     MHC_CG_PP_SIZE=2 MHC_CG_VP_SIZE=2 torchrun --nproc-per-node=4 -m pytest \
         tests/unit_tests/transformer/test_mhc_full_iteration_training.py
@@ -94,6 +93,10 @@ def _build_models(
     tp_size=1,
     cp_size=1,
     ep_size=1,
+    mhc_recompute=False,
+    mhc_attention_graph_split=False,
+    attention_dropout=None,
+    use_te_rng_tracker=None,
 ):
     is_hybrid = model_kind.startswith("hybrid")
     is_moe = "moe" in model_kind
@@ -124,11 +127,16 @@ def _build_models(
         use_fused_mhc=True,
         cuda_graph_impl=graph_impl,
         cuda_graph_modules=te_graph_modules if graph_impl == "transformer_engine" else [],
-        use_te_rng_tracker=graph_impl == "transformer_engine",
+        use_te_rng_tracker=(
+            graph_impl == "transformer_engine" if use_te_rng_tracker is None else use_te_rng_tracker
+        ),
         cuda_graph_warmup_steps=_WARMUP_STEPS,
+        recompute_granularity="selective" if mhc_recompute else None,
+        recompute_modules=["mhc"] if mhc_recompute else None,
+        mhc_recompute_attn_cuda_graph_split=mhc_attention_graph_split,
         attention_backend=AttnBackend.fused if cp_size > 1 else AttnBackend.unfused,
         cp_comm_type="p2p" if cp_size > 1 else None,
-        attention_dropout=dropout,
+        attention_dropout=dropout if attention_dropout is None else attention_dropout,
         hidden_dropout=dropout,
         normalization="RMSNorm",
         add_bias_linear=False,

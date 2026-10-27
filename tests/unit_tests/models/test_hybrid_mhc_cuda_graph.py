@@ -25,6 +25,7 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel import random as tensor_parallel_random
 from megatron.core.tensor_parallel.random import (
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
@@ -120,7 +121,31 @@ def _expected_mhc_backend_calls(fused):
     return expected
 
 
-def _config(kind, scopes, fused=False, tp=1, cp=1, ep=1):
+_ATTENTION_GRAPH_SPLIT = dict(
+    recompute_granularity='selective',
+    recompute_modules=['mhc'],
+    mhc_recompute_attn_cuda_graph_split=True,
+)
+
+
+def _count_recompute_rebuilds(monkeypatch):
+    """Count checkpoint regions that actually re-run in backward."""
+    rebuilds = Counter()
+    rebuild = tensor_parallel_random._RecomputeRegion.rebuild
+
+    def counted_rebuild(region):
+        if region.state in (
+            tensor_parallel_random._RegionState.RECORDED,
+            tensor_parallel_random._RegionState.RELEASED,
+        ):
+            rebuilds['rebuild'] += 1
+        return rebuild(region)
+
+    monkeypatch.setattr(tensor_parallel_random._RecomputeRegion, 'rebuild', counted_rebuild)
+    return rebuilds
+
+
+def _config(kind, scopes, fused=False, tp=1, cp=1, ep=1, **overrides):
     moe = 'moe' in kind
     return TransformerConfig(
         num_layers=2,
@@ -162,6 +187,7 @@ def _config(kind, scopes, fused=False, tp=1, cp=1, ep=1):
         mamba_state_dim=16,
         mamba_head_dim=32,
         mamba_num_groups=1,
+        **overrides,
     )
 
 
@@ -266,6 +292,58 @@ class TestMHCTEGraphs:
                 **{input_name: unsupported},
             )
 
+    @pytest.mark.parametrize('kind', ['gpt', 'gpt_moe', 'hybrid', 'hybrid_moe_mtp'])
+    @pytest.mark.parametrize('fused', [False, True])
+    def test_attention_graph_split_with_mhc_recompute(self, kind, fused, monkeypatch):
+        self._run(kind, [CudaGraphModule.attn], fused, monkeypatch, **_ATTENTION_GRAPH_SPLIT)
+
+    @pytest.mark.parametrize('kind', ['gpt_moe', 'hybrid_moe_mtp'])
+    def test_attention_graph_split_boundary(self, kind):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
+        config = _config(kind, [CudaGraphModule.attn], **_ATTENTION_GRAPH_SPLIT)
+        model = _model(kind, config, ProcessGroupCollection.use_mpu_process_groups())
+        layers = list(model.decoder.layers)
+        for mtp in getattr(getattr(model, 'mtp', None), 'layers', []):
+            layers.extend(_get_mtp_te_layers(mtp.mtp_model_layer))
+        graphable = [layer for layer in layers if _layer_is_graphable(layer, config)]
+        assert graphable
+        for layer in layers:
+            if isinstance(layer, HyperConnectionHybridLayer):
+                has_attention = layer._is_attention_graph_split()
+                assert has_attention == (layer in graphable)
+                attention_layer, hyper_connections = layer.inner_layer, [layer.hyper_connection]
+            else:
+                assert layer in graphable
+                attention_layer = layer
+                hyper_connections = [
+                    layer.self_attention_hyper_connection,
+                    layer.mlp_hyper_connection,
+                ]
+            if layer not in graphable:
+                continue
+            static_inputs = layer.get_layer_static_inputs(16, 2)
+            assert set(static_inputs) == {'hidden_states', 'attention_mask'}
+            assert static_inputs['hidden_states'].shape == (16, 2, config.hidden_size)
+            covered = {
+                id(module)
+                for submodule in layer._get_submodules_under_cudagraphs()
+                for module in submodule.modules()
+            }
+            assert id(attention_layer.input_layernorm) in covered
+            assert id(attention_layer.self_attention) in covered
+            for hyper_connection in hyper_connections:
+                assert not {id(module) for module in hyper_connection.modules()} & covered
+
+    def test_attention_graph_split_rejects_compound_hybrid_layer(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
+        config = _config('hybrid', [CudaGraphModule.attn], **_ATTENTION_GRAPH_SPLIT)
+        spec = get_gpt_layer_with_transformer_engine_spec()
+        inner = TransformerLayer(config, spec.submodules)
+        with pytest.raises(NotImplementedError, match='attention-only inner layers'):
+            HyperConnectionHybridLayer(config, inner)
+
     @pytest.mark.parametrize('kind', ['hybrid_moe_mtp', 'gpt_moe'])
     def test_parallel_capture_replay(self, kind, monkeypatch):
         self._run(
@@ -278,7 +356,7 @@ class TestMHCTEGraphs:
             ep=2,
         )
 
-    def _run(self, kind, scopes, fused, monkeypatch, tp=1, cp=1, ep=1):
+    def _run(self, kind, scopes, fused, monkeypatch, tp=1, cp=1, ep=1, **overrides):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp,
             pipeline_model_parallel_size=1,
@@ -287,8 +365,15 @@ class TestMHCTEGraphs:
             expert_tensor_parallel_size=tp,
         )
         model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
+        attention_graph_split = overrides.get('mhc_recompute_attn_cuda_graph_split', False)
+        reference_overrides = {
+            name: value
+            for name, value in overrides.items()
+            if name != 'mhc_recompute_attn_cuda_graph_split'
+        }
         expected_backend_calls = _expected_mhc_backend_calls(fused)
         backend_calls = _record_mhc_backend_calls(monkeypatch)
+        rebuilds = _count_recompute_rebuilds(monkeypatch)
         init_num_microbatches_calculator(
             rank=0,
             global_batch_size=2,
@@ -297,9 +382,9 @@ class TestMHCTEGraphs:
             decrease_batch_size_if_needed=False,
         )
         pg = ProcessGroupCollection.use_mpu_process_groups()
-        config = _config(kind, scopes, fused, tp, cp, ep)
+        config = _config(kind, scopes, fused, tp, cp, ep, **overrides)
         graphed = _model(kind, config, pg)
-        reference = _model(kind, _config(kind, None, fused, tp, cp, ep), pg)
+        reference = _model(kind, _config(kind, None, fused, tp, cp, ep, **reference_overrides), pg)
         reference.load_state_dict(graphed.state_dict(), strict=True)
         optimizer = torch.optim.SGD(graphed.parameters(), lr=0.01)
         reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
@@ -359,12 +444,18 @@ class TestMHCTEGraphs:
         expected = [layer for layer in expected if _layer_is_graphable(layer, config)]
         assert self.helper.flattened_callables == expected and expected
         if 'mtp' in kind:
-            assert sum(self.helper.flattened_callables_is_mtp) == 4
+            # Two MTP depths of two layers each; only attention layers are graphed in the split.
+            assert sum(self.helper.flattened_callables_is_mtp) == (
+                2 if attention_graph_split else 4
+            )
         self.helper.create_cudagraphs()
         assert self.helper.graphs_created()
         # Python dispatch runs when recording a CUDA graph, not on its replay.
         # Counting capture separately prevents eager warmup from proving this.
-        assert set(backend_calls['capture']) == expected_backend_calls, backend_calls
+        # The attention graph split captures no mHC operation at all.
+        assert set(backend_calls['capture']) == (
+            set() if attention_graph_split else expected_backend_calls
+        ), backend_calls
         print(f'mHC fused={fused}; captured backend calls: {dict(backend_calls["capture"])}')
         assert all(layer.cuda_graphs for layer in expected)
         assert set(graphed.state_dict()) == initial_keys
@@ -379,6 +470,20 @@ class TestMHCTEGraphs:
             for module in submodule.modules()
             if next(module.parameters(recurse=False), None) is not None
         }
+        if attention_graph_split:
+            hyper_connections = [
+                module
+                for layer in expected
+                for module in (
+                    [layer.hyper_connection]
+                    if isinstance(layer, HyperConnectionHybridLayer)
+                    else [layer.self_attention_hyper_connection, layer.mlp_hyper_connection]
+                )
+            ]
+            assert (
+                not {id(module) for hc in hyper_connections for module in hc.modules()}
+                & covered_modules
+            )
         for layer in expected:
             if isinstance(layer, HyperConnectionHybridLayer) and layer._is_partial_moe_graph():
                 assert (
@@ -401,7 +506,13 @@ class TestMHCTEGraphs:
             set_current_microbatch(graphed, index)
             assert all(layer.current_microbatch == index for layer in expected)
             expected_output, expected_input_grad, expected_grads = step(reference, value)
+            backend_calls['eager'].clear()
+            rebuilds.clear()
             actual_output, actual_input_grad, actual_grads = step(graphed, value)
+            if attention_graph_split:
+                # mHC runs eagerly around the replayed graphs, and its recompute regions re-run.
+                assert expected_backend_calls <= set(backend_calls['eager']), backend_calls
+                assert rebuilds['rebuild'] > 0
             torch.testing.assert_close(actual_output, expected_output, rtol=2e-2, atol=2e-3)
             torch.testing.assert_close(actual_input_grad, expected_input_grad, rtol=2e-2, atol=2e-3)
             assert actual_grads.keys() == expected_grads.keys()
@@ -466,6 +577,49 @@ def test_mhc_graph_combination_guards(impl, extra, error):
             cuda_graph_impl=impl,
             **extra,
         )
+
+
+def _split_config(**overrides):
+    kwargs = dict(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        enable_mhc_connections=True,
+        cuda_graph_impl='transformer_engine',
+        cuda_graph_modules=['attn'],
+        **_ATTENTION_GRAPH_SPLIT,
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+@pytest.mark.launch_on_gb200
+def test_mhc_attention_graph_split_config_admits_selective_mhc_recompute():
+    config = _split_config()
+    assert config.cuda_graph_modules == [CudaGraphModule.attn]
+    assert config.recompute_modules == ['mhc']
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize(
+    'overrides,error',
+    [
+        ({'enable_mhc_connections': False, 'recompute_modules': []}, 'enable_mhc_connections'),
+        ({'cuda_graph_impl': 'full_iteration', 'cuda_graph_modules': []}, 'transformer_engine'),
+        ({'cuda_graph_modules': ['attn', 'mlp']}, 'cuda_graph_modules'),
+        ({'recompute_modules': ['core_attn']}, "'mhc' in recompute_modules"),
+        ({'recompute_modules': ['mhc', 'layernorm']}, 'supports recompute_modules'),
+    ],
+)
+def test_mhc_attention_graph_split_config_requirements(overrides, error):
+    with pytest.raises(ValueError, match=error):
+        _split_config(**overrides)
+
+
+@pytest.mark.launch_on_gb200
+def test_mhc_te_graphs_reject_mhc_recompute_without_the_split():
+    with pytest.raises(NotImplementedError, match='mhc_recompute_attn_cuda_graph_split'):
+        _split_config(mhc_recompute_attn_cuda_graph_split=False)
 
 
 @pytest.mark.launch_on_gb200
