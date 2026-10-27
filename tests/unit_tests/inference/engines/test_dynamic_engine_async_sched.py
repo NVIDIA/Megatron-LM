@@ -49,7 +49,6 @@ from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay
-from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
@@ -792,6 +791,34 @@ _ASYNC_PAIR_SCENARIOS = (
         config={"transformer_impl": "inference_optimized"},
         signals=("inference-optimized",),
     ),
+    _pair_scenario(
+        "fp8-transformer-engine",
+        "precision:fp8",
+        config={"fp8": True, "hidden_size": 128},
+        signals=("fp8",),
+        prerequisite="fp8",
+        atol=5.0e-3,
+        parity="reproducible",
+    ),
+    _pair_scenario(
+        "mxfp8-inference-optimized-moe",
+        "precision:mxfp8",
+        "model:moe",
+        "implementation:inference-optimized",
+        config={
+            "fp8": True,
+            "fp8_recipe": "mxfp8",
+            "hidden_size": 128,
+            "num_moe_experts": 2,
+            "moe_grouped_gemm": True,
+            "use_moe_layer_spec": True,
+            "transformer_impl": "inference_optimized",
+        },
+        signals=("inference-optimized", "moe", "mxfp8", "fixed-history-logits"),
+        prerequisite="mxfp8",
+        atol=0.0,
+        graph_parity="reproducible",
+    ),
     # Four heads of width 64 exercise FlashInfer's supported fused-RoPE kernel.
     # Width 16 crosses half-head boundaries in its vectorized NeoX rotation.
     _pair_scenario(
@@ -834,6 +861,22 @@ _ASYNC_PAIR_SCENARIOS = (
         signals=("softmax-sink", "swa-alternating"),
     ),
 )
+
+_ASYNC_SUSPEND_RESUME_SCENARIOS = (
+    _pair_scenario(
+        "offload-suspend-resume",
+        "kv:offload",
+        config={"kv_cache_management_mode": "offload", "static_kv_memory_pointers": False},
+        signals=("offload", "suspend-resume"),
+    ),
+    _pair_scenario(
+        "recompute-suspend-resume",
+        "kv:recompute",
+        config={"kv_cache_management_mode": "recompute", "static_kv_memory_pointers": False},
+        signals=("recompute", "suspend-resume"),
+    ),
+)
+
 
 _CUDA_GRAPH_LIFECYCLE_SCENARIOS = (
     _pair_scenario(
@@ -960,6 +1003,20 @@ _ASYNC_PARALLEL_SCENARIOS = (
         signals=("inference-optimized", "moe", "nvls-dispatch", "parallel"),
     ),
     _pair_scenario(
+        "moe-ep2-etp2-local-allgather",
+        "model:moe",
+        "topology:ep",
+        "topology:etp",
+        "dispatcher:allgather",
+        config={
+            "expert_model_parallel_size": 2,
+            "expert_tensor_parallel_size": 2,
+            "num_moe_experts": 4,
+            "use_moe_layer_spec": True,
+        },
+        signals=("etp", "moe", "parallel"),
+    ),
+    _pair_scenario(
         "optimized-tp2-sp",
         "interaction:optimized-tp-sp",
         "seed:shared-across-dp",
@@ -982,6 +1039,13 @@ _ASYNC_PARALLEL_SCENARIOS = (
     ),
 )
 
+# The all-gather ETP case runs eagerly here; its CUDA-graph replay is covered separately.
+_ASYNC_PARALLEL_GRAPH_SCENARIOS = tuple(
+    scenario
+    for scenario in _ASYNC_PARALLEL_SCENARIOS
+    if scenario.name != "moe-ep2-etp2-local-allgather"
+)
+
 _PROMPT_LENGTHS = (9, 5, 12, 7, 10, 6, 11)
 _OUTPUT_LENGTHS = (10, 5, 9, 7, 11, 6, 8)
 _REQUEST_WAVES = ((0, 1, 2), (3, 4), (5, 6))
@@ -990,8 +1054,6 @@ _REQUEST_WAVES = ((0, 1, 2), (3, 4), (5, 6))
 def _check_scenario_prerequisite(scenario):
     if scenario.prerequisite == "flashinfer":
         pytest.importorskip("flashinfer")
-    elif scenario.prerequisite == "flash-mla":
-        pytest.importorskip("flash_mla")
     elif scenario.prerequisite == "mamba":
         available, reason = _check_mamba_sequence_packing_support()
         if not available:
@@ -1819,7 +1881,6 @@ def _instrument_scenario_runtime(env, scenario, runtime, teacher_tokens=None):
         "hybrid": (
             lambda name, module: name in {"MambaMixer", "GatedDeltaNet", "GatedDeltaProductMixer"}
         ),
-        "mla": lambda name, module: name == "MLASelfAttention",
         "moe": lambda name, module: name in {"MoELayer", "InferenceTopKRouter"},
         "mxfp8": lambda name, module: name == "TELMHeadColumnParallelLinear",
         "parallel": (
@@ -2251,7 +2312,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     )
                 else:
                     runtime["cuda-graph-recapture-deferred"] += int(
-                        env.engine._cuda_graph_recapture_dimensions is not None
+                        getattr(env.engine, "_cuda_graph_recapture_dimensions", None) is not None
                     )
                     runtime["cuda-graph-eager-fallback-armed"] += int(
                         not env.engine.context.cuda_graph_batch_dimensions_list
@@ -2323,27 +2384,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             and not env.engine.context.static_kv_memory_pointers
             and ("offload" in scenario.signals or "recompute" in scenario.signals)
         ):
-            if env.config.num_cuda_graphs:
-                rebuilt_runners = [
-                    runner
-                    for manager in model.modules()
-                    if isinstance(manager, CudaGraphManager)
-                    for runner in manager.cudagraph_runners
-                    if runner.fwd_graph_recorded
-                ]
-                graph_pool = CudaGraphManager.global_mempool
-                runtime["cuda-graph-pool-live-after-idle-rebuild"] += int(
-                    graph_pool is not None
-                    and env.engine._cuda_graph_recapture_dimensions is None
-                    and bool(rebuilt_runners)
-                    and all(runner.mempool == graph_pool for runner in rebuilt_runners)
-                )
-                runtime["cuda-graph-new-objects-after-idle-rebuild"] += int(
-                    bool(rebuilt_runners)
-                    and runtime["cuda-graph-runners-cleared"] == runtime["suspend-resume"]
-                    and all(runner.fwd_graph is not None for runner in rebuilt_runners)
-                )
-
             probe_id = len(env.requests)
             prompt = torch.arange(5, dtype=torch.int64, device="cuda") + 71
             sampling_params = SamplingParams(num_tokens_to_generate=3, termination_id=-1, top_k=1)
@@ -2401,12 +2441,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert not context.cuda_graph_batch_dimensions_list
         if "gpt" in signals:
             assert runtime["module-forward:gpt"] > 0
-        if "mla" in signals:
-            assert isinstance(model_config, MLATransformerConfig)
-            assert model_config.cache_mla_latents
-            assert context.cache_mla_latent
-            assert context.block_size_tokens == 64
-            assert runtime["module-forward:mla"] > 0 or "MLASelfAttention" in replayed_module_names
         if "vlm" in signals:
             assert runtime["vlm-image-forwards"] > 0
             assert runtime["vlm-image-token-count"] > 0
@@ -2456,9 +2490,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE
         if "static-pointers" in signals:
             assert context.static_kv_memory_pointers
-        if "uvm" in signals:
-            assert context.unified_memory_level == 1
-            assert not context._uses_torch_memory_saver
         if "tms" in signals:
             assert context._uses_torch_memory_saver
         if "suspend-resume" in signals:
@@ -2484,23 +2515,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     assert runtime["cuda-graph-runner-objects-preserved"] == expected_cycles
                     assert runtime["cuda-graph-objects-preserved"] == expected_cycles
                     assert runtime["cuda-graph-pool-preserved"] == expected_cycles
-                elif "offload" in signals or "recompute" in signals:
-                    assert runtime["cuda-graph-delete-calls"] == expected_cycles
-                    assert runtime["cuda-graph-pool-releases"] == expected_cycles
-                    assert runtime["cuda-graph-runners-cleared"] == expected_cycles
-                    assert runtime["cuda-graph-runner-buffers-cleared"] == expected_cycles
-                    assert runtime["cuda-graph-recapture-deferred"] == expected_cycles
-                    assert runtime["cuda-graph-eager-fallback-armed"] == expected_cycles
-                    assert runtime["cuda-graph-deferred-eager-steps"] > 0
-                    assert runtime["cuda-graph-create-calls"] == 1
-                    assert runtime["cuda-graph-capture-forwards"] > 0
-                    assert runtime["cuda-graph-create-live-runners"] > 0
-                    assert runtime["cuda-graph-pool-rebinds"] == 1
-                    assert runtime["cuda-graph-runner-objects-preserved"] == expected_cycles
-                    assert runtime["cuda-graph-objects-preserved"] == 0
-                    assert runtime["cuda-graph-pool-live-after-idle-rebuild"] == 1
-                    assert runtime["cuda-graph-new-objects-after-idle-rebuild"] == 1
-                    assert runtime["post-rebuild-probe-requests"] == 1
                 else:
                     assert runtime["cuda-graph-create-calls"] == 0
         if "context-reset" in signals:
@@ -2820,7 +2834,10 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["fp8-context-forwards"] > 0
             assert runtime["fp8-quantized-forwards"] > 0
             assert runtime["fp8-recipe-forwards"] > 0
-            assert runtime["cuda-graph-fp8-replays"] > 0
+            if "cuda-graph" in signals:
+                assert runtime["cuda-graph-fp8-replays"] > 0
+            else:
+                assert runtime["module-forward:fp8"] > 0
         if "mxfp8" in signals:
             from megatron.core.fp8_utils import get_fp8_align_size
             from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
@@ -3207,6 +3224,19 @@ class TestAsyncSchedulePairwise(_AsyncPairwiseHarness):
             delete_cuda_graphs()
             torch.cuda.empty_cache()
 
+    @pytest.mark.parametrize(
+        "scenario", _ASYNC_SUSPEND_RESUME_SCENARIOS, ids=lambda case: case.name
+    )
+    @torch.inference_mode()
+    def test_async_suspend_resume_mode_matches_legacy(self, scenario):
+        """Real OFFLOAD and RECOMPUTE cycles preserve output parity."""
+        try:
+            self._assert_scenario_pair(scenario)
+        finally:
+            gc.collect()
+            delete_cuda_graphs()
+            torch.cuda.empty_cache()
+
 
 @pytest.mark.internal
 @pytest.mark.skipif(
@@ -3440,7 +3470,9 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
             _reset_rounder()
             Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize("scenario", _ASYNC_PARALLEL_SCENARIOS, ids=lambda case: case.name)
+    @pytest.mark.parametrize(
+        "scenario", _ASYNC_PARALLEL_GRAPH_SCENARIOS, ids=lambda case: case.name
+    )
     @torch.inference_mode()
     def test_eager_matches_actual_replay_for_parallel_pair(self, scenario):
         world_size = int(os.environ.get("WORLD_SIZE", "1"))

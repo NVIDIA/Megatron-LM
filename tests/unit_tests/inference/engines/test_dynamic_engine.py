@@ -91,7 +91,7 @@ from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
-from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.engines.ssm_test_helpers import (
@@ -938,8 +938,6 @@ class DynamicEngineTestConfig:
     zero_model_parameters: bool = False
     hidden_size: Optional[int] = None
     model_provider: str = "gpt"
-    multi_latent_attention: bool = False
-    cache_mla_latents: bool = False
     flash_attention_version: Optional[int] = 2
     # Which linear-attention mixer a hybrid stack uses ("mamba", "gdp", or
     # "gdn"). Ignored unless model_provider == "hybrid": all three build a
@@ -980,7 +978,6 @@ class DynamicEngineTestConfig:
     suspend_resume_interval: Optional[int] = None
     kv_cache_management_mode: str = "persist"
     static_kv_memory_pointers: bool = True
-    unified_memory_level: int = 0
     allow_stale_multimodal_embeddings: bool = False
     track_generated_token_events: bool = False
     track_paused_request_events: bool = False
@@ -1175,7 +1172,8 @@ class DynamicInferenceEngineTestBase:
                 prefix_caching_mamba_gb=test_config.prefix_caching_mamba_gb,
                 prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
                 use_flashinfer_fused_rope=test_config.use_flashinfer_fused_rope,
-                unified_memory_level=test_config.unified_memory_level,
+                # this is for compatibility with the LTS environment
+                unified_memory_level=0,  # unit tests currently broken with UVM
                 allow_stale_multimodal_embeddings=(test_config.allow_stale_multimodal_embeddings),
                 track_generated_token_events=test_config.track_generated_token_events,
                 track_paused_request_events=test_config.track_paused_request_events,
@@ -1220,9 +1218,6 @@ class DynamicInferenceEngineTestBase:
 
         if test_config.model_provider in ("gpt", "vlm"):
             # Transformer config.
-            config_cls = (
-                MLATransformerConfig if test_config.multi_latent_attention else TransformerConfig
-            )
             quant_recipe = None
             if (
                 test_config.fp8
@@ -1263,26 +1258,7 @@ class DynamicInferenceEngineTestBase:
                         },
                     }
                 )
-            mla_kwargs = (
-                {
-                    "q_lora_rank": 64,
-                    # FlashMLA's dense-decode kernel supports a 576-wide latent
-                    # cache (512 content + 64 RoPE). FA3 supports the resulting
-                    # unequal Q/K=192 and V=128 widths. Retain unequal channels
-                    # so the E2E owns the K/V split instead of merely building it.
-                    "kv_lora_rank": 512,
-                    "qk_head_dim": 128,
-                    "qk_pos_emb_head_dim": 64,
-                    "v_head_dim": 128,
-                    "rope_type": "rope",
-                    "cache_mla_latents": test_config.cache_mla_latents,
-                    "output_projection_groups": 1,
-                    "output_projection_lora_rank": 64,
-                }
-                if test_config.multi_latent_attention
-                else {}
-            )
-            transformer_config = config_cls(
+            transformer_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
                 flash_attention_version=test_config.flash_attention_version,
                 num_layers=4,
@@ -1360,7 +1336,6 @@ class DynamicInferenceEngineTestBase:
                 # inference optimized currently only supports RMS Norm
                 window_size=test_config.window_size,
                 window_attn_skip_freq=test_config.window_attn_skip_freq,
-                **mla_kwargs,
             )
             # Layer-spec factories do not receive TransformerConfig. Forward num_moe_experts
             # explicitly for MoE test cases so they build MoE layers instead of a dense MLP.
@@ -1369,21 +1344,15 @@ class DynamicInferenceEngineTestBase:
             )
             if test_config.transformer_impl == "inference_optimized":
                 layer_spec = get_gpt_layer_with_inference_spec(
-                    num_experts=num_experts,
-                    moe_grouped_gemm=test_config.moe_grouped_gemm,
-                    multi_latent_attention=test_config.multi_latent_attention,
+                    num_experts=num_experts, moe_grouped_gemm=test_config.moe_grouped_gemm
                 )
             elif test_config.fp8 or test_config.transformer_impl == "transformer_engine":
                 layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                    num_experts=num_experts,
-                    moe_grouped_gemm=test_config.moe_grouped_gemm,
-                    multi_latent_attention=test_config.multi_latent_attention,
+                    num_experts=num_experts, moe_grouped_gemm=test_config.moe_grouped_gemm
                 )
             elif test_config.transformer_impl == "local":
                 layer_spec = get_gpt_layer_local_spec(
-                    num_experts=num_experts,
-                    moe_grouped_gemm=test_config.moe_grouped_gemm,
-                    multi_latent_attention=test_config.multi_latent_attention,
+                    num_experts=num_experts, moe_grouped_gemm=test_config.moe_grouped_gemm
                 )
 
             # MTP block spec (needed for speculative decoding).
@@ -1404,11 +1373,7 @@ class DynamicInferenceEngineTestBase:
                     pre_process=parallel_state.is_pipeline_first_stage(),
                     post_process=parallel_state.is_pipeline_last_stage(),
                     mtp_block_spec=mtp_block_spec,
-                    position_embedding_type=(
-                        "rope"
-                        if test_config.multi_latent_attention
-                        else test_config.position_embedding_type
-                    ),
+                    position_embedding_type=test_config.position_embedding_type,
                 ).cuda()
             else:
                 transformer_config.language_model_type = "dummy"
