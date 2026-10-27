@@ -703,6 +703,9 @@ class NcclP2PTransport(ReplicaWeightTransport):
                     index for route in schedule.sends for index in route.home_indices
                 )
             )
+            gradient_sources = sorted(
+                (*schedule.sends, schedule.local), key=lambda route: route.peer
+            )
             for projection in projections:
                 native = native_grads[projection].tensors
                 replicas = self._replica_grads[projection]
@@ -716,12 +719,20 @@ class NcclP2PTransport(ReplicaWeightTransport):
                     receives = self._chunk_exchange(
                         schedule, replicas, offset, count, self.grad_dtype, reverse=True
                     )
-                    for index, slot in zip(
-                        schedule.local.home_indices, schedule.local.replica_slots
-                    ):
-                        accum[index].add_(replicas[slot].view(-1)[offset : offset + count])
-                    for route in schedule.sends:
-                        for row, index in zip(receives[route.peer], route.home_indices):
+                    # Match Peer-TMA's native + source-rank/slot order. Local
+                    # replicas are ordinary sources: adding them first changes
+                    # FP32 rounding when a lower-ranked remote source cancels
+                    # the accumulated native gradient.
+                    for route in gradient_sources:
+                        rows = (
+                            (
+                                replicas[slot].view(-1)[offset : offset + count]
+                                for slot in route.replica_slots
+                            )
+                            if route.peer == self.rank
+                            else receives[route.peer]
+                        )
+                        for row, index in zip(rows, route.home_indices):
                             accum[index].add_(row)
                     for index in touched:
                         native[index].view(-1)[offset : offset + count].copy_(accum[index])

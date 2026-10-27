@@ -781,3 +781,46 @@ def _mx_dense(shape, expert, device):
     return (((rows * 11 + cols * 7 + expert * 3) % 37 - 18) / 16 * (1 + expert / 8)).to(
         torch.bfloat16
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("backend", ["replica_nccl", "replica_peer_tma"])
+def test_gradients_follow_canonical_source_order(ep_group, dtype, backend):
+    """Cancellation makes local-first reduction observably wrong, even in FP32."""
+    if dist.get_world_size(ep_group) < 2:
+        pytest.skip("Requires both a local and a lower-ranked remote replica.")
+    config = replace(_config(ep_group, dtype), member_shapes=((16, 16), (16, 16)), num_sms=4)
+    rank = dist.get_rank(ep_group)
+    # Rank1 owns expert2. Rank0 has two copies, and rank1 one local copy.
+    table = [[-1] * 4 for _ in range(config.world_size)]
+    table[0][:2] = [2, 2]
+    table[1][0] = 2
+    transport = create_replica_weight_transport(backend, config)
+    try:
+        plan = transport.prepare_plan(_placement(config, table))
+        native = _native_grads(config)
+        destinations = tuple(ReplicaGradDestination(tuple(tensor)) for tensor in native)
+        for projection, tensor in enumerate(native):
+            tensor.fill_(7)
+            if rank == 1:
+                tensor[0].fill_(2**24)
+            _, replicas = transport.projection_views(projection)
+            replicas.fill_(float("nan"))
+            if rank == 0:
+                replicas[0].fill_(-(2**24))
+                replicas[1].fill_(2)
+            elif rank == 1:
+                replicas[0].fill_(1)
+        handle = transport.start_grad_reduce(
+            native_grads=destinations, plan=plan, projections=(0, 1)
+        )
+        transport.wait_grad_reduce(handle)
+        for tensor in native:
+            expected = torch.full_like(tensor, 7)
+            if rank == 1:
+                # (2**24 - 2**24) + 2 + 1 = 3 in canonical rank/slot order.
+                # The former local-first order loses the +1 and returns2.
+                expected[0].fill_(3)
+            torch.testing.assert_close(tensor, expected, rtol=0, atol=0)
+    finally:
+        transport.destroy()
