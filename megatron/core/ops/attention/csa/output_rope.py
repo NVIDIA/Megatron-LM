@@ -138,11 +138,11 @@ def _raw_output_rope(
         batch_size = None
         seq_num = cu_seqlens_q.numel() - 1
     if x.stride(-1) != 1 or x.shape[-1] != nope_dim + emb_dim:
-        raise ValueError('Output RoPE requires contiguous head dimensions.')
+        raise ValueError("Output RoPE requires contiguous head dimensions.")
     kernel = (
         _autotuned_mla_rope_bwd_inplace_kernel if undo else _autotuned_mla_rope_fwd_inplace_kernel
     )
-    grid = lambda meta: (x.shape[0], triton.cdiv(x.shape[1], meta['BLOCK_H']))
+    grid = lambda meta: (x.shape[0], triton.cdiv(x.shape[1], meta["BLOCK_H"]))
     kernel[grid](
         x,
         cos,
@@ -202,7 +202,7 @@ def mla_rope_unapply_raw(
             undo=True,
         )
     if out.shape != t.shape or out.stride() != t.stride() or out.dtype != t.dtype:
-        raise ValueError('Output reconstruction requires matching tensor metadata.')
+        raise ValueError("Output reconstruction requires matching tensor metadata.")
     if cu_seqlens_q is None:
         _, batch_size, nheads, head_dim = t.shape
         x, y = t.view(-1, nheads, head_dim), out.view(-1, nheads, head_dim)

@@ -145,7 +145,8 @@ def _csa_fwd_flash_mla(
             lse_indexer = None
 
     if padded_num_heads != actual_num_heads:
-        out = out[:, :actual_num_heads, :]
+        # Reconstruction uses the same strides for saved output and its private destination.
+        out = out[:, :actual_num_heads, :].contiguous()
         lse = lse[:, :actual_num_heads]
         if lse_indexer is not None:
             lse_indexer = lse_indexer[:, :actual_num_heads]
