@@ -2144,12 +2144,16 @@ def pretrain(
 
         print_datetime('after training is done')
 
+        # Without a periodic interval the end of training is the one save of the run.
         if (
             not cfg_container.validation.skip_train
             and cfg_container.checkpoint.save
             and iteration != 0
             and has_iterations_remaining
-            and iteration % cfg_container.checkpoint.save_interval != 0
+            and (
+                not cfg_container.checkpoint.save_interval
+                or iteration % cfg_container.checkpoint.save_interval != 0
+            )
         ):
             save_checkpoint_and_time(
                 iteration,

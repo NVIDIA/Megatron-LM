@@ -764,9 +764,14 @@ class CheckpointConfig:
         """
         return self.ckpt_format != "torch"
 
-    def validate_format_prerequisites(self) -> None:
-        """The checks that used to run at construction, kept apart so that Megatron-Bridge, whose
-        subclass validates in its own ``finalize()``, can keep exactly them. Raises only."""
+    def validate(self) -> None:
+        """Checks that need no other section. Raises only; it neither mutates nor warns.
+
+        Run by ``ConfigContainerBase.validate()`` for the training and the inference container,
+        and by ``validate_args`` right after the entry point's defaults are applied, so a CLI run
+        fails at parse time with the same messages. Megatron-Bridge's subclass runs it from its
+        own ``finalize()``, after its Bridge-only checks: this is the one set of checkpoint rules.
+        """
         from megatron.training.utils import has_nvrx_checkpointing_async_support
 
         assert self.async_strategy in ["nvrx"], \
@@ -789,15 +794,6 @@ class CheckpointConfig:
             assert self.ckpt_format == "torch_dist", \
                 f"`verify_integrity` is only supported with torch_dist checkpoint format."
 
-    def validate(self) -> None:
-        """Checks that need no other section. Raises only; it neither mutates nor warns.
-
-        Run by ``ConfigContainerBase.validate()`` for the training and the inference container,
-        and by ``validate_args`` right after the entry point's defaults are applied, so a CLI run
-        fails at parse time with the same messages. The messages name the CLI flags, as before.
-        """
-        self.validate_format_prerequisites()
-
         if self.ckpt_convert_format is not None:
             assert self.ckpt_convert_save is not None
             assert self.load is not None
@@ -814,12 +810,19 @@ class CheckpointConfig:
             assert self.non_persistent_local_ckpt_dir is not None, \
                 "Tried to use local checkpointing without specifying --local-ckpt-dir!"
 
-        if self.save is not None:
-            assert self.save_interval is not None
-            assert self.save_interval > 0
-            if self.save_retain_interval is not None:
-                assert self.save_retain_interval > 0
-                assert self.save_retain_interval % self.save_interval == 0
+        # A save directory without a periodic interval (None or 0) saves at the end of training and
+        # on the exit paths only; the same rule for both frameworks (Megatron-Bridge's loops read
+        # it this way, Megatron-LM used to require an interval).
+        if self.save_interval is not None:
+            assert self.save_interval >= 0, \
+                "save_interval must be non-negative (None or 0 disables the periodic saves)"
+        if self.save_retain_interval is not None:
+            assert self.save_interval, "save_retain_interval requires a positive save_interval"
+            assert self.save_retain_interval > 0, "save_retain_interval must be positive"
+            assert self.save_retain_interval % self.save_interval == 0, \
+                "save_retain_interval must be divisible by save_interval"
+            assert self.most_recent_k in (None, -1), \
+                "save_retain_interval and most_recent_k cannot be enabled together"
 
         # The PG-distribution cache stores one file per parallelization group, keyed by that
         # group's ordered global ranks, and each file holds both the save and the load
@@ -840,8 +843,10 @@ class CheckpointConfig:
             )
 
         if self.load_main_params_from_ckpt:
-            assert not self.load_optim, \
-                '--load-main-params-from-ckpt must be used with --no-load-optim.'
+            assert not self.load_optim, (
+                'load_main_params_from_ckpt must be used with load_optim=False '
+                '(--load-main-params-from-ckpt with --no-load-optim).'
+            )
 
         if self.stream_ckpt_dequant:
             # Inference-only load path: the loaded state dict holds the re-quantized params

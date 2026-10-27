@@ -165,14 +165,17 @@ def test_projection_round_trips_every_spelling_of_the_aliased_fields(name, alias
     [
         (["--ckpt-convert-format", "torch"], None),
         (["--ckpt-convert-format", "torch", "--ckpt-convert-save", "/c"], None),
-        (["--save", "/s"], None),
-        (["--save", "/s", "--save-interval", "0"], None),
-        (["--save", "/s", "--save-interval", "10", "--save-retain-interval", "15"], None),
+        (["--save-interval", "-1"], "save_interval must be non-negative"),
+        (["--save-retain-interval", "20"], "requires a positive save_interval"),
+        (
+            ["--save", "/s", "--save-interval", "10", "--save-retain-interval", "15"],
+            "divisible by save_interval",
+        ),
         (
             ["--non-persistent-ckpt-type", "local", "--non-persistent-save-interval", "5"],
             "without specifying --local-ckpt-dir",
         ),
-        (["--load-main-params-from-ckpt"], "must be used with --no-load-optim"),
+        (["--load-main-params-from-ckpt"], "must be used with load_optim=False"),
         (["--stream-ckpt-dequant", "--no-load-optim", "--finetune"], "inference-only load path"),
         (
             ["--stream-ckpt-dequant", "--no-load-optim", "--load-main-params-from-ckpt"],
@@ -211,7 +214,16 @@ def test_validate_args_and_the_section_reject_the_same_inputs(argv, match):
 
 
 def test_validation_accepts_what_validate_args_accepted():
-    for argv in ([], CLI_CASE, ["--replication-jump", "2"], ["--async-save"]):
+    # A save directory without a periodic interval (unset or 0) is accepted: it saves at the end
+    # of training and on the exit paths only, as Megatron-Bridge reads it.
+    for argv in (
+        [],
+        CLI_CASE,
+        ["--replication-jump", "2"],
+        ["--async-save"],
+        ["--save", "/s"],
+        ["--save", "/s", "--save-interval", "0"],
+    ):
         args = _validated(*argv)
         checkpoint_config_from_args(args).validate()
         inference_cfg_container_from_args(args, build_model_config=False).validate()
