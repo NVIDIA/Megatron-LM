@@ -36,6 +36,60 @@ class TestDistributedDataParallel:
     def teardown_class(cls):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.parametrize("grad_reduce_in_fp32", [False, True])
+    def test_nvfp4_fused_weight_gradient_alignment(self, grad_reduce_in_fp32):
+        """A small parameter preceding a TE weight must not misalign its main gradient."""
+        te = pytest.importorskip("transformer_engine.pytorch")
+        from transformer_engine.common.recipe import NVFP4BlockScaling
+        from transformer_engine.pytorch.fp8 import check_nvfp4_support
+
+        supported, reason = check_nvfp4_support()
+        if not supported:
+            pytest.skip(reason)
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = te.Linear(
+                    256, 448, bias=False, params_dtype=torch.bfloat16, fuse_wgrad_accumulation=True
+                )
+                self.marker = torch.nn.Linear(2, 1, bias=False, dtype=torch.bfloat16)
+
+            def forward(self, inputs):
+                return self.linear(inputs) + self.marker.weight.sum() * 0
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=1,
+            bf16=True,
+            fp4="e2m1",
+            gradient_accumulation_fusion=True,
+        )
+        model = DistributedDataParallel(
+            config,
+            DistributedDataParallelConfig(grad_reduce_in_fp32=grad_reduce_in_fp32),
+            Model().cuda(),
+        )
+        inputs = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+        recipe = NVFP4BlockScaling(disable_rht=True, disable_stochastic_rounding=True)
+        previous = None
+        for _ in range(2):
+            model.zero_grad_buffer()
+            with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+                loss = model(inputs).float().square().mean()
+            loss.backward()
+            model.finish_grad_sync()
+            grad = model.module.linear.weight.main_grad
+            assert grad.data_ptr() % 16 == 0
+            assert torch.isfinite(grad).all() and torch.count_nonzero(grad) > 0
+            reference = grad.detach().clone()
+            torch.distributed.broadcast(reference, src=0, group=model.dp_cp_group)
+            testing.assert_close(grad, reference, rtol=0, atol=0)
+            if previous is not None:
+                testing.assert_close(grad, previous, rtol=0, atol=0)
+            previous = grad.detach().clone()
+
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),
         reason="Device mesh feature requires PyTorch 2.3 or later",
