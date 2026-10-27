@@ -4378,13 +4378,6 @@ def save_checkpoint_and_time(
                 report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_gtp_remat_group)
         num_checkpoints_memory_reported += 1
 
-        if args.fp8:
-            # Run garbage collection after checkpoint saving to free memory from
-            # dequantized bf16 tensors that were temporarily created during fp8
-            # model checkpoint saving.
-            with _otel_managed_span('checkpoint', 'megatron.checkpoint.gc_collect', is_goodput_span=True):
-                gc.collect()
-
         # timers.log reports min & max across ranks -> a collective. Sitting right
         # after the per-rank-imbalanced save (and outside the save spans), it's a
         # prime spot for the fast ranks to serialize waiting for the slowest saver.
