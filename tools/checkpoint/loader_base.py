@@ -187,6 +187,7 @@ class MegatronCheckpointLoaderBase:
           - consumed_train_samples, consumed_valid_samples
         """
         from megatron.core import mpu
+        from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
         from megatron.training import get_train_state
         from megatron.training.checkpointing import load_checkpoint
 
@@ -195,22 +196,28 @@ class MegatronCheckpointLoaderBase:
         consumed_valid_samples = None
         tp_size = self.margs.tensor_model_parallel_size
         pp_size = self.margs.pipeline_model_parallel_size
-        vp_size = self.margs.virtual_pipeline_model_parallel_size or 1
+        vp_size = self.margs.virtual_pipeline_model_parallel_size
+        # A pipeline stage holds one model chunk per virtual pipeline stage. Without a virtual
+        # pipeline it holds a single chunk, which is built without a virtual stage.
+        vp_stages = list(range(vp_size)) if vp_size is not None else [None]
 
         pg_collection = self.pg_collection
 
         all_models = []  # all_models[pp_rank][vp_rank] = [list of models across TP ranks]
 
         def get_models_for_pipeline_stage(pp_rank, count, dtype):
-            local_models_for_stage = [[] for _ in range(vp_size)]
+            local_models_for_stage = [[] for _ in vp_stages]
             for tp_rank in range(count):
                 pg_collection.tp.set_rank(tp_rank)
                 model_list = []
 
-                for _ in range(vp_size):
+                for vp_stage in vp_stages:
                     this_model = model_provider(
-                        pre_process=pp_rank == 0,
-                        post_process=pp_rank == pp_size - 1,
+                        pre_process=pp_rank == 0 and is_vp_first_stage(vp_stage, vp_size),
+                        post_process=(
+                            pp_rank == pp_size - 1 and is_vp_last_stage(vp_stage, vp_size)
+                        ),
+                        vp_stage=vp_stage,
                         pg_collection=pg_collection,
                     ).to(dtype)
                     model_list.append(this_model)
@@ -244,8 +251,8 @@ class MegatronCheckpointLoaderBase:
                 else:
                     consumed_valid_samples = train_state.consumed_valid_samples
 
-                for vp_rank in range(vp_size):
-                    local_models_for_stage[vp_rank].append(model_list[vp_rank])
+                for vp_rank, this_model in enumerate(model_list):
+                    local_models_for_stage[vp_rank].append(this_model)
 
                 # Print memory usage
                 print_memory_usage("loader", tp_rank, count)
