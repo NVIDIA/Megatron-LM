@@ -166,6 +166,10 @@ def build_inference_pg_collection(
         # `vars()`, so the fallback is not taken.
         gtp_remat=None,
         expt_gtp_remat=None,
+        # With GTP_remat off, the data-parallel groups that include GTP_remat peers are the
+        # replicate groups. SelfAttention's test-mode consistency check reads dp_gtp_remat.
+        dp_gtp_remat=dp_group,
+        dp_cp_gtp_remat=dp_cp_group,
     )
 
 
