@@ -129,9 +129,10 @@ def _build_sharded(
     *,
     param_dtype: torch.dtype | None = None,
     zero_init: bool = False,
-) -> tuple[nn.Module, torch.optim.Optimizer]:
-    """Shard each direct child module and create an optimizer for the model."""
+) -> tuple[nn.Module, torch.optim.Optimizer, dict[str, torch.Size]]:
+    """Shard the model's children and return the model, optimizer, and original global shapes."""
     model = model.to(device=device, dtype=param_dtype)
+    global_shapes = {key: value.shape for key, value in model.state_dict().items()}
     if zero_init:
         # Zero the destination weights so they are obviously different from the saved (trained)
         # source; a correct load must overwrite them.
@@ -144,7 +145,7 @@ def _build_sharded(
     # main_weight is fp32 by default, so a bf16 model feeds the fp32 optimizer bf16 grads; the
     # adapter casts them around each step.
     fully_shard_optimizer(optimizer)
-    return model, optimizer
+    return model, optimizer, global_shapes
 
 
 def _build_tied_sharded(
@@ -272,11 +273,6 @@ def _assert_optimizer_matches_snapshot(
                 assert expected == actual, f"optim[{index}][{key}] scalar mismatch"
 
 
-def _global_shapes(model: nn.Module) -> dict[str, torch.Size]:
-    """Capture expected checkpoint shapes before sharding the model."""
-    return {key: value.shape for key, value in model.state_dict().items()}
-
-
 def _assert_checkpoint_records_global_shapes(
     checkpoint_dir: Path, expected_shapes: dict[str, torch.Size]
 ) -> None:
@@ -315,9 +311,9 @@ def test_checkpoint_roundtrip_default_placements(
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
 
     # Source: train one step so weights and optimizer state are non-trivial, then save.
-    model = _TinyModel()
-    expected_shapes = _global_shapes(model)
-    model, optimizer = _build_sharded(model, mesh, device, param_dtype=param_dtype, zero_init=False)
+    model, optimizer, expected_shapes = _build_sharded(
+        _TinyModel(), mesh, device, param_dtype=param_dtype, zero_init=False
+    )
     _train_one_step(model, optimizer, device, param_dtype=param_dtype)
     model_snapshot, optimizer_snapshot = _snapshot_state(model, optimizer)
 
@@ -328,7 +324,7 @@ def test_checkpoint_roundtrip_default_placements(
         _assert_optimizer_matches_snapshot(optimizer, optimizer_snapshot)
 
         # Destination: zero-initialized, so a correct load is non-trivial.
-        model, optimizer = _build_sharded(
+        model, optimizer, _ = _build_sharded(
             _TinyModel(), mesh, device, param_dtype=param_dtype, zero_init=True
         )
         load_checkpoint(model, optimizer, checkpoint_dir)
@@ -356,9 +352,7 @@ def test_saved_chunks_match_the_stable_path(
     world_size = distributed_setup.world_size
     mesh = init_device_mesh(device.type, (world_size,))
 
-    model = _PackedModel()
-    expected_shapes = _global_shapes(model)
-    model, optimizer = _build_sharded(model, mesh, device)
+    model, optimizer, expected_shapes = _build_sharded(_PackedModel(), mesh, device)
     _train_one_step(
         model, optimizer, device, param_dtype=torch.float32, in_features=4, out_features=16
     )
@@ -398,9 +392,7 @@ def test_saved_chunks_tile_every_parameter(distributed_setup, tmp_path_dist_ckpt
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
 
-    model = _PackedModel()
-    expected_shapes = _global_shapes(model)
-    model, optimizer = _build_sharded(model, mesh, device)
+    model, optimizer, expected_shapes = _build_sharded(_PackedModel(), mesh, device)
     _train_one_step(
         model, optimizer, device, param_dtype=torch.float32, in_features=4, out_features=16
     )
@@ -461,9 +453,7 @@ def test_metadata_attach_issues_no_collectives(
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
 
-    model = _PackedModel()
-    expected_shapes = _global_shapes(model)
-    model, optimizer = _build_sharded(model, mesh, device)
+    model, optimizer, expected_shapes = _build_sharded(_PackedModel(), mesh, device)
     _train_one_step(
         model, optimizer, device, param_dtype=torch.float32, in_features=4, out_features=16
     )
