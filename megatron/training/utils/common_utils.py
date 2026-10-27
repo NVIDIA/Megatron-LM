@@ -11,11 +11,14 @@ from datetime import datetime
 from typing import Optional
 
 import torch
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import DTensor, Shard
 
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
 from megatron.core._slurm_utils import resolve_slurm_local_rank
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    get_containing_parameter_group,
+)
 from megatron.core.msc_utils import maybe_msc
 
 try:
@@ -106,17 +109,13 @@ def calc_params_l2_norm(
     args = get_args()
 
     if getattr(args, 'use_megatron_fsdp', False):
-        from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
-            get_containing_parameter_group,
-        )
-
         params_data = defaultdict(list)
         for model_chunk in model:
             model_chunk.stop_communication()
             for name, param in model_chunk.named_parameters():
                 if trainable_only and not param.requires_grad:
                     continue
-                if hasattr(param, '_local_tensor'):
+                if isinstance(param, DTensor):
                     mesh, placements = param.device_mesh, param.placements
                     local_param = param._local_tensor
                 else:
@@ -314,17 +313,6 @@ def _calc_mimo_params_l2_norm(
     torch.distributed.all_reduce(norm_sq, op=torch.distributed.ReduceOp.MAX)
     total_norm_sq = norm_sq.sum()
     return total_norm_sq if return_squared_tensor else total_norm_sq.sqrt().item()
-
-
-def calc_dtensor_params_l2_norm(params, return_squared_tensor=False):
-    """Calculate l2 norm of DTensor parameters."""
-    params_data = defaultdict(list)
-    for param in params:
-        params_data[param._spec].append(param._local_tensor)
-    return _calc_sharded_params_l2_norm(
-        ((spec.device_mesh, spec.placements, tensors) for spec, tensors in params_data.items()),
-        return_squared_tensor=return_squared_tensor,
-    )
 
 
 def _calc_sharded_params_l2_norm(params_data, return_squared_tensor=False):

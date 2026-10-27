@@ -688,17 +688,20 @@ def test_log_params_norm_uses_local_shards(
     )
     monkeypatch.setattr(common_utils, "get_args", lambda: SimpleNamespace(use_megatron_fsdp=True))
 
-    # Keep the DTensor norm interface used by MFSDP v1 working as well.
-    runtime_parameters = dict(model.module.named_parameters())
-    checkpoint_parameters = {
-        runtime_parameters[name]: parameter
-        for name, parameter in named_checkpoint_parameters(model.module)
-        if name in runtime_parameters
-        and (not trainable_only or runtime_parameters[name].requires_grad)
-    }
-    assert common_utils.calc_dtensor_params_l2_norm(
-        checkpoint_parameters.values()
-    ) == pytest.approx(expected_squared.sqrt().item())
+    # Exercise the DTensor parameter representation used by MFSDP v1.
+    checkpoint_parameters = dict(named_checkpoint_parameters(model.module))
+    dtensor_parameters = [
+        (
+            name,
+            torch.nn.Parameter(checkpoint_parameters[name], requires_grad=parameter.requires_grad),
+        )
+        for name, parameter in model.module.named_parameters()
+    ]
+    with monkeypatch.context() as patch:
+        patch.setattr(model, "named_parameters", lambda: iter(dtensor_parameters))
+        assert common_utils.calc_params_l2_norm(
+            model, trainable_only=trainable_only
+        ) == pytest.approx(expected_squared.sqrt().item())
 
     def reject_dtensor(*args, **kwargs):
         pytest.fail("Parameter logging must not create checkpoint DTensors")
