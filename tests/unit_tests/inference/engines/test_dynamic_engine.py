@@ -1269,6 +1269,8 @@ class DynamicInferenceEngineTestBase:
                     else InferenceCudaGraphScope.none
                 ),
                 transformer_impl=test_config.transformer_impl,
+                inference_grouped_gemm_backend=test_config.inference_grouped_gemm_backend,
+                inference_moe_nvfp4_recipe=test_config.inference_moe_nvfp4_recipe,
                 activation_func=(
                     squared_relu
                     if test_config.transformer_impl == "inference_optimized"
