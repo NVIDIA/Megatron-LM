@@ -73,6 +73,7 @@ class TestParallelAttention:
     def test_constructor(self):
         assert isinstance(self.parallel_attention, SelfAttention)
         assert self.parallel_attention.layer_number == 1
+
         num_weights = sum([p.numel() for p in self.parallel_attention.parameters()])
         if self.transformer_config.attention_output_gate:
             assert num_weights == 82816
@@ -84,18 +85,25 @@ class TestParallelAttention:
         pass
 
     def test_gpu_forward(self):
+
         config = self.parallel_attention.config
         sequence_length = 32
         micro_batch_size = 2
+
         self.parallel_attention.cuda()
+
+        # [sequence length, batch size, hidden size]
         hidden_states = torch.ones(
             (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size),
             dtype=torch.bfloat16,
         )
         hidden_states = hidden_states.cuda()
+
         attention_mask = torch.ones((micro_batch_size, 1, 1, sequence_length), dtype=bool).cuda()
+
         self.parallel_attention.eval()
         output, bias = self.parallel_attention(hidden_states, attention_mask)
+
         assert config.recompute_granularity is None
         assert output.shape[0] == sequence_length
         assert output.shape[1] == micro_batch_size
@@ -118,13 +126,16 @@ class TestParallelAttention:
         config = self.parallel_attention.config
         sequence_length = 32
         micro_batch_size = 2
+
         self.parallel_attention.cuda()
+
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones(
             (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size),
             dtype=torch.bfloat16,
         )
         hidden_states = hidden_states.cuda()
+
         attention_mask = torch.ones((micro_batch_size, 1, 1, sequence_length), dtype=bool).cuda()
         rotary_pos_emb = torch.ones(
             sequence_length, 1, 1, self.parallel_attention.config.kv_channels
@@ -132,6 +143,7 @@ class TestParallelAttention:
         output, bias = self.parallel_attention(
             hidden_states, attention_mask, rotary_pos_emb=rotary_pos_emb
         )
+
         assert config.recompute_granularity is None
         assert output.shape[0] == sequence_length
         assert output.shape[1] == micro_batch_size
@@ -149,17 +161,23 @@ class TestParallelAttention:
             layer_number=1,
         )
         config = checkpointed_parallel_attention.config
+
         sequence_length = 32
         micro_batch_size = 2
+
         checkpointed_parallel_attention.cuda()
+
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones(
             (sequence_length, micro_batch_size, checkpointed_parallel_attention.config.hidden_size),
             dtype=torch.bfloat16,
         )
         hidden_states = hidden_states.cuda()
+
         attention_mask = torch.ones((micro_batch_size, 1, 1, sequence_length), dtype=bool).cuda()
+
         output, bias = checkpointed_parallel_attention(hidden_states, attention_mask)
+
         assert config.recompute_granularity == 'selective'
         assert "core_attn" in config.recompute_modules
         assert output.shape[0] == sequence_length
@@ -192,6 +210,7 @@ class TestClipQK:
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
         )
+
         with pytest.raises(ValueError, match="qk_clip option needs to be enabled"):
             attention.clip_qk()
 
@@ -211,6 +230,7 @@ class TestClipQK:
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
         )
+
         with pytest.raises(ValueError, match="current_max_attn_logits is None"):
             attention.clip_qk()
 
@@ -231,14 +251,18 @@ class TestClipQK:
             layer_number=1,
         )
         attention.cuda()
+
         # Save original weights
         original_weight = attention.linear_qkv.weight.data.clone()
+
         # Set current_max_attn_logits below threshold
         attention.core_attention.current_max_attn_logits = torch.tensor(
             [50.0, 60.0, 70.0, 80.0], device='cuda'
         )
+
         # Call clip_qk
         attention.clip_qk()
+
         # Weights should not be updated
         assert torch.equal(attention.linear_qkv.weight.data, original_weight)
         # current_max_attn_logits should be reset
@@ -261,14 +285,18 @@ class TestClipQK:
             layer_number=1,
         )
         attention.cuda()
+
         # Save original weights
         original_weight = attention.linear_qkv.weight.data.clone()
+
         # Set current_max_attn_logits above threshold
         attention.core_attention.current_max_attn_logits = torch.tensor(
             [150.0, 160.0, 170.0, 180.0], device='cuda'
         )
+
         # Call clip_qk
         attention.clip_qk()
+
         # Weights should be updated
         assert not torch.equal(attention.linear_qkv.weight.data, original_weight)
         # current_max_attn_logits should be reset
@@ -292,14 +320,18 @@ class TestClipQK:
             layer_number=1,
         )
         attention.cuda()
+
         # Save original weights
         original_weight = attention.linear_qkv.weight.data.clone()
+
         # Set current_max_attn_logits for all heads (8 heads)
         attention.core_attention.current_max_attn_logits = torch.tensor(
             [150.0, 160.0, 170.0, 180.0, 190.0, 200.0, 210.0, 220.0], device='cuda'
         )
+
         # Call clip_qk
         attention.clip_qk()
+
         # Weights should be updated
         assert not torch.equal(attention.linear_qkv.weight.data, original_weight)
         # current_max_attn_logits should be reset
@@ -322,14 +354,18 @@ class TestClipQK:
             layer_number=1,
         )
         attention.cuda()
+
         # Save original weights
         original_weight = attention.linear_qkv.weight.data.clone()
+
         # Set mixed current_max_attn_logits (some above, some below threshold)
         attention.core_attention.current_max_attn_logits = torch.tensor(
             [80.0, 150.0, 90.0, 200.0], device='cuda'
         )
+
         # Call clip_qk
         attention.clip_qk()
+
         # Weights should be updated since at least one head exceeds threshold
         assert not torch.equal(attention.linear_qkv.weight.data, original_weight)
         # current_max_attn_logits should be reset
@@ -364,16 +400,20 @@ class TestSelfAttention:
             attn_mask_type=AttnMaskType.causal,
             pg_collection=pg_collection,
         )
+
         config = self.self_attention.config
         sequence_length = 127
         micro_batch_size = 2
+
         self.self_attention.cuda()
+
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones(
             (sequence_length, micro_batch_size, self.self_attention.config.hidden_size),
             device='cuda',
         )
         hidden_states_ref = copy.deepcopy(hidden_states)
+
         output, bias = self.self_attention(hidden_states, None)
         assert config.recompute_granularity is None
         # Check if output and bias have the correct shape
@@ -384,16 +424,20 @@ class TestSelfAttention:
 
     @pytest.mark.internal
     def test_self_attention_mpu(self):
+
         tp_size = 4
         cp_size = 2
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size, context_parallel_size=cp_size
         )
         model_parallel_cuda_manual_seed(123)
+
         # Get TP and CP process groups from device mesh
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
+
         pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+
         self.run_self_attention(pg_collection)
 
     @pytest.mark.skipif(
@@ -402,21 +446,27 @@ class TestSelfAttention:
     )
     @pytest.mark.internal
     def test_self_attention_independent_pg_smoke(self):
+
         tp_size = 4
         cp_size = 2
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size, context_parallel_size=cp_size
         )
         model_parallel_cuda_manual_seed(123)
+
         # Initialize torch.distributed if not already initialized
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend='nccl')
+
         # Create HyperCommGrid with dimensions cp, tp (reversed from device mesh order)
         grid = HyperCommGrid([cp_size, tp_size], ["cp", "tp"])
+
         # Get TP and CP process groups from HyperCommGrid
         tp_group = grid.create_pg("tp")
         cp_group = grid.create_pg("cp")
+
         pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+
         self.run_self_attention(pg_collection)
 
 
@@ -454,6 +504,7 @@ def _test_parallel_attention_correctness(
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
     )
+
     # Initialize input hidden states
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
@@ -463,16 +514,19 @@ def _test_parallel_attention_correctness(
         .bfloat16()
         .requires_grad_(True)
     )
+
     with TempNamedDir(tmp_path_dist_ckpt / 'test_parallel_attn', sync=True) as ckpt_dir:
         # Set argument
         mock_args = parse_args(ignore_unknown_args=True)
         mock_args.save_tokenizer_assets = False
         set_args(mock_args)
+
         # Initialize baseline model
         init_basic_mock_args(mock_args, 1, 1, bf16=True)
         mock_args.context_parallel_size = 1
         mock_args.sequence_parallel = 1
         gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
+
         # Initialize args and save checkpoint
         init_checkpointing_mock_args(mock_args, ckpt_dir, False)
         mock_args.no_save_optim = True
@@ -480,12 +534,14 @@ def _test_parallel_attention_correctness(
         mock_args.no_load_optim = True
         mock_args.no_load_rng = True
         save_checkpoint(10, gpt_model, None, None, 0)
+
         # Calculate baseline output
         attention = gpt_model[0].decoder.layers[0].self_attention
         output_hidden_states_baseline, bias_hidden_states_baseline = attention(
             input_hidden_states, attention_mask=None
         )
         output_hidden_states_baseline.sum().backward()
+
         # Save baseline output
         input_grad_baseline = input_hidden_states.grad.detach()
         output_hidden_states_baseline = output_hidden_states_baseline.detach()
@@ -495,6 +551,7 @@ def _test_parallel_attention_correctness(
             has_bias = True
         else:
             has_bias = False
+
         # Initialize parallel model
         Utils.destroy_model_parallel()
         Utils.initialize_model_parallel(
@@ -511,6 +568,7 @@ def _test_parallel_attention_correctness(
         gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
         with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
             load_checkpoint(gpt_model, None, None)
+
         # Function to get tensor on this tp and cp rank
         cp_group = parallel_state.get_context_parallel_group()
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
@@ -539,9 +597,11 @@ def _test_parallel_attention_correctness(
         )
         output_hidden_states_parallel.sum().backward()
         input_grad_parallel = input_hidden_states.grad.detach()
+
         # Check if the output is close
         output_hidden_states_baseline = get_tensor_on_this_rank(output_hidden_states_baseline)
         input_grad_baseline = get_tensor_on_this_rank(input_grad_baseline)
+
         assert torch.all(
             ~torch.isnan(output_hidden_states_baseline)
         ), "output_hidden_states_baseline contains nan"
@@ -571,6 +631,7 @@ def _test_parallel_attention_correctness(
             assert torch.all(
                 ~torch.isinf(bias_hidden_states_parallel)
             ), "bias_hidden_states_parallel contains inf"
+
         torch.testing.assert_close(
             output_hidden_states_baseline,
             output_hidden_states_parallel,
@@ -863,6 +924,7 @@ class TestFlashDecodeAndPrefillSoftcap:
     leaves the other three passing, so each site is driven independently here.
     """
 
+    # site -> (is_decode_only, (use_fa4, use_fa3), patched kernel, returns a tuple)
     _SITES = {
         "prefill_fa4": (False, (True, False), "flash_attn4_varlen_func", True),
         "prefill_fa2": (False, (False, False), "flash_attn_varlen_func", False),
@@ -885,6 +947,8 @@ class TestFlashDecodeAndPrefillSoftcap:
         attn.training = False  # the function asserts this before dispatching
         attn._resolve_flash_version.return_value = flash_version
 
+        # (num_requests * tokens_per_request, 1, heads, head_dim), which both branches accept:
+        # prefill squeezes dim 1, decode reshapes on seqlens_k.shape[0] requests.
         q = torch.zeros(2, 1, 4, 8)
         kv = torch.zeros(2, 4, 8)
         out = torch.zeros(2, 4, 8) if not is_decode_only else torch.zeros(2, 1, 4, 8)
@@ -919,6 +983,12 @@ class TestFlashDecodeAndPrefillSoftcap:
 
 
 class TestFlashMLASoftcapRejected:
+    """FlashMLA has no softcap support, so the combination must fail rather than half-apply.
+
+    Without this the cap would be applied in prefill, which shares the non-MLA path, and
+    silently dropped in decode, inside a single forward.
+    """
+
     def test_mla_decode_rejects_a_configured_cap(self):
         from megatron.core.transformer.transformer_config import MLATransformerConfig
 
