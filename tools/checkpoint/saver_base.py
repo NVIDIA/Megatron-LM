@@ -10,6 +10,7 @@ from utils import (
     build_checkpoint_converter_process_groups,
     chunk_bias,
     chunk_weight,
+    initialize_checkpoint_converter_distributed,
     install_checkpoint_converter_process_groups,
     set_checkpoint_converter_pipeline_rank,
 )
@@ -176,14 +177,7 @@ class MegatronCheckpointSaverBase:
 
         self.import_model_provider()
 
-        # Initialize torch.distributed with a minimal single-process backend so that
-        # process-group size queries (get_pg_size / get_tensor_model_parallel_group_if_none)
-        # return the fake groups below rather than falling back to world_size=1.
-        if not torch.distributed.is_initialized():
-            os.environ.setdefault('MASTER_ADDR', 'localhost')
-            os.environ.setdefault('MASTER_PORT', '12356')
-            torch.distributed.init_process_group(backend='gloo', rank=0, world_size=1)
-
+        initialize_checkpoint_converter_distributed()
         self.pg_collection = build_checkpoint_converter_process_groups(
             self.args.target_tensor_parallel_size,
             self.args.target_pipeline_parallel_size,
