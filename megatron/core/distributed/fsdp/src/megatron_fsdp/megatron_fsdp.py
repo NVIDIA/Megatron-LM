@@ -512,6 +512,7 @@ class MegatronFSDP(torch.nn.Module):
         prefetch_order=PrefetchOrder.FORWARD_PASS_ORDER,
         wait_bucket_ready=True,
         bwd=False,
+        recompute=False,
     ):
         """
         All-gather parameters across the data parallel group and wait for
@@ -539,6 +540,7 @@ class MegatronFSDP(torch.nn.Module):
                 and (self.microbatch_count == 0 or self.model_auto_sync)
             ),
             bwd=bwd,
+            recompute=recompute,
         )
         if wait_bucket_ready:
             for param in params:
@@ -861,6 +863,7 @@ class MegatronFSDP(torch.nn.Module):
                 params=param_list,
                 prefetch=fsdp_forward_prefetch,
                 prefetch_order=PrefetchOrder.FORWARD_PASS_ORDER,
+                recompute=input_training_state == TrainingState.PRE_BACKWARD,
             )
             return None
 
