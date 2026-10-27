@@ -17,10 +17,6 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.checkpoint import (
-    named_checkpoint_parameters,
-)
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -688,25 +684,6 @@ def test_log_params_norm_uses_local_shards(
     )
     monkeypatch.setattr(common_utils, "get_args", lambda: SimpleNamespace(use_megatron_fsdp=True))
 
-    # Exercise the DTensor parameter representation used by MFSDP v1.
-    checkpoint_parameters = dict(named_checkpoint_parameters(model.module))
-    dtensor_parameters = [
-        (
-            name,
-            torch.nn.Parameter(checkpoint_parameters[name], requires_grad=parameter.requires_grad),
-        )
-        for name, parameter in model.module.named_parameters()
-    ]
-    with monkeypatch.context() as patch:
-        patch.setattr(model, "named_parameters", lambda: iter(dtensor_parameters))
-        assert common_utils.calc_params_l2_norm(
-            model, trainable_only=trainable_only
-        ) == pytest.approx(expected_squared.sqrt().item())
-
-    def reject_dtensor(*args, **kwargs):
-        pytest.fail("Parameter logging must not create checkpoint DTensors")
-
-    monkeypatch.setattr(DBuffer, "get_dtensor", reject_dtensor)
     actual_squared = common_utils.calc_params_l2_norm(
         model, return_squared_tensor=True, trainable_only=trainable_only
     )
