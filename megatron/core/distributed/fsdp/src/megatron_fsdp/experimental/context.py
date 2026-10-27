@@ -22,7 +22,7 @@ import torch
 from torch import nn
 
 from .execution_order import ExecutionOrder
-from .runtime import RuntimePolicy
+from .runtime_policy import RuntimePolicy
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
 
