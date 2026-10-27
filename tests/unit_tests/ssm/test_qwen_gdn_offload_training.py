@@ -84,7 +84,7 @@ def test_checkpoint_path_boundaries(
 def test_forward_step_activates_nvfp4() -> None:
     """Exercise real TE GEMMs when a custom decoder leaves precision to its caller."""
     te = pytest.importorskip("transformer_engine.pytorch")
-    from transformer_engine.pytorch.fp8 import check_nvfp4_support
+    from transformer_engine.pytorch.fp8 import check_nvfp4_support  # type: ignore[import-untyped]
 
     supported, reason = check_nvfp4_support()
     if not supported:

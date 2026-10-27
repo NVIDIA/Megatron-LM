@@ -198,8 +198,11 @@ def _require_precision(precision: str) -> None:
     """Skip recipes unavailable on this device or unsuitable for exact replay."""
     if precision == "bf16":
         return
-    from transformer_engine.common.recipe import NVFP4BlockScaling
-    from transformer_engine.pytorch.fp8 import check_fp8_support, check_nvfp4_support
+    from transformer_engine.common.recipe import NVFP4BlockScaling  # type: ignore[import-untyped]
+    from transformer_engine.pytorch.fp8 import (  # type: ignore[import-untyped]
+        check_fp8_support,
+        check_nvfp4_support,
+    )
 
     supported, reason = check_nvfp4_support() if precision == "fp4" else check_fp8_support()
     if not supported:
