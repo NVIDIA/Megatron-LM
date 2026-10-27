@@ -24,9 +24,9 @@ def parse_step_lr_rescale_schedule(schedule: str | None) -> tuple[tuple[int, flo
         return ()
 
     entries = []
-    for entry in schedule.replace(',', ' ').split():
+    for entry in schedule.replace(",", " ").split():
         try:
-            threshold_raw, multiplier_raw = entry.split(':', 1)
+            threshold_raw, multiplier_raw = entry.split(":", 1)
             threshold = int(threshold_raw)
             multiplier = float(multiplier_raw)
         except ValueError as error:
@@ -152,7 +152,8 @@ class OptimizerParamScheduler:
         lr_wsd_decay_style (str, optional): decay style for learning rate during weight decay decay
             steps
         step_lr_rescale_schedule (str, optional): sample thresholds and LR multipliers for
-            step-wise LR rescaling
+            step-wise LR rescaling. Thresholds are compared against ``num_steps``, the same
+            clock that drives LR warmup and decay
         step_lr_rescale_warmup_samples (int, optional): number of samples used to linearly
             transition between LR multipliers after the initial schedule entry
 
@@ -346,7 +347,7 @@ class OptimizerParamScheduler:
         return lr * self.get_lr_rescale()
 
     def get_lr_rescale(self) -> float:
-        """Return the active multiplier for the consumed-sample count."""
+        """Return the active multiplier for the current ``num_steps`` position."""
 
         if not self.step_lr_rescale_schedule:
             return 1.0
@@ -405,9 +406,8 @@ class OptimizerParamScheduler:
             'wd_incr_steps': self.wd_incr_steps,
         }
         if self.step_lr_rescale_schedule:
-            state_dict['step_lr_rescale_schedule'] = self.step_lr_rescale_schedule
-        if self.step_lr_rescale_warmup_samples > 0:
-            state_dict['step_lr_rescale_warmup_samples'] = self.step_lr_rescale_warmup_samples
+            state_dict["step_lr_rescale_schedule"] = self.step_lr_rescale_schedule
+            state_dict["step_lr_rescale_warmup_samples"] = self.step_lr_rescale_warmup_samples
         return state_dict
 
     def _check_and_set(self, cls_value: Any, sd_value: Any, name: str) -> Any:
@@ -415,8 +415,8 @@ class OptimizerParamScheduler:
         setting them.
 
         Args:
-            cls_value (float): class value
-            sd_value (float): checkpoint value
+            cls_value (Any): class value
+            sd_value (Any): checkpoint value
             name (str): name of the parameter
         """
 
@@ -478,20 +478,20 @@ class OptimizerParamScheduler:
             self.lr_decay_style, lr_decay_style_, 'learning rate decay style'
         )
 
-        if 'step_lr_rescale_schedule' in state_dict:
+        if "step_lr_rescale_schedule" in state_dict:
             checkpoint_schedule = tuple(
                 (int(threshold), float(multiplier))
-                for threshold, multiplier in state_dict['step_lr_rescale_schedule']
+                for threshold, multiplier in state_dict["step_lr_rescale_schedule"]
             )
             self.step_lr_rescale_schedule = self._check_and_set(
-                self.step_lr_rescale_schedule, checkpoint_schedule, 'step LR rescale schedule'
+                self.step_lr_rescale_schedule, checkpoint_schedule, "step LR rescale schedule"
             )
 
-        if 'step_lr_rescale_warmup_samples' in state_dict:
+        if "step_lr_rescale_warmup_samples" in state_dict:
             self.step_lr_rescale_warmup_samples = self._check_and_set(
                 self.step_lr_rescale_warmup_samples,
-                int(state_dict['step_lr_rescale_warmup_samples']),
-                'step LR rescale warmup samples',
+                int(state_dict["step_lr_rescale_warmup_samples"]),
+                "step LR rescale warmup samples",
             )
 
         if 'num_iters' in state_dict:

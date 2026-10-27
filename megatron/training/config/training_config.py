@@ -197,7 +197,8 @@ class SchedulerConfig:
     """Step-wise LR multipliers in ``SAMPLES:MULTIPLIER`` format.
 
     Entries may be comma- or whitespace-separated. The first threshold must be zero and all
-    subsequent thresholds must be strictly increasing. When unset, LR rescaling is disabled.
+    subsequent thresholds must be strictly increasing. Thresholds use the same sample clock as
+    ``lr_warmup_samples`` and ``lr_decay_samples``. When unset, LR rescaling is disabled.
     Example: ``0:0.5,1000:1.0``.
     """
 
