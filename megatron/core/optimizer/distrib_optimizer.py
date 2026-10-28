@@ -7,7 +7,7 @@ import itertools
 import logging
 import re
 from collections import ChainMap, defaultdict
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -113,6 +113,16 @@ def get_legacy_grad_dtypes(sharded_keys) -> Dict[str, str]:
         for param_dtype, found in grad_dtypes.items()
         if len(found) == 1
     }
+
+
+@dataclass
+class _EmbeddingMinNormState:
+    """Invariant layout and reusable workspace for one input embedding."""
+
+    model_param: torch.nn.Parameter
+    row_width: int
+    num_rows: int
+    row_sums: torch.Tensor
 
 
 class Range:
@@ -823,6 +833,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         self.is_stub_optimizer = False
         if self.ddp_config.use_megatron_fsdp:
+            if config.embedding_min_norm is not None:
+                raise ValueError("embedding_min_norm is not supported with Megatron FSDP")
             # Megatron-FSDP will manage optimizer weights and gradients.
             return
 
@@ -877,6 +889,29 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.gbuf_ranges.append(self._build_gbuf_range_map(buffer))
         self.model_param_gbuf_map = self._build_model_param_gbuf_map(self.gbuf_ranges)
 
+        self._word_embedding_params = []
+        self._embedding_min_norm_stats = None
+        if config.embedding_min_norm is not None:
+            if config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                raise ValueError(
+                    "embedding_min_norm requires optimizer-managed FP32 master parameters"
+                )
+            optimized_params = {
+                param
+                for param_group in self.optimizer.param_groups
+                for param in param_group['params']
+            }
+            seen_params = set()
+            for buffer in self.buffers:
+                for param in buffer.params:
+                    if (
+                        getattr(param, 'is_word_embedding_parameter', False)
+                        and param in optimized_params
+                        and param not in seen_params
+                    ):
+                        seen_params.add(param)
+                        self._word_embedding_params.append(param)
+
         # Add main_param field to each parameter. We will use this fp32 copy to compute
         # the param norm.
         # For parameters with optimizer state on this rank, None will be overwritten by
@@ -914,6 +949,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
             self.optimizer.load_state_dict(self.optimizer.state_dict())
 
+        self._embedding_min_norm_states = self._build_embedding_min_norm_states()
+
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
         Given a model param, get the index sub-range of the param that this
@@ -923,6 +960,108 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         gbuf_range_map = self.gbuf_ranges[gbuf_index][dtype][bucket_index]
         param_range_map = gbuf_range_map["param_map"][param]
         return param_range_map
+
+    def _build_embedding_min_norm_states(self) -> List[_EmbeddingMinNormState]:
+        """Cache embedding layouts and reduction workspaces shared by optimizer steps."""
+        states = []
+        for model_param in self._word_embedding_params:
+            if model_param.ndim != 2:
+                raise ValueError("embedding_min_norm requires a two-dimensional embedding weight")
+
+            row_width = model_param.shape[1]
+            padding_numel = tensor_parallel.gtp_local_pad_zero_count(
+                model_param, 0, model_param.numel()
+            )
+            if padding_numel % row_width != 0:
+                raise RuntimeError("GTP embedding padding must contain complete rows")
+            num_rows = model_param.shape[0] - padding_numel // row_width
+            if num_rows > 0:
+                states.append(
+                    _EmbeddingMinNormState(
+                        model_param=model_param,
+                        row_width=row_width,
+                        num_rows=num_rows,
+                        row_sums=torch.zeros(
+                            num_rows, dtype=torch.float32, device=model_param.device
+                        ),
+                    )
+                )
+        return states
+
+    @torch.no_grad()
+    def _post_optimizer_step(self) -> None:
+        """Rescale sub-threshold input-embedding rows to twice the configured threshold."""
+        min_norm = self.config.embedding_min_norm
+        if min_norm is None:
+            return
+
+        target_norm = 2.0 * min_norm
+        for state in self._embedding_min_norm_states:
+            model_param = state.model_param
+            row_width = state.row_width
+            num_rows = state.num_rows
+            row_sums = state.row_sums
+            row_sums.zero_()
+            main_param = None
+            row_indices = None
+
+            # A DP rank may own no part of this embedding, but must still enter the collective.
+            if model_param in self.model_param_gbuf_map:
+                param_range = self._get_model_param_range_map(model_param)["param"]
+                valid_end = min(param_range.end, num_rows * row_width)
+                valid_numel = max(0, valid_end - param_range.start)
+                if valid_numel > 0:
+                    if model_param.dtype in (torch.float16, torch.bfloat16):
+                        if model_param.main_param is None:
+                            raise RuntimeError(
+                                "embedding_min_norm could not find this rank's FP32 master shard"
+                            )
+                        main_param = model_param.main_param[:valid_numel]
+                    elif model_param.dtype == torch.float32:
+                        main_param = model_param.view(-1)[
+                            param_range.start : param_range.start + valid_numel
+                        ]
+                    else:
+                        raise TypeError(
+                            "embedding_min_norm requires an FP32, FP16, or BF16 embedding weight"
+                        )
+                    row_indices = torch.arange(
+                        param_range.start, valid_end, dtype=torch.int64, device=main_param.device
+                    ).div_(row_width, rounding_mode='floor')
+                    row_sums.scatter_add_(0, row_indices, main_param.square())
+
+            torch.distributed.all_reduce(row_sums, group=self.data_parallel_group)
+
+            row_norms = row_sums.sqrt()
+            rows_to_scale = (row_norms > 0.0) & (row_norms < min_norm)
+            row_scales = torch.where(
+                rows_to_scale,
+                target_norm / row_norms.clamp_min(torch.finfo(row_norms.dtype).tiny),
+                1.0,
+            )
+            if self.data_parallel_group.rank() == 0 and self.distributed_optimizer_instance_id == 0:
+                if self._embedding_min_norm_stats is None:
+                    # Rows scaled, rows checked, squared norm delta, exact-zero rows.
+                    self._embedding_min_norm_stats = torch.zeros(
+                        4, dtype=torch.float64, device=row_norms.device
+                    )
+                stats = self._embedding_min_norm_stats
+                stats[0].add_(rows_to_scale.sum())
+                stats[1].add_(num_rows)
+                norm_delta = torch.where(rows_to_scale, target_norm - row_norms, 0.0)
+                stats[2].add_(norm_delta.square().sum())
+                stats[3].add_((row_norms == 0.0).sum())
+            if main_param is not None:
+                main_param.mul_(row_scales[row_indices])
+
+    @torch.no_grad()
+    def _consume_embedding_min_norm_stats(self) -> Optional[torch.Tensor]:
+        """Return and clear ``[scaled, checked, delta squared, zero]`` interval stats."""
+        stats = getattr(self, '_embedding_min_norm_stats', None)
+        if stats is None:
+            return None
+        self._embedding_min_norm_stats = None
+        return stats
 
     def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         """

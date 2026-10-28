@@ -15,6 +15,7 @@ from megatron.training.config import CheckpointConfig, TrainingConfig, Validatio
 from megatron.training.global_vars import _set_train_state, destroy_global_vars, set_args
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.training import (
+    _consume_embedding_min_norm_metrics,
     _get_indexer_logging_layer_counts,
     _get_optimizer_param_scheduler_increment,
     _pop_samples_seen,
@@ -254,6 +255,30 @@ class TestTraining:
 
         args.log_params_norm = False
         assert not _should_compute_params_norm(args, iteration=20, is_first_iteration=False)
+
+    def test_embedding_min_norm_metrics_combine_model_shards(self, monkeypatch):
+        local_stats = torch.tensor([2.0, 4.0, 0.5, 1.0], dtype=torch.float64, device='cuda')
+        remote_stats = torch.tensor([2.0, 6.0, 1.75, 2.0], dtype=torch.float64, device='cuda')
+        mimo_optimizer = SimpleNamespace(
+            chained_optimizers=[
+                SimpleNamespace(),
+                SimpleNamespace(_consume_embedding_min_norm_stats=lambda: local_stats),
+            ]
+        )
+
+        def fake_all_reduce(stats, op):
+            assert op == torch.distributed.ReduceOp.SUM
+            stats.add_(remote_stats)
+
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+        assert _consume_embedding_min_norm_metrics(mimo_optimizer) == {
+            'embedding-min-norm/row-events-rescaled': 4.0,
+            'embedding-min-norm/fraction-rescaled': 0.4,
+            'embedding-min-norm/projection-delta-rms': 0.75,
+            'embedding-min-norm/zero-row-events': 3.0,
+        }
 
     def test_build_train_valid_test_data_iterators_multi_full_validation(self, run_config):
         """multiple_validation_sets + full_validation builds a list of iterators

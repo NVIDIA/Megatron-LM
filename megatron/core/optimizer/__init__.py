@@ -507,6 +507,15 @@ def _get_megatron_optimizer_based_on_param_groups(
     if skip_megatron_wrapping and config.optimizer_cpu_offload:
         raise ValueError("skip_megatron_wrapping=True is incompatible with optimizer_cpu_offload.")
 
+    has_word_embedding = any(
+        getattr(param, 'is_word_embedding_parameter', False)
+        for param_group in param_groups
+        for param in param_group['params']
+    )
+    if config.embedding_min_norm is not None and has_word_embedding:
+        if not config.use_distributed_optimizer:
+            raise ValueError("embedding_min_norm requires the distributed optimizer")
+
     # When freezing sub-models we may have no trainable parameters on a rank and
     # hence an empty param_groups. However, we still need to create an optimizer
     # for the purposes of grad stats reductions.
