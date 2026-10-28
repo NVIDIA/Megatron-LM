@@ -159,6 +159,7 @@ def reset_transient_process_state():
     reset_cuda_graph_global_state()
     # Sized at the first num_layers seen; TestMTPLossLoggingHelper reads it back.
     multi_token_prediction.MTPLossLoggingHelper.tracker.clear()
+    # Built from the first model (TestMTPCudaGraphExpertParallel resets it by hand).
     inference_utils.moe_layer_cache = None
     inference_utils._moe_metadata_sync_initialized = False
 
