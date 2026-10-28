@@ -162,11 +162,11 @@ def test_hybrid_stack_checkpoint_and_pipeline_owner_gradients(setup):
         torch.testing.assert_close(recomputed.grad, reference.grad)
     hidden, context = _run(stages[0], x.clone().requires_grad_(), cfg, groups)
     sent = context.codec.payload(hidden, context.values, 2)
-    assert sent.descriptor == context.codec.descriptor(2)
+    assert sent.spec == context.codec.descriptor(2)
     received = TensorStatePayload(
         tuple(
-            t.detach().clone().requires_grad_(f.requires_grad)
-            for t, f in zip(sent.tensors, sent.tensor_specs)
+            t.detach().clone().requires_grad_(f.differentiable)
+            for t, f in zip(sent.tensors, sent.spec.schema.packed_fields)
         ),
         sent.spec,
     )
