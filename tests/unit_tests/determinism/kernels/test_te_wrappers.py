@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 import megatron.core.extensions.transformer_engine as te_ext
 from megatron.core import parallel_state
@@ -39,7 +40,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 )
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import init_method_normal
+from megatron.core.utils import init_method_normal, is_te_min_version
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
@@ -583,6 +584,41 @@ class TestTEWrappers:
         )
         assert_module_replays_bit_exact(
             module, (x,), replays=3, contention=True, what=f"TEFusedMLP[hash={hash_threshold}]"
+        )
+
+    @pytest.mark.skipif(TEFusedMLP is None, reason="TE operation-based MLP is unavailable")
+    @pytest.mark.skipif(
+        not is_te_min_version("2.17.0.dev0"),
+        reason="Clamped SwiGLU in the TE op fuser requires Transformer Engine >= 2.17.0.dev0",
+    )
+    def test_te_fused_mlp_clamped_swiglu_replays(self):
+        seeded()
+        config = _config(
+            # Not a multiple of 32: TE <= 2.20 then uses its non-TMA GLU kernels, which also run
+            # on GPUs with less shared memory per block (e.g. sm_120).
+            ffn_hidden_size=FFN - 16,
+            normalization="RMSNorm",
+            gradient_accumulation_fusion=False,
+            activation_func=F.silu,
+            gated_linear_unit=True,
+            # A dense layer of an MoE model: activation_func_clamp_value for SwiGLU requires MoE.
+            num_moe_experts=8,
+            # Small enough that the clamp is active on many elements.
+            activation_func_clamp_value=1.0,
+        )
+        module = TEFusedMLP.as_mlp_submodule(
+            submodules=MLPSubmodules(
+                linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+            ),
+            config=config,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"]),
+            is_mtp_layer=False,
+        ).cuda()
+        x = torch.randn(
+            TOKENS // 2, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        assert_module_replays_bit_exact(
+            module, (x,), replays=3, contention=True, what="TEFusedMLP[clamped SwiGLU]"
         )
 
     def test_te_grouped_linear_replays_on_uneven_splits(self):

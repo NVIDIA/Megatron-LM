@@ -447,6 +447,14 @@ class FusedSharedExpertMLP(SharedExpertMLP):
                 f"fused kernel, but got activation_func={self.config.activation_func}, "
                 f"gated_linear_unit={self.config.gated_linear_unit}."
             )
+        if self.config.activation_func_tanh_clamp_scale is not None:
+            # As for the routed experts, the fused GLU path does not implement SiTU-GLU.
+            raise ValueError(
+                f"{self.__class__.__name__} does not support "
+                "activation_func_tanh_clamp_scale: a clamped gated activation is SiTU-GLU, which "
+                "the fused grouped SwiGLU path does not implement. Set "
+                "use_grouped_gemm_for_shared_expert=False to use SharedExpertMLP."
+            )
         if self.config.activation_func_clamp_value is not None and (
             not is_te_min_version("2.17.0.dev0")
             or not hasattr(te.pytorch.ops, "ScaledClampedQGeGLU")
