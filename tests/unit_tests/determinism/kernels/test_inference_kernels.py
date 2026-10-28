@@ -935,6 +935,64 @@ def test_mxfp8_swiglu_moe_replays():
 
 
 @pytest.mark.launch_on_gb200
+def test_mxfp8_topk2_moe_eager_matches_cuda_graph():
+    from megatron.core.inference.moe.fused_moe import (
+        HAVE_SCALED_GMM,
+        ActivationType,
+        mcore_fused_moe,
+    )
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+    if not HAVE_SCALED_GMM or torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("MXFP8 scaled_grouped_mm requires PyTorch 2.10+ and Blackwell")
+
+    seeded()
+    capacity, live_tokens, hidden, experts = 128, 11, 128, 2
+
+    def weight():
+        quantized = [
+            MXFP8Tensor.from_bf16(
+                0.02 * torch.randn(hidden, hidden, device="cuda", dtype=torch.bfloat16),
+                backend="triton",
+            )
+            for _ in range(experts)
+        ]
+        return MXFP8Tensor(
+            data=torch.stack([item.data for item in quantized]).contiguous(),
+            scale=torch.stack([item.scale for item in quantized]).contiguous(),
+            dtype=torch.bfloat16,
+            backend="triton",
+        )
+
+    fc1, fc2 = weight(), weight()
+    hidden_states = torch.randn(capacity, hidden, device="cuda", dtype=torch.bfloat16)
+    probs = torch.softmax(torch.randn(capacity, experts, device="cuda"), dim=-1)
+    routes = torch.arange(experts, device="cuda").expand(capacity, -1).contiguous()
+    valid = _dev_scalar(live_tokens)
+
+    def run():
+        return mcore_fused_moe(
+            hidden_states, probs, fc1, fc2, ActivationType.SQUARED_RELU, experts, 0, valid, routes
+        )
+
+    eager = run()[:live_tokens].clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    graph.replay()
+    torch.cuda.synchronize()
+    replay = captured[:live_tokens].clone()
+    torch.testing.assert_close(replay, eager, rtol=0, atol=5.0e-3)
+
+    hidden_states.copy_(torch.randn_like(hidden_states))
+    eager = run()[:live_tokens].clone()
+    graph.replay()
+    torch.cuda.synchronize()
+    replay = captured[:live_tokens].clone()
+    torch.testing.assert_close(replay, eager, rtol=0, atol=5.0e-3)
+
+
+@pytest.mark.launch_on_gb200
 def test_torch_mxfp8_moe_is_batch_invariant():
     """A routed token must be bitwise stable as its expert loads change."""
     from megatron.core.inference.moe.fused_moe import (
