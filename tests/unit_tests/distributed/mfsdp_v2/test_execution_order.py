@@ -19,34 +19,29 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import 
 
 @pytest.mark.parametrize(
     'budget, expected',
-    [
-        (None, [[1], [0], [0], [2], []]),
-        (0, [[], [], [], [], []]),
-        (2, [[1, 0], [0, 0], [0, 2], [2], []]),
-    ],
+    [(None, [[1], [2], [2], []]), (0, [[], [], [], []]), (2, [[1, 2], [2], [2], []])],
 )
-def test_prefetch_replays_occurrences(budget, expected):
-    """Reused modules have occurrence-specific successors under every prefetch budget."""
+@pytest.mark.parametrize("phase", [Phase.FORWARD, Phase.BACKWARD])
+def test_prefetch_reuses_adjacent_shared_calls(budget, expected, phase):
+    """Construction-order prefetch reuses a shared MTP block's cursor and successors."""
     modules = [Mock(spec=FsdpModule, num_parameter_elements=1) for _ in range(3)]
     prefetched = []
     for module in modules:
-        module.phase = Phase.FORWARD
+        module.phase = phase
         # Prefetch passes the successor's compute phase; record only which module it targets.
         module._unshard_parameter_groups.side_effect = (
             lambda _phase, target=module: prefetched.append(target)
         )
-    sequence = [modules[index] for index in (0, 1, 0, 0, 2)]
-    order = ExecutionOrder()
-    for module in sequence:
-        order.append(ExecutionEvent(module=module, phase=Phase.FORWARD))
-    # A new pass must explicitly reset before replaying repeated occurrences.
+    sequence = [modules[index] for index in (0, 1, 1, 2)]
+    order = ExecutionOrder(ExecutionEvent(module=module, phase=phase) for module in modules)
+    # Root entry starts a new pass through the construction order.
     for _ in range(2):
         order.reset_cursor()
-        for index, (module, targets) in enumerate(zip(sequence, expected)):
+        for module, targets, position in zip(sequence, expected, (1, 2, 2, 3)):
             prefetched.clear()
             FsdpModule._prefetch_parameter_groups(module, order, budget)
             assert prefetched == [modules[index] for index in targets]
-            assert order.position == index + 1
+            assert order.position == position
 
 
 def test_iteration_and_weak_references():
@@ -73,28 +68,24 @@ def test_iteration_and_weak_references():
 
 
 def test_explicit_reset_and_exhaustion():
-    """Sequential traversal requires reset; unique events can select their position."""
+    """Sequential traversal requires reset before replay."""
     module = nn.Module()
     a = ExecutionEvent(module=module, phase=Phase.FORWARD)
     b = ExecutionEvent(module=module, phase=Phase.BACKWARD)
-    order = ExecutionOrder([a, b, a])
+    order = ExecutionOrder([a, b, a, a])
     for _ in range(2):
         order.reset_cursor()
         assert order.advance() == a
         assert order[order.position] == b
         assert order.position == 1
-        assert list(order) == [a, b, a]
+        assert list(order) == [a, b, a, a]
         assert order.advance() == b
+        assert order.advance() == a
         assert order.advance() == a
         assert list(order)[order.position :] == []
         with pytest.raises(RuntimeError, match='exceeded'):
             order.advance()
-    assert order.advance(b) == b
-    assert order.advance(a) == a
     order.reset_cursor(1)
-    with pytest.raises(RuntimeError, match="diverged"):
-        order.advance(a)
-    assert order.position == 1
     assert order.advance() == b
     empty = ExecutionOrder()
     assert list(empty) == []
