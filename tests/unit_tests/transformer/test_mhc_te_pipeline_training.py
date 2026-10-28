@@ -277,8 +277,9 @@ def _train_eager_reference_and_candidate(model_kind, hidden_dropout, candidate_k
     """
     parallel_sizes = _initialize_test_parallelism(model_kind, torch.bfloat16)
     pp_size = parallel_sizes["pp_size"]
-    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = False
+    previous_tf32 = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
+    # Parity needs IEEE FP32 GEMMs on both sides; CI images enable TF32 by default.
+    torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
     try:
         torch.manual_seed(1234)
         model_parallel_cuda_manual_seed(1234, te_rng_tracker=True, force_reset_rng=True)
@@ -311,7 +312,7 @@ def _train_eager_reference_and_candidate(model_kind, hidden_dropout, candidate_k
         _assert_training_close(actual, expected, torch.bfloat16)
         return candidate_models, groups, actual
     finally:
-        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = previous_tf32
         destroy_num_microbatches_calculator()
         Utils.destroy_model_parallel()
 
@@ -353,8 +354,9 @@ def test_mhc_te_pipeline_training_parity(model_kind):
     """Real TE graph replay matches eager through the selected PP/VPP schedule."""
     parallel_sizes = _initialize_test_parallelism(model_kind, torch.bfloat16)
     pp_size = parallel_sizes["pp_size"]
-    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = False
+    previous_tf32 = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
+    # Parity needs IEEE FP32 GEMMs on both sides; CI images enable TF32 by default.
+    torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
     try:
         torch.manual_seed(1234)
         model_parallel_cuda_manual_seed(1234, te_rng_tracker=True, force_reset_rng=True)
@@ -404,6 +406,6 @@ def test_mhc_te_pipeline_training_parity(model_kind):
                 assert names, f"Missing {fragment} parameters"
                 assert any(actual[-1]["gradients"][name].count_nonzero() for name in names)
     finally:
-        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = previous_tf32
         destroy_num_microbatches_calculator()
         Utils.destroy_model_parallel()

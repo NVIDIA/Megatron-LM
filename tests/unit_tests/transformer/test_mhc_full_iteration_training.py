@@ -443,8 +443,9 @@ def _initialize_test_parallelism(model_kind, dtype):
 def _check_training_parity(model_kind, dtype, dropout):
     parallel_sizes = _initialize_test_parallelism(model_kind, dtype)
     pp_size = parallel_sizes["pp_size"]
-    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = False
+    previous_tf32 = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
+    # Parity needs IEEE FP32 GEMMs on both sides; CI images enable TF32 by default.
+    torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
     try:
         torch.manual_seed(1234)
         model_parallel_cuda_manual_seed(1234, te_rng_tracker=True, force_reset_rng=True)
@@ -496,7 +497,7 @@ def _check_training_parity(model_kind, dtype, dropout):
         sys.__stderr__.flush()
         raise
     finally:
-        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = previous_tf32
         StaticBufferLoader.static_buffers = {"training": [], "validation": []}
         destroy_num_microbatches_calculator()
         Utils.destroy_model_parallel()
