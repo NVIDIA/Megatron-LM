@@ -36,6 +36,8 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
     switch between mHC-enabled and ordinary HybridStacks without key migration.
     """
 
+    supports_hybrid_recompute_kwargs = True
+
     def __init__(self, config: TransformerConfig, layer: MegatronModule) -> None:
         super().__init__(config=config)
         self.inner_layer = layer

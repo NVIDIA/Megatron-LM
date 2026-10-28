@@ -387,6 +387,7 @@ def test_flashinfer_nvls_clears_routing_before_metadata_fence(monkeypatch):
         config=SimpleNamespace(
             inference_grouped_gemm_backend=InferenceGroupedGemmBackend.FLASHINFER
         ),
+        tp_size=1,
         ep_size=4,
     )
 

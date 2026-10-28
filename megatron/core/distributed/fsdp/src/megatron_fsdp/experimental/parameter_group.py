@@ -118,7 +118,12 @@ class FsdpParameterGroup:
     # dtype of the reduce-scatter input (partial_grad): MixedPrecisionPolicy.grad_comm_dtype,
     # or main_grad's dtype when unset.
     grad_comm_dtype: torch.dtype
+    # Full compute storage: persistent model_weight when replicated, otherwise a
+    # temporary buffer populated by all-gather.
     _unsharded_model_weight: DBuffer | QuantizedDBuffer
+    # BF16 shares one event across phases; sharded MXFP8 has independent rowwise
+    # (forward) and columnwise (backward) events. Releasing storage clears its event.
+    _unshard_events: dict[Phase, torch.cuda.Event]
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_scale: float
 
@@ -159,6 +164,7 @@ class FsdpParameterGroup:
             fqn_to_parameter
         )
         self._owning_module = ref(owning_module)
+        self._unshard_events = {}
         self.mesh = mesh
         self.grad_scale = grad_scale
         parameters = tuple(parameter_to_fqns)
@@ -181,9 +187,9 @@ class FsdpParameterGroup:
         )
         self.fsdp_parameters = self._build_fsdp_parameters(parameter_to_fqns)
 
-        # _build_fsdp_parameters() creates views into this storage, which requires a valid
-        # storage size. Release it only after construction; a later unshard reallocates it.
-        self._unsharded_model_weight.release_storage()
+        # Building Parameter views requires live storage. Release temporary gather
+        # storage afterward; replicated weights keep their persistent buffer.
+        self.release_unsharded_storage()
         self._switch_to_sharded_parameters()
 
     @staticmethod
@@ -329,19 +335,23 @@ class FsdpParameterGroup:
                     )
         self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
         self.sync_model_weight_from_main_weight()
-        with self._symmetric_memory_context():
-            if isinstance(self.model_weight, DBuffer):
-                self._unsharded_model_weight = DBuffer(
-                    mesh=self.mesh,
-                    placements=[Replicate()] * self.mesh.ndim,
-                    layout=layout,
-                    dtype=self.dtype,
-                    device=self.main_weight.device,
-                )
-            else:
-                self._unsharded_model_weight = QuantizedDBuffer(
-                    self.mesh, [Replicate()] * self.mesh.ndim, layout, self.main_weight.device
-                )
+        unsharded_placements = (Replicate(),) * self.mesh.ndim
+        if self.model_weight.placements == unsharded_placements:
+            self._unsharded_model_weight = self.model_weight
+        else:
+            with self._symmetric_memory_context():
+                if isinstance(self.model_weight, DBuffer):
+                    self._unsharded_model_weight = DBuffer(
+                        mesh=self.mesh,
+                        placements=unsharded_placements,
+                        layout=layout,
+                        dtype=self.dtype,
+                        device=self.main_weight.device,
+                    )
+                else:
+                    self._unsharded_model_weight = QuantizedDBuffer(
+                        self.mesh, unsharded_placements, layout, self.main_weight.device
+                    )
 
         self.main_grad = None
         self.pre_optimizer_main_grad = None
@@ -420,6 +430,7 @@ class FsdpParameterGroup:
             self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.sharded)
 
     def _switch_to_unsharded_parameters(self) -> None:
+        """Expose each FsdpParameter's unsharded Parameter on its owning module."""
         for fsdp_parameter in self.fsdp_parameters:
             self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.unsharded)
 
@@ -435,93 +446,73 @@ class FsdpParameterGroup:
             self.post_optimizer_model_weight.placements != self.model_weight.placements
         )
 
-    def _is_model_weight_unsharded(self) -> bool:
-        """Whether compute weights are already unsharded."""
-        return self.model_weight.placements == self._unsharded_model_weight.placements
-
     @property
-    def has_forward_only_planes(self) -> bool:
-        """Whether unsharded storage holds planes that only forward compute reads.
+    def is_rowwise_unsharded(self) -> bool:
+        """Whether MXFP8 rowwise planes occupy temporary gathered storage."""
+        buffer = self._unsharded_model_weight
+        if buffer is self.model_weight:
+            return False
+        # QuantizedDBuffer aliases DBuffer when TE is unavailable.
+        if isinstance(buffer, DBuffer):
+            return False
+        return buffer.is_rowwise_allocated
 
-        True when sharded MXFP8 compute weights have rowwise planes allocated;
-        backward reads only columnwise planes. Other groups need all unsharded
-        storage in both phases.
+    def unshard_parameters(self, phase: Phase | None = None) -> None:
+        """Prepare this group's Parameters for the requested compute phase.
+
+        On the caller-selected all-gather stream, refresh compute weights, gather
+        missing data if sharded, update FsdpParameters, switch the module's
+        Parameters to their unsharded representations, and record readiness.
+        Reuse existing events so compute never waits for a later prefetch when its
+        weights are already available.
         """
-        unsharded_model_weight = self._unsharded_model_weight
-        return (
-            isinstance(unsharded_model_weight, QuantizedDBuffer)
-            and not self._is_model_weight_unsharded()
-            and unsharded_model_weight.is_rowwise_allocated
-        )
+        requested_phases = (Phase.FORWARD, Phase.BACKWARD) if phase is None else (phase,)
+        missing_phases = tuple(p for p in requested_phases if p not in self._unshard_events)
+        if not missing_phases:
+            return
 
-    def _needs_to_unshard_rowwise(self, phase: Phase | None) -> bool:
-        """Whether compute in ``phase`` needs MXFP8 rowwise planes not unsharded yet."""
-        # Forward GEMMs read rowwise planes.
-        return phase is not Phase.BACKWARD and not self._unsharded_model_weight.is_rowwise_allocated
-
-    def _needs_to_unshard_columnwise(self, phase: Phase | None) -> bool:
-        """Whether compute in ``phase`` needs MXFP8 columnwise planes not unsharded yet."""
-        # Backward data-gradient GEMMs read columnwise planes.
-        return (
-            phase is not Phase.FORWARD and not self._unsharded_model_weight.is_columnwise_allocated
-        )
-
-    def unshard_parameters(self, phase: Phase | None = None) -> set[Phase]:
-        """Gather and install full parameters for compute in ``phase``.
-
-        Returns the phases whose compute the installed parameters now serve: both
-        for regular and replicated compute weights, and those with allocated planes
-        for sharded MXFP8 compute weights.
-        """
         if self._model_weight_is_stale:
             self.post_optimizer_model_weight.redistribute(
                 self.model_weight.placements, out=self.model_weight
             )
             self._model_weight_is_stale = False
 
-        unsharded_model_weight = self._unsharded_model_weight
-        if self._is_model_weight_unsharded():
-            # Reinstall so parameters see the latest optimizer update; MXFP8 padded
-            # scales are copies.
-            self._install_unsharded_parameters(self.model_weight)
-            ready_phases = {Phase.FORWARD, Phase.BACKWARD}
-        elif isinstance(unsharded_model_weight, DBuffer):
-            # Data that is already unsharded will not be gathered again.
-            if not unsharded_model_weight.is_allocated:
-                self._materialize_unsharded_model_weight()
-                self._install_unsharded_parameters(unsharded_model_weight)
-            ready_phases = {Phase.FORWARD, Phase.BACKWARD}
+        if self._unsharded_model_weight is self.model_weight:
+            ready_phases = (Phase.FORWARD, Phase.BACKWARD)
+        elif isinstance(self._unsharded_model_weight, DBuffer):
+            self._allgather_model_weight()
+            ready_phases = (Phase.FORWARD, Phase.BACKWARD)
         else:
-            rowwise = self._needs_to_unshard_rowwise(phase)
-            columnwise = self._needs_to_unshard_columnwise(phase)
-            self._materialize_unsharded_model_weight(rowwise=rowwise, columnwise=columnwise)
-            self._install_unsharded_parameters(
-                unsharded_model_weight, rowwise=rowwise, columnwise=columnwise
+            self._allgather_model_weight(
+                rowwise=Phase.FORWARD in missing_phases, columnwise=Phase.BACKWARD in missing_phases
             )
-            # Forward GEMMs read rowwise planes; backward dgrad GEMMs read columnwise planes.
-            ready_phases = {
-                ready_phase
-                for ready_phase, allocated in (
-                    (Phase.FORWARD, unsharded_model_weight.is_rowwise_allocated),
-                    (Phase.BACKWARD, unsharded_model_weight.is_columnwise_allocated),
-                )
-                if allocated
-            }
+            ready_phases = missing_phases
+        self._install_unsharded_parameters(
+            rowwise=Phase.FORWARD in ready_phases, columnwise=Phase.BACKWARD in ready_phases
+        )
         self._switch_to_unsharded_parameters()
-        return ready_phases
+        event = torch.cuda.current_stream().record_event()
+        for ready_phase in ready_phases:
+            self._unshard_events[ready_phase] = event
+
+    def wait_for_unshard(self, phase: Phase | None) -> None:
+        """Make the current stream wait for this group's requested weights."""
+        requested_phases = (Phase.FORWARD, Phase.BACKWARD) if phase is None else (phase,)
+        # Fixed phase order, with one wait when BF16 shares an event across phases.
+        for event in dict.fromkeys(self._unshard_events[p] for p in requested_phases):
+            torch.cuda.current_stream().wait_event(event)
 
     def _install_unsharded_parameters(
-        self,
-        unsharded_model_weight: DBuffer | QuantizedDBuffer,
-        *,
-        rowwise: bool = True,
-        columnwise: bool = True,
+        self, *, rowwise: bool = True, columnwise: bool = True
     ) -> None:
-        """Point unsharded parameters' data at ``unsharded_model_weight``.
+        """Update each FsdpParameter's unsharded data and scales from the weight buffer.
 
         ``rowwise`` and ``columnwise`` select the newly gathered MXFP8 planes to
-        install. Regular compute weights ignore them.
+        install, preserving planes already installed for the other phase. Regular
+        compute weights ignore them. Replicated weights also need installation
+        after optimizer updates because their padded MXFP8 scales are copies.
         """
+        unsharded_model_weight = self._unsharded_model_weight
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             tensor_view = unsharded_model_weight.get_tensor_view(index)
             # TE saves an MXFP8 Parameter itself for backward and reads its planes when
@@ -534,10 +525,8 @@ class FsdpParameterGroup:
                     tensor_view, fsdp_parameter.unsharded, rowwise=rowwise, columnwise=columnwise
                 )
 
-    def _materialize_unsharded_model_weight(
-        self, *, rowwise: bool = True, columnwise: bool = True
-    ) -> None:
-        """All-gather full compute weights into their unsharded buffer.
+    def _allgather_model_weight(self, *, rowwise: bool = True, columnwise: bool = True) -> None:
+        """Allocate the gather buffer and fill it from sharded compute weights.
 
         ``rowwise`` and ``columnwise`` select the MXFP8 planes to gather. Regular
         compute weights ignore them and gather their whole buffer.
@@ -576,21 +565,29 @@ class FsdpParameterGroup:
         self._switch_to_sharded_parameters()
 
     def release_unsharded_storage(self, *, rowwise_only: bool = False) -> None:
-        """Release all full-parameter storage, or only MXFP8 rowwise storage.
+        """Release gathered weights, or only their MXFP8 rowwise planes.
+
+        The caller orders this release after compute on the all-gather stream.
 
         Storage is resized to zero instead of replacing parameter ``.data``: autograd
         may have saved views into the unsharded parameters during forward, and those
         views must follow the Storage when a later unshard reallocates it.
         """
         unsharded_model_weight = self._unsharded_model_weight
+        if rowwise_only:
+            del self._unshard_events[Phase.FORWARD]
+        else:
+            self._unshard_events.clear()
+
+        # Clear readiness so the next unshard refreshes Parameter data/scales,
+        # but never free persistent compute weights or their padded scale copies.
+        if unsharded_model_weight is self.model_weight:
+            return
         if isinstance(unsharded_model_weight, DBuffer):
             assert not rowwise_only
             unsharded_model_weight.release_storage()
             return
         unsharded_model_weight.release_storage(rowwise_only=rowwise_only)
-        # Replicated compute parameters reference persistent model_weight storage.
-        if self._is_model_weight_unsharded():
-            return
         for parameter in self.fsdp_parameters:
             weight = parameter.unsharded
             # TE #3518 requires padded scale copies on the Parameter, separate

@@ -764,6 +764,11 @@ class CheckpointFunction(torch.autograd.Function):
 
         ctx.run_function = run_function
         ctx.distribute_saved_activations = distribute_saved_activations
+        # Activation recomputation must use the same autocast policy as the original forward.
+        # Otherwise it replays under the ambient autocast state.
+        ctx.autocast_enabled = torch.is_autocast_enabled("cuda")
+        ctx.autocast_dtype = torch.get_autocast_dtype("cuda")
+        ctx.autocast_cache_enabled = torch.is_autocast_cache_enabled()
 
         # Copy the rng states.
         ctx.rng_states = _get_all_rng_states()
@@ -810,7 +815,13 @@ class CheckpointFunction(torch.autograd.Function):
 
             # Compute the forward pass.
             detached_inputs = detach_variable(inputs)
-            with torch.enable_grad(), suspend_tensor_observations():
+            autocast_context = torch.autocast(
+                device_type="cuda",
+                dtype=ctx.autocast_dtype,
+                enabled=ctx.autocast_enabled,
+                cache_enabled=ctx.autocast_cache_enabled,
+            )
+            with torch.enable_grad(), autocast_context, suspend_tensor_observations():
                 outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
