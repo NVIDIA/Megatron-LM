@@ -124,12 +124,13 @@ def setup(monkeypatch):
     monkeypatch.setattr(hybrid_block, 'TENorm', Norm)
     monkeypatch.setattr(DSAIndexerLossLoggingHelper, 'save_loss_to_tracker', lambda **kw: None)
     monkeypatch.setattr(DSAIndexerLossAutoScaler, 'main_loss_backward_scale', torch.tensor(1.0))
+    cpu_attention = get_csa2_module_spec_for_backend(Backend())
+    # Exercise CPU orchestration even when the installed TE exports its CUDA-only op.
+    cpu_attention.submodules = replace(cpu_attention.submodules, linear_o_group_proj=None)
     attn = ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            input_layernorm=Norm,
-            self_attention=get_csa2_module_spec_for_backend(Backend()),
-            self_attn_bda=get_bias_dropout_add,
+            input_layernorm=Norm, self_attention=cpu_attention, self_attn_bda=get_bias_dropout_add
         ),
     )
     dense = ModuleSpec(
