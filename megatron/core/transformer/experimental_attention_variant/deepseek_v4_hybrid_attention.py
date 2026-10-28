@@ -248,7 +248,7 @@ class DSv4HybridAttention(Attention):
                 self.o_local_groups,
                 group_proj_in_size,
                 self.config.o_lora_rank,
-                batch_dim=-2,
+                input_batch_dim=-2,
                 device=device,
                 dtype=self.config.params_dtype,
                 bias=False,
