@@ -72,6 +72,7 @@ def _make_engine(
         can_prepare_requests=mock.Mock(return_value=True),
         active_token_count=0,
         max_tokens=8,
+        max_prefill_tokens=8,
         chunked_prefill_request_id=-1,
     )
     model_config = SimpleNamespace(

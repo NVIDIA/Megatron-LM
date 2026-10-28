@@ -3963,6 +3963,21 @@ class DynamicInferenceEngine(AbstractEngine):
             return self._cg_admission_check(req, candidate)
         return self._matches_cg_admission(candidate)
 
+    def _chunked_prefill_token_budget(self) -> int:
+        """Return how many more prompt tokens this step can admit.
+
+        The step capacity is `context.max_tokens`. Batch-invariant hybrid models also
+        bound the prefill tokens alone by `context.max_prefill_tokens`, which leaves
+        the rest of the capacity to this step's decode tokens.
+        """
+        context = self.context
+        token_budget = context.max_tokens - context.active_token_count
+        if context.max_prefill_tokens < context.max_tokens:
+            decode_token_count = context.num_decode_requests * (context.num_speculative_tokens + 1)
+            prefill_token_count = context.active_token_count - decode_token_count
+            token_budget = min(token_budget, context.max_prefill_tokens - prefill_token_count)
+        return token_budget
+
     def _can_schedule_chunked_prefill(self, req) -> bool:
         """Return whether the queue-head request can admit at least one prompt token.
 
@@ -3974,7 +3989,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         request_can_be_added, _, kv_cache_available = self.context.check_availability(req)
         is_continuing_chunk = self.context.chunked_prefill_request_id == req.request_id
-        token_capacity_available = self.context.active_token_count < self.context.max_tokens
+        token_capacity_available = self._chunked_prefill_token_budget() > 0
         return (
             (is_continuing_chunk or request_can_be_added)
             and kv_cache_available
@@ -4226,7 +4241,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
             if self._can_schedule_chunked_prefill(req):
                 # How many tokens we can admit this step.
-                token_budget = self.context.max_tokens - self.context.active_token_count
+                token_budget = self._chunked_prefill_token_budget()
 
                 # Prefix-cache skip: on a request's first chunk, the tokens covered
                 # by a cached prefix are reused rather than recomputed, so they do

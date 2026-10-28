@@ -1218,6 +1218,49 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             )
 
     @pytest.mark.internal
+    @pytest.mark.parametrize("batch_invariant_mode", [False, True])
+    @pytest.mark.parametrize("num_decode", [0, 1, 40, 63])
+    def test_batch_invariant_mamba_chunked_prefill_budget_excludes_decode(
+        self, batch_invariant_mode, num_decode
+    ):
+        ctx = self._mctx(
+            block_size_tokens=32,
+            batch_invariant_mode=batch_invariant_mode,
+            enable_prefix_caching=False,
+            enable_chunked_prefill=True,
+            max_tokens=256,
+            max_requests=64,
+        )
+        chunk = ctx.mamba_chunk_size
+        assert ctx.max_prefill_tokens == 256
+        assert ctx.max_tokens == (256 + chunk if batch_invariant_mode else 256)
+
+        # Resident decode requests: one token each this step.
+        for i in range(num_decode):
+            ctx.add_request(self._req(ctx, self._prompt(1, offset=i), request_id=100 + i))
+        ctx.num_prefill_requests = 0
+        assert ctx.num_decode_requests == num_decode
+        assert ctx.active_token_count == num_decode
+
+        engine = _StubEngine(ctx, enable_chunked_prefill=True)
+        req = self._req(ctx, self._prompt(1000), enable_prefix_caching=False)
+        engine.requests[req.request_id] = SimpleNamespace(
+            record=DynamicInferenceRequestRecord.from_request(req),
+            future=engine._loop.create_future(),
+        )
+        req.status = Status.ACTIVE_AND_GENERATING_TOKENS
+        engine.waiting_request_ids.append(req.request_id)
+        engine.schedule_chunked_prefill()
+
+        admitted = req.finished_chunk_token_count
+        assert ctx.active_token_count == num_decode + admitted <= ctx.max_tokens
+        if batch_invariant_mode:
+            # A full SSM-chunk-aligned prefill budget, regardless of the decode tokens.
+            assert admitted == 256 and admitted % chunk == 0
+        else:
+            assert admitted == 256 - num_decode
+
+    @pytest.mark.internal
     def test_mamba_intermediate_offsets(self):
         bs = 256
 
