@@ -441,11 +441,8 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     cfg = get_run_config()
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
-    elif cfg.model.transformer.sequence_packing_scheduler is not None:
-        # The scheduler sends packing metadata to middle PP stages itself and requires that
-        # only the first and last stages hold a data iterator.
-        return is_first_or_last_pipeline_stage(vp_stage)
-    elif is_packed_sequence:
+    elif is_packed_sequence or cfg.model.transformer.sequence_packing_scheduler is not None:
+        # The sequence-packing scheduler runs on every PP stage and reads its input there.
         return True
     return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank_func(
         layout=cfg.model.transformer.pipeline_model_parallel_layout,

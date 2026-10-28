@@ -1166,6 +1166,45 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
     assert batch["padding_mask"] is padding_mask
 
 
+@pytest.mark.parametrize("script", [pretrain_gpt, pretrain_hybrid], ids=["gpt", "hybrid"])
+def test_get_batch_reuses_run_config_without_rebuilding(script, monkeypatch):
+    args = SimpleNamespace()
+    configs = [
+        SimpleNamespace(
+            sequence_packing_scheduler="dp_balanced",
+            dynamic_context_parallel=False,
+            virtual_pipeline_model_parallel_size=None,
+            pipeline_model_parallel_layout=None,
+            mtp_num_layers=None,
+        )
+        for _ in range(2)
+    ]
+    cfg = SimpleNamespace(model=SimpleNamespace(transformer=configs[0]))
+    result = object()
+    fetch_batch = MagicMock(return_value=result)
+    monkeypatch.setattr(script, "get_args", lambda: args)
+    monkeypatch.setattr(script, "get_run_config", lambda: cfg)
+    monkeypatch.setattr(script, "mtp_on_this_rank_func", lambda **kwargs: False)
+    monkeypatch.setattr(script, "get_batch_on_this_rank_for_sequence_packing", fetch_batch)
+    pg_collection = ProcessGroupCollection(pp=object())
+
+    # Repeated microbatches use the already-built config, regardless of CLI object identity.
+    for _ in range(2):
+        assert script.get_batch(None, pg_collection=pg_collection) is result
+        assert fetch_batch.call_args.kwargs["config"] is configs[0]
+    previous_args = args
+    args = SimpleNamespace(**vars(previous_args))
+    assert args == previous_args and args is not previous_args
+    assert script.get_batch(None, pg_collection=pg_collection) is result
+    assert fetch_batch.call_args.kwargs["config"] is configs[0]
+
+    # A new run supplies its own model config; no cached CLI config leaks across runs.
+    cfg = SimpleNamespace(model=SimpleNamespace(transformer=configs[1]))
+    for _ in range(2):
+        assert script.get_batch(None, pg_collection=pg_collection) is result
+        assert fetch_batch.call_args.kwargs["config"] is configs[1]
+
+
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 @pytest.mark.parametrize("pp_size", [1, 2, 4])
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
@@ -1647,14 +1686,19 @@ def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_l
 
 
 @pytest.mark.parametrize("script", [pretrain_gpt, pretrain_hybrid], ids=["gpt", "hybrid"])
-@pytest.mark.parametrize("sequence_packing_scheduler", [None, "dp_balanced"])
+@pytest.mark.parametrize(
+    "sequence_packing_scheduler,is_packed_sequence",
+    [(None, True), ("dp_balanced", True), ("dp_balanced", False)],
+)
 @pytest.mark.parametrize("vp_size", [None, 2])
-def test_packed_sequence_dataset_built_on_rank(script, sequence_packing_scheduler, vp_size):
-    """Check which ranks build a packed-sequence dataset.
+def test_packed_sequence_dataset_built_on_rank(
+    script, sequence_packing_scheduler, is_packed_sequence, vp_size
+):
+    """Check that TP rank 0 of every PP stage builds the dataset for packed sequences.
 
     Without the sequence-packing scheduler, middle PP stages read the packing metadata from their
-    own data iterator. The scheduler sends that metadata to them instead and rejects a data
-    iterator on any rank other than TP rank 0 of the first or last PP stage.
+    own data iterator. The scheduler runs on every PP stage and reads its input there, also when
+    the dataset itself is not a packed-sequence dataset.
     """
     tp_size, pp_size = 2, 4
     if tp_size * pp_size > torch.cuda.device_count():
@@ -1689,14 +1733,9 @@ def test_packed_sequence_dataset_built_on_rank(script, sequence_packing_schedule
         ),
     ):
         for vp_stage in vp_stages:
-            built = script.is_dataset_built_on_rank(vp_stage=vp_stage, is_packed_sequence=True)
-
-            if sequence_packing_scheduler is None:
-                expected = tp_rank == 0
-            else:
-                on_first_stage = pp_rank == 0 and vp_stage == vp_stages[0]
-                on_last_stage = pp_rank == pp_size - 1 and vp_stage == vp_stages[-1]
-                expected = tp_rank == 0 and (on_first_stage or on_last_stage)
-            assert built == expected, f"{tp_rank=} {pp_rank=} {vp_stage=}"
+            built = script.is_dataset_built_on_rank(
+                vp_stage=vp_stage, is_packed_sequence=is_packed_sequence
+            )
+            assert built == (tp_rank == 0), f"{tp_rank=} {pp_rank=} {vp_stage=}"
 
     Utils.destroy_model_parallel()
