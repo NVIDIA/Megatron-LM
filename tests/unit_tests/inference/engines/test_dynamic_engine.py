@@ -1373,6 +1373,9 @@ class DynamicEngineTestConfig:
     cuda_graph_mixed_prefill_count: Optional[int] = 16
     cuda_graph_max_tokens: int = 512
     fp8: bool = False
+    mxfp8: bool = False
+    inference_flashinfer_mxfp8_token_capacity: Optional[int] = None
+    moe_ffn_hidden_size: Optional[int] = None
     hidden_size: Optional[int] = None
     model_provider: str = "gpt"
     flash_attention_version: Optional[int] = 2
@@ -1672,10 +1675,10 @@ class DynamicInferenceEngineTestBase:
                 hidden_size=(
                     test_config.hidden_size
                     if test_config.hidden_size is not None
-                    else (128 if test_config.fp8 else 32)
+                    else (128 if test_config.fp8 or test_config.mxfp8 else 32)
                 ),
                 num_attention_heads=4,
-                use_cpu_initialization=True,
+                use_cpu_initialization=not test_config.mxfp8,
                 cuda_graph_impl=effective_cuda_graph_impl,
                 inference_rng_tracker=True,
                 tensor_model_parallel_size=test_config.tensor_model_parallel_size,
@@ -1686,12 +1689,16 @@ class DynamicInferenceEngineTestBase:
                     if test_config.expert_model_parallel_size == 1
                     else test_config.expert_model_parallel_size
                 ),
+                moe_ffn_hidden_size=test_config.moe_ffn_hidden_size,
                 sequence_parallel=test_config.sequence_parallel,
                 pipeline_dtype=torch.bfloat16,
                 add_bias_linear=test_config.expert_model_parallel_size == 1
                 and not (test_config.transformer_impl == "inference_optimized"),
-                fp8="hybrid" if test_config.fp8 else None,
-                fp8_recipe="tensorwise" if test_config.fp8 else None,
+                fp8="hybrid" if test_config.fp8 or test_config.mxfp8 else None,
+                fp8_recipe=(
+                    "mxfp8" if test_config.mxfp8 else ("tensorwise" if test_config.fp8 else None)
+                ),
+                fp8_param=test_config.mxfp8,
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_modules=test_config.cuda_graph_modules,
                 inference_cuda_graph_scope=(
@@ -1701,6 +1708,11 @@ class DynamicInferenceEngineTestBase:
                     else InferenceCudaGraphScope.none
                 ),
                 transformer_impl=test_config.transformer_impl,
+                # MXFP8 MoE runs on FlashInfer; every other model keeps the config default.
+                **({"inference_grouped_gemm_backend": "flashinfer"} if test_config.mxfp8 else {}),
+                inference_flashinfer_mxfp8_token_capacity=(
+                    test_config.inference_flashinfer_mxfp8_token_capacity
+                ),
                 activation_func=(
                     squared_relu
                     if test_config.transformer_impl == "inference_optimized"
@@ -1839,6 +1851,10 @@ class DynamicInferenceEngineTestBase:
         else:
             raise ValueError(f"Invalid model provider {test_config.model_provider}")
 
+        if test_config.mxfp8:
+            from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
+
+            quantize_model_to_mxfp8(model, backend="triton")
         for param in model.parameters():
             param.data = param.data.to(transformer_config.params_dtype)
 
