@@ -1741,41 +1741,38 @@ def _instrument_scenario_runtime(env, scenario, runtime, teacher_tokens=None):
                         bool((metadata["temperature"][:active_count] != 1.0).any())
                     )
                     sampled = original(*kernel_args, **kernel_kwargs)
-                    if name == "sampling_from_logits":
-                        valid = (sampled >= 0) & (sampled < kernel_args[0].shape[-1])
-                    else:
-                        values = kernel_args[0]
-                        probabilities = (
-                            torch.softmax(values, dim=-1)
-                            if name == "top_k_top_p_sampling_from_logits"
-                            else values
-                        )
-                        sorted_probabilities, sorted_ids = probabilities.sort(
-                            dim=-1, descending=True
-                        )
-                        keep = torch.ones_like(sorted_probabilities, dtype=torch.bool)
-                        if name in {
-                            "top_k_sampling_from_probs",
-                            "top_k_top_p_sampling_from_logits",
-                        }:
-                            top_k = kernel_args[1].clamp(min=1, max=probabilities.shape[-1])
-                            ranks = torch.arange(
-                                probabilities.shape[-1], device=probabilities.device
+                    values = kernel_args[0].float()
+                    valid = (sampled >= 0) & (sampled < values.shape[-1])
+                    if name != "sampling_from_logits":
+                        # FlashInfer filters by value: top-k keeps every token tied with the
+                        # k-th largest value, and top-p keeps a token while the probability
+                        # mass strictly above it is below top_p. Ties sort arbitrarily, so the
+                        # check compares values instead of sort positions.
+                        rows = torch.arange(sampled.numel(), device=values.device)
+                        tokens = sampled.long().clamp(0, values.shape[-1] - 1)
+                        support = torch.ones_like(values, dtype=torch.bool)
+                        if "top-k-filter" in flashinfer_kernels[name]:
+                            top_k = kernel_args[1].long().clamp(min=1, max=values.shape[-1])
+                            support = values >= values.sort(dim=-1, descending=True).values.gather(
+                                1, top_k.unsqueeze(1) - 1
                             )
-                            keep &= ranks.unsqueeze(0) < top_k.unsqueeze(1)
-                        if name in {
-                            "top_p_sampling_from_probs",
-                            "top_k_top_p_sampling_from_logits",
-                        }:
+                        valid &= support[rows, tokens]
+                        if "top-p-filter" in flashinfer_kernels[name]:
+                            if name == "top_k_top_p_sampling_from_logits":
+                                probabilities = torch.softmax(
+                                    values.masked_fill(~support, float("-inf")), dim=-1
+                                )
+                            else:
+                                probabilities = values
                             top_p = kernel_args[
                                 2 if name == "top_k_top_p_sampling_from_logits" else 1
                             ]
-                            nucleus_probabilities = sorted_probabilities * keep
-                            nucleus_probabilities /= nucleus_probabilities.sum(dim=-1, keepdim=True)
-                            keep &= (
-                                nucleus_probabilities.cumsum(dim=-1) - nucleus_probabilities
-                            ) < top_p.unsqueeze(1)
-                        valid = ((sorted_ids == sampled.unsqueeze(1)) & keep).any(dim=-1)
+                            sampled_probability = probabilities[rows, tokens].unsqueeze(1)
+                            mass_above = probabilities.where(
+                                probabilities > sampled_probability, 0.0
+                            ).sum(dim=-1)
+                            # Absorb the kernel's different fp32 summation order.
+                            valid &= mass_above < top_p + 1e-5
                     runtime["flashinfer-support-rows"] += sampled.numel()
                     runtime["flashinfer-valid-support-rows"] += int(valid.sum().item())
                     return sampled
