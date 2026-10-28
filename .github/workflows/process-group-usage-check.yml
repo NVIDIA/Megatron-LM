@@ -58,3 +58,10 @@ jobs:
       - name: Check for new global process-group reads in megatron/core
         continue-on-error: true
         run: python tools/check_process_group_usage.py
+
+      # Report-only as well: deprecated parallel_state calls outside megatron/core are listed in
+      # the log. The unit-test bucket tests/unit_tests/**/*.py runs the same test file too. Run
+      # it by path: it is stdlib-only, and the unit-test package imports torch.
+      - name: Check for deprecated parallel_state calls outside megatron/core
+        continue-on-error: true
+        run: python tests/unit_tests/test_parallel_state_accessor_uses.py

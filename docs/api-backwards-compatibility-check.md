@@ -166,18 +166,32 @@ Bootstrap, teardown and the registry are not deprecated: `initialize_model_paral
   from its caller. It counts the calls of the fallbacks of `process_groups_config.py`, which
   read the grid when the caller omits its groups, as guarded: `resolve_process_groups()`,
   `resolve_gtp_remat_group()`, and `ProcessGroupCollection.setup_process_groups_for_ddp()` and
-  `setup_process_groups_for_optimizer()`. A new call of any of them fails the check. Its
-  allowlist of the existing calls records which ones are warned: preceded, in the same function,
-  by a `warn_global_process_group_fallback()` call in their block or in a block that contains
-  it, or inside a `with global_process_group_fallback(...)` block. A warned call that loses its
-  warning fails the check too.
+  `setup_process_groups_for_optimizer()`. A new call of any of them makes the check exit with
+  an error. Its allowlist of the existing calls records which ones are warned: preceded, in the
+  same function, by a `warn_global_process_group_fallback()` call in their block or in a block
+  that contains it, or inside a `with global_process_group_fallback(...)` block. A warned call
+  that loses its warning is an error too.
 - **A fallback outside Megatron Core** reads the grid inside
   `with global_process_group_fallback(owner, argument, deprecated_in=..., removed_in=...):`
   from `megatron.core.process_groups_config`. It emits one `ProcessGroupFallbackWarning` for the
   fallback, and the accessors and `use_mpu_process_groups()` it calls do not warn again.
   `tests/unit_tests/test_parallel_state_accessor_uses.py` checks that the code of this
-  repository outside Megatron Core calls them only in such a block or in bootstrap code that
-  ignores `ParallelStateDeprecationWarning`.
+  repository outside Megatron Core and its tests calls them only in such a block or in
+  bootstrap code that ignores `ParallelStateDeprecationWarning`.
+- **In CI**, the *Process group usage check* workflow
+  (`.github/workflows/process-group-usage-check.yml`) runs on pull requests and in the merge
+  queue. Its job fails when the tests of the checker,
+  `tests/unit_tests/test_check_process_group_usage.py`, fail; they also check that each call in
+  the allowlist is warned or guarded, apart from two that the test lists. The job then runs
+  `tools/check_process_group_usage.py` and `tests/unit_tests/test_parallel_state_accessor_uses.py`
+  as report-only steps (`continue-on-error`): a new call in Megatron Core, a call that lost its
+  warning, or a deprecated call outside Megatron Core is listed in the step's log, and the job
+  still passes. Whether that should block a pull request is still to be decided, see
+  [#6307](https://github.com/NVIDIA/Megatron-LM/issues/6307). The unit-test jobs run both test
+  files in the `tests/unit_tests/**/*.py` bucket, where a failure of either fails the job;
+  nothing there runs the checker on the repository's code. A pull request that runs selective
+  (Testmon) unit tests may skip both files, because Testmon selects tests by the code they
+  execute and they read the files they check as text; the merge queue runs every test.
 - **Strict mode** (`--strict-process-group-fallbacks`, `enable_strict_process_group_fallbacks()`)
   turns `ProcessGroupFallbackWarning` into an error. It does not affect
   `ParallelStateDeprecationWarning`.
