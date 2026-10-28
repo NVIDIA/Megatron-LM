@@ -219,27 +219,17 @@ def validate_phase(cache_dir: Path, phase: str, *, check_runtime: bool = True) -
         raise ValueError(f"Testmon database checksum changed: {phase}")
 
 
-def finalize(
-    cache_dir: Path,
-    identity: dict,
-    source_sha: str,
-    generation: str,
-    source_ref: str = "refs/heads/main",
-) -> dict:
+def finalize(cache_dir: Path, identity: dict, source_sha: str, generation: str) -> dict:
     """Write the generation manifest only after both baseline phases succeeded."""
     if not re.fullmatch(r"[0-9a-f]{40}", source_sha) or not re.fullmatch(
         r"[0-9]+-[0-9]+", generation
     ):
         raise ValueError("invalid baseline source or generation")
-    if source_ref != "refs/heads/main" and not source_ref.startswith(
-        "refs/heads/gh-readonly-queue/main/"
-    ):
-        raise ValueError("invalid baseline source ref")
     for phase in PHASES:
         validate_phase(cache_dir, phase, check_runtime=False)
     manifest = {
         "schema": SCHEMA,
-        "source_ref": source_ref,
+        "source_ref": "refs/heads/main",
         "source_sha": source_sha,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "generation": generation,
@@ -250,9 +240,7 @@ def finalize(
     return manifest
 
 
-def validate_cache(
-    cache_dir: Path, identity: dict, matched_key: str, *, source_ref: str = "refs/heads/main"
-) -> dict:
+def validate_cache(cache_dir: Path, identity: dict, matched_key: str) -> dict:
     """Require a compatible completed main generation, including a prefix cache match."""
     manifest = _read_json(cache_dir / "manifest.json")
     generation = manifest.get("generation", "")
@@ -262,7 +250,7 @@ def validate_cache(
         raise ValueError("restored Testmon key does not match its generation")
     if manifest.get("schema") != SCHEMA or manifest.get("identity") != identity["compatibility"]:
         raise ValueError("Testmon cache compatibility changed")
-    if manifest.get("source_ref") != source_ref or not re.fullmatch(
+    if manifest.get("source_ref") != "refs/heads/main" or not re.fullmatch(
         r"[0-9a-f]{40}", str(manifest.get("source_sha", ""))
     ):
         raise ValueError("invalid Testmon baseline source")
@@ -294,7 +282,6 @@ def main(argv: list[str] | None = None) -> int:
         if command == "validate":
             child.add_argument("--matched-key", required=True)
         else:
-            child.add_argument("--source-ref", default="refs/heads/main")
             child.add_argument("--source-sha", required=True)
             child.add_argument("--generation", required=True)
     args = parser.parse_args(argv)
@@ -306,13 +293,7 @@ def main(argv: list[str] | None = None) -> int:
             _write_json(args.output, identity)
             print(f"cache_prefix={identity['cache_prefix']}")
         elif args.command == "finalize":
-            finalize(
-                args.cache_dir,
-                _read_json(args.identity),
-                args.source_sha,
-                args.generation,
-                args.source_ref,
-            )
+            finalize(args.cache_dir, _read_json(args.identity), args.source_sha, args.generation)
         else:
             identity = _read_json(args.identity)
             manifest = validate_cache(args.cache_dir, identity, args.matched_key)

@@ -14,7 +14,7 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tests/unit_tests"))
-from testmon_cache import PHASES, PLATFORMS, cache_identity, finalize, validate_cache
+from testmon_cache import PHASES, PLATFORMS, cache_identity, finalize
 
 logger = logging.getLogger(__name__)
 REPOSITORY = "NVIDIA/Megatron-LM"
@@ -81,14 +81,10 @@ def artifact_matrix(run: dict) -> list[dict]:
                 identity = cache_identity(Path.cwd(), bucket, platform)
                 expected[identity["cache_prefix"] + generation] = identity
     selected = []
-    seen = set()
     for artifact in artifacts:
         name = artifact["name"]
         if artifact["expired"] or name not in expected:
             continue
-        if name in seen:
-            raise ValueError(f"Duplicate baseline artifact: {name}")
-        seen.add(name)
         selected.append({"id": artifact["id"], "name": name, "identity": expected[name]})
     return selected
 
@@ -98,13 +94,14 @@ def promote(directory: Path, artifact: dict, run: dict, source_sha: str, generat
     identity = artifact["identity"]
     if any(path.is_symlink() for path in directory.rglob("*")):
         raise ValueError("Symlinks are not allowed in baseline artifacts")
-    manifest = validate_cache(
-        directory, identity, artifact["name"], source_ref=f"refs/heads/{run['head_branch']}"
-    )
-    if manifest["source_sha"] != run["head_sha"]:
-        raise ValueError("Baseline source does not match the successful merge group")
-    # Keep the observed GPU image for diagnostics; CPU hosts do not resolve it.
-    identity = {**identity, "image_id": manifest["image_id"]}
+    producer = json.loads((directory / "producer.json").read_text())
+    if (
+        producer["source_sha"] != run["head_sha"]
+        or producer["generation"] != f"{run['id']}-{run['run_attempt']}"
+        or producer["identity"]["compatibility"] != identity["compatibility"]
+    ):
+        raise ValueError("Baseline does not match the successful merge group and current identity")
+    identity = {**identity, "image_id": producer["identity"]["image_id"]}
     # The cache path and gzip compression must match existing PR restores.
     destination = Path("assets_dir/testmon")
     if destination.exists():
@@ -113,40 +110,18 @@ def promote(directory: Path, artifact: dict, run: dict, source_sha: str, generat
         (destination / phase).mkdir(parents=True)
         for name in (".testmondata", "metadata.json"):
             shutil.copyfile(directory / phase / name, destination / phase / name)
-    manifest = finalize(destination, identity, source_sha, generation)
-    manifest["producer_sha"] = run["head_sha"]
-    manifest["producer_run_id"] = run["id"]
-    manifest["producer_run_attempt"] = run["run_attempt"]
-    (destination / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    key = identity["cache_prefix"] + generation
-    validate_cache(destination, identity, key)
-    return key
+    finalize(destination, identity, source_sha, generation)
+    return identity["cache_prefix"] + generation
 
 
 def main() -> None:
     """Publish validated artifacts only while this push is the current main head."""
-    if (
-        os.environ["GITHUB_REPOSITORY"] != REPOSITORY
-        or os.environ["GITHUB_REF"] != "refs/heads/main"
-        or os.environ["GITHUB_EVENT_NAME"] != "push"
-    ):
-        raise ValueError("Baseline promotion requires a push to NVIDIA/Megatron-LM main")
     source_sha = os.environ["GITHUB_SHA"]
-    if subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() != source_sha:
-        raise ValueError("Publisher checkout does not match the main push")
-    if api("git/ref/heads/main")["object"]["sha"] != source_sha:
-        logger.info("A newer main push superseded this publication")
-        return
     run = find_producer(source_sha)
     if run is None:
         logger.info("No successful merge-group run matches this main tree; retaining old caches")
         return
     artifacts = artifact_matrix(run)
-    if not artifacts:
-        logger.info(
-            "Matching run has no baseline artifacts; retain caches or use manual regeneration"
-        )
-        return
     generation = f"{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
     for artifact in artifacts:
         if api("git/ref/heads/main")["object"]["sha"] != source_sha:

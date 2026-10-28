@@ -420,12 +420,18 @@ runs:
         CACHE_DIR: assets_dir/testmon
         SOURCE_SHA: ${{ github.sha }}
         GENERATION: ${{ github.run_id }}-${{ github.run_attempt }}
-        SOURCE_REF: ${{ github.ref }}
+        SOURCE_EVENT: ${{ github.event_name }}
       run: |
         sudo chown -R "$(id -u):$(id -g)" "$CACHE_DIR"
-        python tests/unit_tests/testmon_cache.py finalize \
-          --cache-dir "$CACHE_DIR" --identity "$RUNNER_TEMP/unit-testmon-identity.json" \
-          --source-sha "$SOURCE_SHA" --source-ref "$SOURCE_REF" --generation "$GENERATION"
+        if [[ "$SOURCE_EVENT" == "merge_group" ]]; then
+          jq -n --slurpfile identity "$RUNNER_TEMP/unit-testmon-identity.json" \
+            --arg sha "$SOURCE_SHA" --arg generation "$GENERATION" \
+            '{identity: $identity[0], source_sha: $sha, generation: $generation}' > "$CACHE_DIR/producer.json"
+        else
+          python tests/unit_tests/testmon_cache.py finalize \
+            --cache-dir "$CACHE_DIR" --identity "$RUNNER_TEMP/unit-testmon-identity.json" \
+            --source-sha "$SOURCE_SHA" --generation "$GENERATION"
+        fi
 
     - name: Upload merge-group Testmon baseline
       id: upload-unit-testmon-baseline

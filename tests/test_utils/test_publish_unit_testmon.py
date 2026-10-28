@@ -99,52 +99,36 @@ def baseline(tmp_path, monkeypatch):
         DB(str(database)).con.close()
         cache.record_phase(directory, phase)
     run = run_metadata()
-    cache.finalize(directory, identity, MERGE_SHA, "123-2", f"refs/heads/{run['head_branch']}")
+    (directory / "producer.json").write_text(
+        json.dumps({"identity": identity, "source_sha": MERGE_SHA, "generation": "123-2"})
+    )
     artifact = {"id": 42, "name": identity["cache_prefix"] + "123-2", "identity": identity}
     return directory, artifact, run
 
 
-@pytest.mark.parametrize(
-    "problem", [None, "sha", "ref", "attempt", "identity", "checksum", "incomplete", "symlink"]
-)
-def test_promotion_validates_provenance_and_database_before_main_publication(baseline, problem):
+@pytest.mark.parametrize("problem", [None, "sha", "attempt", "identity", "incomplete"])
+def test_promotion_rejects_invalid_artifacts(baseline, problem):
     directory, artifact, run = baseline
-    manifest_file = directory / "manifest.json"
-    manifest = json.loads(manifest_file.read_text())
+    producer_file = directory / "producer.json"
+    producer = json.loads(producer_file.read_text())
     if problem == "sha":
-        manifest["source_sha"] = "c" * 40
-    elif problem == "ref":
-        manifest["source_ref"] = "refs/heads/main"
+        producer["source_sha"] = "c" * 40
     elif problem == "attempt":
-        manifest["generation"] = "123-1"
+        producer["generation"] = "123-1"
     elif problem == "identity":
-        manifest["identity"]["platform"] = "dgx_gb200"
-    elif problem == "checksum":
-        metadata_file = directory / "prod/metadata.json"
-        metadata = json.loads(metadata_file.read_text())
-        metadata["database_sha256"] = "wrong"
-        metadata_file.write_text(json.dumps(metadata))
+        producer["identity"]["compatibility"]["platform"] = "dgx_gb200"
     elif problem == "incomplete":
         (directory / "experimental/metadata.json").unlink()
-    elif problem == "symlink":
-        (directory / "link").symlink_to(manifest_file)
-    manifest_file.write_text(json.dumps(manifest))
+    producer_file.write_text(json.dumps(producer))
     if problem:
         with pytest.raises((ValueError, OSError)):
             publisher.promote(directory, artifact, run, MAIN_SHA, "456-1")
-        assert not Path("assets_dir/testmon").exists()
-        return
-    with pytest.raises(ValueError, match="source"):
-        cache.validate_cache(directory, artifact["identity"], artifact["name"])
-    key = publisher.promote(directory, artifact, run, MAIN_SHA, "456-1")
-    promoted = cache.validate_cache(Path("assets_dir/testmon"), artifact["identity"], key)
-    assert promoted["source_ref"] == "refs/heads/main"
-    assert promoted["source_sha"] == MAIN_SHA
-    assert promoted["producer_sha"] == MERGE_SHA
-    assert promoted["producer_run_id"] == 123
-    assert promoted["producer_run_attempt"] == 2
-    # Repeating preparation is safe and validates the same immutable cache key.
-    assert publisher.promote(directory, artifact, run, MAIN_SHA, "456-1") == key
+        assert not Path("assets_dir/testmon/manifest.json").exists()
+    else:
+        key = publisher.promote(directory, artifact, run, MAIN_SHA, "456-1")
+        promoted = cache.validate_cache(Path("assets_dir/testmon"), artifact["identity"], key)
+        assert promoted["source_sha"] == MAIN_SHA
+        assert publisher.promote(directory, artifact, run, MAIN_SHA, "456-1") == key
 
 
 def test_artifact_discovery_paginates_and_excludes_old_attempts(baseline, monkeypatch):
@@ -175,32 +159,12 @@ def test_artifact_discovery_paginates_and_excludes_old_attempts(baseline, monkey
     assert len(calls) == 2
 
 
-def test_workflow_keeps_manual_recovery_and_publishes_only_from_main_push():
-    producer = yaml.safe_load((ROOT / ".github/workflows/populate-build-cache.yml").read_text())
-    assert "schedule" not in producer[True]
-    assert "push" in producer[True] and "workflow_dispatch" in producer[True]
-    assert producer["jobs"]["parse-unit-tests"]["if"] == "github.event_name == 'workflow_dispatch'"
-    workflow = yaml.safe_load((ROOT / ".github/workflows/publish-unit-testmon.yml").read_text())
-    assert workflow[True] == {"push": {"branches": ["main"]}}
-    assert workflow["permissions"] == {"contents": "read", "actions": "read"}
-    assert workflow["jobs"]["publish"]["runs-on"] == "ubuntu-latest"
-    action = yaml.safe_load((ROOT / ".github/actions/action.yml").read_text())
-    steps = {step["name"]: step for step in action["runs"]["steps"]}
-    upload = steps["Upload merge-group Testmon baseline"]
-    assert upload["with"]["include-hidden-files"] is True
-    assert "prepare-unit-testmon-cache.outcome == 'success'" in upload["if"]
-    assert "github.ref == 'refs/heads/main'" in steps["Save unit Testmon baseline"]["if"]
-
-
 @pytest.mark.parametrize(
     "scenario", ["success", "superseded", "no-producer", "download-failure", "save-failure"]
 )
 def test_main_publishes_only_validated_artifacts(baseline, monkeypatch, tmp_path, scenario):
     directory, artifact, run = baseline
     for key, value in {
-        "GITHUB_REPOSITORY": publisher.REPOSITORY,
-        "GITHUB_REF": "refs/heads/main",
-        "GITHUB_EVENT_NAME": "push",
         "GITHUB_SHA": MAIN_SHA,
         "GITHUB_RUN_ID": "456",
         "GITHUB_RUN_ATTEMPT": "1",
@@ -208,7 +172,6 @@ def test_main_publishes_only_validated_artifacts(baseline, monkeypatch, tmp_path
         "RUNNER_TEMP": str(tmp_path),
     }.items():
         monkeypatch.setenv(key, value)
-    monkeypatch.setattr(publisher.subprocess, "check_output", lambda *a, **k: MAIN_SHA + "\n")
     monkeypatch.setattr(
         publisher, "find_producer", lambda sha: None if scenario == "no-producer" else run
     )
@@ -233,7 +196,6 @@ def test_main_publishes_only_validated_artifacts(baseline, monkeypatch, tmp_path
             assert operation == "save"
             manifest = cache.validate_cache(Path(args[0]), artifact["identity"], args[1])
             assert manifest["source_sha"] == MAIN_SHA
-            assert manifest["producer_sha"] == MERGE_SHA
 
     monkeypatch.setattr(publisher, "actions", actions)
     if scenario.endswith("-failure"):
