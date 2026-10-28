@@ -7,6 +7,7 @@ calls its provider with keyword arguments only. The tests run without torch.dist
 stand-ins for ``get_model`` and the builder.
 """
 
+import inspect
 from argparse import Namespace
 
 import pytest
@@ -43,6 +44,9 @@ def _get_model(groups):
     """
 
     def get_model(model_provider_func, wrap_with_ddp=True, config=None, pg_collection=None):
+        if pg_collection is None:
+            # get_model falls back to the global groups; a distinct object stands in for them.
+            pg_collection = object()
         groups.append(pg_collection)
         return [
             model_provider_func(
@@ -51,6 +55,24 @@ def _get_model(groups):
         ]
 
     return get_model
+
+
+def _assert_built_with(args, calls, groups):
+    """Checks that the builder ran once with ``args`` bound and the groups of ``get_model``."""
+    assert len(groups) == 1
+    assert calls == [(args, True, True, None, None, groups[0])]
+    assert calls[0][0] is args
+
+
+def test_stand_in_builder_matches_the_modelopt_builder_signature():
+    """The stand-in keeps the parameters of the real builder, which needs ModelOpt to import."""
+    pytest.importorskip("modelopt", reason="modelopt is not installed")
+    from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
+
+    def parameters(func):
+        return [(p.name, p.kind, p.default) for p in inspect.signature(func).parameters.values()]
+
+    assert parameters(_modelopt_builder([])) == parameters(modelopt_gpt_hybrid_builder)
 
 
 # The entry point runs after initialization, when the run config is set.
@@ -70,9 +92,7 @@ def test_get_model_for_inference_binds_args_to_the_modelopt_builder(monkeypatch)
     with pytest.raises(_Built):
         utils.get_model_for_inference()
 
-    # The builder receives the bound arguments and whatever groups get_model was given.
-    assert len(groups) == 1
-    assert calls == [(args, True, True, None, None, groups[0])]
+    _assert_built_with(args, calls, groups)
 
 
 def test_text_generation_server_binds_args_to_the_modelopt_builder(monkeypatch):
@@ -94,6 +114,4 @@ def test_text_generation_server_binds_args_to_the_modelopt_builder(monkeypatch):
     with pytest.raises(_Built):
         server.main()
 
-    # The builder receives the bound arguments and whatever groups get_model was given.
-    assert len(groups) == 1
-    assert calls == [(args, True, True, None, None, groups[0])]
+    _assert_built_with(args, calls, groups)
