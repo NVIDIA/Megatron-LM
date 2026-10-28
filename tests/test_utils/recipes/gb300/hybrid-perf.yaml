@@ -43,6 +43,7 @@ spec:
         "CONFIG_PATH=tests/performance_tests/test_cases/hybrid/{test_case}/model_config.yaml"
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts/"
         "RESULTS_ROOT={assets_dir}/perf_results"
+        "PLATFORM=gb300"
     )
 
     GPUS_PER_NODE=4 bash ./tests/performance_tests/shell_test_utils/run_perf_test.sh ${{ARGUMENTS[@]}}
