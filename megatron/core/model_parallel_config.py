@@ -421,6 +421,19 @@ class ModelParallelConfig:
     exposed (not overlapped with other computation).
     """
 
+    ep_overlap_unpaired_layer_post_process: bool = False
+    """With EP overlap, hide the EP communication of an unpaired layer behind the post-process
+    (output layer + loss) of the other microbatch.
+    When the forward and backward model chunks of a 1F1B step have different layer counts, the
+    extra layers run without a partner and their dispatch/combine is exposed. With this flag:
+    - if the backward chunk has the post-process and fewer layers, its output-layer backward
+      runs in the dispatch window of the first unpaired forward layer, and the unpaired forward
+      layers run before the paired ones;
+    - if the forward chunk has the post-process and fewer layers, its output-layer forward runs
+      in the combine-backward window of the first unpaired backward layer.
+    Only the execution order changes; the computed values are the same.
+    """
+
     ###################
     # Pipeline Parallel
     ###################
