@@ -133,8 +133,9 @@ absent field raises and an explicit `None` keeps its meaning of "this axis is no
 ```
 
 The tensor-parallel mappings fall back to the global tensor-parallel group when `group` is `None`.
-They warn only on global rank 0, and only with a `DeprecationWarning`, which Python hides by
-default.
+The fallback emits a `ProcessGroupFallbackWarning` once per mapping, on every rank that reaches it,
+but it still selects the global group. Without an initialized global grid, the group stays `None`
+and the mapping fails.
 
 **What goes wrong.** The weights are sharded over the module's tensor-parallel group, but the
 gather or reduction runs over the global one. Depending on the layouts, this sums unrelated
@@ -258,8 +259,8 @@ the whole job, say so in a comment, so that reviewers can tell it apart from a m
   every component of a model.
 - `torch.distributed.new_group` is collective. Every rank must call it with the same ranks in the
   same order. Creating a different group on each rank desynchronizes group creation, and can hang.
-- State that only `initialize_model_parallel` creates, such as the global memory buffer, is missing
-  on a grid that was built without it.
+- State that only `initialize_model_parallel` creates is missing on a grid that was built without
+  it.
 - Teardown that does not destroy every group it created leaks communicators on each
   initialize/destroy cycle.
 
@@ -268,7 +269,8 @@ the whole job, say so in a comment, so that reviewers can tell it apart from a m
 - Keep derived groups in local variables, or raise when a required field is missing.
 - Create groups collectively. For one group per rank, use
   `torch.distributed.new_subgroups_by_enumeration([[r] for r in range(world_size)])`.
-- Create shared buffers on first use instead of at grid initialization.
+- Create shared state on first use instead of at grid initialization, as
+  `get_global_memory_buffer()` in `megatron.core.utils` does for the memory buffer.
 - Track every group that initialization creates, and destroy each one at teardown.
 
 ## 9. A training loop that gives the collection only to the model
@@ -295,10 +297,10 @@ in [Passing the collection](process-group-collection.md#passing-the-collection).
     vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
 ```
 
-**What goes wrong.** Pipeline-stage predicates, the virtual-pipeline size and the global memory
-buffer have no collection field, so code that uses them only works on the global grid. Offline
-tools sometimes assign fake groups to `parallel_state`'s private module variables so that models
-can be built. A component that reads its own collection never sees those groups.
+**What goes wrong.** Pipeline-stage predicates and the virtual-pipeline size have no collection
+field, so code that uses them only works on the global grid. Offline tools sometimes assign fake
+groups to `parallel_state`'s private module variables so that models can be built. A component
+that reads its own collection never sees those groups.
 
 **Write instead:**
 

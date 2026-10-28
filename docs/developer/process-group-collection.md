@@ -175,9 +175,11 @@ Transformer Engine layer spec, without calling `initialize_model_parallel`. Some
 - With pipeline parallelism, the schedules take a `P2PCommunicator` for the pipeline group
   together with the collection.
 - The example builds no Gloo groups. Pass `use_gloo_process_groups=False` to
-  `get_megatron_optimizer`, or set `intra_dp_cp_gloo`, and `intra_expt_dp_gloo` with experts, to
-  Gloo groups with the ranks of the groups that the distributed optimizer shards over. Without
-  them, `use_gloo_process_groups=True` raises an error.
+  `get_megatron_optimizer`, or set `intra_dp_cp_gloo` and `intra_expt_dp_gloo` to Gloo groups with
+  the ranks of the data-parallel and expert data-parallel groups that the distributed optimizer
+  shards over. The expert one is needed whenever `expt_dp` is a group, as in the example, which
+  sets it to `dp` even for a dense model. Without them, `use_gloo_process_groups=True` raises an
+  error.
 - The local (non-Transformer Engine) layers use the process-wide memory buffer of
   `megatron.core.utils`. It does not depend on any process group and is created on first use, so
   it needs no `initialize_model_parallel` either.
