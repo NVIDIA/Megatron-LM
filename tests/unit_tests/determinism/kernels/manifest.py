@@ -103,6 +103,13 @@ K = "tests/unit_tests/determinism/kernels/"
 C = "tests/unit_tests/determinism/correctness/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
+    KernelEntry(
+        name="mtp_kl_loss",
+        sources=("megatron/core/ops/mtp_kl_loss.py",),
+        tests=(K + "test_mtp_kl_loss.py",),
+        kind="torch.compile",
+        notes="MTP KD local sum-exp/KL reductions and recomputed student gradient; no teacher gradient.",
+    ),
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
     KernelEntry(
         name="fused_bias_swiglu",

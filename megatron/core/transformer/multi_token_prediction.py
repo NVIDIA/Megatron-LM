@@ -1,4 +1,5 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
+# Source license: BSD-3-Clause (NVIDIA terms reproduced in LICENSE).
 from __future__ import annotations
 
 import inspect
@@ -22,6 +23,7 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, get_backend
+from megatron.core.ops.mtp_kl_loss import vocab_parallel_kl_div, vocab_parallel_log_normalizer
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -555,7 +557,7 @@ class MTPLossLoggingHelper:
 
     @staticmethod
     def save_metrics_to_tracker(
-        loss: torch.Tensor,
+        loss: Optional[torch.Tensor],
         correct: torch.Tensor,
         total: torch.Tensor,
         layer_number: int,
@@ -566,7 +568,7 @@ class MTPLossLoggingHelper:
         """Save the mtp metrics (loss, correct, total) for logging.
 
         Args:
-            loss (torch.Tensor): The normalized loss value for this MTP layer.
+            loss (Optional[torch.Tensor]): Unweighted CE mean, or None when CE is disabled.
             correct (torch.Tensor): Number of correct predictions.
             total (torch.Tensor): Total number of predictions.
             layer_number (int): Layer index of the loss.
@@ -579,23 +581,39 @@ class MTPLossLoggingHelper:
             return
 
         tracker = MTPLossLoggingHelper.tracker
-        if "loss_values" not in tracker:
-            tracker["loss_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+        if loss is not None and "loss_values" not in tracker:
+            tracker["loss_values"] = loss.new_zeros(num_layers, dtype=torch.float32)
         if "correct_values" not in tracker:
             tracker["correct_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
         if "total_values" not in tracker:
             tracker["total_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
 
-        tracker["loss_values"][layer_number] += loss.detach()
+        if loss is not None:
+            tracker["loss_values"][layer_number] += loss.detach()
         tracker["correct_values"][layer_number] += correct.detach()
         tracker["total_values"][layer_number] += total.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
     @staticmethod
+    def save_kd_loss_to_tracker(loss_sum, count, layer_number, num_layers, avg_group):
+        """Accumulate unweighted KL sums/counts, independently of the CE tracker."""
+        tracker = MTPLossLoggingHelper.tracker
+        if "kd_loss_values" not in tracker:
+            tracker["kd_loss_values"] = loss_sum.new_zeros(num_layers, dtype=torch.float32)
+            tracker["kd_loss_counts"] = loss_sum.new_zeros(num_layers, dtype=torch.float32)
+        tracker["kd_loss_values"][layer_number] += loss_sum.detach()
+        # Match the source objective's empty-microbatch logging convention.
+        tracker["kd_loss_counts"][layer_number] += count.detach().float().clamp(min=1)
+        tracker["kd_avg_group"] = avg_group
+
+    @staticmethod
     def clean_metrics_in_tracker():
         """Clear the mtp metrics."""
         tracker = MTPLossLoggingHelper.tracker
+        for key in ("kd_loss_values", "kd_loss_counts"):
+            if key in tracker:
+                tracker[key].zero_()
         if "loss_values" in tracker:
             tracker["loss_values"].zero_()
         if "correct_values" in tracker:
@@ -610,16 +628,14 @@ class MTPLossLoggingHelper:
     def reduce_metrics_in_tracker():
         """Collect and reduce the mtp metrics across ranks."""
         tracker = MTPLossLoggingHelper.tracker
-        if "loss_values" not in tracker:
-            return
-
-        loss_values = tracker["loss_values"]
-        if tracker.get('reduce_group') is not None:
-            torch.distributed.all_reduce(loss_values, group=tracker.get('reduce_group'))
-        if tracker.get('avg_group') is not None:
-            torch.distributed.all_reduce(
-                loss_values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
-            )
+        if "loss_values" in tracker:
+            loss_values = tracker["loss_values"]
+            if tracker.get('reduce_group') is not None:
+                torch.distributed.all_reduce(loss_values, group=tracker['reduce_group'])
+            if tracker.get('avg_group') is not None:
+                torch.distributed.all_reduce(
+                    loss_values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+                )
 
         for key in ["correct_values", "total_values"]:
             if key not in tracker:
@@ -637,12 +653,28 @@ class MTPLossLoggingHelper:
         """Track the Multi-Token Prediction (MTP) metrics for logging."""
         MTPLossLoggingHelper.reduce_metrics_in_tracker()
         tracker = MTPLossLoggingHelper.tracker
-        if "loss_values" not in tracker:
+        if "kd_loss_values" in tracker:
+            metrics = torch.stack((tracker["kd_loss_values"], tracker["kd_loss_counts"]))
+            if tracker.get("kd_avg_group") is not None:
+                torch.distributed.all_reduce(metrics, group=tracker["kd_avg_group"])
+            # Sums/counts already account for microbatches; do not apply loss_scale again.
+            for i, loss in enumerate(metrics[0] / metrics[1].clamp(min=1)):
+                name = f"mtp_{i+1} kd_logit_loss"
+                if total_loss_dict is not None:
+                    total_loss_dict[name] = total_loss_dict.get(name, 0) + loss
+                if writer is not None:
+                    writer.add_scalar(name, loss, iteration)
+                if wandb_writer is not None:
+                    wandb_writer.log({name: loss}, iteration)
+        if "correct_values" not in tracker:
+            MTPLossLoggingHelper.clean_metrics_in_tracker()
             return
 
-        mtp_losses = tracker["loss_values"] * loss_scale
-        mtp_corrects = tracker.get("correct_values", torch.zeros_like(mtp_losses))
-        mtp_totals = tracker.get("total_values", torch.ones_like(mtp_losses))
+        mtp_losses = tracker.get("loss_values")
+        if mtp_losses is not None:
+            mtp_losses = mtp_losses * loss_scale
+        mtp_corrects = tracker["correct_values"]
+        mtp_totals = tracker["total_values"]
 
         # Process-local logging state; cumulative rates intentionally reset after restart/resume.
         if (
@@ -661,30 +693,32 @@ class MTPLossLoggingHelper:
         mtp_cumulative_corrects = tracker["cumulative_correct_values"]
         mtp_cumulative_totals = tracker["cumulative_total_values"]
 
-        mtp_num_layers = mtp_losses.shape[0]
+        mtp_num_layers = mtp_corrects.shape[0]
         for i in range(mtp_num_layers):
             loss_name = f"mtp_{i+1} loss"
             step_acc_name = f"mtp_{i+1}_acceptance_rate"
             cum_acc_name = f"mtp_{i+1}_cumulative_acceptance_rate"
 
-            loss = mtp_losses[i]
+            loss = mtp_losses[i] if mtp_losses is not None else None
             # Empty masks can leave no valid MTP positions, so clamp denominators to avoid NaNs.
             step_rate = (mtp_corrects[i] / torch.clamp(mtp_totals[i], min=1)) * 100.0
             cum_rate = (
                 mtp_cumulative_corrects[i] / torch.clamp(mtp_cumulative_totals[i], min=1)
             ) * 100.0
 
-            if total_loss_dict is not None:
+            if total_loss_dict is not None and loss is not None:
                 total_loss_dict[loss_name] = (
                     total_loss_dict.get(loss_name, torch.zeros_like(loss)) + loss
                 )
 
             if writer is not None:
-                writer.add_scalar(loss_name, loss, iteration)
+                if loss is not None:
+                    writer.add_scalar(loss_name, loss, iteration)
                 writer.add_scalar(step_acc_name, step_rate, iteration)
                 writer.add_scalar(cum_acc_name, cum_rate, iteration)
             if wandb_writer is not None:
-                wandb_writer.log({f"{loss_name}": loss}, iteration)
+                if loss is not None:
+                    wandb_writer.log({f"{loss_name}": loss}, iteration)
                 wandb_writer.log({f"{step_acc_name}": step_rate}, iteration)
                 wandb_writer.log({f"{cum_acc_name}": cum_rate}, iteration)
 
@@ -1036,6 +1070,18 @@ def _accepts_return_argmax(compute_language_model_loss: Callable) -> bool:
         return False
 
 
+def _roll_mtp_teacher(tensor, cp_group, packed_seq_params, cp_layout):
+    """Align projected teacher logits with the next MTP depth's target positions."""
+    shifted, _ = roll_tensor(
+        tensor.movedim(0, -1),
+        cp_group=cp_group,
+        packed_seq_params=packed_seq_params,
+        return_sum=False,
+        cp_layout=cp_layout,
+    )
+    return shifted.movedim(-1, 0).contiguous()
+
+
 def process_mtp_loss(
     hidden_states: Tensor,
     labels: Tensor,
@@ -1134,6 +1180,31 @@ def process_mtp_loss(
     # when calculate_per_token_loss is enabled. This ensures MTP gradients are
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum()
+    ce_enabled = config.mtp_ce_loss_weight > 0
+    kd_enabled = is_training and config.mtp_kl_loss_weight > 0
+    if not ce_enabled and not kd_enabled:
+        return hidden_states
+    if kd_enabled:
+        # Project before shifting: sequence-parallel projection gathers sequence rows.
+        # The first chunk uses the MTP CP layout, unlike an optional main_hidden_states.
+        with torch.no_grad():
+            activation_buffer = getattr(output_layer, "embedding_activation_buffer", None)
+            buffered = len(activation_buffer) if activation_buffer is not None else 0
+            try:
+                teacher_logits, _ = output_layer(
+                    hidden_states_list[0].detach(),
+                    weight=output_weight,
+                    runtime_gather_output=False,
+                )
+            finally:
+                # No teacher backward will consume deferred embedding wgrad activations.
+                if activation_buffer is not None:
+                    del activation_buffer[buffered:]
+            if scale_logits_fn is not None:
+                teacher_logits = scale_logits_fn(teacher_logits)
+            teacher_normalizer = vocab_parallel_log_normalizer(
+                teacher_logits, config.mtp_kd_logit_temperature, tp_group
+            )
 
     cumulative_mtp_input_mask = None
     rolled_num_tokens = original_num_tokens
@@ -1152,8 +1223,8 @@ def process_mtp_loss(
     ):
         """Project one MTP depth to the vocabulary and compute its masked per-token loss.
 
-        Returns ``(masked_loss, correct, total)``. ``correct``/``total`` are the acceptance
-        counts (``None`` when not training). Everything that allocates [s, b, v] tensors for
+        Returns the masked loss, acceptance counts, and detached CE/KL sums.
+        ``correct``/``total`` are None when not training. All [s, b, v] allocations for
         one head lives here so ``mtp_loss_early_backward`` can run and release it as a unit.
         """
         mtp_logits, _ = output_layer(head_hidden, weight=output_weight, runtime_gather_output=False)
@@ -1170,19 +1241,44 @@ def process_mtp_loss(
                 batch_dim=1,
             )
         mtp_preds = None
-        if loss_returns_argmax:
-            head_loss, mtp_preds = compute_language_model_loss(
-                head_labels, mtp_logits, return_argmax=True
+        ce_loss = kd_loss = None
+        if ce_enabled:
+            # Native CE may overwrite its input; KD backward needs the original logits.
+            ce_logits = mtp_logits.clone() if kd_enabled else mtp_logits
+            if loss_returns_argmax:
+                ce_loss, mtp_preds = compute_language_model_loss(
+                    head_labels, ce_logits, return_argmax=True
+                )
+            else:
+                ce_loss = compute_language_model_loss(head_labels, ce_logits)
+            ce_loss = layer_loss_mask * ce_loss
+        if kd_enabled:
+            kd_loss = (
+                vocab_parallel_kl_div(
+                    mtp_logits,
+                    teacher_logits,
+                    config.mtp_kd_logit_temperature,
+                    tp_group,
+                    teacher_normalizer,
+                ).transpose(0, 1)
+                * layer_loss_mask
             )
-        else:
-            head_loss = compute_language_model_loss(head_labels, mtp_logits)
+        head_loss = config.mtp_ce_loss_weight * ce_loss if ce_loss is not None else 0
+        if kd_loss is not None:
+            head_loss = head_loss + config.mtp_kl_loss_weight * kd_loss
         correct = total = None
         if is_training:
             correct, total = _compute_mtp_acceptance_counts(
                 mtp_logits, head_labels, layer_loss_mask, tp_group=tp_group, preds=mtp_preds
             )
-        head_loss = layer_loss_mask * head_loss
-        return head_loss, correct, total
+        # Only detached scalars escape with the loss, including during early backward.
+        return (
+            head_loss,
+            correct,
+            total,
+            ce_loss.detach().sum() if ce_loss is not None else None,
+            kd_loss.detach().sum() if kd_loss is not None else None,
+        )
 
     # Early backward: fwd(head) -> bwd(head) per depth so at most one head's logits/softmax is
     # resident at a time. Needs a live graph and cannot run inside CUDA-graph capture/warmup.
@@ -1250,19 +1346,25 @@ def process_mtp_loss(
                 # no-mask fast path for all non-multimodal MTP callers.
                 num_tokens = rolled_num_tokens
 
+        if kd_enabled:
+            teacher_logits = _roll_mtp_teacher(
+                teacher_logits, cp_group, packed_seq_params, config.attention_cp_layout
+            )
+            teacher_normalizer = _roll_mtp_teacher(
+                teacher_normalizer, cp_group, packed_seq_params, config.attention_cp_layout
+            )
+
         head_hidden = hidden_states_list[mtp_layer_number + 1]
         # In early-backward mode the head runs on a detached leaf so its backward stops at the
         # head input; the resulting gradient is re-injected into the main graph below.
         head_input = head_hidden.detach().requires_grad_(True) if early_backward else head_hidden
-        mtp_loss, correct, total = _mtp_head_loss(
+        mtp_loss, correct, total, ce_sum, kd_sum = _mtp_head_loss(
             mtp_layer_number, head_input, mtp_labels, layer_loss_mask
         )
 
         if is_training:
             # Logging only: detach so nothing here keeps this head's graph alive.
-            mtp_loss_for_log = (
-                torch.sum(mtp_loss.detach()) * (num_tokens > 0).to(mtp_loss.dtype)
-            ) / num_tokens.clamp(min=1)
+            mtp_loss_for_log = ce_sum / num_tokens.clamp(min=1) if ce_enabled else None
 
             if metric_avg_group is None:
                 # Compatibility fallback for callers that have not migrated to explicit groups.
@@ -1277,6 +1379,10 @@ def process_mtp_loss(
                 config.mtp_num_layers,
                 avg_group=metric_avg_group,
             )
+            if kd_enabled:
+                MTPLossLoggingHelper.save_kd_loss_to_tracker(
+                    kd_sum, num_tokens, mtp_layer_number, config.mtp_num_layers, metric_avg_group
+                )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
         if config.calculate_per_token_loss:
             # This uses local counts; exact parity for packed or uneven valid-token
