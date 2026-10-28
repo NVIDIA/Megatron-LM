@@ -739,6 +739,38 @@ class TestTEWrappers:
             what="te_fused_cross_entropy",
         )
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 needs Blackwell")
+    @pytest.mark.parametrize("grad_fp8_format", ["e4m3", "e5m2"])
+    def test_te_fused_cross_entropy_mxfp8_grad_replays(self, grad_fp8_format):
+        """The MXFP8 gradient of the logits (cross_entropy_mxfp8_grad) replays bit-exactly."""
+        if not getattr(te_ext, "_TE_FUSED_PARALLEL_CE_GRAD_QUANTIZER", False):
+            pytest.skip(
+                "Transformer Engine's parallel_cross_entropy does not accept grad_quantizer"
+            )
+        seeded()
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        tokens = TOKENS // 2
+        logits = torch.randn(tokens, 1, 32768, device="cuda", dtype=torch.bfloat16)
+        target = torch.randint(0, 32768 * tp_group.size(), (tokens, 1), device="cuda")
+        buffers = (
+            "_rowwise_data",
+            "_rowwise_scale_inv",
+            "_columnwise_data",
+            "_columnwise_scale_inv",
+        )
+        ref = None
+        for replay in range(4):
+            x = logits.clone().requires_grad_()
+            loss = te_cross_entropy(x, target, tp_group, grad_fp8_format=grad_fp8_format)
+            (grad,) = torch.autograd.grad(loss, x, torch.ones_like(loss))
+            out = [loss.detach().clone()] + [getattr(grad, name).clone() for name in buffers]
+            if ref is None:
+                ref = out
+                continue
+            for name, a, b in zip(("loss",) + buffers, out, ref):
+                assert bytes_equal(a, b), f"replay {replay}: {name} differs"
+
     @pytest.mark.parametrize("backend", ["fused", "flash"])
     def test_te_dot_product_attention_replays(self, backend, monkeypatch):
         """GQA causal attention; TE must pick a deterministic backward (NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)."""

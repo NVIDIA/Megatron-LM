@@ -799,6 +799,16 @@ class TransformerConfig(ModelParallelConfig):
     under the MXFP8 autocast context. Only active when fp8=True and
     fp8_recipe='mxfp8'."""
 
+    cross_entropy_mxfp8_grad: bool = False
+    """With the MXFP8 LM head (fp8_output_proj) and Transformer Engine's fused cross entropy
+    (cross_entropy_loss_fusion=True, cross_entropy_fusion_impl='te'), let the cross entropy
+    backward return the gradient of the logits already quantized to MXFP8, in the LM head's
+    gradient format, so the LM head does not quantize it again. Transformer Engine writes it
+    from the loss kernel directly with tensor parallel size 1, BF16 logits and token count and
+    vocabulary multiples of 128, and quantizes the BF16 gradient otherwise. Either way the
+    gradient has the bytes the LM head's own quantization would produce. Requires a Transformer
+    Engine whose parallel_cross_entropy accepts grad_quantizer."""
+
     fp8_dot_product_attention: bool = False
     """When set to True, use the FP8 implementation of Dot Product Attention."""
 
@@ -2164,6 +2174,20 @@ class TransformerConfig(ModelParallelConfig):
             if self.fp8_recipe != Fp8Recipe.mxfp8:
                 raise ValueError(
                     f"fp8_output_proj requires fp8_recipe='mxfp8', got " f"'{self.fp8_recipe}'."
+                )
+
+        if self.cross_entropy_mxfp8_grad:
+            if not self.fp8_output_proj:
+                raise ValueError("cross_entropy_mxfp8_grad requires fp8_output_proj=True.")
+            if not (self.cross_entropy_loss_fusion and self.cross_entropy_fusion_impl == "te"):
+                raise ValueError(
+                    "cross_entropy_mxfp8_grad requires cross_entropy_loss_fusion=True and "
+                    "cross_entropy_fusion_impl='te'."
+                )
+            if self.use_mup:
+                raise ValueError(
+                    "cross_entropy_mxfp8_grad does not support use_mup: the MuP logit scaling "
+                    "between the LM head and the loss would take the MXFP8 gradient."
                 )
 
         # FP4 validation
