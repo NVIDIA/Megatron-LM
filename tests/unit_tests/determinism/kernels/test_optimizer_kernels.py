@@ -6,10 +6,16 @@ Adam update. These run once per step on every parameter, so any drift here chang
 whole trajectory even when the model kernels are deterministic.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from megatron.core.optimizer import Adam
+from megatron.core.optimizer import (
+    Adam,
+    OptimizerConfig,
+    _get_megatron_optimizer_based_on_param_groups,
+)
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32, get_grad_norm_fp32
 from megatron.training.tensor_metrics.definitions import L2NormMetric, _fused_l2_norm_impl
 from tests.unit_tests.determinism.kernels.harness import (
@@ -139,3 +145,59 @@ def test_fused_adam_step_replays():
         assert len(got) == len(ref)
         for j, (a, b) in enumerate(zip(ref, got)):
             assert bytes_equal(a, b), f"Adam tensor {j} differs on replay {i}"
+
+
+@pytest.mark.parametrize("store_param_remainders", [False, True])
+def test_precision_aware_initializer_matches_lazy_adam(monkeypatch, store_param_remainders):
+    """Resume's explicit initialization must preserve TE's lazy-init update trajectory."""
+    te_optimizers = pytest.importorskip("transformer_engine.pytorch.optimizers")
+    seeded()
+    params0 = [
+        torch.randn(65_536, device="cuda", dtype=dtype) for dtype in (torch.bfloat16, torch.float32)
+    ]
+    grads = [torch.randn_like(param, dtype=torch.float32) for param in params0]
+    config = OptimizerConfig(
+        optimizer="adam",
+        lr=1e-3,
+        bf16=True,
+        use_distributed_optimizer=True,
+        use_precision_aware_optimizer=True,
+        store_param_remainders=store_param_remainders,
+    )
+
+    def capture_initializer(optimizer, config, grad_scaler, init_state_fn, **kwargs):
+        # Exercise the production factory callback without distributed-buffer setup.
+        return SimpleNamespace(optimizer=optimizer, initialize=init_state_fn)
+
+    monkeypatch.setattr("megatron.core.optimizer.DistributedOptimizer", capture_initializer)
+
+    def run_steps(initialize):
+        params = [torch.nn.Parameter(param.clone()) for param in params0]
+        result = _get_megatron_optimizer_based_on_param_groups(
+            config,
+            model_chunks=[torch.nn.Module()],
+            param_groups=[{"params": params}],
+            pg_collection=SimpleNamespace(tp=None, expt_tp=None),
+        )
+        optimizer = result.optimizer
+        assert type(optimizer) is te_optimizers.FusedAdam
+        if initialize:
+            result.initialize(optimizer, config)
+        with RacingStreams():
+            for step in range(3):
+                for param, grad in zip(params, grads):
+                    param.decoupled_grad = grad + step * 0.01
+                optimizer.step()
+        torch.cuda.synchronize()
+        return [param.detach().clone() for param in params] + [
+            optimizer.state[param][key].clone()
+            for param in params
+            for key in sorted(optimizer.state[param])
+        ]
+
+    reference = run_steps(initialize=False)
+    for replay in range(3):
+        actual = run_steps(initialize=True)
+        assert len(actual) == len(reference)
+        for index, (expected, value) in enumerate(zip(reference, actual)):
+            assert bytes_equal(expected, value), f"Adam tensor {index} differs on replay {replay}"
