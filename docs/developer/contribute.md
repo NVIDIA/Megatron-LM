@@ -51,8 +51,9 @@ File any bugs you find, keeping the following in mind:
 
 ### Process groups in `megatron/core`
 
-`megatron.core.parallel_state` is being deprecated. It holds the process groups for a single,
-global parallel grid; Megatron-Core is moving to explicit passing via `ProcessGroupCollection`.
+`megatron.core.parallel_state` holds the process groups for a single, global parallel grid. Its
+functions that read those groups are deprecated; Megatron-Core is moving to explicit passing via
+`ProcessGroupCollection`.
 
 - **New features must not call** `parallel_state.get_*_group()`, `get_*_rank()`, or
   `get_*_world_size()` in `megatron/core`. Accept a `ProcessGroupCollection` or an explicit

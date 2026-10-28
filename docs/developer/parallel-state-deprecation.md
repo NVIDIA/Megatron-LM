@@ -7,7 +7,7 @@ caller passes instead. The functions that read the global grid are deprecated in
 and tear down the standard grid.
 
 This page describes what is deprecated, how the warnings work, how a framework built on Megatron
-Core migrates, and how the repository keeps new reads of the global grid out.
+Core migrates, and how the repository tracks new reads of the global grid.
 
 ## Why it matters
 
@@ -415,7 +415,7 @@ grid and pass it in. See
 
 ## The CI check
 
-Two checks keep new reads of the global grid out of the repository. CI runs both.
+Two checks report new reads of the global grid. CI runs both.
 
 `tools/check_process_group_usage.py` is a ratchet over Megatron Core. It parses the files under
 `megatron/core`, except `parallel_state.py` and `process_groups_config.py`, and counts calls of:
