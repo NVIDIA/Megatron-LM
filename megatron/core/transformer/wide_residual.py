@@ -23,7 +23,6 @@ from megatron.core.transformer.streamwise_residual_ops import (
     streamwise_sigmoid_writeback,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.typed_torch import apply_module
 
 _MIN_CONTROLLER_NUMEL = 128
 
@@ -223,15 +222,17 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
             else None
         )
 
-    def _read(
+    def _eager_read(
         self,
         hidden_states: Tensor,
         *,
         fp32_residual_connection: bool,
         branch_input_dtype: torch.dtype | None,
+        execution_context: object | None,
     ) -> tuple[Tensor, ResidualConnectionState]:
         """Read in branch precision before promoting the carried residual."""
 
+        del execution_context
         branch_input = streamwise_sigmoid_read(
             hidden_states,
             self.read_map(return_logits=True),
@@ -243,14 +244,16 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
         residual_stream = hidden_states.float() if fp32_residual_connection else hidden_states
         return branch_input, (residual_stream,)
 
-    def _write(
+    def _eager_write(
         self,
         branch_output: ResidualBranchOutput,
         state: ResidualConnectionState,
         *,
         dropout_probability: float,
         training: bool,
+        execution_context: object | None,
     ) -> Tensor:
+        del execution_context
         residual_stream = state[0]
         if isinstance(branch_output, tuple):
             branch_update, bias = branch_output
@@ -293,16 +296,21 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
         *,
         fp32_residual_connection: bool,
         branch_input_dtype: torch.dtype | None = None,
+        execution_context: object | None,
     ) -> tuple[Tensor, ResidualConnectionState]:
         """Replay WR's read while retaining its incoming residual stream.
 
         An optional branch-input dtype request is captured by the replay closure so eager execution
         and backward reconstruction produce the same branch dtype.
+        Adapter hooks surround the outer module call, not this arithmetic reconstruction.
         """
 
         def run_read(stream: Tensor) -> tuple[Tensor, ...]:
-            branch_input, state = apply_module(self)(
-                stream, fp32_residual_connection=False, branch_input_dtype=branch_input_dtype
+            branch_input, state = self._eager_read(
+                stream,
+                fp32_residual_connection=False,
+                branch_input_dtype=branch_input_dtype,
+                execution_context=execution_context,
             )
             if state[0].shape != stream.shape:
                 raise ValueError(
@@ -332,6 +340,7 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
         *,
         dropout_probability: float,
         training: bool,
+        execution_context: object | None,
     ) -> Tensor:
         """Replay WR's whole write, whose output has independent storage."""
 
@@ -346,11 +355,12 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
             branch_update: Tensor, branch_bias: Tensor | None, *connection_state: Tensor
         ) -> Tensor:
             value = (branch_update, branch_bias) if return_tuple else branch_update
-            return apply_module(self)(
+            return self._eager_write(
                 value,
-                state=connection_state,
+                connection_state,
                 dropout_probability=dropout_probability,
                 training=training,
+                execution_context=execution_context,
             )
 
         hidden_states = context.checkpoint(run_write, output, bias, *state)

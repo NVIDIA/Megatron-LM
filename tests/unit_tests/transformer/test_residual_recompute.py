@@ -35,13 +35,14 @@ from megatron.core.transformer.residual_connection import (
 from megatron.core.transformer.residual_recompute import (
     ResidualStreamRecomputeContext,
     build_residual_stream_recompute_plan,
-    checkpoint_residual_read,
-    checkpoint_residual_write,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
-from megatron.core.transformer.wide_residual import wide_residual_recompute_enabled
+from megatron.core.transformer.wide_residual import (
+    StreamwiseSigmoidWideResidualConnection,
+    wide_residual_recompute_enabled,
+)
 from megatron.core.transformer.wide_residual_transformer_layer import WideResidualTransformerLayer
 from megatron.core.typed_torch import apply_module
 from tests.unit_tests.test_utilities import Utils
@@ -59,13 +60,15 @@ class _StaticTestConnection(ResidualConnection):
                 torch.randn(branch_width, stream_width) / branch_width**0.5
             )
 
-    def _read(
+    def _eager_read(
         self,
         hidden_states: Tensor,
         *,
         fp32_residual_connection: bool,
         branch_input_dtype: torch.dtype | None,
+        execution_context: object | None,
     ) -> tuple[Tensor, ResidualConnectionState]:
+        del execution_context
         branch_input = hidden_states @ self.read_map
         if branch_input_dtype is not None:
             branch_input = branch_input.to(branch_input_dtype)
@@ -73,11 +76,20 @@ class _StaticTestConnection(ResidualConnection):
         return branch_input, (residual,)
 
     def _checkpoint_read(
-        self, hidden_states, context, *, fp32_residual_connection, branch_input_dtype
+        self,
+        hidden_states,
+        context,
+        *,
+        fp32_residual_connection,
+        branch_input_dtype,
+        execution_context,
     ):
         def read_branch(stream):
-            branch_input, _ = apply_module(self)(
-                stream, fp32_residual_connection=False, branch_input_dtype=branch_input_dtype
+            branch_input, _ = self._eager_read(
+                stream,
+                fp32_residual_connection=False,
+                branch_input_dtype=branch_input_dtype,
+                execution_context=execution_context,
             )
             return branch_input
 
@@ -85,28 +97,33 @@ class _StaticTestConnection(ResidualConnection):
         residual = hidden_states.float() if fp32_residual_connection else hidden_states
         return branch_input, (residual,)
 
-    def _checkpoint_write(self, branch_output, state, context, *, dropout_probability, training):
+    def _checkpoint_write(
+        self, branch_output, state, context, *, dropout_probability, training, execution_context
+    ):
         is_tuple = isinstance(branch_output, tuple)
         output, bias = branch_output if is_tuple else (branch_output, None)
 
         def write_update(update, bias, *connection_state):
-            return apply_module(self)(
+            return self._eager_write(
                 (update, bias) if is_tuple else update,
                 state=connection_state,
                 dropout_probability=dropout_probability,
                 training=training,
+                execution_context=execution_context,
             )
 
         return context.checkpoint(write_update, output, bias, *state)
 
-    def _write(
+    def _eager_write(
         self,
         branch_output: ResidualBranchOutput,
         state: ResidualConnectionState,
         *,
         dropout_probability: float,
         training: bool,
+        execution_context: object | None,
     ) -> Tensor:
+        del execution_context
         update, bias = branch_output if isinstance(branch_output, tuple) else (branch_output, None)
         if bias is not None:
             update = update + bias
@@ -122,6 +139,20 @@ class _HeavyTestBranch(nn.Module):
 
     def forward(self, hidden_states: Tensor) -> tuple[Tensor, Tensor]:
         return F.gelu(self.projection(hidden_states)), self.output_bias
+
+
+class _ForwardScaledWideConnection(StreamwiseSigmoidWideResidualConnection):
+    """A compatible forward override around the real WR implementation."""
+
+    def forward(self, value, **kwargs):
+        self.forward_calls = getattr(self, "forward_calls", 0) + 1
+        self.forward_input = value
+        result = super().forward(value, **kwargs)
+        if self.operation == "read":
+            branch, state = result
+            self.forward_state = state
+            return branch * 1.125, state
+        return result * 0.875
 
 
 class _StaticResidualChain(nn.Module):
@@ -155,15 +186,19 @@ class _StaticResidualChain(nn.Module):
                 )
                 branch_input = apply_module(norm)(branch_input)
             else:
-                branch_input, state = checkpoint_residual_read(
-                    reader, hidden_states, context, fp32_residual_connection=False
+                branch_input, state = apply_module(reader)(
+                    hidden_states, recompute_context=context, fp32_residual_connection=False
                 )
                 branch_input = context.checkpoint(apply_module(norm), branch_input)
 
             branch_output = apply_module(branch)(branch_input)
             if context is not None and not context.is_block_end:
-                hidden_states = checkpoint_residual_write(
-                    writer, branch_output, state, context, dropout_probability=0.2, training=True
+                hidden_states = apply_module(writer)(
+                    branch_output,
+                    state=state,
+                    recompute_context=context,
+                    dropout_probability=0.2,
+                    training=True,
                 )
             else:
                 hidden_states = apply_module(writer)(
@@ -408,10 +443,9 @@ def test_checkpoint_fp32_state_promotion_aliases_an_already_fp32_stream():
     hidden_states = torch.randn(4, 12, dtype=torch.float32, requires_grad=True)
     context = build_residual_stream_recompute_plan(num_layers=1, block_size=1)[0]
 
-    _, state = checkpoint_residual_read(
-        connection,
+    _, state = connection(
         hidden_states,
-        context,
+        recompute_context=context,
         fp32_residual_connection=True,
         branch_input_dtype=torch.bfloat16,
     )
@@ -640,7 +674,100 @@ class TestResidualStreamRecomputeIntegration:
         assert all(output.untyped_storage().size() > 0 for output in managed_outputs)
         torch.testing.assert_close(recomputed_input.grad, reference_input.grad)
         _assert_matching_gradients(reference, recomputed)
-        assert operation_counts == {"connections": 7, "norms": 4, "branches": 2}
+        assert operation_counts == {"connections": 4, "norms": 4, "branches": 2}
+
+    @pytest.mark.parametrize("checkpointed", [False, True])
+    def test_wide_connection_hooks_and_forward_override_preserve_values_and_aliases(
+        self, checkpointed
+    ):
+        """Hooks surround the logical call; replay only rebuilds WR's numerical operations."""
+        config = _wide_recompute_config()
+        actual, reference = (
+            nn.ModuleList(
+                connection_type(config, 1, "test", operation=operation)
+                for operation in ("read", "write")
+            ).cuda()
+            for connection_type in (
+                _ForwardScaledWideConnection,
+                StreamwiseSigmoidWideResidualConnection,
+            )
+        )
+        reference.load_state_dict(actual.state_dict())
+        counts = {operation: dict(pre=0, post=0, backward=0) for operation in ("read", "write")}
+        prepared = {}
+
+        def pre_hook(module, args):
+            counts[module.operation]["pre"] += 1
+            value = args[0] * 1.25 + 0.1
+            prepared[module.operation] = value
+            return (value,)
+
+        def post_hook(module, args, output):
+            counts[module.operation]["post"] += 1
+            if module.operation == "read":
+                branch, state = output
+                return branch + 0.05, state
+            return output + 0.07
+
+        def backward_hook(module, grad_input, grad_output):
+            counts[module.operation]["backward"] += 1
+            assert len(grad_input) == 1 and grad_input[0] is not None
+
+        for connection in actual:
+            connection.register_forward_pre_hook(pre_hook)
+            connection.register_forward_hook(post_hook)
+            connection.register_full_backward_hook(backward_hook)
+
+        value = torch.randn(4, 2, 24, device="cuda", requires_grad=True)
+        expected_value = value.detach().clone().requires_grad_(True)
+        expected_branch, expected_state = reference[0](expected_value * 1.25 + 0.1)
+        expected_branch = expected_branch * 1.125 + 0.05
+        expected = reference[1](
+            expected_branch.sin() * 1.25 + 0.1,
+            state=expected_state,
+            dropout_probability=0.0,
+            training=True,
+        )
+        expected = (expected * 0.875 + 0.07).tanh()
+
+        context = build_residual_stream_recompute_plan(1, 1)[0]
+        if checkpointed:
+            branch, state = actual[0](
+                value, recompute_context=context, fp32_residual_connection=False
+            )
+            output = actual[1](
+                branch.sin(),
+                state=state,
+                recompute_context=context,
+                dropout_probability=0.0,
+                training=True,
+            )
+        else:
+            branch, state = actual[0](value)
+            output = actual[1](branch.sin(), state=state, dropout_probability=0.0, training=True)
+        output = output.tanh()  # A live terminal boundary outside the two replayed operations.
+        assert state[0] is actual[0].forward_input
+        assert actual[0].forward_state is state
+        for connection in actual:
+            module_input = connection.forward_input
+            assert module_input is not prepared[connection.operation]
+            assert module_input.data_ptr() == prepared[connection.operation].data_ptr()
+        torch.testing.assert_close(state[0], expected_state[0], rtol=0, atol=0)
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        managed = [tensor for item in context.manager.checkpoints for tensor in item.outputs]
+        assert len(managed) == (2 if checkpointed else 0)
+        if checkpointed:
+            context.finalize(output)
+            assert all(tensor.untyped_storage().size() == 0 for tensor in managed)
+        assert state[0].untyped_storage().size() > 0
+        output.square().sum().backward()
+        expected.square().sum().backward()
+        assert all(tensor.untyped_storage().size() > 0 for tensor in managed)
+        torch.testing.assert_close(value.grad, expected_value.grad)
+        _assert_matching_gradients(reference, actual)
+        for connection in actual:
+            assert connection.forward_calls == 1
+            assert counts[connection.operation] == dict(pre=1, post=1, backward=1)
 
     def test_replay_owns_connected_norms_under_fine_grained_offload(self):
         with pytest.warns(UserWarning, match="Residual-stream recomputation owns"):
@@ -797,8 +924,8 @@ class TestResidualStreamRecomputeIntegration:
         assert all(dtype == expected_state_dtype for dtype in state_dtypes["eager"])
         assert all(dtype == expected_state_dtype for dtype in state_dtypes["replay"])
         assert all(name == "_StreamwiseSigmoidReadBackward" for name in read_grad_fns["eager"])
-        assert "_StreamwiseSigmoidReadBackward" in read_grad_fns["replay"]
-        assert len(read_grad_fns["replay"]) > len(read_grad_fns["eager"])
+        assert all(name == "_RegionFunctionBackward" for name in read_grad_fns["replay"])
+        assert len(read_grad_fns["replay"]) == len(read_grad_fns["eager"]) == 1
 
     @pytest.mark.parametrize(
         "fp32_residual_connection", [False, True], ids=["native-residual", "fp32-residual"]
