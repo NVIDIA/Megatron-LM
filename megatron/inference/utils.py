@@ -184,9 +184,8 @@ def get_model_for_inference(
             )
         # ModelOpt path keeps the legacy callable-based builder because the
         # modelopt hooks (custom layer specs, calibration, etc.) have not been
-        # ported to the new ``ModelBuilder`` API yet. ``_get_model`` also takes
-        # care of running the modelopt-checkpoint auto-detection side effect.
-        # ``_get_model`` calls the provider with keyword arguments only, so bind ``args``.
+        # ported to the new ``ModelBuilder`` API yet. ``_get_model`` calls the
+        # provider with keyword arguments only, so bind ``args``.
         model = _get_model(partial(modelopt_gpt_hybrid_builder, args), wrap_with_ddp=False)
     else:
         if pg_collection is None:

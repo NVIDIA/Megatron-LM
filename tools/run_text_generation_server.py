@@ -149,9 +149,8 @@ def main(model_type: str = "gpt"):
         if HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
             # ModelOpt path keeps the legacy callable-based builder because the
             # modelopt hooks have not been ported to the new ``ModelBuilder``
-            # API yet. ``get_model`` also handles the modelopt-checkpoint
-            # auto-detection side effect.
-            # ``get_model`` calls the provider with keyword arguments only, so bind ``args``.
+            # API yet. ``get_model`` calls the provider with keyword arguments
+            # only, so bind ``args``.
             model = get_model(partial(modelopt_gpt_hybrid_builder, args), wrap_with_ddp=False)
         else:
             builder = get_model_builder(args, provider=model_type)
