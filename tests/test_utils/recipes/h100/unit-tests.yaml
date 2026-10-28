@@ -245,6 +245,14 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  # Engine tests run apart from the rest of inference so each job fits the CI time limit.
+  - test_case: [tests/unit_tests/inference/engines/**/*.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/inference/engines/test_dynamic_engine.py]
     products:
       - environment: [lts, dev]
