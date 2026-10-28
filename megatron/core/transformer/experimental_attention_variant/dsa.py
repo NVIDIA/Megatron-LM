@@ -303,10 +303,10 @@ class DSAIndexerLossLoggingHelper:
             loss: The loss tensor.
             layer_number: Layer index of the loss, 1-indexed.
             num_layers: The number of total layers.
-            reduce_group: Legacy CP sum-group metadata. Reduction uses the fixed DP x CP
-                group supplied when logging.
-            avg_group: CP group whose size normalizes this local contribution before it
-                is accumulated. No collective is performed here.
+            reduce_group: Runtime CP group for a CP-partial loss sum. Its size weights
+                the contribution so fixed-group averaging yields the mean per logical sample.
+            avg_group: Runtime CP group for a CP-mean loss. Its contribution is already
+                normalized. No collective is performed here.
             raw_loss: The unscaled loss, before the indexer loss coefficient is applied.
                 Optional so call sites that do not track it (the fused-kernel path) keep
                 working; it is appended last to preserve the positional order above.
@@ -316,6 +316,9 @@ class DSAIndexerLossLoggingHelper:
             return
 
         tracker = DSAIndexerLossLoggingHelper.tracker
+        tracker["requires_dp_cp"] = tracker.get("requires_dp_cp", False) or any(
+            group is not None and group.size() > 1 for group in (reduce_group, avg_group)
+        )
         # Hybrid MTP layer numbers can exceed ``num_layers + mtp_num_layers``
         # because every prediction depth can contain multiple hybrid layers.
         needed = max(num_layers, layer_number)
@@ -327,10 +330,11 @@ class DSAIndexerLossLoggingHelper:
             )
             grown[: tracker["values"].shape[0]] = tracker["values"]
             tracker["values"] = grown
-        # CP topology may change between microbatches. Apply CP-mean scaling to each
-        # contribution now, then reduce the accumulator over a fixed group exactly once.
-        average_scale = 1.0 / avg_group.size() if avg_group is not None else 1.0
-        tracker["values"][layer_number - 1].add_(loss.detach(), alpha=average_scale)
+        # A CP-partial sum needs one factor of runtime CP before averaging over
+        # fixed rank slots; CP means are already normalized. This preserves the
+        # mean per logical sample when CP topology changes between microbatches.
+        contribution_scale = float(reduce_group.size()) if reduce_group is not None else 1.0
+        tracker["values"][layer_number - 1].add_(loss.detach(), alpha=contribution_scale)
         if raw_loss is not None:
             if "raw_values" not in tracker or tracker["raw_values"].shape[0] < needed:
                 grown = torch.zeros(
@@ -339,24 +343,24 @@ class DSAIndexerLossLoggingHelper:
                 if "raw_values" in tracker:
                     grown[: tracker["raw_values"].shape[0]] = tracker["raw_values"]
                 tracker["raw_values"] = grown
-            tracker["raw_values"][layer_number - 1].add_(raw_loss.detach(), alpha=average_scale)
-        # Preserve legacy metadata for callers that retain it across graph replays.
-        # These groups must never be applied to the accumulated losses.
-        tracker["reduce_group"] = reduce_group
-        tracker["avg_group"] = avg_group
+            tracker["raw_values"][layer_number - 1].add_(
+                raw_loss.detach(), alpha=contribution_scale
+            )
 
     @staticmethod
     def clean_loss_in_tracker(preserve_groups: bool = False):
-        """Clear the indexer losses."""
+        """Clear losses; ``preserve_groups`` is retained for caller compatibility.
+
+        Runtime group sizes are baked into the accumulation operation. Graph replay
+        only retains whether a fixed DP x CP group is required, without saved group pointers.
+        """
         tracker = DSAIndexerLossLoggingHelper.tracker
-        reduce_group = tracker.get("reduce_group") if preserve_groups else None
-        avg_group = tracker.get("avg_group") if preserve_groups else None
         if "values" in tracker:
             tracker["values"].zero_()
         if "raw_values" in tracker:
             tracker["raw_values"].zero_()
-        tracker["reduce_group"] = reduce_group
-        tracker["avg_group"] = avg_group
+        if not preserve_groups:
+            tracker["requires_dp_cp"] = False
 
     @staticmethod
     def reduce_loss_in_tracker(
@@ -373,7 +377,17 @@ class DSAIndexerLossLoggingHelper:
         pp_group = pg_collection.pp
         dp_cp_group = getattr(pg_collection, "dp_cp", None)
         if dp_cp_group is None:
-            raise ValueError("DSA indexer logging requires a fixed dp_cp process group")
+            cp_group = getattr(pg_collection, "cp", None)
+            dynamic_cp_groups = getattr(pg_collection, "dynamic_cp", None) or {}
+            if (
+                tracker.get("requires_dp_cp", False)
+                or (cp_group is not None and cp_group.size() > 1)
+                or any(group.size() > 1 for group in dynamic_cp_groups.values())
+            ):
+                raise ValueError("DSA indexer logging with CP requires a fixed dp_cp process group")
+            dp_cp_group = pg_collection.dp
+            if dp_cp_group is None:
+                raise ValueError("DSA indexer logging requires a dp or dp_cp process group")
 
         # Pipeline ranks can own different attention variants, so first agree on
         # a common tracker size. Cache the result because layer allocation is
@@ -407,9 +421,9 @@ class DSAIndexerLossLoggingHelper:
             if "raw_values" in tracker:
                 grown[: tracker["raw_values"].shape[0]] = tracker["raw_values"]
             tracker["raw_values"] = grown
-        # Preserve DP/remat averaging. Any CP-mean factor has already been applied
-        # per contribution; CP sums are part of the fixed DP x CP reduction below.
-        contributing_ranks = pg_collection.dp.size()
+        # Contributions already carry their runtime CP weighting. Average once
+        # over the fixed data/context domain, preserving static CP and remat means.
+        contributing_ranks = dp_cp_group.size()
         gtp_remat_group = getattr(pg_collection, "gtp_remat", None)
         if gtp_remat_group is not None:
             contributing_ranks *= gtp_remat_group.size()
@@ -451,7 +465,8 @@ class DSAIndexerLossLoggingHelper:
                 without a local indexer participate in the pipeline reduction.
             num_indexer_layers: Number of layers that own an indexer. Defaults to the
                 tracker size when every tracked layer owns one.
-            preserve_groups: Keep the saved reduction groups for CUDA Graph replays.
+            preserve_groups: Keep the fixed-group requirement across CUDA Graph replays.
+                Runtime weights are recorded directly in accumulation operations.
         """
         DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(
             pg_collection=pg_collection, num_layers=num_layers

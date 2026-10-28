@@ -87,3 +87,27 @@ def test_rejects_mixed_normalization_modes():
     save(2, 1)
     with pytest.raises(ValueError, match="Cannot mix"):
         save(2, None)
+
+
+@pytest.mark.parametrize("first_per_token", [False, True])
+@pytest.mark.parametrize("cleanup", ["clean", "log"])
+def test_fresh_window_can_change_calculate_per_token_loss(tracker, first_per_token, cleanup):
+    save(4, 2 if first_per_token else None)
+    if cleanup == "clean":
+        MTPLossLoggingHelper.clean_metrics_in_tracker()
+    else:
+        MTPLossLoggingHelper.track_mtp_metrics(0.5, 1, None)
+    save(18, None if first_per_token else 3)
+    losses = {}
+    MTPLossLoggingHelper.track_mtp_metrics(0.5, 2, None, total_loss_dict=losses)
+    assert tracker["per_token"] is not first_per_token
+    assert losses["mtp_1 loss"].item() == (9 if first_per_token else 6)
+
+
+def test_reset_discards_tracker_mode_and_storage(tracker):
+    save(4, 2)
+    MTPLossLoggingHelper.reset_metrics_tracker()
+    assert MTPLossLoggingHelper.tracker == {}
+    assert MTPLossLoggingHelper.tracker is not tracker
+    save(6, None)
+    assert MTPLossLoggingHelper.tracker["per_token"] is False

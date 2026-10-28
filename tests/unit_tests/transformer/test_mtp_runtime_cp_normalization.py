@@ -142,7 +142,9 @@ def _masks(case, device):
     return mask, input_mask
 
 
-def _backward(cp_group, static_group, mask, input_mask, num_layers, derive_labels):
+def _backward(
+    cp_group, static_group, mask, input_mask, num_layers, derive_labels, runtime_metadata=True
+):
     """Use real packed rolling, cross entropy, and trainable hidden/output parameters."""
     device = mask.device
     cp_size = cp_group.size()
@@ -154,8 +156,8 @@ def _backward(cp_group, static_group, mask, input_mask, num_layers, derive_label
         qkv_format="thd",
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
-        local_cp_size=cp_size,
-        cp_group=cp_group,
+        local_cp_size=cp_size if runtime_metadata else None,
+        cp_group=cp_group if runtime_metadata else None,
     )
     head = torch.nn.Parameter(torch.arange(20, device=device).reshape(5, 4).float() / 20)
     hidden = torch.nn.Parameter(
@@ -180,8 +182,8 @@ def _backward(cp_group, static_group, mask, input_mask, num_layers, derive_label
             logits.transpose(0, 1).reshape(-1, 5), labels.reshape(-1), reduction="none"
         ).reshape_as(labels),
         config=_config(num_layers=num_layers),
-        # Deliberately pass the build-time CP1 group: packed runtime metadata wins.
-        cp_group=static_group,
+        # Exercise both a CP1-built runtime group override and the static CP path.
+        cp_group=static_group if runtime_metadata else cp_group,
         packed_seq_params=params,
     )
     (result.sum() * 0).backward()
@@ -205,7 +207,10 @@ def _backward(cp_group, static_group, mask, input_mask, num_layers, derive_label
 )
 @pytest.mark.parametrize("num_layers", [1, 3])
 @pytest.mark.parametrize("derive_labels", [False, True])
-def test_cp2_cp4_parameter_gradients_match_cp1(cp_groups, case, num_layers, derive_labels):
+@pytest.mark.parametrize("runtime_metadata", [False, True])
+def test_cp2_cp4_parameter_gradients_match_cp1(
+    cp_groups, case, num_layers, derive_labels, runtime_metadata
+):
     """Changing runtime CP size preserves parameter gradients, including empty ranks."""
     device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
     mask, input_mask = _masks(case, device)
@@ -215,7 +220,13 @@ def test_cp2_cp4_parameter_gradients_match_cp1(cp_groups, case, num_layers, deri
             assert torch.count_nonzero(grad) == 0
     for cp_size in (2, 4):
         actual = _backward(
-            cp_groups[cp_size], cp_groups[1], mask, input_mask, num_layers, derive_labels
+            cp_groups[cp_size],
+            cp_groups[1],
+            mask,
+            input_mask,
+            num_layers,
+            derive_labels,
+            runtime_metadata=runtime_metadata,
         )
         for expected_grad, actual_grad in zip(reference, actual):
             assert torch.isfinite(actual_grad).all()

@@ -1140,10 +1140,11 @@ class TestMultiTokenPredictionLayer:
             reference_layer.named_parameters(), dynamic_layer.named_parameters(), strict=True
         ):
             assert reference_name == dynamic_name
-            assert (
-                reference_param.grad is not None
-            ), f"Missing reference gradient for {reference_name}"
-            assert dynamic_param.grad is not None, f"Missing dynamic gradient for {dynamic_name}"
+            assert (reference_param.grad is None) == (
+                dynamic_param.grad is None
+            ), f"MTP runtime-CP gradient participation differs for {reference_name}"
+            if reference_param.grad is None:
+                continue
             torch.testing.assert_close(
                 reference_param.grad,
                 dynamic_param.grad,

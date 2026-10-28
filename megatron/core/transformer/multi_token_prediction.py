@@ -585,7 +585,23 @@ class MTPLossLoggingHelper:
         tracker = MTPLossLoggingHelper.tracker
         per_token = num_tokens is not None
         if tracker.get("per_token", per_token) != per_token:
-            raise ValueError("Cannot mix per-token and normalized MTP metrics before logging")
+            # Retain the mode across graph replays, but allow a new model/config
+            # to start a fresh logging window in this process. Only this uncommon
+            # reconfiguration path synchronizes accumulator contents to the host.
+            if any(
+                torch.count_nonzero(tracker[key]).item()
+                for key in (
+                    "loss_values",
+                    "correct_values",
+                    "total_values",
+                    "loss_sums",
+                    "loss_token_counts",
+                )
+                if key in tracker
+            ):
+                raise ValueError(
+                    "Cannot mix calculate_per_token_loss modes within an MTP logging window"
+                )
         tracker["per_token"] = per_token
         if "loss_values" not in tracker:
             tracker["loss_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
@@ -595,6 +611,7 @@ class MTPLossLoggingHelper:
             tracker["total_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
 
         if per_token:
+            assert num_tokens is not None
             if "loss_sums" not in tracker:
                 tracker["loss_sums"] = torch.zeros_like(tracker["loss_values"])
                 tracker["loss_token_counts"] = torch.zeros_like(tracker["loss_values"])
@@ -607,6 +624,14 @@ class MTPLossLoggingHelper:
         tracker["total_values"][layer_number] += total.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
+
+    @staticmethod
+    def reset_metrics_tracker():
+        """Discard metrics and mode metadata before model reconfiguration or a test.
+
+        Do not call while a CUDA graph retains references to the current accumulators.
+        """
+        MTPLossLoggingHelper.tracker = {}
 
     @staticmethod
     def clean_metrics_in_tracker():
@@ -2473,14 +2498,12 @@ class MultiTokenPredictionBlock(MegatronModule):
         target_layout = self.config.attention_cp_layout
         runtime_cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
         assert runtime_cp_group is not None, "MTP requires a context-parallel group"
-        runtime_tp_cp_group = self.tp_cp_group
-        if (
-            packed_seq_params is not None
-            and packed_seq_params.local_cp_size is not None
-            and self.sequence_parallel
-            and self.tp_group.size() > 1
-        ):
-            runtime_tp_cp_group = resolve_tp_cp_group(self.tp_cp_group, packed_seq_params)
+        runtime_tp_cp_group = resolve_tp_cp_group(
+            self.tp_cp_group,
+            packed_seq_params,
+            sequence_parallel=self.sequence_parallel,
+            tp_group=self.tp_group,
+        )
         requires_conversion = runtime_cp_group.size() > 1 and source_layout != target_layout
 
         if requires_conversion:

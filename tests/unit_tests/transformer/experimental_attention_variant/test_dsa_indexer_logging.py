@@ -45,6 +45,13 @@ def logging_groups():
         group = group_for(list(range(offset, world_size, 2)))
         if group is not None:
             stripe = group
+    quad_stripe = None
+    if world_size % 4 == 0:
+        for first in range(0, world_size, 4):
+            for offset in range(2):
+                group = group_for([first + offset, first + offset + 2])
+                if group is not None:
+                    quad_stripe = group
     device = (
         torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else "cpu"
     )
@@ -52,6 +59,7 @@ def logging_groups():
         singleton=singleton,
         pair=pair,
         stripe=stripe,
+        quad_stripe=quad_stripe,
         world=dist.group.WORLD,
         size=world_size,
         rank=rank,
@@ -108,7 +116,7 @@ def test_runtime_cp_microbatch_order_does_not_change_logging(
             )
         results.append(_log(pg_collection, loss_scale=0.5))
     contributing_sum = sum(range(1, groups.size + (0 if empty_rank else 1)))
-    expected = contributing_sum / groups.size * (1 + (5 if average_cp else 10)) * 0.5
+    expected = contributing_sum / groups.size * (1 + (10 if average_cp else 20)) * 0.5
     for losses in results:
         torch.testing.assert_close(
             losses["indexer loss"], torch.tensor(expected, device=groups.device)
@@ -124,13 +132,13 @@ def test_static_cp_and_gtp_remat_normalization_is_preserved(
     logging_groups, average_cp, with_gtp_remat
 ):
     groups = logging_groups
-    if with_gtp_remat and groups.size != 4:
-        pytest.skip("CP2 x GTP-remat2 normalization requires four ranks")
+    if with_gtp_remat and groups.size % 4:
+        pytest.skip("CP2 x GTP-remat2 normalization requires a multiple of four ranks")
     pg_collection = ProcessGroupCollection(
         pp=groups.singleton,
         dp=groups.singleton if with_gtp_remat else groups.stripe,
         dp_cp=groups.pair if with_gtp_remat else groups.world,
-        gtp_remat=groups.stripe if with_gtp_remat else None,
+        gtp_remat=groups.quad_stripe if with_gtp_remat else None,
     )
     local_loss = torch.tensor(float(groups.rank + 1), device=groups.device)
     DSAIndexerLossLoggingHelper.save_loss_to_tracker(
@@ -142,7 +150,12 @@ def test_static_cp_and_gtp_remat_normalization_is_preserved(
         raw_loss=local_loss * 2,
     )
     losses = _log(pg_collection)
-    expected = sum(range(1, groups.size + 1)) / (groups.size // 2) / (2 if average_cp else 1)
+    if with_gtp_remat:
+        first = groups.rank // 4 * 4
+        expected = sum(range(first + 1, first + 5)) / 2
+    else:
+        expected = sum(range(1, groups.size + 1)) / (groups.size // 2)
+    expected /= 2 if average_cp else 1
     torch.testing.assert_close(losses["indexer loss"], torch.tensor(expected, device=groups.device))
     torch.testing.assert_close(
         losses["indexer raw loss"], torch.tensor(expected * 2, device=groups.device)
@@ -152,10 +165,12 @@ def test_static_cp_and_gtp_remat_normalization_is_preserved(
 @pytest.mark.parametrize("average_cp", [False, True])
 def test_pipeline_stage_without_indexer_uses_the_same_reduction(logging_groups, average_cp):
     groups = logging_groups
-    if groups.size != 4:
-        pytest.skip("PP2 x CP2 logging requires four ranks")
-    pg_collection = ProcessGroupCollection(pp=groups.stripe, dp=groups.singleton, dp_cp=groups.pair)
-    if groups.stripe.rank() == 0:
+    if groups.size % 4:
+        pytest.skip("PP2 x CP2 logging requires a multiple of four ranks")
+    pg_collection = ProcessGroupCollection(
+        pp=groups.quad_stripe, dp=groups.singleton, dp_cp=groups.pair
+    )
+    if groups.quad_stripe.rank() == 0:
         local_loss = torch.tensor(float(groups.rank + 1), device=groups.device)
         DSAIndexerLossLoggingHelper.save_loss_to_tracker(
             local_loss,
@@ -166,8 +181,78 @@ def test_pipeline_stage_without_indexer_uses_the_same_reduction(logging_groups, 
             raw_loss=local_loss * 2,
         )
     losses = _log(pg_collection, num_layers=3)
-    expected = 3.0 / (2 if average_cp else 1)
+    first = groups.rank // 4 * 4
+    expected = float(2 * first + 3) / (2 if average_cp else 1)
     torch.testing.assert_close(losses["indexer loss"], torch.tensor(expected, device=groups.device))
     torch.testing.assert_close(
         losses["indexer raw loss"], torch.tensor(expected * 2, device=groups.device)
     )
+
+
+@pytest.mark.parametrize("average_cp", [False, True])
+def test_runtime_cp2_matches_static_cp2_logical_sample_mean(logging_groups, average_cp):
+    groups = logging_groups
+    results = []
+    for static_cp in (1, 2):
+        DSAIndexerLossLoggingHelper.tracker = {}
+        pg_collection = ProcessGroupCollection(
+            pp=groups.singleton,
+            cp=groups.singleton if static_cp == 1 else groups.pair,
+            dp=groups.world if static_cp == 1 else groups.stripe,
+            dp_cp=groups.world,
+        )
+        local_loss = torch.tensor(float(groups.rank + 1), device=groups.device)
+        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+            local_loss,
+            1,
+            1,
+            reduce_group=groups.pair if not average_cp else None,
+            avg_group=groups.pair if average_cp else None,
+            raw_loss=local_loss * 2,
+        )
+        results.append(_log(pg_collection))
+    expected = sum(range(1, groups.size + 1)) / groups.size * (1 if average_cp else 2)
+    for losses in results:
+        torch.testing.assert_close(
+            losses["indexer loss"], torch.tensor(expected, device=groups.device)
+        )
+        torch.testing.assert_close(
+            losses["indexer raw loss"], torch.tensor(expected * 2, device=groups.device)
+        )
+
+
+@pytest.mark.parametrize("include_singleton_cp", [False, True])
+def test_cp1_partial_collection_uses_legacy_dp_group(logging_groups, include_singleton_cp):
+    groups = logging_groups
+    pg_collection = ProcessGroupCollection(pp=groups.singleton, dp=groups.world)
+    if include_singleton_cp:
+        pg_collection.cp = groups.singleton
+    DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+        torch.tensor(float(groups.rank + 1), device=groups.device), 1, 1
+    )
+    losses = _log(pg_collection)
+    torch.testing.assert_close(
+        losses["indexer loss"], torch.tensor((groups.size + 1) / 2, device=groups.device)
+    )
+
+
+def test_real_cp_requires_fixed_data_context_group(logging_groups):
+    groups = logging_groups
+    pg_collection = ProcessGroupCollection(pp=groups.singleton, dp=groups.stripe, cp=groups.pair)
+    with pytest.raises(ValueError, match="with CP requires a fixed dp_cp"):
+        _log(pg_collection)
+
+
+@pytest.mark.parametrize("average_cp", [False, True])
+def test_runtime_cp_requires_fixed_group_even_without_collection_cp(logging_groups, average_cp):
+    groups = logging_groups
+    pg_collection = ProcessGroupCollection(pp=groups.singleton, dp=groups.world)
+    DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+        torch.tensor(1.0, device=groups.device),
+        1,
+        1,
+        reduce_group=groups.pair if not average_cp else None,
+        avg_group=groups.pair if average_cp else None,
+    )
+    with pytest.raises(ValueError, match="with CP requires a fixed dp_cp"):
+        _log(pg_collection)
