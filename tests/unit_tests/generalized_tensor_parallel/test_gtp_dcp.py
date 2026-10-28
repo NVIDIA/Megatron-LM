@@ -1348,8 +1348,10 @@ def test_gdp_gtp_padding_tensor_aware_state_dict_round_trip(algo, gtp_rank, vali
     assert saved_gtp_rows == valid_rows, "Padding and placeholders must not be saved"
     assert saved.common == {"model": {"iteration": 7}}, saved.common
 
-    gtp_data.fill_(-999)
-    split_data.fill_(-999)
+    # The tensor-aware state dict holds views of the live tensors until it is copied or
+    # written out, so reload into fresh tensors instead of overwriting the saved data.
+    gtp_data = torch.full_like(gtp_data, -999)
+    split_data = torch.full_like(split_data, -999)
     loaded = saved.to_state_dict(state_dict(gtp_data, split_data), algo=algo)["model"]
 
     assert loaded[key].shape == (local_rows, 2)
