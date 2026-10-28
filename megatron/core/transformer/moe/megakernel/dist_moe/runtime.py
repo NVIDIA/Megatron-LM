@@ -166,6 +166,7 @@ class _RuntimePool:
     context: object = None
 
     def configure(self, num_slots):
+        """Allocate scheduler-sized state while preserving live or captured bindings."""
         import dist_moe
 
         if self.context is not None and self.context.config.num_activation_slots == num_slots:

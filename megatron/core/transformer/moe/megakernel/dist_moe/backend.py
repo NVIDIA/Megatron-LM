@@ -9,8 +9,10 @@ from types import MethodType
 import torch
 
 from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
+from megatron.core.transformer.moe.megakernel.mok.route_adapter import (
+    routing_map_to_mok_inputs as routing_map_to_indices,
+)
 from megatron.core.transformer.moe.megakernel.parameter_bridge import main_grad_buffer
-from megatron.core.transformer.moe.megakernel.route_adapter import routing_map_to_indices
 
 from .runtime import (
     DistMoEBackendOptions,

@@ -52,8 +52,6 @@ def prepare_weight(weight, *, use_mxfp8, cached=None):
             None,
             output=cache.get("workspace"),
         )
-        if getattr(operands, "quantized_tensors", None) is None:
-            operands.quantized_tensors = operands.split_into_quantized_tensors()
         cache["workspace"] = operands
     members = get_grouped_quantized_members(operands, create_if_missing=True)
     if any(getattr(member, "_with_gemm_swizzled_scales", False) for member in members):

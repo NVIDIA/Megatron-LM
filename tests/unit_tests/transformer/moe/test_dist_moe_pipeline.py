@@ -111,6 +111,17 @@ def _backward(scope, tickets, chunk, microbatch):
     scope.backward_step(execute, chunk, microbatch)
 
 
+def _run_plan(scope, layers):
+    tickets = {}
+    for direction, chunk, microbatch in scope.plan.events:
+        if direction == "forward":
+            tickets[chunk, microbatch] = _forward(scope, layers, chunk, microbatch)
+        else:
+            _backward(scope, tickets.pop((chunk, microbatch)), chunk, microbatch)
+    scope.finish()
+    assert not tickets
+
+
 def test_non_lifo_backward_and_early_slot_reuse(layers):
     # F(A), F(B), B(A), F(C), B(B), B(C), with two saved layers per invocation.
     scope = DistMoEPipelineSchedule(layers[:1], [(i, 0) for i in range(3)], 1)
@@ -159,14 +170,7 @@ def test_graph_recording_binding_is_read_only_and_includes_schedule_order(layers
 def test_interleaved_chunks_and_schedule_change(layers):
     for table, warmup in ((get_schedule_table(4, 2, 2), 4), (get_schedule_table(6, 2, 3), 5)):
         scope = DistMoEPipelineSchedule(layers, table, warmup)
-        tickets = {}
-        for direction, chunk, microbatch in scope.plan.events:
-            if direction == "forward":
-                tickets[chunk, microbatch] = _forward(scope, layers, chunk, microbatch)
-            else:
-                _backward(scope, tickets.pop((chunk, microbatch)), chunk, microbatch)
-        scope.finish()
-        assert not tickets
+        _run_plan(scope, layers)
     assert runtime.configure_dist_moe_activation_slots.call_count == 2
 
 
@@ -177,21 +181,10 @@ def test_different_pools_and_empty_chunks_do_not_reserve_unused_slots(layers):
     scope = DistMoEPipelineSchedule(layers, get_schedule_table(4, 2, 2), 4)
     capacities = runtime.configure_dist_moe_activation_slots.call_args.args[1]
     assert capacities == {id(layers[0][0]._runtime_pool): 4, id(layers[1][0]._runtime_pool): 2}
-    tickets = {}
-    for direction, chunk, microbatch in scope.plan.events:
-        if direction == "forward":
-            tickets[chunk, microbatch] = _forward(scope, layers, chunk, microbatch)
-        else:
-            _backward(scope, tickets.pop((chunk, microbatch)), chunk, microbatch)
-    scope.finish()
+    _run_plan(scope, layers)
     layers[1] = []
     scope = DistMoEPipelineSchedule(layers, get_schedule_table(4, 2, 2), 4)
-    for direction, chunk, microbatch in scope.plan.events:
-        if direction == "forward":
-            tickets[chunk, microbatch] = _forward(scope, layers, chunk, microbatch)
-        else:
-            _backward(scope, tickets.pop((chunk, microbatch)), chunk, microbatch)
-    scope.finish()
+    _run_plan(scope, layers)
 
 
 def test_layer_order_is_checked_before_backward_execution(layers):

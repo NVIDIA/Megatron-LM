@@ -784,9 +784,9 @@ class MoELayer(BaseMoELayer):
                 )
                 shared = None
                 if (
-                    self.use_shared_expert
+                    not self.megakernel_experts.handles_shared_expert
+                    and self.use_shared_expert
                     and self.shared_expert_overlap
-                    and not self.megakernel_experts.handles_shared_expert
                 ):
                     # Use the native module and its autograd/DDP ownership on the
                     # existing shared stream. The fork and join are captured too.

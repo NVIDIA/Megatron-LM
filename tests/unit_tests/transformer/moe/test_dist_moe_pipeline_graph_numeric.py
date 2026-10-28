@@ -5,14 +5,8 @@ from contextlib import contextmanager
 from unittest.mock import patch
 
 import pytest
-import torch
 
-from tests.unit_tests.transformer.moe.test_dist_moe_pipeline_numeric import (
-    PipelineCase,
-    _plain,
-    compare_snapshots,
-    run_pipeline_case,
-)
+from tests.unit_tests.transformer.moe.test_dist_moe_pipeline_numeric import _run_pipeline_comparison
 
 
 class PipelineGraphAudit:
@@ -67,13 +61,7 @@ class PipelineGraphAudit:
             chunk = self.chunks[id(runner.base_module)]
             self.prefixes[runner] = f"{chunk.phase}/mb{chunk.microbatch}"
             self.read(runner, backward=False)
-            if chunk.pending_update is not None and chunk.microbatch == 0:
-                layer = runner.base_module
-                for name, parameter in layer.named_parameters():
-                    chunk._save(
-                        f"train{chunk.pending_update}/updated/layer{layer.layer_number}/{name}",
-                        _plain(parameter),
-                    )
+            chunk._save_updated_parameters(runner.base_module)
             self.replays["forward"] += 1
             return result
 
@@ -186,35 +174,4 @@ class PipelineGraphAudit:
 @pytest.mark.parametrize("vpp", [1, 2, 3], ids=["pp2", "pp2_vpp2", "pp2_vpp3"])
 def test_dist_moe_pipeline_graph_numeric(precision, vpp):
     """Compare default-Adam optimizer trajectories, including all internal observations."""
-    from tests.unit_tests.test_utilities import Utils
-
-    pytest.importorskip("dist_moe")
-    if Utils.world_size < 8 or Utils.world_size % 8:
-        pytest.skip("Requires PP2 * EP4 * expert-DP ranks")
-    if torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("Dist-MoE requires Blackwell")
-    Utils.initialize_model_parallel(
-        pipeline_model_parallel_size=2,
-        virtual_pipeline_model_parallel_size=vpp if vpp > 1 else None,
-        expert_model_parallel_size=4,
-    )
-    try:
-        case = PipelineCase(
-            precision=precision,
-            vpp=vpp,
-            graph_recapture=True,
-            overlap_grad_reduce=vpp >= 3,
-            overlap_param_gather=vpp >= 3,
-        )
-        expected, _ = run_pipeline_case(case)
-        case.cuda_graph = True
-        actual, _ = run_pipeline_case(case)
-        metrics = compare_snapshots(expected, actual, precision, exact=True)
-        failed = {name: value for name, value in metrics.items() if not value["passed"]}
-        assert not failed, failed
-    finally:
-        try:
-            if PipelineGraphAudit.active is not None:
-                PipelineGraphAudit.active.close()
-        finally:
-            Utils.destroy_model_parallel()
+    _run_pipeline_comparison(precision, vpp, cuda_graph=True)

@@ -212,19 +212,21 @@ class _TransformerChunk(MegatronModule):
         assert name not in self.snapshots, f"Duplicate observation: {name}"
         self.snapshots[name] = value.detach().float().cpu().clone()
 
+    def _save_updated_parameters(self, layer):
+        # Called after native DDP pre-hooks finish gathering this layer's parameters.
+        if self.pending_update is not None and self.microbatch == 0:
+            for name, parameter in layer.named_parameters():
+                self._save(
+                    f"train{self.pending_update}/updated/layer{layer.layer_number}/{name}",
+                    _plain(parameter),
+                )
+
     def _install_observers(self, layer):
         def observe(module, inputs, output, boundary):
             prefix = f"{self.phase}/mb{self.microbatch}/layer{layer.layer_number}/{boundary}"
             self._save(f"{prefix}Y", output[0])
-            if boundary == "" and self.pending_update is not None and self.microbatch == 0:
-                # This hook runs after the layer's native DDP pre-hooks completed
-                # param gather. Observe refreshed weights without forcing gather
-                # ahead of the scheduler (especially VPP chunk >= 2).
-                for name, parameter in layer.named_parameters():
-                    self._save(
-                        f"train{self.pending_update}/updated/layer{layer.layer_number}/{name}",
-                        _plain(parameter),
-                    )
+            if boundary == "":
+                self._save_updated_parameters(layer)
             if torch.is_grad_enabled() and inputs[0].requires_grad:
                 inputs[0].register_hook(lambda grad: self._save(f"{prefix}dgrad", grad))
 
@@ -640,20 +642,12 @@ def compare_snapshots(expected, actual, precision, exact=False):
     return metrics
 
 
-@pytest.mark.internal
-@pytest.mark.launch_on_gb200
-@pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
-@pytest.mark.parametrize("vpp", [1, 2, 3], ids=["pp2", "pp2_vpp2", "pp2_vpp3"])
-def test_dist_moe_pipeline_numeric(precision, vpp):
-    """Check schedules with well-conditioned Adam updates, including native overlap.
-
-    Epsilon=1e-4 prevents near-zero LayerNorm bias gradients from producing
-    opposite O(lr) Adam updates solely from BF16/MXFP8 rounding. All original
-    numerical gates still apply to losses, activations, gradients, FP32 masters,
-    and logical weights. The CLI fixture keeps epsilon=1e-8 by default to retain
-    separate diagnostics of ordinary Adam training trajectories.
-    """
+def _run_pipeline_comparison(precision, vpp, *, cuda_graph):
+    """Compare native/Dist eager or Dist eager/graph with the same topology."""
     from tests.unit_tests.test_utilities import Utils
+    from tests.unit_tests.transformer.moe.test_dist_moe_pipeline_graph_numeric import (
+        PipelineGraphAudit,
+    )
 
     pytest.importorskip("dist_moe")
     if Utils.world_size < 8 or Utils.world_size % 8:
@@ -669,16 +663,38 @@ def test_dist_moe_pipeline_numeric(precision, vpp):
         case = PipelineCase(
             precision=precision,
             vpp=vpp,
-            backend="alltoall",
-            adam_eps=1e-4,
+            backend="dist_moe" if cuda_graph else "alltoall",
+            adam_eps=1e-8 if cuda_graph else 1e-4,
+            graph_recapture=cuda_graph,
             overlap_grad_reduce=vpp >= 3,
             overlap_param_gather=vpp >= 3,
         )
         expected, _ = run_pipeline_case(case)
         case.backend = "dist_moe"
+        case.cuda_graph = cuda_graph
         actual, _ = run_pipeline_case(case)
-        metrics = compare_snapshots(expected, actual, precision)
+        metrics = compare_snapshots(expected, actual, precision, exact=cuda_graph)
         failed = {key: value for key, value in metrics.items() if not value["passed"]}
         assert not failed, failed
     finally:
-        Utils.destroy_model_parallel()
+        try:
+            if cuda_graph and PipelineGraphAudit.active is not None:
+                PipelineGraphAudit.active.close()
+        finally:
+            Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
+@pytest.mark.parametrize("vpp", [1, 2, 3], ids=["pp2", "pp2_vpp2", "pp2_vpp3"])
+def test_dist_moe_pipeline_numeric(precision, vpp):
+    """Check schedules with well-conditioned Adam updates, including native overlap.
+
+    Epsilon=1e-4 prevents near-zero LayerNorm bias gradients from producing
+    opposite O(lr) Adam updates solely from BF16/MXFP8 rounding. All original
+    numerical gates still apply to losses, activations, gradients, FP32 masters,
+    and logical weights. The CLI fixture keeps epsilon=1e-8 by default to retain
+    separate diagnostics of ordinary Adam training trajectories.
+    """
+    _run_pipeline_comparison(precision, vpp, cuda_graph=False)

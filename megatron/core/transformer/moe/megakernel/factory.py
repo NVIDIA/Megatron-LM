@@ -62,7 +62,7 @@ def prepare_megakernel_shared_expert_config(config: TransformerConfig) -> Transf
         shared_config.fp8 = None
         shared_config.fp8_param = False
         return shared_config
-    if backend in ("mok", "dist_moe"):
+    if backend == "mok":
         from megatron.core.transformer.moe.megakernel.mok.weights import (
             prepare_shared_expert_config,
         )
