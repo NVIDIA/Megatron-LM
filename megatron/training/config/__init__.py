@@ -14,6 +14,7 @@ from megatron.training.config.rl_config import RLConfig
 from megatron.training.config.training_config import (
     CheckpointConfig,
     LoggerConfig,
+    MultiModalTokenizerConfig,
     SchedulerConfig,
     TokenizerConfig,
     TrainingConfig,

@@ -1013,14 +1013,15 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             precomputed_seq_start=seq_start,
         ).unsqueeze(0)
 
-    def _compute_gating(self, ba):
+    def _compute_gating(self, ba: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute the beta and g gating tensors from the ba slice."""
         b, a = torch.split(
             ba, [self.nheads_local_cp * self.num_householder, self.nheads_local_cp], dim=-1
         )
 
         b, a = b.contiguous(), a.contiguous()
-        beta = b.sigmoid()
+        # Save FP32 sigmoid values for backward, retaining the kernel's input dtype.
+        beta = b.float().sigmoid().to(b.dtype)
 
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         if self.chunkwise_context_parallel:
@@ -1048,7 +1049,18 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             assert self.cp is not None
             y = self.cp.post_conv_ssm(y, packed_seq_params=packed_seq_params)
         if self.rmsnorm:
-            z = rearrange(z, "b l d -> l b d").contiguous()
+            z = rearrange(z, "b l d -> l b d")
+            # CP1 and chunkwise CP leave z in projection storage. At batch size one,
+            # the gated norm's flattening preserves this unit-column-stride view,
+            # so in_proj recompute can discard and restore the norm's saved gate.
+            # Headwise CP and larger batches keep their existing materialization.
+            keep_gate_view = (
+                self.recompute_in_proj
+                and (self.pg_collection.cp.size() == 1 or self.chunkwise_context_parallel)
+                and z.shape[1] == 1
+            )
+            if not keep_gate_view:
+                z = z.contiguous()
             if not self.chunkwise_context_parallel:
                 z = self.cp.post_conv_ssm(z, packed_seq_params=packed_seq_params)
             y = self.norm(y, z)

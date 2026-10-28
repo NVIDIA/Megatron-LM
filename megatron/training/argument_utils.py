@@ -33,6 +33,7 @@ from megatron.training.config import (
     InferenceConfigContainer,
     InferenceSetupConfig,
     LoggerConfig,
+    MultiModalTokenizerConfig,
     PretrainConfigContainer,
     ProfilingConfig,
     RerunStateMachineConfig,
@@ -572,21 +573,21 @@ def _default_config_from_args(
 
 
 def resolve_tokenizer_vocab_size(
-    cfg: PretrainConfigContainer | InferenceConfigContainer, padded_vocab_size: int | None
-) -> None:
+    cfg: PretrainConfigContainer | InferenceConfigContainer) -> None:
     """Bind tokenizer-derived vocabulary after runtime tokenizer construction.
+        
+    Final padded_vocab_size value is resolved by tokenizer initialization,
+        and updated on cfg.tokenizer. including any CLI/checkpoint override.
+        None is valid only when the model does not require a tokenizer-derived size.
 
     Args:
         cfg: Previously constructed run configuration. Explicit model
             vocabulary is preserved; only unresolved GPT/Hybrid sizes are bound.
-        padded_vocab_size: Final size resolved by tokenizer initialization,
-            including any CLI/checkpoint override. None is valid only when the
-            model does not require a tokenizer-derived size.
 
     Raises:
         ValueError: A GPT/Hybrid model's vocabulary remains unresolved.
     """
-    cfg.tokenizer.padded_vocab_size = padded_vocab_size
+    padded_vocab_size = cfg.tokenizer.padded_vocab_size
     if isinstance(cfg.model, (GPTModelConfig, HybridModelConfig)) and cfg.model.vocab_size is None:
         if padded_vocab_size is None:
             raise ValueError('Model vocabulary must be resolved before model construction')
@@ -766,6 +767,13 @@ def hybrid_config_from_args(
     return model_config_cls(**kwargs)
 
 
+def tokenizer_config_from_args(args: Namespace) -> TokenizerConfig:
+    if hasattr(args, "image_tag_type"):
+        return _default_config_from_args(MultiModalTokenizerConfig, args)
+    else:
+        return _default_config_from_args(TokenizerConfig, args)
+
+
 def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
     """Normalize legacy CLI/YAML profiling inputs at the configuration boundary."""
     # Legacy args retain these fields temporarily during the training-loop refactor;
@@ -939,13 +947,22 @@ def core_gpt_dataset_config_from_args(
     ``gpt_data_config_from_args(args, standalone=True)`` (the layout and validation fields and the
     seed from ``args``), the dataset class pinned to ``dataset_type`` when given
     (``tools/prepare_cache.py`` builds ``GPTDataset`` whatever the flags name), validated, then bound
-    to ``tokenizer`` or a tokenizer built from ``args`` (Megatron Core's ``validate()`` runs then).
+    to ``tokenizer``, else to the run's registered tokenizer, else to one built from ``args``
+    (Megatron Core's ``validate()`` runs then).
     """
     data = gpt_data_config_from_args(args, standalone=True)
     if dataset_type is not None:
         data.dataset_type = dataset_type
     data.validate()
-    data.bind_tokenizer(build_tokenizer(args) if tokenizer is None else tokenizer)
+    if tokenizer is None:
+        from megatron.training import global_vars
+
+        # The run's tokenizer when one is registered, as the entry points' own factories did
+        # since #8391; tools/prepare_cache.py registers none and builds one from the arguments.
+        tokenizer = global_vars._GLOBAL_TOKENIZER
+        if tokenizer is None:
+            tokenizer = build_tokenizer(args)
+    data.bind_tokenizer(tokenizer)
     return data.dataset
 
 
@@ -1003,7 +1020,7 @@ def pretrain_cfg_container_from_args(
         logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
         checkpoint=CheckpointConfig(**ckpt_kwargs),
         profiling=profiling_config_from_args(args),
-        tokenizer=_default_config_from_args(TokenizerConfig, args),
+        tokenizer=tokenizer_config_from_args(args),
         rl=_default_config_from_args(RLConfig, args),
 
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
@@ -1065,7 +1082,7 @@ def inference_cfg_container_from_args(
         inference=inference_cfg_from_args(args),
         dist=deepcopy(_default_config_from_args(DistributedInitConfig, args)),
         rng=_default_config_from_args(RNGConfig, args),
-        tokenizer=_default_config_from_args(TokenizerConfig, args),
+        tokenizer=tokenizer_config_from_args(args),
         logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
         profiling=profiling_config_from_args(args),
     )

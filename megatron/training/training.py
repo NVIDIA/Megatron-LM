@@ -20,6 +20,7 @@ import math
 import os
 import sys
 from collections import defaultdict
+from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -165,6 +166,7 @@ from megatron.training.initialize import (
     write_args_to_tensorboard,
 )
 from megatron.training.kernel_warmup import warmup_training_kernels
+from megatron.training.logging.dsa_flops import dsa_indexer_flops, dsa_layer_flops
 
 # Retain the training.py import path used by existing multimodal callers.
 from megatron.training.logging.packed_sequence_stats import (
@@ -212,6 +214,8 @@ from .utils import (
     to_empty_if_meta_device,
     update_use_dist_ckpt,
 )
+
+_TensorMetricObserverCallback = Callable[..., None]
 
 # Optional dependencies. Each is guarded so the module imports cleanly when the
 # dependency is unavailable; the ``has_*``/``HAVE_*`` flags gate later usage.
@@ -829,6 +833,7 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
 
 def num_floating_point_operations(
     args,
+    cfg,
     batch_size,
     seqlen_squared_sum_in_batch=None,
     total_real_tokens_in_batch=None,
@@ -997,7 +1002,7 @@ def num_floating_point_operations(
 
     def hybrid_flops(total_tokens, seqlen_squared_sum, hidden_size,
                      num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
-                     gdp_num_householder,
+                     num_dsa_layers, gdp_num_householder,
                      num_gdn_layers=0,
                      mamba_state_dim=128, mamba_head_dim=64,
                      mamba_num_groups=8, mamba_num_heads=128,
@@ -1011,7 +1016,7 @@ def num_floating_point_operations(
                      gdn_num_qk_heads=16, gdn_num_v_heads=32,
                      gdn_conv_kernel_dim=4, gdn_use_gdn2=False,
                      vocab_size=256000, mtp_num_layers=0):
-        """Calculate total FLOPs for the hybrid model."""
+        """Calculate total training FLOPs for the hybrid model, including DSA."""
         mamba_flops = (
             gated_delta_product_layer_flops(total_tokens, hidden_size,
                                             gdp_num_householder,
@@ -1022,7 +1027,26 @@ def num_floating_point_operations(
                                    mamba_state_dim, mamba_head_dim,
                                    mamba_num_groups, mamba_num_heads)
         )
+        dsa_attention_flops = (
+            dsa_layer_flops(
+                total_tokens=total_tokens,
+                seqlen_squared_sum=seqlen_squared_sum,
+                hidden_size=hidden_size,
+                num_attention_heads=num_attn_heads,
+                q_lora_rank=args.q_lora_rank,
+                kv_lora_rank=args.kv_lora_rank,
+                qk_head_dim=args.qk_head_dim,
+                qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
+                v_head_dim=args.v_head_dim,
+                dsa_indexer_topk=args.dsa_indexer_topk,
+                dsa_indexer_kpool=getattr(args, "dsa_indexer_kpool", 1),
+                dsa_indexer_kpool_always_select_tail=getattr(
+                    args, "dsa_indexer_kpool_always_select_tail", True
+                ),
+            ) if num_dsa_layers else 0
+        )
         flops_fwd = (
+                num_dsa_layers * dsa_attention_flops +
                 num_attn_layers * attn_layer_flops(total_tokens, seqlen_squared_sum,
                                                    hidden_size, num_attn_heads, gqa,
                                                    gqa_groups, kv_channels) +
@@ -1038,7 +1062,26 @@ def num_floating_point_operations(
                                                   gdn_conv_kernel_dim, gdn_use_gdn2) +
                 (2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
         )
-        return flops_fwd * 3
+        # The indexer has its own loss-dependent backward cost.
+        indexer_flops = (
+            dsa_indexer_flops(
+                total_tokens=total_tokens,
+                seqlen_squared_sum=seqlen_squared_sum,
+                hidden_size=hidden_size,
+                q_lora_rank=args.q_lora_rank,
+                dsa_indexer_n_heads=args.dsa_indexer_n_heads,
+                dsa_indexer_head_dim=args.dsa_indexer_head_dim,
+                dsa_indexer_topk=args.dsa_indexer_topk,
+                num_dsa_layers=num_dsa_layers,
+                dsa_indexer_loss_coeff=args.dsa_indexer_loss_coeff,
+                dsa_indexer_use_sparse_loss=getattr(args, "dsa_indexer_use_sparse_loss", False),
+                dsa_indexer_skip_topk_offset=args.dsa_indexer_skip_topk_offset,
+                dsa_indexer_topk_freq=args.dsa_indexer_topk_freq,
+                hybrid_layer_pattern=args.hybrid_layer_pattern,
+                dsa_indexer_kpool=getattr(args, "dsa_indexer_kpool", 1),
+            ) if num_dsa_layers else 0
+        )
+        return flops_fwd * 3 + indexer_flops
 
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
@@ -1112,6 +1155,11 @@ def num_floating_point_operations(
         # causal mask of packed attention.
         if args.multi_latent_attention:
             assert not args.group_query_attention
+        if args.experimental_attention_variant == "dsa":
+            # DSA attention and its indexer are counted separately below.
+            standard_self_attn_term = 0
+            standard_self_attn_core_term = 0
+        elif args.multi_latent_attention:
             '''
             Basic arithmetic
             let B is batch size, s is seq_len, h is embedding dim,
@@ -1336,7 +1384,7 @@ def num_floating_point_operations(
                 + forward_backward_expansion_factor
                 * fma_expansion_factor
                 * args.hidden_size
-                * args.padded_vocab_size
+                * cfg.tokenizer.padded_vocab_size
                 * (mtp_num_layers + 1)  # MTP + final logit
             )
             # Self Attention (core L^2 part). For BSHD the default
@@ -1345,6 +1393,45 @@ def num_floating_point_operations(
             # ragged ``sum(L_i^2)`` and so undercounts the BSHD figure correctly.
             + seqlen_squared_sum_in_batch * self_attn_core_term
         )
+        if args.experimental_attention_variant == "dsa":
+            total_floating_point_operations += (
+                num_layers
+                * dsa_layer_flops(
+                    total_tokens=total_real_tokens_in_batch,
+                    seqlen_squared_sum=seqlen_squared_sum_in_batch,
+                    hidden_size=args.hidden_size,
+                    num_attention_heads=args.num_attention_heads,
+                    q_lora_rank=args.q_lora_rank,
+                    kv_lora_rank=args.kv_lora_rank,
+                    qk_head_dim=args.qk_head_dim,
+                    qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
+                    v_head_dim=args.v_head_dim,
+                    dsa_indexer_topk=args.dsa_indexer_topk,
+                    dsa_indexer_kpool=getattr(args, "dsa_indexer_kpool", 1),
+                    dsa_indexer_kpool_always_select_tail=getattr(
+                        args, "dsa_indexer_kpool_always_select_tail", True
+                    ),
+                )
+                * forward_backward_expansion_factor
+            )
+            # Pass all DSA layers; the helper counts only layers that compute an index.
+            total_floating_point_operations += dsa_indexer_flops(
+                total_tokens=total_real_tokens_in_batch,
+                seqlen_squared_sum=seqlen_squared_sum_in_batch,
+                hidden_size=args.hidden_size,
+                q_lora_rank=args.q_lora_rank,
+                dsa_indexer_n_heads=args.dsa_indexer_n_heads,
+                dsa_indexer_head_dim=args.dsa_indexer_head_dim,
+                dsa_indexer_topk=args.dsa_indexer_topk,
+                num_dsa_layers=num_layers,
+                dsa_indexer_loss_coeff=args.dsa_indexer_loss_coeff,
+                dsa_indexer_use_sparse_loss=getattr(args, "dsa_indexer_use_sparse_loss", False),
+                dsa_indexer_skip_topk_offset=args.dsa_indexer_skip_topk_offset,
+                dsa_indexer_topk_freq=args.dsa_indexer_topk_freq,
+                mtp_num_layers=mtp_num_layers,
+                mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
+                dsa_indexer_kpool=getattr(args, "dsa_indexer_kpool", 1),
+            )
         return total_floating_point_operations
 
     def _uses_gated_delta_product_spec(args):
@@ -1374,8 +1461,11 @@ def num_floating_point_operations(
             Symbols,
             get_hybrid_layer_counts,
         )
-        num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers = (
-            itemgetter(Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)(
+        num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers, num_dsa_layers = (
+            itemgetter(
+                Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE,
+                Symbols.DS_ATTENTION,
+            )(
                 get_hybrid_layer_counts(args.hybrid_layer_pattern)
             )
         )
@@ -1392,6 +1482,7 @@ def num_floating_point_operations(
             num_mamba_layers=num_mamba_layers,
             num_mlp_layers=num_mlp_layers,
             num_moe_layers=num_moe_layers,
+            num_dsa_layers=num_dsa_layers,
             num_gdn_layers=num_gdn_layers,
             mamba_state_dim=args.mamba_state_dim,
             mamba_head_dim=args.mamba_head_dim,
@@ -1417,7 +1508,7 @@ def num_floating_point_operations(
             gdn_num_v_heads=args.linear_num_value_heads or 32,
             gdn_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             gdn_use_gdn2=(args.experimental_attention_variant == "gdn2"),
-            vocab_size=args.padded_vocab_size,
+            vocab_size=cfg.tokenizer.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
         ))
     else:
@@ -1587,6 +1678,7 @@ def pretrain(
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
     skip_model_parallel_init=False,
     callbacks: list[Callback] | CallbackManager | None = None,
+    tensor_metric_observer: _TensorMetricObserverCallback | None = None,
     *,
     build_tokenizer: bool = True,
 ):
@@ -1631,6 +1723,11 @@ def pretrain(
             torch.distributed.init_process_group
         inprocess_call_wrapper: an optional instance of inprocess.CallWrapper,
             it is automatically injected when in-process restart is in use
+        tensor_metric_observer: Optional callback invoked immediately before each optimizer step.
+            Observers exposing `observe_forward_backward` also receive a context around the
+            forward-backward execution. The callback runs on every rank and owns tensor selection,
+            metric execution, and sinks. It overrides any observer selected by
+            `cfg_container.logger.tensor_metrics`.
         build_tokenizer: whether startup builds the shared tokenizer. Disable for
             workloads that provide their own tokenization, such as heterogeneous MiMo.
     """
@@ -1679,6 +1776,11 @@ def pretrain(
     args = get_args()
     train_state = get_train_state()
     timers = get_timers()
+
+    if tensor_metric_observer is None and cfg_container.logger.tensor_metrics:
+        from .tensor_metrics.observer import build_tensor_metric_observer
+
+        tensor_metric_observer = build_tensor_metric_observer(cfg_container.logger.tensor_metrics)
 
     # OTel span setup (_start_otel_job_spans) is deferred until after
     # kernel warmup below, where program_start/main_entry/pretrain_entry
@@ -2124,6 +2226,7 @@ def pretrain(
                     p2p_communicator=p2p_communicator,
                     pg_collection=pg_collection,
                     callback_manager=callback_manager,
+                    tensor_metric_observer=tensor_metric_observer,
                 )
             except Exception:
                 # OTel: an uncaught training exception (a real hardware/CUDA/NCCL
@@ -3230,13 +3333,46 @@ def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
     return samples_seen_in_iteration
 
 
-def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
+def _get_model_pg_collection(
+    model_chunk,
+) -> ProcessGroupCollection | MultiModuleProcessGroupCollection:
+    """Return a model's process groups, falling back to the MPU compatibility collection."""
+    while not hasattr(model_chunk, "pg_collection"):
+        model_chunk = getattr(model_chunk, "module", None)
+        if model_chunk is None:
+            return ProcessGroupCollection.use_mpu_process_groups()
+
+    pg_collection = model_chunk.pg_collection
+    if pg_collection is None:
+        return ProcessGroupCollection.use_mpu_process_groups()
+    return pg_collection
+
+
+def train_step(
+    forward_step_func,
+    data_iterator,
+    model,
+    optimizer,
+    opt_param_scheduler,
+    config,
+    forward_backward_func,
+    iteration=None,
+    pg_collection: Optional[
+        ProcessGroupCollection | MultiModuleProcessGroupCollection
+    ] = None,
+    p2p_communicator: Optional[P2PCommunicator] = None,
+    tensor_metric_observer: _TensorMetricObserverCallback | None = None,
+):
     """Single training step.
 
     pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
         preserves the default behavior. Reductions source per-rank groups from the model.
     p2p_communicator: optional communicator forwarded to the schedule for cross-grid P2P; None
         preserves the default behavior.
+    tensor_metric_observer: optional callback invoked after backward and immediately before the
+        optimizer step. The callback sees finalized but not necessarily unscaled gradients.
+        Observers exposing `observe_forward_backward` also receive a context around the
+        forward-backward execution for short-lived tensors.
     """
     cfg = get_run_config()
     args = get_args()
@@ -3354,7 +3490,18 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             span_cm("megatron.train.iteration.forward_backward", tracer=_otel_step_tracer, num_microbatches=scheduled_num_microbatches)
             if _otel_sg_enabled('forward_backward') and _otel_step_tracer is not None else nullcontext()
         )
-        with grad_context, _fb_cm:
+        tensor_metric_context = nullcontext()
+        observe_forward_backward = getattr(
+            tensor_metric_observer, "observe_forward_backward", None
+        )
+        if observe_forward_backward is not None:
+            metric_pg_collection = _get_model_pg_collection(model[0])
+            tensor_metric_context = observe_forward_backward(
+                model=model,
+                iteration=iteration,
+                pg_collection=metric_pg_collection,
+            )
+        with grad_context, tensor_metric_context, _fb_cm:
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=forward_backward_data_iterator,
@@ -3426,6 +3573,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         losses_reduced, args, model_pg_collection
     )
 
+    if tensor_metric_observer is not None:
+        metric_pg_collection = _get_model_pg_collection(model[0])
+        tensor_metric_observer(
+            model=model,
+            optimizer=optimizer,
+            iteration=iteration,
+            pg_collection=metric_pg_collection,
+        )
+
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=config.barrier_with_L1_time)
@@ -3453,9 +3609,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         _save_state_dict(attr_name="data", label="params")
 
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
-    pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
-    if pg_collection is None:
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    pg_collection = _get_model_pg_collection(model[0])
     for _required in ("mp", "pp", "dp_cp"):
         assert getattr(pg_collection, _required, None) is not None, (
             f"model pg_collection used by train_step must define {_required}"
@@ -3670,6 +3824,7 @@ def training_log(
             'dataloader-next',
             'batch-generator',
             'forward-backward',
+            'tensor-metrics',
             'layernorm-grads-all-reduce',
             'embedding-grads-all-reduce',
             'all-grads-sync',
@@ -3910,6 +4065,7 @@ def training_log(
 
         throughput = num_floating_point_operations(
             args,
+            cfg,
             batch_size,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
@@ -4050,7 +4206,7 @@ def training_log(
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(
-                    args, num_microbatches=num_microbatches, verbose=True,
+                    cfg, args, num_microbatches=num_microbatches, verbose=True,
                     micro_batch_size=cfg.train.micro_batch_size,
                 )
             report_memory(
@@ -4290,13 +4446,6 @@ def save_checkpoint_and_time(
             with _otel_managed_span('checkpoint', 'megatron.checkpoint.report_memory', is_goodput_span=True):
                 report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_gtp_remat_group)
         num_checkpoints_memory_reported += 1
-
-        if args.fp8:
-            # Run garbage collection after checkpoint saving to free memory from
-            # dequantized bf16 tensors that were temporarily created during fp8
-            # model checkpoint saving.
-            with _otel_managed_span('checkpoint', 'megatron.checkpoint.gc_collect', is_goodput_span=True):
-                gc.collect()
 
         # timers.log reports min & max across ranks -> a collective. Sitting right
         # after the per-rank-imbalanced save (and outside the save spans), it's a
@@ -4557,6 +4706,22 @@ def checkpoint_and_decide_exit(
     return False
 
 
+def is_batch_size_transition(
+    num_microbatches: int, global_batch_size: int, has_step_batch_size_schedule: bool
+) -> bool:
+    """Return whether the last unchecked microbatch update moved to a new batch size.
+
+    With a step batch-size schedule, compare the global batch size too: the unchecked
+    update rounds the number of microbatches down, so a new batch size that the current
+    data-parallel size does not divide (e.g., 8192 -> 12288 at 8192 ranks) can leave it
+    unchanged. RL without sequence packing resizes the global batch every step, so the
+    comparison is limited to the schedule.
+    """
+    if get_num_microbatches() != num_microbatches:
+        return True
+    return has_step_batch_size_schedule and get_current_global_batch_size() != global_batch_size
+
+
 def train(
     forward_step_func,
     model,
@@ -4572,6 +4737,7 @@ def train(
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
     callback_manager: CallbackManager | None = None,
+    tensor_metric_observer: _TensorMetricObserverCallback | None = None,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
 
@@ -4579,6 +4745,7 @@ def train(
         preserves the default behavior.
     pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
         preserves the default behavior.
+    tensor_metric_observer: optional callback forwarded to each training step.
     """
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
@@ -4842,6 +5009,7 @@ def train(
     num_floating_point_operations_since_last_log_event = 0.0
 
     num_microbatches = get_num_microbatches()
+    global_batch_size = get_current_global_batch_size()
     eval_duration = 0.0
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
@@ -5020,23 +5188,25 @@ def train(
             # for the duration of timeout
             update_pg_timeout(timedelta(seconds=cfg.dist.distributed_timeout_seconds_after_init))
         # Update number of microbatches first without consistency check to decide if a
-        # checkpoint should be saved. If the number of microbatches is different
-        # from the previous iteration, save a checkpoint. Then run consistency check
+        # checkpoint should be saved. If the global batch size or the number of microbatches is
+        # different from the previous iteration, save a checkpoint. Then run consistency check
         # to make sure training configuration is still valid.
         # Standard microbatch update (sequence packing overrides this in rl_utils.py)
         update_num_microbatches(train_state.consumed_train_samples, consistency_check=False, verbose=True)
         # Skip automatic checkpoint on microbatch changes when sequence packing is active
         # as it intentionally reconfigures microbatches
-        if get_num_microbatches() != num_microbatches and iteration != 0:
+        if iteration != 0 and is_batch_size_transition(
+            num_microbatches, global_batch_size, cfg.train.step_batch_size_schedule is not None
+        ):
             if cfg.rl.rl_use_sequence_packing:
                 print_rank_0(
                     f"[Sequence Packing] Skipping automatic checkpoint at iteration {iteration} "
                     f"(microbatch change: {num_microbatches} -> {get_num_microbatches()})"
                 )
             else:
-                assert get_num_microbatches() > num_microbatches, (
-                    f"Number of microbatches should not decrease; "
-                    f"going from {num_microbatches} to {get_num_microbatches()}"
+                assert get_current_global_batch_size() > global_batch_size, (
+                    f"Global batch size should not decrease; "
+                    f"going from {global_batch_size} to {get_current_global_batch_size()}"
                 )
                 if args.save is not None:
                     print_rank_0("[StepBatchsizeNumMicroBatchesCalculator] Reached batch size "
@@ -5062,6 +5232,7 @@ def train(
                              "transition but --save is unset, so there is no checkpoint to "
                              "relaunch from; continuing at the new batch size.")
         num_microbatches = get_num_microbatches()
+        global_batch_size = get_current_global_batch_size()
         update_num_microbatches(train_state.consumed_train_samples, consistency_check=True, verbose=True)
 
         # Capture CUDA Graphs. One-off, at the warmup-step boundary -- the actual
@@ -5155,7 +5326,16 @@ def train(
             )
             # OTel: optional per-step span wrapping the real train_step.
             with _first_iter_span_cm, _otel_managed_span('step', 'megatron.train.iteration', is_goodput_span=True, **{'megatron.iteration': iteration}) as _step_span:
-                ft_integration.on_training_step_start()
+                # Iterations that run the periodic router tensor-metrics reduction are timed
+                # under a separate, generous section so their (potentially minutes-long) cost is
+                # not charged to the tight "step" hang-detection timeout.
+                ft_integration.on_training_step_start(
+                    is_tensor_metrics_iteration=(
+                        tensor_metric_observer is not None
+                        and hasattr(tensor_metric_observer, "has_due_metrics")
+                        and tensor_metric_observer.has_due_metrics(iteration)
+                    )
+                )
                 (
                     loss_dict,
                     skipped_iter,
@@ -5171,6 +5351,7 @@ def train(
                     forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
                     pg_collection=pg_collection,
                     p2p_communicator=p2p_communicator,
+                    tensor_metric_observer=tensor_metric_observer,
                 )
                 ft_integration.on_training_step_end()
                 if _maybe_raise_workload_exception is not None and iteration != start_iteration:
@@ -5297,6 +5478,7 @@ def train(
             packed_sequence_stats = consume_packed_sequence_stats_in_iteration()
         num_floating_point_operations_in_batch = num_floating_point_operations(
             args,
+            cfg,
             batch_size,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,

@@ -768,7 +768,7 @@ def test_set_global_variables_finalizes_a_dataset_section(
         monkeypatch.setattr(global_vars, name, None)
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 1)
 
-    def build(_args):
+    def build(_cfg, _args):  # main's _build_tokenizer(cfg, args) since #8391
         global_vars._GLOBAL_TOKENIZER = tokenizer
         return tokenizer
 
