@@ -21,8 +21,9 @@
       in its own change, not bundled into a fix.
     * ``ProcessGroupCollection.use_mpu_process_groups()`` is **not** a migration target. It is a
       backward-compatibility shim that reads this same global state, so swapping a direct
-      accessor for it preserves the global dependency. Bootstrap code and explicitly commented
-      migration fallbacks may still use it during the transition.
+      accessor for it preserves the global dependency. Bootstrap code may still use it during
+      the transition. A compatibility fallback uses ``resolve_process_groups()`` in Megatron
+      Core, or a ``global_process_group_fallback()`` block outside it.
 
     Bootstrap, teardown and the registry are not deprecated: ``initialize_model_parallel``,
     ``build_process_group_collection``, ``destroy_model_parallel``, ``is_initialized``,

@@ -61,8 +61,9 @@ functions that read those groups are deprecated; Megatron-Core is moving to expl
 - **Do not introduce global-state fallbacks for new features.** A `None` default that reads
   `parallel_state` can select a different model's grid or fail if the globals are uninitialized.
 - **`ProcessGroupCollection.use_mpu_process_groups()` is not a migration target.** It reads the
-  same global state. Bootstrap code and explicitly commented compatibility fallbacks may use
-  it while existing callers migrate.
+  same global state. Bootstrap code may use it while existing callers migrate; a compatibility
+  fallback goes through `resolve_process_groups()`, which warns the caller that omitted its
+  groups.
 - **Bug fixes may leave existing calls alone.** Process-group plumbing changes belong in their own
   PR.
 - **CI reports new reads.** The "Process group usage check" job lists every global read that a PR
