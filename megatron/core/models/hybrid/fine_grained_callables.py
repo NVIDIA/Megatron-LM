@@ -194,7 +194,9 @@ def _run_moe_preprocess(layer, node: ScheduleNode, hidden_states: Tensor):
     )
     node.layer_state.moe_unflatten_mbs = moe_unflatten_mbs
     shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
-    probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output, padding_mask)
+    probs, routing_map = layer.mlp.route(
+        pre_mlp_layernorm_output, padding_mask, packed_seq_params=node.chunk_state.packed_seq_params
+    )
     local_tokens, probs = layer.mlp.preprocess(
         pre_mlp_layernorm_output, probs, routing_map, padding_mask
     )
@@ -215,7 +217,7 @@ def _run_moe_experts(layer, node: ScheduleNode, dispatched_tokens: Tensor):
     )
     enable_deepep = (
         layer.config.moe_token_dispatcher_type == "flex"
-        and layer.config.moe_flex_dispatcher_backend == "deepep"
+        and layer.config.moe_flex_dispatcher_backend in ("deepep", "deepepv2")
     )
     enable_ncclep = (
         layer.config.moe_token_dispatcher_type == "flex"
@@ -352,7 +354,7 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
         )
         enable_deepep = (
             terminal_layer.config.moe_token_dispatcher_type == "flex"
-            and terminal_layer.config.moe_flex_dispatcher_backend == "deepep"
+            and terminal_layer.config.moe_flex_dispatcher_backend in ("deepep", "deepepv2")
         )
         enable_ncclep = (
             terminal_layer.config.moe_token_dispatcher_type == "flex"
