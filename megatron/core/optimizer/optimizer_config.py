@@ -429,6 +429,12 @@ class OptimizerConfig:
 
     def validate(self) -> None:
         """Check optimizer-local settings without modifying the config."""
+        if self.optimizer == 'dist_muon':
+            logger.warning(
+                "optimizer='dist_muon' is deprecated. "
+                "Use --optimizer muon --use-distributed-optimizer instead."
+            )
+
         if self.lr is not None and self.min_lr is not None:
             assert self.min_lr <= self.lr
 
@@ -576,13 +582,6 @@ class OptimizerConfig:
             assert (
                 ddp_config.overlap_grad_reduce
             ), 'Must use --overlap-param-gather with --overlap-grad-reduce'
-
-        if self.optimizer not in ('sgd', 'adam'):
-            if self.optimizer == 'dist_muon':
-                logger.warning(
-                    "optimizer='dist_muon' is deprecated. "
-                    "Use --optimizer muon --use-distributed-optimizer instead."
-                )
 
         if self.use_distributed_optimizer:
             assert (
