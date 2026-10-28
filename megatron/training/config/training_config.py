@@ -1,4 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
 import signal
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional
@@ -226,17 +227,61 @@ class SchedulerConfig:
     weight_decay_incr_style: Literal["constant", "linear", "cosine"] = "constant"
     """Weight decay increment function."""
 
-    no_weight_decay_cond_type: Literal["qwen3_next"] | None = None
-    """Type of no weight decay condition. Choices:
-    None (default): param no weight decay if and only if it is 1D; or it is bias;
-    or it is embedding and embedding_init_method_std is not None.
-    "qwen3_next": In addition to the default rules, apply weight decay to qk layernorm as a special case."""
-
     wd_incr_steps: int | None = field(init=False, default=None)
     """Number of samples to increment weight decay over. Calculated at runtime."""
 
     wsd_decay_steps: int | None = field(init=False, default=None)
     """Number of samples to decay WSD weight decay. Calculated at runtime."""
+
+    def validate_run(
+        self,
+        *,
+        train_iters: int | None,
+        train_samples: int | None,
+        skip_train: bool,
+        weight_decay: float | None,
+    ) -> None:
+        """Check this section against the rest of the run it belongs to."""
+        if train_iters and not skip_train:
+            # If we use iteration-based training, make sure the
+            # sample-based options are off.
+            assert train_samples is None, \
+                'expected iteration-based training'
+            assert self.lr_decay_samples is None, \
+                'expected iteration-based learning rate decay'
+            assert self.lr_warmup_samples == 0, \
+                'expected iteration-based learning rate warmup'
+            if self.lr_warmup_fraction is not None:
+                assert self.lr_warmup_iters == 0, \
+                    'can only specify one of lr-warmup-fraction and lr-warmup-iters'
+
+        # Sample-based training.
+        if train_samples and not skip_train:
+            # If we use sample-based training, make sure the
+            # iteration-based options are off.
+            assert train_iters is None, \
+                'expected sample-based training'
+            assert self.lr_decay_iters is None, \
+                'expected sample-based learning rate decay'
+            assert self.lr_warmup_iters == 0, \
+                'expected sample-based learning rate warmup'
+            if self.lr_warmup_fraction is not None:
+                assert self.lr_warmup_samples == 0, \
+                    'can only specify one of lr-warmup-fraction ' \
+                    'and lr-warmup-samples'
+
+        if self.weight_decay_incr_style == "constant":
+            for w in (self.start_weight_decay, self.end_weight_decay):
+                assert w is None or w == weight_decay
+        else:
+            assert self.start_weight_decay is not None
+            assert self.end_weight_decay is not None
+
+    def finalize_scheduler_config(self, weight_decay: float | None) -> None:
+        """Finalize the scheduler configuration after validation and before training starts."""
+        if self.weight_decay_incr_style == "constant":
+            self.start_weight_decay = weight_decay
+            self.end_weight_decay = weight_decay
 
 
 @dataclass(kw_only=True)
@@ -245,6 +290,12 @@ class LoggerConfig:
 
     log_interval: int = 100
     """Report loss and timing interval."""
+
+    tensor_metrics: list[str] = field(default_factory=list)
+    """Tensor metric specifications in `NAME:INTERVAL` form, such as
+    `layer-param-l2:10`. Multiple specifications may be supplied after one
+    `--tensor-metrics` flag.
+    """
 
     log_params_norm: bool = False
     """If set, calculate and log parameters norm."""
@@ -745,11 +796,29 @@ class TokenizerConfig:
         "HuggingFaceTokenizer",
         "Llama2Tokenizer",
         "TikTokenizer",
-        "MultimodalTokenizer",
         "NullTokenizer",
-        "NullMultimodalTokenizer",
         "SFTTokenizer",
-    ] = None
+        ] = field(
+                default=None,
+                metadata={
+                    "argparse_meta": {
+                        "choices": [
+                            "BertWordPieceLowerCase",
+                            "BertWordPieceCase",
+                            "GPT2BPETokenizer",
+                            "SentencePieceTokenizer",
+                            "GPTSentencePieceTokenizer",
+                            "HuggingFaceTokenizer",
+                            "Llama2Tokenizer",
+                            "TikTokenizer",
+                            "MultimodalTokenizer",
+                            "NullTokenizer",
+                            "NullMultimodalTokenizer",
+                            "SFTTokenizer",
+                        ]
+                    }
+                }
+            )
     """What type of tokenizer to use."""
 
     tokenizer_model: str = None
@@ -798,3 +867,28 @@ class TokenizerConfig:
 
     use_gigatoken: Optional[bool] = False
     """Whether to use faster implementation of tokenizers (gigatoken)"""
+
+    sft_tokenizer_prompt_format: str = "nemotron-h-aligned"
+    """SFT prompt format."""
+
+@dataclass(kw_only=True)
+class MultiModalTokenizerConfig(TokenizerConfig):
+    """Extended tokenizer config with additional settings for multimodal-model tokenizers."""
+
+    tokenizer_type: Literal[
+        "MultimodalTokenizer",
+        "NullMultimodalTokenizer",
+    ] = None
+    """What type of tokenizer to use."""
+
+    tokenizer_prompt_format: Literal["mistral", "llama3", "chatml", "nvlm-yi-34b", "qwen2p0", "qwen2p5", "llama3p1", "nemotron5", "nemotron5-aligned", "llama_nemotron_8b", "nemotron6-moe"] | None = None
+    """Prompt format to use with the tokenizer."""
+
+    image_tag_type: Literal["nvlm", "internvl", ""] | None = None
+    """Surround image tokens with tags."""
+
+    force_system_message: bool = False
+    """Force a specific system message."""
+
+    tokenizer_keep_history_thinking: bool = False
+    """Preserve thinking traces in conversation history."""
