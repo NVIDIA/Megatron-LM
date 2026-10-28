@@ -119,8 +119,7 @@ class DistributedDataParallelConfig:
       None is replaced with `data_parallel_sharding_strategy` during initialization."""
 
     gradient_reduce_div_fusion: bool = True
-    """If true, perform gradient reduce and division fusion. MFSDP v1 requires a single
-    gradient communication dtype per coalesced bucket group when this is enabled."""
+    """If true, perform gradient reduce and division fusion."""
 
     suggested_communication_unit_size: int = None
     """Specifies the number of elements to communicate at once during
