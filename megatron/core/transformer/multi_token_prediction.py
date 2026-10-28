@@ -24,7 +24,11 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, get_backend
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    require_process_groups,
+    warn_global_process_group_fallback,
+)
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
@@ -721,19 +725,11 @@ def _compute_mtp_acceptance_counts(
 ) -> tuple[Tensor, Tensor]:
     """Compute MTP acceptance correct/total counts.
 
-    ``preds`` is the argmax of ``mtp_logits`` over the full vocabulary, [s, b], when the loss
-    already found it; otherwise it is computed here.
+    ``tp_group`` is the group that ``mtp_logits`` are sharded over along the vocabulary; None
+    means that they hold the whole vocabulary. ``preds`` is the argmax of ``mtp_logits`` over the
+    full vocabulary, [s, b], when the loss already found it; otherwise it is computed here.
     """
     with torch.no_grad():
-        if (
-            tp_group is None
-            and parallel_state.is_initialized()
-            and parallel_state.get_tensor_model_parallel_world_size() > 1
-        ):
-            raise ValueError(
-                "tp_group must be provided when computing MTP acceptance counts "
-                "from vocab-sharded logits under tensor model parallelism."
-            )
         tp_size = torch.distributed.get_world_size(group=tp_group) if tp_group is not None else 1
 
         if preds is None:
@@ -839,14 +835,17 @@ def mtp_on_this_rank(
         - If no custom layout is provided, assumes all MTP layers (if any) are placed on the last
           pipeline stage. The function returns True only on the last pipeline stage.
     """
+    if layout is None and mtp_num_layers is None:
+        # No MTP layers anywhere, so the pipeline rank is not needed.
+        return False
     mtp_on_this_rank = False
-    if pp_group is not None:
-        pp_rank = get_pg_rank(pp_group)
-        pp_size = get_pg_size(pp_group)
-    else:
-        # Compatibility fallback for callers that have not migrated to an explicit PP group.
+    if pp_group is None:
+        warn_global_process_group_fallback("mtp_on_this_rank", "pp_group")
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         pp_size = None
+    else:
+        pp_rank = get_pg_rank(pp_group)
+        pp_size = get_pg_size(pp_group)
     if vp_size is None and layout is not None:
         vp_size = layout.virtual_pipeline_model_parallel_size
     elif vp_size is None and not ignore_virtual:
@@ -868,7 +867,6 @@ def mtp_on_this_rank(
         # without custom PP layout, we only support put all of MTP layers on the last pipeline stage
         if mtp_num_layers is not None:
             if pp_size is None:
-                # Compatibility fallback for callers without explicit pipeline metadata.
                 pp_size = parallel_state.get_pipeline_model_parallel_world_size()
             mtp_on_this_rank = pp_rank == pp_size - 1
             if mtp_on_this_rank and not ignore_virtual and vp_size not in (None, 1):
@@ -904,7 +902,9 @@ def get_mtp_layer_offset(
     if config.pipeline_model_parallel_size > 1:
         if config.pipeline_model_parallel_layout:
             if pp_rank is None:
-                # Compatibility fallback for callers without explicit pipeline metadata.
+                warn_global_process_group_fallback(
+                    "get_mtp_layer_offset", "pp_rank", deprecated_in="0.21", removed_in="0.23"
+                )
                 pp_rank = parallel_state.get_pipeline_model_parallel_rank()
             layout = config.pipeline_model_parallel_layout
             if layout.virtual_pipeline_model_parallel_size > 1:
@@ -932,7 +932,9 @@ def get_mtp_num_layers_to_build(
 ) -> int:
     """Get the number of MTP layers to build."""
     if pp_rank is None:
-        # Compatibility fallback for callers that have not migrated to explicit PP ranks.
+        warn_global_process_group_fallback(
+            "get_mtp_num_layers_to_build", "pp_rank", deprecated_in="0.21", removed_in="0.23"
+        )
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
 
     if config.pipeline_model_parallel_layout is not None:
@@ -1069,7 +1071,8 @@ def process_mtp_loss(
         compute_language_model_loss (Callable): Method to compute language model loss.
         config (TransformerConfig): Model configuration containing mtp_num_layers etc.
         cp_group (Optional[ProcessGroup]): Context parallelism process group.
-        tp_group (Optional[ProcessGroup]): Tensor parallelism process group.
+        tp_group (Optional[ProcessGroup]): Tensor parallelism process group. Required in
+            training when ``config.tensor_model_parallel_size > 1``.
         packed_seq_params (Optional[PackedSeqParams]): Packed sequence parameters.
         scale_logits_fn (Optional[Callable[[Tensor], Tensor]]): Optional function to
             scale logits before loss computation (e.g., MuP output scaling).
@@ -1106,6 +1109,14 @@ def process_mtp_loss(
             cp_layout=config.attention_cp_layout,
         )
         derived_labels_from_input_ids = True
+
+    # The output layer returns vocab-sharded logits, so the acceptance metric needs their group
+    # to find the argmax over the whole vocabulary.
+    if is_training and tp_group is None and config.tensor_model_parallel_size > 1:
+        raise ValueError(
+            "tp_group must be provided when computing MTP acceptance counts "
+            "from vocab-sharded logits; pass the model's tensor-parallel group."
+        )
 
     if config.mtp_detach_heads:
         if output_weight is not None:
@@ -1265,7 +1276,9 @@ def process_mtp_loss(
             ) / num_tokens.clamp(min=1)
 
             if metric_avg_group is None:
-                # Compatibility fallback for callers that have not migrated to explicit groups.
+                warn_global_process_group_fallback(
+                    "process_mtp_loss", "metric_avg_group", deprecated_in="0.21", removed_in="0.23"
+                )
                 metric_avg_group = parallel_state.get_data_parallel_group(
                     with_context_parallel=True
                 )
@@ -1375,6 +1388,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 "Multi-token prediction with hyper connections requires the HybridModel "
                 "MTP contract: both mtp_layer_pattern and hybrid_submodules must be provided."
             )
+        require_process_groups(pg_collection, ('tp', 'cp', 'pp'), owner=type(self).__name__)
         self.sequence_parallel = config.sequence_parallel
         self.submodules = submodules
         self.layer_number = layer_number + get_mtp_layer_offset(
@@ -2368,19 +2382,18 @@ class MultiTokenPredictionBlock(MegatronModule):
         # This enables MTP to work with CP > 1 by providing the CP process group
         # to the roll_tensor function for proper boundary communication
         if pg_collection is None:
-            # Use default MPU process groups if not provided
-            required_pgs = ['cp', 'tp', 'pp'] + (['dp'] if self.config.mtp_hsm else [])
+            warn_global_process_group_fallback(type(self).__name__)
+            # hcp feeds TEDotProductAttention's a2a+p2p path in the MTP layers.
+            required_pgs = ['cp', 'hcp', 'tp', 'pp'] + (['dp'] if self.config.mtp_hsm else [])
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
-        else:
-            # Ensure the provided process groups include TP, CP, and PP.
-            for group_name in ('tp', 'cp', 'pp'):
-                assert (
-                    getattr(pg_collection, group_name, None) is not None
-                ), f"MultiTokenPredictionBlock pg_collection must have {group_name} process group"
-            if self.config.mtp_hsm:
-                assert hasattr(
-                    pg_collection, 'dp'
-                ), "MultiTokenPredictionBlock with HSM requires a dp process group"
+        # Ensure the provided process groups include TP, CP, and PP.
+        for group_name in ('tp', 'cp', 'pp'):
+            if vars(pg_collection).get(group_name) is None:
+                raise ValueError(
+                    f"MultiTokenPredictionBlock pg_collection must have {group_name} process group"
+                )
+        if self.config.mtp_hsm and 'dp' not in vars(pg_collection):
+            raise ValueError("MultiTokenPredictionBlock with HSM requires a dp process group")
 
         self._build_layers(pg_collection)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
