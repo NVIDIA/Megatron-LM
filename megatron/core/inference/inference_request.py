@@ -1450,6 +1450,7 @@ class FinishedRequestRecord:
     num_evictions: int
     num_tokens_to_generate: Optional[int] = None
     finish_reason: Optional[str] = None
+    payload: Optional["OffloadedRequestPayload"] = None
 
     @classmethod
     def from_request(cls, request: "DynamicInferenceRequest") -> "FinishedRequestRecord":
