@@ -189,3 +189,13 @@ def test_loader_flags_feed_the_section():
     loader = dataloader_config_from_args(_validated(["--num-workers", "0"]))
     loader.finalize()
     assert loader.persistent_workers is False
+
+
+def test_inter_document_masking_on_the_cli_builds_a_valid_section():
+    """validate_args clears create_attention_mask_in_dataloader under inter-document masking, so
+    the section the factory builds passes the pair check the container enforces for Python."""
+    args = _validated(["--dataloader-inter-document-masking"])
+    assert args.create_attention_mask_in_dataloader is False
+    data = gpt_data_config_from_args(args)
+    data.validate()
+    assert data.batch_flags().has_cu_seqlens and not data.batch_flags().create_attention_mask

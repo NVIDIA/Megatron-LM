@@ -38,7 +38,7 @@ from megatron.training.config import (
 from megatron.training.config import container as container_module
 from megatron.training.config.dataset_config import CONTAINER_WRITTEN_FIELDS
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
-from megatron.training.datasets.varlen_dataset import MockVarlenDataset
+from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 
 MODEL_ARGV = (
     "--num-layers 2 --hidden-size 128 --num-attention-heads 8 --micro-batch-size 1 "
@@ -178,6 +178,9 @@ def _layout(**overrides):
         context_parallel_size=1,
         sequence_parallel=False,
         dynamic_context_parallel=False,
+        sequence_packing_scheduler=None,
+        calculate_per_token_loss=True,
+        max_seqlen_per_dp_cp_rank=None,
         gtp_weight_remat_size=1,
         gtp_remat_num_sequence_shards=1,
         cuda_graph_impl="none",
@@ -918,3 +921,108 @@ def test_microbatch_loss_reduction_is_keyed_on_the_sft_family(monkeypatch):
         training._reduce_microbatch_losses(
             [{"lm loss": torch.zeros(3)}], is_sft=False, sft_loss_log_mode="token", group=None
         )
+
+
+# The data-path rules of validate_args, on the container (placed by their inputs).
+
+
+def test_dynamic_cp_needs_the_single_loader_even_without_a_dataset(container_factory):
+    _, cfg = container_factory(["--seq-length", "64"])  # a loader-only section
+    cfg.model = _layout(dynamic_context_parallel=True)
+    cfg.validate()  # unset selects single
+    cfg.data.dataloader.dataloader_type = "cyclic"
+    with pytest.raises(ValueError, match="needs data.dataloader.dataloader_type='single'"):
+        cfg.validate()
+    cfg.data.dataloader.dataloader_type = "single"
+    cfg.validate()
+    cfg.model = _layout(dynamic_context_parallel=False)
+    cfg.data.dataloader.dataloader_type = "cyclic"
+    cfg.validate()
+
+
+def test_a_packing_scheduler_needs_per_token_loss(container_factory):
+    _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
+    cfg.model = _layout(sequence_packing_scheduler="dp_balanced", calculate_per_token_loss=False)
+    with pytest.raises(ValueError, match="needs model.transformer.calculate_per_token_loss=True"):
+        cfg.validate()
+    cfg.model = _layout(sequence_packing_scheduler="dp_balanced", calculate_per_token_loss=True)
+    cfg.validate()
+
+
+def test_varlen_datasets_and_the_packing_scheduler(container_factory):
+    """A packed varlen dataset needs a scheduler (the CLI selects one; a Python container names
+    it); SBHD validation excludes one."""
+    from megatron.training.config import DataConfig
+
+    bools = dict(reset_position_ids=False, reset_attention_mask=False, eod_mask_loss=False)
+    _, cfg = container_factory(["--seq-length", "64"])
+    plain = GPTDatasetConfig(sequence_length=64, random_seed=1, **bools)
+    cfg.data = DataConfig(
+        dataset=plain, dataset_type=MockVarlenDataset, dataloader=cfg.data.dataloader
+    )
+    cfg.model = _layout()
+    with pytest.raises(ValueError, match="needs model.transformer.sequence_packing_scheduler"):
+        cfg.validate()
+    cfg.model = _layout(sequence_packing_scheduler="dp_balanced")
+    cfg.validate()
+    sbhd = GPTDatasetConfig(
+        sequence_length=64,
+        random_seed=1,
+        blend=(["prefix-a"], None),
+        split="9,1,0",
+        varlen_sbhd_validation=True,
+        **bools,
+    )
+    cfg.data = DataConfig(dataset=sbhd, dataset_type=VarlenDataset, dataloader=cfg.data.dataloader)
+    with pytest.raises(ValueError, match="does not use a packing scheduler"):
+        cfg.validate()
+    cfg.model = _layout()
+    cfg.validate()
+    cfg.model = None  # no model section: the model-dependent rules do not apply
+    cfg.validate()
+
+
+def test_sample_length_is_a_multiple_of_twice_the_cp_size(container_factory):
+    _, cfg = container_factory(["--seq-length", "60", "--mock-data"], data=True)
+    cfg.model = _layout(context_parallel_size=4)
+    with pytest.raises(
+        ValueError, match="multiple of 2 \\* model.transformer.context_parallel_size"
+    ):
+        cfg.validate()
+    cfg.model = _layout(context_parallel_size=2)  # 60 % 4 == 0
+    cfg.validate()
+
+
+def test_packed_buffer_budget_is_checked_at_finalize(container_factory, monkeypatch):
+    """cp ranks (times the data-parallel replicas under default_dynamic_cp) times the per-rank
+    budget must cover one sample; it needs the world size, so it runs at finalize(), before any
+    derived field is written."""
+    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 4)
+    _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
+    cfg.model = _layout(
+        context_parallel_size=2,
+        sequence_packing_scheduler="dp_balanced",
+        max_seqlen_per_dp_cp_rank=16,
+    )
+    cfg.validate()
+    with pytest.raises(
+        ValueError,
+        match="packed-sequence buffer \\(2 ranks \\* max_seqlen_per_dp_cp_rank 16 = 32\\)",
+    ):
+        cfg.finalize()
+    assert not cfg._finalized and cfg.data.dataset.data_parallel_size == 1  # nothing written
+    cfg.model = _layout(
+        context_parallel_size=2,
+        sequence_packing_scheduler="dp_balanced",
+        max_seqlen_per_dp_cp_rank=32,
+    )
+    cfg.finalize()
+    assert cfg.data.dataset.data_parallel_size == 2
+    _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
+    cfg.model = _layout(  # 2 cp ranks * 2 replicas * 16 = 64 covers the sample
+        context_parallel_size=2,
+        dynamic_context_parallel=True,
+        sequence_packing_scheduler="default_dynamic_cp",
+        max_seqlen_per_dp_cp_rank=16,
+    )
+    cfg.finalize()

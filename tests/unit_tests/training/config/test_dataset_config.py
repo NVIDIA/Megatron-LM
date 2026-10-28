@@ -370,6 +370,17 @@ def test_batch_flags_formulas_and_fim():
     assert fim.batch_flags().is_packed_sequence is False and not fim.yields_unpacked_samples()
 
 
+def test_inter_document_masking_excludes_the_dataloader_attention_mask():
+    """The dataset omits the attention mask under inter-document masking: a section asking for
+    both is rejected before any collective runs (validate_args clears the flag on the CLI)."""
+    masked = DataConfig(dataset=_dataset(inter_document_masking=True, create_attention_mask=True))
+    with pytest.raises(ValueError, match="needs create_attention_mask=False"):
+        masked.validate()
+    DataConfig(
+        dataset=_dataset(inter_document_masking=True, create_attention_mask=False)
+    ).validate()
+
+
 def test_loader_only_section_reports_the_plain_gpt_batch_flags():
     data = DataConfig()
     assert data.batch_flags() == LOADER_ONLY_BATCH_FLAGS
