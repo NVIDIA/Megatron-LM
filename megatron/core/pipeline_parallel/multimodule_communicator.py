@@ -193,6 +193,11 @@ class MultiModulePipelineCommunicator:
         self.rank_module_map = {}
         self._build_rank_module_info_map()
 
+    def reset_forward_fanin_state(self) -> None:
+        """Reset transient fan-in metadata at a train/eval schedule boundary."""
+        for bridge_comm in self.bridge_comms:
+            bridge_comm.reset_forward_fanin_state()
+
     def _bridge_comm_dtype(self, src_module_name: str) -> Optional[torch.dtype]:
         """Return the communication dtype for a bridge source."""
         return self.bridge_comm_dtypes.get(src_module_name, self.config.pipeline_dtype)
