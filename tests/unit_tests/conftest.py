@@ -12,12 +12,17 @@ from megatron.core import config
 from megatron.core.utils import is_te_min_version
 from tests.test_utils.python_scripts.download_unit_tests_dataset import download_and_extract_asset
 from tests.unit_tests.dist_checkpointing import TempNamedDir
+from tests.unit_tests.post_accumulate_trace import install_post_accumulate_trace
 from tests.unit_tests.test_utilities import (
     Utils,
     reset_transient_process_state,
     restore_process_state,
     snapshot_process_state,
 )
+
+# Install before test modules import. CUDA post-accumulate hooks run without the
+# test thread's tracer, so coverage and Testmon miss their bodies (#5633).
+install_post_accumulate_trace()
 
 
 def pytest_configure(config):
