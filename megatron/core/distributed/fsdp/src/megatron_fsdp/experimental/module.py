@@ -84,8 +84,6 @@ class FsdpModule:
                 window. Defaults to one per owned trainable parameter.
         """
         self._context = context
-        # Keep AccumulateGrad nodes alive for parameter hooks returning None.
-        self._grad_acc_nodes = []
         self._phase = Phase.RESTING
         self._schedule_policy = schedule_policy
         owned_parameters = _collect_owned_parameters(self)
@@ -223,20 +221,7 @@ class FsdpModule:
                 # ``skip_backward_post_hook`` is TE's delayed-wgrad contract: these
                 # gradients are materialized by ``backward_dw()``, not autograd.
                 if not getattr(parameter, "skip_backward_post_hook", False):
-                    # Tensor post-accumulate hooks are skipped on PyTorch 2.6 when
-                    # fused wgrad writes main_grad and returns None. The node hook
-                    # still runs on the parameter's device worker thread.
-                    grad_acc = parameter.expand_as(parameter).grad_fn.next_functions[0][0]
-                    self._grad_acc_nodes.append(grad_acc)
-
-                    def fused_grad_hook(*_, parameter=parameter):
-                        if parameter.grad is None and not getattr(
-                            parameter, "grad_added_to_main_grad", False
-                        ):
-                            return
-                        grad_hook(parameter)
-
-                    grad_acc.register_hook(fused_grad_hook)
+                    parameter.register_post_accumulate_grad_hook(grad_hook)
                     continue
                 if len(fsdp_parameter.fqns) > 1:
                     raise ValueError(
