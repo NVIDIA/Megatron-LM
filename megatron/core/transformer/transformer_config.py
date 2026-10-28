@@ -1226,19 +1226,23 @@ class TransformerConfig(ModelParallelConfig):
     symm-mem buffers are a fixed [recv_capacity, hidden] and cannot be resized per step) and the
     fused op (use_transformer_engine_op_fuser). Defaults to False."""
 
-    moe_dispatch_fwd_dtype: Literal['bf16', 'mxfp8'] = 'bf16'
+    moe_dispatch_fwd_dtype: Literal['bf16', 'mxfp8', 'nvfp4'] = 'bf16'
     """Wire dtype of the MoE dispatch forward payload ('ncclep' flex dispatcher only). With
     'mxfp8', TransformerEngine quantizes the payload before the all-to-all and the receive
     buffer comes back as a per-expert MXFP8 GroupedTensor that the grouped GEMM consumes
-    directly. Requires moe_grouped_gemm and use_transformer_engine_op_fuser. Defaults to
-    'bf16' (no quantization on the wire)."""
+    directly. With 'nvfp4' (FP4 models only), TransformerEngine packs each token to NVFP4 with
+    a per-token scale for the wire and builds the NVFP4 GroupedTensor that the grouped GEMM
+    consumes on the receiver. Requires moe_grouped_gemm and use_transformer_engine_op_fuser.
+    Defaults to 'bf16' (no quantization on the wire)."""
 
-    moe_combine_bwd_dtype: Literal['bf16', 'mxfp8'] = 'bf16'
+    moe_combine_bwd_dtype: Literal['bf16', 'mxfp8', 'nvfp4'] = 'bf16'
     """Wire dtype of the MoE combine backward gradient ('ncclep' flex dispatcher only). With
     'mxfp8', TransformerEngine quantizes the gradient before the all-to-all and the
     expert-output gradient comes back as a per-expert MXFP8 GroupedTensor that the grouped
-    GEMM backward consumes directly. Same requirements as moe_dispatch_fwd_dtype. Defaults to
-    'bf16' (no quantization on the wire)."""
+    GEMM backward consumes directly. With 'nvfp4' (FP4 models only), the gradient goes over the
+    wire in NVFP4 with stochastic rounding, as the NVFP4 recipe quantizes gradients. Same
+    requirements as moe_dispatch_fwd_dtype. Defaults to 'bf16' (no quantization on the
+    wire)."""
 
     moe_mlp_glu_interleave_size: Optional[int] = None
     """When set, GLU activations in the MoE grouped MLP layer will use a
@@ -2485,9 +2489,17 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if not (self.use_transformer_engine_op_fuser and self.moe_grouped_gemm):
                 raise ValueError(
-                    "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'mxfp8' require BOTH "
-                    "use_transformer_engine_op_fuser and moe_grouped_gemm: only the fused "
-                    "grouped GEMM path consumes the pre-quantized MXFP8 GroupedTensor payload."
+                    "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'mxfp8' or 'nvfp4' require "
+                    "BOTH use_transformer_engine_op_fuser and moe_grouped_gemm: only the fused "
+                    "grouped GEMM path consumes the pre-quantized GroupedTensor payload."
+                )
+            if 'nvfp4' in (self.moe_dispatch_fwd_dtype, self.moe_combine_bwd_dtype) and not (
+                self.fp4 and self.fp4_recipe == Fp4Recipe.nvfp4
+            ):
+                raise ValueError(
+                    "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'nvfp4' require fp4 with "
+                    "fp4_recipe='nvfp4': the experts then quantize their inputs and output "
+                    "gradients to NVFP4 anyway."
                 )
 
         if self.moe_use_norm_before_up_proj and self.moe_latent_size is None:

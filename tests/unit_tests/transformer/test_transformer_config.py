@@ -554,6 +554,56 @@ def test_mxfp8_wire_dtypes_require_op_fuser_grouped_gemm(overrides):
         _make_mxfp8_wire_config(**overrides)
 
 
+@pytest.mark.parametrize(
+    "wire_dtypes",
+    [
+        dict(moe_dispatch_fwd_dtype='nvfp4', moe_combine_bwd_dtype='nvfp4'),
+        dict(moe_dispatch_fwd_dtype='nvfp4', moe_combine_bwd_dtype='bf16'),
+        dict(moe_dispatch_fwd_dtype='bf16', moe_combine_bwd_dtype='nvfp4'),
+    ],
+)
+def test_nvfp4_wire_dtypes_accept_fp4_config(wire_dtypes):
+    config = _make_mxfp8_wire_config(fp4="e2m1", **wire_dtypes)
+
+    assert config.moe_dispatch_fwd_dtype == wire_dtypes['moe_dispatch_fwd_dtype']
+    assert config.moe_combine_bwd_dtype == wire_dtypes['moe_combine_bwd_dtype']
+
+
+@pytest.mark.parametrize("compute", [dict(), dict(fp8="e4m3", fp8_recipe="mxfp8")])
+def test_nvfp4_wire_dtypes_require_fp4(compute):
+    with pytest.raises(ValueError, match="'nvfp4' require fp4"):
+        _make_mxfp8_wire_config(
+            moe_dispatch_fwd_dtype='nvfp4', moe_combine_bwd_dtype='bf16', **compute
+        )
+
+
+def test_nvfp4_wire_dtypes_require_op_fuser():
+    with pytest.raises(ValueError, match="require BOTH"):
+        _make_mxfp8_wire_config(
+            fp4="e2m1",
+            moe_dispatch_fwd_dtype='nvfp4',
+            moe_combine_bwd_dtype='nvfp4',
+            use_transformer_engine_op_fuser=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "a2a_dtype, recipe_name",
+    [('bf16', None), ('mxfp8', 'MXFP8BlockScaling'), ('nvfp4', 'NVFP4BlockScaling')],
+)
+def test_get_fp8_recipe_for_a2a(a2a_dtype, recipe_name):
+    te_recipe = pytest.importorskip("transformer_engine.common.recipe")
+    from megatron.core.fp8_utils import get_fp8_recipe_for_a2a
+
+    recipe = get_fp8_recipe_for_a2a(a2a_dtype)
+    if recipe_name is None:
+        assert recipe is None
+    else:
+        assert isinstance(recipe, getattr(te_recipe, recipe_name))
+    with pytest.raises(ValueError, match="Unsupported a2a wire dtype"):
+        get_fp8_recipe_for_a2a('fp16')
+
+
 requires_te_2_9 = pytest.mark.skipif(
     not is_te_min_version("2.9.0"), reason="sequence packing requires Transformer Engine >= 2.9.0"
 )

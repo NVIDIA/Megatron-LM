@@ -837,7 +837,7 @@ if HAVE_TE:
         communication payload).
 
         Arguments:
-            a2a_dtype (str): Wire dtype, 'bf16' (returns None) or 'mxfp8'.
+            a2a_dtype (str): Wire dtype, 'bf16' (returns None), 'mxfp8' or 'nvfp4'.
         """
         if a2a_dtype == 'bf16':
             return None
@@ -845,6 +845,8 @@ if HAVE_TE:
             return transformer_engine.common.recipe.MXFP8BlockScaling(
                 fp8_format=transformer_engine.common.recipe.Format.E4M3
             )
+        if a2a_dtype == 'nvfp4':
+            return transformer_engine.common.recipe.NVFP4BlockScaling()
         raise ValueError(f"Unsupported a2a wire dtype: {a2a_dtype!r}.")
 
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
