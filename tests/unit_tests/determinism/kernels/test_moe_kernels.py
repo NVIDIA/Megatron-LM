@@ -1285,7 +1285,6 @@ class TestMoEModules:
         )
 
         try:
-            from transformer_engine.pytorch.ops import GroupedLinear
             from transformer_engine.pytorch.ops.basic.grouped_linear import (
                 is_op_fuser_grouped_tensor_path_supported,
             )
@@ -1328,13 +1327,16 @@ class TestMoEModules:
             )
         assert experts._with_fused_impl
         contexts = []
-        original_forward = GroupedLinear.fuser_forward
+        make_ops = experts._make_fused_ops
 
-        def record_context(op, *args, **kwargs):
-            contexts.append(FP8GlobalStateManager.is_fp8_enabled())
-            return original_forward(op, *args, **kwargs)
+        def make_ops_with_precision_probe():
+            ops = make_ops()
+            ops.register_forward_pre_hook(
+                lambda _ops, _inputs: contexts.append(FP8GlobalStateManager.is_fp8_enabled())
+            )
+            return ops
 
-        monkeypatch.setattr(GroupedLinear, "fuser_forward", record_context)
+        monkeypatch.setattr(experts, "_make_fused_ops", make_ops_with_precision_probe)
         splits = torch.tensor([256, 768, 0, 3072], device="cuda", dtype=torch.int64)
         hidden = torch.randn(4096, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         probs = torch.rand(4096, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -1346,7 +1348,7 @@ class TestMoEModules:
             what="TE op fuser[BF16 override under MXFP8]",
         )
         assert experts._fused_ops is not None
-        assert contexts == [False, False] * 3
+        assert contexts == [False] * 3
 
     @pytest.mark.skipif(
         not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,

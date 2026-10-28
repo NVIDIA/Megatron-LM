@@ -429,7 +429,7 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
             fp8_param=True,
             moe_router_padding_for_quantization=True,
             # Cover mixed BF16/MXFP8 experts without EGTP and joint MXFP8 fusion with EGTP.
-            # BF16 MTP experts retain the op-fuser path and execute its basic operations.
+            # BF16 MTP experts retain the op-fuser path; TE selects their kernel implementation.
             quant_recipe=recipe if egtp_size == 1 else None,
             mtp_num_layers=2,
             mtp_use_repeated_layer=True,
@@ -567,19 +567,14 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
                         assert (manager.tokens_per_expert % manager._alignment == 0).all()
                         assert manager.tokens_per_expert.sum() <= manager.rank_capacity
                         assert layer.experts._fused_ops is not None
-                        (sequence,) = layer.experts._fused_ops
-                        forward_ops = [
-                            op for group in sequence._module_groups for op, _ in group._forward_ops
-                        ]
+                        # Retain MXFP8 fusion coverage; BF16 kernel selection belongs to TE.
                         if egtp_size > 1 or 'mtp' not in name:
+                            (sequence,) = layer.experts._fused_ops
                             assert any(
                                 type(op).__name__ == 'GroupedMLP_CuTeGEMMUnary'
-                                for op in forward_ops
+                                for group in sequence._module_groups
+                                for op, _ in group._forward_ops
                             ), 'MXFP8 must execute the fused CuTeDSL MLP'
-                        else:
-                            assert len(forward_ops) == 3 and all(
-                                op is sequence[index] for index, op in enumerate(forward_ops)
-                            ), 'BF16 MTP must execute the three basic TE operations'
                 gtp.wait_for_gtp_grad_reduction_on_current_stream()
                 model.finish_grad_sync()
                 torch.cuda.synchronize()

@@ -587,7 +587,7 @@ class TestGPTModelTEQuantizationConfig:
         ids=("decoder", "mtp"),
     )
     @pytest.mark.parametrize("late_override", (False, True), ids=("constructor", "late"))
-    def test_bf16_override_executes_basic_ops_under_mxfp8(
+    def test_bf16_override_matches_reference_under_mxfp8(
         self, monkeypatch, record_property, experts_path, late_override
     ) -> None:
         """Full GPT construction must apply exact-path overrides to real expert ops."""
@@ -683,16 +683,18 @@ class TestGPTModelTEQuantizationConfig:
             for weight in original_params.values():
                 weight.normal_(std=weight.shape[-1] ** -0.5)
 
-        # Spy on real basic-op execution. A fused quantized kernel bypasses these calls,
-        # while a lost override makes the recorded context True even without joint fusion.
-        basic_op_contexts = []
-        real_fuser_forward = GroupedLinear.fuser_forward
+        # Check the precision handed to TE without constraining its fusion selection.
+        op_contexts = []
+        make_ops = experts._make_fused_ops
 
-        def record_basic_op_context(op, *args, **kwargs):
-            basic_op_contexts.append(FP8GlobalStateManager.is_fp8_enabled())
-            return real_fuser_forward(op, *args, **kwargs)
+        def make_ops_with_precision_probe():
+            ops = make_ops()
+            ops.register_forward_pre_hook(
+                lambda _ops, _inputs: op_contexts.append(FP8GlobalStateManager.is_fp8_enabled())
+            )
+            return ops
 
-        monkeypatch.setattr(GroupedLinear, "fuser_forward", record_basic_op_context)
+        monkeypatch.setattr(experts, "_make_fused_ops", make_ops_with_precision_probe)
         split_sizes = (256, 512)
         tokens_per_expert = torch.tensor(split_sizes, dtype=torch.int64, device="cuda")
         num_tokens = sum(split_sizes)
@@ -758,7 +760,7 @@ class TestGPTModelTEQuantizationConfig:
             assert weight.grad is not None
             assert_bf16_close(weight.grad, reference_weights[name].grad, name)
         # Keep this after numerical checks: a lost override must fail numerically too.
-        assert basic_op_contexts == [False, False]
+        assert op_contexts == [False]
 
     @pytest.mark.parametrize(
         ("transformer_impl", "recipe_storage"),
