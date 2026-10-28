@@ -427,7 +427,7 @@ def test_force_all_reduce_uses_correct_collective(force_all_reduce: bool):
 
 
 def test_reduce_scatter_selection_is_per_bucket_group():
-    """Mixed DDP configurations must dispatch and wait on their own reduction implementation."""
+    """Mixed DDP configurations must produce bit-exact reductions across repeated steps."""
     Utils.initialize_model_parallel()
     try:
         # Build both models before reducing either so dispatch cannot depend on
@@ -448,14 +448,17 @@ def test_reduce_scatter_selection_is_per_bucket_group():
             )
             for fp32_accumulation in (True, False)
         ]
-        for model, buffer, bucket_groups in models:
-            buffer.grad_data.fill_(1)
-            model.finish_grad_sync()
-            for group in bucket_groups:
-                shard = group.cached_grad_buffer_shard_list[0][
-                    group.intra_distributed_optimizer_instance_rank
-                ]
-                torch.testing.assert_close(shard, torch.ones_like(shard))
+        for _ in range(3):
+            for model, buffer, bucket_groups in models:
+                model.zero_grad_buffer()
+                buffer.grad_data.fill_(1)
+                model.finish_grad_sync()
+                for group in bucket_groups:
+                    shard = group.cached_grad_buffer_shard_list[0][
+                        group.intra_distributed_optimizer_instance_rank
+                    ]
+                    expected = torch.ones_like(shard)
+                    assert torch.equal(shard.view(torch.uint8), expected.view(torch.uint8))
     finally:
         Utils.destroy_model_parallel()
 
