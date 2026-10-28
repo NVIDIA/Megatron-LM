@@ -123,7 +123,7 @@ class WideResidualTransformerLayer(TransformerLayer):
                     f"{connection.branch_hidden_size}."
                 )
 
-    def _get_self_attention_residual_connection(
+    def _get_residual_connection_for_self_attention(
         self, operation: ResidualConnectionOperation
     ) -> ResidualConnection | None:
         """Return the reader or writer surrounding the self-attention branch."""
@@ -136,7 +136,7 @@ class WideResidualTransformerLayer(TransformerLayer):
             case _:
                 raise ValueError(f"Unsupported residual connection operation: {operation}.")
 
-    def _get_mlp_residual_connection(
+    def _get_residual_connection_for_mlp(
         self, operation: ResidualConnectionOperation
     ) -> ResidualConnection | None:
         """Return the reader or writer surrounding the MLP or MoE branch."""

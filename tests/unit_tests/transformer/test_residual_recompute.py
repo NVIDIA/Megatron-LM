@@ -1100,7 +1100,7 @@ class TestResidualStreamRecomputeIntegration:
         assert layer.is_mtp_layer
         assert not layer.supports_wide_residual_connections
         for operation in ("read", "write"):
-            assert layer._get_self_attention_residual_connection(operation=operation) is None
-            assert layer._get_mlp_residual_connection(operation=operation) is None
+            assert layer._get_residual_connection_for_self_attention(operation=operation) is None
+            assert layer._get_residual_connection_for_mlp(operation=operation) is None
         assert not layer.received_residual_recompute_kwarg
         assert hidden_states.grad is not None
