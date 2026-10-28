@@ -121,13 +121,15 @@ class WideResidualMambaLayer(MambaLayer):
 
         if state is None:
             raise RuntimeError("Missing state for the Mamba residual connection.")
-        write_context = (
+        write_recompute_context = (
             recompute_context
             if recompute_context is not None and not recompute_context.is_block_end
             else None
         )
         grad_scope = (
-            self.bias_dropout_add_exec_handler() if write_context is None else nullcontext()
+            self.bias_dropout_add_exec_handler()
+            if write_recompute_context is None
+            else nullcontext()
         )
         with grad_scope:
             return apply_module(self.residual_write)(
@@ -135,7 +137,7 @@ class WideResidualMambaLayer(MambaLayer):
                 state=state,
                 dropout_probability=self.hidden_dropout,
                 training=self.training,
-                recompute_context=write_context,
+                recompute_context=write_recompute_context,
             )
 
     def _pack_two_stage_output(
