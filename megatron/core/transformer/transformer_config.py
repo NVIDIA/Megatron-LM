@@ -791,7 +791,7 @@ class TransformerConfig(ModelParallelConfig):
     fp8_output_proj: bool = False
     """If True, run the LM-head output projection with a TE ColumnParallelLinear
     under the MXFP8 autocast context. Only active when fp8=True and
-    fp8_recipe='mxfp8'."""
+    fp8_recipe='mxfp8', or with fp4, where the LM head runs under its own MXFP8 autocast."""
 
     fp8_dot_product_attention: bool = False
     """When set to True, use the FP8 implementation of Dot Product Attention."""
@@ -2152,9 +2152,10 @@ class TransformerConfig(ModelParallelConfig):
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
 
-        if self.fp8_output_proj:
+        if self.fp8_output_proj and not self.fp4:
+            # FP4 models run the LM head under its own MXFP8 autocast.
             if not self.fp8:
-                raise ValueError("fp8_output_proj must be used together with fp8 mode.")
+                raise ValueError("fp8_output_proj must be used together with fp8 or fp4 mode.")
             if self.fp8_recipe != Fp8Recipe.mxfp8:
                 raise ValueError(
                     f"fp8_output_proj requires fp8_recipe='mxfp8', got " f"'{self.fp8_recipe}'."
@@ -4843,7 +4844,8 @@ class MLATransformerConfig(TransformerConfig):
     """Split the key/value up-projection output, apply RoPE to the key and quantize key and value
     for MXFP8 attention in one Transformer Engine kernel (SM100 only), and quantize the RoPE'd
     query before attention, instead of writing BF16 key and value that attention then
-    quantizes. Bitwise identical. Requires apply_rope_fusion=True, MXFP8 DPA, zero attention
+    quantizes. Bitwise identical. Requires apply_rope_fusion=True, MXFP8 DPA (with fp4, Transformer
+    Engine's NVTE_DPA_FP8_RECIPE=MXFP8BlockScaling, checked at run time), zero attention
     dropout and qk_head_dim=128, qk_pos_emb_head_dim=64, v_head_dim=128; layers with TP or CP
     above 1, THD inputs, FP16 inputs, recomputed up-projections or checkpointed core attention,
     NVTE_FP8_DPA_BWD=0 and evaluation use the unfused path."""
@@ -4941,14 +4943,17 @@ class MLATransformerConfig(TransformerConfig):
                 "backward does not support dropout."
             )
 
+        # FP4 models can run attention in MXFP8 (TE's NVTE_DPA_FP8_RECIPE=MXFP8BlockScaling).
+        # The fused kernel is then used only when that holds at run time; see
+        # _is_mxfp8_attention_active.
+        mxfp8_linear_recipe = self.fp8 is not None and self.fp8_recipe == Fp8Recipe.mxfp8
         if self.use_fused_mla_kv_rope_quant and (
-            self.fp8 is None
-            or self.fp8_recipe != Fp8Recipe.mxfp8
+            not (mxfp8_linear_recipe or self.fp4)
             or not self.fp8_dot_product_attention
             or self.attention_dropout != 0.0
         ):
             raise ValueError(
-                "use_fused_mla_kv_rope_quant requires FP8 with fp8_recipe='mxfp8' and "
+                "use_fused_mla_kv_rope_quant requires FP8 with fp8_recipe='mxfp8' or FP4, and "
                 "fp8_dot_product_attention=True, because it feeds MXFP8 Q/K/V to attention, "
                 "plus attention_dropout=0.0 because MXFP8 attention backward does not support "
                 "dropout."

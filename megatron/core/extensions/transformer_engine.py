@@ -1945,7 +1945,8 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
     raise when set non-default — TE will not support them natively, so they
     would have to be implemented in this subclass, which has not been done yet.
 
-    Active only when ``fp8_output_proj=True`` with ``fp8_recipe='mxfp8'``.
+    Active only when ``fp8_output_proj=True`` with ``fp8_recipe='mxfp8'``, or with an FP4 model,
+    whose LM head runs under its own MXFP8 autocast.
     """
 
     def __init__(
@@ -1974,8 +1975,8 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
 
         if not is_mxfp8_output_proj_active(config):
             raise RuntimeError(
-                "TELMHeadColumnParallelLinear is only valid when fp8_output_proj=True, "
-                "fp8=True, and fp8_recipe='mxfp8'."
+                "TELMHeadColumnParallelLinear is only valid when fp8_output_proj=True, with "
+                "fp8=True and fp8_recipe='mxfp8' or with fp4."
             )
         if keep_master_weight_for_test:
             raise ValueError("TE output projection does not support keep_master_weight_for_test.")
@@ -2056,7 +2057,18 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
         if weight is not None and weight is not self.weight:
             raise RuntimeError("TE MXFP8 output projection does not support runtime weight.")
 
-        with get_fp8_context(self.config):
+        if self.config.fp4:
+            # An FP4 model has no FP8 context: run the LM head under its own MXFP8 autocast.
+            # MXFP8 needs no amax reduction, so no group is passed.
+            lm_head_context = fp8_autocast(
+                enabled=True,
+                fp8_recipe=te.common.recipe.MXFP8BlockScaling(
+                    fp8_format=te.common.recipe.Format.E4M3
+                ),
+            )
+        else:
+            lm_head_context = get_fp8_context(self.config)
+        with lm_head_context:
             torch.cuda.nvtx.range_push("mxfp8_output_proj_telinear")
             try:
                 output_parallel, output_bias = super().forward(input_)

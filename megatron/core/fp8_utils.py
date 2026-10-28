@@ -748,13 +748,16 @@ def is_first_last_bf16_layer(config: TransformerConfig, layer_no: int):
 def is_mxfp8_output_proj_active(config) -> bool:
     """Return True when the LM-head output projection should run under MXFP8.
 
-    Active when ``fp8_output_proj=True``, ``fp8=True``, ``fp8_recipe='mxfp8'``,
-    and Transformer Engine is installed.
+    Active when ``fp8_output_proj=True`` and Transformer Engine is installed, with either
+    ``fp8=True`` and ``fp8_recipe='mxfp8'``, or an FP4 model (``fp4`` set), whose LM head then
+    runs under its own MXFP8 autocast.
     """
     if not HAVE_TE:
         return False
     if not getattr(config, "fp8_output_proj", False):
         return False
+    if getattr(config, "fp4", None):
+        return True
     if not getattr(config, "fp8", False):
         return False
 

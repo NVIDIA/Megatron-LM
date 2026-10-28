@@ -19,9 +19,9 @@ from tests.unit_tests.test_utilities import Utils
 _IS_BLACKWELL = torch.cuda.is_available() and (torch.cuda.get_device_properties(0).major >= 10)
 
 
-def _fake_config(*, fp8_output_proj=True, fp8=True, fp8_recipe="mxfp8"):
+def _fake_config(*, fp8_output_proj=True, fp8=True, fp8_recipe="mxfp8", fp4=None):
     """SimpleNamespace stub of TransformerConfig used by is_mxfp8_output_proj_active."""
-    return SimpleNamespace(fp8_output_proj=fp8_output_proj, fp8=fp8, fp8_recipe=fp8_recipe)
+    return SimpleNamespace(fp8_output_proj=fp8_output_proj, fp8=fp8, fp8_recipe=fp8_recipe, fp4=fp4)
 
 
 class TestIsMxfp8OutputProjActive:
@@ -51,6 +51,16 @@ class TestIsMxfp8OutputProjActive:
 
     def test_returns_false_when_attributes_missing(self):
         assert is_mxfp8_output_proj_active(SimpleNamespace()) is False
+
+    def test_returns_true_for_fp4(self):
+        """FP4 models run the LM head under its own MXFP8 autocast, without fp8 set."""
+        if not HAVE_TE:
+            pytest.skip("TE not installed; helper always returns False")
+        assert is_mxfp8_output_proj_active(_fake_config(fp8=None, fp4="e2m1")) is True
+
+    def test_returns_false_for_fp4_when_flag_off(self):
+        config = _fake_config(fp8_output_proj=False, fp8=None, fp4="e2m1")
+        assert is_mxfp8_output_proj_active(config) is False
 
 
 @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine not installed")
@@ -95,6 +105,47 @@ class TestTELMHeadColumnParallelLinearRejections:
     def test_rejects_output_dtype(self):
         with pytest.raises(ValueError, match="output_dtype"):
             TELMHeadColumnParallelLinear(**self._kwargs(output_dtype=torch.float32))
+
+
+class TestFp8OutputProjConfigValidation:
+    """fp8_output_proj needs fp8 with the mxfp8 recipe, or fp4."""
+
+    def test_rejects_without_fp8_or_fp4(self):
+        with pytest.raises(ValueError, match="fp8_output_proj must be used together with fp8"):
+            TransformerConfig(
+                num_layers=2, hidden_size=12, num_attention_heads=4, fp8_output_proj=True
+            )
+
+    def test_rejects_non_mxfp8_recipe(self):
+        with pytest.raises(ValueError, match="fp8_output_proj requires fp8_recipe='mxfp8'"):
+            TransformerConfig(
+                num_layers=2,
+                hidden_size=12,
+                num_attention_heads=4,
+                fp8="e4m3",
+                fp8_recipe="tensorwise",
+                fp8_output_proj=True,
+            )
+
+    def test_accepts_fp4(self):
+        config = TransformerConfig(
+            num_layers=2, hidden_size=12, num_attention_heads=4, fp4="e2m1", fp8_output_proj=True
+        )
+        assert config.fp8_output_proj and config.fp8 is None
+
+
+def _lm_head_config(**overrides):
+    kwargs = dict(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        use_cpu_initialization=False,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        fp8_output_proj=True,
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
 
 
 class TestGPTModelOutputLayerSelection:
@@ -160,3 +211,62 @@ class TestGPTModelOutputLayerSelection:
             max_sequence_length=8,
         )
         assert isinstance(model.output_layer, TELMHeadColumnParallelLinear)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not _IS_BLACKWELL, reason="MXFP8 output projection requires Blackwell (SM >= 10)"
+    )
+    def test_fp4_uses_te_lm_head(self):
+        """With fp8_output_proj=True under fp4, the LM head is TELMHeadColumnParallelLinear."""
+        model = GPTModel(
+            config=_lm_head_config(fp4="e2m1"),
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=128,
+            max_sequence_length=8,
+        )
+        assert isinstance(model.output_layer, TELMHeadColumnParallelLinear)
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(
+    not _IS_BLACKWELL, reason="MXFP8 output projection requires Blackwell (SM >= 10)"
+)
+class TestTELMHeadColumnParallelLinearFp4Forward:
+    """Under fp4 the LM head runs under its own MXFP8 autocast, as it does under fp8 mxfp8."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_fp4_matches_mxfp8_lm_head(self):
+        heads = []
+        for overrides in ({"fp8": "e4m3", "fp8_recipe": "mxfp8"}, {"fp4": "e2m1"}):
+            heads.append(
+                TELMHeadColumnParallelLinear(
+                    128,
+                    256,
+                    config=_lm_head_config(**overrides),
+                    init_method=torch.nn.init.normal_,
+                    bias=False,
+                )
+            )
+        mxfp8_head, fp4_head = heads
+        fp4_head.load_state_dict(mxfp8_head.state_dict())
+
+        torch.manual_seed(0)
+        x = torch.randn(64, 2, 128, dtype=torch.bfloat16, device="cuda")
+        grad_output = torch.randn(64, 2, 256, dtype=torch.bfloat16, device="cuda")
+        results = []
+        for head in heads:
+            inp = x.clone().requires_grad_(True)
+            output, _ = head(inp)
+            output.backward(grad_output)
+            assert head.fp8_meta["recipe"].mxfp8()
+            results.append((output.detach(), inp.grad, head.weight.grad))
+        (ref_out, ref_dx, ref_dw), (out, dx, dw) = results
+        assert torch.equal(out, ref_out)
+        assert torch.equal(dx, ref_dx)
+        assert torch.equal(dw, ref_dw)

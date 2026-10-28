@@ -183,14 +183,18 @@ class _FusedKVRoPEQuantForFusedAttn(torch.autograd.Function):
 
 def _is_mxfp8_attention_active() -> bool:
     """Whether attention runs in MXFP8 here: in an FP8 autocast with an MXFP8 recipe and FP8 DPA
-    (layers kept in BF16 run outside it), with an FP8 backward. With NVTE_FP8_DPA_BWD=0, attention
-    keeps the BF16 q/k/v for its backward, which pre-quantized inputs would replace by their
-    dequantized values."""
+    (layers kept in BF16 run outside it), or in an NVFP4 autocast with FP8 DPA that Transformer
+    Engine runs in MXFP8 (NVTE_DPA_FP8_RECIPE=MXFP8BlockScaling), with an FP8 backward. With
+    NVTE_FP8_DPA_BWD=0, attention keeps the BF16 q/k/v for its backward, which pre-quantized
+    inputs would replace by their dequantized values."""
     if not FP8GlobalStateManager.is_fp8_enabled():
         return False
     if int(os.getenv("NVTE_FP8_DPA_BWD", "1")) == 0:
         return False
     recipe = FP8GlobalStateManager.get_fp8_recipe()
+    if (recipe.nvfp4() or recipe.custom()) and recipe.fp8_dpa:
+        # FP4 linears: TE runs FP8 attention with the recipe named by NVTE_DPA_FP8_RECIPE.
+        return os.getenv("NVTE_DPA_FP8_RECIPE", "") == "MXFP8BlockScaling"
     return recipe.mxfp8() and recipe.fp8_dpa
 
 
