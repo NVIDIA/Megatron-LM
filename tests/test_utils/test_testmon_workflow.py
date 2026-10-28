@@ -806,7 +806,9 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
     outputs = {"has_tests": str(has_tests).lower()}
     assert workflow["jobs"]["select"]["runs-on"] == "ubuntu-latest"
     assert workflow["jobs"]["select"]["name"] == "unit tests selection"
-    assert workflow["jobs"]["select"]["if"] == "inputs.unit_testmon_mode == 'enforce'"
+    assert workflow["jobs"]["select"]["if"] == (
+        "inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_target_branch == 'main'"
+    )
     for step in workflow["jobs"]["select"]["steps"]:
         assert "unit_testmon_mode" not in step.get("if", "")
     for platform, parser_job, output in (
@@ -831,7 +833,7 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
     needs = SimpleNamespace(
         select=SimpleNamespace(result="success", outputs=SimpleNamespace(**outputs))
     )
-    inputs = SimpleNamespace(unit_testmon_mode="enforce")
+    inputs = SimpleNamespace(unit_testmon_mode="enforce", unit_testmon_target_branch="main")
     context = {"needs": needs, "inputs": inputs}
     assert eval(expression, {"__builtins__": {}}, context) == has_tests
     assert workflow["jobs"]["run"]["strategy"]["matrix"]["include"] == (
@@ -1057,3 +1059,23 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
             assert matches[0]["plan_artifact"] == upload["name"]
     assert any("/empty/" in upload["plan"]["bucket"] for upload in uploads)
     assert all(entry["plan_artifact"] == "" for entry in matrix if entry["mode"] == "full")
+
+
+@pytest.mark.parametrize("branch", ["dev", "core_r0.20.0", "pull-request/8523", ""])
+def test_unsupported_testmon_branch_runs_full_buckets(branch):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
+    inputs = SimpleNamespace(unit_testmon_mode="enforce", unit_testmon_target_branch=branch)
+    selection = workflow["jobs"]["select"]["if"].replace("&&", "and")
+    assert not eval(selection, {"__builtins__": {}}, {"inputs": inputs})
+    needs = SimpleNamespace(
+        select=SimpleNamespace(result="skipped", outputs=SimpleNamespace(has_tests=""))
+    )
+    expression = workflow["jobs"]["run"]["if"].removeprefix("${{").removesuffix("}}")
+    expression = expression.replace("!cancelled()", "True").replace("&&", "and").replace("||", "or")
+    assert eval(expression, {"__builtins__": {}}, {"inputs": inputs, "needs": needs})
+    assert workflow["jobs"]["run"]["strategy"]["matrix"]["include"] == (
+        "${{ fromJSON(needs.select.outputs.matrix || inputs.buckets) }}"
+    )
+    assert workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"] == (
+        "${{ matrix.mode || 'full' }}"
+    )
