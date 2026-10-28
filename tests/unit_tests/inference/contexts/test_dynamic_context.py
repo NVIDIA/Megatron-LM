@@ -1683,6 +1683,42 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(8)
+    @pytest.mark.parametrize("is_hybrid_model", [False, True])
+    @pytest.mark.parametrize("mask", [[0, 0], [1, 0], [0, 1]])
+    def test_async_sched_resolve_requests_keeps_hidden_chunked_prefill(self, mask, is_hybrid_model):
+        """Resolution keeps a chunked prefill request hidden past the active rows, with its
+        KV blocks, and pulls it to the new boundary, as update_requests does."""
+        ctx = self._get_async_sched_context(is_hybrid_model=is_hybrid_model)
+        self._setup_async_sched_decode_rows(ctx, active_request_count=2, request_ids=[10, 11])
+        # Request 12 has prefilled one chunk into two blocks and waits outside the active rows.
+        # Clone: allocation returns a view of the free-block bag, which release overwrites.
+        chunk_blocks = ctx.kv_block_allocator.allocate_memory_blocks(2).clone()
+        ctx.request_ids[2] = 12
+        ctx.request_to_kv_block_ids[2, :2] = chunk_blocks
+        ctx.request_kv_block_counts[2] = 2
+        ctx.request_last_kv_block_id[2] = chunk_blocks[-1]
+        ctx.chunked_prefill_request_id = 12
+        if is_hybrid_model:
+            chunk_slot = ctx.mamba_metadata.batch_allocate_slots(1)
+            ctx.mamba_metadata.request_to_mamba_state_idx[2] = chunk_slot
+        free_blocks = ctx.kv_block_allocator.pool_avail
+        survivors = sum(mask)
+
+        ctx.resolve_requests(torch.tensor(mask, dtype=torch.int32))
+
+        assert ctx.total_request_count == survivors
+        assert ctx.get_index_of_chunked_prefill_request(safe=False) == survivors
+        assert ctx.request_kv_block_counts[survivors] == 2
+        assert ctx.request_to_kv_block_ids[survivors, :2].tolist() == chunk_blocks.tolist()
+        # Only the finished decode rows' blocks return to the pool.
+        assert ctx.kv_block_allocator.pool_avail == free_blocks + len(mask) - survivors
+        if is_hybrid_model:
+            assert ctx.mamba_metadata.request_to_mamba_state_idx[survivors].item() == int(
+                chunk_slot
+            )
+
+    @pytest.mark.internal
+    @rounder_override(8)
     def test_async_sched_mtp_prepare_commit_and_resolve(self):
         """MTP survivor tokens are committed after request resolution."""
         ctx = self._get_async_sched_context(num_speculative_tokens=2)
