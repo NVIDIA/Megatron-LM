@@ -368,6 +368,7 @@ def test_native_decode_and_mixed_batches_replay_in_cuda_graph(decode_only):
     """Refreshed requests, caches and padding in a captured native layer match eager rows."""
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("Native DSA decode requires Blackwell")
+    pytest.importorskip("cutlass.cute")
     device = torch.device("cuda", torch.cuda.current_device())
     torch.manual_seed(71)
     page_size, bound = 256, 9216

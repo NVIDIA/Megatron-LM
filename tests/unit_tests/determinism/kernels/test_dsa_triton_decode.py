@@ -1,15 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Training/decode forward parity, exact fallback, and graph refresh."""
+"""Training/decode forward parity, CuTe DSL top-k, and graph refresh."""
 
 import logging
 
 import pytest
 import torch
 
-from megatron.core.transformer.experimental_attention_variant._dsa_triton_decode.topk import (
-    exact_topk,
-)
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa_triton_decode import (
     TritonDSADecodeWorkspace,
 )
@@ -64,6 +61,7 @@ def test_native_decode_matches_training_kernels_and_graph_refresh(head_dim, seed
     """Decode matches the training forward kernels on the final causal query row."""
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("Native DSA decode requires Blackwell")
+    pytest.importorskip("cutlass.cute")
     torch.manual_seed(seed)
     device = torch.device("cuda", torch.cuda.current_device())
     batch, page, heads = 8, 256, 16
@@ -170,34 +168,32 @@ def test_native_decode_matches_training_kernels_and_graph_refresh(head_dim, seed
 
 
 @pytest.mark.parametrize("width,topk", [(516, 512), (4096, 1024), (32772, 2048), (65536, 2048)])
-def test_exact_topk_cutoffs_ties_and_radix_fallback(width, topk):
-    """Dense crossing buckets, infinities, and partial float4 packs remain exact."""
+def test_cute_topk_cutoffs_ties_and_graph_replay(width, topk):
+    """Short/empty rows, ties, infinities, and unaligned lengths select exact values."""
+    pytest.importorskip("cutlass.cute")
     torch.manual_seed(71)
     device = torch.device("cuda", torch.cuda.current_device())
     batch = 6
-    scores = torch.randn(batch, width, device=device)
+    from megatron.core.transformer.experimental_attention_variant._dsa_cute_topk.workspace import (
+        CuteTopKWorkspace,
+    )
+
+    alignment = 4
+    stride = -(-width // alignment) * alignment
+    scores = torch.randn(batch, stride, device=device)
     lengths = torch.tensor([width - 3, 1, 0, width, width, width], device=device, dtype=torch.int32)
     scores[3].zero_()
-    # A wide range packs the cutoff into an oversized coarse bin.
-    scores[4].copy_(torch.arange(width, device=device).float() / width)
+    scores[4, :width].copy_(torch.arange(width, device=device).float() / width)
     scores[4, 0] = -1e20
     scores[4, 1] = 1e20
     scores[5, ::3] = float("inf")
     scores[5, 1::3] = -float("inf")
     indices = torch.empty(batch, topk, device=device, dtype=torch.int32)
-    flags = torch.empty(batch, device=device, dtype=torch.int32)
+
+    selector = CuteTopKWorkspace(scores, lengths, indices)
 
     def run():
-        exact_topk[(batch,)](
-            scores,
-            lengths,
-            indices,
-            flags,
-            WIDTH=width,
-            K=topk,
-            num_warps=32,
-            enable_fp_fusion=False,
-        )
+        selector()
 
     run()
     expected = indices.clone()
@@ -215,10 +211,6 @@ def test_exact_topk_cutoffs_ties_and_radix_fallback(width, topk):
                 atol=0,
                 rtol=0,
             )
-    if width > topk:
-        assert int(flags[5]) == 1
-    if width > 1024:
-        assert int(flags[4]) == 1
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()

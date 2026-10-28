@@ -1190,6 +1190,7 @@ class TestDSGQADynamicInference:
         """The same weights and token histories give close full-vocabulary logprobs."""
         if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
             pytest.skip("Native DSA decode requires Blackwell")
+        pytest.importorskip("cutlass.cute")
         torch.manual_seed(53)
         vocab_size, decode_steps = 1024, 8
         prompt_lengths = (31, 63, 513)

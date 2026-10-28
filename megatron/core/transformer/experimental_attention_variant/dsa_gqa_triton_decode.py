@@ -1,9 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""BF16 decode with a Gluon TMA/tcgen05 scorer and Triton exact top-k/attention.
+"""BF16 decode with Gluon TMA/tcgen05 scoring, CuTe DSL top-k, and Triton attention.
 
-The implementation calls no CuTe DSL or FlashInfer GPU operators. Scoring uses
-native KV page tables; there is no expanded-page planning step.
+Scoring and attention use native Triton kernels; exact selection uses CuTe DSL
+with a pure Triton radix fallback. Scoring reads native KV page tables.
 """
 
 from __future__ import annotations
@@ -26,8 +26,7 @@ class TritonDSADecodeWorkspace:
     page sizes must be multiples of 128. Every positive context length must fit
     max_context and reference valid allocated pages in block_table. Active request
     indices must address valid rows of block_table. Score inputs must be NaN-free.
-    The optimized top-k path uses count crossing to remain exact, with a GPU radix
-    fallback for non-finite ranges or an oversized crossing bucket.
+    CuTe DSL selects exact top-k with a pure Triton radix fallback for every shape.
 
     Args:
         batch_size: Number of padded decode rows.
@@ -53,13 +52,10 @@ class TritonDSADecodeWorkspace:
         from triton.experimental.gluon import language as gl
         from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
+        from ._dsa_cute_topk.workspace import CuteTopKWorkspace
         from ._dsa_triton_decode.score import score_tcgen
-        from ._dsa_triton_decode.topk import (
-            chunk_lengths,
-            exact_topk,
-            gather_chunk_candidates,
-            remap_chunk_indices,
-        )
+
+        self._topk_workspace_type = CuteTopKWorkspace
 
         device = torch.device(device)
         if device.type != "cuda" or torch.cuda.get_device_capability(device) not in (
@@ -87,34 +83,18 @@ class TritonDSADecodeWorkspace:
         self.index_topk = index_topk
         self.max_context = max_context
         self.page_size = page_size
-        self.score_width = triton.cdiv(max_context, 4) * 4
-        self._chunks = triton.cdiv(max_context, 65536)
-        if self._chunks > 1:
-            self.score_width = self._chunks * 65536
-            self._chunk_lengths = torch.empty(
-                batch_size * self._chunks, dtype=torch.int32, device=device
-            )
-            self._candidate_lengths = torch.empty(batch_size, dtype=torch.int32, device=device)
-            self._chunk_indices = torch.empty(
-                batch_size * self._chunks, index_topk, dtype=torch.int32, device=device
-            )
-            self._chunk_flags = torch.empty_like(self._chunk_lengths)
-            self._candidates = torch.empty(
-                batch_size, self._chunks * index_topk, dtype=torch.float32, device=device
-            )
-            self._selected = torch.empty(batch_size, index_topk, dtype=torch.int32, device=device)
-        self._chunk_lengths_kernel = chunk_lengths
-        self._gather_candidates = gather_chunk_candidates
-        self._remap_indices = remap_chunk_indices
+        width = max(max_context, index_topk)
+        self.score_width = (
+            triton.cdiv(width, 65536) * 65536 if width > 65536 else triton.cdiv(width, 4) * 4
+        )
+        self._topk_selectors = {}
         self.scores = torch.empty(batch_size, self.score_width, dtype=torch.float32, device=device)
         self.indices = torch.empty(batch_size, index_topk, dtype=torch.int32, device=device)
         self.output = torch.empty(
             batch_size, num_query_heads, head_dim, dtype=torch.bfloat16, device=device
         )
-        self.used_radix_fallback = torch.empty(batch_size, dtype=torch.int32, device=device)
         self.request_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
         self._score = score_tcgen
-        self._topk = exact_topk
         self._descriptor_type = TensorDescriptor
         self._descriptor_layout = gl.NVMMASharedLayout(
             swizzle_byte_width=128, element_bitwidth=16, rank=2, transposed=False
@@ -234,62 +214,14 @@ class TritonDSADecodeWorkspace:
                 STAGES=self._score_stages,
                 num_warps=4,
             )
-            if self._chunks == 1:
-                self._topk[(self.batch_size,)](
-                    self.scores,
-                    context_lengths,
-                    self.indices,
-                    self.used_radix_fallback,
-                    WIDTH=self.score_width,
-                    K=self.index_topk,
-                    num_warps=32,
-                    enable_fp_fusion=False,
+            selector_key = context_lengths.data_ptr()
+            if selector_key not in self._topk_selectors:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError("CuTe top-k selector must be warmed before capture")
+                self._topk_selectors[selector_key] = self._topk_workspace_type(
+                    self.scores, context_lengths, self.indices
                 )
-            else:
-                # A global top-k is contained in the union of each disjoint chunk's top-k.
-                self._chunk_lengths_kernel[(self.batch_size,)](
-                    context_lengths,
-                    self._chunk_lengths,
-                    self._candidate_lengths,
-                    CHUNKS=self._chunks,
-                    K=self.index_topk,
-                )
-                self._topk[(self.batch_size * self._chunks,)](
-                    self.scores,
-                    self._chunk_lengths,
-                    self._chunk_indices,
-                    self._chunk_flags,
-                    WIDTH=65536,
-                    K=self.index_topk,
-                    num_warps=32,
-                    enable_fp_fusion=False,
-                )
-                self._gather_candidates[(self.batch_size, self._chunks)](
-                    self.scores,
-                    self._chunk_indices,
-                    self._candidates,
-                    WIDTH=self.score_width,
-                    CHUNKS=self._chunks,
-                    K=self.index_topk,
-                )
-                self._topk[(self.batch_size,)](
-                    self._candidates,
-                    self._candidate_lengths,
-                    self._selected,
-                    self.used_radix_fallback,
-                    WIDTH=self._chunks * self.index_topk,
-                    K=self.index_topk,
-                    num_warps=32,
-                    enable_fp_fusion=False,
-                )
-                self._remap_indices[(self.batch_size,)](
-                    self._chunk_indices,
-                    self._selected,
-                    context_lengths,
-                    self.indices,
-                    CHUNKS=self._chunks,
-                    K=self.index_topk,
-                )
+            self._topk_selectors[selector_key]()
             dsa_gqa_inference_kernels._partial_kernel[(self.batch_size, 1, self._slices)](
                 query,
                 key_cache,
