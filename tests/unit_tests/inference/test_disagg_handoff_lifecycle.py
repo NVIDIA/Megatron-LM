@@ -1958,7 +1958,7 @@ class _CoordinatorLoopPrefillEngine(DisaggDynamicInferenceEngine):
         self._kv_transfer_role = "prefill"
         self.state = EngineState.RUNNING
         self.rank = 0
-        self.ep_world_size = ep_world_size
+        self.tp_ep_world_size = ep_world_size
         self.ep_consensus_interval = 20
         self._ep_consensus_loop_counter = 0
         self._last_ep_consensus = (0, False)

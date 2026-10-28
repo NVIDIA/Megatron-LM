@@ -5478,7 +5478,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
                     global_work_from_last_consensus, _ = self._last_ep_consensus
                     if (
-                        self.ep_world_size == 1
+                        self.tp_ep_world_size == 1
                         or global_work_from_last_consensus == 0
                         or self._ep_consensus_loop_counter % self.ep_consensus_interval == 0
                     ):
