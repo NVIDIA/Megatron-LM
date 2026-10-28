@@ -31,7 +31,7 @@ class _ProtocolResidualConnection(ResidualConnection):
     def _read_result(
         self, hidden_states, *, fp32_residual_connection, branch_input_dtype, execution_context
     ):
-        del execution_context
+        self.received_execution_context = execution_context
         self.received_input = hidden_states
         if self.read_behavior == "non_tensor":
             return object(), ()
@@ -53,7 +53,8 @@ class _ProtocolResidualConnection(ResidualConnection):
     def _write_result(
         self, branch_output, state, *, dropout_probability, training, execution_context
     ):
-        del dropout_probability, training, execution_context
+        del dropout_probability, training
+        self.received_execution_context = execution_context
         self.received_input = branch_output
         self.received_state = state
         if self.write_behavior == "add_branch":
@@ -352,6 +353,7 @@ class TestResidualConnectionContract:
     ):
         connection = _ForwardOverrideConnection(operation=operation, write_behavior="add_branch")
         connection.events = []
+        execution_context = object()
 
         def prepare(module, args):
             module.events.append("pre")
@@ -370,7 +372,9 @@ class TestResidualConnectionContract:
         reference = value.detach().clone().requires_grad_()
         transformed = (reference + 3) * 2
         if operation == "read":
-            output, state = _execute(connection, value, checkpointed=checkpointed)
+            output, state = _execute(
+                connection, value, checkpointed=checkpointed, execution_context=execution_context
+            )
             expected = (transformed[..., :4] + 1) * 0.5
             assert state[0] is connection.received_input
             torch.testing.assert_close(state[0], transformed, rtol=0, atol=0)
@@ -382,6 +386,7 @@ class TestResidualConnectionContract:
                 value,
                 checkpointed=checkpointed,
                 state=(residual,),
+                execution_context=execution_context,
                 dropout_probability=0.0,
                 training=True,
             )
@@ -395,6 +400,7 @@ class TestResidualConnectionContract:
         output.square().sum().backward()
         expected.square().sum().backward()
         assert connection.events == ["pre", "forward", "post"]
+        assert connection.received_execution_context is execution_context
         torch.testing.assert_close(value.grad, reference.grad, rtol=0, atol=0)
         if operation == "write":
             torch.testing.assert_close(residual.grad, reference_residual.grad, rtol=0, atol=0)

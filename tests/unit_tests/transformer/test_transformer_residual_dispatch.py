@@ -179,7 +179,9 @@ def test_stage_dispatch_preserves_call_settings_and_reader_state(is_mlp, mode):
     calls = []
     for connection in (reader, writer):
         connection.register_forward_pre_hook(
-            lambda module, args, kwargs: calls.append((module, args, kwargs.copy())),
+            lambda module, args, kwargs: calls.append(
+                (module, args, kwargs.copy(), torch.is_grad_enabled())
+            ),
             with_kwargs=True,
         )
     value = torch.randn(2, 1, 8, device=next(layer.parameters()).device)
@@ -187,7 +189,8 @@ def test_stage_dispatch_preserves_call_settings_and_reader_state(is_mlp, mode):
     assert state is reader.selected_state and residual is state[0]
     torch.testing.assert_close(residual, value * 2)
     branch_output = (branch, None)
-    _write(layer, branch_output, residual, state, is_mlp, context)
+    with torch.no_grad():
+        _write(layer, branch_output, residual, state, is_mlp, context)
     write_context = (
         None if mode == "terminal_attention_only" or (is_mlp and mode == "terminal") else context
     )
@@ -203,6 +206,7 @@ def test_stage_dispatch_preserves_call_settings_and_reader_state(is_mlp, mode):
     assert calls[1][2]["dropout_probability"] == 0.25
     assert calls[1][2]["training"] is False
     assert calls[1][2]["recompute_context"] is write_context
+    assert calls[1][3] is (write_context is None)
     assert layer.events == [
         ("read", reader, is_mlp, context),
         ("write", writer, is_mlp, write_context),
