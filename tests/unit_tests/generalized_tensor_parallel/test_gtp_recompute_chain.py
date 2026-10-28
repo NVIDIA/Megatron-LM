@@ -122,6 +122,14 @@ def _forward_backward(layers, x, recompute):
     return x.grad.detach().clone()
 
 
+@pytest.fixture(autouse=True)
+def _restore_buffer_policy():
+    """The workers below pin the pooled policy in-process; leave the default for later files."""
+    saved = gtp_module.GTP_CONFIG.eager_buffer_policy
+    yield
+    gtp_module.update_gtp_config(eager_buffer_policy=saved)
+
+
 def _worker_adjacent_nodes_use_distinct_buffers(rank, world_size, port):
     """Every adjacent pair of recompute-chain nodes must gather into different buffers."""
     torch.manual_seed(0)

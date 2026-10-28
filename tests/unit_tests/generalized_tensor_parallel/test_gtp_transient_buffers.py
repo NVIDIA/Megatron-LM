@@ -116,6 +116,30 @@ class TestTransientTicketLifecycle:
         assert cache.get(graphed) is buf  # pooled: the same buffer comes back
         assert cache._total_bytes == 64 * 32 * 2
 
+    def test_gathered_serves_a_repeated_consume_within_the_step(self):
+        cache, producer = self.cache, self.producer
+        a = cache.reserve(_StubParam(64, 32), torch.bfloat16, fwd=True)
+        b = cache.reserve(_StubParam(64, 32), torch.bfloat16, fwd=True)
+        assert cache.gathered(a) is None  # nothing gathered yet
+        cache.begin_consume()
+        buf_a = cache.acquire(a, producer)
+        assert cache.gathered(a) is None and cache.unconsumed_this_step(a)  # consumer pending
+        cache.consume(a)
+        assert not cache.unconsumed_this_step(a)
+        assert cache.gathered(a) is buf_a  # a repeated consume: its own epoch, no new gather
+        cache.acquire(b, producer)  # an acquire in that epoch keeps ``a`` for the new reader
+        assert cache._slots[a].buf is buf_a
+        cache.consume(b)
+        cache.begin_consume()
+        cache.acquire(cache.reserve(_StubParam(64, 32), torch.bfloat16, fwd=True), producer)
+        assert cache._slots[a].buf is None and cache._slots[b].buf is None
+        # Across a step boundary the weights change: a buffer that survived is not served.
+        cache.begin_consume()
+        buf_b = cache.acquire(b, producer)
+        cache.consume(b)
+        cache.step_boundary()
+        assert cache._slots[b].buf is buf_b and cache.gathered(b) is None
+
     def test_legacy_release_of_a_gathered_weight_is_the_consume_marker(self):
         cache, producer = self.cache, self.producer
         a = cache.reserve(_StubParam(64, 32), torch.bfloat16, fwd=True)

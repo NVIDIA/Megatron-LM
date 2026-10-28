@@ -293,6 +293,78 @@ def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, mo
     )
 
 
+def _worker_slab_matches_pooled_with_mtp(rank, world_size, port, repeated_layer=False, moe=False):
+    """With exclusive buffers a weight consumed several times per pass is gathered once: the
+    output layer serves every MTP head and the main head, forward and dgrad, from one gather.
+    The gradients must match the pooled cache, which gathers for every consume."""
+    from collections import defaultdict
+
+    from megatron.core import parallel_state as ps
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTP_CONFIG
+    from megatron.core.tensor_parallel.gtp_api import classify_gtp_remat_chains
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    P = GTPShardedParam
+    o_ag = P._all_gather_weight
+    issued = defaultdict(int)
+
+    def ag(self, async_op, fwd, nvtx_label=None):
+        issued[(self._debug_name, bool(fwd))] += 1
+        return o_ag(self, async_op, fwd, nvtx_label=nvtx_label)
+
+    saved_policy, saved_pad = GTP_CONFIG.eager_buffer_policy, GTP_CONFIG.pad_for_alignment
+    grads, losses, table_gathers = {}, {}, {}
+    try:
+        GTP_CONFIG.pad_for_alignment = 0
+        P._all_gather_weight = ag
+        for policy in ("pooled", "slab"):
+            ps.destroy_model_parallel()
+            ps.initialize_model_parallel(
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=1,
+                gtp_remat_size=world_size,
+                **_expert_parallel_kwargs(moe, world_size),
+            )
+            model_parallel_cuda_manual_seed(42)
+            torch.manual_seed(42)
+            GTP_CONFIG.eager_buffer_policy = policy
+            model = _build_mtp_gpt_model(repeated_layer, moe)
+            classify_gtp_remat_chains([model])
+            issued.clear()
+            losses[policy] = _forward_backward(model)
+            grads[policy] = _gathered_main_grads(model)
+            table_gathers[policy] = {
+                "fwd" if fwd else "bwd": n
+                for (name, fwd), n in issued.items()
+                if "output_layer" in name
+            }
+            del model
+            ps.destroy_model_parallel()
+            GTPShardedParam._chain_state = {}
+            GTPShardedParam._recompute_chain_state = {}
+            GTPShardedParam._link_tables_flushed = False
+    finally:
+        P._all_gather_weight = o_ag
+        GTP_CONFIG.eager_buffer_policy, GTP_CONFIG.pad_for_alignment = saved_policy, saved_pad
+
+    # Every rank: pooled gathers the table for each of the 2 * (mtp_num_layers + 1) consumes;
+    # the slab serves every dgrad from a forward gather and forward consumes that follow each
+    # other directly (the main head after the last MTP head) from the previous one.
+    pooled, slab = table_gathers["pooled"], table_gathers["slab"]
+    assert pooled == {"fwd": MTP_NUM_LAYERS + 1, "bwd": MTP_NUM_LAYERS + 1}, table_gathers
+    assert "bwd" not in slab and slab["fwd"] <= MTP_NUM_LAYERS, table_gathers
+    if rank != 0:
+        return
+    torch.testing.assert_close(
+        torch.tensor(losses["slab"]), torch.tensor(losses["pooled"]), atol=1e-2, rtol=1e-2
+    )
+    ref, test = grads["pooled"], grads["slab"]
+    assert set(ref) == set(test), "param sets differ between phases"
+    for name in ref:
+        rel = (ref[name] - test[name]).abs().max().item() / (ref[name].abs().max().item() + 1e-8)
+        assert rel < 2e-2, f"{name}: slab vs pooled max rel grad err {rel:.3e}"
+
+
 def _worker_wgrad_accum_matches_per_backward_rs(
     rank,
     world_size,
@@ -556,8 +628,12 @@ def _worker_repeated_consume_all_gathers(rank, world_size, port, repeated_layer=
         return out
 
     saved_pad = GTP_CONFIG.pad_for_alignment
+    saved_policy = GTP_CONFIG.eager_buffer_policy
     try:
         GTP_CONFIG.pad_for_alignment = 0
+        # Pooled buffers are shared, so every consume needs its own gather; exclusive (transient
+        # or slab) buffers serve a repeated consume from the first gather instead.
+        GTP_CONFIG.eager_buffer_policy = "pooled"
         P._all_gather_weight, P._get_prefetched_weight = ag, get_prefetched
         P._all_gather_weight_on_demand = on_demand
 
@@ -581,6 +657,7 @@ def _worker_repeated_consume_all_gathers(rank, world_size, port, repeated_layer=
         P._get_prefetched_weight = o_get
         P._all_gather_weight_on_demand = o_ondemand
         GTP_CONFIG.pad_for_alignment = saved_pad
+        GTP_CONFIG.eager_buffer_policy = saved_policy
         ps.destroy_model_parallel()
         GTPShardedParam._chain_state.clear()
         GTPShardedParam._recompute_chain_state.clear()
@@ -853,6 +930,13 @@ class TestGTPMTP:
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires 4 CUDA devices")
         _run_distributed(_worker_shared_weight_grads, 4, repeated_layer, moe)
+
+    @pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
+    @pytest.mark.parametrize("repeated_layer", [False, True])
+    def test_slab_gathers_the_shared_table_once_and_matches_pooled(self, repeated_layer, moe):
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        _run_distributed(_worker_slab_matches_pooled_with_mtp, 4, repeated_layer, moe)
 
     @pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
     @pytest.mark.parametrize("repeated_layer", [False, True])

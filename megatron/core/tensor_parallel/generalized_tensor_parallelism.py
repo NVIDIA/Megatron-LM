@@ -1711,6 +1711,38 @@ class GTPShardedParam(torch.nn.Parameter):
         result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
         return result if self.is_routed_expert else result[0]
 
+    def _reuse_gathered(self, fwd: bool):
+        """The weight gathered earlier in this step, when its buffer is still held: a weight
+        consumed several times in a row (the output layer under every MTP head and the main head,
+        forward and dgrad) is gathered once. Exclusive buffers keep the gathered weights valid
+        until the optimizer step; a plain-dtype weight gathers the same bytes in both directions,
+        so either direction's buffer serves. The pooled policy, whose shared buffers may have
+        been overwritten, gathers again (``None``)."""
+        if self.is_routed_expert:
+            return None
+        cache = get_global_GTP_cache()
+        tickets = [self._ag_ticket_fwd if fwd else self._ag_ticket_bwd]
+        if getattr(self, "_gtp_gather_quantizer", None) is None and not getattr(
+            self, "_gtp_native_fp8", False
+        ):
+            tickets.append(self._ag_ticket_bwd if fwd else self._ag_ticket_fwd)
+        for ticket in tickets:
+            buf = cache.gathered(ticket)
+            if buf is not None:
+                return self._strip_padding(buf).detach().requires_grad_(self.requires_grad)
+        return None
+
+    def _prefetch_pending(self, fwd: bool) -> bool:
+        """A prefetch of this weight issued this step is still waiting for its consumer. The
+        neighbour that prefetches a weight may run more than once before the weight does (an MTP
+        layer replayed per depth, or each head's backward under early backward); on an exclusive
+        buffer the first prefetch stays valid, and issuing another would only drop it."""
+        if self._prefetch_handle is None:
+            return False
+        return get_global_GTP_cache().unconsumed_this_step(
+            self._ag_ticket_fwd if fwd else self._ag_ticket_bwd
+        )
+
     def _prefetch_available(self) -> bool:
         """True when an all-gather was actually issued for THIS consume (either direction).
 
@@ -1874,13 +1906,16 @@ class GTPShardedParam(torch.nn.Parameter):
         if GTP_CONFIG.weight_prefetch and self._prefetch_available():
             result = self._get_prefetched_weight(False)
         else:
-            result = self._all_gather_weight_on_demand(False)
+            result = self._reuse_gathered(fwd=False)
+            if result is None:
+                result = self._all_gather_weight_on_demand(False)
 
         if (
             GTP_CONFIG.weight_prefetch
             and self.prev_w is not None
             and self.prev_w._need_weight_prefetch
             and self.prev_w._need_weight_prefetch_bwd
+            and not self.prev_w._prefetch_pending(fwd=False)
         ):
             # Pre-AG work (quantize, ticket lookup) runs on caller's stream; the NCCL collective
             # is wrapped on ag_stream inside _all_gather_weight (see its async/sync gate).
@@ -1942,9 +1977,11 @@ class GTPShardedParam(torch.nn.Parameter):
                 ),
             )
         else:
-            # On-demand: fwd chain head or first-iter build. Deliberately called with the
-            # original signature so the recompute plumbing never perturbs the fwd path.
-            result = self._all_gather_weight_on_demand(True)
+            # On-demand: fwd chain head, a repeated consume or the first-iter build. Called
+            # with the original signature so the recompute plumbing never perturbs the fwd path.
+            result = None if in_recompute else self._reuse_gathered(fwd=True)
+            if result is None:
+                result = self._all_gather_weight_on_demand(True)
 
         # Prefetch next weight on the matching chain.
         if (
@@ -1958,6 +1995,7 @@ class GTPShardedParam(torch.nn.Parameter):
             and GTP_CONFIG.weight_prefetch
             and self.next_w is not None
             and self.next_w._need_weight_prefetch
+            and not self.next_w._prefetch_pending(fwd=fwd)
         ):
             # Pre-AG work on caller; NCCL wrap lives at the collective site
             # inside _all_gather_weight. See all_gather_and_prefetch_bwd.
@@ -2865,6 +2903,7 @@ class _TicketSlot:
     epoch: int = -1  # consume epoch; freed once the cache sees a later epoch
     region: Optional[_SlabRegion] = None  # slab slice backing the current use, if any
     use_id: int = -1  # identifies the current use in the recorded trace
+    step: int = -1  # step of the current use; gathered weights stay valid until the step ends
 
 
 class GTPWeightCache:
@@ -3107,6 +3146,7 @@ class GTPWeightCache:
             self._next_use += 1
             self._record_event("acq", slot.use_id, ticket, occurrence, slot.param.device)
         slot.alloc_stream, slot.producer_stream, slot.consumed = current, producer_stream, False
+        slot.step = self._step
         if producer_stream != current:
             # The bytes may have been in use on the allocating stream a moment ago: the
             # collective waits for that stream (once per consume call and producer).
@@ -3128,6 +3168,38 @@ class GTPWeightCache:
         self.transient_bytes += slot.nbytes
         self.peak_transient_bytes = max(self.peak_transient_bytes, self.transient_bytes)
         return slot.buf
+
+    def gathered(self, ticket: Optional[int]) -> Optional[torch.Tensor]:
+        """The buffer ``ticket`` was gathered into earlier in this step, if its consuming call
+        has returned and no later acquire has reclaimed it; the caller is about to enqueue another
+        reader on the current stream, so the use is extended to the current epoch. Weights change
+        only at the optimizer step, after the step boundary, and the buffer belongs to this ticket
+        alone, so the gathered weights are still valid. None for pooled tickets, whose shared
+        buffer may have been overwritten since."""
+        if ticket is None or not self.is_transient(ticket):
+            return None
+        slot = self._slots[ticket]
+        if slot.buf is None or not slot.consumed or slot.step != self._step:
+            return None
+        self.begin_consume()
+        stream = _current_stream(slot.param.device)
+        if slot.region is not None:
+            self._note_reader(slot, stream)
+        elif stream != slot.alloc_stream:
+            _record_stream(slot.buf, stream)
+        self._pending.remove(slot)
+        slot.epoch = self._epoch
+        self._pending.append(slot)
+        return slot.buf
+
+    def unconsumed_this_step(self, ticket: Optional[int]) -> bool:
+        """``ticket`` holds a gather issued this step whose consumer has not run yet (a prefetch
+        waiting for its consume). Only for exclusive buffers: a pooled buffer offers no such
+        guarantee."""
+        if ticket is None or not self.is_transient(ticket):
+            return False
+        slot = self._slots[ticket]
+        return slot.buf is not None and not slot.consumed and slot.step == self._step
 
     def consume(self, ticket: Optional[int]) -> None:
         """The caller is about to enqueue the reader of ``ticket``'s buffer on the current
@@ -3198,12 +3270,13 @@ class GTPWeightCache:
 
     # ---------------------------------------------------------------- weight slab
     def step_boundary(self) -> None:
-        """Training-step boundary (once per step, after the backward). Builds the plan at the
-        end of the recording step, drops it when the step that just ended deviated from it (the
-        schedule changed), and resets the per-step counters."""
+        """Training-step boundary (once per step, after the backward). Advances the step, which
+        ends the reuse of gathered weights (the optimizer step follows). With the slab: builds
+        the plan at the end of the recording step, drops it when the step that just ended
+        deviated from it (the schedule changed), and resets the per-step counters."""
         if not self._slab_enabled:
-            return
-        if self._plan is None:
+            pass
+        elif self._plan is None:
             if self._slab_disabled is None and self._step == self._record_from - 1:
                 # The step before the recording: return the warm-up's cached blocks once, so
                 # the optimizer state and the recorded step start from a compact pool.
