@@ -1608,14 +1608,19 @@ def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_l
 
 
 @pytest.mark.parametrize("script", [pretrain_gpt, pretrain_hybrid], ids=["gpt", "hybrid"])
-@pytest.mark.parametrize("sequence_packing_scheduler", [None, "dp_balanced"])
+@pytest.mark.parametrize(
+    "sequence_packing_scheduler,is_packed_sequence",
+    [(None, True), ("dp_balanced", True), ("dp_balanced", False)],
+)
 @pytest.mark.parametrize("vp_size", [None, 2])
-def test_packed_sequence_dataset_built_on_rank(script, sequence_packing_scheduler, vp_size):
-    """Check which ranks build a packed-sequence dataset.
+def test_packed_sequence_dataset_built_on_rank(
+    script, sequence_packing_scheduler, is_packed_sequence, vp_size
+):
+    """Check that TP rank 0 of every PP stage builds the dataset for packed sequences.
 
     Without the sequence-packing scheduler, middle PP stages read the packing metadata from their
-    own data iterator. The scheduler sends that metadata to them instead and rejects a data
-    iterator on any rank other than TP rank 0 of the first or last PP stage.
+    own data iterator. The scheduler runs on every PP stage and reads its input there, also when
+    the dataset itself is not a packed-sequence dataset.
     """
     tp_size, pp_size = 2, 4
     if tp_size * pp_size > torch.cuda.device_count():
@@ -1639,14 +1644,9 @@ def test_packed_sequence_dataset_built_on_rank(script, sequence_packing_schedule
         patch.object(script, "core_transformer_config_from_args", return_value=config),
     ):
         for vp_stage in vp_stages:
-            built = script.is_dataset_built_on_rank(vp_stage=vp_stage, is_packed_sequence=True)
-
-            if sequence_packing_scheduler is None:
-                expected = tp_rank == 0
-            else:
-                on_first_stage = pp_rank == 0 and vp_stage == vp_stages[0]
-                on_last_stage = pp_rank == pp_size - 1 and vp_stage == vp_stages[-1]
-                expected = tp_rank == 0 and (on_first_stage or on_last_stage)
-            assert built == expected, f"{tp_rank=} {pp_rank=} {vp_stage=}"
+            built = script.is_dataset_built_on_rank(
+                vp_stage=vp_stage, is_packed_sequence=is_packed_sequence
+            )
+            assert built == (tp_rank == 0), f"{tp_rank=} {pp_rank=} {vp_stage=}"
 
     Utils.destroy_model_parallel()
