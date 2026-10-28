@@ -11,6 +11,7 @@ from torch import nn
 
 from megatron.core.pipeline_parallel.pipeline_payload import TensorStatePayload
 from megatron.core.tensor_parallel import random as rng
+from megatron.core.transformer import stateful_module
 from megatron.core.transformer.state_boundary import TensorField, TensorSchema
 from megatron.core.transformer.stateful_module import StatefulGraphs, StatefulModule
 
@@ -274,11 +275,12 @@ def test_schema_payload_roundtrip_preserves_aliases_and_optional_fields():
     )
     restored, state = payload.restore()
     assert restored is not hidden and restored.data_ptr() == hidden.data_ptr()
-    assert state["shared"] is hidden
+    # Differentiable roots are owned aliases, so releasing them never shrinks the caller's.
+    assert state["shared"] is not hidden and state["shared"].data_ptr() == hidden.data_ptr()
     assert not state["readonly"].requires_grad
     assert state["readonly"].data_ptr() == hidden.data_ptr()
     assert state["absent"] is None
-    assert schema.fingerprint == TensorSchema(fields).fingerprint
+    assert schema == TensorSchema(fields)
     with pytest.raises(ValueError, match="Absent"):
         schema.pack({"shared": hidden, "readonly": hidden, "absent": torch.ones(1)})
     with pytest.raises(ValueError, match="duplicate"):
@@ -391,11 +393,13 @@ def test_abort_rejects_old_backward_without_retiring_new_invocation(backend):
     graphs.close()
 
 
-def test_graph_module_validation_can_run_outside_replay():
+@pytest.mark.parametrize("debug_checks", [False, True])
+def test_graph_rejects_a_changed_training_mode(debug_checks):
     region = StatefulModule(_Branches(), output_fields=_fields())
     sample = torch.ones(4, 1, 8, device="cuda", requires_grad=True)
-    graphs = StatefulGraphs(region, sample, {}, debug_checks=True)
-    region.eval()
+    graphs = StatefulGraphs(region, sample, {}, debug_checks=debug_checks)
+    # model.eval() reaches the registered module, never the graphs' slot wrappers.
+    region.module.eval()
     with pytest.raises(ValueError, match="training mode"):
         graphs.validate_module()
     with pytest.raises(ValueError, match="training mode"):
@@ -432,3 +436,54 @@ def test_capture_failure_restores_process_settings(backend):
     assert te_graph.is_graph_capturing() == before_te
     if get_override is not None:
         assert get_override() == before_override
+
+
+def test_recompute_uses_checkpoint_fn_and_rejects_default_checkpoint_under_fp8(monkeypatch):
+    region = StatefulModule(_Branches(), output_fields=_fields())
+    x = torch.ones(4, 1, 8, device="cuda", requires_grad=True)
+    calls = []
+
+    def checkpoint_fn(function, *tensors):
+        calls.append(len(tensors))
+        return function(*tensors)
+
+    _, state = region.run(x, {}, recompute=True, checkpoint_fn=checkpoint_fn)
+    assert calls == [1] and state["memory"].requires_grad
+    monkeypatch.setattr(stateful_module, "_fp8_autocast_enabled", lambda: True)
+    with pytest.raises(ValueError, match="FP8-aware checkpoint_fn"):
+        region.run(x, {}, recompute=True)
+    region.run(x, {}, recompute=True, checkpoint_fn=checkpoint_fn)
+    assert calls == [1, 1]
+
+
+@pytest.mark.usefixtures("te_rng_tracker")
+@pytest.mark.parametrize("backend", ["torch", "transformer_engine"])
+def test_graph_capture_preserves_registered_statistics(backend):
+    """Graph warmup must not inflate router-like counters, including across slots."""
+
+    class Counter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(8, device="cuda"))
+            self.register_buffer("calls", torch.tensor(17, device="cuda"))
+
+        def forward(self, hidden, state):
+            self.calls.add_(1)
+            return hidden * self.weight, {}
+
+    module = Counter()
+    region = StatefulModule(module)
+    sample = torch.ones(4, 1, 8, device="cuda", requires_grad=True)
+    graphs = StatefulGraphs(region, sample, {}, slots=2, backend=backend)
+    pre_hooks = []
+    graphs.setup_manual_hooks(lambda: lambda owner: pre_hooks.append(owner))
+    try:
+        assert module.calls.item() == 17
+        outputs = [graphs.run(sample.clone(), {}, slot=i)[0] for i in range(2)]
+        for output in outputs:
+            output.sum().backward()
+        assert module.calls.item() == 19
+        assert pre_hooks == [module, module]
+    finally:
+        graphs.abort()
+        graphs.close()

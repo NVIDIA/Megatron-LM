@@ -5,7 +5,6 @@
 import gc
 import os
 import weakref
-from dataclasses import dataclass
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -16,54 +15,42 @@ import torch.distributed as dist
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.pipeline_payload import (
     PipelineDataIterator,
-    PipelineGradientMessage,
-    PipelinePayload,
     PipelinePayloadPlan,
     PipelinePayloadSpec,
-    PipelineTensorSpec,
     TensorStatePayload,
     backward_pipeline_payload,
 )
 from megatron.core.pipeline_parallel.schedules import (
     backward_step,
-    deallocate_output_tensor,
     forward_backward_pipelining_with_interleaving,
     forward_backward_pipelining_without_interleaving,
 )
-from megatron.core.pipeline_parallel.typed_p2p_communication import (
-    TypedP2PCommunicator,
-    _decode_header,
-    _MessageRecord,
-    _P2PWork,
-    _pack_header,
-    _unpack_header,
-    create_pipeline_control_group,
-)
+from megatron.core.pipeline_parallel.typed_p2p_communication import TypedP2PCommunicator
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
 from megatron.core.transformer.state_boundary import TensorField, TensorSchema
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-
-def _spec(name, shape, dtype, requires_grad, layout="strided", present=True):
-    return PipelineTensorSpec(name, TensorField(name, shape, dtype, layout, requires_grad, present))
+_CONFIG = SimpleNamespace(timers=None, grad_scale_func=None, deallocate_pipeline_outputs=True)
 
 
-@dataclass(frozen=True)
-class _Payload(PipelinePayload):
-    tensors: tuple[torch.Tensor, ...]
+def _field(key, shape, dtype, differentiable, layout="local", present=True):
+    return TensorField(key, tuple(shape), dtype, layout, differentiable, present)
 
-    @property
-    def metadata(self):
-        return self.tensors[0].shape[0], self.tensors[1].shape[0]
 
-    @property
-    def tensor_specs(self):
-        return tuple(
-            _spec(str(i), tuple(t.shape), t.dtype, t.requires_grad)
-            for i, t in enumerate(self.tensors)
+def _payload(*tensors, differentiable=None):
+    """A received-style payload over the given tensors; the first is hidden."""
+    fields = tuple(
+        _field(
+            "__hidden__" if i == 0 else f"field{i}",
+            t.shape,
+            t.dtype,
+            t.requires_grad if differentiable is None else differentiable[i],
         )
+        for i, t in enumerate(tensors)
+    )
+    return TensorStatePayload(tensors, PipelinePayloadSpec(fields))
 
 
 @pytest.mark.parametrize("release", [False, True])
@@ -72,365 +59,255 @@ def test_joint_backward_sums_local_and_relay_contributions(release):
     shared = torch.tensor([3.0, 4.0], requires_grad=True)
     indexer = torch.tensor([5.0, 6.0], requires_grad=True)
     indices = torch.tensor([0, 1], dtype=torch.int32)
-    incoming = _Payload((hidden, shared, indexer, indices))
+    incoming = _payload(hidden, shared, indexer, indices)
     weight = torch.tensor(2.0, requires_grad=True)
-    outgoing = _Payload((hidden * weight + shared.square(), shared, indexer, indices))
-    deallocate_output_tensor(outgoing, release)
+    outgoing = _payload(hidden * weight + shared.square(), shared, indexer, indices)
+    if release:
+        outgoing.release_output()
     assert bool(outgoing.tensors) is not release
-    assert shared.shape == indexer.shape == hidden.shape == (2,)
     gradients = backward_step(
         incoming,
         outgoing,
         (torch.tensor([7.0, 8.0]), torch.tensor([9.0, 10.0]), None, None),
-        SimpleNamespace(
-            timers=None, grad_scale_func=lambda loss: loss * 100, deallocate_pipeline_outputs=True
-        ),
+        SimpleNamespace(**{**vars(_CONFIG), "grad_scale_func": lambda loss: loss * 100}),
     )
     torch.testing.assert_close(gradients[0], torch.tensor([14.0, 16.0]))
     torch.testing.assert_close(gradients[1], torch.tensor([51.0, 74.0]))
-    assert gradients[2] is None
-    assert gradients[3] is None
+    assert gradients[2] is None and gradients[3] is None
     torch.testing.assert_close(weight.grad, torch.tensor(23.0))
 
 
-def test_payload_release_preserves_saved_views_hooks_and_empty_gradients():
-    """Only unused output ownership is dropped; local backward still owns its saved values."""
-
-    class Copy(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, tensor):
-            return tensor.clone()
-
-        @staticmethod
-        def backward(ctx, grad):
-            return grad
-
+def test_release_shrinks_owned_roots_and_keeps_saved_values():
     x = torch.tensor([1.0, 2.0, 3.0, 4.0], requires_grad=True)
-    hidden = Copy.apply(x * 2)
-    saved = x.sigmoid()
-    empty = x[:0]
-    hooks = []
-    hidden.register_hook(lambda grad: hooks.append(grad.clone()))
-    hidden_ref = weakref.ref(hidden)
-    payload = _Payload((hidden, saved.view(2, 2), empty))
-    saved_value = saved.detach().clone()
-    del hidden, saved, empty
+    saved = x.sigmoid()  # sigmoid saves this very output for its own backward
+    expected = saved.detach().clone()
+    schema = TensorSchema(
+        (_field("saved", (2, 2), torch.float32, True), _field("empty", (0,), torch.float32, True))
+    )
+    payload = TensorStatePayload.from_state(
+        x * 2, {"saved": saved.view(2, 2), "empty": x[:0]}, schema
+    )
     payload.release_output()
     payload.release_output()  # The schedule may retire the same output more than once.
-    gc.collect()
-    assert hidden_ref() is not None  # Original roots remain alive until backward completes.
-    assert not payload.tensors
-    backward_step(
-        None,
-        payload,
-        (torch.ones(4), torch.ones(2, 2), None),
-        SimpleNamespace(timers=None, grad_scale_func=None, deallocate_pipeline_outputs=True),
-    )
-    torch.testing.assert_close(x.grad, 2 + saved_value * (1 - saved_value))
-    assert len(hooks) == 1
-    torch.testing.assert_close(hooks[0], torch.ones(4))
-    assert payload._backward_state.outputs == ()
-    assert hidden_ref() is None
+    assert not payload.tensors and all(root.numel() == 1 for root in payload.backward_roots())
+    torch.testing.assert_close(saved, expected)  # The caller's alias keeps its storage.
+    backward_step(None, payload, (torch.ones(4), torch.ones(2, 2), torch.empty(0)), _CONFIG)
+    torch.testing.assert_close(x.grad, 2 + expected * (1 - expected))
+    with pytest.raises(ValueError, match="unconsumed forward payload"):
+        backward_pipeline_payload(None, payload, (torch.ones(4), torch.ones(2, 2), None))
 
 
 def test_terminal_payload_backward_scales_loss_once():
     hidden = torch.tensor([2.0, 3.0], requires_grad=True)
     state = torch.tensor([4.0, 5.0], requires_grad=True)
-    incoming = _Payload((hidden, state))
     grads = backward_step(
-        incoming,
+        _payload(hidden, state),
         (hidden * state).sum(),
         None,
-        SimpleNamespace(
-            timers=None, grad_scale_func=lambda loss: loss * 3, deallocate_pipeline_outputs=True
-        ),
+        SimpleNamespace(**{**vars(_CONFIG), "grad_scale_func": lambda loss: loss * 3}),
     )
     torch.testing.assert_close(grads[0], torch.tensor([12.0, 15.0]))
     torch.testing.assert_close(grads[1], torch.tensor([6.0, 9.0]))
 
 
-def test_header_preserves_mixed_dtypes_empty_shapes_and_host_metadata():
-    specs = (
-        _spec("hidden", (9, 1, 128), torch.bfloat16, True),
-        _spec("mix", (9, 1, 4), torch.float32, True),
-        _spec("empty", (0, 1, 16), torch.bfloat16, True),
-        _spec("ids", (9, 3), torch.int32, False),
-        _spec("prefixes", (5,), torch.int64, False),
-        _spec("scalar", (), torch.float64, False),
-    )
-    values = _pack_header(specs, (12345, 4), 7)
-    decoded, metadata = _unpack_header(values, 7)
-    assert _pack_header(decoded, metadata, 7) == values
-    assert metadata == (12345, 4)
-    with pytest.raises(ValueError, match="microbatch mismatch"):
-        _unpack_header(values, 8)
-    with pytest.raises(ValueError, match="chunk mismatch"):
-        _unpack_header(values, 7, chunk_id=1)
-
-
-def test_generic_schema_has_no_csa2_field_dimension_or_metadata_limit():
-    specs = tuple(
-        _spec(
-            f"feature/value:L{i}",
-            (2, 1, 3, 1),
-            torch.float32,
-            i % 3 == 0,
-            layout="bshd",
-            present=i % 2 == 0,
-        )
+def test_spec_is_generic_and_fingerprints_every_qualification():
+    fields = tuple(
+        _field(f"feature/value:L{i}", (2, 1, 3, 1), torch.float32, i % 3 == 0, present=i % 2 == 0)
         for i in range(12)
     )
-    descriptor = PipelinePayloadSpec(specs, (0, 1, 2, 3, 4, 5), "decoder/cut:20")
-    values = _pack_header(specs, descriptor.metadata, 7, 2, boundary_id=descriptor.boundary_id)
-    assert _decode_header(values, 7, 2) == descriptor
-    assert descriptor.schema.present_spec_indices == (0, 2, 4, 6, 8, 10)
-    assert descriptor.schema.grad_tensor_indices == (0, 3)
-    message = PipelineGradientMessage(
-        (torch.zeros(1), None, torch.ones(1)),
-        torch.tensor([7, 2, descriptor.fingerprint, 1, 0]),
-        (7, 2, descriptor.fingerprint),
-        (0, 2),
+    spec = PipelinePayloadSpec(fields, (0, 1, 2, 3, 4, 5), "decoder/cut:20")
+    assert [f.key for f in spec.schema.packed_fields] == [
+        f"feature/value:L{i}" for i in range(0, 12, 2)
+    ]
+    assert spec == PipelinePayloadSpec(fields, (0, 1, 2, 3, 4, 5), "decoder/cut:20")
+    assert (
+        spec.fingerprint
+        == PipelinePayloadSpec(fields, (0, 1, 2, 3, 4, 5), "decoder/cut:20").fingerprint
     )
-    grads = message.resolve()
-    assert grads[0] is not None and grads[1:] == (None, None)
-    message.control[0] += 1
-    with pytest.raises(ValueError, match="microbatch"):
-        message.resolve()
+    variants = [
+        PipelinePayloadSpec(fields, (0, 1, 2, 3, 4, 6), "decoder/cut:20"),
+        PipelinePayloadSpec(fields, (0, 1, 2, 3, 4, 5), "decoder/cut:21"),
+        PipelinePayloadSpec((_field("x", (2,), torch.float32, True),) + fields[1:], spec.metadata),
+    ]
+    for change in ("shape", "dtype", "differentiable", "present"):
+        value = {
+            "shape": (2, 1, 3, 2),
+            "dtype": torch.bfloat16,
+            "differentiable": False,
+            "present": False,
+        }[change]
+        replaced = TensorField(**{**vars(fields[0]), change: value})
+        variants.append(
+            PipelinePayloadSpec((replaced, *fields[1:]), spec.metadata, spec.boundary_id)
+        )
+    assert len({spec.fingerprint, *(v.fingerprint for v in variants)}) == len(variants) + 1
+    for bad in [((), ()), (fields, (1.5,)), ((object(),), ())]:
+        with pytest.raises((ValueError, TypeError)):
+            PipelinePayloadSpec(*bad)
 
 
-@pytest.mark.parametrize("activity", ["kv", "zero_hidden", "inactive"])
-def test_pipeline_roots_preserve_dsa_aux_activity(monkeypatch, activity):
+@pytest.mark.parametrize("activity", ["kv", "zero_hidden", "missing"])
+def test_missing_and_zero_gradients_differ_for_auxiliary_losses(monkeypatch, activity):
+    """Why the transport never zero-fills: a zero still runs auxiliary-loss hooks."""
     monkeypatch.setattr(DSAIndexerLossAutoScaler, "main_loss_backward_scale", None)
     x = torch.ones(3, requires_grad=True)
     weight = torch.nn.Parameter(torch.tensor(2.0))
     auxiliary = torch.nn.Parameter(torch.tensor(3.0))
     hidden = DSAIndexerLossAutoScaler.apply(x.square(), auxiliary.square())
-    kv = x * weight
-    payload = _Payload((hidden, kv))
+    payload = TensorStatePayload.from_state(
+        hidden, {"kv": x * weight}, TensorSchema((_field("kv", (3,), torch.float32, True),))
+    )
     payload.release_output()
     grads = (
-        torch.zeros_like(hidden) if activity == "zero_hidden" else None,
-        torch.ones_like(kv) if activity != "inactive" else None,
+        torch.zeros(3) if activity == "zero_hidden" else None,
+        None if activity == "missing" else torch.ones(3),
     )
     backward_pipeline_payload(None, payload, grads)
     assert (auxiliary.grad is not None) == (activity == "zero_hidden")
-    assert (weight.grad is not None) == (activity != "inactive")
-    if auxiliary.grad is not None:
-        assert auxiliary.grad == 6
-    assert payload._backward_state.outputs == ()
+    assert (weight.grad is not None) == (activity != "missing")
 
 
-def test_duplicate_output_roots_accumulate_exactly_once():
+def test_same_tensor_in_several_fields_accumulates_each_contribution():
     x = torch.ones(3, requires_grad=True)
     shared = x.square()
+    schema = TensorSchema(
+        (_field("a", (3,), torch.float32, True), _field("b", (3,), torch.float32, True))
+    )
+    payload = TensorStatePayload.from_state(shared, {"a": shared, "b": shared}, schema)
+    payload.release_output()
     backward_pipeline_payload(
-        None, _Payload((shared, shared)), (torch.ones(3), torch.full((3,), 2.0))
+        None, payload, (torch.ones(3), torch.full((3,), 2.0), torch.full((3,), 3.0))
     )
-    torch.testing.assert_close(x.grad, torch.full((3,), 6.0))
+    torch.testing.assert_close(x.grad, torch.full((3,), 12.0))
+    y = torch.ones(3, requires_grad=True)
+    backward_pipeline_payload(None, _payload(y, y), (torch.ones(3), torch.full((3,), 2.0)))
+    torch.testing.assert_close(y.grad, torch.full((3,), 3.0))
 
 
-def test_inactive_boundary_backward_with_mcore_ddp(monkeypatch):
-    """Exercise real DDP buffers/reduction with changing activity on two DP ranks.
-
-    CPU runs replace only CUDA allocation/stream access; autograd, MCore hooks,
-    buffer lifecycle and Gloo collectives execute normally. Overlapping DDP's
-    fixed parameter-readiness counts are outside this dynamic-activity contract.
-    """
-    if int(os.environ.get("WORLD_SIZE", "1")) != 2:
-        pytest.skip("Requires two distributed ranks")
-    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-
-    if not dist.is_initialized():
-        dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo")
-    rank = dist.get_rank()
-    singletons = [dist.new_group([i]) for i in range(2)]
-    groups = ProcessGroupCollection()
-    groups.dp = groups.dp_cp = groups.expt_dp = dist.group.WORLD
-    groups.tp = groups.pp = groups.ep = singletons[rank]
-    if torch.cuda.is_available():
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        device = torch.device("cuda", torch.cuda.current_device())
-    else:
-        device = torch.device("cpu")
-        monkeypatch.setattr(torch.cuda, "current_device", lambda: device)
-        monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
-    monkeypatch.setattr(DSAIndexerLossAutoScaler, "main_loss_backward_scale", None)
-
-    class Stage(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = torch.nn.Parameter(torch.tensor(2.0, device=device))
-            self.auxiliary = torch.nn.Parameter(torch.tensor(3.0, device=device))
-
-        def forward(self, x):
-            return _Payload(
-                (
-                    DSAIndexerLossAutoScaler.apply(x.square(), self.auxiliary.square()),
-                    x * self.weight,
-                )
-            )
-
-    config = TransformerConfig(num_layers=1, hidden_size=4, num_attention_heads=1)
-    module = Stage()
-    ddp = DistributedDataParallel(
-        config,
-        DistributedDataParallelConfig(
-            overlap_grad_reduce=False, use_distributed_optimizer=False, check_for_nan_in_grad=False
-        ),
-        module,
-        pg_collection=groups,
+@pytest.mark.parametrize("view", [False, True])
+@pytest.mark.parametrize("empty", [False, True])
+def test_owned_release_preserves_saved_aliases_and_joint_gradients(view, empty):
+    leaf = torch.arange(12, dtype=torch.float32).reshape(3, 4).requires_grad_()
+    expected_leaf = leaf.detach().clone().requires_grad_()
+    hidden, expected_hidden = leaf.sigmoid(), expected_leaf.sigmoid()
+    if view:
+        hidden, expected_hidden = hidden.t(), expected_hidden.t()
+    if empty:
+        hidden, expected_hidden = hidden[:0], expected_hidden[:0]
+    schema = TensorSchema((_field("shared", hidden.shape, hidden.dtype, True),))
+    payload = TensorStatePayload.from_state(hidden, {"shared": hidden}, schema)
+    wire = payload.tensors[0].detach().contiguous()
+    snapshot = hidden.detach().clone()
+    payload.release_output()
+    assert payload.backward_roots()[0].numel() == 1
+    torch.testing.assert_close(hidden, snapshot)
+    torch.testing.assert_close(wire, snapshot)
+    backward_pipeline_payload(
+        None, payload, (torch.ones_like(snapshot), torch.full_like(snapshot, 2))
     )
-    try:
-        for activity in ("kv", "inactive", "zero_hidden", "different_ranks", "inactive"):
-            ddp.zero_grad_buffer()
-            x = torch.full((3,), rank + 1.0, device=device, requires_grad=True)
-            output = ddp(x)
-            active = activity != "inactive" and (activity != "different_ranks" or rank == 0)
-            backward_pipeline_payload(
-                None,
-                output,
-                (
-                    torch.zeros_like(x) if activity == "zero_hidden" else None,
-                    torch.ones_like(x) if active else None,
-                ),
-            )
-            ddp.finish_grad_sync()
-            expected_weight = 1.5 if activity == "different_ranks" else (4.5 if active else 0.0)
-            torch.testing.assert_close(
-                module.weight.main_grad, torch.tensor(expected_weight, device=device)
-            )
-            torch.testing.assert_close(
-                module.auxiliary.main_grad,
-                torch.tensor(6.0 if activity == "zero_hidden" else 0.0, device=device),
-            )
-            assert (x.grad is not None) == active
-    finally:
-        dist.destroy_process_group(singletons[rank])
+    (expected_hidden.sum() * 3).backward()
+    torch.testing.assert_close(leaf.grad, expected_leaf.grad)
 
 
-@pytest.mark.parametrize("prepared", [False, True])
-def test_generic_packed_fields_actual_transport(monkeypatch, prepared, transport_groups):
-    """Absence, 4-D fields and all-inactive backward use the real two-rank protocol."""
-    if int(os.environ.get("WORLD_SIZE", "1")) != 2:
-        pytest.skip("Requires two distributed ranks")
-    if not dist.is_initialized():
-        dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo")
-    rank = dist.get_rank()
-    if torch.cuda.is_available():
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    device = (
-        torch.device("cuda", torch.cuda.current_device())
-        if torch.cuda.is_available()
-        else torch.device("cpu")
+def test_owned_release_does_not_retain_an_unaliased_output_storage():
+    leaf = torch.ones(4096, requires_grad=True)
+    hidden = leaf * 2
+    reference = weakref.ref(hidden)
+    payload = TensorStatePayload.from_state(hidden, {}, TensorSchema(()))
+    del hidden
+    gc.collect()
+    assert reference() is None
+    payload.release_output()
+    root = payload.backward_roots()[0]
+    assert root.numel() == 1 and root.untyped_storage().nbytes() == root.element_size()
+    backward_pipeline_payload(None, payload, (torch.ones_like(leaf),))
+    torch.testing.assert_close(leaf.grad, torch.full_like(leaf, 2))
+
+
+def test_release_drops_readonly_outputs_after_the_wire_owns_them():
+    leaf = torch.ones(4, requires_grad=True)
+    ids = torch.arange(4)
+    reference = weakref.ref(ids)
+    payload = TensorStatePayload.from_state(
+        leaf * 2, {"ids": ids}, TensorSchema((_field("ids", (4,), torch.int64, False),))
     )
-    monkeypatch.setattr(DSAIndexerLossAutoScaler, "main_loss_backward_scale", None)
-    descriptor = PipelinePayloadSpec(
-        tuple(
-            _spec(
-                f"example/value:L{i}",
-                (2, 1, 3, 1),
-                torch.float32 if i % 3 == 0 else torch.int64,
-                i % 3 == 0,
-                present=i % 2 == 0,
-                layout="bshd",
-            )
-            for i in range(12)
-        ),
-        (0, 1, 2, 3, 4, 5),
-        "example/pp:4",
+    wire = payload.tensors[1].detach()
+    del ids
+    payload.release_output()
+    gc.collect()
+    assert reference() is None and payload.backward_roots()[1] is None
+    torch.testing.assert_close(wire, torch.arange(4))
+    backward_pipeline_payload(None, payload, (torch.ones_like(leaf), None))
+    torch.testing.assert_close(leaf.grad, torch.full_like(leaf, 2))
+
+
+def test_released_identity_payload_still_returns_input_gradients():
+    hidden = torch.ones(4, requires_grad=True)
+    incoming = _payload(hidden, torch.arange(4))
+    incoming.release_output()  # The stage returns exactly its received payload.
+    gradients = backward_pipeline_payload(incoming, incoming, (torch.full_like(hidden, 3), None))
+    torch.testing.assert_close(gradients[0], torch.full_like(hidden, 3))
+    assert gradients[1] is None
+
+
+def test_gradient_wire_requires_every_declared_gradient():
+    spec = PipelinePayloadSpec(
+        (
+            _field("__hidden__", (3,), torch.float32, True),
+            _field("empty", (0, 2), torch.float32, True),
+            _field("ids", (3,), torch.int64, False),
+        )
     )
-
-    class Payload(PipelinePayload):
-        tensor_specs = descriptor.tensor_specs
-        metadata = descriptor.metadata
-        boundary_id = descriptor.boundary_id
-
-        def __init__(self, tensors, spec):
-            assert spec == descriptor
-            self.tensors = tensors
-
-    config = TransformerConfig(
-        num_layers=2,
-        hidden_size=4,
-        num_attention_heads=1,
-        pipeline_model_parallel_size=2,
-        pipeline_dtype=torch.float32,
-        batch_p2p_comm=False,
-        deallocate_pipeline_outputs=True,
-    )
-    plans = (
-        [
-            PipelinePayloadPlan(
-                (descriptor if rank else None,) * 3, (None if rank else descriptor,) * 3
-            )
-        ]
-        if prepared
-        else None
-    )
-    control = transport_groups[0].control
-    transport = TypedP2PCommunicator(
-        dist.group.WORLD, config, Payload, device=device, payload_plans=plans, control_group=control
-    )
-    for activity in ("kv", "zero_hidden", "inactive"):
-        if rank == 0:
-            x = torch.ones(2, 1, 3, 1, device=device, requires_grad=True)
-            auxiliary = torch.tensor(3.0, device=device, requires_grad=True)
-            hidden = DSAIndexerLossAutoScaler.apply(x.square(), auxiliary.square())
-            kv = x * 2
-            tensors = tuple(
-                (
-                    hidden
-                    if i == 0
-                    else (
-                        kv
-                        if i == 6
-                        else torch.zeros(
-                            descriptor.tensor_specs[i].shape,
-                            dtype=descriptor.tensor_specs[i].dtype,
-                            device=device,
-                        )
-                    )
-                )
-                for i in descriptor.schema.present_spec_indices
-            )
-            outgoing = Payload(tensors, descriptor)
-            gradients = transport.send_forward_recv_backward(outgoing, None, False)
-            backward_pipeline_payload(None, outgoing, gradients)
-            assert (x.grad is not None) == (activity != "inactive")
-            assert (auxiliary.grad is not None) == (activity == "zero_hidden")
-            if x.grad is not None:
-                torch.testing.assert_close(x.grad, torch.full_like(x, 2.0))
-        else:
-            incoming = transport.recv_forward(None, False)
-            loss = (
-                incoming.tensors[3].sum()
-                if activity != "inactive"
-                else torch.zeros((), device=device)
-            )
-            if activity == "zero_hidden":
-                loss = loss + incoming.tensors[0].sum() * 0
-            gradients = backward_pipeline_payload(incoming, loss, None)
-            transport.send_backward(gradients, False)
-    transport.finish()
+    owner = SimpleNamespace(device=torch.device("cpu"))
+    wire = TypedP2PCommunicator._gradient_wire(owner, (torch.ones(3), None, None), spec)
+    assert len(wire) == 1  # Empty fields carry no data; integers carry no gradient.
+    with pytest.raises(ValueError, match="received no gradient"):
+        TypedP2PCommunicator._gradient_wire(owner, (None, None, None), spec)
+    with pytest.raises(ValueError, match="Unexpected gradient"):
+        TypedP2PCommunicator._gradient_wire(owner, (torch.ones(3), None, torch.ones(3)), spec)
+    with pytest.raises(ValueError, match="incoming field slots"):
+        TypedP2PCommunicator._gradient_wire(owner, (), spec)
 
 
-@pytest.mark.parametrize("shape,dtype", [((-1, 3), torch.float32), ((1,), torch.int32)])
-def test_invalid_wire_descriptors(shape, dtype):
-    with pytest.raises(ValueError):
-        _pack_header((_spec("bad", shape, dtype, True),), (0, 0), 0)
-
-
-def _make_payload(tensors, descriptor):
-    payload = _Payload(tensors)
-    assert payload.descriptor == descriptor
-    return payload
+_TRANSFER_SPEC = PipelinePayloadSpec(
+    (
+        _field("__hidden__", (3,), torch.float32, True, "strided"),
+        _field("empty", (0,), torch.bfloat16, True),
+        _field("ids", (2,), torch.int64, False),
+    ),
+    (3, 0),
+)
 
 
 @pytest.fixture
-def delayed_transport(monkeypatch):
-    """Control request completion without letting the fake Work retain wire buffers."""
-    group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
+def fake_transport(monkeypatch):
+    """Two-stage VPP communicator whose requests complete only when waited."""
+    requests = []
+
+    class DelayedWork:
+        def __init__(self, operation, tensor):
+            self.operation, self.buffer, self.wait_count = operation, weakref.ref(tensor), 0
+            self.value = None
+
+        def wait(self):
+            assert self.buffer() is not None, "Communication buffer was released before wait"
+            self.wait_count += 1
+            if self.value is not None:
+                with torch.no_grad():
+                    self.buffer().fill_(self.value)
+
+    def post(operation):
+        def issue(tensor, peer, group=None):
+            requests.append(DelayedWork(operation, tensor))
+            return requests[-1]
+
+        return issue
+
     monkeypatch.setattr(dist, "get_global_rank", lambda group, rank: rank)
+    monkeypatch.setattr(dist, "get_backend", lambda group: "gloo")
+    monkeypatch.setattr(dist, "isend", post("send"))
+    monkeypatch.setattr(dist, "irecv", post("recv"))
+    monkeypatch.setattr(TypedP2PCommunicator, "_validate_plan_peers", lambda self: None)
     config = TransformerConfig(
         num_layers=4,
         hidden_size=8,
@@ -440,140 +317,63 @@ def delayed_transport(monkeypatch):
         virtual_pipeline_model_parallel_size=2,
         overlap_p2p_comm=True,
         batch_p2p_comm=False,
+        deallocate_pipeline_outputs=True,
     )
-    # Exercise low-level request ownership with controlled fake completions.
-    # The public constructor rejects dynamic headers for real overlapped transport.
-    config.overlap_p2p_comm = False
+    plans = [
+        PipelinePayloadPlan((None,), (_TRANSFER_SPEC,)),
+        PipelinePayloadPlan((_TRANSFER_SPEC,), (None,)),
+    ]
     communicator = TypedP2PCommunicator(
-        group, config, [_make_payload, _make_payload], device=torch.device("cpu")
+        SimpleNamespace(size=lambda: 2, rank=lambda: 0),
+        config,
+        [TensorStatePayload] * 2,
+        plans,
+        device=torch.device("cpu"),
     )
-    config.overlap_p2p_comm = True
-    requests = []
-
-    class DelayedWork:
-        def __init__(self, name, tensor):
-            self.name = name
-            self.buffer = weakref.ref(tensor)
-            self.wait_count = 0
-            self.received_value = None
-
-        def wait(self):
-            assert self.buffer() is not None, "Communication buffer was released before wait"
-            self.wait_count += 1
-            if self.received_value is not None:
-                with torch.no_grad():
-                    self.buffer().copy_(self.received_value)
-
-    def post(**kwargs):
-        result = {}
-        for key, tensor in kwargs.items():
-            if key.startswith("tensor_") and tensor is not None:
-                name = key.removeprefix("tensor_")
-                request = DelayedWork(name, tensor)
-                requests.append(request)
-                result[name] = request
-        return result
-
-    monkeypatch.setattr("megatron.core.pipeline_parallel.typed_p2p_communication._p2p_ops", post)
-    return communicator, requests, post
+    return communicator, requests
 
 
-def test_overlap_waits_each_direction_and_retains_wire_copies(delayed_transport):
-    communicator, requests, _ = delayed_transport
+def test_overlap_waits_each_direction_and_retains_wire_copies(fake_transport):
+    communicator, requests = fake_transport
     view = torch.arange(12.0, requires_grad=True).reshape(3, 4).t()
     expected = view.detach().clone()
     handles = communicator._transfer(
         send_next=(view, torch.empty(0)),
         send_prev=(torch.ones(2),),
         recv_prev=(torch.empty(3),),
-        recv_next=(torch.empty(4),),
-        overlap=True,
+        recv_next=(None, torch.empty(4)),
     )
     assert set(handles) == {"send_next", "send_prev", "recv_prev", "recv_next"}
-    assert len(requests) == 4  # The empty field has no wire operation.
-    assert all(request.wait_count == 0 for request in requests)
-    sent = next(request for request in requests if request.name == "send_next")
-    assert sent.buffer().is_contiguous() and not sent.buffer().requires_grad
+    assert len(requests) == 4  # Empty and absent fields have no wire operation.
+    sent = requests[0]  # Even stages post sends first.
+    assert sent.operation == "send" and sent.buffer().is_contiguous()
+    assert not sent.buffer().requires_grad
     del view
     gc.collect()
     torch.testing.assert_close(sent.buffer(), expected)
-
-    handles["recv_prev"].wait()
-    assert all(request.wait_count == int(request.name == "recv_prev") for request in requests)
-    assert len(communicator._pending) == 3
     handles["send_next"].wait()
     handles["send_next"].wait()  # Idempotent even if schedule cleanup waits again.
     assert sent.wait_count == 1 and sent.buffer() is None
-    del handles  # finish() must retain and drain requests not kept by the caller.
+    assert all(request.wait_count == 0 for request in requests[1:])
+    del handles  # finish() must drain requests not kept by the caller.
+    communicator.payload_plans = [PipelinePayloadPlan((), ())] * 2
     communicator.finish()
-    assert not communicator._pending
     assert all(request.wait_count == 1 and request.buffer() is None for request in requests)
 
 
-def test_overlap_constructs_payload_after_header_and_waits_before_data_use(
-    delayed_transport, monkeypatch
-):
-    communicator, requests, post = delayed_transport
-    source = _Payload((torch.ones(3, requires_grad=True), torch.ones(0, dtype=torch.bfloat16)))
-    wire_header = torch.tensor(_pack_header(source.tensor_specs, source.metadata, 0, chunk_id=1))
-
-    def post_receive(**kwargs):
-        result = post(**kwargs)
-        for name, request in result.items():
-            if name == "recv_prev":
-                request.received_value = (
-                    wire_header.numel()
-                    if request.buffer().shape == (1,) and request.buffer().dtype == torch.int64
-                    else wire_header if request.buffer().dtype == torch.uint8 else 7
-                )
-        return result
-
-    def factory(tensors, descriptor):
-        assert all(request.wait_count == 1 for request in requests[:2])
-        assert len(requests) == 2  # Length and descriptor precede allocation/data receive.
-        return _make_payload(tensors, descriptor)
-
-    monkeypatch.setattr(
-        "megatron.core.pipeline_parallel.typed_p2p_communication._p2p_ops", post_receive
-    )
-    communicator.make_payloads[1] = factory
-    received, handles = communicator.send_forward_recv_forward(
-        None, True, None, overlap_p2p_comm=True, recv_chunk_id=1
-    )
-    assert len(requests) == 1 and requests[0].wait_count == 0
-    handles["recv_prev"].wait()
-    payload = communicator.resolve_forward(received)
-    assert payload.metadata == (3, 0)
-    torch.testing.assert_close(payload.tensors[0], torch.full((3,), 7.0))
-    assert payload.tensors[1].numel() == 0
-
-    # Fixed buffers carry zeros, but the bitmap preserves inactive contributions.
-    _, handles = communicator.send_backward_recv_backward(
-        (None, None), False, None, overlap_p2p_comm=True, send_chunk_id=1
-    )
-    assert requests[-1].wait_count == 0
-    torch.testing.assert_close(requests[-1].buffer(), torch.zeros(3))
-    assert requests[-2].buffer()[-1].item() == 0
-    communicator.finish()
-    assert all(request.wait_count == 1 for request in requests)
-    assert not communicator._pending
-
-
-def test_overlap_empty_directions_still_have_wait_handles(delayed_transport):
-    communicator, requests, _ = delayed_transport
-    handles = communicator._transfer(
-        send_next=(torch.empty(0),), recv_next=(None, torch.empty(0)), overlap=True
-    )
-    assert set(handles) == {"send_next", "recv_next"}
-    assert not requests
+def test_overlap_empty_directions_still_have_wait_handles(fake_transport):
+    communicator, requests = fake_transport
+    handles = communicator._transfer(send_next=(torch.empty(0),), recv_next=(None, torch.empty(0)))
+    assert set(handles) == {"send_next", "recv_next"} and not requests
     for handle in handles.values():
         handle.wait()
+    communicator.payload_plans = [PipelinePayloadPlan((), ())] * 2
     communicator.finish()
 
 
-def test_batched_work_owns_every_direction_until_completion(delayed_transport, monkeypatch):
+def test_batched_work_owns_every_direction_until_completion(fake_transport, monkeypatch):
     """NCCL may return a single Work for a batch containing several field operations."""
-    communicator, _, _ = delayed_transport
+    communicator, _ = fake_transport
     communicator.config.batch_p2p_comm = True
     send, receive = torch.ones(3), torch.empty(3)
     references = []
@@ -589,274 +389,82 @@ def test_batched_work_owns_every_direction_until_completion(delayed_transport, m
     request = BatchWork()
     monkeypatch.setattr(dist, "P2POp", lambda *args: args)
     monkeypatch.setattr(dist, "batch_isend_irecv", lambda ops: [request])
-    handles = communicator._transfer(send_next=[send], recv_next=[receive], overlap=True)
-    references.extend(weakref.ref(handles[name]._buffers[0]) for name in ("send_next", "recv_next"))
+    handles = communicator._transfer(send_next=[send], recv_next=[receive])
+    references.extend(weakref.ref(handles[name].buffers[0]) for name in ("send_next", "recv_next"))
     del send, receive
-    # Waiting the later direction must wait the common Work too, not drop its buffer early.
+    # Waiting one direction must wait the common Work, not drop the other's buffer early.
     handles["recv_next"].wait()
     assert request.done and references[0]() is not None and references[1]() is None
     handles["send_next"].wait()
     assert all(ref() is None for ref in references)
+    communicator.payload_plans = [PipelinePayloadPlan((), ())] * 2
     communicator.finish()
-    assert not communicator._pending
-
-
-def test_gradient_activity_wait_is_deferred_until_backward_consumes_it():
-    control = torch.empty(4, dtype=torch.int64)
-    pending = {}
-    handle = _P2PWork([], [], pending)
-
-    class Receive:
-        waited = False
-
-        def wait(self):
-            self.waited = True
-            control.copy_(torch.tensor([0, 1, 17, 0]))
-
-    request = Receive()
-    handle._control_requests.append(request)
-    handle._control_buffers.append(control)
-    handle.wait()
-    assert not request.waited
-    message = PipelineGradientMessage(
-        (torch.ones(3),), control, (0, 1, 17), (0,), wait_control=handle.wait_control
-    )
-    assert message.resolve() == (None,)
-    assert request.waited and not handle._control_buffers
-
-
-@pytest.mark.parametrize("next_is_backward", [False, True])
-def test_warmup_prefetch_defers_header_and_preserves_peer_order(
-    delayed_transport, monkeypatch, next_is_backward
-):
-    communicator, requests, post = delayed_transport
-    communicator.config.overlap_p2p_comm_warmup_flush = True
-    sources = [
-        _Payload(
-            (torch.ones(3, requires_grad=True), torch.empty(0), torch.ones(2, dtype=torch.int32))
-        ),
-        _Payload((torch.ones(5, requires_grad=True), torch.ones(1, dtype=torch.bfloat16))),
-    ]
-    headers = iter(
-        torch.tensor(_pack_header(source.tensor_specs, source.metadata, i, chunk_id=1))
-        for i, source in enumerate(sources)
-    )
-    posted, factories = [], []
-    current_header = None
-
-    def post_receive(**kwargs):
-        nonlocal current_header
-        result = post(**kwargs)
-        for name, request in result.items():
-            tensor = request.buffer()
-            is_header = name == "recv_prev" and tensor.dtype in (torch.int64, torch.uint8)
-            is_length = is_header and tensor.numel() == 1
-            posted.append(
-                (name, "length" if is_length else "header" if is_header else tuple(tensor.shape))
-            )
-            if name.startswith("recv_"):
-                if is_length:
-                    current_header = next(headers)
-                    request.received_value = current_header.numel()
-                else:
-                    request.received_value = current_header if is_header else 7
-        return result
-
-    def factory(tensors, descriptor):
-        factories.append(descriptor.metadata)
-        return _make_payload(tensors, descriptor)
-
-    monkeypatch.setattr(
-        "megatron.core.pipeline_parallel.typed_p2p_communication._p2p_ops", post_receive
-    )
-    communicator.make_payloads[1] = factory
-    first, first_handles = communicator.send_forward_recv_forward(
-        None, True, None, overlap_p2p_comm=True, recv_chunk_id=1
-    )
-    assert posted == [("recv_prev", "length")]
-    assert requests[0].wait_count == 0 and not factories
-    assert not isinstance(first, PipelinePayload)
-
-    if next_is_backward:
-        # A gradient receive sharing PP=2's peer must not consume forward data.
-        communicator._sent[0].append(_MessageRecord(sources[0].descriptor, 0, 0))
-        _, next_handles = communicator.send_backward_recv_backward(
-            None, True, None, overlap_p2p_comm=True, recv_chunk_id=0
-        )
-        next_direction, next_shape = "recv_next", (3,)
-    else:
-        second, next_handles = communicator.send_forward_recv_forward(
-            None, True, None, overlap_p2p_comm=True, recv_chunk_id=1
-        )
-        next_direction, next_shape = "recv_prev", "length"
-    assert posted == [
-        ("recv_prev", "length"),
-        ("recv_prev", "header"),
-        ("recv_prev", (3,)),
-        ("recv_prev", (2,)),
-        *([(next_direction, (4,))] if next_is_backward else []),
-        (next_direction, next_shape),
-    ]
-    assert all(request.wait_count == 1 for request in requests[:2])
-    assert all(request.wait_count == 0 for request in requests[2:])
-    assert factories == [(3, 0)]
-
-    first_handles["recv_prev"].wait()
-    payload = communicator.resolve_forward(first)
-    torch.testing.assert_close(payload.tensors[0], torch.full((3,), 7.0))
-    reference = weakref.ref(payload)
-    del payload
-    assert reference() is None  # A retained wait handle must not retain model inputs.
-    with pytest.raises(RuntimeError, match="already been consumed"):
-        communicator.resolve_forward(first)
-    next_handles[next_direction].wait()
-    if not next_is_backward:
-        payload = communicator.resolve_forward(second)
-        torch.testing.assert_close(payload.tensors[0], torch.full((5,), 7.0))
-        assert factories == [(3, 0), (5, 1)]
-    for source in sources[: 1 if next_is_backward else 2]:
-        communicator.send_backward_recv_backward(
-            (None,) * len(source.tensors), False, None, overlap_p2p_comm=True, send_chunk_id=1
-        )
-    communicator.finish()
-    assert not communicator._pending and communicator._forward_header is None
-    assert all(request.wait_count == 1 for request in requests)
 
 
 @pytest.mark.parametrize("release", [False, True])
-def test_warmup_send_retains_header_and_all_fields_until_wait(delayed_transport, release):
-    communicator, requests, _ = delayed_transport
-    communicator.config.overlap_p2p_comm_warmup_flush = True
+def test_planned_exchange_posts_only_tensor_data(fake_transport, release):
+    communicator, requests = fake_transport
     communicator.config.deallocate_pipeline_outputs = release
-    communicator.forward_only = True
-    source = _Payload(
-        (torch.ones(2, 3, requires_grad=True).t(), torch.ones(2, dtype=torch.bfloat16))
-    )
-    _, handles = communicator.send_forward_recv_forward(source, False, None, overlap_p2p_comm=True)
-    assert bool(source.tensors) is not release
-    assert len(requests) == 4 and all(request.wait_count == 0 for request in requests)
-    assert requests[0].buffer().dtype == torch.int64
-    assert all(request.buffer().is_contiguous() for request in requests)
-    del source
-    handles["send_next"].wait()
-    communicator.finish()
-    assert all(request.wait_count == 1 and request.buffer() is None for request in requests)
-
-
-def test_retiring_send_advances_prefetched_data_before_wait(delayed_transport, monkeypatch):
-    communicator, requests, post = delayed_transport
-    communicator.config.overlap_p2p_comm_warmup_flush = True
-    communicator.forward_only = True
-    source = _Payload((torch.ones(3), torch.empty(0)))
-    wire_header = torch.tensor(_pack_header(source.tensor_specs, source.metadata, 0, chunk_id=1))
-
-    def post_receive(**kwargs):
-        result = post(**kwargs)
-        for name, request in result.items():
-            if name == "recv_prev":
-                request.received_value = (
-                    wire_header.numel()
-                    if request.buffer().shape == (1,) and request.buffer().dtype == torch.int64
-                    else wire_header if request.buffer().dtype == torch.uint8 else 9
-                )
-        return result
-
-    monkeypatch.setattr(
-        "megatron.core.pipeline_parallel.typed_p2p_communication._p2p_ops", post_receive
-    )
-    received, _ = communicator.send_forward_recv_forward(
-        None, True, None, overlap_p2p_comm=True, recv_chunk_id=1
-    )
-    empty = communicator._transfer(send_prev=(torch.empty(0),), overlap=True)
-    empty["send_prev"].wait()
-    assert len(requests) == 1 and requests[0].wait_count == 0
-    _, handles = communicator.send_forward_recv_forward(source, False, None, overlap_p2p_comm=True)
-    assert len(requests) == 4 and all(request.wait_count == 0 for request in requests)
-    handles["send_next"].wait()
-    # Retiring a send must first post the prefetched payload's data. Otherwise
-    # neighbors can both block retiring sends that have no posted data receives.
-    assert len(requests) == 6 and requests[0].wait_count == 1
-    assert requests[-1].name == "recv_prev" and requests[-1].wait_count == 0
-    payload = communicator.resolve_forward(received)
-    torch.testing.assert_close(payload.tensors[0], torch.full((3,), 9.0))
-    communicator.finish()
-    assert not communicator._pending
-
-
-@pytest.mark.parametrize("release", [False, True])
-def test_prepared_receive_posts_all_fields_without_waiting_for_a_header(
-    delayed_transport, monkeypatch, release
-):
-    communicator, requests, post = delayed_transport
-    communicator.config.deallocate_pipeline_outputs = release
-    communicator.forward_only = True
-    source = _Payload((torch.ones(3), torch.empty(0), torch.ones(2, dtype=torch.int64)))
-    descriptor = PipelinePayloadSpec(source.tensor_specs, source.metadata)
-    communicator.payload_plans = [
-        PipelinePayloadPlan((None,), (descriptor,)),
-        PipelinePayloadPlan((descriptor,), (None,)),
-    ]
-
-    def no_header(*args, **kwargs):
-        pytest.fail("Prepared communication must never build or parse a header")
-
-    def post_receive(**kwargs):
-        result = post(**kwargs)
-        for name, request in result.items():
-            if name == "recv_prev":
-                request.received_value = (
-                    torch.tensor((0, 1, descriptor.fingerprint))
-                    if request.buffer().shape == (3,) and request.buffer().dtype == torch.int64
-                    else 7
-                )
-        return result
-
-    monkeypatch.setattr(
-        "megatron.core.pipeline_parallel.typed_p2p_communication._pack_header", no_header
-    )
-    monkeypatch.setattr(
-        "megatron.core.pipeline_parallel.typed_p2p_communication._unpack_header", no_header
-    )
-    monkeypatch.setattr(
-        "megatron.core.pipeline_parallel.typed_p2p_communication._p2p_ops", post_receive
+    hidden = torch.ones(3, requires_grad=True) * 2
+    source = TensorStatePayload.from_state(
+        hidden,
+        {"empty": torch.empty(0, dtype=torch.bfloat16), "ids": torch.arange(2)},
+        TensorSchema(_TRANSFER_SPEC.fields[1:]),
+        boundary_id=_TRANSFER_SPEC.boundary_id,
+        metadata=_TRANSFER_SPEC.metadata,
     )
     received, handles = communicator.send_forward_recv_forward(
         source, True, None, overlap_p2p_comm=True, send_chunk_id=0, recv_chunk_id=1
     )
     assert bool(source.tensors) is not release
-    assert isinstance(received, PipelinePayload)
-    assert len(requests) == 6  # Identity + two fields each way; no dynamic descriptor.
+    assert received.spec == _TRANSFER_SPEC and received.tensors[0].requires_grad
+    assert len(requests) == 4  # hidden and ids each way; the empty field has no data.
     assert all(request.wait_count == 0 for request in requests)
-    assert communicator._forward_header is None
+    for request in requests:
+        request.value = 7 if request.operation == "recv" else None
     handles["recv_prev"].wait()
     torch.testing.assert_close(received.tensors[0], torch.full((3,), 7.0))
-    assert received.tensors[1].numel() == 0
+    gradients = backward_pipeline_payload(received, received.tensors[0].sum(), None)
+    _, handles = communicator.send_backward_recv_backward(
+        gradients, True, None, overlap_p2p_comm=True, send_chunk_id=1, recv_chunk_id=0
+    )
+    handles["recv_next"].wait()
     communicator.finish()
     assert all(request.wait_count == 1 for request in requests)
 
 
 @pytest.mark.parametrize("mismatch", ["shape", "dtype", "grad", "metadata"])
 @pytest.mark.parametrize("forward_only", [False, True])
-def test_prepared_sender_rejects_stale_plan_before_posting(
-    delayed_transport, mismatch, forward_only
-):
-    communicator, requests, _ = delayed_transport
+def test_planned_sender_rejects_stale_plan_before_posting(fake_transport, mismatch, forward_only):
+    communicator, requests = fake_transport
     communicator.forward_only = forward_only
-    source = _Payload((torch.ones(3, requires_grad=True), torch.empty(0)))
-    spec = source.tensor_specs[0]
-    replacement = _spec(
-        spec.name,
-        (5,) if mismatch == "shape" else spec.shape,
-        torch.bfloat16 if mismatch == "dtype" else spec.dtype,
-        False if mismatch == "grad" else spec.requires_grad,
+    field = _TRANSFER_SPEC.fields[0]
+    replaced = TensorField(
+        field.key,
+        (5,) if mismatch == "shape" else field.shape,
+        torch.bfloat16 if mismatch == "dtype" else field.dtype,
+        field.layout,
+        mismatch != "grad",
     )
-    descriptor = PipelinePayloadSpec(
-        (replacement, source.tensor_specs[1]), (5, 0) if mismatch == "metadata" else source.metadata
+    stale = PipelinePayloadSpec(
+        (replaced, *_TRANSFER_SPEC.fields[1:]),
+        (5, 0) if mismatch == "metadata" else _TRANSFER_SPEC.metadata,
     )
-    communicator.payload_plans = [PipelinePayloadPlan((None,), (descriptor,))] * 2
+    communicator.payload_plans = [PipelinePayloadPlan((None,), (stale,))] * 2
+    source = TensorStatePayload(
+        (torch.ones(3), torch.empty(0, dtype=torch.bfloat16), torch.arange(2)), _TRANSFER_SPEC
+    )
     with pytest.raises(ValueError, match="disagrees"):
         communicator.send_forward_recv_forward(source, False, None, overlap_p2p_comm=True)
     assert not requests
+
+
+def test_bad_gradient_length_is_rejected_without_consuming_forward(fake_transport):
+    communicator, requests = fake_transport
+    communicator._received[0].append(_TRANSFER_SPEC)
+    with pytest.raises(ValueError, match="match the incoming field slots"):
+        communicator.send_backward((), is_first_stage=False)
+    assert communicator._received[0][0] is _TRANSFER_SPEC and not requests
 
 
 class _Timer:
@@ -879,38 +487,65 @@ class _Timers(dict):
         return self[name]
 
 
+def _boundary_spec(x, microbatch, train):
+    """Per-microbatch plan: shapes vary, and 'aux' is differentiable on even microbatches."""
+    rows = x.shape[0]
+    return PipelinePayloadSpec(
+        (
+            _field("__hidden__", x.shape, torch.float32, True, "strided"),
+            _field("shared", (rows // 2, 2), torch.bfloat16, train),
+            _field("aux", (rows,), torch.float32, train and microbatch % 2 == 0),
+            _field("indices", (rows, 2), torch.int32, False),
+            _field("prefixes", (rows % 3 + 2,), torch.int64, False),
+            _field("absent", (rows,), torch.float32, False, present=False),
+        ),
+        (rows, rows // 2),
+        "test",
+    )
+
+
 class _Stage(torch.nn.Module):
+    pipeline_payload_factory = TensorStatePayload
+
     def __init__(self, config, rank, size, device):
         super().__init__()
-        self.config = config
+        self.config, self.rank, self.size = config, rank, size
         self.model_type = ModelType.encoder_or_decoder
-        self.rank = rank
-        self.size = size
         self.weight = torch.nn.Parameter(torch.tensor((rank + 1) / 2, device=device))
-        self.pipeline_payload_factory = _make_payload
-        self.input_tensor = None
-        self.references = []
+        self.input_tensor, self.calls, self.references = None, 0, []
 
     def set_input_tensor(self, inputs):
         self.input_tensor = inputs[0] if isinstance(inputs, list) else inputs
 
     def forward(self, x):
         incoming, self.input_tensor = self.input_tensor, None
+        spec = _boundary_spec(x, self.calls, torch.is_grad_enabled())
+        self.calls += 1
         if self.rank == 0:
             hidden = x * self.weight
             rows = x.shape[0] // 2
-            # A non-contiguous differentiable view, including zero capacity.
-            shared = (self.weight * torch.ones(2, rows, device=x.device)).to(torch.bfloat16).t()
-            unused = self.weight * torch.ones(x.shape[0], device=x.device)
-            indices = torch.zeros(x.shape[0], 2, device=x.device, dtype=torch.int32)
-            prefixes = torch.arange(x.shape[0] % 3 + 2, device=x.device, dtype=torch.int64)
+            state = {
+                # A non-contiguous differentiable view, including zero capacity.
+                "shared": (self.weight * torch.ones(2, rows, device=x.device)).bfloat16().t(),
+                "aux": self.weight * torch.ones(x.shape[0], device=x.device),
+                "indices": torch.zeros(x.shape[0], 2, device=x.device, dtype=torch.int32),
+                "prefixes": torch.arange(x.shape[0] % 3 + 2, device=x.device),
+            }
         else:
             self.references.append(weakref.ref(incoming))
-            hidden, shared, unused, indices, prefixes = incoming.tensors
-            hidden = hidden * self.weight + shared.float().sum() * self.weight
+            hidden, state = incoming.restore()
+            hidden = hidden * self.weight + state["shared"].float().sum() * self.weight
+            if incoming.spec.fields[2].differentiable:
+                hidden = hidden + state["aux"].sum() * self.weight
         if self.rank == self.size - 1:
             return hidden.sum()
-        payload = _Payload((hidden, shared, unused, indices, prefixes))
+        payload = TensorStatePayload.from_state(
+            hidden,
+            state,
+            TensorSchema(spec.fields[1:]),
+            boundary_id=spec.boundary_id,
+            metadata=spec.metadata,
+        )
         self.references.append(weakref.ref(payload))
         return payload
 
@@ -933,14 +568,12 @@ def transport_groups():
     singleton_groups = [dist.new_group([i]) for i in range(size)]
     groups = ProcessGroupCollection()
     groups.pp = dist.new_group(list(range(size)))
-    groups.control = create_pipeline_control_group(groups.pp, world_group=dist.group.WORLD)
     groups.tp = groups.cp = singleton_groups[rank]
     # Initialize the full PP communicator before mixing batched and unbatched P2P.
     # Lazy pairwise NCCL communicators can hang when this fixture shuts them down.
     dist.barrier(group=groups.pp)
     yield groups, device
     dist.barrier()
-    dist.destroy_process_group(groups.control)
     dist.destroy_process_group(groups.pp)
     dist.destroy_process_group(singleton_groups[rank])
 
@@ -1002,20 +635,10 @@ def test_typed_adapter_rejects_custom_communicator(transport_groups, interleaved
         (3, 3, True, 2),
     ],
 )
-@pytest.mark.parametrize("planned", [False, True], ids=["dynamic-header", "prepared"])
 def test_typed_1f1b_actual_transport(
-    transport_groups,
-    batch_p2p,
-    overlap,
-    warmup_flush,
-    vp_size,
-    count,
-    forward_only,
-    group_multiple,
-    planned,
-    monkeypatch,
+    transport_groups, batch_p2p, overlap, warmup_flush, vp_size, count, forward_only, group_multiple
 ):
-    """Exercise ordinary/VPP P2P, rank wraparound, dynamic FIFO shapes and release."""
+    """Ordinary/VPP P2P, rank wraparound, per-microbatch shapes/eligibility and release."""
     if overlap and vp_size == 1:
         pytest.skip("P2P overlap requires VPP")
     groups, device = transport_groups
@@ -1038,38 +661,19 @@ def test_typed_1f1b_actual_transport(
     )
     if warmup_flush:
         with pytest.raises(ValueError, match="warmup/flush prefetch"):
-            TypedP2PCommunicator(groups.pp, config, [_make_payload] * vp_size, device=device)
-        return
-    if (batch_p2p or overlap) and not planned:
-        with pytest.raises(ValueError, match="prepared"):
-            TypedP2PCommunicator(groups.pp, config, [_make_payload] * vp_size, device=device)
+            TypedP2PCommunicator(groups.pp, config, [TensorStatePayload] * vp_size, [])
         return
     models = [_Stage(config, rank + vp * size, size * vp_size, device) for vp in range(vp_size)]
-    for model in models:
-        model.pipeline_control_group = groups.control
     reference = [_Stage(config, i, size * vp_size, device) for i in range(size * vp_size)]
     batches = [
         torch.arange((1, 4, 7)[i % 3] * 3, device=device).float().reshape(-1, 1, 3) / 8
         for i in range(count)
     ]
-    if planned:
-
-        def no_header(*args, **kwargs):
-            pytest.fail("Prepared transport must not use dynamic headers")
-
-        monkeypatch.setattr(
-            "megatron.core.pipeline_parallel.typed_p2p_communication._pack_header", no_header
-        )
-        monkeypatch.setattr(
-            "megatron.core.pipeline_parallel.typed_p2p_communication._unpack_header", no_header
-        )
-
     for _ in range(2):
-        expected = []
-        for model in models:
-            model.zero_grad(set_to_none=True)
-        for stage in reference:
+        expected, actual = [], []
+        for stage in (*models, *reference):
             stage.zero_grad(set_to_none=True)
+            stage.calls = 0
         with torch.set_grad_enabled(not forward_only):
             for x in batches:
                 value = None
@@ -1079,7 +683,8 @@ def test_typed_1f1b_actual_transport(
                 expected.append(value.detach().clone())
                 if not forward_only:
                     (value / count).backward()
-            actual = []
+            for stage in models:
+                stage.calls = 0
 
             def forward_step(iterator, stage):
                 output = stage(next(iterator))
@@ -1090,43 +695,27 @@ def test_typed_1f1b_actual_transport(
 
                 return output, loss_func
 
-            iterators = [iter(batches) for _ in models]
-            if planned:
-                descriptors = []
-                for x in batches:
-                    rows = x.shape[0]
-                    fields = [
-                        (tuple(x.shape), torch.float32, not forward_only),
-                        ((rows // 2, 2), torch.bfloat16, not forward_only),
-                        ((rows,), torch.float32, not forward_only),
-                        ((rows, 2), torch.int32, False),
-                        ((rows % 3 + 2,), torch.int64, False),
-                    ]
-                    descriptors.append(
-                        PipelinePayloadSpec(
-                            tuple(_spec(str(i), *field) for i, field in enumerate(fields)),
-                            (rows, rows // 2),
-                        )
-                    )
-                iterators = [
-                    PipelineDataIterator(
-                        batches,
-                        PipelinePayloadPlan(
-                            tuple(descriptors) if stage.rank else (None,) * count,
-                            tuple(descriptors) if stage.rank < stage.size - 1 else (None,) * count,
-                        ),
-                    )
-                    for stage in models
-                ]
+            descriptors = tuple(
+                _boundary_spec(x, i, not forward_only) for i, x in enumerate(batches)
+            )
+            iterators = [
+                PipelineDataIterator(
+                    batches,
+                    PipelinePayloadPlan(
+                        descriptors if stage.rank else (None,) * count,
+                        descriptors if stage.rank < stage.size - 1 else (None,) * count,
+                    ),
+                )
+                for stage in models
+            ]
 
-                def prepare(iterator, stage, count, *, forward_only):
-                    timer = stage.config.timers('forward-backward')
-                    assert timer.started == timer.stopped + 1
-                    assert count == len(iterator.pipeline_payload_plan.incoming)
-                    return iterator
+            def prepare(iterator, stage, count, *, forward_only):
+                timer = stage.config.timers('forward-backward')
+                assert timer.started == timer.stopped + 1
+                assert count == len(iterator.pipeline_payload_plan.incoming)
+                return iterator
 
-                forward_step.prepare_pipeline_inputs = prepare
-
+            forward_step.prepare_pipeline_inputs = prepare
             schedule = (
                 forward_backward_pipelining_with_interleaving
                 if vp_size > 1
@@ -1162,112 +751,24 @@ def test_typed_1f1b_actual_transport(
             assert any("recv" in name for name in config.timers)
 
 
-@pytest.mark.parametrize("view", [False, True])
-@pytest.mark.parametrize("empty", [False, True])
-def test_owned_hidden_release_preserves_saved_aliases_and_joint_gradients(view, empty):
-    leaf = torch.arange(12, dtype=torch.float32).reshape(3, 4).requires_grad_()
-    expected_leaf = leaf.detach().clone().requires_grad_()
-    hidden, expected_hidden = leaf.sigmoid(), expected_leaf.sigmoid()
-    if view:
-        hidden, expected_hidden = hidden.t(), expected_hidden.t()
-    if empty:
-        hidden, expected_hidden = hidden[:0], expected_hidden[:0]
-    shared = hidden  # Deliberately share the very same Tensor with the state.
-    schema = TensorSchema((TensorField("shared", hidden.shape, hidden.dtype, "local", True),))
-    payload = TensorStatePayload.from_state(hidden, {"shared": shared}, schema)
-    wire = payload.tensors[0].detach().contiguous()
-    snapshot = hidden.detach().clone()
-    payload.release_output()
-    assert payload._backward_state.outputs[0].numel() == 1
-    assert hidden.shape == snapshot.shape and shared is hidden
-    torch.testing.assert_close(hidden, snapshot)
-    torch.testing.assert_close(wire, snapshot)
-    backward_pipeline_payload(
-        None, payload, (torch.ones_like(snapshot), torch.full_like(snapshot, 2))
+def test_schedule_requires_prepared_plans(transport_groups):
+    groups, device = transport_groups
+    config = TransformerConfig(
+        num_layers=groups.pp.size(),
+        hidden_size=8,
+        num_attention_heads=1,
+        pipeline_model_parallel_size=groups.pp.size(),
+        pipeline_dtype=torch.float32,
+        batch_p2p_comm=False,
     )
-    (expected_hidden.sum() * 3).backward()
-    torch.testing.assert_close(leaf.grad, expected_leaf.grad)
-    assert payload._backward_state.outputs == ()
-
-
-def test_owned_hidden_release_does_not_retain_an_unaliased_output_storage():
-    leaf = torch.ones(4096, requires_grad=True)
-    hidden = leaf * 2
-    reference = weakref.ref(hidden)
-    payload = TensorStatePayload.from_state(hidden, {}, TensorSchema(()))
-    del hidden
-    gc.collect()
-    assert reference() is None
-    payload.release_output()
-    root = payload._backward_state.outputs[0]
-    assert root.numel() == 1 and root.untyped_storage().nbytes() == root.element_size()
-    backward_pipeline_payload(None, payload, (torch.ones_like(leaf),))
-    torch.testing.assert_close(leaf.grad, torch.full_like(leaf, 2))
-
-
-def test_bad_gradient_length_is_rejected_without_consuming_forward(delayed_transport):
-    communicator, requests, _ = delayed_transport
-    descriptor = PipelinePayloadSpec((_spec("hidden", (3,), torch.float32, True),), ())
-    record = _MessageRecord(descriptor, 0, 0)
-    communicator._received[0].append(record)
-    with pytest.raises(ValueError, match="match the incoming field slots"):
-        communicator.send_backward((), is_first_stage=False)
-    assert communicator._received[0][0] is record
-    assert not requests
-
-
-def test_prepared_identity_is_checked_before_forward_handoff(delayed_transport, monkeypatch):
-    communicator, _, post = delayed_transport
-    communicator.forward_only = True
-    descriptor = _Payload((torch.ones(3), torch.empty(0))).descriptor
-    communicator.payload_plans = [
-        PipelinePayloadPlan((None,), (descriptor,)),
-        PipelinePayloadPlan((descriptor,), (None,)),
-    ]
-
-    def receive(**kwargs):
-        works = post(**kwargs)
-        for name, work in works.items():
-            if name == "recv_prev":
-                work.received_value = (
-                    torch.tensor((99, 1, descriptor.fingerprint))
-                    if work.buffer().dtype == torch.int64
-                    else 1
-                )
-        return works
-
-    monkeypatch.setattr("megatron.core.pipeline_parallel.typed_p2p_communication._p2p_ops", receive)
-    payload, _ = communicator.send_forward_recv_forward(
-        None, True, None, overlap_p2p_comm=True, recv_chunk_id=1
-    )
-    with pytest.raises(ValueError, match="forward microbatch/chunk/boundary"):
-        communicator.resolve_forward(payload)
-
-
-def test_release_drops_readonly_outputs_after_the_wire_owns_them():
-    leaf = torch.ones(4, requires_grad=True)
-    ids = torch.arange(4)
-    reference = weakref.ref(ids)
-    payload = TensorStatePayload.from_state(
-        leaf * 2,
-        {"ids": ids},
-        TensorSchema((TensorField("ids", (4,), torch.int64, "local", False),)),
-    )
-    wire = payload.tensors[1].detach()
-    del ids
-    payload.release_output()
-    gc.collect()
-    assert reference() is None and payload._backward_state.outputs[1] is None
-    torch.testing.assert_close(wire, torch.arange(4))
-    backward_pipeline_payload(None, payload, (torch.ones_like(leaf), None))
-    torch.testing.assert_close(leaf.grad, torch.full_like(leaf, 2))
-
-
-def test_released_identity_payload_still_returns_input_gradients():
-    hidden = torch.ones(4, requires_grad=True)
-    ids = torch.arange(4)
-    incoming = _Payload((hidden, ids))
-    incoming.release_output()  # The stage returns exactly its received payload.
-    gradients = backward_pipeline_payload(incoming, incoming, (torch.full_like(hidden, 3), None))
-    torch.testing.assert_close(gradients[0], torch.full_like(hidden, 3))
-    assert gradients[1] is None
+    with pytest.raises(ValueError, match="PipelinePayloadPlan"):
+        forward_backward_pipelining_without_interleaving(
+            forward_step_func=lambda *args: pytest.fail("must fail before forward"),
+            data_iterator=iter(()),
+            model=_Stage(config, groups.pp.rank(), groups.pp.size(), device),
+            num_microbatches=2,
+            seq_length=8,
+            micro_batch_size=1,
+            p2p_communicator=P2PCommunicator(groups.pp, config),
+            pg_collection=groups,
+        )
