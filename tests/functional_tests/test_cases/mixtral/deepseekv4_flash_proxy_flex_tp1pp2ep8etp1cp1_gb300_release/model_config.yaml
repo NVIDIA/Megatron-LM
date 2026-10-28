@@ -13,8 +13,10 @@ ENV_VARS:
   NCCL_DEBUG: VERSION
   NON_DETERMINSTIC_RESULTS: 1
   NVSHMEM_IB_ENABLE_IBGDA: 0
-  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: 16
+  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: 8
   USE_MNNVL: 1
+  # Preserve each eight-rank expert group within a two-node NVLink segment.
+  FT_NODE_SEGMENT_SIZE: 2
 BEFORE_SCRIPT: |
   # Hash routing needs the real vocabulary before HybridModel config validation.
   # Write a private runtime config per node; the harness's .tmp file is shared.
@@ -52,8 +54,8 @@ MODEL_ARGS:
   # Distributed args
   --distributed-timeout-minutes: 60
   --tensor-model-parallel-size: 1
-  --pipeline-model-parallel-size: 4
-  --expert-model-parallel-size: 16
+  --pipeline-model-parallel-size: 2
+  --expert-model-parallel-size: 8
   --context-parallel-size: 1
   --expert-tensor-parallel-size: 1
   --use-distributed-optimizer: true
@@ -76,11 +78,11 @@ MODEL_ARGS:
   # Transformer Engine args
   --transformer-impl: transformer_engine
 
-  # Data args
+  # SlimPajama preprocessed with the paired DeepSeek-V4 Flash tokenizer.
   --seq-length: 4096
   --data-cache-path: ${DATA_CACHE_PATH}
-  --tokenizer-type: GPTSentencePieceTokenizer
-  --tokenizer-model: ${DATA_PATH}/utils/nemotron_2_256k.model
+  --tokenizer-type: HuggingFaceTokenizer
+  --tokenizer-model: ${DATA_PATH}/model/DeepSeek-V4-Flash
   --data-path: $DATA_BLEND
   --split: 99,1,0
   --no-mmap-bin-files: true
@@ -90,7 +92,7 @@ MODEL_ARGS:
   # DSv4 hybrid attention and MoE composition. Keep the first three hash MoE
   # layers on the embedding stage; /WE supplies the MTP inner layers.
   --spec: "[megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec]"
-  --hybrid-layer-pattern: "WEWECEHE|CEHECEHE|CEHECE|HECEHE/WE"
+  --hybrid-layer-pattern: "WEWECEHECEHECE|HECEHECEHECEHE/WE"
   --experimental-attention-variant: dsv4_hybrid
   --enable-mhc-connections: true
   --mhc-num-residual-streams: 4
@@ -108,7 +110,7 @@ MODEL_ARGS:
   --max-position-embeddings: 4096
   --position-embedding-type: rope
   --rotary-base: 10000
-  --make-vocab-size-divisible-by: 3232
+  --make-vocab-size-divisible-by: 1280
   --normalization: RMSNorm
   --norm-epsilon: 1e-6
   --swiglu: true
@@ -222,7 +224,7 @@ MODEL_ARGS:
 
   # enable experimental
   --enable-experimental: true
-  --exit-interval: 9536
+  --exit-interval: 47683
 METRICS:
   - "iteration-time"
   - "lm loss"
