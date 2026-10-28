@@ -1,6 +1,4 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-from functools import partial
-
 import pytest
 import torch
 import torch.distributed as dist
@@ -8,7 +6,6 @@ import transformer_engine.pytorch.module.linear as te_linear
 
 from megatron.core.transformer import attention
 from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
-from megatron.core.transformer.enums import AttnBackend
 from tests.unit_tests.inference.engines import disagg_test_utils as du
 from tests.unit_tests.inference.engines import test_dynamic_engine as dynamic_tests
 from tests.unit_tests.inference.engines.test_disagg_pairwise import transport_world  # noqa: F401
@@ -48,7 +45,6 @@ def _observe(engine, active):
 
 
 def _install_factory(monkeypatch):
-    constructor = dynamic_tests.TransformerConfig
     rounder = dynamic_tests.set_rounder
     active = [None]
 
@@ -70,16 +66,6 @@ def _install_factory(monkeypatch):
         trace(type(fa3), "__call__", 2, fa3)
         trace(attention, "flash_attn3_with_kvcache", 2)
     monkeypatch.setattr(dynamic_tests, "set_rounder", lambda _: rounder(64))
-    monkeypatch.setattr(
-        dynamic_tests,
-        "TransformerConfig",
-        partial(
-            constructor,
-            attention_backend=AttnBackend.flash,
-            attention_dropout=0.0,
-            batch_invariant_mode=True,
-        ),
-    )
     return active
 
 
@@ -93,7 +79,9 @@ def _assert_target_equal(left, right):
 def test_disaggregated_prefill_is_batch_invariant(transport_world, monkeypatch):
     active = _install_factory(monkeypatch)
     config = du.disagg_config(
-        flash_attention_version=du.FLASH_ATTENTION_VERSION, context_max_requests=128
+        flash_attention_version=du.FLASH_ATTENTION_VERSION,
+        context_max_requests=128,
+        batch_invariant_mode=True,
     )
     tokens, neighbor_tokens, params = du.prompt(33), du.prompt(66)[1:], du.sampling(2)
     source = dist.get_rank() % 2 == 0

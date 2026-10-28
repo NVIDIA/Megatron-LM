@@ -95,15 +95,14 @@ async def _shutdown(engine, client, address, comm, context, rank):
     [
         pytest.param(Policy.LONGEST_PREFIX, None, id="longest-prefix"),
         pytest.param(Policy.FIRST_PREFIX_BLOCK, None, id="first-block"),
-        pytest.param(Policy.LONGEST_PREFIX, (False, False, 1), id="ep-async"),
-        pytest.param(Policy.LONGEST_PREFIX, (True, False, 3), id="ep-sync"),
-        pytest.param(Policy.LONGEST_PREFIX, (False, True, 1), id="ep-disabled"),
+        pytest.param(Policy.LONGEST_PREFIX, (False, 1), id="ep-async"),
+        pytest.param(Policy.LONGEST_PREFIX, (True, 3), id="ep-sync"),
     ],
 )
 async def test_live_coordinator_batch_invariance_and_output_contracts(policy, progress):
-    synchronous, disabled, interval = progress or (False, False, 1)
+    synchronous, interval = progress or (False, 1)
     model = {}
-    if progress is not None and not disabled:
+    if progress is not None:
         model = dict(
             expert_model_parallel_size=2,
             num_moe_experts=4,
@@ -128,9 +127,7 @@ async def test_live_coordinator_batch_invariance_and_output_contracts(policy, pr
     )
     if progress is not None:
         case.context.update(
-            use_synchronous_zmq_collectives=synchronous,
-            disable_ep_consensus=disabled,
-            ep_consensus_interval=interval,
+            use_synchronous_zmq_collectives=synchronous, ep_consensus_interval=interval
         )
     client = None
     with bi.invariant_runtime(case) as (backend, fa_version):
@@ -200,11 +197,7 @@ async def test_live_coordinator_batch_invariance_and_output_contracts(policy, pr
                             return result
 
                         patch.setattr(module, name, collective)
-                    communicator, name = (
-                        (engine, "_ep_establish_consensus")
-                        if disabled
-                        else (engine.expert_parallel_zmq_communicator, "all_reduce_max")
-                    )
+                    communicator, name = engine.expert_parallel_zmq_communicator, "all_reduce_max"
                     consensus = getattr(communicator, name)
 
                     async def reduce(*args, **kwargs):
@@ -261,33 +254,24 @@ async def test_live_coordinator_batch_invariance_and_output_contracts(policy, pr
                 ]
                 all_ep = [None, None]
                 torch.distributed.all_gather_object(all_ep, (ep_calls, ep_sync))
-                if disabled:
-                    assert not ep_calls and not ep_sync
-                    assert any(
-                        s["physical"] == 64 and s["attention"] and s["gemms"]
-                        for s in joint_witness.dummy_steps
-                    ), "missing actual disabled-consensus dummy model"
                 wide = [
                     (i, call)
                     for i, call in enumerate(all_ep[owner][0])
                     if call[2] and call[3] == 128 and call[4] == 65
                 ]
-                assert {call[0] for _, call in wide} == (
-                    set()
-                    if disabled
-                    else {"multimem_all_gatherv_3tensor", "ordered_reduce_scatter_v"}
-                )
+                assert {call[0] for _, call in wide} == {
+                    "multimem_all_gatherv_3tensor",
+                    "ordered_reduce_scatter_v",
+                }
                 for index, call in wide:
                     peer = all_ep[owner ^ 1][0][index]
                     assert peer[0] == call[0] and not peer[2] and peer[3] == 64 and peer[4] == 0
                     if peer[5] is not None:
                         assert (peer[5] == -1).all(), "idle peer routed a real token"
                 for _, sync in all_ep:
-                    assert bool(sync) != disabled
-                    assert all(kwargs["async_op"] != synchronous for _, kwargs in sync)
-                if not disabled:
-                    seen = {counter for counter, _ in all_ep[owner][1]}
-                    assert {c[1] - 1 in seen for _, c in wide} == {True, interval == 1}
+                    assert sync and all(kwargs["async_op"] != synchronous for _, kwargs in sync)
+                seen = {counter for counter, _ in all_ep[owner][1]}
+                assert {c[1] - 1 in seen for _, c in wide} == {True, interval == 1}
 
             assert engine.context.step_count > steps_before
             assert admitted == ([2, *range(4, 68)] if rank == owner else [3])

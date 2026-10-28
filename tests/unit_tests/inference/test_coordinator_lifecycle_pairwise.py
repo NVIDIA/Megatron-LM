@@ -201,8 +201,9 @@ async def test_routed_epoch_change_reaches_all_engines(monkeypatch, synchronous)
 
 async def test_routed_allocator_pressure_preserves_victim_identity(monkeypatch):
     prompt, params = list(range(4, 20)), greedy_params()
+    # Sized for five active blocks and one paused block at the fixture's hidden size.
     async with routed_model(
-        monkeypatch, context_buffer_size_gb=0.00004, context_paused_buffer_size_gb=0.000008
+        monkeypatch, context_buffer_size_gb=0.00008, context_paused_buffer_size_gb=0.000016
     ) as h:
         direct = await h.direct(prompt, params)
         context, transitions = h.engine.context, []

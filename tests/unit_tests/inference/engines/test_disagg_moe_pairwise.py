@@ -28,6 +28,11 @@ async def finish_live_request(engine, future, control):
         while not work.is_completed():
             await asyncio.sleep(0.001)
         work.wait()
+    # Follow the coordinator's PAUSE-then-STOP order: stopping a running loop can
+    # strand an EP peer in consensus while this rank waits at the world barrier.
+    engine.state = EngineState.PAUSING
+    engine._state_events[EngineState.RUNNING].clear()
+    await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=60)
     engine.state = EngineState.STOPPING
     await asyncio.wait_for(asyncio.shield(engine.engine_loop_task), timeout=60)
     return future.result() if future is not None else None

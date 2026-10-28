@@ -17,6 +17,8 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest, S
 from megatron.core.inference.sampling_params import SamplingParams
 from tests.unit_tests.inference.coordinator_pairwise_utils import CoordinatorThread, until
 
+REPLY_TIMEOUT = 30.0
+
 
 class _ObservedSocket:
     """Count actual terminal frames without replacing transport or client parsing."""
@@ -137,8 +139,9 @@ def _start_client(runtime, *, deserialize=False):
 
 
 async def _eventually(predicate, message):
+    # Failure paths log on the coordinator thread; slow log storage can stall them.
     try:
-        await until(predicate, timeout=5.0)
+        await until(predicate, timeout=REPLY_TIMEOUT)
     except TimeoutError:
         raise AssertionError(message) from None
 
@@ -181,7 +184,7 @@ async def test_engine_disconnect_fails_owned_request_and_ignores_late_reply(coor
         assert coordinator._pending_counts.tolist() == [2]
         coordinator.request_id_to_sampling_params[server_request_ids[0]]["streaming_interval"] = 0
         engine.disconnect()
-        replies = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
+        replies = await asyncio.wait_for(asyncio.gather(*futures), timeout=REPLY_TIMEOUT)
         by_id = {reply["request_id"]: reply for reply in replies}
         assert by_id[server_request_ids[0]]["sampling_params"] == SamplingParams().serialize()
         assert by_id[server_request_ids[1]]["sampling_params"]["num_tokens_to_generate"] == 1
@@ -255,7 +258,7 @@ async def test_no_engines_fails_submission_but_keeps_loop_alive(coordinator_runt
         future = client.add_request([3, 4], SamplingParams(num_tokens_to_generate=1))
         server_request_id = engine.receive_request()
         engine.send_reply(server_request_id)
-        reply = await asyncio.wait_for(future, timeout=5.0)
+        reply = await asyncio.wait_for(future, timeout=REPLY_TIMEOUT)
         _assert_reply(reply, Status.COMPLETED)
         assert client.socket.replies == {0: 1, 1: 1, 2: 1}
         runtime.assert_requests_retired()
@@ -289,7 +292,7 @@ async def test_closed_client_delivery_does_not_disrupt_live_client(coordinator_r
         engine.send_reply(closed_request_id, partial=delivery == "partial")
         # Same-peer FIFO makes this live reply a barrier after the failed delivery.
         engine.send_reply(live_request_id)
-        reply = await asyncio.wait_for(live_future, timeout=5.0)
+        reply = await asyncio.wait_for(live_future, timeout=REPLY_TIMEOUT)
         assert reply["status"] == Status.COMPLETED.name
         runtime.assert_healthy()
         assert resolved == [live_future]

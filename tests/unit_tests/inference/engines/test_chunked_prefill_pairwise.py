@@ -76,6 +76,16 @@ _PREFIX_LENGTH = 2 * _BLOCK_SIZE
 _PREFIX_FOLLOWER_LENGTH = _PREFIX_LENGTH + 300
 _MAX_SEQUENCE_LENGTH = 896
 _FLASH_ATTENTION_VERSION = 4 if HAVE_FA4 else (3 if HAVE_FA3 else None)
+# Production lets FA4 choose a KV split count, but the installed FA4 cannot split KV
+# on SM90. Rows that attend over more than four KV tiles make it pick a split and fail.
+_FA4_SPLIT_KV_UNSUPPORTED = (
+    _FLASH_ATTENTION_VERSION == 4
+    and torch.cuda.is_available()
+    and torch.cuda.get_device_capability()[0] == 9
+)
+_SKIP_LONG_KV = pytest.mark.skipif(
+    _FA4_SPLIT_KV_UNSUPPORTED, reason="FA4 cannot split long KV on SM90"
+)
 _TARGET_ID = 1
 _DONOR_ID = 10
 
@@ -1179,7 +1189,21 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
                 DynamicInferenceEventType.FINISH
             ]
 
-    @pytest.mark.parametrize("case", _CASES, ids=lambda case: case.name)
+    @pytest.mark.parametrize(
+        "case",
+        [
+            pytest.param(
+                case,
+                id=case.name,
+                marks=(
+                    _SKIP_LONG_KV
+                    if case.prefix_flow or case.name == "cuda-graph-mixed-phase"
+                    else ()
+                ),
+            )
+            for case in _CASES
+        ],
+    )
     @torch.inference_mode()
     def test_chunked_prefill_matches_one_shot(self, case: _ChunkCase) -> None:
         _case_prerequisites(case)
@@ -1236,6 +1260,7 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
             _reset_rounder()
             Utils.destroy_model_parallel()
 
+    @_SKIP_LONG_KV
     @pytest.mark.parametrize("later_length", [128, 384], ids=["bypass", "defer"])
     @torch.inference_mode()
     def test_prefix_conflict_bypass_preserves_outputs(self, later_length):

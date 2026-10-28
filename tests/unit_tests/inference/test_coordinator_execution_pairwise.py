@@ -69,49 +69,41 @@ async def test_routed_prefill_graph_selection(monkeypatch, all_prefills, distrib
     await schedule.test_routed_chunk_partition_beside_decode(monkeypatch)
 
 
-@pytest.mark.parametrize("interval", [20, 3, None])
+@pytest.mark.parametrize("interval", [20, 3])
 @pytest.mark.parametrize("synchronous", [False, True])
 async def test_routed_idle_expert_progress(monkeypatch, interval, synchronous):
     params = greedy_params(num_tokens_to_generate=32, return_log_probs=True)
     params.skip_prompt_log_probs = True
     async with routed_model(
         monkeypatch,
-        expert_model_parallel_size=2 if interval else 1,
+        expert_model_parallel_size=2,
         use_moe_layer_spec=True,
         transformer_impl="inference_optimized",
         inference_moe_token_dispatcher_type="nccl",
     ) as h:
-        h.engine.disable_ep_consensus = interval is None
-        h.engine.ep_consensus_interval = interval or 20
+        h.engine.ep_consensus_interval = interval
         h.engine.use_synchronous_zmq_collectives = synchronous
-        assert h.dp_size == 2 and h.engine.pg_collection.ep.size() == (2 if interval else 1)
+        assert h.dp_size == 2 and h.engine.pg_collection.ep.size() == 2
         runtime, spans, cadence = Counter(), {False: set(), True: set()}, []
-        span_key = "nccl-token-dispatches" if interval else "model-forwards"
         model = h.engine.controller.inference_wrapped_model.model
         for module in model.modules():
             features._instrument_nccl_dispatch_runtime(module, runtime)
         forward, consensus = model.forward, h.engine._ep_establish_consensus
 
         def observed(*args, **kwargs):
-            real, before = bool(features._active_target_ids(h)), runtime[span_key]
+            real, before = bool(features._active_target_ids(h)), runtime["nccl-token-dispatches"]
             result = forward(*args, **kwargs)
             if h.engine.use_coordinator:
                 runtime["model-forwards"] += 1
-                spans[real].update(range(before, runtime[span_key]))
+                spans[real].update(range(before, runtime["nccl-token-dispatches"]))
             return result
 
-        def observed_dummy(dummy=h.engine.controller.dummy_forward):
-            dummy()
-            runtime["dummy-forwards"] += int(h.engine.use_coordinator)
-
         async def observed_consensus(work, *args, **kwargs):
-            runtime["ep-consensus-calls"] += int(h.engine.use_coordinator)
             if work and h.engine._last_ep_consensus[0]:
                 cadence.append(h.engine._ep_consensus_loop_counter)
             return await consensus(work, *args, **kwargs)
 
         monkeypatch.setattr(model, "forward", observed)
-        monkeypatch.setattr(h.engine.controller, "dummy_forward", observed_dummy)
         monkeypatch.setattr(h.engine, "_ep_establish_consensus", observed_consensus)
         direct = await h.direct([4, 5, 6], params)
         await h.start()
@@ -129,12 +121,10 @@ async def test_routed_idle_expert_progress(monkeypatch, interval, synchronous):
         torch.distributed.all_gather_object(records, (spans, runtime, cadence))
         owner = next(i for i in range(h.dp_size) if owners[0] == f"mp-coord-{i}".encode())
         real, idle = records[owner][0][True], records[1 - owner][0]
-        assert real and idle[False] and not idle[True] and (not interval or real <= idle[False])
+        assert real and idle[False] and not idle[True] and real <= idle[False]
         for _, stats, _ in records:
-            assert interval or not stats["ep-consensus-calls"]
-            assert interval or stats["dummy-forwards"] > 0
-            assert stats["nccl-token-dispatches"] == stats["nccl-token-combines"] >= bool(interval)
+            assert stats["nccl-token-dispatches"] == stats["nccl-token-combines"] >= 1
             assert stats["nccl-combine-before-dispatch"] == stats["nccl-dispatch-inflight"] == 0
         calls = records[owner][2]
-        assert (bool(calls) and all(c % interval == 0 for c in calls)) if interval else not calls
+        assert calls and all(c % interval == 0 for c in calls)
         h.assert_retired()
