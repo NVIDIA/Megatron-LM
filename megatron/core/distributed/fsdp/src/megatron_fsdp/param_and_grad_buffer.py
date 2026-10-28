@@ -4820,6 +4820,7 @@ class AllGatherPipeline:
                 gathered buckets that have a transpose buffer are recorded, and later backward
                 gathers also gather the row-wise weights of recorded buckets in their window.
         """
+        assert not (bwd and recompute), "Recompute gathers are row-wise (bwd=False)."
         if len(params) == 0:
             return
 

@@ -162,6 +162,13 @@ def test_recompute_prefetch_is_off_with_double_buffer():
     assert calls == [([0], False, False), ([0], True, True)]
 
 
+def test_recompute_gather_is_row_wise():
+    pipeline, params, _ = _recompute_prefetch_pipeline(extended_buckets=[0])
+
+    with pytest.raises(AssertionError):
+        pipeline.all_gather_params(params[:1], bwd=True, recompute=True)
+
+
 @pytest.mark.parametrize(
     ("order", "start_buckets", "expected_buckets"),
     [
