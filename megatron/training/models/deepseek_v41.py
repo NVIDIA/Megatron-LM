@@ -10,7 +10,6 @@ import torch
 
 from megatron.core.models.deepseek_v41.config import EngramConfig
 from megatron.core.models.deepseek_v41.model import DeepSeekV41Model
-from megatron.core.pipeline_parallel.typed_p2p_communication import create_pipeline_control_group
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
 from megatron.training.vocab_utils import calculate_padded_vocab_size
@@ -58,18 +57,10 @@ class DeepSeekV41ModelBuilder(HybridModelBuilder):
     """Reuse Hybrid's distributed wrapping, optimizer and checkpoint integration."""
 
     def build_model(self, pg_collection, pre_process=None, post_process=None, vp_stage=None):
-        """Create one stage and reuse one typed-control group across its VPP chunks."""
+        """Create one physical or virtual pipeline stage."""
         c = self._model_config
         if c.share_embeddings_and_output_weights:
             raise ValueError('V4.1 requires --untie-embeddings-and-output-weights')
-        if not hasattr(self, '_pipeline_control_group'):
-            self._pipeline_control_group = (
-                create_pipeline_control_group(
-                    pg_collection.pp, world_group=torch.distributed.group.WORLD
-                )
-                if pg_collection.pp.size() > 1
-                else None
-            )
         vocab = (
             calculate_padded_vocab_size(
                 c.vocab_size,
@@ -99,7 +90,6 @@ class DeepSeekV41ModelBuilder(HybridModelBuilder):
             logit_dtype=c.logit_dtype,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
-            pipeline_control_group=self._pipeline_control_group,
         )
 
 
