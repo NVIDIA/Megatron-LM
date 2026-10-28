@@ -577,6 +577,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_optimizer_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
+            "tests/unit_tests/test_muon_fp8_param_gather.py",
+            "tests/unit_tests/test_fp8_param.py",
         ),
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
@@ -599,11 +601,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
             C + "test_gpt_model.py",
             "tests/unit_tests/distributed/test_param_storage_copyback.py",
             "tests/unit_tests/rl/test_rl_utils.py",
+            "tests/unit_tests/test_muon_fp8_param_gather.py",
         ),
         kind="external-lib",
         notes="NCCL reduce-scatter / all-gather; covered by the FSDP/DP cells of the model-level suite. "
         "Relocated parameter storage is checked exactly after all-gather and CUDA graph replay; "
-        "the RL test checks exact classic-DDP reduce-scatter after gradient-buffer restoration.",
+        "the RL test checks exact classic-DDP reduce-scatter after gradient-buffer restoration. "
+        "Muon tests compare FP8 gather transport bitwise across layout and overlap modes.",
     ),
     KernelEntry(
         name="nccl_allocator",
@@ -726,7 +730,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="ssm_gated_delta_product",
         sources=("megatron/core/ssm/gated_delta_product.py",),
-        tests=(K + "test_ssm_kernels.py",),
+        tests=(
+            K + "test_ssm_kernels.py",
+            "tests/unit_tests/test_muon_mxfp8_param_gather.py",
+            "tests/unit_tests/test_muon_blockwise_fp8_param_gather.py",
+        ),
         kind="dispatch",
         notes="Dispatches FLA chunk_gated_delta_product / l2_norm, the CuTeDSL gdp_attn kernel "
         "(gdp_cutedsl_kernel; not in the CI container, uncovered), causal_conv1d and the Megatron "
@@ -734,7 +742,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "replayed in test_ssm_kernels.py. ssm_decode also drives the speculative-decoding path, "
         "where causal_conv1d_update and the fused recurrence take several draft tokens per step and "
         "fill the conv / SSM rollback snapshot buffers; both are replayed there with the snapshots "
-        "as outputs. No module-level replay yet (HYBRID_CONFIGS has no GDP cell).",
+        "as outputs. GDP/MoE gather parity tests also exercise publication of directly read "
+        "convolution weights. No module-level replay yet (HYBRID_CONFIGS has no GDP cell).",
     ),
     KernelEntry(
         name="rope_dispatch",
@@ -774,12 +783,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/fp4_utils.py",
             "megatron/core/distributed/fsdp/src/megatron_fsdp/mixed_precision.py",
         ),
-        tests=(C + "test_fp8_determinism.py", K + "test_optimizer_kernels.py"),
+        tests=(
+            C + "test_fp8_determinism.py",
+            K + "test_optimizer_kernels.py",
+            "tests/unit_tests/test_fp8_param.py",
+            "tests/unit_tests/test_muon_fp8_param_gather.py",
+        ),
         kind="dispatch",
         notes="TE cast_master_weights_to_fp8 / cast_to_fp8 (covered at model level by "
         "test_fp8_determinism.py), NVFP4 quantize_master_weights (needs TE>=2.7 + Blackwell, "
         "uncovered) and the apex multi_tensor_scale used by Megatron-FSDP mixed precision "
-        "(kernel replayed in test_optimizer_kernels.py).",
+        "(kernel replayed in test_optimizer_kernels.py). Native FP8 gather and checkpoint tests "
+        "check exact quantized storage, optimizer state and resumed training trajectories.",
     ),
     KernelEntry(
         name="inference_mxfp8_quantization",

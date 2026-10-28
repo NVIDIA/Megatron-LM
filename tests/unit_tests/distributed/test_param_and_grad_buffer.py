@@ -424,10 +424,9 @@ def test_force_all_reduce_uses_correct_collective(force_all_reduce: bool):
     Utils.destroy_model_parallel()
 
 
-def test_start_param_sync_dp_size_1():
-    """When dp_size == 1 (e.g., expt_dp_size == 1), start_param_sync should set
-    param_gather_dispatched=True and return immediately without launching any
-    all-gather collective."""
+@pytest.mark.parametrize("force_sync", [False, True])
+def test_start_param_sync_dp_size_1(force_sync):
+    """Unbound single-rank DDP dispatches no gather and preserves force-sync post-processing."""
     world_size = Utils.world_size
     Utils.initialize_model_parallel(tensor_model_parallel_size=world_size)
 
@@ -452,10 +451,15 @@ def test_start_param_sync_dp_size_1():
     with mock.patch('torch.distributed.all_gather') as mock_all_gather:
         for bg in model.bucket_groups:
             assert not bg.param_gather_dispatched
-            bg.start_param_sync()
-            assert (
-                bg.param_gather_dispatched
-            ), "param_gather_dispatched should be True after start_param_sync with dp_size=1"
+            assert all(bucket.layerwise_gather_plan is None for bucket in bg.buckets)
+            with mock.patch.object(bg, "_post_param_sync", wraps=bg._post_param_sync) as post_sync:
+                bg.start_param_sync(force_sync=force_sync)
+                assert bg.param_gather_dispatched
+                assert bg.param_gather_handle is None
+                assert all(bucket.layerwise_gather_list is None for bucket in bg.buckets)
+                assert post_sync.call_count == int(force_sync)
+                bg.finish_param_sync(skip_next_bucket_dispatch=True)
+                assert post_sync.call_count == int(force_sync)
         # No all-gather should have been called.
         assert not mock_all_gather.called, "all_gather should not be called when dp_size == 1"
 
