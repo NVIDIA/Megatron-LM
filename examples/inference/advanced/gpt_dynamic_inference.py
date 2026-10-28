@@ -36,6 +36,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.parallel_state import get_registered_process_groups
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.inference.utils import (
     add_inference_args,
@@ -328,7 +329,7 @@ def main():
         stop_words=args.stop_words,
     )
 
-    model = get_model_for_inference()
+    model = get_model_for_inference(pg_collection=get_registered_process_groups())
 
     # Requests, context, controller.
     requests = build_requests(args, tokenizer, sampling_params)

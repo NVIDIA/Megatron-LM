@@ -19,6 +19,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.parallel_state import get_registered_process_groups
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
@@ -167,7 +168,7 @@ def main():
 
     args = get_args()
 
-    model = get_model_for_inference()
+    model = get_model_for_inference(pg_collection=get_registered_process_groups())
 
     tokenizer = build_tokenizer(args)
 
