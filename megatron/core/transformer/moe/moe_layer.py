@@ -20,6 +20,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.layer_interface import LayerInterface
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.megakernel import (
     build_megakernel_backend,
@@ -246,7 +247,7 @@ class BaseMoELayer(MegatronModule, ABC):
         self.router.set_layer_number(layer_number)
 
 
-class MoELayer(BaseMoELayer):
+class MoELayer(BaseMoELayer, LayerInterface):
     """Mixture of Experts layer.
 
     This layer implements a Mixture of Experts model, where each token is routed to a

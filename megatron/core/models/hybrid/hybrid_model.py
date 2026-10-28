@@ -27,6 +27,7 @@ from megatron.core.tensor_observation import observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
+from megatron.core.transformer.layer_interface import AuxInputs
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
@@ -732,24 +733,25 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             if self.config.freeze_base_model_for_mtp and self.training
             else nullcontext()
         )
+        aux_inputs = AuxInputs(
+            attention_mask=attention_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params_by_layout=packed_seq_params_by_layout,
+            cp_layout_plan=cp_layout_plan,
+        )
         with backbone_context:
-            decoder_output = self.decoder(
+            hidden_states = self.decoder(
                 hidden_states=decoder_input,
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
-                packed_seq_params=packed_seq_params,
-                padding_mask=padding_mask,
+                aux_inputs=aux_inputs,
                 padding_mask_by_layout=padding_mask_by_layout,
-                packed_seq_params_by_layout=packed_seq_params_by_layout,
-                cp_layout_plan=cp_layout_plan,
                 input_ids=hash_input_ids,
+                padding_mask=padding_mask,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
             )
-        if isinstance(decoder_output, tuple):
-            hidden_states, mhc_multistream = decoder_output
-        else:
-            hidden_states = decoder_output
-            mhc_multistream = None
+        mhc_multistream = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, mhc_multistream = hidden_states
 
         output_weight = None
         if self.share_embeddings_and_output_weights:
@@ -790,20 +792,17 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     "decoder_input embeddings are not provided."
                 )
             mtp_hidden_states = self.mtp(
+                hidden_states=mtp_inputs.hidden_states,
                 input_ids=mtp_inputs.input_ids,
                 position_ids=mtp_inputs.position_ids,
-                hidden_states=mtp_inputs.hidden_states,
-                mhc_multistream=mtp_inputs.mhc_multistream,
-                attention_mask=attention_mask,
-                inference_params=inference_params,
-                rotary_pos_emb=rotary_pos_emb,
-                packed_seq_params=mtp_inputs.packed_seq_params,
-                embedding=self.embedding,
                 decoder_input=mtp_inputs.decoder_input,
+                embedding=self.embedding,
+                mhc_multistream=mtp_inputs.mhc_multistream,
                 mtp_input_mask=mtp_inputs.mtp_input_mask,
+                packed_seq_params=mtp_inputs.packed_seq_params,
+                inference_context=None,
+                aux_inputs=aux_inputs,
                 padding_mask=mtp_inputs.padding_mask,
-                packed_seq_params_by_layout=packed_seq_params_by_layout,
-                cp_layout_plan=cp_layout_plan,
             )
 
         if not self.post_process:

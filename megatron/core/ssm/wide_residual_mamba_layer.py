@@ -6,6 +6,7 @@ from torch import Tensor
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.layer_interface import bind_layer_output_stage
 from megatron.core.transformer.residual_connection import (
     ResidualBranchInput,
     ResidualConnectionState,
@@ -155,6 +156,7 @@ class WideResidualMambaLayer(MambaLayer):
 
         return ssm_output, state[0], state
 
+    @bind_layer_output_stage
     def forward_post_core_attn(
         self,
         ssm_output: Tensor,

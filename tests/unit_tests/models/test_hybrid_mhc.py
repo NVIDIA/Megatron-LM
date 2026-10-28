@@ -14,6 +14,7 @@ from megatron.core.pipeline_parallel.schedules import custom_backward, deallocat
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.layer_interface import LayerInterface
 from megatron.core.transformer.module import (
     MegatronModule,
     convert_module_to_dtype_except_fp32_marked,
@@ -25,7 +26,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
 
 
-class _DummyHybridLayer(MegatronModule):
+class _DummyHybridLayer(MegatronModule, LayerInterface):
     """Same-shape residual layer used to isolate HybridStack mHC plumbing."""
 
     def __init__(self, config: TransformerConfig, layer_number: int, **_kwargs):
@@ -305,7 +306,7 @@ class TestHybridStackMHC:
             else:
                 assert not hasattr(stack, name)
 
-    def test_selective_mhc_strips_input_ids_from_non_hash_layers(self, monkeypatch):
+    def test_selective_mhc_passes_routing_inputs_to_inner_helpers(self, monkeypatch):
         config = _get_config(
             num_layers=2,
             recompute_granularity="selective",
@@ -318,31 +319,9 @@ class TestHybridStackMHC:
         seen_input_ids = []
         original = HyperConnectionHybridLayer._call_inner_transformer_layer_without_local_bda
 
-        def record_input_ids(
-            layer,
-            hidden_states,
-            attention_mask,
-            inference_context,
-            rotary_pos_emb,
-            sequence_len_offset,
-            packed_seq_params,
-            padding_mask,
-            input_ids=None,
-            mhc_recompute_manager=None,
-        ):
-            seen_input_ids.append(input_ids)
-            return original(
-                layer,
-                hidden_states,
-                attention_mask,
-                inference_context,
-                rotary_pos_emb,
-                sequence_len_offset,
-                packed_seq_params,
-                padding_mask,
-                input_ids,
-                mhc_recompute_manager,
-            )
+        def record_input_ids(layer, hidden_states, mhc_recompute_manager=None, *, aux_inputs):
+            seen_input_ids.append(aux_inputs.input_ids)
+            return original(layer, hidden_states, mhc_recompute_manager, aux_inputs=aux_inputs)
 
         monkeypatch.setattr(
             HyperConnectionHybridLayer,
@@ -354,7 +333,7 @@ class TestHybridStackMHC:
         output.float().sum().backward()
 
         assert len(seen_input_ids) == 2
-        assert all(captured is None for captured in seen_input_ids)
+        assert all(captured is input_ids for captured in seen_input_ids)
 
     @pytest.mark.parametrize("recompute_method", ["uniform", "block"])
     @pytest.mark.parametrize(

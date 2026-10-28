@@ -18,6 +18,7 @@ from megatron.core.models.hybrid.hybrid_model import (
 )
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.layer_interface import AuxInputs, LayerAuxOutputs
 from megatron.core.transformer.moe import router as router_module
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.multi_token_prediction import (
@@ -26,6 +27,7 @@ from megatron.core.transformer.multi_token_prediction import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.typed_torch import copy_signature
 
 
 class RecordingTransformerLayer(TransformerLayer):
@@ -43,6 +45,7 @@ class RecordingTransformerLayer(TransformerLayer):
         if cuda_graph_impl == "transformer_engine":
             self.cuda_graphs = [object()]
 
+    @copy_signature(TransformerLayer.forward)
     def forward(self, hidden_states, **kwargs):
         self.calls.append(kwargs)
         return hidden_states, None
@@ -76,21 +79,13 @@ class RecordingHashMlpTransformerLayer(TransformerLayer):
         self.mhc_checkpoint_pre_mlp_layernorm = False
         self.calls = []
 
-    def _forward_mlp_output_with_bias(
-        self,
-        hidden_states,
-        inference_context=None,
-        padding_mask=None,
-        packed_seq_params=None,
-        input_ids=None,
-        mhc_recompute_manager=None,
-    ):
+    def _forward_mlp_output_with_bias(self, hidden_states, aux_inputs, mhc_recompute_manager=None):
         self.calls.append(
             {
-                'inference_context': inference_context,
-                'padding_mask': padding_mask,
-                'packed_seq_params': packed_seq_params,
-                'input_ids': input_ids,
+                'inference_context': aux_inputs.inference_context,
+                'padding_mask': aux_inputs.padding_mask,
+                'packed_seq_params': aux_inputs.packed_seq_params,
+                'input_ids': aux_inputs.input_ids,
                 'mhc_recompute_manager': mhc_recompute_manager,
             }
         )
@@ -105,17 +100,9 @@ class RecordingNonTransformerLayer(torch.nn.Module):
         self.layer_number = layer_number
         self.num_calls = 0
 
-    def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        inference_context=None,
-        rotary_pos_emb=None,
-        *,
-        packed_seq_params=None,
-    ):
+    def forward(self, hidden_states, aux_inputs, **kwargs):
         self.num_calls += 1
-        return hidden_states
+        return hidden_states, LayerAuxOutputs()
 
 
 class RecordingDecoder:
@@ -201,7 +188,7 @@ def run_stack(stack, input_ids):
     return output
 
 
-def test_hybrid_stack_forwards_input_ids_only_to_transformer_layers():
+def test_hybrid_stack_passes_shared_ids_and_non_transformer_ignores_them():
     transformer_layer = RecordingTransformerLayer()
     learned_transformer_layer = RecordingTransformerLayer(layer_number=2, is_hash_layer=False)
     non_transformer_layer = RecordingNonTransformerLayer()
@@ -211,17 +198,70 @@ def test_hybrid_stack_forwards_input_ids_only_to_transformer_layers():
     run_stack(stack, input_ids)
 
     assert transformer_layer.calls[0]['input_ids'] is input_ids
-    assert 'input_ids' not in learned_transformer_layer.calls[0]
+    assert learned_transformer_layer.calls[0]['input_ids'] is input_ids
     assert non_transformer_layer.num_calls == 1
 
 
-def test_hybrid_stack_omits_input_ids_keyword_when_not_provided():
+def test_hybrid_stack_preserves_absent_ids_as_none():
     transformer_layer = RecordingTransformerLayer()
     stack = make_stack([transformer_layer])
 
     run_stack(stack, input_ids=None)
 
-    assert 'input_ids' not in transformer_layer.calls[0]
+    assert transformer_layer.calls[0]['input_ids'] is None
+
+
+@pytest.mark.parametrize("recompute_method", [None, "uniform", "block"])
+def test_hybrid_stack_scopes_chunkwise_metadata_before_layer_calls(monkeypatch, recompute_method):
+    metadata = object()
+
+    class RecordingMetadataLayer(RecordingNonTransformerLayer):
+        def __init__(self, layer_number):
+            super().__init__(layer_number)
+            self.calls = []
+
+        def forward(self, hidden_states, aux_inputs, **kwargs):
+            # Record the call boundary, before any layer binding or graph dispatch.
+            self.calls.append(vars(aux_inputs) | kwargs)
+            return hidden_states, LayerAuxOutputs()
+
+    layers = [RecordingMetadataLayer(i + 1) for i in range(3)]
+    config_overrides = (
+        dict(
+            recompute_granularity="full", recompute_method=recompute_method, recompute_num_layers=3
+        )
+        if recompute_method is not None
+        else {}
+    )
+    stack = make_stack(layers, **config_overrides)
+    for index, (layer, config) in enumerate(zip(layers, stack._execution_layer_config_list)):
+        config.linear_cp_mode = "chunkwise" if index == 1 else "none"
+        layer.config = config
+    # Stub metadata construction to exercise routing without a multi-rank CP setup.
+    stack._has_linear_layer_with_chunkwise_cp = True
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_block.build_packed_sequence_cp_metadata",
+        lambda *args, **kwargs: metadata,
+    )
+
+    def checkpoint(function, _distribute_saved_activations, *args):
+        function(*args)
+        return function(*args)  # Replay must reconstruct the same per-layer inputs.
+
+    monkeypatch.setattr(tensor_parallel, "checkpoint", checkpoint)
+    hidden_states = torch.randn(4, 2, 8, requires_grad=True)
+    stack(
+        hidden_states,
+        AuxInputs(),
+        packed_seq_params=SimpleNamespace(seq_idx=torch.zeros(8, dtype=torch.int32)),
+    )
+    for index, layer in enumerate(layers):
+        assert len(layer.calls) == (1 if recompute_method is None else 2)
+        for call in layer.calls:
+            if index == 1:
+                assert call["packed_sequence_cp_metadata"] is metadata
+            else:
+                assert "packed_sequence_cp_metadata" not in call
 
 
 def test_hybrid_stack_full_recompute_preserves_ids_and_non_transformer_signature(monkeypatch):
@@ -244,7 +284,7 @@ def test_hybrid_stack_full_recompute_preserves_ids_and_non_transformer_signature
     run_stack(stack, input_ids)
 
     assert transformer_layer.calls[0]['input_ids'] is input_ids
-    assert 'input_ids' not in learned_transformer_layer.calls[0]
+    assert learned_transformer_layer.calls[0]['input_ids'] is input_ids
     assert non_transformer_layer.num_calls == 1
 
 
@@ -256,7 +296,7 @@ def test_hybrid_mhc_wrapper_passes_ids_and_recompute_manager_to_mlp_branch():
     input_ids = torch.arange(8).reshape(2, 4)
 
     output, _ = wrapped_layer(
-        hidden_states, attention_mask=None, mhc_recompute_manager=manager, input_ids=input_ids
+        hidden_states, AuxInputs(input_ids=input_ids), mhc_recompute_manager=manager
     )
 
     assert output.shape == hidden_states.shape
@@ -274,9 +314,7 @@ def test_hybrid_mhc_wrapper_discards_managed_pre_mlp_norm_checkpoint():
 
     wrapped_layer(
         hidden_states,
-        attention_mask=None,
-        mhc_recompute_manager=manager,
-        input_ids=torch.arange(8).reshape(2, 4),
+        AuxInputs(mhc_recompute_manager=manager, input_ids=torch.arange(8).reshape(2, 4)),
     )
 
     inner_layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute.assert_called_once()

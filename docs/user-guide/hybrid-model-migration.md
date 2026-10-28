@@ -386,6 +386,24 @@ state-dict differences:
 - Expand per-layer settings such as attention-window schedules to the full
   HybridModel pattern.
 
+Interchangeable layers inherit `LayerInterface`, which automatically lets callers use
+`layer(hidden_states, AuxInputs(...))` and receive `(hidden_states, LayerAuxOutputs)`.
+This includes cores and layers that HybridStack calls interchangeably, such as
+TransformerLayer and MambaLayer. `LayerAuxOutputs.bias` holds any bias the caller must
+apply; complete residual layers leave it as `None`. Existing explicit-argument calls
+keep their natural results. Split stages on these layers may use
+`@bind_layer_input_stage` to unpack inputs or `@bind_layer_output_stage` to bind the
+final output.
+
+`@bind_aux_inputs` is general argument packing for layers and non-layer code, including
+models, blocks, and helpers. It does not impose a layer interface or return format.
+The method's signature selects its named arguments, using ordinary defaults and
+required-argument checks; a declared `aux_inputs` parameter receives the remaining
+fields. `AuxInputs` is read-only, and `update(...)` adds fields without overwriting
+existing ones. A decorated method also exposes an `Inputs` dataclass generated from
+its signature. Keep controls used by a wrapper explicit and pass shared downstream
+arguments through `AuxInputs`.
+
 ### Validate before scaling up
 
 Before starting a long run:

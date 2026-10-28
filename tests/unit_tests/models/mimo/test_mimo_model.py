@@ -35,6 +35,7 @@ from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.layer_interface import LayerAuxOutputs
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -780,8 +781,8 @@ class TestMimoModel:
                     return hidden_states if hidden_states is not None else self.input_tensor
 
             class _IdentityMTPLayer(torch.nn.Module):
-                def forward(self, hidden_states, **kwargs):
-                    return hidden_states, None
+                def forward(self, hidden_states, aux_inputs):
+                    return hidden_states, LayerAuxOutputs()
 
             model.language_model.decoder = _IdentityDecoder()
             for mtp_layer in model.language_model.mtp.layers:
@@ -900,8 +901,8 @@ class TestMimoModel:
                     return hidden_states if hidden_states is not None else self.input_tensor
 
             class _IdentityMTPLayer(torch.nn.Module):
-                def forward(self, hidden_states, **kwargs):
-                    return hidden_states, None
+                def forward(self, hidden_states, aux_inputs):
+                    return hidden_states, LayerAuxOutputs()
 
             model.language_model.decoder = _IdentityDecoder()
             for mtp_layer in model.language_model.mtp.layers:

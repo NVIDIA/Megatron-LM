@@ -13,6 +13,7 @@ from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
     group_layers_into_shortcut_blocks,
 )
+from megatron.core.transformer.layer_interface import AuxInputs, LayerAuxOutputs
 from megatron.core.transformer.module import TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -58,11 +59,11 @@ class _FakeCompute(torch.nn.Module, TwoStageAttentionLayer):
     def supports_two_stage_attention(self) -> bool:
         return self.supports_two_stage
 
-    def forward_pre_attn_and_core_attn(self, hidden_states, **kwargs):
+    def forward_pre_attn_and_core_attn(self, hidden_states, aux_inputs, **kwargs):
         return (hidden_states,)
 
     def forward_post_core_attn(self, hidden_states, **kwargs):
-        return hidden_states
+        return hidden_states, LayerAuxOutputs()
 
 
 class _FakeMLP(torch.nn.Module):
@@ -259,19 +260,16 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
             assert padding_mask_by_layout is masks_by_layout
             return moe_padding_mask
 
-    def attn_forward(hidden_states, packed_seq_params=None, **kwargs):
-        observed["attn_packed"] = packed_seq_params
-        observed["cp_metadata"] = kwargs.get("packed_sequence_cp_metadata")
-        assert {
-            key: value
-            for key, value in kwargs.items()
-            if key == "residual_stream_recompute_context"
-        } == expected_layer_kwargs
+    def attn_forward(hidden_states, aux_inputs, **kwargs):
+        observed["attn_packed"] = kwargs["packed_seq_params"]
+        observed["cp_metadata"] = aux_inputs.packed_sequence_cp_metadata
+        assert aux_inputs.residual_stream_recompute_context is attn_context
         return (hidden_states,)
 
     def attn_post(hidden_states, **kwargs):
+        assert isinstance(kwargs.pop("aux_inputs"), AuxInputs)
         assert kwargs == expected_layer_kwargs
-        return hidden_states
+        return hidden_states, LayerAuxOutputs()
 
     def route(shortcut_hidden, padding_mask=None, packed_seq_params=None, recompute_context=None):
         assert recompute_context is attn_context
@@ -316,18 +314,13 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
     cp_metadata = object()
     hidden_states = torch.zeros(2, 1, config.hidden_size)
     output = block(
-        hidden_states=hidden_states,
-        attention_mask=None,
-        inference_context=None,
-        rotary_pos_emb=None,
-        sequence_len_offset=None,
+        hidden_states,
         packed_seq_params="packed-input",
-        padding_mask=input_padding_mask,
+        packed_sequence_cp_metadata=cp_metadata,
         quant_context_factory=quant_context_factory,
         cp_layout_state=RecordingCPLayoutState(),
-        packed_sequence_cp_metadata=cp_metadata,
-        attn_recompute_context=attn_context,
-        moe_recompute_context=moe_context,
+        residual_stream_recompute_plan=[None] * 4 + [attn_context, moe_context],
+        padding_mask=input_padding_mask,
         padding_mask_by_layout=masks_by_layout,
     )
 
@@ -355,9 +348,9 @@ def test_inference_runs_paired_layer_atomically(monkeypatch):
     inference_context = object()
     observed = {}
 
-    def compute_forward(hidden_states, **kwargs):
+    def compute_forward(hidden_states, aux_inputs, **kwargs):
         observed["compute_context"] = kwargs["inference_context"]
-        return hidden_states + 1, None
+        return hidden_states + 1, LayerAuxOutputs()
 
     def two_stage(*_args, **_kwargs):
         raise AssertionError("inference must not use the two-stage training path")
@@ -524,13 +517,13 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             self.input_scale = torch.nn.Parameter(torch.tensor(2.0))
             self.output_scale = torch.nn.Parameter(torch.tensor(3.0))
 
-        def forward_pre_attn_and_core_attn(self, hidden_states, **kwargs):
+        def forward_pre_attn_and_core_attn(self, hidden_states, aux_inputs, **kwargs):
             assert_quant_layer(0)
             return hidden_states * self.input_scale, hidden_states
 
         def forward_post_core_attn(self, projected, residual, **kwargs):
             assert_quant_layer(0)
-            return projected * self.output_scale
+            return projected * self.output_scale, LayerAuxOutputs()
 
     class FakeMLP(torch.nn.Module):
         def __init__(self):

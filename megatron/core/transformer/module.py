@@ -11,6 +11,13 @@ from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.transformer.layer_interface import (
+    AuxInputBinding,
+    AuxInputs,
+    _call_with_aux_inputs,
+    _parse_layer_aux_inputs,
+    _uses_layer_outputs,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -63,7 +70,7 @@ def is_first_microbatch_tracked(config) -> bool:
     )
 
 
-class MegatronModule(torch.nn.Module):
+class MegatronModule(torch.nn.Module, AuxInputBinding):
     """Base Megatron module inhertied by all Models.
 
     Megatron specific extensions of torch Module with support
@@ -77,6 +84,25 @@ class MegatronModule(torch.nn.Module):
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.config = config
+
+    def __call__(self, *args, **kwargs):
+        """Bind shared inputs before execution. Overrides must call super().__call__.
+
+        Change execution by overriding ``_call_with_bound_args`` instead.
+        """
+        # Bind once, before graph selection or PyTorch hooks, and convert the
+        # result only after the normal module execution path has completed.
+        if getattr(self.forward, "_layer_input_signature", None) is not None:
+            shared_inputs = _parse_layer_aux_inputs(
+                args, kwargs, forward=self.forward, allow_aux_keyword=True
+            )
+            if shared_inputs is not None:
+                return _call_with_aux_inputs(self, self._call_with_bound_args, *shared_inputs)
+        return self._call_with_bound_args(*args, **kwargs)
+
+    def _call_with_bound_args(self, *args, **kwargs):
+        """Run forward through PyTorch, including its hooks and compiled calls."""
+        return super().__call__(*args, **kwargs)
 
     def refresh_cache(self) -> None:
         """Refresh state derived from parameters after an in-place weight refit.
@@ -351,6 +377,7 @@ class GraphableMegatronModule(MegatronModule):
 
         cg_index = getattr(self, 'current_microbatch', 0) % len(self.cuda_graphs)
         cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(*args, **kwargs)
+        cudagraph_kwargs = {k: v for k, v in cudagraph_kwargs.items() if v is not None}
 
         for hook, hook_args in self.cuda_graph_manual_hooks:
             hook(*hook_args)
@@ -402,18 +429,49 @@ class GraphableMegatronModule(MegatronModule):
             and (is_graph_capturing() or self.cuda_graphs)
         )
 
-    def __call__(self, *args, **kwargs):
-        if self._should_call_local_cudagraph(*args, **kwargs):
-            return self.cudagraph_manager(self, args, kwargs)
-        elif self._should_call_te_cudagraph(*args, **kwargs):
+    def process_aux_inputs(self, args, kwargs):
+        """Name the hidden input and remove ``aux_inputs`` before graph execution."""
+        signature = getattr(self.forward, "_layer_input_signature", None)
+        # Local inference selects cached graphs using the named hidden input.
+        if signature is not None and len(args) == 1:
+            hidden = next(iter(signature.parameters.values()))
+            if hidden.kind != hidden.POSITIONAL_ONLY and hidden.name not in kwargs:
+                args, kwargs = (), {hidden.name: args[0], **kwargs}
+        if "aux_inputs" in kwargs:
+            kwargs = kwargs.copy()
+            aux_inputs = kwargs.pop("aux_inputs")
+            if aux_inputs is not None and not isinstance(aux_inputs, AuxInputs):
+                raise TypeError("aux_inputs must be an AuxInputs instance")
+        return args, kwargs
+
+    def process_aux_outputs(self, result, kwargs, *, local=False):
+        """Unwrap a graph's one-item tuple before binding the layer output."""
+        if (
+            hasattr(self.forward, "_layer_input_signature")
+            and _uses_layer_outputs(self, self.forward)
+            and (local or isinstance(kwargs.get("aux_inputs"), AuxInputs))
+            and isinstance(result, tuple)
+            and len(result) == 1
+        ):
+            return result[0]
+        return result
+
+    def _call_with_bound_args(self, *args, **kwargs):
+        """Choose eager execution, graph capture, or graph replay after input binding."""
+        graph_args, graph_kwargs = self.process_aux_inputs(args, kwargs)
+        if self._should_call_local_cudagraph(*graph_args, **graph_kwargs):
+            result = self.cudagraph_manager(self, graph_args, graph_kwargs)
+            return self.process_aux_outputs(result, kwargs, local=True)
+        elif self._should_call_te_cudagraph(*graph_args, **graph_kwargs):
             if not self.cuda_graphs:
                 # Do CUDA Graphs capture.
                 cuda_graph_func = self._te_cuda_graph_capture
             else:
                 # Do CUDA Graphs replay.
                 cuda_graph_func = self._te_cuda_graph_replay
-            return cuda_graph_func(*args, **kwargs)
-        return super().__call__(*args, **kwargs)
+            result = cuda_graph_func(*graph_args, **graph_kwargs)
+            return self.process_aux_outputs(result, kwargs)
+        return super()._call_with_bound_args(*args, **kwargs)
 
 
 def conversion_helper(val, conversion):

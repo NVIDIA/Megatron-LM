@@ -33,6 +33,7 @@ from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.layer_interface import LayerInterface
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
@@ -145,7 +146,7 @@ class GatedDeltaRuleInterface(Protocol):
     ) -> tuple[torch.Tensor, torch.Tensor | None]: ...
 
 
-class _GDNBase(MegatronModule, TwoStageAttentionLayer):
+class _GDNBase(MegatronModule, TwoStageAttentionLayer, LayerInterface):
     """Common base class for the Gated Delta Net (GDN) family of layers.
 
     Hosts everything the GDN variants share: the fused input projection, causal

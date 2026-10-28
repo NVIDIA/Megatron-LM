@@ -35,6 +35,7 @@ from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_c
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import multi_token_prediction as mtp_module
 from megatron.core.transformer.hyper_connection import learned_output_contract
+from megatron.core.transformer.layer_interface import AuxInputs, LayerAuxOutputs
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossAutoScaler,
@@ -86,6 +87,13 @@ else:
 _SEED = 42
 
 
+class _PassthroughMTPEmbeddings:
+    def _get_embeddings(
+        self, *, hidden_states, input_ids, position_ids, padding_mask, mtp_input_mask, **kwargs
+    ):
+        return (input_ids, position_ids, padding_mask, mtp_input_mask, hidden_states, hidden_states)
+
+
 def _randint_stub(expected_size, make_result):
     """Build a ``torch.randint`` replacement that pins the shape HSM asks for.
 
@@ -119,13 +127,13 @@ def test_checkpointed_forward_uses_layer_tp_group_not_global(precision, monkeypa
 
     def fake_tensor_parallel_checkpoint(function, distribute_saved_activations, *args):
         calls.append(("tensor_parallel", None))
-        return function(*args)
+        return function(*(arg.clone() for arg in args))
 
     def fake_te_checkpoint(
         function, distribute_saved_activations, get_rng_tracker, tp_group, *args, **kwargs
     ):
         calls.append(("te", tp_group))
-        return function(*args, **kwargs)
+        return function(*(arg.clone() for arg in args), **kwargs)
 
     monkeypatch.setattr(
         transformer_utils.tensor_parallel, "checkpoint", fake_tensor_parallel_checkpoint
@@ -148,17 +156,52 @@ def test_checkpointed_forward_uses_layer_tp_group_not_global(precision, monkeypa
     object.__setattr__(layer, "config", config)
     object.__setattr__(layer, "tp_group", tp_group)
     object.__setattr__(layer, "mtp_layer_pattern", None)
-    object.__setattr__(
-        layer,
-        "_proj_and_transformer_layer",
-        lambda **kwargs: kwargs["hidden_states"] + kwargs["decoder_input"],
+    rotary = torch.full((2, 1, 4), 3.0)
+    metadata = object()
+
+    def project(hidden_states, aux_inputs, *, decoder_input):
+        assert aux_inputs.rotary_pos_emb[0] is not rotary
+        assert aux_inputs.rotary_pos_emb[1] is None
+        assert aux_inputs.packed_seq_params is metadata
+        return hidden_states + decoder_input + aux_inputs.rotary_pos_emb[0]
+
+    object.__setattr__(layer, "_proj_and_transformer_layer", project)
+    output = layer._checkpointed_forward(
+        torch.ones(2, 1, 4),
+        AuxInputs(rotary_pos_emb=(rotary, None), packed_seq_params=metadata),
+        decoder_input=torch.full((2, 1, 4), 2.0),
     )
 
-    output = layer._checkpointed_forward(torch.ones(2, 1, 4), torch.full((2, 1, 4), 2.0))
+    assert torch.equal(output, torch.full((2, 1, 4), 6.0))
 
-    assert torch.equal(output, torch.full((2, 1, 4), 3.0))
     expected = ("te", tp_group) if precision == "fp4" else ("tensor_parallel", None)
     assert calls == [expected]
+
+
+def test_single_position_forwards_aux_inputs():
+    layer = MultiTokenPredictionLayer.__new__(MultiTokenPredictionLayer)
+    context = object()
+    hidden_states = torch.ones(2, 1, 4)
+    token_ids = torch.tensor([[1, 2]])
+    position_ids = torch.tensor([[4, 5]])
+
+    def embedding(*, input_ids, position_ids):
+        return (input_ids + position_ids).T.unsqueeze(-1).expand_as(hidden_states)
+
+    def project(hidden_states, aux_inputs, *, decoder_input):
+        assert isinstance(aux_inputs, AuxInputs)
+        assert aux_inputs.inference_context is context
+        return hidden_states + decoder_input
+
+    object.__setattr__(layer, "_proj_and_transformer_layer", project)
+    output = layer.forward_single_position(
+        hidden_states=hidden_states,
+        next_token_ids=token_ids,
+        position_ids=position_ids,
+        embedding=embedding,
+        inference_context=context,
+    )
+    assert torch.equal(output[:, 0, 0], torch.tensor([6.0, 8.0]))
 
 
 class TestMultiTokenPredictionLayer:
@@ -484,19 +527,16 @@ class TestMultiTokenPredictionLayer:
         seen_inputs = []
         seen_masks = []
 
-        class _IncrementLayer:
-            def __call__(
-                self,
-                hidden_states,
-                input_ids,
-                position_ids,
-                padding_mask,
-                mtp_input_mask=None,
-                **kwargs,
-            ):
+        class _IncrementLayer(_PassthroughMTPEmbeddings):
+
+            def _get_embeddings(self, **kwargs):
+                seen_masks.append(kwargs["mtp_input_mask"])
+                return super()._get_embeddings(**kwargs)
+
+            def __call__(self, hidden_states, aux_inputs, **kwargs):
                 seen_inputs.append(hidden_states.clone())
-                seen_masks.append(mtp_input_mask)
-                return hidden_states + 1, input_ids, position_ids, padding_mask, mtp_input_mask
+                assert not {"input_ids", "position_ids", "mtp_input_mask"} & kwargs.keys()
+                return hidden_states + 1
 
         block = types.SimpleNamespace(
             config=config,
@@ -544,12 +584,22 @@ class TestMultiTokenPredictionLayer:
         )
         seen_embeddings = []
 
-        class _CaptureLayer:
-            def __call__(
-                self, hidden_states, input_ids, position_ids, padding_mask, decoder_input, **kwargs
-            ):
-                seen_embeddings.append(decoder_input.clone())
-                return hidden_states, input_ids, position_ids, padding_mask, None
+        layer = MultiTokenPredictionLayer.__new__(MultiTokenPredictionLayer)
+        torch.nn.Module.__init__(layer)
+        layer.config = config
+        layer.cp_group = layer.tp_group = None
+        layer.mtp_layer_pattern = None
+
+        def capture_precomputed(decoder_input, hidden_states):
+            seen_embeddings.append(decoder_input.clone())
+            return MultiTokenPredictionLayer._get_precomputed_embeddings(
+                layer, decoder_input, hidden_states
+            )
+
+        layer._get_precomputed_embeddings = capture_precomputed
+        layer._proj_and_transformer_layer = (
+            lambda hidden_states, aux_inputs, **kwargs: hidden_states
+        )
 
         block = types.SimpleNamespace(
             config=config,
@@ -561,15 +611,15 @@ class TestMultiTokenPredictionLayer:
             tp_group=None,
             hidden_state_mixing_rng_tracker_name=None,
             sequence_parallel=False,
-            layers=[_CaptureLayer(), _CaptureLayer()],
+            layers=[layer, layer],
         )
         decoder_input = torch.arange(4, dtype=torch.float32).view(4, 1, 1)
 
         MultiTokenPredictionBlock.forward(
             block,
+            hidden_states=torch.ones_like(decoder_input),
             input_ids=None,
             position_ids=None,
-            hidden_states=torch.ones_like(decoder_input),
             decoder_input=decoder_input,
             attention_mask=None,
         )
@@ -589,16 +639,11 @@ class TestMultiTokenPredictionLayer:
         )
         seen_inputs = []
 
-        class _IncrementLayer:
-            def __call__(self, hidden_states, input_ids, position_ids, padding_mask, **kwargs):
+        class _IncrementLayer(_PassthroughMTPEmbeddings):
+
+            def __call__(self, hidden_states, aux_inputs, **kwargs):
                 seen_inputs.append(hidden_states.clone())
-                return (
-                    hidden_states + 10,
-                    input_ids,
-                    position_ids,
-                    padding_mask,
-                    kwargs.get("mtp_input_mask"),
-                )
+                return hidden_states + 10
 
         block = types.SimpleNamespace(
             config=config,
@@ -949,7 +994,6 @@ class TestMultiTokenPredictionLayer:
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
         mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
-        mtp_layer = mtp.layers[0]
 
         seq_len = 4
         batch_size = 2
@@ -958,52 +1002,39 @@ class TestMultiTokenPredictionLayer:
         padding_mask = torch.tensor([[False, False, False, True], [False, False, True, True]])
         hidden_states = torch.randn(seq_len, batch_size, config.hidden_size)
         attention_mask = torch.ones((batch_size, 1, seq_len, seq_len), dtype=torch.bool)
-        seen = {}
+        seen = []
 
         def fake_embedding(input_ids, position_ids):
             return torch.zeros(seq_len, batch_size, config.hidden_size, dtype=hidden_states.dtype)
 
-        def fake_proj_and_transformer_layer(
-            self,
-            hidden_states,
-            decoder_input,
-            attention_mask=None,
-            padding_mask=None,
-            context=None,
-            context_mask=None,
-            rotary_pos_emb=None,
-            rotary_pos_cos=None,
-            rotary_pos_sin=None,
-            attention_bias=None,
-            inference_params=None,
-            packed_seq_params=None,
-            sequence_len_offset=None,
-            packed_seq_params_by_layout=None,
-            cp_layout_plan=None,
-        ):
-            seen["padding_mask"] = padding_mask
+        def fake_proj_and_transformer_layer(self, hidden_states, aux_inputs, *, decoder_input):
+            seen.append(aux_inputs.padding_mask)
             return hidden_states
 
-        monkeypatch.setattr(
-            mtp_layer,
-            "_proj_and_transformer_layer",
-            types.MethodType(fake_proj_and_transformer_layer, mtp_layer),
-        )
+        for layer in mtp.layers:
+            monkeypatch.setattr(
+                layer,
+                "_proj_and_transformer_layer",
+                types.MethodType(fake_proj_and_transformer_layer, layer),
+            )
 
-        _, _, _, returned_padding_mask, _ = mtp_layer.forward(
+        inputs = AuxInputs(
             input_ids=input_ids,
             position_ids=position_ids,
-            hidden_states=hidden_states,
             attention_mask=attention_mask,
             padding_mask=padding_mask,
             embedding=fake_embedding,
         )
+        mtp(hidden_states, inputs)
+        assert inputs.padding_mask is padding_mask
+        assert inputs.decoder_input is None
 
-        expected_padding_mask = torch.tensor(
-            [[False, False, True, True], [False, True, True, True]]
-        )
-        assert torch.equal(seen["padding_mask"], expected_padding_mask)
-        assert torch.equal(returned_padding_mask, expected_padding_mask)
+        expected_padding_mask = padding_mask
+        assert len(seen) == config.mtp_num_layers
+        for actual_padding_mask in seen:
+            validity, _ = roll_tensor(~expected_padding_mask, shifts=-1, dims=-1)
+            expected_padding_mask = ~validity
+            assert torch.equal(actual_padding_mask, expected_padding_mask)
 
     def test_get_embeddings_detaches_decoder_input(self):
         """With mtp_detach_heads=True, _get_embeddings detaches decoder_input (severing
@@ -1115,8 +1146,10 @@ class TestMultiTokenPredictionLayer:
         # gradient flow to the detach logic (not the attention kernels). Must be an
         # nn.Module since it is assigned as a child module of the layer.
         class _IdentityMTPLayer(torch.nn.Module):
-            def forward(self, hidden_states, **kwargs):
-                return hidden_states, None
+
+            def forward(self, hidden_states, aux_inputs):
+                assert not {"input_ids", "position_ids", "mtp_input_mask"} & vars(aux_inputs).keys()
+                return hidden_states, LayerAuxOutputs()
 
         for layer in mtp.layers:
             monkeypatch.setattr(layer, "mtp_model_layer", _IdentityMTPLayer())
@@ -4135,41 +4168,34 @@ class TestMultiTokenPredictionHybrid:
         input_ids = torch.arange(4).reshape(1, 4)
         position_ids = torch.arange(4).reshape(1, 4)
         padding_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-        mtp_input_mask = torch.ones_like(input_ids, dtype=torch.bool)
         decoder_input = torch.randn(4, 1, 8)
         hidden_states = torch.randn(4, 1, 8)
         calls = {"inner": 0, "outer": 0}
+        expected_decoder_input = decoder_input
 
-        def get_embeddings(_self, **_kwargs):
-            return (
-                input_ids,
-                position_ids,
-                padding_mask,
-                mtp_input_mask,
-                decoder_input,
-                hidden_states,
-            )
-
-        def inner_forward(_self, **kwargs):
+        def inner_forward(_self, states, aux_inputs, *, decoder_input):
             calls["inner"] += 1
-            assert kwargs["hidden_states"] is hidden_states
+            assert decoder_input is expected_decoder_input
+            assert "decoder_input" not in vars(aux_inputs)
+            assert states is hidden_states
+            assert aux_inputs.padding_mask is padding_mask
             return hidden_states + 1
 
-        def outer_forward(_self, **_kwargs):
+        def outer_forward(_self, states, inputs, *, decoder_input):
             calls["outer"] += 1
             raise AssertionError("Hybrid MTP must not use the outer checkpoint")
 
-        layer._get_embeddings = types.MethodType(get_embeddings, layer)
         layer._proj_and_transformer_layer = types.MethodType(inner_forward, layer)
         layer._checkpointed_forward = types.MethodType(outer_forward, layer)
 
-        output, *_ = layer(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attention_mask=None,
-            padding_mask=padding_mask,
-            embedding=object(),
+        output = layer(
+            hidden_states,
+            AuxInputs(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                padding_mask=padding_mask,
+                decoder_input=decoder_input,
+            ),
         )
 
         assert calls == {"inner": 1, "outer": 0}
@@ -4391,8 +4417,8 @@ class TestMultiTokenPredictionHybrid:
                     packed_seq_params=kwargs["packed_seq_params"],
                 )
 
-            def __call__(self, **kwargs):
-                return self.forward_impl(**kwargs)
+            def __call__(self, *, aux_inputs, **kwargs):
+                return self.forward_impl(**(vars(aux_inputs) | kwargs))
 
         def output_layer(output, **kwargs):
             return output, None
