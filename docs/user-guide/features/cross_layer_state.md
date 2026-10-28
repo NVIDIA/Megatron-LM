@@ -5,20 +5,21 @@ while preserving all consumer gradients to the producer. The same declared
 tensor interface can cross a checkpoint, CUDA graph, or pipeline boundary.
 The implementation is adapted from the general state and transport contracts
 in [#7224](https://github.com/NVIDIA/Megatron-LM/pull/7224), by Hongxiao Bai.
-It contains no DeepSeek-specific attention, compression, or routing rules.
+It contains no model-specific attention, compression, or routing rules.
 
-THD (packed sequences) support is still a work in progress and is not supported
-by this feature's main-branch implementation. The existing layout-plan hooks
-and variable-shape tensor transport do not provide end-to-end THD support.
+Packed (THD) batches cross pipeline boundaries through per-microbatch plans, whose
+shapes may vary. Packed CP layout conversion remains model-owned: the CP helpers'
+`thd_plans` argument is preliminary plumbing without end-to-end coverage.
 
 ## Declare the inputs and outputs of a region
 
-`TensorField` declares a stable key, concrete shape, dtype, layout, gradient
+`TensorField` declares a stable key, concrete shape, dtype, CP layout, gradient
 eligibility, and presence. `TensorSchema` orders those fields and packs/unpacks
 ordinary tensors. Integer fields cannot be differentiable. `present=False`
 represents an absent field and differs from a present, zero-length tensor.
-Layout names are validated when the field is constructed; unknown names fail
-before communication.
+The layout describes sequence sharding under context parallelism: `contiguous`
+and `zigzag` shard dimension zero, `replicated` is identical on every CP rank,
+`local` is rank-specific, and `strided` declares no sequence semantics.
 
 Gradient eligibility is a property of the model's interface, not the current
 producer's `requires_grad` value: a frozen producer can still send a field that
@@ -68,40 +69,47 @@ an already registered module need not replace that module in the model tree.
 `region.run(..., recompute=True)` checkpoints explicit input tensors and rebuilds
 the mapping on replay. It preserves PyTorch's default RNG and Megatron's
 model-parallel RNG, supports parameter gradients even when input tensors are
-frozen, and preserves absent versus explicitly zero gradients.
+frozen, and preserves absent versus explicitly zero gradients. Quantized regions
+pass an FP8-aware `checkpoint_fn(region, *tensors)`, e.g. one calling
+`te_checkpoint(..., use_reentrant=False)`; the default checkpoint is rejected
+while FP8 autocast is active, since its replay would run outside the forward's
+FP8 recipe state.
 
 `StatefulGraphs(region, sample_hidden, sample_state, slots=N, backend=...)`
 captures the same tensor interface with `backend="torch"` or
 `backend="transformer_engine"`. Replay with `graphs.run(hidden, state, slot=i)`.
 For the TE backend, initialize and seed Megatron's TE RNG tracker during model
 setup. Legacy byte-tensor RNG states are rejected before capture; the adapter
-does not reset or replace the caller's RNG configuration.
+does not reset or replace the caller's RNG configuration. `capture_kwargs`
+forward backend options such as TE's FP8 recipe. With MCore DDP's overlapped
+parameter gather, pass `make_forward_pre_hook` so replays still run the
+parameter owners' gather hooks.
+
 Use independent slots for outstanding forwards; a slot cannot be reused until
 its backward completes. Forward-only and frozen invocations return independent
 copies, so another replay cannot overwrite outputs held by an asynchronous send.
 Replays on different streams wait for the previous invocation to finish copying.
 
-Input geometry, strides, dtypes, gradient profile, parameter storage, and training
-mode must match capture. Input signatures are checked on replay. The more costly
-module walk is opt-in with `debug_checks=True`, or call `validate_module()` at a
-configuration boundary. Optimizer updates to existing parameter storage are allowed;
-FSDP storage replacement and MXFP8 parameter-gather buffer reuse are unsupported.
+Input geometry, strides, dtypes, gradient profile, training mode and parameter
+storage must match capture. Input signatures and the training mode of every
+captured module are checked on each replay; capture a separate profile for
+evaluation. The more costly storage walk is opt-in with `debug_checks=True`, or
+call `validate_module()` at a configuration boundary. Optimizer updates to existing
+parameter storage are allowed; FSDP storage replacement and MXFP8 parameter-gather
+buffer reuse are unsupported.
 
 Each slot still owns a separate graph memory pool. Memory grows with the number
 of outstanding microbatches; size `slots` for the schedule and include these pools
 in the activation-memory budget. Shared pools remain future work.
 
-Warmup and capture preserve existing parameter gradients and fused `main_grad`
-buffers and suppress MCore DDP reductions during capture. Capture also scopes
-PyTorch's stale-stream override where available, as needed for DDP's retained
-gradient nodes. CUDA graph creation must be serialized within a process.
+Warmup and capture preserve existing parameter gradients, fused `main_grad`
+buffers and registered buffers (e.g. router statistics), and suppress MCore DDP
+reductions during capture. CUDA graph creation must be serialized within a process.
 
-This initial graph API validates FP32/BF16 execution. Every differentiable
-captured output must participate in one backward invocation. An unused output
-must be omitted from that capture profile; silently turning a missing gradient
-into a numeric zero would change optimizer and auxiliary-loss behavior. Full
-recomputation inside capture is rejected. FP8/FP4 capture recipes and automatic
-integration with model-specific graph collection are outside this interface.
+Every differentiable captured output must participate in one backward
+invocation. An unused output must be omitted from that capture profile; silently
+turning a missing gradient into a numeric zero would change optimizer and
+auxiliary-loss behavior. Full recomputation inside capture is rejected.
 
 For a skipped or failed iteration, first drain communication and stop scheduling
 work, then call `graphs.abort()` and discard its outputs. The slots can be reused;
@@ -117,86 +125,66 @@ The helpers in `megatron.core.context_parallel.shared_state` accept an explicit
 CP process group:
 
 - `redistribute_state` reuses the existing contiguous/zigzag conversion. Its
-  `thd_plans` argument is preliminary plumbing for `THDCPLayoutPlan`; packed THD
-  execution remains unsupported.
-- `gather_state` gathers equal contiguous or zigzag sequence shards and sums all
-  consumer gradient contributions back to each owner. Zigzag uses one all-gather
-  plus a local reorder, without a preliminary all-to-all. The collective writes
-  directly into one output buffer. A local slice of the result needs no additional
-  gradient collective; normal slicing avoids double reduction.
+  `thd_plans` argument (a `THDCPLayoutPlan` per field) is preliminary.
+- `gather_state` gathers equal contiguous or zigzag sequence shards with one
+  all-gather into a single buffer and a local reorder without host
+  synchronization, so it also runs inside CUDA graph capture. Backward
+  reduce-scatters, summing every consumer's contribution to its owner. A local
+  slice of the result needs no additional gradient collective.
 - With sequence parallelism, pass `sequence_parallel=True`, `tp_group`, and
   `tp_cp_group` to both helpers. Gathering then spans TP x CP and restores logical
   sequence order. Missing SP groups are rejected, including no-op conversions.
-  Select fields with the same sharding for each call.
+  If TP ranks consume the gathered state identically (a TP-replicated consumer),
+  pass `tp_replicated=True` so their duplicate contributions are averaged; the
+  default sum is correct for TP-partitioned consumers such as split heads.
 - Fields marked `replicated`, `local`, or `strided` remain unchanged. Select the
   fields to communicate through the schema; do not gather query-local state
   simply because another field needs global visibility.
 
-Sequence is dimension zero. Peers must agree on shapes and collective/backward
-participation, as required by the underlying distributed operations. The model
-owns compression groups, halo ownership, packed positions, and TP/SP-specific
-layout rules. The general state layer does not infer those semantics.
+Peers must agree on shapes and collective/backward participation, as required by
+the underlying distributed operations. The model owns compression groups, halo
+ownership, packed positions, and TP/SP-specific layout rules.
 
 ## Pipeline parallelism
 
 Stages opt into the existing ordinary or interleaved 1F1B scheduler by exposing
 `pipeline_payload_factory = TensorStatePayload`. A nonterminal stage returns
-`TensorStatePayload.from_state(hidden, state, output_schema, boundary_id=...)`.
+`TensorStatePayload.from_state(hidden, state, output_schema, boundary_id=..., metadata=...)`.
 Its successor receives that object through the normal `set_input_tensor` hook
 and calls `payload.restore()` to obtain hidden and a fresh state mapping. The
 terminal stage uses the normal scalar-loss reduction interface.
 
-CUDA stages also expose `pipeline_control_group`, created once during model
-assembly with `create_pipeline_control_group(pg_collection.pp, world_group=world_group)`
-from `typed_p2p_communication`. All global ranks call this in the same order with
-their local PP group and the explicitly supplied world process group. It creates
-every PP replica in a common global order. Reuse that
-group across iterations and virtual chunks; destroy it after the schedules
-and graph captures finish. Its Gloo backend carries host-derived descriptors,
-identities, and gradient-activity bits. For PP=2, its NCCL backend carries one
-physical direction while the original PP group carries the other. Separate
-channels keep a prefetched receive from blocking a send to the same peer. Reading
-activity bits from a CUDA tensor would synchronize the CPU with pending GPU work.
+Every boundary message is described ahead of time by a `PipelinePayloadSpec`
+(hidden field first, then the state fields, host metadata and a boundary
+identity). Provide one incoming/outgoing spec per microbatch and virtual chunk
+through `PipelineDataIterator` and `PipelinePayloadPlan`; the optional
+`forward_step_func.prepare_pipeline_inputs` hook prepares iterators before
+communication. Shapes may change between microbatches (e.g. packed sequences),
+and all receives are posted without runtime shape discovery, so blocking,
+batched and VPP-overlapped P2P share one protocol. Terminal directions use `None`.
+Neighboring plans are compared once per schedule invocation, and each send is
+checked against its plan before it is posted. Peers exchange only tensor data.
 
-Typed transport carries mixed dtypes, empty/absent fields, and independent
-gradient eligibility. A backward activity bitmap distinguishes a missing
-gradient from an explicitly zero gradient. All active output roots participate
-in one autograd traversal; relay and local-consumer contributions accumulate
-once. The communicator owns detached wire buffers until their Work completes.
-`TensorStatePayload.from_state` creates a separate viewless tensor object for
-`__hidden__`, without copying its data. With `deallocate_pipeline_outputs=True`,
-that owned root is pseudo-freed after posting the send; detached wire buffers keep
-the storage alive until send completion. Joint backward uses Megatron's engine
-entry point to handle the released root's shape. Differentiable side roots, caller aliases,
-and storage saved by autograd remain live as required. Non-differentiable output
-references are dropped from the backward record once the wire owns them. Custom payloads retain all
-roots unless they explicitly declare exclusively owned releasable tensor objects.
-Prepared forward identities are checked when the receive is handed to the model,
-including after an asynchronous prefetch. Dynamic JSON descriptors use byte buffers.
+Gradient eligibility is static per microbatch. A field declared differentiable
+must receive a gradient from its consumers; a missing gradient is an error rather
+than a silent zero, because a zero would still run producer-side auxiliary-loss
+hooks. Declare a branch that is unused for a microbatch non-differentiable in
+that microbatch's plan. Empty fields carry no data.
 
-There are two transport modes:
+Typed transport carries mixed dtypes and empty/absent fields. All differentiable
+output roots of a stage participate in one autograd traversal; relay and
+local-consumer contributions accumulate once. `from_state` wraps each
+differentiable root in its own viewless tensor object without copying data; with
+`deallocate_pipeline_outputs=True`, these roots are shrunk after the send is
+posted, while detached wire buffers keep the storage alive until the transfer
+completes. Caller aliases and storage saved by autograd are unaffected.
+Non-differentiable references are dropped once the wire owns them.
 
-| Mode | Configuration and contract |
-|---|---|
-| Dynamic descriptors | Blocking, unbatched P2P (`batch_p2p_comm=False`, `overlap_p2p_comm=False`); shapes may vary between microbatches. |
-| Prepared descriptors | Provide one incoming/outgoing `PipelinePayloadSpec` per microbatch and virtual chunk through `PipelineDataIterator` and `PipelinePayloadPlan`. Supports batched P2P without runtime shape discovery. |
-
-Terminal directions use `None` in the plan. Neighboring descriptors must match
-exactly, including field identity, presence and gradient eligibility. The
-optional `forward_step_func.prepare_pipeline_inputs` hook prepares iterators
-before communication; dataset interpretation remains outside core scheduling.
-
-Batched and overlapped P2P **require prepared plans**: NCCL can return one coalesced Work for
-the entire batch, which cannot be waited just for a dynamic header while its
-data receives are still unknown. Asynchronous schedules likewise must post all receive buffers before waiting for future gradients. Overlapped P2P requires VPP and unbatched P2P.
-`overlap_p2p_comm_warmup_flush=True` is rejected: warmup/flush prefetch still
-hangs with NCCL and requires further work. Ordinary VPP communication overlap
-remains available with that option disabled. Ring exchange, multi-module pipelines,
-and the combined MoE schedule are not supported by this typed transport. Existing tensor-only models retain their
-current scheduling path.
-
-Custom P2P communicator subclasses cannot be combined with the automatic typed
-adapter; the scheduler rejects them instead of silently replacing their behavior.
+Like the tensor-only communicator, PP=2 carries one physical direction on the
+world group so that a posted receive never blocks a send to the same peer.
+`overlap_p2p_comm_warmup_flush=True`, ring exchange, multi-module pipelines, the
+combined MoE schedule and custom P2P communicator subclasses are rejected for
+typed stages. Existing tensor-only models retain their current scheduling path.
 
 ## Validation
 

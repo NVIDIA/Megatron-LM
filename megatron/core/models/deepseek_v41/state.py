@@ -2,16 +2,12 @@
 
 """V4.1's live fields on the common execution and pipeline tensor contract."""
 
-from dataclasses import astuple, dataclass, replace
+from dataclasses import astuple, dataclass
 
 import torch
 
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.pipeline_payload import (
-    PipelinePayloadSpec,
-    PipelineTensorSpec,
-    TensorStatePayload,
-)
+from megatron.core.pipeline_parallel.pipeline_payload import PipelinePayloadSpec, TensorStatePayload
 from megatron.core.transformer.experimental_attention_variant.csa2 import (
     CSA2State,
     csa2_source_layers,
@@ -220,14 +216,16 @@ class V41StateCodec:
         hidden = TensorField(
             '__hidden__', (p.sequence, p.batch, width), c.params_dtype, 'strided', True
         )
-        specs = tuple(
-            PipelineTensorSpec.from_field(f) for f in (hidden, *self.schema(boundary).fields)
+        return PipelinePayloadSpec(
+            (hidden, *self.schema(boundary).fields), astuple(p), f'v41:{boundary}'
         )
-        return PipelinePayloadSpec(specs, astuple(p), f'v41:{boundary}')
 
     def payload(self, hidden, state, boundary):
-        """Create an owned hidden root while sharing side-field storage with autograd."""
-        payload = TensorStatePayload.from_state(
-            hidden, state, self.schema(boundary), boundary_id=f'v41:{boundary}'
+        """Publish owned differentiable roots while sharing their storage with autograd."""
+        return TensorStatePayload.from_state(
+            hidden,
+            state,
+            self.schema(boundary),
+            boundary_id=f'v41:{boundary}',
+            metadata=astuple(self.shape),
         )
-        return replace(payload, spec=replace(payload.spec, metadata=astuple(self.shape)))
