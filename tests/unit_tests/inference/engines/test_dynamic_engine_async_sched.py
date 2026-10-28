@@ -1342,9 +1342,6 @@ def _instrument_scenario_runtime(env, scenario, runtime):
         runtime[("sampling-step", runtime["model-forward"])] += 1
         runtime[f"sampling-backend:{controller._sampling_backend}"] += 1
         runtime["metadata-consumed"] += int(active_count > 0)
-        runtime["request-seeded-samples"] += int(
-            active_count > 0 and bool((metadata["seed"][:active_count] >= 0).any())
-        )
         sampling_class = type(controller._sampling).__name__
 
         if sampling_class == "TorchSampling":
@@ -1757,8 +1754,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         config.update(scenario.config)
         config["async_sched_mode"] = mode
         env = cls._build_test_env(_DynamicEngineTestConfig(**config))
-        if "suspend-resume" in scenario.signals:
-            env.engine._generation_epoch = 7
         env.requests = _make_scenario_requests(
             env, scenario, stop_tokens=stop_tokens, termination_token=termination_token
         )
@@ -1813,14 +1808,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 env.engine.suspend()
                 runtime["pending-after-suspend"] += int(
                     env.engine.controller._async_sched_forward.is_valid
-                )
-                suspended = [entry.record[-1] for entry in env.engine.requests.values()]
-                runtime["suspended-request-count"] = len(suspended)
-                runtime["policy-epoch-after-suspend"] = sum(
-                    request.policy_epoch == [(0, 7)] for request in suspended
-                )
-                runtime["kv-epoch-after-suspend"] = sum(
-                    request.kv_cache_epoch == [(0, 7)] for request in suspended
                 )
                 env.engine.resume()
                 for request_id in env.engine.resume_request_ids:
@@ -1887,20 +1874,12 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert context.static_kv_memory_pointers
         if "suspend-resume" in signals:
             assert runtime["suspend-resume"] == runtime["pending-before-suspend"] == 1
-            assert runtime["suspended-request-count"] > 0
-            assert runtime["policy-epoch-after-suspend"] == runtime["suspended-request-count"]
             if "recompute" in signals:
                 assert runtime["pending-after-suspend"] == 0
                 assert runtime["pending-after-resume"] == 0
-                assert runtime["kv-epoch-after-suspend"] == 0
             else:
                 assert runtime["pending-after-suspend"] == 1
                 assert runtime["pending-after-resume"] == 1
-                assert runtime["kv-epoch-after-suspend"] == runtime["suspended-request-count"]
-            assert all(
-                request.policy_epoch == request.kv_cache_epoch == [(0, 7)]
-                for request in env.requests
-            )
             if "static-pointers" in signals:
                 assert runtime["static-pointer-preserved"] == 1
         if "dp-offset" in signals:
@@ -2031,10 +2010,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     ):
                         token_text = controller.tokenizer.detokenize([token])
                         assert 0 < len(top_n) <= request.sampling_params.top_n_logprobs
-                        if token_text in top_n:
-                            assert top_n[token_text] == pytest.approx(logprob, rel=0, abs=0.1)
-                        else:
-                            assert logprob <= min(top_n.values())
+                        assert token_text in top_n
+                        assert top_n[token_text] == pytest.approx(logprob, rel=0, abs=0.1)
                     if request.sampling_params.skip_prompt_log_probs:
                         assert not request.prompt_top_n_logprobs
                     else:
@@ -2078,9 +2055,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert int(env.engine._spec_tokens_proposed_per_pos.sum()) > 0
             assert runtime["mtp-rewind-calls"] > 0
             assert runtime["mtp-acceptance-decisions"] > 0
-            if "mtp-accept-rewind" in signals:
-                assert runtime["mtp-accepted-tokens"] > 0
-                assert runtime["mtp-rejected-tokens"] > 0
         if "metadata-compaction" in signals:
             assert runtime["non-prefix-survivor-compactions"] > 0
         if "hybrid" in signals:

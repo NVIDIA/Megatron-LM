@@ -905,7 +905,7 @@ class DynamicEngineTestConfig:
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
     expert_model_parallel_size: int = 1
-    expert_tensor_parallel_size: int = 1
+    expert_tensor_parallel_size: Optional[int] = None
     # EP process groups can also exercise dense models; build MoE layers only
     # when a test explicitly owns that model behavior.
     use_moe_layer_spec: bool = False
@@ -955,7 +955,6 @@ class DynamicEngineTestConfig:
     inference_moe_token_dispatcher_type: str = "nccl"
     moe_enable_routing_replay: bool = False
     moe_router_topk: int = 2
-    moe_router_load_balancing_type: str = "aux_loss"
     moe_router_score_function: str = "softmax"
     moe_num_hash_layers: int = 0
     moe_apply_probs_on_input: bool = False
@@ -1284,7 +1283,6 @@ class DynamicInferenceEngineTestBase:
                 ),
                 moe_enable_routing_replay=test_config.moe_enable_routing_replay,
                 moe_router_topk=test_config.moe_router_topk,
-                moe_router_load_balancing_type=test_config.moe_router_load_balancing_type,
                 moe_router_score_function=test_config.moe_router_score_function,
                 moe_apply_probs_on_input=test_config.moe_apply_probs_on_input,
                 moe_latent_size=test_config.moe_latent_size,
@@ -1435,7 +1433,8 @@ class DynamicInferenceEngineTestBase:
                 config=transformer_config,
                 hybrid_stack_spec=hybrid_stack_spec_for(
                     test_config.ssm_mixer,
-                    inference_optimized=test_config.transformer_impl == "inference_optimized",
+                    inference_optimized=test_config.use_moe_layer_spec
+                    and test_config.transformer_impl == "inference_optimized",
                 ),
                 vocab_size=test_config.vocab_size,
                 max_sequence_length=test_config.max_sequence_length,
@@ -3333,7 +3332,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     )
     @torch.inference_mode()
     def test_moe_decode_after_local_kv_handoff_matches_uninterrupted_request(self):
-        config = self._handoff_config()
+        config = self._handoff_config(hidden_size=256)
 
         baseline = self._build_test_env(config)
         baseline_request = baseline.requests[0]
