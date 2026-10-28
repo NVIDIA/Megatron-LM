@@ -60,18 +60,22 @@ All PP stages of a given step share a single `trace_id`. Each stage's `megatron.
 
 ## Where the integration lives
 
+Neither part is wired into this repository yet: `megatron/training/training.py` does not call
+`broadcast_trace_context`, and `schedules.py` does not emit `megatron.pp.recv_forward.linked`.
+The snippets below show where each part goes.
+
 ### Broadcast — `megatron/training/training.py`
 
-Inside the main training loop, just before the `megatron.train_step` managed_span opens:
+Inside the main training loop of `train()`, just before the per-iteration span opens. The pipeline
+size comes from the model's process groups, which `train()` holds as `model_pg_collection`:
 
 ```python
 # Broadcast rank 0's trace context to all PP ranks.
 # Collective — all ranks must participate.
 _pp_carrier = None
 try:
-    from megatron.core import parallel_state
     if (torch.distributed.is_initialized()
-            and parallel_state.get_pipeline_model_parallel_world_size() > 1
+            and get_pg_size(model_pg_collection.pp) > 1
             and get_telemetry() is not None):
         from nemo.lens.distributed import broadcast_trace_context
         from nemo.lens.state import set_pp_trace_carrier
