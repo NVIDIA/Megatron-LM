@@ -36,6 +36,7 @@ def test_hybrid_schedule_runs_without_a_transformer_context_hook(layer_type):
     plan = HybridStackSchedulePlan.__new__(HybridStackSchedulePlan)
     plan.layer = SimpleNamespace()
     plan.layer_type = layer_type
+    plan.recompute_segment = None
     visited = []
     for name in (
         "pre_dispatch_computation",

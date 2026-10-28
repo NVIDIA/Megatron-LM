@@ -6,7 +6,6 @@ from unittest import mock
 import pytest
 import torch
 
-from megatron.core import recompute as recompute_module
 from megatron.core import tensor_parallel
 from megatron.core.context_parallel.utils import ContextParallelBatch
 from megatron.core.inference.utils import InferenceMode
@@ -475,8 +474,8 @@ def test_hybrid_model_scatters_embedding_for_sequence_parallel(monkeypatch):
     inference_context.zero_padding_tokens.assert_called_once_with(
         local_embeddings, sequence_parallel_rank=3
     )
-    assert output is decoder.kwargs["hidden_states"]
-    assert output.unwrap() is local_embeddings
+    assert isinstance(decoder.kwargs["hidden_states"], WrappedTensor)
+    assert output is local_embeddings
 
 
 @pytest.mark.parametrize("pre_process", [True, False])

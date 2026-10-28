@@ -503,9 +503,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # The schedule plan calls the layer callables directly and bypasses
         # ``HybridStack.forward``, which is where per-layer context-parallel layout
         # conversion happens and where chunkwise linear CP gets its packed-sequence
-        # metadata and padding-mask check. A bracketed group presents the boundary
-        # layout to its enclosing stack even when its own layers need conversion, so
-        # check every stack, including the nested ones.
+        # metadata. A bracketed group presents the boundary layout to its enclosing
+        # stack even when its own layers need conversion, so check every stack,
+        # including the nested ones.
         for module in self.modules():
             if not isinstance(module, HybridStack):
                 continue
