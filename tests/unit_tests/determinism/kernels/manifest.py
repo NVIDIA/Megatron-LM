@@ -969,12 +969,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/experimental_attention_variant/dsa_gqa_triton_decode.py",
             "megatron/core/transformer/experimental_attention_variant/_dsa_triton_decode/attention.py",
             "megatron/core/transformer/experimental_attention_variant/_dsa_triton_decode/score.py",
-            "megatron/core/transformer/experimental_attention_variant/_dsa_triton_decode/topk.py",
+            "megatron/core/transformer/experimental_attention_variant/_dsa_cute_topk/histogram_topk.py",
+            "megatron/core/transformer/experimental_attention_variant/_dsa_cute_topk/dispatch.py",
+            "megatron/core/transformer/experimental_attention_variant/_dsa_cute_topk/workspace.py",
+            "megatron/core/transformer/experimental_attention_variant/_dsa_cute_topk/radix_fallback.py",
         ),
         tests=(K + "test_dsa_triton_decode.py",),
         kind="triton",
         training_path=False,
-        notes="TMA/tcgen05 score, exact float4 top-k and radix fallback, and sparse attention "
+        notes="TMA/tcgen05 score, CuTe DSL exact top-k with a Triton radix fallback, and Triton sparse attention "
         "replay bit-exactly; compares simplified training/decode forward kernels and covers "
         "empty/ragged requests, causal masks, and graph page-table refresh.",
     ),
