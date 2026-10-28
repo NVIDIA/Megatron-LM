@@ -150,8 +150,10 @@ def test_dynamic_context_rejects_context_parallelism_before_allocating_cache():
             context_parallel_size=2,
         )
 
+        allocated = torch.cuda.memory_allocated()
         with pytest.raises(ValueError, match="does not support context parallelism"):
             DynamicInferenceContext(model_config, InferenceConfig(buffer_size_gb=0.01))
+        assert torch.cuda.memory_allocated() == allocated
     finally:
         Utils.destroy_model_parallel()
 
