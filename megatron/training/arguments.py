@@ -2773,9 +2773,10 @@ def _add_regularization_args(parser):
                        'OptimizerConfig.muon_tp_mode.')
     group.add_argument('--muon-ns-batch-size', type=int, default=1,
                        help='Max number of same-shape matrices fused into one batched '
-                       'Newton-Schulz on an NS home under --muon-tp-mode layer_sharded. '
-                       'The default of 1 keeps the bit-exact per-matrix path; raise '
-                       '(e.g. to 32) to cut kernel launches on MoE expert homes at '
+                       'Newton-Schulz call in duplicated or layer-sharded Muon. '
+                       'Duplicated mode batches only unsharded expert matrices. '
+                       'The default of 1 keeps the existing per-matrix path; raise '
+                       '(e.g. to 32) to cut launches for compatible expert matrices at '
                        'the cost of bitwise parity (baddbmm vs addmm rounding).')
     group.add_argument('--muon-use-syrk', action='store_true',
                        help='Use the Triton SYRK kernel for the symmetric-output '

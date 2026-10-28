@@ -907,6 +907,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "GEMM path; the SYRK paths are exercised only where the stack supports them.",
     ),
     KernelEntry(
+        name="duplicated_muon_newton_schulz_dispatch",
+        sources=("megatron/core/optimizer/emerging_optimizers.py",),
+        tests=(K + "test_muon_batching.py",),
+        kind="dispatch",
+        notes="Duplicated TensorParallelMuon batches unsharded expert updates through "
+        "Emerging Optimizers' newton_schulz. Multi-step weights and momentum replay "
+        "bit-exactly under contention in FP32 and BF16 matmul modes, including singleton tails. "
+        "Batched and unbatched paths may differ by GEMM rounding.",
+    ),
+    KernelEntry(
         name="mfsdp_muon_dispatch",
         sources=("megatron/core/distributed/fsdp/src/megatron_fsdp/experimental/muon.py",),
         tests=("tests/unit_tests/distributed/mfsdp_v2/test_muon.py",),
