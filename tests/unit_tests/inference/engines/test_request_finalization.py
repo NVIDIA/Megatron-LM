@@ -91,7 +91,9 @@ async def test_finalization_precedes_reuse_but_publication_waits_for_bookkeeping
 
     expected_routing = np.arange(4, dtype=np.int32).reshape(4, 1, 1)
     for i, block in enumerate(blocks[:2].tolist()):
-        allocator.store_block_routing(block, np.arange(2), expected_routing[2 * i : 2 * i + 2])
+        allocator.routing_replay.store_block_routing(
+            block, np.arange(2), expected_routing[2 * i : 2 * i + 2]
+        )
     samples = torch.tensor([1, 2])
     accepted = torch.tensor([[6, -1], [7, -1]]) if mtp else None
     score_count = 2 if mtp else 1
@@ -119,7 +121,9 @@ async def test_finalization_precedes_reuse_but_publication_waits_for_bookkeeping
         reused = allocator.allocate_memory_blocks(2).clone()
         assert set(reused.tolist()) == set(blocks[:2].tolist())
         for block in reused.tolist():
-            allocator.store_block_routing(block, np.arange(2), expected_routing[:2] + 100)
+            allocator.routing_replay.store_block_routing(
+                block, np.arange(2), expected_routing[:2] + 100
+            )
         if path == "overlap":
             return torch.tensor([10]), torch.tensor([1])
         return {}

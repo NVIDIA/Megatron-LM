@@ -12,6 +12,7 @@ POOL_SIZE = 10
 PAUSED_LIMIT = 2
 MAX_REQUESTS = 8
 MAX_BLOCKS_PER_REQ = 4
+BLOCK_SIZE_TOKENS = 4
 
 
 def _make_context(
@@ -32,6 +33,7 @@ def _make_context(
         request_kv_block_counts=request_kv_block_counts,
         request_to_kv_block_ids=request_to_kv_block_ids,
         prefix_cache_lru_clock=prefix_cache_lru_clock,
+        block_size_tokens=BLOCK_SIZE_TOKENS,
     )
 
 
@@ -95,7 +97,7 @@ def test_allocate_release_reset_round_trip_no_prefix_caching():
     assert a.pool_avail == POOL_SIZE - 1
     assert a.get_allocatable_count() == POOL_SIZE - 1
     assert a.block_bag.tolist() == list(range(POOL_SIZE))
-    assert a.block_routing == {}
+    assert not a.routing_replay.has_data()
 
 
 @pytest.mark.parametrize("policy", list(PrefixCachingEvictionPolicy))
