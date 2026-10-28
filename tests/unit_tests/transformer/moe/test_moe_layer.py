@@ -5,9 +5,15 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 import megatron.core.transformer.moe.moe_layer as moe_layer_module
 from megatron.core import parallel_state
+from megatron.core.distributed import (
+    DistributedDataParallel,
+    DistributedDataParallelConfig,
+    finalize_model_grads,
+)
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_local_submodules,
@@ -21,6 +27,142 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
+
+
+def _shared_composition_reference(x, fc1, fc2):
+    gate, up = F.linear(x, fc1).chunk(2, dim=-1)
+    return F.linear(F.silu(gate) * up, fc2)
+
+
+def _composition_reference(x, parameters, config):
+    probs = F.linear(x, parameters["router.weight"]).softmax(dim=-1)
+    hidden = F.linear(x, parameters["fc1_latent_proj.weight"]) if config.moe_latent_size else x
+    output = hidden.tanh() * (probs[..., :1] + 2 * probs[..., 1:])
+    if config.moe_latent_size:
+        output = output * torch.rsqrt(
+            output.square().mean(-1, keepdim=True) + config.layernorm_epsilon
+        )
+        output = output * parameters["fc2_norm.weight"]
+        output = F.linear(output, parameters["fc2_latent_proj.weight"])
+    if config.moe_shared_expert_intermediate_size:
+        output = output + _shared_composition_reference(
+            x,
+            parameters["shared_experts.linear_fc1.weight"],
+            parameters["shared_experts.linear_fc2.weight"],
+        )
+    return output
+
+
+def _mok_composition_layer(
+    monkeypatch, *, tp=1, latent=None, shared=64, mode="auto", recompute=False
+):
+    """Real MoELayer/TE composition; only the external routed backend is substituted."""
+    seen = {"router": [], "shared": [], "backend": []}
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("MOK composition must not construct or call a native dispatcher")
+
+    class NoDispatcher:
+        __getattr__ = forbidden
+
+    class Routed(torch.nn.Module):
+        def __init__(self, shared_module) -> None:
+            super().__init__()
+            self.shared = shared_module
+
+        def forward(self, hidden, probs, routes):
+            seen["backend"].append(hidden.shape)
+            assert routes.all()
+            scale = (probs[:, :1] + 2 * probs[:, 1:]).view(*hidden.shape[:-1], 1)
+            output = hidden.tanh() * scale
+            if self.shared is not None:
+                output = output + _shared_composition_reference(
+                    hidden, self.shared.linear_fc1.weight, self.shared.linear_fc2.weight
+                )
+            return output
+
+    for name in (
+        "MoEAllGatherTokenDispatcher",
+        "MoEAlltoAllTokenDispatcher",
+        "MoEFlexTokenDispatcher",
+    ):
+        monkeypatch.setattr(moe_layer_module, name, forbidden)
+    monkeypatch.setattr(
+        moe_layer_module,
+        "build_megakernel_backend",
+        lambda **kwargs: Routed(kwargs["shared_experts"]),
+    )
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        ffn_hidden_size=64,
+        num_moe_experts=2,
+        moe_router_topk=2,
+        moe_router_pre_softmax=True,
+        moe_router_load_balancing_type="none",
+        moe_aux_loss_coeff=0.0,
+        moe_router_dtype="fp32",
+        moe_ffn_hidden_size=64,
+        moe_shared_expert_intermediate_size=shared,
+        moe_latent_size=latent,
+        moe_use_norm_before_up_proj=latent is not None,
+        normalization="RMSNorm",
+        tensor_model_parallel_size=tp,
+        sequence_parallel=tp > 1,
+        expert_tensor_parallel_size=1,
+        moe_grouped_gemm=True,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        add_bias_linear=False,
+        bias_activation_fusion=False,
+        bf16=True,
+        params_dtype=torch.float32,
+        gradient_accumulation_fusion=True,
+        use_cpu_initialization=True,
+        moe_megakernel_backend="mok",
+        moe_megakernel_backend_config={"shared_expert_mode": mode},
+        recompute_granularity="selective" if recompute else None,
+        recompute_modules=["moe", "shared_experts"] if recompute else [],
+    )
+    spec = get_submodules(
+        get_gpt_layer_with_transformer_engine_submodules(num_experts=2, moe_grouped_gemm=True).mlp
+    )
+    layer = MoELayer(config, spec).cuda()
+    assert layer.token_dispatcher is None
+    assert isinstance(layer.megakernel_experts, Routed)
+    assert layer.megakernel_experts.shared is (
+        layer.shared_experts if layer.megakernel_fuses_shared_expert else None
+    )
+    layer.token_dispatcher = NoDispatcher()
+    for name in ("router", "shared"):
+        module = layer.router if name == "router" else layer.shared_experts
+        if module is not None:
+            module.register_forward_pre_hook(
+                lambda module, args, key=name: seen[key].append(args[0].detach().clone())
+            )
+    with torch.no_grad():
+        for index, (name, param) in enumerate(layer.named_parameters()):
+            values = torch.arange(param.numel(), device=param.device).reshape(param.shape)
+            param.copy_(
+                torch.ones_like(param)
+                if "layer_norm_weight" in name or name == "fc2_norm.weight"
+                else 0.04 * torch.sin(values * 0.37 + index + 1)
+            )
+    parameters = {
+        name: param
+        for name, param in layer.named_parameters()
+        if name.startswith(
+            ("router.", "shared_experts.", "fc1_latent_proj.", "fc2_norm.", "fc2_latent_proj.")
+        )
+    }
+    reference = {
+        name: param.detach().clone().requires_grad_() for name, param in parameters.items()
+    }
+    model = DistributedDataParallel(
+        config, DistributedDataParallelConfig(grad_reduce_in_fp32=True), layer
+    )
+    return model, parameters, reference, seen
 
 
 class TestMoELayerInit:
@@ -143,6 +285,94 @@ class TestMoELayerInit:
                 assert layer.postprocess(hidden, None) is hidden
         finally:
             Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not is_te_min_version("1.7.0.dev0"), reason="Composition test requires TE")
+    @pytest.mark.parametrize(
+        "latent,shared,mode",
+        [(64, 128, "auto"), (None, None, "auto"), (None, 64, "native"), (None, 64, "fused")],
+    )
+    def test_mok_forward_composition(self, monkeypatch, latent, shared, mode):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        previous = None
+        for recompute in ((False, True) if latent else (False,)):
+            model, params, reference, seen = _mok_composition_layer(
+                monkeypatch, latent=latent, shared=shared, mode=mode, recompute=recompute
+            )
+            x = (
+                torch.linspace(-0.7, 0.9, 8 * 2 * 128, device="cuda")
+                .reshape(8, 2, 128)
+                .requires_grad_()
+            )
+            ref_x = x.detach().clone().requires_grad_()
+            dy = torch.linspace(0.2, 1.1, x.numel(), device="cuda").reshape_as(x)
+            actual, bias = model(x)
+            expected = _composition_reference(ref_x, reference, model.config)
+            assert bias is None and actual.shape == x.shape
+            torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-6)
+            actual.backward(dy)
+            expected.backward(dy)
+            torch.testing.assert_close(x.grad, ref_x.grad, rtol=2e-4, atol=2e-6)
+            for name, param in params.items():
+                assert reference[name].grad is not None and reference[name].grad.abs().max() > 0
+                assert param.main_grad.abs().max() > 0, name
+                torch.testing.assert_close(
+                    param.main_grad, reference[name].grad, rtol=3e-4, atol=2e-5
+                )
+            assert seen["router"]
+            for observed in seen["router"] + seen["shared"]:
+                torch.testing.assert_close(observed, x.detach(), rtol=0, atol=0)
+            assert seen["backend"] and all(
+                shape[-1] == (latent or 128) for shape in seen["backend"]
+            )
+            assert bool(seen["shared"]) == (shared is not None and mode != "fused")
+            values = [
+                actual.detach(),
+                x.grad,
+                *(p.main_grad.detach().clone() for p in params.values()),
+            ]
+            if previous is not None:
+                for value, baseline in zip(values, previous):
+                    torch.testing.assert_close(value, baseline, rtol=3e-4, atol=2e-5)
+            previous = values
+
+    @pytest.mark.skipif(
+        not is_te_min_version("1.7.0.dev0"), reason="TP gradient reference requires TE"
+    )
+    def test_mok_latent_tp_gradient_reference(self, monkeypatch):
+        if Utils.world_size < 2 or Utils.world_size % 2:
+            pytest.skip("TP2 gradient reference requires an even distributed world size")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2, expert_tensor_parallel_size=1)
+        model_parallel_cuda_manual_seed(123)
+        model, params, reference, _ = _mok_composition_layer(
+            monkeypatch, tp=2, latent=64, shared=None
+        )
+        for param in params.values():
+            peers = [torch.empty_like(param) for _ in range(2)]
+            torch.distributed.all_gather(peers, param.detach().contiguous(), group=model.tp_group)
+            assert all(torch.equal(param, peer) for peer in peers)
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        # DP replicas use the same data; TP ranks own explicitly different halves.
+        full = torch.linspace(-0.8, 1.0, 16 * 2 * 128, device="cuda").reshape(16, 2, 128)
+        full_dy = torch.linspace(0.1, 0.7, full.numel(), device="cuda").reshape_as(full)
+        x = full.chunk(2)[tp_rank].clone().requires_grad_()
+        ref_x = full.clone().requires_grad_()
+        actual, _ = model(x)
+        expected = _composition_reference(ref_x, reference, model.config)
+        assert actual.shape == x.shape
+        torch.testing.assert_close(actual, expected.chunk(2)[tp_rank], rtol=2e-4, atol=2e-6)
+        # Sum loss; DP averaging is neutral because each DP replica has identical TP shards.
+        actual.backward(full_dy.chunk(2)[tp_rank].contiguous())
+        expected.backward(full_dy)
+        finalize_model_grads([model])
+        torch.testing.assert_close(x.grad, ref_x.grad.chunk(2)[tp_rank], rtol=2e-4, atol=2e-6)
+        for name, param in params.items():
+            if name.startswith(("fc1_latent_proj.", "fc2_norm.", "fc2_latent_proj.")):
+                assert param.sequence_parallel and reference[name].grad.abs().max() > 0
+                assert param.main_grad.abs().max() > 0, name
+                torch.testing.assert_close(
+                    param.main_grad, reference[name].grad, rtol=3e-4, atol=2e-5
+                )
 
     def setup_method(self, method):
         pass

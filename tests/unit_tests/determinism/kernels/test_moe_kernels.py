@@ -13,6 +13,8 @@ the all-gather and all-to-all dispatchers (plus the flex/DeepEP dispatcher from
 ``MoELayer`` through FlashInfer per-token NVFP4 experts on Blackwell.
 """
 
+import inspect
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -21,7 +23,8 @@ import torch.nn.functional as F
 import megatron.core.extensions.transformer_engine as te_ext
 from megatron.core import parallel_state
 from megatron.core.activations import squared_relu
-from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_spec,
@@ -831,6 +834,132 @@ class TestMoEModules:
     def _init(self, ep=1):
         Utils.initialize_model_parallel(expert_model_parallel_size=ep)
         model_parallel_cuda_manual_seed(123)
+
+    @pytest.mark.parametrize(
+        "tp,latent,shared,mxfp8,gated",
+        [
+            (1, None, None, False, False),
+            (2, 256, 512, False, False),
+            (1, None, None, True, False),
+            (1, None, 256, False, False),
+            (1, None, 256, False, True),
+        ],
+    )
+    def test_mok_moe_layer_replays(self, tp, latent, shared, mxfp8, gated):
+        """Replay real routed-only SiTU and legacy fused SwiGLU, including MXFP8 and dP."""
+        if not HAVE_TE or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+            pytest.skip("MOK requires Transformer Engine and SM100/SM103 GPUs")
+        if Utils.world_size < 4 or Utils.world_size % 4:
+            pytest.skip("MOK EP4 requires a world size divisible by four")
+        functional = pytest.importorskip("mok.functional")
+        if "situ_beta" not in inspect.signature(functional.forward).parameters:
+            pytest.skip("MOK build with routed-only and SiTU support is required")
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp,
+            expert_model_parallel_size=4,
+            expert_tensor_parallel_size=1,
+        )
+        model_parallel_cuda_manual_seed(123)
+        seeded()
+        fused = shared is not None and latent is None
+        config = _moe_config(
+            hidden_size=512,
+            ffn_hidden_size=512,
+            moe_ffn_hidden_size=256,
+            tensor_model_parallel_size=tp,
+            sequence_parallel=tp > 1,
+            expert_model_parallel_size=4,
+            expert_tensor_parallel_size=1,
+            moe_latent_size=latent,
+            moe_use_norm_before_up_proj=latent is not None,
+            normalization="RMSNorm",
+            moe_shared_expert_intermediate_size=shared,
+            moe_shared_expert_gate=gated,
+            activation_func=F.silu,
+            activation_func_tanh_clamp_scale=None if fused else 2.0,
+            activation_func_tanh_clamp_scale_linear=None if fused else 8.0,
+            bias_activation_fusion=False,
+            moe_router_load_balancing_type="none",
+            moe_aux_loss_coeff=0.0,
+            moe_router_pre_softmax=True,
+            gradient_accumulation_fusion=True,
+            fp8="e4m3" if mxfp8 else None,
+            fp8_recipe="mxfp8",
+            fp8_param=mxfp8,
+            moe_megakernel_backend="mok",
+            moe_megakernel_backend_config=dict(
+                shared_expert_mode="fused" if fused else "native",
+                fwd_num_comm_sms=2,
+                bwd_num_comm_sms=2,
+                minibatch_size=512,
+                macrobatch_size=4096,
+                schedule_capacity_multiplier=1.5,
+            ),
+        )
+        spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=8, moe_grouped_gemm=True
+        ).submodules.mlp
+        with get_fp8_context(config, is_init=True):
+            layer = MoELayer(config, get_submodules(spec)).cuda()
+        backend = layer.megakernel_experts
+        assert layer.token_dispatcher is None and layer.megakernel_fuses_shared_expert == fused
+        assert (backend.shared_fc1_weight is not None) == fused
+        assert (backend.shared_output_gate_weight is not None) == gated
+        assert backend.situ_beta == (None if fused else (2.0, 8.0))
+        assert backend.use_mxfp8_weights == mxfp8
+        assert all(
+            is_mxfp8tensor(p) == mxfp8
+            for p in backend.routed_fc1_parameters + backend.routed_fc2_parameters
+        )
+        model = DistributedDataParallel(
+            config,
+            DistributedDataParallelConfig(grad_reduce_in_fp32=True, fp8_param_gather=mxfp8),
+            _InQuantizationContext(layer, config),
+        )
+        # Explicitly distinct TP shards, rather than assuming per-rank seeds differ.
+        full = torch.randn(
+            512 * tp,
+            1,
+            512,
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=torch.Generator(device="cuda").manual_seed(4321),
+        )
+        hidden = (
+            full.chunk(tp)[parallel_state.get_tensor_model_parallel_rank()].clone().requires_grad_()
+        )
+        routes, dprobs = [], []
+
+        def observe_router(module, inputs, result):
+            probs, routing_map = result
+            routes.append((probs.detach().clone(), routing_map.detach().clone()))
+            probs.register_hook(lambda grad: dprobs.append(grad.detach().clone()))
+
+        handle = layer.router.register_forward_hook(observe_router)
+        try:
+            with deterministic_algorithms(True):
+                outputs, grads = assert_module_replays_bit_exact(
+                    model,
+                    (hidden,),
+                    replays=3,
+                    contention=True,
+                    what=f"MOK {'fused' if fused else 'routed-only'} {'MXFP8' if mxfp8 else 'BF16'} TP{tp}",
+                )
+            assert "in[0]" in grads and grads["in[0]"].shape == hidden.shape
+            assert all(
+                torch.isfinite(value).all() for value in (*outputs.values(), *grads.values())
+            )
+            assert len(routes) == len(dprobs) == 3
+            assert torch.isfinite(dprobs[0]).all() and dprobs[0].abs().max() > 0
+            for index in (1, 2):
+                assert all(bytes_equal(a, b) for a, b in zip(routes[0], routes[index]))
+                assert bytes_equal(dprobs[0], dprobs[index])
+            for name, param in layer.named_parameters():
+                assert any(key.endswith(name) for key in grads), name
+                assert param.main_grad.dtype == torch.float32
+        finally:
+            handle.remove()
+            functional.clear_workspace_cache()
 
     @pytest.mark.parametrize("dispatcher", ["allgather", "alltoall"])
     @pytest.mark.parametrize("balancing", ["aux_loss", "seq_aux_loss"])
