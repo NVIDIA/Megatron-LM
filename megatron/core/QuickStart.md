@@ -296,10 +296,12 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
             print(f'Losses reduced :  {losses_reduced}')
 
         # Saving the model
-        save_distributed_checkpoint(gpt_model=gpt_model, checkpoint_path='/workspace/ckpt')
+        ckpt_path = '/workspace/ckpt'
+        Path(ckpt_path).mkdir(parents=True, exist_ok=True)
+        save_distributed_checkpoint(gpt_model=gpt_model, checkpoint_path=ckpt_path)
 
         # Loading the model
-        gpt_model = load_distributed_checkpoint(gpt_model=gpt_model, checkpoint_path='/workspace/ckpt')
+        gpt_model = load_distributed_checkpoint(gpt_model=gpt_model, checkpoint_path=ckpt_path)
         gpt_model.to(device)
         print('Successfully loaded the model')  
     ```
