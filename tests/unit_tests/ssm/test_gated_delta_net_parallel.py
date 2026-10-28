@@ -32,6 +32,7 @@ from tests.unit_tests.transformer.test_attention import _test_parallel_attention
         (2, False, 2, False),  # TP w/o SP + static CP
         (2, True, 2, False),  # TP w/ SP + static CP
         (1, False, 2, True),  # Build-time CP1 + runtime Dynamic CP2
+        (2, True, 2, True),  # Runtime CP2 with TP2 and sequence parallelism
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
@@ -83,7 +84,12 @@ def test_parallel_gated_delta_net_correctness(
         micro_batch_size=4,
         sequence_packing=sequence_packing,
         dynamic_cp=dynamic_cp,
-        check_parameter_gradients=dynamic_cp,
+        check_parameter_gradients=cp > 1,
+        # CP changes GEMM accumulation order. Local BF16 parameter gradients are
+        # rounded before their FP32 CP sum; allow two BF16 relative ulps while
+        # keeping the existing, tighter output/input-gradient tolerances.
+        parameter_atol=2e-2,
+        parameter_rtol=2e-2,
     )
 
 

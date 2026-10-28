@@ -2225,12 +2225,16 @@ class TEGatedDeltaNetAttention(torch.nn.Module):
     def _make_te_attention(self, num_attention_heads: int) -> torch.nn.Module:
         """Build a TE adapter whose head geometry remains fixed across forwards."""
         assert _TE_LINEAR_ATTENTION is not None
-        return _TE_LINEAR_ATTENTION(
+        attention = _TE_LINEAR_ATTENTION(
             num_attention_heads=num_attention_heads,
             kv_channels=(self.qk_head_dim, self.value_head_dim),
             qkv_format="bshd",
             layer_number=self.layer_number,
         )
+        assert not any(True for _ in attention.parameters()) and not any(
+            True for _ in attention.buffers()
+        ), "TE GDN runtime variants are cached outside module registration and must be stateless"
+        return attention
 
     def forward(
         self,

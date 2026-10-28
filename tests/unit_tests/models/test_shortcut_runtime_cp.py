@@ -12,11 +12,10 @@ from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.packed_seq_params import PackedSeqParams
 
 
-@pytest.mark.parametrize("cp_size", [1, 2, 4])
-def test_shortcut_router_receives_runtime_cp_metadata(cp_size):
+def test_shortcut_router_receives_runtime_cp_metadata():
     hidden = torch.randn(4, 1, 2)
     mask = torch.tensor([[False, True, False, False]])
-    packed = PackedSeqParams(local_cp_size=cp_size, cp_group=SimpleNamespace(size=lambda: cp_size))
+    packed = PackedSeqParams(local_cp_size=2, cp_group=SimpleNamespace(size=lambda: 2))
     calls = []
 
     def unflatten(value, padding_mask, input_ids, packed_seq_params):
@@ -26,7 +25,7 @@ def test_shortcut_router_receives_runtime_cp_metadata(cp_size):
 
     def route(value, padding_mask, packed_seq_params=None):
         assert padding_mask is mask and packed_seq_params is packed
-        calls.append(packed_seq_params.cp_group.size())
+        calls.append(packed_seq_params)
         return value, value
 
     block = SimpleNamespace(
@@ -39,7 +38,7 @@ def test_shortcut_router_receives_runtime_cp_metadata(cp_size):
     )
     result, _ = ShortcutMoEBlock._moe_router_preprocess(block, hidden, mask, packed)
     assert result is hidden
-    assert calls == [cp_size]
+    assert calls == [packed]
 
 
 @pytest.mark.parametrize("with_layout", [False, True])

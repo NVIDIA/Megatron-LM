@@ -96,14 +96,12 @@ def test_te_gdn_runtime_head_selection_replays(monkeypatch, packed):
 
     if not HAVE_TE_GDN:
         pytest.skip("requires Transformer Engine GDN")
-    from transformer_engine.pytorch.attention.linear_attention import base as te_base
-
-    from tests.unit_tests.ssm.test_te_gdn_runtime_cp import _torch_te_gdn_op
+    from tests.unit_tests.ssm.te_gdn_test_utils import patch_te_gdn_op
 
     Utils.initialize_distributed()
     seeded()
     # Keep TE's layout, gate and head validation; the reference op runs on pre-Hopper GPUs too.
-    monkeypatch.setattr(te_base, "_import_linear_attention_op", lambda *args: _torch_te_gdn_op)
+    patch_te_gdn_op(monkeypatch)
     module = TEGatedDeltaNetAttention(8, qk_head_dim=4, value_head_dim=6, layer_number=1)
     default_backend = module.te_attention
     batch, sequence = (1, 8) if packed else (2, 4)

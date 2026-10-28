@@ -109,8 +109,8 @@ def test_runtime_cp_gdn_module_replays(variant):
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
     from megatron.core.transformer import TransformerConfig
 
-    if Utils.world_size < 4 or Utils.world_size % 4:
-        pytest.skip("requires four distributed ranks")
+    if Utils.world_size < 2 or Utils.world_size % 2:
+        pytest.skip("requires a world size divisible by two")
     Utils.initialize_model_parallel(dynamic_context_parallel=True)
     try:
         model_parallel_cuda_manual_seed(123)
@@ -128,6 +128,7 @@ def test_runtime_cp_gdn_module_replays(variant):
             experimental_attention_variant=variant,
             linear_attention_freq=[1],
             deterministic_mode=True,
+            gdn_kernel_backend="torch",
             use_cpu_initialization=True,
             bf16=True,
             params_dtype=torch.bfloat16,
@@ -147,7 +148,8 @@ def test_runtime_cp_gdn_module_replays(variant):
         )
         build_group = module.pg_collection.cp
         reference = None
-        for size in (1, 2, 4, 1):
+        runtime_sizes = (1, 2, 4, 1) if Utils.world_size % 4 == 0 else (1, 2, 1)
+        for size in runtime_sizes:
             group = parallel_state.get_dynamic_data_context_parallel_groups(group_size=size)
             packed = PackedSeqParams(qkv_format="sbhd", local_cp_size=size, cp_group=group)
             seeded()

@@ -34,6 +34,11 @@ from tests.unit_tests.dist_checkpointing import (
     init_checkpointing_mock_args,
 )
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.parallel_test_utils import (
+    assert_parameter_gradient_shards_close,
+    parameter_gradient_shards,
+    synchronized_assertions,
+)
 from tests.unit_tests.transformer.test_multi_latent_attention import make_test_packed_seq_params
 
 pytestmark = pytest.mark.usefixtures("run_config")
@@ -489,11 +494,16 @@ def _test_parallel_attention_correctness(
     input_grad_rtol=None,
     dynamic_cp=False,
     check_parameter_gradients=False,
+    parameter_atol=None,
+    parameter_rtol=None,
 ):
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size < tp * cp or world_size % (tp * cp):
+        pytest.skip(f"TP={tp}, CP={cp} parity requires world size divisible by {tp * cp}")
     if dynamic_cp:
         assert cp > 1, "Runtime Dynamic CP parity requires cp > 1"
         assert sequence_packing, "Runtime Dynamic CP parity requires packed THD input"
-        if int(os.environ.get("WORLD_SIZE", "1")) < cp:
+        if int(os.environ.get("WORLD_SIZE", "1")) < tp * cp:
             pytest.skip(f"Runtime CP={cp} parity requires at least {cp} distributed ranks")
 
     # Model initialization function
@@ -553,13 +563,9 @@ def _test_parallel_attention_correctness(
             input_hidden_states, attention_mask=None
         )
         output_hidden_states_baseline.sum().backward()
-        parameter_grads_baseline = None
-        if check_parameter_gradients:
-            parameter_grads_baseline = {
-                name: param.grad.detach().clone()
-                for name, param in attention.named_parameters()
-                if param.grad is not None
-            }
+        parameter_grads_baseline = (
+            parameter_gradient_shards(attention) if check_parameter_gradients else None
+        )
 
         # Save baseline output
         input_grad_baseline = input_hidden_states.grad.detach()
@@ -633,83 +639,93 @@ def _test_parallel_attention_correctness(
         output_hidden_states_parallel.sum().backward()
         input_grad_parallel = input_hidden_states.grad.detach()
 
+        parameter_grads_parallel = None
         if check_parameter_gradients:
-            assert parameter_grads_baseline is not None
-            for name, param in parallel_attention.named_parameters():
-                if name not in parameter_grads_baseline:
-                    continue
-                assert param.grad is not None, f"Missing parallel gradient for {name}"
-                parallel_grad = param.grad.detach().clone()
-                if dynamic_cp:
-                    torch.distributed.all_reduce(parallel_grad, group=cp_group)
-                torch.testing.assert_close(
-                    parameter_grads_baseline[name],
-                    parallel_grad,
-                    atol=atol,
-                    rtol=rtol,
-                    msg=lambda msg, param_name=name: (
-                        f"Mismatch in parameter gradient {param_name}: {msg}"
-                    ),
-                )
-
-        # Check if the output is close
-        output_hidden_states_baseline = get_tensor_on_this_rank(output_hidden_states_baseline)
-        input_grad_baseline = get_tensor_on_this_rank(input_grad_baseline)
-
-        assert torch.all(
-            ~torch.isnan(output_hidden_states_baseline)
-        ), "output_hidden_states_baseline contains nan"
-        assert torch.all(
-            ~torch.isinf(output_hidden_states_baseline)
-        ), "output_hidden_states_baseline contains inf"
-        assert torch.all(~torch.isnan(input_grad_baseline)), "input_grad_baseline contains nan"
-        assert torch.all(~torch.isinf(input_grad_baseline)), "input_grad_baseline contains inf"
-        assert torch.all(
-            ~torch.isnan(output_hidden_states_parallel)
-        ), "output_hidden_states_parallel contains nan"
-        assert torch.all(
-            ~torch.isinf(output_hidden_states_parallel)
-        ), "output_hidden_states_parallel contains inf"
-        assert torch.all(~torch.isnan(input_grad_parallel)), "input_grad_parallel contains nan"
-        assert torch.all(~torch.isinf(input_grad_parallel)), "input_grad_parallel contains inf"
-        if has_bias:
-            assert torch.all(
-                ~torch.isnan(bias_hidden_states_baseline)
-            ), "bias_hidden_states_baseline contains nan"
-            assert torch.all(
-                ~torch.isinf(bias_hidden_states_baseline)
-            ), "bias_hidden_states_baseline contains inf"
-            assert torch.all(
-                ~torch.isnan(bias_hidden_states_parallel)
-            ), "bias_hidden_states_parallel contains nan"
-            assert torch.all(
-                ~torch.isinf(bias_hidden_states_parallel)
-            ), "bias_hidden_states_parallel contains inf"
-
-        torch.testing.assert_close(
-            output_hidden_states_baseline,
-            output_hidden_states_parallel,
-            atol=atol,
-            rtol=rtol,
-            msg=lambda msg: f"Mismatch in output_hidden_states: {msg}",
-        )
-        torch.testing.assert_close(
-            input_grad_baseline,
-            input_grad_parallel,
-            atol=atol if input_grad_atol is None else input_grad_atol,
-            rtol=rtol if input_grad_rtol is None else input_grad_rtol,
-            msg=lambda msg: f"Mismatch in input_grad: {msg}",
-        )
-        if has_bias:
-            torch.testing.assert_close(
-                bias_hidden_states_baseline,
-                bias_hidden_states_parallel,
-                atol=atol,
-                rtol=rtol,
-                msg=lambda msg: f"Mismatch in bias_hidden_states: {msg}",
+            parameter_grads_parallel = parameter_gradient_shards(
+                parallel_attention,
+                cp_group=cp_group,
+                tp_group=parallel_state.get_tensor_model_parallel_group(),
             )
 
-        Utils.destroy_model_parallel()
+        try:
+            with synchronized_assertions():
+                # Check if the output is close
+                output_hidden_states_baseline = get_tensor_on_this_rank(
+                    output_hidden_states_baseline
+                )
+                input_grad_baseline = get_tensor_on_this_rank(input_grad_baseline)
+
+                assert torch.all(
+                    ~torch.isnan(output_hidden_states_baseline)
+                ), "output_hidden_states_baseline contains nan"
+                assert torch.all(
+                    ~torch.isinf(output_hidden_states_baseline)
+                ), "output_hidden_states_baseline contains inf"
+                assert torch.all(
+                    ~torch.isnan(input_grad_baseline)
+                ), "input_grad_baseline contains nan"
+                assert torch.all(
+                    ~torch.isinf(input_grad_baseline)
+                ), "input_grad_baseline contains inf"
+                assert torch.all(
+                    ~torch.isnan(output_hidden_states_parallel)
+                ), "output_hidden_states_parallel contains nan"
+                assert torch.all(
+                    ~torch.isinf(output_hidden_states_parallel)
+                ), "output_hidden_states_parallel contains inf"
+                assert torch.all(
+                    ~torch.isnan(input_grad_parallel)
+                ), "input_grad_parallel contains nan"
+                assert torch.all(
+                    ~torch.isinf(input_grad_parallel)
+                ), "input_grad_parallel contains inf"
+                if has_bias:
+                    assert torch.all(
+                        ~torch.isnan(bias_hidden_states_baseline)
+                    ), "bias_hidden_states_baseline contains nan"
+                    assert torch.all(
+                        ~torch.isinf(bias_hidden_states_baseline)
+                    ), "bias_hidden_states_baseline contains inf"
+                    assert torch.all(
+                        ~torch.isnan(bias_hidden_states_parallel)
+                    ), "bias_hidden_states_parallel contains nan"
+                    assert torch.all(
+                        ~torch.isinf(bias_hidden_states_parallel)
+                    ), "bias_hidden_states_parallel contains inf"
+
+                torch.testing.assert_close(
+                    output_hidden_states_baseline,
+                    output_hidden_states_parallel,
+                    atol=atol,
+                    rtol=rtol,
+                    msg=lambda msg: f"Mismatch in output_hidden_states: {msg}",
+                )
+                torch.testing.assert_close(
+                    input_grad_baseline,
+                    input_grad_parallel,
+                    atol=atol if input_grad_atol is None else input_grad_atol,
+                    rtol=rtol if input_grad_rtol is None else input_grad_rtol,
+                    msg=lambda msg: f"Mismatch in input_grad: {msg}",
+                )
+                if has_bias:
+                    torch.testing.assert_close(
+                        bias_hidden_states_baseline,
+                        bias_hidden_states_parallel,
+                        atol=atol,
+                        rtol=rtol,
+                        msg=lambda msg: f"Mismatch in bias_hidden_states: {msg}",
+                    )
+
+                if check_parameter_gradients:
+                    assert_parameter_gradient_shards_close(
+                        parameter_grads_baseline,
+                        parameter_grads_parallel,
+                        atol=atol if parameter_atol is None else parameter_atol,
+                        rtol=rtol if parameter_rtol is None else parameter_rtol,
+                    )
+
+        finally:
+            Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("sequence_packing", [False, True])

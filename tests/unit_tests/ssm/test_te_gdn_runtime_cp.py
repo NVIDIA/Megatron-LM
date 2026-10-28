@@ -6,35 +6,13 @@ import pytest
 import torch
 
 from megatron.core.extensions.transformer_engine import HAVE_TE_GDN, TEGatedDeltaNetAttention
-from megatron.core.ssm.gated_delta_net.gdn import torch_chunk_gated_delta_rule
+from tests.unit_tests.ssm.te_gdn_test_utils import patch_te_gdn_op, torch_te_gdn_op
 from tests.unit_tests.test_utilities import Utils
 
-pytestmark = pytest.mark.skipif(
+
+@pytest.mark.skipif(
     not (HAVE_TE_GDN and torch.cuda.is_available()), reason="requires CUDA and TE GDN"
 )
-
-
-def _torch_te_gdn_op(q, k, v, g, beta, cu_seqlens, **kwargs):
-    """Use MCore's reference recurrence behind TE's actual layout and shape validation."""
-    outputs, states = [], []
-    initial_state = kwargs.pop("initial_state", None)
-    bounds = cu_seqlens.tolist()
-    for index, (start, end) in enumerate(zip(bounds[:-1], bounds[1:])):
-        state = (
-            None if initial_state is None else initial_state[index : index + 1].transpose(-1, -2)
-        )
-        output, final_state = torch_chunk_gated_delta_rule(
-            *(tensor[start:end].unsqueeze(0) for tensor in (q, k, v, g, beta)),
-            initial_state=state,
-            chunk_size=4,
-            **kwargs,
-        )
-        outputs.append(output.squeeze(0))
-        if final_state is not None:
-            states.append(final_state.squeeze(0).transpose(-1, -2))
-    return torch.cat(outputs), torch.stack(states) if states else None
-
-
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("output_final_state", [False, True])
 @pytest.mark.parametrize("build_heads", [4, 8])
@@ -42,10 +20,8 @@ def test_te_gdn_runtime_heads_preserve_backend_and_backward(
     monkeypatch, packed, output_final_state, build_heads
 ):
     """CP1/2/4/2/1 head changes preserve TE validation, cached instances and pending backward."""
-    from transformer_engine.pytorch.attention.linear_attention import base as te_base
-
     Utils.initialize_distributed()
-    monkeypatch.setattr(te_base, "_import_linear_attention_op", lambda *args: _torch_te_gdn_op)
+    patch_te_gdn_op(monkeypatch)
     module = TEGatedDeltaNetAttention(build_heads, qk_head_dim=4, value_head_dim=6, layer_number=1)
     default_backend = module.te_attention
     checkpoint_keys = set(module.state_dict())
@@ -78,7 +54,7 @@ def test_te_gdn_runtime_heads_preserve_backend_and_backward(
         output, state = module(
             **inputs, cu_seqlens=bounds if packed else None, output_final_state=output_final_state
         )
-        expected, expected_state = _torch_te_gdn_op(
+        expected, expected_state = torch_te_gdn_op(
             *(
                 reference_inputs[name].reshape(-1, heads, dim)
                 for name, dim in (("q", 4), ("k", 4), ("v", 6))
@@ -116,3 +92,22 @@ def test_te_gdn_runtime_heads_preserve_backend_and_backward(
     assert len({identity for _, _, identity in seen}) == 3
     assert set(module.state_dict()) == checkpoint_keys
     assert list(module.named_children()) == [("te_attention", default_backend)]
+
+
+@pytest.mark.parametrize("state_kind", ["parameter", "buffer"])
+def test_te_gdn_rejects_stateful_runtime_adapter(monkeypatch, state_kind):
+    """Unregistered runtime variants must never hide learned or device state."""
+    from megatron.core.extensions import transformer_engine as te_ext
+
+    class StatefulAdapter(torch.nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            if state_kind == "parameter":
+                self.weight = torch.nn.Parameter(torch.ones(1))
+            else:
+                self.register_buffer("cache", torch.ones(1))
+
+    monkeypatch.setattr(te_ext, "_TE_LINEAR_ATTENTION", StatefulAdapter)
+    monkeypatch.setattr(te_ext, "HAVE_TE_GDN", True)
+    with pytest.raises(AssertionError, match="must be stateless"):
+        TEGatedDeltaNetAttention(8, qk_head_dim=4, value_head_dim=6, layer_number=1)
