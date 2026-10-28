@@ -106,17 +106,13 @@ class _DispatchLayer(TransformerLayer):
         self.bias_dropout_add_exec_handler = torch.enable_grad
         self._legacy_forward_post_mlp = None
         self.events = []
-        for stage in ("attn", "mlp"):
+        for stage in ("self_attn", "mlp"):
             for operation in ("read", "write"):
                 setattr(
-                    self, f"{operation}_{stage}", _Connection(operation) if connections else None
+                    self,
+                    f"residual_{operation}_{stage}",
+                    _Connection(operation) if connections else None,
                 )
-
-    def _get_residual_connection_for_self_attention(self, operation):
-        return getattr(self, f"{operation}_attn")
-
-    def _get_residual_connection_for_mlp(self, operation):
-        return getattr(self, f"{operation}_mlp")
 
     def _read_residual_connection(self, connection, value, *, is_mlp, recompute_context):
         self.events.append(("read", connection, is_mlp, recompute_context))
@@ -166,13 +162,57 @@ def gpu_model_parallel():
 
 
 @pytest.mark.parametrize("is_mlp", [False, True], ids=["attention", "mlp"])
+@pytest.mark.parametrize("operation", ["read", "write"])
+def test_getters_resolve_registered_connections(is_mlp, operation):
+    layer = _layer()
+    stage = "mlp" if is_mlp else "self_attn"
+    getter = (
+        layer._get_residual_connection_for_mlp
+        if is_mlp
+        else layer._get_residual_connection_for_self_attention
+    )
+    name = f"residual_{operation}_{stage}"
+    assert getter(operation) is getattr(layer, name)
+    parameter_names = {
+        f"residual_{op}_{branch}.scale"
+        for op in ("read", "write")
+        for branch in ("self_attn", "mlp")
+    }
+    assert {name for name, _ in layer.named_parameters() if name.startswith("residual_")} == (
+        parameter_names
+    )
+    assert {name for name in layer.state_dict() if name.startswith("residual_")} == parameter_names
+    replacement = _Connection(operation).to(next(layer.parameters()).device)
+    setattr(layer, name, replacement)
+    assert getter(operation) is replacement
+    setattr(layer, name, None)
+    assert getter(operation) is None
+    delattr(layer, name)
+    assert getter(operation) is None
+
+
+@pytest.mark.parametrize("is_mlp", [False, True], ids=["attention", "mlp"])
+def test_getters_reject_invalid_operation(is_mlp):
+    layer = _layer(connections=False)
+    getter = (
+        layer._get_residual_connection_for_mlp
+        if is_mlp
+        else layer._get_residual_connection_for_self_attention
+    )
+    with pytest.raises(ValueError, match="Unsupported residual connection operation: invalid"):
+        getter("invalid")
+
+
+@pytest.mark.parametrize("is_mlp", [False, True], ids=["attention", "mlp"])
 def test_helper_forwards_call_settings(is_mlp):
     layer = _layer().eval()
     layer.config.fp32_residual_connection = True
     layer.config.params_dtype = torch.bfloat16
     layer.hidden_dropout = 0.25
-    stage = "mlp" if is_mlp else "attn"
-    reader, writer = getattr(layer, f"read_{stage}"), getattr(layer, f"write_{stage}")
+    stage = "mlp" if is_mlp else "self_attn"
+    reader, writer = getattr(layer, f"residual_read_{stage}"), getattr(
+        layer, f"residual_write_{stage}"
+    )
     calls = []
     for connection in (reader, writer):
         connection.register_forward_pre_hook(
@@ -216,8 +256,10 @@ def test_stage_dispatch_preserves_reader_state_and_module_hooks(is_mlp, mode, gp
             CheckpointWithoutOutputManager(), is_block_end=mode == "terminal"
         )
     )
-    stage = "mlp" if is_mlp else "attn"
-    reader, writer = getattr(actual, f"read_{stage}"), getattr(actual, f"write_{stage}")
+    stage = "mlp" if is_mlp else "self_attn"
+    reader, writer = getattr(actual, f"residual_read_{stage}"), getattr(
+        actual, f"residual_write_{stage}"
+    )
     hooks = []
     for connection in (reader, writer):
         connection.register_forward_pre_hook(lambda module, args: hooks.append(("pre", module)))
