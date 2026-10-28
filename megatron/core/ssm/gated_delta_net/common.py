@@ -27,7 +27,7 @@ from megatron.core.ssm.mamba_context_parallel import (
     _redo_attention_load_balancing,
     _undo_attention_load_balancing,
 )
-from megatron.core.ssm.utils import _split_tensor_factory
+from megatron.core.ssm.utils import _split_tensor_factory, _validate_dynamic_cp_head_geometry
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
@@ -221,6 +221,16 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         self.num_v_heads_local_tp = self.num_value_heads // self.tp_size
         self.num_k_heads_local_tp = self.num_key_heads // self.tp_size
 
+        _validate_dynamic_cp_head_geometry(
+            config,
+            self.pg_collection,
+            head_counts={
+                "GDN key heads": self.num_k_heads_local_tp,
+                "GDN value heads": self.num_v_heads_local_tp,
+            },
+        )
+        self._validate_runtime_cp_size(self.cp_size)
+
         attrs_to_check = (
             "dt_bias_dim",
             "a_log_dim",
@@ -338,6 +348,18 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             self.norm_out_checkpoint.discard_output_and_register_recompute(out)
 
         return out, out_bias
+
+    def _validate_runtime_cp_size(self, cp_size: int) -> None:
+        """Require a nonempty integer key/value head shard for the runtime topology."""
+        for name, count in (
+            ("key", self.num_k_heads_local_tp),
+            ("value", self.num_v_heads_local_tp),
+        ):
+            if count < 1 or count % cp_size:
+                raise ValueError(
+                    f"GDN TP-local {name} head count {count} must be positive and "
+                    f"divisible by runtime CP size {cp_size}"
+                )
 
     def _setup_variant_attrs(self):
         """Set variant specifics on the module. Called once from ``__init__``.
@@ -737,6 +759,7 @@ def get_parameter_local_cp(
     if cp_size == 1:
         return param
 
+    assert cp_group is not None
     cp_rank = cp_group.rank()
 
     # Split first if needed.

@@ -121,28 +121,31 @@ class GDPContextParallel:
 
         self.cp_rank = self.cp_group.rank()
 
-        assert (
-            self.nheads_local_tp % self.cp_size == 0
-        ), "nheads must be evenly divisible by tp_size * cp_size"
+        assert self.nheads_local_tp % self.cp_size == 0, (
+            f"TP-local head count {self.nheads_local_tp} must be divisible by "
+            f"runtime CP size {self.cp_size}"
+        )
         self.nheads_local_tpcp = self.nheads_local_tp // self.cp_size
 
         self.d_inner_local_tpcp = self.d_inner_local_tp // self.cp_size
 
         # Group repeat logic (same as GDNContextParallel)
         if self.ngroups_local_tp < self.cp_size:
-            assert (
-                self.cp_size % self.ngroups_local_tp == 0
-            ), "cp_size must be evenly divisible by ngroups/tp_size"
+            assert self.cp_size % self.ngroups_local_tp == 0, (
+                f"runtime CP size {self.cp_size} must be divisible by "
+                f"TP-local group count {self.ngroups_local_tp}"
+            )
             self.group_repeat_count = self.cp_size // self.ngroups_local_tp
             self.ngroups_local_tpcp = 1
         else:
-            assert (
-                self.ngroups_local_tp % self.cp_size == 0
-            ), "ngroups must be evenly divisible by tp_size * cp_size"
+            assert self.ngroups_local_tp % self.cp_size == 0, (
+                f"TP-local group count {self.ngroups_local_tp} must be divisible by "
+                f"runtime CP size {self.cp_size}"
+            )
             self.group_repeat_count = 1
             self.ngroups_local_tpcp = self.ngroups_local_tp // self.cp_size
 
-    def set_context_parallel_group(
+    def _set_context_parallel_group(
         self, cp_group: Optional[torch.distributed.ProcessGroup]
     ) -> None:
         """Set the active context-parallel group."""
@@ -156,7 +159,7 @@ class GDPContextParallel:
         if cp_group is self.cp_group:
             return self
         runtime_view = copy.copy(self)
-        runtime_view.set_context_parallel_group(cp_group)
+        runtime_view._set_context_parallel_group(cp_group)
         return runtime_view
 
     def pre_conv_ssm(

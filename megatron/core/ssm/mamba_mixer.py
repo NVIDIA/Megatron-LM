@@ -34,7 +34,7 @@ from megatron.core.ssm.ops.mamba2.batch_invariant_decode import MambaBatchInvari
 from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
 from megatron.core.ssm.packed_seq_helpers import build_packed_seq_idx
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
-from megatron.core.ssm.utils import _split_tensor_factory
+from megatron.core.ssm.utils import _split_tensor_factory, _validate_dynamic_cp_head_geometry
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
@@ -279,6 +279,13 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
 
         # Ensure that each group has a positive integer number of heads:
         assert self.nheads % self.ngroups == 0, "nheads must be evenly divisible by ngroups"
+
+        _validate_dynamic_cp_head_geometry(
+            config,
+            self.pg_collection,
+            head_counts={"Mamba heads": self.nheads_local_tp},
+            group_count=self.ngroups_local_tp,
+        )
 
         assert not bias
         assert conv_bias
