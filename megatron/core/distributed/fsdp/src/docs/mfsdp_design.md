@@ -43,6 +43,7 @@ established here.
 # Subdesigns
 
 - [Optimizer](optimizer.md)
+- [Muon](muon.md)
 - [Runtime schedule](runtime_schedule.md)
 
 # API
