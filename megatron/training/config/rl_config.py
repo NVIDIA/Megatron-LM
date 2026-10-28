@@ -359,9 +359,11 @@ class RLConfig:
                 "--rl-rollout-only iterates the RL loop; it needs --train-iters or --train-samples."
             )
         if skip_train and (has_horizon or self.rl_rollout_only):
+            # Unlike pretraining, RL rejects a horizon under --skip-train: that spelling used to
+            # collect rollouts, and evaluating instead would change a launch's meaning silently.
             raise ValueError(
-                "--skip-train only evaluates; --rl-rollout-only collects rollouts without updates "
-                "(with --no-load-optim to leave the optimizer out)."
+                "--skip-train only evaluates: drop --train-iters/--train-samples; "
+                "--rl-rollout-only collects rollouts without updates."
             )
         if self.rl_offload_optimizer_during_inference and (
             skip_train or (self.rl_rollout_only and not load_optim)

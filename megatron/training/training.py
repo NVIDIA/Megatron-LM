@@ -1686,6 +1686,9 @@ def pretrain(
     Args:
         train_valid_test_dataset_provider: a function that takes the size of
             train/valid/test dataset and returns `train, valid, test` datasets.
+            May be None when a caller-provided `next_train_iterator` supplies the training data;
+            validation and test data are then absent too (a caller-supplied `run_eval` may still
+            evaluate), and --train-full-dataset (which samples the provider) raises.
         model_provider: a function that returns a vanilla version of the
             model. By vanilla we mean a simple model on cpu with no fp16 or ddp.
         model_type: an enum that specifies the type of model being trained.
@@ -1723,11 +1726,11 @@ def pretrain(
             `cfg_container.logger.tensor_metrics`.
         build_tokenizer: whether startup builds the shared tokenizer. Disable for
             workloads that provide their own tokenization, such as heterogeneous MiMo.
-        next_train_iterator / run_eval: the loop's data and evaluation hooks (see `train`);
-            default to the provider-built iterators and evaluate_and_print_results.
-            A caller-provided next_train_iterator replaces only the training dataloader;
-            validation/test dataloaders (and the default run_eval over them) are still
-            built when a dataset provider is given.
+        next_train_iterator: the loop's data hook (see `train`); defaults to the provider-built
+            iterators. A caller-provided hook replaces only the training dataloader; the
+            validation/test dataloaders (and the default run_eval over them) are still built
+            when a dataset provider is given.
+        run_eval: the loop's evaluation hook (see `train`); defaults to evaluate_and_print_results.
         run_train_loop_without_updates: iterate the training loop without optimizer updates.
         suppress_microbatch_rampup_handling: skip the automatic checkpoint on mid-loop
             microbatch changes (for data sources that reconfigure microbatches every iteration).
@@ -2066,7 +2069,9 @@ def pretrain(
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
     if next_train_iterator is None or train_valid_test_dataset_provider is not None:
-        with _otel_managed_span('data_loading', 'megatron.startup.dataloader', is_goodput_span=True):
+        with _otel_managed_span(
+            'data_loading', 'megatron.startup.dataloader', is_goodput_span=True
+        ):
             # A caller-provided next_train_iterator owns the training data;
             # the provider's validation/test data (and the default run_eval over it) still works.
             build_train = next_train_iterator is None
@@ -2106,7 +2111,9 @@ def pretrain(
         broadcast_data_flags(
             do_train=(cfg_container.train.train_iters or 0) > 0,
             do_valid=run_eval is not None
-            and (cfg_container.validation.full_validation or cfg_container.validation.eval_iters > 0),
+            and (
+                cfg_container.validation.full_validation or cfg_container.validation.eval_iters > 0
+            ),
             do_test=False,
         )
     timers('train/valid/test-data-iterators-setup').stop()
@@ -5064,12 +5071,8 @@ def train(
         # checkpoint should be saved. If the global batch size or the number of microbatches is
         # different from the previous iteration, save a checkpoint. Then run consistency check
         # to make sure training configuration is still valid.
-        # Standard microbatch update (data sources that reconfigure microbatches themselves
-        # suppress the checkpoint below via suppress_microbatch_rampup_handling).
         update_num_microbatches(train_state.consumed_train_samples, consistency_check=False, verbose=True)
-        # Normally a batch-size transition mid-loop is a monotonically increasing ramp-up
-        # that triggers an automatic checkpoint. Data sources that intentionally reconfigure
-        # microbatches every iteration (e.g. RL sequence packing) suppress this declaratively.
+        # A batch-size transition saves a checkpoint and exits for a relaunch unless suppressed.
         if iteration != 0 and is_batch_size_transition(
             num_microbatches, global_batch_size, cfg.train.step_batch_size_schedule is not None
         ):
@@ -5150,9 +5153,7 @@ def train(
             train_state.skipped_train_samples += batch_size
             continue
 
-        # Refresh the data iterator for this iteration. The dataloader path keeps it; the GRPO
-        # rollout source (re)builds rollouts on its own schedule (kept for a few epochs, the
-        # DeepSeekMath $\mu$), using the current iterator as the buffer.
+        # The data hook may replace the iterator each iteration; the dataloader path keeps it.
         train_data_iterator = next_train_iterator(iteration, train_data_iterator)
 
         if run_train_loop_without_updates:
@@ -6051,7 +6052,7 @@ def build_train_valid_test_data_loaders(
     else:
         do_train, do_valid, do_test = False, False, False
 
-    broadcast_data_flags(do_train, do_valid, do_test)
+    broadcast_data_flags(do_train=do_train, do_valid=do_valid, do_test=do_test)
     return train_dataloader, valid_dataloaders, test_dataloader
 
 
@@ -6062,7 +6063,7 @@ def backfill_consumed_samples_from_iteration():
     if train_state.iteration > 0 and train_state.consumed_train_samples == 0:
         assert (
             cfg.train.train_samples is None
-        ), 'Only backward compatiblity support for iteration-based training'
+        ), 'Only backward compatibility support for iteration-based training'
 
         train_state.consumed_train_samples = train_state.iteration * cfg.train.global_batch_size
     if train_state.iteration > 0 and train_state.consumed_valid_samples == 0:
@@ -6076,7 +6077,7 @@ def backfill_consumed_samples_from_iteration():
             )
 
 
-def broadcast_data_flags(do_train, do_valid, do_test):
+def broadcast_data_flags(*, do_train, do_valid, do_test):
     """Broadcast rank 0's train/valid/test availability flags into the TrainState."""
     flags = torch.tensor(
         [int(do_train), int(do_valid), int(do_test)], dtype=torch.long, device='cuda'

@@ -212,6 +212,7 @@ RUN = dict(
             "nothing to offload",
         ),
         (dict(rl_rollout_only=True), dict(train_iters=None), "needs --train-iters"),
+        (dict(rl_rollout_only=True), dict(train_iters=0), "needs --train-iters"),
         (dict(), dict(skip_train=True), "--rl-rollout-only collects"),
         (dict(rl_rollout_only=True), dict(skip_train=True), "--rl-rollout-only collects"),
         (
@@ -291,6 +292,14 @@ def test_validate_run_at_every_call_site():
     rollout_only.validate_run(**RUN)
     rollout_only.validate_run(**{**RUN, "load_optim": False})
     rollout_only.validate_run(**{**RUN, "train_iters": None, "train_samples": 120})
+    # Offloading the optimizer needs one: accepted while it stays resident, rejected above when
+    # --no-load-optim leaves it out.
+    RLConfig(
+        perform_rl_step=True,
+        rl_rollout_only=True,
+        rl_offload_optimizer_during_inference=True,
+        **GRPO_4x3,
+    ).validate_run(**RUN)
     cfg.validate_run(**{**RUN, "skip_train": True, "train_iters": None})
     cfg.validate_run(**{**RUN, "skip_train": True, "train_iters": 0})
     RLConfig(rl_rollout_only=True).validate_run(**RUN)  # accepted while the RL loop is off

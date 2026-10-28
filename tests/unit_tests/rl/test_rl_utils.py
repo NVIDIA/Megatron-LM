@@ -100,15 +100,22 @@ def test_disagg_refit_reads_migrated_rl_config(monkeypatch):
         pass
 
 
-@pytest.mark.parametrize("skip_train, rollout_only", [(False, False), (False, True), (True, False)])
-def test_setup_callback(monkeypatch, skip_train, rollout_only):
+@pytest.mark.parametrize(
+    "skip_train, rollout_only, optimizer",
+    [
+        (False, False, "optimizer"),
+        (False, True, "optimizer"),
+        (False, True, None),  # --rl-rollout-only --no-load-optim still builds the GRPO state
+        (True, False, None),
+    ],
+)
+def test_setup_callback(monkeypatch, skip_train, rollout_only, optimizer):
     """on_data_init_start keeps the loop's model and optimizer, builds the inference model, and
     loads the reference weights and reinitializes the GRPO calculator unless --skip-train makes
     the run eval-only."""
     calls = []
     args = SimpleNamespace()
     run_config = SimpleNamespace(validation=SimpleNamespace(skip_train=skip_train))
-    optimizer = None if skip_train else "optimizer"
     monkeypatch.setattr(training_setup, "get_args", lambda: args)
     monkeypatch.setattr(training_setup, "get_run_config", lambda: run_config)
     monkeypatch.setattr(training_setup, "get_model_config", lambda chunk: f"config({chunk})")
@@ -146,6 +153,110 @@ def test_setup_callback(monkeypatch, skip_train, rollout_only):
     assert (callback.model, callback.optimizer) == (["chunk"], optimizer)
     assert callback.inference_model == "inference_model"
     assert callback.ref_state_dict == ({"w": 1} if loop_runs else None)
+
+
+@pytest.mark.parametrize(
+    "optimizer, packing, correction, offload",
+    [(None, True, False, True), ("optimizer", False, True, False)],
+)
+def test_next_rollout_iterator_forwards_the_grpo_schedule(
+    monkeypatch, optimizer, packing, correction, offload
+):
+    """The data hook rebuilds rollouts through get_grpo_data_iterator with the section's knobs,
+    the current iterator as the buffer and grad disabled; the CUDA cache is released only when
+    the run has no optimizer (--rl-rollout-only --no-load-optim)."""
+    seen = {}
+
+    def grpo_iterator(model, inference_model, opt, iteration, ref, **kwargs):
+        seen.update(kwargs, head=(model, inference_model, opt, iteration, ref))
+        seen["grad_enabled"] = torch.is_grad_enabled()
+        return "iterator"
+
+    empty_cache = MagicMock()
+    monkeypatch.setattr(rl_utils, "get_grpo_data_iterator", grpo_iterator)
+    monkeypatch.setattr(rl_utils.torch.cuda, "empty_cache", empty_cache)
+    rl_config = RLConfig(
+        grpo_iterations=1,
+        grpo_prompts_per_step=4,
+        grpo_group_size=3,
+        rl_use_sequence_packing=packing,
+        rl_inference_logprobs_is_correction=correction,
+        rl_offload_optimizer_during_inference=offload,
+    )
+
+    result = rl_utils.next_rollout_iterator(
+        7,
+        "buffer",
+        model=["model"],
+        inference_model=None,
+        optimizer=optimizer,
+        ref_state_dict={"ref": 1},
+        rl_config=rl_config,
+        train_config=SimpleNamespace(global_batch_size=12),
+    )
+
+    assert result == "iterator"
+    assert seen == dict(
+        head=(["model"], None, optimizer, 7, {"ref": 1}),
+        grad_enabled=False,
+        grpo_iterations=1,
+        grpo_prompts_per_step=4,
+        grpo_group_size=3,
+        global_batch_size=12,
+        sequence_packing=packing,
+        buffered_rollouts="buffer",
+        is_correction=correction,
+        optimizer_is_on_cpu=offload,
+    )
+    assert empty_cache.called is (optimizer is None)
+
+
+@pytest.mark.parametrize("separate", [False, True])
+def test_evaluate_rollouts_refits_before_scoring(monkeypatch, separate):
+    """With a separate inference model the eval hook prefetches its weights and refits them from
+    the training model before scoring, then scores the inference model with the training model
+    attached; without one it scores the training model as-is."""
+    calls = []
+    inf_core = object()
+    monkeypatch.setattr(rl_utils, "get_args", lambda: "args")
+    monkeypatch.setattr(
+        rl_utils, "unwrap_model", lambda chunk: calls.append(("unwrap", chunk)) or inf_core
+    )
+    monkeypatch.setattr(
+        rl_utils,
+        "_maybe_prefetch_separate_inference_model_weights",
+        lambda core, *, to_cpu: calls.append(("prefetch", core, to_cpu)),
+    )
+    monkeypatch.setattr(
+        rl_utils, "refit_inference_model", lambda m, im, a: calls.append(("refit", m, im, a))
+    )
+
+    def evaluate(*args, **kwargs):
+        # The positional tail is (model, optimizer, iteration); anything before it is not contract.
+        calls.append(("eval", args[-3:], kwargs))
+
+    monkeypatch.setattr(rl_utils, "evaluate_and_print_results_rl", evaluate)
+
+    rl_utils.evaluate_rollouts(
+        model=["train"],
+        inference_model=["inf"] if separate else None,
+        optimizer="optimizer",
+        prefix="iteration 3 on validation set",
+        iteration=3,
+        verbose=True,
+        write_to_tensorboard=False,
+    )
+
+    eval_kwargs = {"write_to_tensorboard": False, "training_model": ["train"] if separate else None}
+    if separate:
+        assert calls == [
+            ("unwrap", "inf"),
+            ("prefetch", inf_core, False),
+            ("refit", ["train"], ["inf"], "args"),
+            ("eval", (["inf"], "optimizer", 3), eval_kwargs),
+        ]
+    else:
+        assert calls == [("eval", (["train"], "optimizer", 3), eval_kwargs)]
 
 
 class MockModel(LanguageModule):
@@ -723,8 +834,9 @@ class TestRLUtils:
         [pytest.param(True, id="shared-config"), pytest.param(False, id="distinct-config")],
     )
     @pytest.mark.parametrize("num_experts", [None, 8], ids=["dense", "moe"])
+    @pytest.mark.parametrize("has_optimizer", [False, True], ids=["no-optimizer", "optimizer"])
     def test_megatron_rl_inference_mode_restores_training_cuda_graph_state(
-        self, monkeypatch, share_config, num_experts
+        self, monkeypatch, share_config, num_experts, has_optimizer
     ):
         config = SimpleNamespace(
             cuda_graph_impl="none",
@@ -754,7 +866,9 @@ class TestRLUtils:
         toggle_cuda_graphs = self._make_toggle_cuda_graphs_mock()
         monkeypatch.setattr(rl_utils, "toggle_cuda_graphs", toggle_cuda_graphs)
 
-        with rl_utils.megatron_rl_inference_mode(model, MagicMock(), "local", False) as result:
+        # --rl-rollout-only --no-load-optim runs the loop with no optimizer: no param sync.
+        optimizer = MagicMock() if has_optimizer else None
+        with rl_utils.megatron_rl_inference_mode(model, optimizer, "local", False) as result:
             assert result is interface
             for current_config in (config, layer_config):
                 assert current_config.cuda_graph_impl == "local"
@@ -782,24 +896,15 @@ class TestRLUtils:
             assert current_config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
         lang_module.eval.assert_called_once()
         lang_module.train.assert_called_once()
+        if has_optimizer:
+            optimizer.prepare_model_params_for_param_sync.assert_called_once_with()
 
-    @pytest.mark.parametrize(
-        "do_train, skip_train, expect_train_branch",
-        [
-            pytest.param(True, False, True, id="training"),
-            pytest.param(True, True, True, id="inference_only"),
-            pytest.param(False, False, False, id="eval_only"),
-        ],
-    )
-    def test_evaluate_and_print_results_rl_wandb_step_handling(
-        self, monkeypatch, do_train, skip_train, expect_train_branch
-    ):
-        """Only eval-only mode (--skip-train --train-iters 0, do_train=False) takes the decoupled
-        eval_only/* wandb path. --skip-train alone still runs the RL loop with monotonically
-        advancing iteration, so its evals log against the global step (see PR #6043)."""
-        args = SimpleNamespace(
-            skip_train=skip_train, world_size=1, cuda_graph_impl="none", seq_length=SEQ
-        )
+    @pytest.mark.parametrize("do_train", [True, False], ids=["training", "eval_only"])
+    def test_evaluate_and_print_results_rl_wandb_step_handling(self, monkeypatch, do_train):
+        """Only eval-only runs (--skip-train never enters the loop, so do_train=False) take the
+        decoupled eval_only/* wandb path; training and --rl-rollout-only runs log against the
+        global step (see PR #6043)."""
+        args = SimpleNamespace(world_size=1, cuda_graph_impl="none", seq_length=SEQ)
         train_state = TrainState(do_train=do_train)
         rl_config = RLConfig(
             rl_prompts_per_eval=1,
@@ -835,14 +940,10 @@ class TestRLUtils:
         )
 
         rl_utils.evaluate_and_print_results_rl(
-            data_iterator=None,
-            model=[MagicMock()],
-            optimizer=MagicMock(),
-            iteration=7,
-            write_to_tensorboard=False,
+            model=[MagicMock()], optimizer=MagicMock(), iteration=7, write_to_tensorboard=False
         )
 
-        if expect_train_branch:
+        if do_train:
             wandb_writer.log.assert_called_once_with({"env_eval_mean_reward": 0.75}, step=7)
             wandb_writer.define_metric.assert_not_called()
         else:

@@ -162,12 +162,10 @@ def load_reference_state_dict(
 def reinitialize_grpo_microbatch_calculator(args: Any, data_parallel_size: int) -> None:
     """Reinitialize the microbatch calculator with the GRPO configuration."""
     cfg = get_run_config()
-    # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct
-    # configuration.
+    # Rebuild the calculator on the loop's plain MPU data-parallel size;
+    # startup initialized it with the batch-parallel degree (DP x gtp weight-remat sequence shards).
     print_rank_0("> Reinitializing microbatch calculator for GRPO training...")
-    # First destroy the existing calculator
     destroy_num_microbatches_calculator()
-    # Then initialize with the correct perform_rl_step=True context
     init_num_microbatches_calculator(
         rank=args.rank,
         global_batch_size=cfg.train.global_batch_size,

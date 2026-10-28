@@ -2930,7 +2930,6 @@ def get_grpo_data_iterator(
 
 
 def evaluate_and_print_results_rl(
-    data_iterator: Iterator[TensorDataset],
     model: list[LanguageModule],
     optimizer: MegatronOptimizer,
     iteration: int,
@@ -2940,7 +2939,6 @@ def evaluate_and_print_results_rl(
     """Helper function to evaluate and dump results on screen.
 
     Args:
-        data_iterator: Iterator over batches of evaluation dataset.
         model: Model to evaluate with (may be separate inference model).
         iteration: Current training iteration.
         write_to_tensorboard: Dumpt stuff to tensorboard or not.
@@ -3068,6 +3066,7 @@ def next_rollout_iterator(
     train_config: Any,
 ) -> Any:
     """The rollout iterator for this iteration, rebuilt on the GRPO schedule."""
+    assert model is not None, "RLSetupCallback has not run; pass it in pretrain(callbacks=...)"
     if optimizer is None:
         # Release stale CUDA cached memory before inference.
         torch.cuda.empty_cache()
@@ -3100,6 +3099,7 @@ def evaluate_rollouts(
     write_to_tensorboard: bool,
 ) -> None:
     """Run the RL evaluation rollouts, on the separate inference model when there is one."""
+    assert model is not None, "RLSetupCallback has not run; pass it in pretrain(callbacks=...)"
     eval_model, training_model = model, None
     if inference_model is not None:
         # Swap the training weights onto the inference model first.
@@ -3108,7 +3108,6 @@ def evaluate_rollouts(
         refit_inference_model(model, inference_model, get_args())
         eval_model, training_model = inference_model, model
     evaluate_and_print_results_rl(
-        None,  # evaluation generates its own rollouts; there is no validation iterator
         eval_model,
         optimizer,
         iteration,

@@ -12,7 +12,12 @@ from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_paddi
 from megatron.training import training
 from megatron.training.checkpointing import save_grads
 from megatron.training.config import CheckpointConfig, TrainingConfig, ValidationConfig
-from megatron.training.global_vars import _set_train_state, destroy_global_vars, set_args
+from megatron.training.global_vars import (
+    _set_train_state,
+    destroy_global_vars,
+    get_train_state,
+    set_args,
+)
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.training import (
     _get_indexer_logging_layer_counts,
@@ -123,6 +128,25 @@ def test_native_builder_uses_dist_and_ddp_configs(monkeypatch, run_config, fsdp2
     assert kwargs["use_megatron_fsdp"] is megatron_fsdp
 
 
+@pytest.mark.parametrize("optimizer", [None, "optimizer"])
+@pytest.mark.parametrize("layer_wise", [False, True])
+def test_should_disable_forward_pre_hook_needs_a_live_optimizer(optimizer, layer_wise):
+    """The pre-hooks belong to the distributed optimizer's overlapped param-gather, so the loop
+    toggles them only when an optimizer was built (not under --skip-train or
+    --rl-rollout-only --no-load-optim)."""
+    args = SimpleNamespace(
+        use_megatron_fsdp=False,
+        use_distributed_optimizer=not layer_wise,
+        use_layer_wise_distributed_optimizer=layer_wise,
+        overlap_param_gather=True,
+    )
+    assert training.should_disable_forward_pre_hook(args, optimizer) is (optimizer is not None)
+    args.overlap_param_gather = False
+    assert not training.should_disable_forward_pre_hook(args, optimizer)
+    args.overlap_param_gather = args.use_megatron_fsdp = True
+    assert not training.should_disable_forward_pre_hook(args, optimizer)
+
+
 def test_indexer_logging_counts_hybrid_mtp_depths_and_dense_mode():
     """Hybrid MTP repeats each inner-pattern indexer once per unshared prediction depth."""
     args = SimpleNamespace(
@@ -229,14 +253,21 @@ class TestTraining:
         load.assert_called_once()
         save.assert_called_once()
 
-    def test_build_train_valid_test_data_iterators(self, run_config):
+    @pytest.mark.parametrize("build_train", [True, False])
+    def test_build_train_valid_test_data_iterators(self, run_config, build_train):
+        """A caller-managed training iterator (build_train_dataloader=False) skips only the
+        training loader; validation and test loaders and the data flags are still built."""
         train_iter, valid_iter, test_iter = build_train_valid_test_data_iterators(
-            mock_train_valid_test_datasets_provider
+            mock_train_valid_test_datasets_provider, build_train_dataloader=build_train
         )
-        train_data = next(train_iter)
-        valid_data = next(valid_iter)
-        test_data = next(test_iter)
-        assert (train_data, valid_data, test_data) == (1, 2, 3)
+        if build_train:
+            assert next(train_iter) == 1
+        else:
+            assert train_iter is None
+        assert (next(valid_iter), next(test_iter)) == (2, 3)
+        train_state = get_train_state()
+        flags = (train_state.do_train, train_state.do_valid, train_state.do_test)
+        assert flags == (True, True, True)
 
     def test_params_norm_is_computed_only_when_it_can_be_logged(self, run_config):
         args = SimpleNamespace(
