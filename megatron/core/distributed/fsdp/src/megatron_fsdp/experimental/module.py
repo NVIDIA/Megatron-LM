@@ -31,7 +31,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .execution_order import ExecutionOrder
+from .execution_order import ExecutionEvent, ExecutionOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import (
     FsdpParameter,
@@ -282,6 +282,8 @@ class FsdpModule:
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
 
         if self.is_root():
+            if not is_recomputing:
+                context.reset_execution_order(cast(nn.Module, self), Phase.FORWARD)
             context.allgather_stream.wait_stream(context.current_stream())
 
         # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
@@ -337,15 +339,20 @@ class FsdpModule:
         """
         if not order:
             return
-        order.advance((self, self.phase))
+        if order.position < len(order) and order[order.position] != ExecutionEvent(
+            module=cast(nn.Module, self), phase=self.phase
+        ):
+            raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
+        order.advance()
         if prefetch_size == 0:
             return
         prefetched_size = 0
         for index in range(order.position, len(order)):
-            fsdp_module, phase = order[index]
+            event = order[index]
             # Forward and backward retain their separate prefetch boundaries.
-            if phase is not self.phase:
+            if event.phase is not self.phase:
                 break
+            fsdp_module = cast(FsdpModule, event.module)
             fsdp_module._unshard_parameter_groups(self.phase)
             prefetched_size += fsdp_module.num_parameter_elements
             if prefetch_size is None or prefetched_size >= prefetch_size:
@@ -426,6 +433,7 @@ class FsdpModule:
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():
+            context.reset_execution_order(cast(nn.Module, self), Phase.BACKWARD)
             context.register_post_backward_hook()
             # Fork the reduce-scatter stream from the current stream once, at the
             # start of backward, so every module's post-backward reduce-scatter is

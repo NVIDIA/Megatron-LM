@@ -15,42 +15,34 @@
 """Weakly held construction or recorded module execution sequences."""
 
 from collections.abc import Iterable, Iterator
-from typing import TYPE_CHECKING
+from typing import NamedTuple
 from weakref import ref
+
+from torch import nn
 
 from .phase import Phase
 
-if TYPE_CHECKING:
-    from .module import FsdpModule
 
-ExecutionEvent = tuple["FsdpModule", Phase]
+class ExecutionEvent(NamedTuple):
+    """A module and its compute phase."""
+
+    module: nn.Module
+    phase: Phase
 
 
 class ExecutionOrder:
-    """Look up unique modules and validate repeated module-call occurrences.
-
-    A module appearing once can unambiguously select its position, preserving
-    construction-order prefetch for reordered or repeated demand calls. Modules
-    appearing more than once must match the next occurrence at the cursor.
-    Prefetch lookahead never advances that cursor. Events are (module, phase)
-    pairs; modules are held weakly inside the order.
-    """
+    """An ordered sequence of module/phase occurrences."""
 
     def __init__(self, items: Iterable[ExecutionEvent] = ()) -> None:
         """Create an execution sequence, preserving repeated occurrences."""
-        self._items: list[tuple[ref["FsdpModule"], Phase]] = []
-        # An index identifies a unique item; None marks an ambiguous repeated item.
-        self._unique_index: dict[tuple[ref["FsdpModule"], Phase], int | None] = {}
+        self._items: list[tuple[ref[nn.Module], Phase]] = []
         self._position = 0
         for item in items:
             self.append(item)
 
     def append(self, item: ExecutionEvent) -> None:
-        """Append an occurrence and mark previously seen items as repeated."""
-        module, phase = item
-        key = (ref(module), phase)
-        self._unique_index[key] = None if key in self._unique_index else len(self._items)
-        self._items.append(key)
+        """Append an occurrence."""
+        self._items.append((ref(item.module), item.phase))
 
     def __iter__(self) -> Iterator[ExecutionEvent]:
         """Iterate over occurrences in execution order."""
@@ -75,24 +67,10 @@ class ExecutionOrder:
         module = module_ref()
         if module is None:
             raise RuntimeError("A module in the FSDP execution order was destroyed.")
-        return module, phase
+        return ExecutionEvent(module=module, phase=phase)
 
-    def advance(self, item: ExecutionEvent | None = None) -> ExecutionEvent:
-        """Locate a unique demand call or consume the next expected repeated call.
-
-        With no item, consume the next occurrence without lookup.
-        """
-        if item is not None:
-            module, phase = item
-            key = (ref(module), phase)
-            index = self._unique_index.get(key)
-            if index is None:
-                if not self._items or self._items[self._position % len(self._items)] != key:
-                    raise RuntimeError(
-                        "FSDP module calls diverged from the expected prefetch order."
-                    )
-                index = self._position % len(self._items)
-            self._position = index
+    def advance(self) -> ExecutionEvent:
+        """Consume the next occurrence; the caller owns cursor resets."""
         if self._position >= len(self._items):
             raise RuntimeError("Calls exceeded the execution order; reset its cursor first.")
         result = self[self._position]
