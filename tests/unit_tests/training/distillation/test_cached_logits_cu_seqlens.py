@@ -17,6 +17,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
+from megatron.training.config import DataConfig
+from megatron.training.datasets.sft_dataset import MockSFTDataset
 from megatron.training.distillation import cached_logits_loss
 from megatron.training.distillation import utils as distillation_utils
 from megatron.training.distillation.cached_logits_loss import make_teacher_tar_dataset
@@ -28,6 +31,20 @@ from megatron.training.distillation.utils import (
 )
 
 zstandard = pytest.importorskip("zstandard")
+
+
+def _run_config_for(sft: bool):
+    """A run config whose data section has the family of the run (what is_packed_sequence_run
+    reads: the SFT family packs documents, plain GPT does not)."""
+    dataset = GPTDatasetConfig(
+        sequence_length=16,
+        random_seed=1,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+    )
+    dataset_type = MockSFTDataset if sft else MockGPTDataset
+    return SimpleNamespace(data=DataConfig(dataset=dataset, dataset_type=dataset_type))
 
 
 def _torch_save_bytes(payload) -> bytes:
@@ -94,10 +111,10 @@ def _load_args(monkeypatch, *, sft: bool, num_samples: int):
         dataloader_inter_document_masking=False,
     )
     monkeypatch.setattr(cached_logits_loss, "get_args", lambda: args)
-    # is_packed_sequence_run() reads get_args() bound inside utils.py itself,
-    # not cached_logits_loss's binding -- patch both so TeacherTarDataset's
-    # _requires_cu_seqlens sees the same args.
+    # is_packed_sequence_run() reads the data section of the registered run config, the same
+    # source as get_batch; give it a section whose family matches the run.
     monkeypatch.setattr(distillation_utils, "get_args", lambda: args)
+    monkeypatch.setattr(distillation_utils, "get_run_config", lambda: _run_config_for(sft))
 
 
 # ---------------------------------------------------------------------------

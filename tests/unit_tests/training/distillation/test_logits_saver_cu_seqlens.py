@@ -16,11 +16,28 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
+from megatron.training.config import DataConfig
+from megatron.training.datasets.sft_dataset import MockSFTDataset
 from megatron.training.distillation import logits_saver
 from megatron.training.distillation import utils as distillation_utils
 from megatron.training.distillation.logits_saver import LogitsSaverHooks
 
 zstandard = pytest.importorskip("zstandard")
+
+
+def _run_config_for(sft: bool):
+    """A run config whose data section has the family of the run (what is_packed_sequence_run
+    reads: the SFT family packs documents, plain GPT does not)."""
+    dataset = GPTDatasetConfig(
+        sequence_length=16,
+        random_seed=1,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+    )
+    dataset_type = MockSFTDataset if sft else MockGPTDataset
+    return SimpleNamespace(data=DataConfig(dataset=dataset, dataset_type=dataset_type))
 
 
 def _bare_saver(cp_size=1, tp_rank=0, tp_size=1, dp_rank=0, dp_size=1):
@@ -190,10 +207,10 @@ def _patch_init_deps(monkeypatch, *, cp_size, sft):
         freeze_all_layers=False,
     )
     monkeypatch.setattr(logits_saver, "get_args", lambda: args)
-    # is_packed_sequence_run() reads get_args() bound inside utils.py itself,
-    # not logits_saver's binding -- patch both so LogitsSaverHooks.__init__
-    # sees the same args.
+    # is_packed_sequence_run() reads the data section of the registered run config, the same
+    # source as get_batch; give it a section whose family matches the run.
     monkeypatch.setattr(distillation_utils, "get_args", lambda: args)
+    monkeypatch.setattr(distillation_utils, "get_run_config", lambda: _run_config_for(sft))
     monkeypatch.setattr(logits_saver, "compute_dataset_hash", lambda: ("hash", {}))
     monkeypatch.setattr(logits_saver, "storage_makedirs", lambda *a, **k: None)
 
