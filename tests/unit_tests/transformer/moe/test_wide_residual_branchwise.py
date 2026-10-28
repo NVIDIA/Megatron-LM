@@ -14,11 +14,9 @@ from megatron.core.tensor_parallel.random import initialize_rng_tracker
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualConnection
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
-from megatron.core.transformer.wide_residual_layer import (
-    StreamwiseSigmoidWideResidualConnection,
-    WideResidualTransformerLayer,
-)
+from megatron.core.transformer.wide_residual_transformer_layer import WideResidualTransformerLayer
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 

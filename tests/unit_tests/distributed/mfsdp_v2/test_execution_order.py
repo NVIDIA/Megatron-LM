@@ -28,8 +28,9 @@ def test_prefetch_replays_occurrences(budget, expected):
     modules = [Mock(spec=FsdpModule, num_parameter_elements=1) for _ in range(3)]
     prefetched = []
     for module in modules:
-        module._unshard_parameter_groups.side_effect = lambda target=module: prefetched.append(
-            target
+        # Prefetch passes the successor's compute phase; record only which module it targets.
+        module._unshard_parameter_groups.side_effect = (
+            lambda _phase, target=module: prefetched.append(target)
         )
     sequence = [modules[index] for index in (0, 1, 0, 0, 2)]
     order = ExecutionOrder()
