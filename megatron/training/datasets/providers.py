@@ -9,7 +9,7 @@ and hands the dataset config to ``BlendedMegatronDatasetBuilder`` as is. Each sc
 ``is_dataset_built_on_rank_explicit`` below is the GPT and hybrid rule with its inputs spelled out
 (a packed dataset is built on every pipeline stage, the others on the first and last stages and on
 the multi-token-prediction ranks); ``is_dataset_built_on_rank`` applies it to the registered
-arguments and is the predicate ``pretrain_gpt.py`` and ``pretrain_hybrid.py`` pass; hybrid-flex
+run config (the model section, or the arguments' transformer config without one) and is the predicate ``pretrain_gpt.py`` and ``pretrain_hybrid.py`` pass; hybrid-flex
 passes its own.
 """
 
@@ -56,22 +56,23 @@ def is_dataset_built_on_rank_explicit(
 def is_dataset_built_on_rank(
     vp_stage: Optional[int] = None, is_packed_sequence: bool = False
 ) -> bool:
-    """``is_dataset_built_on_rank_explicit`` applied to the registered arguments: the predicate
+    """``is_dataset_built_on_rank_explicit`` applied to the registered run config: the predicate
     ``pretrain_gpt.py`` and ``pretrain_hybrid.py`` pass, and the default of ``build_gpt_datasets``.
-    The arguments and the transformer config are read at call time from
-    ``megatron.training.global_vars`` and ``megatron.training.arguments``, which is where tests
-    patch them."""
-    from megatron.training.arguments import core_transformer_config_from_args
-    from megatron.training.global_vars import get_args
+    The scheduler, the pipeline layout and the MTP depth come from the model section when the
+    container has one, and from the transformer config the registered arguments describe
+    otherwise (``megatron.training.config.compat``); both are read at call time."""
+    from megatron.training.config.compat import model_layout, model_topology
+    from megatron.training.global_vars import get_args, get_run_config
 
+    cfg = get_run_config()
     args = get_args()
-    config = core_transformer_config_from_args(args)
+    layout, mtp_num_layers = model_layout(cfg, args)
     return is_dataset_built_on_rank_explicit(
         vp_stage,
         is_packed_sequence,
-        sequence_packing_scheduler=args.sequence_packing_scheduler,
-        pipeline_model_parallel_layout=config.pipeline_model_parallel_layout,
-        mtp_num_layers=config.mtp_num_layers,
+        sequence_packing_scheduler=model_topology(cfg, args).sequence_packing_scheduler,
+        pipeline_model_parallel_layout=layout,
+        mtp_num_layers=mtp_num_layers,
     )
 
 
