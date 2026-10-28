@@ -73,6 +73,33 @@ void share_storage(at::Tensor dst, at::Tensor src) {
 
 _share_storage_ext = None
 
+# Set on the output StorageImpl wrapper used by CheckpointWithoutOutput.  The
+# storage-level marker is visible through aliases/views of the output tensor.
+_CHECKPOINT_WITHOUT_OUTPUT_STORAGE_ATTR = "_mcore_checkpoint_without_output"
+
+
+def _get_checkpoint_without_output_storage(tensor: torch.Tensor) -> torch.UntypedStorage | None:
+    """Return a tensor's storage, or None for storage-less tensor subclasses."""
+    try:
+        return tensor.untyped_storage()
+    except (AttributeError, NotImplementedError, RuntimeError):
+        return None
+
+
+def _mark_checkpoint_without_output_tensor(tensor: torch.Tensor) -> None:
+    """Mark a tensor's storage as owned by CheckpointWithoutOutput."""
+    storage = _get_checkpoint_without_output_storage(tensor)
+    if storage is not None:
+        setattr(storage, _CHECKPOINT_WITHOUT_OUTPUT_STORAGE_ATTR, True)
+
+
+def is_checkpoint_without_output_tensor(tensor: torch.Tensor) -> bool:
+    """Return whether a tensor aliases a CheckpointWithoutOutput output storage."""
+    storage = _get_checkpoint_without_output_storage(tensor)
+    return storage is not None and bool(
+        getattr(storage, _CHECKPOINT_WITHOUT_OUTPUT_STORAGE_ATTR, False)
+    )
+
 
 def _get_share_storage():
     """Lazily compile & cache the share_storage extension."""
@@ -719,6 +746,11 @@ class CheckpointFunction(torch.autograd.Function):
         # router GEMM row blocks) instead of inheriting that thread's defaults.
         ctx.forward_context = _capture_forward_context()
         ctx.distribute_saved_activations = distribute_saved_activations
+        # Activation recomputation must use the same autocast policy as the original forward.
+        # Otherwise it replays under the ambient autocast state.
+        ctx.autocast_enabled = torch.is_autocast_enabled("cuda")
+        ctx.autocast_dtype = torch.get_autocast_dtype("cuda")
+        ctx.autocast_cache_enabled = torch.is_autocast_cache_enabled()
 
         # Copy the rng states.
         ctx.rng_states = _get_all_rng_states()
@@ -765,7 +797,13 @@ class CheckpointFunction(torch.autograd.Function):
 
             # Compute the forward pass.
             detached_inputs = detach_variable(inputs)
-            with torch.enable_grad():
+            autocast_context = torch.autocast(
+                device_type="cuda",
+                dtype=ctx.autocast_dtype,
+                enabled=ctx.autocast_enabled,
+                cache_enabled=ctx.autocast_cache_enabled,
+            )
+            with torch.enable_grad(), autocast_context:
                 outputs = ctx.forward_context.copy().run(
                     _run_recompute_with_observation_suspended, ctx.run_function, *detached_inputs
                 )
@@ -1190,6 +1228,12 @@ class CheckpointWithoutOutput:
         result = region.record(args)
         self._region, self._released_region = region, None
         self.outputs = _as_tuple(result)
+
+        # Offload group commits can run before discard_output_and_register_recompute().
+        # Mark the output storages now so activation offload does not copy or release
+        # memory that this checkpoint owns and regenerates itself.
+        for output in self.outputs:
+            _mark_checkpoint_without_output_tensor(output)
 
         # Auto-register to manager if provided
         if self.ckpt_manager is not None:
