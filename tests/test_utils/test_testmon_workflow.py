@@ -1057,3 +1057,32 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
             assert matches[0]["plan_artifact"] == upload["name"]
     assert any("/empty/" in upload["plan"]["bucket"] for upload in uploads)
     assert all(entry["plan_artifact"] == "" for entry in matrix if entry["mode"] == "full")
+
+
+@pytest.mark.parametrize("other_labels", [[], ["Run tests"], ["Run functional tests"]])
+def test_functional_coverage_selects_full_merge_queue_matrix(
+    tmp_path: Path, configure_environment: dict[str, str], other_labels: list[str]
+) -> None:
+    """Coverage requests keep full training and the same cadence as merge queue."""
+    result, outputs = _run_configure(
+        tmp_path, configure_environment, ["Collect functional coverage", *other_labels]
+    )
+    assert result.returncode == 0, result.stderr
+    assert outputs["functional_coverage"] == "true"
+    assert outputs["run_functional"] == "true"
+    assert outputs["run_h100_functional"] == "true"
+    assert outputs["scope"] == "L1"
+    assert outputs["cadence"] == "mergegroup"
+    assert outputs["cadence_bypass"] == "false"
+    assert outputs["n_repeat"] == "1"
+    assert outputs["lightweight"] == "false"
+
+
+def test_functional_coverage_is_opt_in(
+    tmp_path: Path, configure_environment: dict[str, str]
+) -> None:
+    """Unlabelled PRs retain their normal instrumentation and selection defaults."""
+    result, outputs = _run_configure(tmp_path, configure_environment, [])
+    assert result.returncode == 0, result.stderr
+    assert outputs["functional_coverage"] == "false"
+    assert outputs["scope"] == "L0"
