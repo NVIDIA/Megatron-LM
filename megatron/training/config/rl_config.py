@@ -4,6 +4,8 @@ import argparse
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
+from megatron.core.inference.shards_spec import spec_declares_disaggregation
+
 if TYPE_CHECKING:
     from megatron.core.distributed import DistributedDataParallelConfig
 
@@ -286,8 +288,6 @@ class RLConfig:
     ) -> bool:
         """Whether rollouts run on their own copy of the model: disaggregated shards, any
         --rl-inference-* parallelism override, or CP>1 (RL inference does not support CP)."""
-        from megatron.core.inference.shards_spec import spec_declares_disaggregation
-
         return (
             spec_declares_disaggregation(inference_shards)
             or self.rl_inference_tensor_model_parallel_size is not None

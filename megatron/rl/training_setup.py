@@ -16,8 +16,10 @@ from megatron.core.utils import get_model_config
 from megatron.rl.inference.disagg import build_disagg_inference_model
 from megatron.rl.rl_utils import inference_model_alloc_context
 from megatron.training.callbacks import Callback, CallbackContext
+from megatron.training.checkpointing import load_checkpoint
 from megatron.training.config.container import update_train_iters
 from megatron.training.global_vars import get_args, get_run_config, get_train_state
+from megatron.training.training import get_model
 from megatron.training.utils import print_rank_0
 
 try:
@@ -96,8 +98,6 @@ def build_rl_inference_model(
             rl_config.rl_inference_expert_tensor_model_parallel_size
         )
 
-    from megatron.training.training import get_model
-
     with inference_model_alloc_context():
         inference_model = get_model(
             model_provider,
@@ -116,8 +116,6 @@ def load_reference_state_dict(model: list, checkpointing_context: dict, args: An
     With --skip-train the current weights are the reference; otherwise the pretrained
     checkpoint is loaded, snapshotted to CPU, and the RL training checkpoint reloaded.
     """
-    from megatron.training.checkpointing import load_checkpoint
-
     cfg = get_run_config()
     if cfg.validation.skip_train:
         # In inference-only mode, use current weights as reference.

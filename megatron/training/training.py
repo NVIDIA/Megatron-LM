@@ -2168,7 +2168,6 @@ def pretrain(
     # fallback.
 
     # Enter the loop when training, or when the caller opted into running it.
-    train_state = get_train_state()
     if not cfg_container.validation.skip_train or (
         run_train_loop_without_updates and train_state.do_train
     ):
