@@ -10,7 +10,8 @@ same tensor signature. The module never retains a forward's state mapping.
 
 import gc
 from contextlib import contextmanager
-from typing import Mapping
+from dataclasses import fields, is_dataclass, replace
+from typing import Any, Mapping
 
 import torch
 from torch import Tensor, nn
@@ -19,6 +20,30 @@ from torch.utils.checkpoint import checkpoint
 from megatron.core.tensor_observation import suspend_tensor_observations
 from megatron.core.tensor_parallel import random as rng
 from megatron.core.transformer.state_boundary import TensorField, TensorSchema
+
+
+def detach_state(value: Any) -> Any:
+    """Copy a forward-local state object while detaching all tensor leaves."""
+    if isinstance(value, Tensor):
+        return value.detach()
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return value
+    if is_dataclass(value):
+        return replace(
+            value,
+            **{field.name: detach_state(getattr(value, field.name)) for field in fields(value)},
+        )
+    if isinstance(value, dict):
+        return type(value)((key, detach_state(item)) for key, item in value.items())
+    if isinstance(value, list):
+        return [detach_state(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(detach_state(item) for item in value)
+    # Forward state metadata should normally be dataclasses. Do not walk arbitrary
+    # object __dict__ values here: process-group and runtime objects may contain
+    # cycles or large non-state graphs. Unknown objects are immutable metadata from
+    # the state detacher's perspective and can be shared safely.
+    return value
 
 
 class StatefulModule(nn.Module):
