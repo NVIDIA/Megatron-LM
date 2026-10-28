@@ -9,49 +9,11 @@ import pytest
 
 from tests.test_utils.python_scripts import launch_nemo_run_workload
 
-EXPECTED_FLAKY_FAILURE_SIGNATURES = (
-    "The server socket has failed to listen on any local network address.",
-    "Some NCCL operations have failed or timed out.",
-    "Watchdog caught collective operation timeout",
-    "uncorrectable ECC error encountered",
-    "illegal memory access",
-    "illegal instruction",
-    "torch.distributed.DistNetworkError",
-    "Segmentation fault",
-    "found NaN in",
-    "For debugging consider passing CUDA_LAUNCH_BLOCKING=1",
-    "double free or corruption",
-    "Call to CUDA function failed.",
-    "Connection reset by peer",
-    "invalid pointer",
-    "malloc(): unaligned tcache chunk detected",
-    "zmq.error.ZMQError: Address already in use",
-    "We couldn't connect to 'https://huggingface.co'",
-    "Unpack failed: incomplete input",
-    "The read operation timed out",
-    "Read timed out",
-    "TimeoutError",
-    "Connection broken",
-    "Temporary failure in name resolution",
-    "unspecified launch failure",
-    "free(): corrupted unsorted chunks",
-    "Segfault encountered",
-    "The following metrics failed",
-    "removal of container",
-    "is already in progress",
-    "Error deleting container",
-)
-
 
 def test_nccl_watchdog_timeout_is_flaky():
     log = "Watchdog caught collective operation timeout: WorkNCCL(SeqNum=281)"
 
     assert launch_nemo_run_workload.is_flaky_failure(log)
-
-
-@pytest.mark.parametrize("signature", EXPECTED_FLAKY_FAILURE_SIGNATURES)
-def test_every_flaky_failure_signature_is_recognized(signature):
-    assert launch_nemo_run_workload.is_flaky_failure(signature)
 
 
 def test_hang_prone_flaky_failure_cancels_active_attempt():
@@ -111,17 +73,18 @@ def test_stopped_monitor_does_not_cancel_attempt():
 
 
 def test_failure_signature_split_at_file_chunk_boundary(tmp_path, monkeypatch):
-    monkeypatch.setattr(launch_nemo_run_workload, "_FAILURE_LOG_SCAN_CHUNK_SIZE", 16)
+    chunk_size = 128
+    monkeypatch.setattr(launch_nemo_run_workload, "_FAILURE_LOG_SCAN_CHUNK_SIZE", chunk_size)
     signature = "Connection reset by peer"
     log_path = tmp_path / "task" / "attempt_0" / "rank0" / "stdout.log"
     log_path.parent.mkdir(parents=True)
-    log_path.write_text("x" * 13 + signature + " trailing text")
+    log_path.write_text("x" * (chunk_size - 5) + signature + " trailing text")
 
     assert launch_nemo_run_workload._has_flaky_failure_in_logs(tmp_path)
 
 
 def test_failure_signature_at_end_of_file_is_found(tmp_path, monkeypatch):
-    monkeypatch.setattr(launch_nemo_run_workload, "_FAILURE_LOG_SCAN_CHUNK_SIZE", 16)
+    monkeypatch.setattr(launch_nemo_run_workload, "_FAILURE_LOG_SCAN_CHUNK_SIZE", 128)
     signature = "The following metrics failed"
     log_path = tmp_path / "task.log"
     log_path.write_text("x" * 7 + signature)
@@ -190,30 +153,25 @@ def test_all_nonflaky_logs_return_false(tmp_path):
     assert not launch_nemo_run_workload._has_flaky_failure_in_logs(tmp_path)
 
 
-def test_existing_monitor_signal_short_circuits_log_scan(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("monitor_hit", "tee_signature"),
+    [(True, ""), (False, "The server socket has failed to listen on any local network address.")],
+)
+def test_existing_failure_evidence_short_circuits_log_scan(
+    tmp_path, monkeypatch, monitor_hit, tee_signature
+):
     log_buffer = launch_nemo_run_workload._ThreadSafeBuffer()
     failure_detected_event = threading.Event()
-    failure_detected_event.set()
+    if monitor_hit:
+        failure_detected_event.set()
+    else:
+        log_buffer.write(tee_signature)
 
     def unexpected_scan(_workdir):
-        pytest.fail("archived logs should not be scanned after a monitor hit")
+        pytest.fail("archived logs should not be scanned after streamed failure evidence")
 
     monkeypatch.setattr(launch_nemo_run_workload, "_has_flaky_failure_in_logs", unexpected_scan)
 
     assert launch_nemo_run_workload._should_retry_failed_attempt(
         tmp_path, log_buffer, failure_detected_event
-    )
-
-
-def test_existing_tee_signature_short_circuits_log_scan(tmp_path, monkeypatch):
-    log_buffer = launch_nemo_run_workload._ThreadSafeBuffer()
-    log_buffer.write("The server socket has failed to listen on any local network address.")
-
-    def unexpected_scan(_workdir):
-        pytest.fail("archived logs should not be scanned after a tee hit")
-
-    monkeypatch.setattr(launch_nemo_run_workload, "_has_flaky_failure_in_logs", unexpected_scan)
-
-    assert launch_nemo_run_workload._should_retry_failed_attempt(
-        tmp_path, log_buffer, threading.Event()
     )

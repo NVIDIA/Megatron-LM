@@ -4,7 +4,6 @@ import io
 import logging
 import os
 import pathlib
-import re
 import sys
 import threading
 from typing import Optional
@@ -17,48 +16,47 @@ from tests.test_utils.python_scripts import recipe_parser
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-FLAKY_FAILURE_SIGNATURES = (
-    "The server socket has failed to listen on any local network address.",
-    "Some NCCL operations have failed or timed out.",
-    "Watchdog caught collective operation timeout",
-    "uncorrectable ECC error encountered",
-    "illegal memory access",
-    "illegal instruction",
-    "torch.distributed.DistNetworkError",
-    "Segmentation fault",
-    "found NaN in",
-    "For debugging consider passing CUDA_LAUNCH_BLOCKING=1",
-    "double free or corruption",
-    "Call to CUDA function failed.",
-    "Connection reset by peer",
-    "invalid pointer",
-    "malloc(): unaligned tcache chunk detected",
-    "zmq.error.ZMQError: Address already in use",
-    "We couldn't connect to 'https://huggingface.co'",
-    "Unpack failed: incomplete input",
-    "The read operation timed out",
-    "Read timed out",
-    "TimeoutError",
-    "Connection broken",
-    "Temporary failure in name resolution",
-    "unspecified launch failure",
-    "free(): corrupted unsorted chunks",
-    "Segfault encountered",
-    "The following metrics failed",
-    "removal of container",
-    "is already in progress",
-    "Error deleting container",
-)
-_FLAKY_FAILURE_SIGNATURE_RE = re.compile(
-    "|".join(re.escape(signature) for signature in FLAKY_FAILURE_SIGNATURES)
-)
 _FAILURE_LOG_SCAN_CHUNK_SIZE = 1024 * 1024
-_FAILURE_LOG_SCAN_OVERLAP = max(map(len, FLAKY_FAILURE_SIGNATURES)) - 1
+# Current retry signatures are under 100 characters, so a 4 KiB overlap covers boundary splits.
+_FAILURE_LOG_SCAN_OVERLAP = 4 * 1024
 
 
 def is_flaky_failure(concat_allranks_logs: str) -> bool:
     """Assumes that certain keywords hint towards intermittent failures"""
-    return _FLAKY_FAILURE_SIGNATURE_RE.search(concat_allranks_logs) is not None
+
+    return (
+        "The server socket has failed to listen on any local network address."
+        in concat_allranks_logs
+        or "Some NCCL operations have failed or timed out." in concat_allranks_logs
+        or "Watchdog caught collective operation timeout" in concat_allranks_logs
+        or "uncorrectable ECC error encountered" in concat_allranks_logs
+        or "illegal memory access" in concat_allranks_logs
+        or "illegal instruction" in concat_allranks_logs
+        or "torch.distributed.DistNetworkError" in concat_allranks_logs
+        or "Segmentation fault" in concat_allranks_logs
+        or "found NaN in" in concat_allranks_logs
+        or "For debugging consider passing CUDA_LAUNCH_BLOCKING=1" in concat_allranks_logs
+        or "double free or corruption" in concat_allranks_logs
+        or "Call to CUDA function failed." in concat_allranks_logs
+        or "Connection reset by peer" in concat_allranks_logs
+        or "invalid pointer" in concat_allranks_logs
+        or "malloc(): unaligned tcache chunk detected" in concat_allranks_logs
+        or "zmq.error.ZMQError: Address already in use" in concat_allranks_logs
+        or "We couldn't connect to 'https://huggingface.co'" in concat_allranks_logs
+        or "Unpack failed: incomplete input" in concat_allranks_logs
+        or "The read operation timed out" in concat_allranks_logs
+        or "Read timed out" in concat_allranks_logs
+        or "TimeoutError" in concat_allranks_logs
+        or "Connection broken" in concat_allranks_logs
+        or "Temporary failure in name resolution" in concat_allranks_logs
+        or "unspecified launch failure" in concat_allranks_logs
+        or "free(): corrupted unsorted chunks" in concat_allranks_logs
+        or "Segfault encountered" in concat_allranks_logs
+        or "The following metrics failed" in concat_allranks_logs
+        or "removal of container" in concat_allranks_logs
+        or "is already in progress" in concat_allranks_logs
+        or "Error deleting container" in concat_allranks_logs
+    )
 
 
 def _is_hang_prone_flaky_failure(concat_allranks_logs: str) -> bool:
@@ -131,12 +129,12 @@ def _has_flaky_failure_in_logs(workdir: pathlib.Path) -> bool:
             seen_paths.add(resolved)
             try:
                 with open(log_file_path, "r", errors="replace") as f:
-                    overlap = ""
+                    previous_chunk = ""
                     while chunk := f.read(_FAILURE_LOG_SCAN_CHUNK_SIZE):
-                        candidate = overlap + chunk
+                        candidate = previous_chunk + chunk
                         if is_flaky_failure(candidate):
                             return True
-                        overlap = candidate[-_FAILURE_LOG_SCAN_OVERLAP:]
+                        previous_chunk = chunk[-_FAILURE_LOG_SCAN_OVERLAP:]
             except OSError as error:
                 logger.warning("Could not read log file %s: %s", log_file_path, error)
     return False
