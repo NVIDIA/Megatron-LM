@@ -12,9 +12,11 @@ import torch
 import yaml
 
 from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.training.config.container import ConfigContainerBase
 from megatron.training.config.instantiate_utils import InstantiationMode
-from megatron.training.config.utils import serialize_value
+from megatron.training.config.utils import serialize_dataclass, serialize_value
 from megatron.training.models import Serializable
 
 
@@ -105,6 +107,20 @@ class CallableConfigContainer(ConfigContainerBase):
         """Initialize callable_data if not provided."""
         if self.callable_data is None:
             self.callable_data = CallableDataclass()
+
+
+@dataclass
+class LayoutConfigContainer(ConfigContainerBase):
+    """Exercise the recursive conversion extension point used by Bridge."""
+
+    transformer: TransformerConfig
+    metadata: dict
+
+    @classmethod
+    def _convert_value_to_dict(cls, value):
+        if isinstance(value, PipelineParallelLayerLayout):
+            return cls._convert_value_to_dict(value.input_data)
+        return super()._convert_value_to_dict(value)
 
 
 class TestConfigContainer_FromDict:
@@ -266,6 +282,46 @@ class TestConfigContainer_FromYaml:
 
 class TestConfigContainer_ToDict:
     """Test ConfigContainer.to_dict method."""
+
+    def test_subclass_conversion_hook_round_trip(self, tmp_path):
+        transformer = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=2,
+            pipeline_model_parallel_layout='EtL',
+        )
+        layout = transformer.pipeline_model_parallel_layout
+        transformer.finalize_model_grads_func = lambda *args: None
+        config = LayoutConfigContainer(
+            transformer=transformer, metadata={'layouts': (layout, {'nested': layout})}
+        )
+
+        serialized = config.to_dict()
+        assert serialized['transformer']['pipeline_model_parallel_layout'] == 'EtL'
+        assert serialized['metadata']['layouts'] == ['EtL', {'nested': 'EtL'}]
+        assert 'finalize_model_grads_func' not in serialized['transformer']
+        assert serialized['transformer']['activation_func']['_call_'] is False
+
+        path = str(tmp_path / 'layout.yaml')
+        config.to_yaml(path)
+        restored = LayoutConfigContainer.from_yaml(path)
+        assert restored.transformer.pipeline_model_parallel_layout.input_data == 'EtL'
+        assert restored.to_dict() == serialized
+
+        config.metadata['callbacks'] = [activation_function, {'nested': loss_function}]
+        encoded = serialize_dataclass(
+            config, encode_callables=True, value_serializer=config._convert_value_to_dict
+        )
+        assert encoded['metadata']['callbacks'][0]['_call_'] is False
+        assert encoded['metadata']['callbacks'][1]['nested']['_call_'] is False
+        assert (
+            serialize_value(
+                config.metadata,
+                encode_callables=True,
+                value_serializer=config._convert_value_to_dict,
+            )
+            == encoded['metadata']
+        )
 
     def test_to_dict_basic(self):
         """Test basic to_dict functionality."""
