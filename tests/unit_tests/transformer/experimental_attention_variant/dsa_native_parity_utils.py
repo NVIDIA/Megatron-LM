@@ -11,9 +11,9 @@ from megatron.core.extensions.transformer_engine_spec_provider import TESpecProv
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_dsa_module_spec_for_backend,
 )
+from megatron.core.ops.attention.dsa import modules as dsa_module
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.transformer.experimental_attention_variant import dsa as dsa_module
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
@@ -44,7 +44,7 @@ def _skip_if_backend_unavailable(kernel_backend: str) -> None:
             pytest.skip(f"fused DSA dependencies are unavailable: {', '.join(missing)}")
     elif kernel_backend == "tilelang":
         try:
-            from megatron.core.transformer.experimental_attention_variant.ops import tilelang_dsa
+            from megatron.core.ops.attention.dsa.kernels import tilelang_dsa
         except (AttributeError, ImportError, OSError) as error:
             pytest.skip(f"DSA TileLang kernels are unavailable: {error}")
         if tilelang_dsa.lighting_indexer is None and tilelang_dsa.SparseMLA is None:

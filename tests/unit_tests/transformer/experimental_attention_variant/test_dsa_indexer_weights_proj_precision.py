@@ -15,20 +15,18 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
+import megatron.core.ops.attention.dsa.modules as dsa_module
 from megatron.core.extensions.transformer_engine import HAVE_TE, TELinear, TENorm
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.quantization.quant_config import MatchContext, RecipeConfig
-from megatron.core.transformer.enums import AttnBackend
-from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
-    AbsorbedMLASelfAttention,
-)
-from megatron.core.transformer.experimental_attention_variant.dsa import (
+from megatron.core.ops.attention.dsa.modules import (
     DSAIndexer,
     DSAIndexerSubmodules,
     DSAttention,
     fused_qk_topk_naive,
 )
+from megatron.core.ops.attention.mla import AbsorbedMLASelfAttention
+from megatron.core.quantization.quant_config import MatchContext, RecipeConfig
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.argument_utils import ArgumentGroupFactory

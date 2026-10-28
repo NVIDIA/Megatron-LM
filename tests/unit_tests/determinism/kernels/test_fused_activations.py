@@ -317,9 +317,7 @@ def test_dsv4_q_rms_norm_replays(dtype, layout):
     strided-input specialisation the compiler guards on separately.
     """
     try:
-        from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
-            _q_rms_norm,
-        )
+        from megatron.core.ops.attention.dsv4 import _q_rms_norm
     except ImportError as e:  # pragma: no cover - depends on optional dependencies
         pytest.skip(f"DeepSeek-V4 hybrid attention unavailable: {e}")
 

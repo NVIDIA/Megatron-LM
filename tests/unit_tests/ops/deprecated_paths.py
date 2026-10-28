@@ -71,6 +71,102 @@ FORWARDED = {
     "megatron.core.ssm.context_parallel.gdp_cutedsl": (
         "megatron.core.ops.ssm.context_parallel.gdp_cutedsl",
     ),
+    "megatron.core.transformer.experimental_attention_variant.absorbed_mla": (
+        "megatron.core.ops.attention.mla",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.csa": (
+        "megatron.core.ops.attention.csa.modules",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention": (
+        "megatron.core.ops.attention.dsv4",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.dsa": (
+        "megatron.core.ops.attention.dsa.modules",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.dsa_cudnn_kernels": (
+        "megatron.core.ops.attention.dsa.dsa_cudnn_kernels",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.dsa_gqa": (
+        "megatron.core.ops.attention.dsa.dsa_gqa",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.dsa_indexer_loss": (
+        "megatron.core.ops.attention.dsa.dsa_indexer_loss",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.dsa_kernels": (
+        "megatron.core.ops.attention.dsa.dsa_kernels",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.dsa_layout": (
+        "megatron.core.ops.attention.dsa.dsa_layout",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.dsa_masking": (
+        "megatron.core.ops.attention.dsa.dsa_masking",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.dsa_min_memory": (
+        "megatron.core.ops.attention.dsa.dsa_min_memory",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.dsa_min_memory_triton": (
+        "megatron.core.ops.attention.dsa.dsa_min_memory_triton",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.dsa_tilelang_kernels": (
+        "megatron.core.ops.attention.dsa.dsa_tilelang_kernels",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention_module_specs": (
+        "megatron.core.models.gpt.deepseek_v4_hybrid_attention_module_specs",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.dsa_layer_specs": (
+        "megatron.core.models.hybrid.dsa_layer_specs",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.ops.indexer": (
+        "megatron.core.ops.attention.dsa.kernels.indexer",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.ops.sparse_mla": (
+        "megatron.core.ops.attention.dsa.kernels.sparse_mla",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.ops.tilelang_dsa": (
+        "megatron.core.ops.attention.dsa.kernels.tilelang_dsa",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.ops.tilelang_indexer_bwd": (
+        "megatron.core.ops.attention.dsa.kernels.tilelang_indexer_bwd",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.ops.tilelang_indexer_fwd": (
+        "megatron.core.ops.attention.dsa.kernels.tilelang_indexer_fwd",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.ops.tilelang_indexer_loss": (
+        "megatron.core.ops.attention.dsa.kernels.tilelang_indexer_loss",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.ops.tilelang_sparse_mla_bwd": (
+        "megatron.core.ops.attention.dsa.kernels.tilelang_sparse_mla_bwd",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.ops.tilelang_sparse_mla_fwd": (
+        "megatron.core.ops.attention.dsa.kernels.tilelang_sparse_mla_fwd",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.ops.tilelang_utils": (
+        "megatron.core.ops.attention.dsa.kernels.tilelang_utils",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.csa_utils": (
+        "megatron.core.ops.attention.csa.kernels",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils": (
+        "megatron.core.ops.attention.csa.kernels.cp_utils",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.csa_utils.csa_indexer_loss_kernels": (
+        "megatron.core.ops.attention.csa.kernels.csa_indexer_loss_kernels",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse": (
+        "megatron.core.ops.attention.csa.kernels.csa_teacher_lse",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention": (
+        "megatron.core.ops.attention.csa.kernels.fused_sparse_attention",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.csa_utils.packed_layout": (
+        "megatron.core.ops.attention.csa.kernels.packed_layout",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.csa_utils.packed_sparse_attention": (
+        "megatron.core.ops.attention.csa.kernels.packed_sparse_attention",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.ops": (
+        "megatron.core.ops.attention.dsa.kernels",
+    ),
 }
 
 # Names each historical package re-exported, and the module that defines each. The

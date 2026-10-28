@@ -40,7 +40,7 @@ megatron/core/ops/
 │   └── context_parallel/  chunkwise CP protocol and the FLA / CuTeDSL GDP adapters
 └── attention/
     ├── dsa/               modules.py, layout/masking, kernels/, TileLang & cuDNN adapters
-    ├── csa/               modules.py
+    ├── csa/               modules.py, kernels/ (SBHD and packed THD paths, CP helpers)
     ├── mla.py             absorbed MLA
     └── dsv4.py            DeepSeek-v4 hybrid attention
 ```
@@ -55,9 +55,10 @@ below; until then its module carries the availability checks it had before the m
 | `ssm/gated_delta` | GDN/GDN2 modules, reference recurrences and FLA adapters |
 | `ssm/gdp` | `mixer.py`, context-parallel transforms, training adapters and inference kernels |
 | `ssm/context_parallel` | Chunkwise SSM communication and GDP backend implementations |
-| `attention/dsa` | `modules.py`, layout/masking, indexer loss, reference and fused adapters |
+| `attention/dsa` | `modules.py`, `dsa_gqa.py` (DSA over GQA), layout/masking, indexer loss, reference and fused adapters |
 | `attention/dsa/kernels` | TileLang/Triton kernel implementations |
 | `attention/csa` | `modules.py` with compressor/indexer/attention modules and reference kernels |
+| `attention/csa/kernels` | SBHD and packed THD sparse attention, teacher LSE, packed layout and CP helpers |
 | `attention/mla.py` | Absorbed MLA operation and its projection/layout helpers |
 | `attention/dsv4.py` | DeepSeek-v4 hybrid attention operation |
 

@@ -333,9 +333,7 @@ class TestGetDsaModuleSpec:
 
     def test_returns_absorbed_mla_self_attention_spec(self):
         """Verify the returned attention module is absorbed MLA with causal mask."""
-        from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
-            AbsorbedMLASelfAttention,
-        )
+        from megatron.core.ops.attention.mla import AbsorbedMLASelfAttention
 
         spec = self._call()
         assert spec.module is AbsorbedMLASelfAttention
@@ -344,7 +342,7 @@ class TestGetDsaModuleSpec:
 
     def test_core_attention_is_dsa(self):
         """Verify MLA core_attention is wrapped with DSAttention."""
-        from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+        from megatron.core.ops.attention.dsa.modules import DSAttention
 
         spec = self._call()
         core = spec.submodules.core_attention
@@ -352,7 +350,7 @@ class TestGetDsaModuleSpec:
 
     def test_dsa_indexer_structure(self):
         """Verify DSA indexer wiring uses expected backend linear/norm modules."""
-        from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexer
+        from megatron.core.ops.attention.dsa.modules import DSAIndexer
 
         spec = self._call()
         indexer = spec.submodules.core_attention.submodules.indexer

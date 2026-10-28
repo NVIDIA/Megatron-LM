@@ -16,6 +16,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.ops.attention.dsa.modules import DSAIndexer, DSAttention
 from megatron.core.ops.ssm.gated_delta.gdn import GatedDeltaNet
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
@@ -26,7 +27,6 @@ from megatron.core.post_training.modelopt.layers import Linear, Norm
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexer, DSAttention
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.multi_token_prediction import (

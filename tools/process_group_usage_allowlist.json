@@ -138,6 +138,13 @@
     "megatron/core/models/multimodal/llava_model.py": [
       "LLaVAModel.__init__:shim:use_mpu_process_groups"
     ],
+    "megatron/core/ops/attention/dsa/modules.py": [
+      "DSAIndexer.__init__:shim:use_mpu_process_groups",
+      "DSAttention.__init__:shim:use_mpu_process_groups"
+    ],
+    "megatron/core/ops/attention/mla.py": [
+      "AbsorbedMLASelfAttention.__init__:shim:use_mpu_process_groups"
+    ],
     "megatron/core/ops/ssm/mamba2/mixer.py": [
       "ExtendedRMSNorm.sharded_state_dict:accessor:parallel_state.get_tensor_model_parallel_group"
     ],
@@ -215,13 +222,6 @@
     ],
     "megatron/core/transformer/dot_product_attention.py": [
       "DotProductAttention.__init__:shim:use_mpu_process_groups"
-    ],
-    "megatron/core/transformer/experimental_attention_variant/absorbed_mla.py": [
-      "AbsorbedMLASelfAttention.__init__:shim:use_mpu_process_groups"
-    ],
-    "megatron/core/transformer/experimental_attention_variant/dsa.py": [
-      "DSAIndexer.__init__:shim:use_mpu_process_groups",
-      "DSAttention.__init__:shim:use_mpu_process_groups"
     ],
     "megatron/core/transformer/fsdp_dtensor_checkpoint.py": [
       "get_ep_layer_offset:accessor:parallel_state.get_expert_model_parallel_rank",

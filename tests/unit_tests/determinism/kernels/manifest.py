@@ -192,9 +192,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="dsv4_q_rms_norm",
-        sources=(
-            "megatron/core/transformer/experimental_attention_variant/deepseek_v4_hybrid_attention.py",
-        ),
+        sources=("megatron/core/ops/attention/dsv4.py",),
         tests=(
             K + "test_fused_activations.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention.py",
@@ -764,7 +762,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         name="mla_rope_dispatch",
         sources=(
             "megatron/core/transformer/multi_latent_attention.py",
-            "megatron/core/transformer/experimental_attention_variant/absorbed_mla.py",
+            "megatron/core/ops/attention/mla.py",
         ),
         tests=(K + "test_fused_triton_kernels.py", K + "test_te_wrappers.py"),
         kind="dispatch",
@@ -777,7 +775,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="dsa_indexer_weights_projection",
-        sources=("megatron/core/transformer/experimental_attention_variant/dsa.py",),
+        sources=("megatron/core/ops/attention/dsa/modules.py",),
         tests=(K + "test_te_wrappers.py",),
         kind="dispatch",
         notes="Dispatches the non-quantized FP32 indexer projection to TE general_gemm when "
@@ -922,9 +920,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(
         name="csa_teacher_lse",
-        sources=(
-            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa_teacher_lse.py",
-        ),
+        sources=("megatron/core/ops/attention/csa/kernels/csa_teacher_lse.py",),
         tests=(K + "test_fused_triton_kernels.py",),
         kind="triton",
         notes="Fixed-order window/sink and compressed-key LSE reductions; teacher-only forward kernels.",
@@ -932,10 +928,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="csa_packed_layout_and_loss",
         sources=(
-            "megatron/core/transformer/experimental_attention_variant/csa_utils/cp_utils.py",
-            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa_indexer_loss_kernels.py",
-            "megatron/core/transformer/experimental_attention_variant/csa_utils/packed_sparse_attention.py",
-            "megatron/core/transformer/experimental_attention_variant/csa_utils/packed_layout.py",
+            "megatron/core/ops/attention/csa/kernels/cp_utils.py",
+            "megatron/core/ops/attention/csa/kernels/csa_indexer_loss_kernels.py",
+            "megatron/core/ops/attention/csa/kernels/packed_sparse_attention.py",
+            "megatron/core/ops/attention/csa/kernels/packed_layout.py",
         ),
         tests=(
             K + "test_csa_packed_kernels.py",
@@ -948,7 +944,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="dsa_dispatch",
-        sources=("megatron/core/transformer/experimental_attention_variant/dsa.py",),
+        sources=("megatron/core/ops/attention/dsa/modules.py",),
         tests=(K + "test_fused_triton_kernels.py",),
         kind="dispatch",
         notes="DSA weights projection dispatches Transformer Engine general_gemm when available; "
@@ -957,7 +953,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(
         name="dsa_tilelang_absorbed_shape_dispatch",
-        sources=("megatron/core/transformer/experimental_attention_variant/ops/tilelang_dsa.py",),
+        sources=("megatron/core/ops/attention/dsa/kernels/tilelang_dsa.py",),
         tests=(K + "test_dsa_tilelang_shapes.py",),
         kind="dispatch",
         notes="SparseMLA forward replay with NoPE channel padding and invalid top-k slot padding. "
@@ -967,17 +963,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="dsa_tilelang_kernels",
         sources=(
-            "megatron/core/transformer/experimental_attention_variant/ops/indexer.py",
-            "megatron/core/transformer/experimental_attention_variant/ops/sparse_mla.py",
-            "megatron/core/transformer/experimental_attention_variant/ops/tilelang_dsa.py",
-            "megatron/core/transformer/experimental_attention_variant/ops/tilelang_indexer_bwd.py",
-            "megatron/core/transformer/experimental_attention_variant/ops/tilelang_indexer_fwd.py",
-            "megatron/core/transformer/experimental_attention_variant/ops/tilelang_indexer_loss.py",
-            "megatron/core/transformer/experimental_attention_variant/ops/tilelang_sparse_mla_bwd.py",
-            "megatron/core/transformer/experimental_attention_variant/ops/tilelang_sparse_mla_fwd.py",
-            "megatron/core/transformer/experimental_attention_variant/ops/tilelang_utils.py",
-            "megatron/core/transformer/experimental_attention_variant/dsa_kernels.py",
-            "megatron/core/transformer/experimental_attention_variant/dsa_tilelang_kernels.py",
+            "megatron/core/ops/attention/dsa/kernels/indexer.py",
+            "megatron/core/ops/attention/dsa/kernels/sparse_mla.py",
+            "megatron/core/ops/attention/dsa/kernels/tilelang_dsa.py",
+            "megatron/core/ops/attention/dsa/kernels/tilelang_indexer_bwd.py",
+            "megatron/core/ops/attention/dsa/kernels/tilelang_indexer_fwd.py",
+            "megatron/core/ops/attention/dsa/kernels/tilelang_indexer_loss.py",
+            "megatron/core/ops/attention/dsa/kernels/tilelang_sparse_mla_bwd.py",
+            "megatron/core/ops/attention/dsa/kernels/tilelang_sparse_mla_fwd.py",
+            "megatron/core/ops/attention/dsa/kernels/tilelang_utils.py",
+            "megatron/core/ops/attention/dsa/dsa_kernels.py",
+            "megatron/core/ops/attention/dsa/dsa_tilelang_kernels.py",
         ),
         kind="tilelang",
         exempt_reason="Experimental DeepSeek sparse attention kernels (indexer / sparse MLA backward accumulate with "
@@ -987,9 +983,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     # ---------------------------------------------------------------- DSA min-memory backends
     KernelEntry(
         name="dsa_min_memory_triton",
-        sources=(
-            "megatron/core/transformer/experimental_attention_variant/dsa_min_memory_triton.py",
-        ),
+        sources=("megatron/core/ops/attention/dsa/dsa_min_memory_triton.py",),
         tests=("tests/unit_tests/transformer/test_dsa_min_memory_kernels.py",),
         kind="triton",
         notes="Streaming top-k routing, selected-score forward/backward, scatter of the selected "
@@ -998,7 +992,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="dsa_min_memory_torch",
-        sources=("megatron/core/transformer/experimental_attention_variant/dsa_min_memory.py",),
+        sources=("megatron/core/ops/attention/dsa/dsa_min_memory.py",),
         tests=("tests/unit_tests/transformer/test_dsa_min_memory_kernels.py",),
         kind="torch-op",
         notes="index_add_ accumulates the key, value and indexer-K gradients where top-k selects "

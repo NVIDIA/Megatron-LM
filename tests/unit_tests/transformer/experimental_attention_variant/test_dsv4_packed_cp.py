@@ -11,13 +11,10 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.extensions.transformer_engine import HAVE_TE, TELinear
+from megatron.core.ops.attention.csa.kernels import cp_utils, packed_layout
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.experimental_attention_variant.csa_utils import (
-    cp_utils,
-    packed_layout,
-)
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_attention import (
     HAVE_HADAMARD,

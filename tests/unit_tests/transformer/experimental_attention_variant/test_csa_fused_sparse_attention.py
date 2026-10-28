@@ -8,10 +8,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from megatron.core.transformer.experimental_attention_variant.csa_utils import (
-    fused_sparse_attention as fused_csa,
-)
-from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse import (
+from megatron.core.ops.attention.csa.kernels import fused_sparse_attention as fused_csa
+from megatron.core.ops.attention.csa.kernels.csa_teacher_lse import (
     can_use_fused_csa_teacher_lse,
     fused_csa_teacher_lse,
 )
@@ -634,7 +632,7 @@ def test_zero_indexer_loss_skips_teacher_and_preserves_gradients(
 def test_ratio4_training_dispatch_never_touches_native_dense_fallback(monkeypatch):
     import torch.nn as nn
 
-    from megatron.core.transformer.experimental_attention_variant import csa as csa_module
+    from megatron.core.ops.attention.csa import modules as csa_module
 
     module = csa_module.CompressedSparseAttention.__new__(csa_module.CompressedSparseAttention)
     nn.Module.__init__(module)
@@ -767,7 +765,7 @@ def test_real_fused_sbhd_forward_backward_matches_native_reference(num_heads):
     except ImportError:
         pytest.skip("fused CSA dependencies are unavailable")
 
-    from megatron.core.transformer.experimental_attention_variant.csa import (
+    from megatron.core.ops.attention.csa.modules import (
         get_window_topk_idxs,
         unfused_compressed_sparse_attn,
     )

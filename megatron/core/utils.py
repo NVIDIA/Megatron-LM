@@ -536,7 +536,7 @@ _VALID_DSA_KERNEL_BACKENDS = _UNFUSED_DSA_KERNEL_BACKENDS + _FUSED_DSA_KERNEL_BA
 def _missing_tilelang_dsa_kernel_dependencies() -> List[str]:
     """Return missing TileLang DSA kernel dependencies."""
     try:
-        from megatron.core.transformer.experimental_attention_variant.ops import tilelang_dsa
+        from megatron.core.ops.attention.dsa.kernels import tilelang_dsa
     except (ImportError, OSError):
         return ["TileLang DSA kernels"]
 
