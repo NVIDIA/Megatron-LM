@@ -23,7 +23,7 @@ from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
-    warn_global_process_group_fallback,
+    global_process_group_fallback,
 )
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.utils import log_single_rank
@@ -66,10 +66,10 @@ def model_provider(
     if pg_collection is None:
         # LLaVAModel requires an explicit process-group collection. A caller that omits it gets
         # the groups of the global parallel grid; that fallback is deprecated.
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "examples.multimodal.model.model_provider", deprecated_in="0.21", removed_in="0.23"
-        )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        ):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     print_rank_0('building a multimodal model ...')
 

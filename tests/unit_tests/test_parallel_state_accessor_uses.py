@@ -1,7 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""In-tree code outside Megatron Core calls the deprecated parallel_state functions only in a
-warned fallback or in bootstrap, so it emits no ParallelStateDeprecationWarning.
+"""In-tree code outside Megatron Core calls the deprecated parallel_state functions, and
+ProcessGroupCollection.use_mpu_process_groups(), only in a warned fallback or in bootstrap, so it
+emits no ParallelStateDeprecationWarning.
 
 A call is allowed inside ``with global_process_group_fallback(...)`` (or a helper of the same
 module that returns one), whose ProcessGroupFallbackWarning reports the fallback, and inside a
@@ -27,6 +28,9 @@ PARALLEL_STATE = "megatron.core.parallel_state"
 PARALLEL_STATE_NAMES = {"parallel_state", "mpu"}
 FALLBACK = "global_process_group_fallback"
 WARNING = "ParallelStateDeprecationWarning"
+# ProcessGroupCollection.use_mpu_process_groups(), deprecated with the parallel_state accessors.
+# The name is unique to it, so every attribute of that name counts, whatever its owner.
+SHIM = "use_mpu_process_groups"
 # megatron/core is scanned by tools/check_process_group_usage.py; tests are not scanned.
 SCANNED_FOLDERS = ("megatron", "examples", "tools", "tasks")
 EXCLUDED_FOLDER = REPO_ROOT / "megatron" / "core"
@@ -87,7 +91,8 @@ def _ignores_the_warning(statement):
 
 
 def uncovered_uses(source, package, deprecated):
-    """Return the lines that use a deprecated parallel_state function outside an allowed block.
+    """Return the lines that use a deprecated parallel_state function, or the
+    ProcessGroupCollection.use_mpu_process_groups() shim, outside an allowed block.
 
     ``package`` is the dotted package of the scanned file, used to resolve relative imports. A
     name bound to the parallel_state module, or to one of its deprecated functions, anywhere in
@@ -142,6 +147,8 @@ def uncovered_uses(source, package, deprecated):
                     ast.unparse(owner) == PARALLEL_STATE
                 ):
                     lines.append(node.lineno)
+            if not self.covered and node.attr == SHIM:
+                lines.append(node.lineno)
             self.generic_visit(node)
 
         def visit_Name(self, node):
@@ -201,6 +208,27 @@ class TestUncoveredUses(unittest.TestCase):
                 "    mpu.set_tensor_model_parallel_rank(0)\n",
                 [4],
             ),
+            (
+                "from megatron.core.process_groups_config import ProcessGroupCollection\n"
+                "pg_collection = ProcessGroupCollection.use_mpu_process_groups()\n",
+                [2],
+            ),
+            (
+                "import megatron.core.process_groups_config as pgc\n"
+                "def f():\n"
+                "    return pgc.ProcessGroupCollection.use_mpu_process_groups(['tp'])\n",
+                [3],
+            ),
+            (
+                "warn_global_process_group_fallback('f')\n"
+                "pg_collection = ProcessGroupCollection.use_mpu_process_groups()\n",
+                [2],
+            ),
+            (
+                "with global_process_group_fallback('f'):\n"
+                "    build = lambda: ProcessGroupCollection.use_mpu_process_groups()\n",
+                [2],
+            ),
         ]
         for source, lines in cases:
             with self.subTest(source=source):
@@ -225,6 +253,14 @@ class TestUncoveredUses(unittest.TestCase):
             "    mpu.set_tensor_model_parallel_rank(0)\n",
             "from megatron.core import mpu\nmpu.initialize_model_parallel()\n",
             "from megatron.core import utils\nutils.get_tensor_model_parallel_rank()\n",
+            "with global_process_group_fallback('f', deprecated_in='0.21'):\n"
+            "    pg_collection = ProcessGroupCollection.use_mpu_process_groups(['tp'])\n",
+            "import warnings\n"
+            "with warnings.catch_warnings():\n"
+            "    warnings.simplefilter('ignore', ParallelStateDeprecationWarning)\n"
+            "    pg_collection = ProcessGroupCollection.use_mpu_process_groups()\n",
+            "from megatron.core import parallel_state\n"
+            "pg_collection = parallel_state.get_registered_process_groups()\n",
         ]
         for source in cases:
             with self.subTest(source=source):

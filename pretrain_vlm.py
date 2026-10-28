@@ -30,7 +30,7 @@ from megatron.core.models.vision.vit_layer_specs import (
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
-    warn_global_process_group_fallback,
+    global_process_group_fallback,
 )
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import get_submodules, import_module
@@ -85,10 +85,10 @@ def model_provider(
     if pg_collection is None:
         # LLaVAModel requires an explicit process-group collection; training passes the run's
         # groups, and direct callers that omit them get the global parallel grid.
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "pretrain_vlm.model_provider", deprecated_in="0.21", removed_in="0.23"
-        )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        ):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     assert (
         args.ckpt_format == 'torch'
@@ -269,10 +269,10 @@ def is_dataset_built_on_rank(pg_collection=None):
             global parallel state, with a ProcessGroupFallbackWarning.
     """
     if pg_collection is None:
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "pretrain_vlm.is_dataset_built_on_rank", deprecated_in="0.21", removed_in="0.23"
-        )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
+        ):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
     if vars(pg_collection).get("tp") is None:
         raise ValueError("is_dataset_built_on_rank requires pg_collection.tp")
     return get_pg_rank(pg_collection.tp) == 0
@@ -373,10 +373,10 @@ def get_batch(data_iterator, pg_collection=None):
     cp_size = args.context_parallel_size
     if pg_collection is None:
         # Compatibility for direct entrypoint callers; forward_step passes the model's groups.
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "pretrain_vlm.get_batch", deprecated_in="0.21", removed_in="0.23"
-        )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
+        ):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
     if vars(pg_collection).get("tp") is None:
         raise ValueError("get_batch requires pg_collection.tp")
     tp_group = pg_collection.tp

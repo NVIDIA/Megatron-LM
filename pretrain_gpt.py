@@ -32,7 +32,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
-    warn_global_process_group_fallback,
+    global_process_group_fallback,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
@@ -122,12 +122,12 @@ def get_batch(
 
     if pg_collection is None:
         # Compatibility for direct entrypoint callers; forward_step passes the model's groups.
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "pretrain_gpt.get_batch", deprecated_in="0.21", removed_in="0.23"
-        )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["tp", "pp", "cp", "tp_cp", "dynamic_cp", "dynamic_tp_cp"]
-        )
+        ):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=["tp", "pp", "cp", "tp_cp", "dynamic_cp", "dynamic_tp_cp"]
+            )
 
     if args.sequence_packing_scheduler is not None:
         return get_batch_on_this_rank_for_sequence_packing(
@@ -475,10 +475,10 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False, pg_collect
     args = get_args()
     config = core_transformer_config_from_args(args)
     if pg_collection is None:
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "pretrain_gpt.is_dataset_built_on_rank", deprecated_in="0.21", removed_in="0.23"
-        )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "pp"])
+        ):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "pp"])
     for group_name in ("tp", "pp"):
         if vars(pg_collection).get(group_name) is None:
             raise ValueError(f"is_dataset_built_on_rank requires pg_collection.{group_name}")

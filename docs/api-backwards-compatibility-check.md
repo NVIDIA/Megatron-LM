@@ -132,7 +132,8 @@ def old_function(x):
 
 ### Deprecated `parallel_state` Accessors
 
-The functions of `megatron.core.parallel_state` that read the global parallel grid are
+The functions of `megatron.core.parallel_state` that read the global parallel grid, and
+`ProcessGroupCollection.use_mpu_process_groups()`, which builds a collection from them, are
 deprecated in Megatron Core 0.21 and removed in 0.23. The global grid belongs to a single model;
 code that needs process groups takes them from the `ProcessGroupCollection` that its caller
 passes. Called from outside Megatron Core, each function emits a
@@ -147,6 +148,7 @@ replacement:
 | Virtual-pipeline rank and size getters and setters | The `vp_stage` of the model chunk, passed explicitly, and the `virtual_pipeline_model_parallel_size` of the model's configuration |
 | Rank and size overrides, such as `set_tensor_model_parallel_rank()` | A `ProcessGroupCollection` whose groups have that rank and size, passed to the code that needs it or registered with `register_process_groups()` |
 | `get_global_memory_buffer()`, `destroy_global_memory_buffer()`, `_set_global_memory_buffer()` | The same functions in `megatron.core.utils` |
+| `ProcessGroupCollection.use_mpu_process_groups()` | The `ProcessGroupCollection` that the caller passes, or `parallel_state.get_registered_process_groups()` for the groups that `initialize_model_parallel()` or `register_process_groups()` registered for the run. It returns the registered collection itself, not a new one, so copy it before setting a field |
 
 Bootstrap, teardown and the registry are not deprecated: `initialize_model_parallel()`,
 `destroy_model_parallel()`, `is_initialized()`, `model_parallel_is_initialized()`,
@@ -158,12 +160,15 @@ Bootstrap, teardown and the registry are not deprecated: `initialize_model_paral
   `tools/check_process_group_usage.py` ratchets Megatron Core's calls of every deprecated
   function outside `parallel_state.py` and `process_groups_config.py`: the group, rank and size
   accessors, the stage predicates, the rank and size overrides, the virtual-pipeline getters and
-  setters, `get_all_ranks()`, the dynamic context-parallel group maps and the memory-buffer
-  aliases. A new call of any of them fails the check.
+  setters, `get_all_ranks()`, the dynamic context-parallel group maps, the memory-buffer
+  aliases and `use_mpu_process_groups()`. A new call of any of them fails the check.
 - **A fallback outside Megatron Core** reads the grid inside
   `with global_process_group_fallback(owner, argument, deprecated_in=..., removed_in=...):`
   from `megatron.core.process_groups_config`. It emits one `ProcessGroupFallbackWarning` for the
-  fallback, and the accessors it calls do not warn again.
+  fallback, and the accessors and `use_mpu_process_groups()` it calls do not warn again.
+  `tests/unit_tests/test_parallel_state_accessor_uses.py` checks that the code of this
+  repository outside Megatron Core calls them only in such a block or in bootstrap code that
+  ignores `ParallelStateDeprecationWarning`.
 - **Strict mode** (`--strict-process-group-fallbacks`, `enable_strict_process_group_fallbacks()`)
   turns `ProcessGroupFallbackWarning` into an error. It does not affect
   `ParallelStateDeprecationWarning`.

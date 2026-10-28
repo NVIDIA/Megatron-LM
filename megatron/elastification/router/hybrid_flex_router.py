@@ -14,8 +14,8 @@ from megatron.core.num_microbatches_calculator import (
 )
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
+    global_process_group_fallback,
     require_process_groups,
-    warn_global_process_group_fallback,
 )
 
 # Remove top-level import to avoid circular imports
@@ -62,10 +62,10 @@ class FlextronRouter(MegatronModule):
         super().__init__(config=config)
 
         if pg_collection is None:
-            warn_global_process_group_fallback(
+            with global_process_group_fallback(
                 "FlextronRouter", deprecated_in="0.21", removed_in="0.23"
-            )
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            ):
+                pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         require_process_groups(pg_collection, ("tp", "dp_gtp_remat"), owner="FlextronRouter")
         self.pg_collection = pg_collection
         self.config = config

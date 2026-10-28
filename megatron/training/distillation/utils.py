@@ -50,7 +50,6 @@ from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     global_process_group_fallback,
-    warn_global_process_group_fallback,
 )
 from megatron.training import get_args, get_train_state
 from megatron.training.global_vars import get_run_config
@@ -212,10 +211,10 @@ def resolve_distillation_process_groups(
         ValueError: If *pg_collection* does not set one of the four groups.
     """
     if pg_collection is None:
-        warn_global_process_group_fallback(owner, deprecated_in="0.21", removed_in="0.23")
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=list(_DISTILLATION_PROCESS_GROUPS)
-        )
+        with global_process_group_fallback(owner, deprecated_in="0.21", removed_in="0.23"):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=list(_DISTILLATION_PROCESS_GROUPS)
+            )
     groups = vars(pg_collection)
     missing = [name for name in _DISTILLATION_PROCESS_GROUPS if groups.get(name) is None]
     if missing:
