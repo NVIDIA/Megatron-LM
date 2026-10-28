@@ -214,11 +214,23 @@ def index_topk(q, w, keys, rope, ratio, emit, candidates=None, *, m=None):
             logits.stride(0),
             logits.stride(1),
             512,
+            **_zero_starts(),
         )
         del logits
     if observer is not None:
         emit('indexer_logits_valid', torch.cat(diagnostics))
     return topk
+
+
+def _zero_starts():
+    """Rows start at column zero; lets vLLM's VLLM_BI_INDEXER_DEEPSELECT pick the
+    same top-k kernel as rollout (older vLLM lacks the keyword)."""
+    import inspect
+
+    from vllm.model_executor.kernels.batch_invariant import top_k_per_row_prefill_index_order
+
+    params = inspect.signature(top_k_per_row_prefill_index_order).parameters
+    return {'zero_starts': True} if 'zero_starts' in params else {}
 
 
 def source(attention, x, qr, qa, rope, documents, emit):
