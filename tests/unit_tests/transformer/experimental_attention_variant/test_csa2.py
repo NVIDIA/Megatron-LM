@@ -73,6 +73,236 @@ class CpuRoPE(nn.Module):
         return torch.cat((frequencies, frequencies), -1)[:, None, None, :]
 
 
+@pytest.mark.parametrize("rotate", [False, True])
+@pytest.mark.parametrize("objective", ["attention", "indexer", "joint"])
+def test_joint_output_rope_preserves_storage_padding_and_gradients(monkeypatch, rotate, objective):
+    """Exercise the real joint autograd boundary with an analytic backend oracle."""
+    from types import SimpleNamespace
+
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import csa2_indexer
+
+    torch.manual_seed(610)
+    padding = torch.tensor([False, False, False, False, True])
+    signs = torch.tensor([1.0, 1.0, -1.0, -1.0])
+    rope = (
+        SimpleNamespace(apply_=lambda x: x.mul_(signs), undo=lambda x, out: out.copy_(x * signs))
+        if rotate
+        else None
+    )
+    seen = {}
+
+    def attention(q, kv, _indices, _scale, *, attn_sink, **_kwargs):
+        out = (q + kv.mean(0) + attn_sink[None, :, None]).tanh()
+        seen['raw'] = out.clone().masked_fill(padding[:, None, None], 0)
+        # Real sparse kernels may leave fully padded rows undefined.
+        out[padding] = torch.nan
+        seen['owned'] = out
+        return out, torch.zeros_like(q[..., 0]), None
+
+    def backward(q, kv, out, grad, _lse, sink, *_args, **_kwargs):
+        torch.testing.assert_close(out, seen['raw'])
+        assert torch.isfinite(grad).all() and torch.count_nonzero(grad[padding]) == 0
+        dpre = grad * (1 - out.square())
+        return dpre, dpre.sum((0, 1)).expand_as(kv) / kv.shape[0], dpre.sum((0, 2))
+
+    def indexer_loss(iq, ik, weights, *_args, **_kwargs):
+        loss = (iq.sum() + 2 * ik.sum() + 3 * weights.sum()) / 4
+        return loss, (
+            torch.ones_like(iq) / 4,
+            torch.ones_like(ik) / 2,
+            torch.ones_like(weights) * 0.75,
+        )
+
+    monkeypatch.setattr(csa2_indexer.fused_sparse_attention, '_csa_fwd_flash_mla', attention)
+    monkeypatch.setattr(
+        csa2_indexer.fused_sparse_attention, '_csa_sparse_attention_backward', backward
+    )
+    monkeypatch.setattr(csa2_indexer, '_precompute_indexer_loss', indexer_loss)
+    shapes = ((5, 2, 4), (3, 4), (2, 1, 4), (2,), (5, 1, 2), (2, 2), (5, 1))
+    leaves = [torch.randn(shape, requires_grad=True) for shape in shapes]
+    q, local, global_kv, sink, iq, ik, weights = leaves
+    prepared = csa2_indexer.CSA2IndexerInputs(
+        iq,
+        ik,
+        weights,
+        1,
+        torch.zeros(5, dtype=torch.int32),
+        torch.full((5,), 2),
+        ~padding,
+        2,
+        2,
+        (5,),
+        thd_layout=SimpleNamespace(cp_size=1),
+    )
+    saved = []
+    with torch.autograd.graph.saved_tensors_hooks(lambda t: saved.append(t) or t, lambda t: t):
+        output, loss = csa2_indexer.fused_csa2_indexer_sparse_attn(
+            prepared,
+            q,
+            local,
+            global_kv,
+            sink,
+            torch.zeros(5, 1, dtype=torch.int32),
+            torch.zeros(5, 1, dtype=torch.int32),
+            1.0,
+            0.25,
+            True,
+            attention_indices=torch.zeros(5, 2, dtype=torch.int32),
+            attention_topk_length=torch.tensor([2, 2, 2, 2, 0]),
+            q_padding_mask=padding,
+            out_rope=rope,
+        )
+    assert output.data_ptr() == seen['owned'].data_ptr()
+    assert any(t.data_ptr() == output.data_ptr() for t in saved)
+    assert torch.count_nonzero(output[padding]) == 0
+    snapshot = output.detach().clone()
+    upstream = torch.randn_like(output).masked_fill(padding[:, None], torch.nan)
+    upstream_snapshot = upstream.clone()
+
+    reference = [t.detach().clone().requires_grad_() for t in leaves]
+    rq, rl, rg, rs, riq, rik, rw = reference
+    expected = (rq + torch.cat((rl, rg.squeeze(1))).mean(0) + rs[None, :, None]).tanh()
+    expected = expected.masked_fill(padding[:, None, None], 0)
+    if rotate:
+        expected = expected * signs
+    expected_loss = (riq.sum() + 2 * rik.sum() + 3 * rw.sum()) / 4
+    torch.testing.assert_close(output, expected.flatten(1))
+    actual_targets, expected_targets, probes = [], [], []
+    if objective != 'indexer':
+        actual_targets.append(output)
+        expected_targets.append(expected.flatten(1))
+        probes.append(upstream)
+    if objective != 'attention':
+        actual_targets.append(loss)
+        expected_targets.append(expected_loss)
+        probes.append(torch.tensor(2.0))
+    actual = torch.autograd.grad(actual_targets, leaves, probes, allow_unused=True)
+    expected = torch.autograd.grad(expected_targets, reference, probes, allow_unused=True)
+    for observed, wanted in zip(actual, expected):
+        if wanted is None:
+            assert observed is None
+        else:
+            torch.testing.assert_close(observed, wanted)
+    torch.testing.assert_close(output, snapshot)
+    torch.testing.assert_close(upstream, upstream_snapshot, equal_nan=True)
+
+
+@pytest.mark.parametrize('cp_size', [1, 2])
+def test_packed_output_rope_uses_query_positions_without_post_attention_copy(monkeypatch, cp_size):
+    """The optimized CSA2 return aliases its sanitized, rotated attention output."""
+    from megatron.core.ops.attention.csa.output_rope import OutputRopeParams
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.experimental_attention_variant import csa2
+
+    class CPGroup(Group):
+        def size(self):
+            return cp_size
+
+        def rank(self):
+            return cp_size - 1
+
+    _, layers = _setup()
+    layer = layers[0]
+    layer.use_fused_kernels = True
+    layer.eval()
+    group = CPGroup()
+    monkeypatch.setattr(csa2, 'get_pg_size', lambda group: group.size())
+    layer.pg_collection.cp = group
+    rows = 16 // cp_size
+    logical = torch.tensor([0, 5, 12], dtype=torch.int32)
+    physical = torch.tensor([0, 8, 16], dtype=torch.int32)
+    packed = PackedSeqParams(
+        qkv_format='thd',
+        cu_seqlens_q=logical,
+        cu_seqlens_kv=logical,
+        cu_seqlens_q_padded=physical,
+        cu_seqlens_kv_padded=physical,
+        max_seqlen_q=8,
+        max_seqlen_kv=8,
+        cp_group=group,
+    )
+    params = OutputRopeParams(torch.ones(8, 4), torch.zeros(8, 4), 4, 4, physical)
+    seen = {}
+
+    def attention(query, *args, **kwargs):
+        seen['rope'] = kwargs.get('out_rope', args[-1])
+        seen['output'] = query.flatten(1)
+        return seen['output'], None
+
+    monkeypatch.setattr(
+        layer, '_forward_thd_cp' if cp_size > 1 else '_forward_attention', attention
+    )
+    q = torch.randn(rows, 2, 8, requires_grad=True)
+    kv = torch.randn(rows, 1, 8, requires_grad=True)
+    boundary = (
+        dict(boundary_hidden=torch.empty(3, 1, 16), boundary_kv=torch.empty(3, 1, 8))
+        if cp_size > 1
+        else {}
+    )
+    output = layer(
+        q,
+        kv,
+        kv,
+        None,
+        x=torch.randn(rows, 1, 16),
+        qr=torch.randn(rows, 1, 8),
+        packed_seq_params=packed,
+        csa2_state=CSA2State(),
+        out_rope=params,
+        **boundary,
+    )
+    assert output.data_ptr() == seen['output'].data_ptr()
+    expected_positions = ([0, 1, 2, 3, 4, 0, 0, 0] if cp_size == 1 else []) + [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        0,
+    ]
+    assert seen['rope'].position_ids.tolist() == expected_positions
+    assert (seen['rope'].cp_rank, seen['rope'].cp_size) == (0, 1)
+    valid = torch.tensor(([True] * 5 + [False] * 3 if cp_size == 1 else []) + [True] * 7 + [False])
+    assert torch.count_nonzero(output[~valid]) == 0
+
+
+@pytest.mark.parametrize('rows', [0, 4])
+def test_output_rope_native_and_empty_fallback_rotate_once(monkeypatch, rows):
+    """Native THD fallback remains differentiable and empty outputs never launch RoPE."""
+    from megatron.core.ops.attention.csa import output_rope
+
+    _, layers = _setup()
+    layer = layers[0]
+    layer.compress_ratio = 0
+    layer.use_fused_kernels = rows == 0
+    q = torch.randn(rows, 2, 8, requires_grad=True)
+    local = torch.randn(rows, 8, requires_grad=True)
+    window = torch.arange(rows).view(rows, 1).expand(rows, 4).int()
+    params = output_rope.OutputRopeParams(
+        torch.ones(max(rows, 1), 4),
+        torch.zeros(max(rows, 1), 4),
+        4,
+        4,
+        cu_seqlens_q=torch.tensor([0, rows], dtype=torch.int32),
+    )
+    calls = []
+
+    def rotate(x, *_args, **_kwargs):
+        calls.append(x)
+        return x * torch.tensor([1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0])
+
+    monkeypatch.setattr(output_rope, 'fused_mla_rope_out_of_place', rotate)
+    output, loss = layer._forward_attention(
+        q, local, window, None, None, CSA2State(), False, params
+    )
+    assert loss is None and output.shape == (rows, 16)
+    assert len(calls) == (1 if rows else 0)
+    output.sum().backward()
+    assert q.grad is not None and torch.isfinite(q.grad).all()
+
+
 def _setup():
     cfg = MLATransformerConfig(
         num_layers=3,
@@ -447,7 +677,8 @@ def test_cp_layout_uses_main_packed_metadata():
 @pytest.mark.launch_on_gb200
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("ratio", [1, 2])
-def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, ratio):
+@pytest.mark.parametrize("output_rope", [False, True])
+def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, ratio, output_rope):
     """Exercise real Full/Reindex/Reuse kernels with shared producer gradients."""
     import os
     import shutil
@@ -455,6 +686,7 @@ def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, 
     from dataclasses import replace
 
     from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+    from megatron.core.ops.attention.csa.output_rope import OutputRopeParams
 
     pytest.importorskip("cudnn")
     flash_mla_cuda = pytest.importorskip("flash_mla.cuda")
@@ -544,13 +776,17 @@ def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, 
         tuple(torch.randn(shape, device='cuda', dtype=torch.bfloat16) for shape in shapes)
         for _ in range(3)
     ]
+    out_rope = None
+    if output_rope:
+        cos, sin = rope.get_cached_cos_sin(32, dtype=torch.bfloat16, mscale=1.0)
+        out_rope = OutputRopeParams(cos, sin, 448, 64, sbhd_batch_size=2)
     results = []
     for layers in (native, fused):
         state, outputs, leaves = CSA2State(), [], []
         for layer, values in zip(layers, inputs):
             q, kv, x, qr = [v.detach().clone().requires_grad_() for v in values]
             leaves.extend((q, kv, x, qr))
-            outputs.append(layer(q, kv, kv, None, x=x, qr=qr, csa2_state=state))
+            outputs.append(layer(q, kv, kv, None, x=x, qr=qr, csa2_state=state, out_rope=out_rope))
         sum(y.float().square().mean() for y in outputs).backward()
         grads = [p.grad for p in layers.parameters()] + [x.grad for x in leaves]
         results.append((outputs, grads))

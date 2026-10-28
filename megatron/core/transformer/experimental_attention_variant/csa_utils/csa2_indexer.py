@@ -22,6 +22,10 @@ from megatron.core.ops.attention.csa.indexer_quantization import (
     quantize_indexer_mxfp8,
     quantize_indexer_mxfp8_logical,
 )
+from megatron.core.ops.attention.csa.output_rope import (
+    OutputRopeParams,
+    undo_output_rope_for_backward,
+)
 
 from . import fused_sparse_attention
 from .csa2_candidates import CSA2CandidateBlocks, fused_candidate_blocks, select_compact_positions
@@ -939,6 +943,7 @@ class _CSA2IndexerSparseAttn(torch.autograd.Function):
         counts,
         options,
         query_shape,
+        out_rope=None,
     ):
         """Evaluate sparse attention and its detached teacher objective."""
         width, mode, block_size, scale, coefficient = options
@@ -990,6 +995,12 @@ class _CSA2IndexerSparseAttn(torch.autograd.Function):
             topk_length = topk_length.clone()
             if q_padding_mask is not None:
                 topk_length.masked_fill_(q_padding_mask, 1)
+        if q_padding_mask is not None:
+            out.masked_fill_(q_padding_mask[:, None, None], 0)
+        if out_rope is not None:
+            out_rope.apply_(out)
+        ctx.out_rope = out_rope
+        ctx.num_forward_inputs = len(ctx.needs_input_grad)
         ctx.save_for_backward(
             q, local, global_kv, sink, indices, topk_length, q_padding_mask, out, lse, *gradients
         )
@@ -1009,6 +1020,7 @@ class _CSA2IndexerSparseAttn(torch.autograd.Function):
             if q_padding_mask is not None:
                 grad_out = grad_out.masked_fill(q_padding_mask[:, None, None], 0)
                 lse = lse.masked_fill(q_padding_mask[:, None], 0)
+            out, grad_out = undo_output_rope_for_backward(ctx.out_rope, out, grad_out)
             dq, dkv, dsink = fused_sparse_attention._csa_sparse_attention_backward(
                 q, kv, out, grad_out, lse, sink, indices, ctx.scale, topk_length=topk_length
             )
@@ -1018,7 +1030,7 @@ class _CSA2IndexerSparseAttn(torch.autograd.Function):
             if grad_loss is None
             else tuple(g * grad_loss for g in (diq, dik, dw))
         )
-        return dq, dlocal, dglobal, dsink, *gradients, *([None] * 11)
+        return (dq, dlocal, dglobal, dsink, *gradients, *([None] * 12))[: ctx.num_forward_inputs]
 
 
 def fused_csa2_indexer_sparse_attn(
@@ -1038,6 +1050,7 @@ def fused_csa2_indexer_sparse_attn(
     attention_indices: Tensor | None = None,
     attention_topk_length: Tensor | None = None,
     q_padding_mask: Tensor | None = None,
+    out_rope: OutputRopeParams | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Keep V4 attention layout; pack the detached teacher only for the loss work.
 
@@ -1120,6 +1133,7 @@ def fused_csa2_indexer_sparse_attn(
         counts,
         (width, mode, block_size, softmax_scale, loss_coeff),
         (seq_len, batch) if inputs.thd_layout is None else None,
+        out_rope,
     )
     if inputs.thd_layout is None:
         output = output.reshape(seq_len, batch, -1)

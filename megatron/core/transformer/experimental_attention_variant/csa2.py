@@ -12,7 +12,7 @@ no activation state or inference caches.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -23,6 +23,7 @@ from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.ops._backends import require
 from megatron.core.ops.attention.csa.cudnn_pooling import get_cudnn_r2_pool
+from megatron.core.ops.attention.csa.output_rope import OutputRopeParams
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import async_gather_from_sequence_parallel_region
@@ -1386,14 +1387,22 @@ class CompressedSparseAttention2(MegatronModule):
         state.fused_window_size = window_size
         return state.fused_indices
 
-    def _fused_attention(self, query, local, window, global_kv=None, topk=None, state=None):
+    def _fused_attention(
+        self, query, local, window, global_kv=None, topk=None, state=None, out_rope=None
+    ):
         """Use main's sparse kernels and packed backward padding contract."""
         is_thd = query.ndim == 3
         halo = local.shape[0] - query.shape[0] if is_thd else 0
         if global_kv is None and not is_thd:
             indices, lengths = build_flat_topk_idxs(window, batch_size=query.shape[1], compact=True)
             return csa_sparse_attn(
-                query, local, self.attn_sink, indices, self.softmax_scale, topk_length=lengths
+                query,
+                local,
+                self.attn_sink,
+                indices,
+                self.softmax_scale,
+                topk_length=lengths,
+                out_rope=out_rope,
             )
         if global_kv is None:
             indices, lengths, padding = self._build_fused_thd_indices(query, None, state, halo=halo)
@@ -1417,11 +1426,12 @@ class CompressedSparseAttention2(MegatronModule):
             topk_length=lengths,
             kv_reconstruction_parts=parts,
             q_padding_mask=padding,
+            out_rope=out_rope,
         )
         return output if is_thd else output.reshape(query.shape[0], query.shape[1], -1)
 
     def _forward_unfused(
-        self, query, local, window, x, qr, state, use_indexer_loss, **shared_kwargs
+        self, query, local, window, x, qr, state, use_indexer_loss, out_rope=None, **shared_kwargs
     ):
         """Native semantic reference, also handling empty packed batches."""
         loss = None
@@ -1436,16 +1446,30 @@ class CompressedSparseAttention2(MegatronModule):
                 )
             kv, indices = self._attention_inputs(local, window, global_kv, topk)
         # Repeated KV positions accumulate their gradients in FP32.
+        is_thd = query.ndim == 3
         output = unfused_compressed_sparse_attn(
-            query, kv.float(), self.attn_sink, indices, self.softmax_scale
+            query.unsqueeze(1) if is_thd else query,
+            kv.float().unsqueeze(1) if is_thd else kv.float(),
+            self.attn_sink,
+            indices.unsqueeze(0) if is_thd else indices,
+            self.softmax_scale,
         )
+        if is_thd:
+            output = output.squeeze(1)
+        if out_rope is not None:
+            # An empty fused batch also reaches this native fallback. Keep its
+            # identity gradient; nonempty fallbacks need differentiable RoPE.
+            flat = output.reshape(-1, query.shape[-2], self.config.v_head_dim)
+            output = out_rope.apply(flat).view_as(output)
         return output, loss
 
-    def _forward_fused_no_indexer(self, query, local, window, state):
+    def _forward_fused_no_indexer(self, query, local, window, state, out_rope=None):
         """Window-only layer: one sparse-attention forward/backward."""
-        return self._fused_attention(query, local, window, state=state), None
+        return self._fused_attention(query, local, window, state=state, out_rope=out_rope), None
 
-    def _forward_fused_indexer_training(self, query, local, window, x, qr, state, **shared_kwargs):
+    def _forward_fused_indexer_training(
+        self, query, local, window, x, qr, state, out_rope=None, **shared_kwargs
+    ):
         """Full/Reindex with supervision: shared selection, joint attention/KL autograd."""
         global_kv, topk, scores = self._shared_global_attention(
             x, qr, state, use_indexer_loss=True, **shared_kwargs
@@ -1476,42 +1500,49 @@ class CompressedSparseAttention2(MegatronModule):
                 attention_indices=indices,
                 attention_topk_length=state.fused_topk_length,
                 q_padding_mask=state.fused_q_padding_mask,
+                out_rope=out_rope,
             )
         # Keep independently selectable native indexer math for diagnosis.
-        output = self._fused_attention(query, local, window, global_kv, topk, state)
+        output = self._fused_attention(query, local, window, global_kv, topk, state, out_rope)
         loss = self._compute_indexer_loss(
             query, local, global_kv, window, topk, scores, thd_layout=state.thd_layout
         )
         return output, loss
 
-    def _forward_fused_indexer_no_loss(self, query, local, window, x, qr, state, **shared_kwargs):
+    def _forward_fused_indexer_no_loss(
+        self, query, local, window, x, qr, state, out_rope=None, **shared_kwargs
+    ):
         """Full/Reindex without auxiliary supervision; selection stays discrete."""
         global_kv, topk, _ = self._shared_global_attention(x, qr, state, **shared_kwargs)
-        return self._fused_attention(query, local, window, global_kv, topk, state), None
+        return self._fused_attention(query, local, window, global_kv, topk, state, out_rope), None
 
-    def _forward_fused_reuse(self, query, local, window, x, qr, state, **shared_kwargs):
+    def _forward_fused_reuse(
+        self, query, local, window, x, qr, state, out_rope=None, **shared_kwargs
+    ):
         """Consume the owner's shared KV/Top-K without indexer projection or loss."""
         global_kv, topk, _ = self._shared_global_attention(x, qr, state, **shared_kwargs)
-        return self._fused_attention(query, local, window, global_kv, topk, state), None
+        return self._fused_attention(query, local, window, global_kv, topk, state, out_rope), None
 
     def _forward_attention(
-        self, query, local, window, x, qr, state, use_indexer_loss, **shared_kwargs
+        self, query, local, window, x, qr, state, use_indexer_loss, out_rope=None, **shared_kwargs
     ):
         """Dispatch the same selection, supervision and attention paths for CP=1 and CP>1."""
         if not self.use_fused_kernels or query.shape[0] == 0:
             return self._forward_unfused(
-                query, local, window, x, qr, state, use_indexer_loss, **shared_kwargs
+                query, local, window, x, qr, state, use_indexer_loss, out_rope, **shared_kwargs
             )
         if not self.compress_ratio:
-            return self._forward_fused_no_indexer(query, local, window, state)
+            return self._forward_fused_no_indexer(query, local, window, state, out_rope)
         if not self.is_index_source:
-            return self._forward_fused_reuse(query, local, window, x, qr, state, **shared_kwargs)
+            return self._forward_fused_reuse(
+                query, local, window, x, qr, state, out_rope, **shared_kwargs
+            )
         if use_indexer_loss:
             return self._forward_fused_indexer_training(
-                query, local, window, x, qr, state, **shared_kwargs
+                query, local, window, x, qr, state, out_rope, **shared_kwargs
             )
         return self._forward_fused_indexer_no_loss(
-            query, local, window, x, qr, state, **shared_kwargs
+            query, local, window, x, qr, state, out_rope, **shared_kwargs
         )
 
     def _forward_thd_cp(
@@ -1525,6 +1556,7 @@ class CompressedSparseAttention2(MegatronModule):
         state: CSA2State,
         cp_group: torch.distributed.ProcessGroup,
         use_indexer_loss: bool,
+        out_rope: OutputRopeParams | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Address halo/local KV, then use the shared Full/Reindex/Reuse training paths."""
         layout = state.thd_layout
@@ -1567,6 +1599,7 @@ class CompressedSparseAttention2(MegatronModule):
             qr,
             state,
             use_indexer_loss,
+            out_rope=out_rope,
             boundary_hidden=boundary_hidden,
             cp_group=cp_group,
         )
@@ -1585,6 +1618,7 @@ class CompressedSparseAttention2(MegatronModule):
         boundary_kv: torch.Tensor | None = None,
         csa2_state: CSA2State | None = None,
         thd_layout: CSA2THDLayout | None = None,
+        out_rope: OutputRopeParams | None = None,
     ) -> torch.Tensor:
         """Attend jointly to causal window and selected global latents using one softmax.
 
@@ -1612,6 +1646,16 @@ class CompressedSparseAttention2(MegatronModule):
                 )
             else:
                 thd_layout.validate_compatible(packed_seq_params, query.shape[0], cp_group)
+            if out_rope is not None:
+                # Use query-document positions, including contiguous CP slices
+                # and zero positions for logical padding/unassigned capacity.
+                out_rope = replace(
+                    out_rope,
+                    cu_seqlens_q=thd_layout.cu_seqlens_padded,
+                    position_ids=thd_layout.position_ids,
+                    cp_rank=0,
+                    cp_size=1,
+                )
             # The DSv4 QKV wrapper returns packed qr without its dummy batch axis.
             if qr.ndim == 2:
                 qr = qr.unsqueeze(1)
@@ -1653,6 +1697,7 @@ class CompressedSparseAttention2(MegatronModule):
                 csa2_state,
                 cp_group,
                 use_indexer_loss,
+                out_rope=out_rope,
             )
         else:
             if is_thd and self.use_fused_kernels and query.is_cuda and seq_len > 0:
@@ -1679,9 +1724,9 @@ class CompressedSparseAttention2(MegatronModule):
                 )
             local = key.squeeze(-2)
             output, indexer_loss = self._forward_attention(
-                query, local, indices, x, qr, csa2_state, use_indexer_loss
+                query, local, indices, x, qr, csa2_state, use_indexer_loss, out_rope
             )
-        if is_thd:
+        if is_thd and (out_rope is None or not self.use_fused_kernels or seq_len == 0):
             output = output.masked_fill(~thd_layout.valid_tokens[:, None], 0)
         if indexer_loss is not None:
             # The tracker averages microbatches, so report a token mean in either
