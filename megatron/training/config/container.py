@@ -397,6 +397,8 @@ class PretrainConfigContainer(ConfigContainerBase):
             cuda_graph_impl=cuda_graph_impl,
             micro_batch_size=self.train.micro_batch_size,
             global_batch_size=global_batch_size,
+            train_iters=self.train.train_iters,
+            train_samples=self.train.train_samples,
             skip_train=self.validation.skip_train,
             load_optim=self.checkpoint.load_optim,
             save_interval=self.checkpoint.save_interval,

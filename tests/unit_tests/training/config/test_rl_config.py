@@ -178,6 +178,8 @@ RUN = dict(
     cuda_graph_impl="local",
     micro_batch_size=1,
     global_batch_size=12,
+    train_iters=10,
+    train_samples=None,
     skip_train=False,
     load_optim=True,
     save_interval=None,
@@ -196,14 +198,22 @@ RUN = dict(
         (dict(), dict(save_interval=5), "save_interval should be divisible"),
         (
             dict(rl_offload_optimizer_during_inference=True),
-            dict(skip_train=True, load_optim=False),
-            "no optimizer to offload",
+            dict(skip_train=True, train_iters=None),
+            "nothing to offload",
         ),
         (
             dict(rl_offload_optimizer_during_inference=True),
-            dict(global_batch_size=None, skip_train=True, load_optim=False),
-            "no optimizer to offload",
+            dict(global_batch_size=None, skip_train=True, train_iters=None),
+            "nothing to offload",
         ),
+        (
+            dict(rl_offload_optimizer_during_inference=True, rl_rollout_only=True),
+            dict(load_optim=False),
+            "nothing to offload",
+        ),
+        (dict(rl_rollout_only=True), dict(train_iters=None), "needs --train-iters"),
+        (dict(), dict(skip_train=True), "--rl-rollout-only collects"),
+        (dict(rl_rollout_only=True), dict(skip_train=True), "--rl-rollout-only collects"),
         (
             dict(
                 rl_offload_inference_model_weights=True, rl_inference_model_unified_memory_level=1
@@ -275,6 +285,15 @@ def test_validate_run_at_every_call_site():
     offload_weights.validate_run(**{**RUN, "separate_inference_model": None})
 
     cfg.validate_run(**{**RUN, "global_batch_size": None})
+    # The RL modes: rollout-only with or without the optimizer (either horizon form), and
+    # eval-only (--skip-train with no horizon, including the --train-iters 0 spelling).
+    rollout_only = RLConfig(perform_rl_step=True, rl_rollout_only=True, **GRPO_4x3)
+    rollout_only.validate_run(**RUN)
+    rollout_only.validate_run(**{**RUN, "load_optim": False})
+    rollout_only.validate_run(**{**RUN, "train_iters": None, "train_samples": 120})
+    cfg.validate_run(**{**RUN, "skip_train": True, "train_iters": None})
+    cfg.validate_run(**{**RUN, "skip_train": True, "train_iters": 0})
+    RLConfig(rl_rollout_only=True).validate_run(**RUN)  # accepted while the RL loop is off
 
     # Through the container: the sections supply the inputs.
     # The CUDA-graph rule reads the model's transformer section; skipped for a model without one.
@@ -363,6 +382,23 @@ def test_validate_run_at_every_call_site():
         validate_args(parse_args())
     with patch("sys.argv", argv + ["--rl-inference-tensor-model-parallel-size", "1"]):
         validate_args(parse_args())
+    # The retired inference-only spelling points at the new flag, which does not combine with
+    # --skip-train; the variant without an optimizer is --rl-rollout-only --no-load-optim.
+    argv = (
+        "test_rl_config.py --num-layers 2 --hidden-size 128 --num-attention-heads 8 "
+        f"--micro-batch-size 1 --global-batch-size {2 * dp} --seq-length 32 "
+        f"--max-position-embeddings 32 --perform-rl-step --grpo-prompts-per-step {dp} "
+        "--grpo-group-size 2 --train-iters 10"
+    ).split()
+    for retired in (["--skip-train"], ["--skip-train", "--rl-rollout-only"]):
+        with (
+            patch("sys.argv", argv + retired),
+            pytest.raises(ValueError, match="--rl-rollout-only collects"),
+        ):
+            validate_args(parse_args())
+    with patch("sys.argv", argv + ["--rl-rollout-only", "--no-load-optim"]):
+        args = validate_args(parse_args())
+    assert args.rl_rollout_only and args.no_load_optim
 
 
 def test_validate_args_leaves_derived_values_on_the_section():

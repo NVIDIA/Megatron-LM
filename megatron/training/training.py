@@ -155,7 +155,7 @@ from megatron.training.checkpointing import (
     save_grads,
 )
 from megatron.training.config import FaultInjectorConfig, TrainingConfig
-from megatron.training.config.container import PretrainConfigContainer, update_train_iters
+from megatron.training.config.container import PretrainConfigContainer
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.initialize import (
     initialize_megatron,
@@ -1670,7 +1670,6 @@ def pretrain(
     tensor_metric_observer: _TensorMetricObserverCallback | None = None,
     *,
     build_tokenizer: bool = True,
-    skip_train_keeps_optimizer: bool = False,
     next_train_iterator: Optional[Callable[[int, Any], Any]] = None,
     run_eval: Optional[Callable[..., None]] = None,
     run_train_loop_without_updates: bool = False,
@@ -1724,14 +1723,12 @@ def pretrain(
             `cfg_container.logger.tensor_metrics`.
         build_tokenizer: whether startup builds the shared tokenizer. Disable for
             workloads that provide their own tokenization, such as heterogeneous MiMo.
-        skip_train_keeps_optimizer: with --skip-train, still build the optimizer.
         next_train_iterator / run_eval: the loop's data and evaluation hooks (see `train`);
             default to the provider-built iterators and evaluate_and_print_results.
             A caller-provided next_train_iterator replaces only the training dataloader;
             validation/test dataloaders (and the default run_eval over them) are still
             built when a dataset provider is given.
-        run_train_loop_without_updates: also enter the training loop under --skip-train when
-            there is training data (inference-only RL collection; no optimizer updates).
+        run_train_loop_without_updates: iterate the training loop without optimizer updates.
         suppress_microbatch_rampup_handling: skip the automatic checkpoint on mid-loop
             microbatch changes (for data sources that reconfigure microbatches every iteration).
     """
@@ -2050,7 +2047,7 @@ def pretrain(
                 if pg_collection is not None
                 else ProcessGroupCollection.use_mpu_process_groups()
             ),
-            skip_train_keeps_optimizer=skip_train_keeps_optimizer,
+            run_train_loop_without_updates=run_train_loop_without_updates,
         )
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
@@ -2167,14 +2164,10 @@ def pretrain(
     # (do_train False), _end_otel_job_spans() ends startup as an idempotent
     # fallback.
 
-    # Enter the loop when training, or when the caller opted into running it.
-    if not cfg_container.validation.skip_train or (
-        run_train_loop_without_updates and train_state.do_train
-    ):
-        if cfg_container.validation.skip_train:
-            print_rank_0(
-                'inference-only mode (--skip-train); entering the train loop without updates ...'
-            )
+    # --skip-train never enters the loop; rollout-only iterates it without updates.
+    if not cfg_container.validation.skip_train:
+        if run_train_loop_without_updates:
+            print_rank_0('rollout-only mode: entering the train loop without updates ...')
         else:
             print_rank_0('training ...')
 
@@ -2200,6 +2193,7 @@ def pretrain(
                     pg_collection=pg_collection,
                     callback_manager=callback_manager,
                     tensor_metric_observer=tensor_metric_observer,
+                    run_train_loop_without_updates=run_train_loop_without_updates,
                     suppress_microbatch_rampup_handling=suppress_microbatch_rampup_handling,
                 )
             except Exception:
@@ -2217,7 +2211,8 @@ def pretrain(
         print_datetime('after training is done')
 
         if (
-            not cfg_container.validation.skip_train
+            # No updates, nothing new to save.
+            not run_train_loop_without_updates
             and cfg_container.checkpoint.save
             and iteration != 0
             and has_iterations_remaining
@@ -2853,7 +2848,7 @@ def setup_model_and_optimizer(
     *,
     cfg_container: PretrainConfigContainer | None = None,
     pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None = None,
-    skip_train_keeps_optimizer: bool = False,
+    run_train_loop_without_updates: bool = False,
 ):
     """Setup model and optimizer."""
     # Temporary args/config duplication during the training-loop refactor:
@@ -2866,9 +2861,9 @@ def setup_model_and_optimizer(
 
     cfg = cfg_container if cfg_container is not None else get_run_config()
 
-    # No optimizer under --skip-train, unless the entry point keeps one for a loop that runs
-    # without updates (RL inference-only mode may offload it).
-    build_optimizer = not cfg.validation.skip_train or skip_train_keeps_optimizer
+    build_optimizer = not cfg.validation.skip_train and not (
+        run_train_loop_without_updates and not cfg.checkpoint.load_optim
+    )
     wrap_with_ddp = build_optimizer
 
     if has_nvidia_modelopt:
@@ -4678,6 +4673,7 @@ def train(
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
     callback_manager: CallbackManager | None = None,
     tensor_metric_observer: _TensorMetricObserverCallback | None = None,
+    run_train_loop_without_updates: bool = False,
     suppress_microbatch_rampup_handling: bool = False,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
@@ -4692,6 +4688,7 @@ def train(
     pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
         preserves the default behavior.
     tensor_metric_observer: optional callback forwarded to each training step.
+    run_train_loop_without_updates: take no optimizer steps.
     suppress_microbatch_rampup_handling: skip the automatic checkpoint on mid-loop microbatch
         changes (for data sources that reconfigure microbatches every iteration).
     """
@@ -5158,8 +5155,8 @@ def train(
         # DeepSeekMath $\mu$), using the current iterator as the buffer.
         train_data_iterator = next_train_iterator(iteration, train_data_iterator)
 
-        if cfg.validation.skip_train:
-            # RL inference-only mode: skip gradient updates, just collect rollouts.
+        if run_train_loop_without_updates:
+            # Rollout-only: the data hook collected this iteration's rollouts; no optimizer step.
             loss_dict = {}
             skipped_iter = 0
             should_checkpoint = False

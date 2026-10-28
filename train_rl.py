@@ -467,12 +467,10 @@ if __name__ == "__main__":
             ModelType.encoder_or_decoder,
             forward_step,
             rl_model_provider,
-            # Even with --skip-train, RL keeps its optimizer unless --no-load-optim is set.
-            skip_train_keeps_optimizer=full_config.checkpoint.load_optim,
             next_train_iterator=next_train_iterator,
             run_eval=run_eval,
-            # RL inference-only mode (--skip-train) still enters the loop to collect rollouts.
-            run_train_loop_without_updates=True,
+            # --rl-rollout-only iterates the loop collecting rollouts without optimizer updates.
+            run_train_loop_without_updates=rl_cfg.rl_rollout_only,
             suppress_microbatch_rampup_handling=rl_cfg.rl_use_sequence_packing,
             callbacks=[
                 rl_setup,

@@ -354,14 +354,10 @@ class TestPackedSampleAccounting:
         self, monkeypatch, schedule, expected_iters
     ):
         from megatron.core import num_microbatches_calculator as calculator
-        from megatron.training import training
+        from megatron.training.config import container
 
         monkeypatch.setattr(calculator, "_GLOBAL_NUM_MICROBATCHES_CALCULATOR", None)
 
-        def unexpected_global_config():
-            raise AssertionError("sample horizon must use the supplied TrainingConfig")
-
-        monkeypatch.setattr(training, "get_run_config", unexpected_global_config)
         train = TrainingConfig(
             micro_batch_size=2,
             global_batch_size=16,
@@ -375,7 +371,7 @@ class TestPackedSampleAccounting:
             data_parallel_size=1,
             step_batch_size_schedule=schedule,
         )
-        training.update_train_iters(train)
+        container.update_train_iters(train)
         assert train.train_iters == expected_iters
         assert calculator.get_current_global_batch_size() == (8 if schedule else 16)
 

@@ -17,7 +17,6 @@ from megatron.rl.inference.disagg import build_disagg_inference_model
 from megatron.rl.rl_utils import inference_model_alloc_context
 from megatron.training.callbacks import Callback, CallbackContext
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.config.container import update_train_iters
 from megatron.training.global_vars import get_args, get_run_config, get_train_state
 from megatron.training.training import get_model
 from megatron.training.utils import print_rank_0
@@ -110,16 +109,13 @@ def build_rl_inference_model(
     return inference_model
 
 
-def load_reference_state_dict(model: list, checkpointing_context: dict, args: Any) -> dict:
-    """Load the pretrained checkpoint's weights as the RL reference state dict.
-
-    With --skip-train the current weights are the reference; otherwise the pretrained
-    checkpoint is loaded, snapshotted to CPU, and the RL training checkpoint reloaded.
-    """
+def load_reference_state_dict(
+    model: list, checkpointing_context: dict, args: Any, *, rollout_only: bool
+) -> dict:
+    """Load the pretrained checkpoint's weights as the RL reference state dict."""
     cfg = get_run_config()
-    if cfg.validation.skip_train:
-        # In inference-only mode, use current weights as reference.
-        print_rank_0("> RL inference-only: using current weights as reference.")
+    if rollout_only:
+        print_rank_0("> RL rollout-only: using current weights as reference.")
         return {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
 
     print_rank_0("> Loading pretrained checkpoint for reference weights in RL training...")
@@ -201,10 +197,6 @@ class RLSetupCallback(Callback):
         cfg = get_run_config()
         self.model = context.model
         self.optimizer = context.optimizer
-        if self.optimizer is None:
-            # The loop may run without an optimizer (inference-only),
-            # so derive the iteration count that the scheduler build would otherwise have set.
-            update_train_iters(cfg.train)
         self.inference_model = build_rl_inference_model(
             self._rl_config,
             args,
@@ -212,10 +204,13 @@ class RLSetupCallback(Callback):
             self._model_provider,
             self._model_type,
         )
-        if (cfg.train.train_iters or 0) > 0:
-            # GRPO loop state; eval-only runs (no iterations) evaluate the loaded weights directly.
+        if not cfg.validation.skip_train:
+            # GRPO loop state; eval-only runs (--skip-train) evaluate the loaded weights directly.
             self.ref_state_dict = load_reference_state_dict(
-                self.model, context.checkpointing_context, args
+                self.model,
+                context.checkpointing_context,
+                args,
+                rollout_only=self._rl_config.rl_rollout_only,
             )
             # RL runs on the plain MPU groups: the loop's data-parallel size for them.
             reinitialize_grpo_microbatch_calculator(args, mpu.get_data_parallel_world_size())

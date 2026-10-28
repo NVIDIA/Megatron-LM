@@ -22,6 +22,10 @@ class RLConfig:
     perform_rl_step: bool = False
     """Use the RL training step."""
 
+    rl_rollout_only: bool = False
+    """Iterate the RL loop collecting rollouts without optimizer updates.
+    The optimizer stays resident unless --no-load-optim is also set, which skips optimizer build."""
+
     rl_prompts_per_eval: int = 32
     """Number of prompts to evaluate for each RL task. This evaluation can be very expensive when
     using environments that evaluate pass@k so we default to a lower number."""
@@ -303,17 +307,15 @@ class RLConfig:
         cuda_graph_impl: str | None,
         micro_batch_size: int | None,
         global_batch_size: int | None,
+        train_iters: int | None,
+        train_samples: int | None,
         skip_train: bool,
         load_optim: bool,
         save_interval: int | None,
         exit_interval: int | None,
         separate_inference_model: bool | None,
     ) -> None:
-        """Check this section against the rest of the run it belongs to.
-
-        separate_inference_model: `uses_separate_inference_model` for the run's deployment; None
-            when the caller does not see the inference shards, which skips that rule.
-        """
+        """Check this section against the rest of the run it belongs to."""
         if not self.perform_rl_step:
             return
 
@@ -351,11 +353,22 @@ class RLConfig:
                     "iteration."
                 )
 
-        # In inference-only mode the optimizer is created only when it is loaded.
-        if skip_train and not load_optim and self.rl_offload_optimizer_during_inference:
+        has_horizon = bool(train_iters) or bool(train_samples)
+        if self.rl_rollout_only and not has_horizon:
             raise ValueError(
-                "--no-load-optim with --skip-train --perform-rl-step skips the optimizer; "
-                "--rl-offload-optimizer-during-inference is incompatible (no optimizer to offload)."
+                "--rl-rollout-only iterates the RL loop; it needs --train-iters or --train-samples."
+            )
+        if skip_train and (has_horizon or self.rl_rollout_only):
+            raise ValueError(
+                "--skip-train only evaluates; --rl-rollout-only collects rollouts without updates "
+                "(with --no-load-optim to leave the optimizer out)."
+            )
+        if self.rl_offload_optimizer_during_inference and (
+            skip_train or (self.rl_rollout_only and not load_optim)
+        ):
+            raise ValueError(
+                "--skip-train and --rl-rollout-only --no-load-optim build no optimizer; "
+                "--rl-offload-optimizer-during-inference has nothing to offload."
             )
 
         # Offloading inference weights that are the training weights would be a no-op.

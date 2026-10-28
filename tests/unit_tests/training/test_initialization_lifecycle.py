@@ -832,7 +832,10 @@ def test_invalid_config_stops_before_runtime_services(monkeypatch, isolated_glob
     services.assert_not_called()
 
 
-def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(monkeypatch, isolated_globals, run_config):
+@pytest.mark.parametrize("rollout_only", [False, True])
+def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(
+    monkeypatch, isolated_globals, run_config, rollout_only
+):
     import megatron.training as training_package
     from megatron.rl import rl_utils
     from megatron.rl.callbacks import RLCheckpointCallback, RLLoggingCallback
@@ -853,6 +856,7 @@ def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(monkeypatch, isolated_gl
     # The entrypoint branches on the container; the namespace carries the matching attrs
     # anyway so the test stays green under a raw-args read as well.
     cfg.rl.perform_rl_step = True
+    cfg.rl.rl_rollout_only = rollout_only
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
     monkeypatch.setattr(logging, "basicConfig", Mock())
     monkeypatch.setattr(arguments, "parse_and_validate_args", Mock(return_value=args))
@@ -878,8 +882,7 @@ def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(monkeypatch, isolated_gl
         RLLoggingCallback,
         RLCheckpointCallback,
     ]
-    assert kwargs["skip_train_keeps_optimizer"] is True
-    assert kwargs["run_train_loop_without_updates"] is True
+    assert kwargs["run_train_loop_without_updates"] is rollout_only
     assert kwargs["suppress_microbatch_rampup_handling"] is False
     assert callable(kwargs["next_train_iterator"]) and callable(kwargs["run_eval"])
     assert global_vars.get_run_config() is cfg

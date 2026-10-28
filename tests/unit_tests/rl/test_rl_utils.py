@@ -100,49 +100,52 @@ def test_disagg_refit_reads_migrated_rl_config(monkeypatch):
         pass
 
 
-@pytest.mark.parametrize("train_iters, optimizer", [(0, None), (5, "optimizer")])
-def test_setup_callback(monkeypatch, train_iters, optimizer):
-    """on_data_init_start keeps the loop's model and optimizer, derives train_iters when there is
-    no optimizer, builds the inference model, and loads the reference weights and reinitializes
-    the GRPO calculator only when there are iterations."""
+@pytest.mark.parametrize("skip_train, rollout_only", [(False, False), (False, True), (True, False)])
+def test_setup_callback(monkeypatch, skip_train, rollout_only):
+    """on_data_init_start keeps the loop's model and optimizer, builds the inference model, and
+    loads the reference weights and reinitializes the GRPO calculator unless --skip-train makes
+    the run eval-only."""
     calls = []
     args = SimpleNamespace()
-    run_config = SimpleNamespace(train=SimpleNamespace(train_iters=train_iters))
+    run_config = SimpleNamespace(validation=SimpleNamespace(skip_train=skip_train))
+    optimizer = None if skip_train else "optimizer"
     monkeypatch.setattr(training_setup, "get_args", lambda: args)
     monkeypatch.setattr(training_setup, "get_run_config", lambda: run_config)
     monkeypatch.setattr(training_setup, "get_model_config", lambda chunk: f"config({chunk})")
     monkeypatch.setattr(training_setup.mpu, "get_data_parallel_world_size", lambda: 4)
-    monkeypatch.setattr(
-        training_setup, "update_train_iters", lambda train: calls.append(("iters", train))
-    )
     monkeypatch.setattr(
         training_setup,
         "build_rl_inference_model",
         lambda *a: calls.append(("inference", a)) or "inference_model",
     )
     monkeypatch.setattr(
-        training_setup, "load_reference_state_dict", lambda *a: calls.append(("ref", a)) or {"w": 1}
+        training_setup,
+        "load_reference_state_dict",
+        lambda *a, **k: calls.append(("ref", a, k)) or {"w": 1},
     )
     monkeypatch.setattr(
         training_setup,
         "reinitialize_grpo_microbatch_calculator",
         lambda *a: calls.append(("mb", a)),
     )
-    cfg = RLConfig()
+    cfg = RLConfig(rl_rollout_only=rollout_only)
     callback = training_setup.RLSetupCallback(cfg, model_provider="provider", model_type="type")
 
     callback.on_data_init_start(
         CallbackContext(model=["chunk"], optimizer=optimizer, checkpointing_context={"ckpt": 1})
     )
 
-    expected = [("iters", run_config.train)] if optimizer is None else []
-    expected.append(("inference", (cfg, args, "config(chunk)", "provider", "type")))
-    if train_iters:
-        expected += [("ref", (["chunk"], {"ckpt": 1}, args)), ("mb", (args, 4))]
+    loop_runs = not skip_train
+    expected = [("inference", (cfg, args, "config(chunk)", "provider", "type"))]
+    if loop_runs:
+        expected += [
+            ("ref", (["chunk"], {"ckpt": 1}, args), {"rollout_only": rollout_only}),
+            ("mb", (args, 4)),
+        ]
     assert calls == expected
     assert (callback.model, callback.optimizer) == (["chunk"], optimizer)
     assert callback.inference_model == "inference_model"
-    assert callback.ref_state_dict == ({"w": 1} if train_iters else None)
+    assert callback.ref_state_dict == ({"w": 1} if loop_runs else None)
 
 
 class MockModel(LanguageModule):
