@@ -19,12 +19,7 @@ from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import get_pg_size, log_single_rank
-from megatron.training.global_vars import (
-    get_args,
-    get_run_config,
-    get_tokenizer,
-    get_train_state,
-)
+from megatron.training.global_vars import get_args, get_run_config, get_tokenizer, get_train_state
 from megatron.training.utils import print_rank_0
 
 from ..rollout_bank import (
@@ -35,6 +30,7 @@ from ..rollout_bank import (
     resolve_bank_dir,
 )
 from ..server.api import InferenceServer
+from ..token_custody import HeldPrefixPreparer, PrefixStore
 from .chat_interface import MegatronChatInterface
 
 logger = logging.getLogger(__name__)
@@ -92,6 +88,7 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
     _generation_lag: float = PrivateAttr(None)
     _request_record_backup_dir: str | None = PrivateAttr(None)
+    _prefix_store: PrefixStore | None = PrivateAttr(None)
 
     @property
     def generation_lag(self) -> float:
@@ -148,11 +145,20 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
             # Need to copy the staged payloads into the durable bank.
             bank_dir = resolve_bank_dir(cfg.rl.rl_rollout_bank_dir, cfg.checkpoint.save)
             writer = FinishedRequestLedgerWriter(
-                request_record_backup_path(
-                    bank_dir, dist.get_rank(), get_train_state().iteration
-                )
+                request_record_backup_path(bank_dir, dist.get_rank(), get_train_state().iteration)
             )
-        inference_engine.payload_stager = LedgerPayloadStager(writer)
+        # Gym admissions need the parent call's exact tokens on whichever engine continues it:
+        # rank 0 serves them for the job, every stager publishes, every preparer fetches.
+        address = [None]
+        if dist.get_rank() == 0:
+            prefix_store = PrefixStore(is_master=True)
+            address[0] = (prefix_store.host, prefix_store.port)
+        dist.broadcast_object_list(address, src=0)
+        if dist.get_rank() != 0:
+            prefix_store = PrefixStore(*address[0])
+        print_rank_0("Prefix store for held calls at %s:%d" % address[0])
+        inference_engine.payload_stager = LedgerPayloadStager(writer, prefix_store)
+        inference_engine.prompt_preparer = HeldPrefixPreparer(prefix_store)
         dp_addr = await inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=41521, launch_inference_coordinator=True,
         )
@@ -187,6 +193,7 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
         launched_server._inference_engine = inference_engine
         launched_server._generation_lag = generation_lag
         launched_server._request_record_backup_dir = bank_dir
+        launched_server._prefix_store = prefix_store
 
         concurrency_limit = (
             get_pg_size(inference_engine.pg_collection.dp) * inference_engine.context.max_requests
@@ -222,9 +229,7 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
             self._client.stop_engines()
         await self._inference_engine.wait_until(EngineState.STOPPED)
 
-        writer = self._inference_engine.payload_stager.writer
-        if writer is not None:
-            writer.close()
+        self._inference_engine.payload_stager.close()
 
         if dist.get_rank() == 0:
             self._client.shutdown_coordinator()
@@ -235,6 +240,11 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
                 stop_text_gen_server,
             )
             stop_text_gen_server()
+
+    def forget_held_prefixes(self, uids) -> None:
+        """Drop the prefix store's calls whose rollouts the trainer consumed."""
+        if dist.get_rank() == 0:
+            self._prefix_store.forget(uids)
 
     def set_generation_epoch(self, generation_epoch: int):
         if dist.get_rank() == 0:
@@ -254,8 +264,9 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
     ) -> dict[str, FinishedRequestRecord]:
         """Drain every engine's staged records into rank 0 (a gather over the world).
 
-        Routing indices and prompt log probs stay on the owning rank (its durable backup holds
-        them); the gathered record carries the token ids, generated log probs and stamps.
+        Only what the joins read is gathered: token ids, generated log probs and the stamps.
+        Routing indices survive only in the owning rank's durable backup when
+        `rl_durable_rollout_bank` is on; top-N log probs and media tensors are kept nowhere.
 
         Args:
             rotate_to: New window for the writer to point to after the drain,
@@ -266,12 +277,24 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
         """
         stager = self._inference_engine.payload_stager
         drained = stager.drain()
-        if rotate_to is not None and stager.writer is not None:
-            stager.writer.rotate(
-                request_record_backup_path(
-                    self._request_record_backup_dir, dist.get_rank(), rotate_to
+        writer_error = None
+        if rotate_to is not None and self._request_record_backup_dir is not None:
+            try:
+                stager.rotate(
+                    request_record_backup_path(
+                        self._request_record_backup_dir, dist.get_rank(), rotate_to
+                    )
                 )
-            )
+            except RuntimeError as error:
+                writer_error = error
+        # A backup write fails on one rank: raise on every rank, after agreeing,
+        # instead of leaving the peers in the gather below until the distributed timeout.
+        failures = [None] * dist.get_world_size()
+        dist.all_gather_object(failures, None if writer_error is None else repr(writer_error))
+        if any(failure is not None for failure in failures):
+            raise RuntimeError(
+                f"finished-request ledger writer failed: {failures}"
+            ) from writer_error
         local = {uid: gather_view(record) for uid, record in drained.items()}
         shards = [None] * dist.get_world_size() if dist.get_rank() == 0 else None
         dist.gather_object(local, shards, dst=0)

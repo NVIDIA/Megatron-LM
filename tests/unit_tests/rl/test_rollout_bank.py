@@ -1,17 +1,24 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Parameterized coverage for durable rollout-bank persistence and replay."""
+"""Parameterized coverage for durable rollout-bank persistence and replay, and for the token
+custody the engines keep for a worker-custody harness: held receipts and exact-prefix splices."""
 
 import asyncio
 import dataclasses
 import json
+import os
 from collections import Counter
 from contextlib import aclosing
 
+import msgpack
 import numpy as np
 import pytest
 
 from megatron.core.inference.inference_request import (
+    PREFIX_EOS_TOKEN_ID_FIELD,
+    PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
+    PREFIX_MEDIA_COUNT_FIELD,
+    PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
     FinishedRequestRecord,
     OffloadedRequestPayload,
     RequestPayloadStageResult,
@@ -35,6 +42,12 @@ from megatron.rl.rollout_bank import (
     load_finished_request_records,
     request_record_backup_path,
     request_record_paths,
+)
+from megatron.rl.token_custody import (
+    NG_CAPTURE_FIELD,
+    NG_COMMIT_COORDS_FIELD,
+    HeldPrefixPreparer,
+    PrefixStore,
 )
 from megatron.rl.types import Rollout as SharedRollout
 from megatron.rl.types import RolloutGroup as SharedRolloutGroup
@@ -186,6 +199,7 @@ def test_rollout_bank_round_trip(tmp_path, group_factory):
         pytest.param("bad_checksum", 1, id="bad-checksum"),
         pytest.param("missing_records", 1, id="missing-request-records"),
         pytest.param("no_records", 0, id="no-request-records"),
+        pytest.param("short_log_probs", 0, id="record-lost-log-probs"),
     ],
 )
 def test_restore_drops_only_the_damaged_groups(tmp_path, damage, expected_survivors):
@@ -208,6 +222,15 @@ def test_restore_drops_only_the_damaged_groups(tmp_path, damage, expected_surviv
         manifests = [json.loads(line) for line in ledger.read_text().splitlines()]
         manifests[-1]["checksum"] = "0" * 32
         ledger.write_text("".join(json.dumps(m) + "\n" for m in manifests))
+    elif damage == "short_log_probs":
+        # One turn's record kept its tokens but lost its log probs: unusable, not restorable.
+        cid, rec = next(iter(records_a.items()))
+        records = {
+            **records_a,
+            cid: dataclasses.replace(
+                rec, payload=dataclasses.replace(rec.payload, generated_log_probs=[])
+            ),
+        }
 
     restarted = RolloutBank(str(tmp_path))
     restarted.set_collection(3)  # a torn tail is truncated before appends resume
@@ -322,7 +345,7 @@ def test_checkpoint_compacts_at_consumption_boundary(tmp_path, consumed_offset, 
 
     # Window 5 is closed: both groups' records, a turn of an in-flight group, a retired request.
     backup(5, {**all_records, "chatcmpl-inflight": _record(), "chatcmpl-retired": _record()})
-    # The window the checkpoint closes is the engines' current file (an evaluation created it).
+    # Window 10 is the engines' open file (an evaluation created it); declared at each checkpoint.
     current = backup(checkpoint_iteration, {"chatcmpl-eval": _record()})
 
     bank = RolloutBank(str(tmp_path))
@@ -339,7 +362,7 @@ def test_checkpoint_compacts_at_consumption_boundary(tmp_path, consumed_offset, 
     assert (consumed in before_checkpoint) is should_restore
     assert never_consumed in before_checkpoint
 
-    bank.checkpoint(checkpoint_iteration)
+    bank.checkpoint(checkpoint_iteration, open_window=checkpoint_iteration)
     manifest = json.loads((tmp_path / _MANIFEST).read_text())
     assert manifest["trained_through"] == checkpoint_iteration
     assert manifest["segments"] == [_segment_name(checkpoint_iteration)]
@@ -373,13 +396,326 @@ def test_checkpoint_compacts_at_consumption_boundary(tmp_path, consumed_offset, 
     # unretired evaluation record remain.
     backup(checkpoint_iteration + 1, {"chatcmpl-later": _record()})
     bank.retire_records(["chatcmpl-inflight"])
-    bank.checkpoint(checkpoint_iteration + 2)
+    bank.checkpoint(checkpoint_iteration + 2, open_window=checkpoint_iteration + 2)
     assert kept() == set(records_b) | {"chatcmpl-eval"}
     restored = bank.restore(
         checkpoint_iteration + 2,
         request_records=load_finished_request_records(request_record_paths(str(tmp_path))),
     )
     assert {group.uid for group in restored} == {never_consumed}
+
+
+def test_checkpoint_keeps_the_engines_open_backup_window(tmp_path):
+    """After a collection at iteration L the engines stage into the window-(L + 1) backup file
+    until the next collection rotates it. A checkpoint two or more iterations later must leave
+    that file alone: folding and unlinking it while the engines still hold it open sends every
+    record staged afterwards to an unlinked inode, so no restore can find those groups."""
+    bank = RolloutBank(str(tmp_path))
+    bank.set_collection(5)
+    open_file = request_record_backup_path(str(tmp_path), rank=0, iteration=6, tag="deadbeef")
+    writer = FinishedRequestLedgerWriter(open_file)
+    writer.append("chatcmpl-eval", _record())  # an evaluation during the window creates the file
+    writer.close()
+    with open(open_file, "ab") as handle:  # the engine writer's handle stays open across saves
+        bank.checkpoint(7, open_window=6)
+        bank.checkpoint(8, open_window=6)
+        handle.write(rollout_bank.pack_finished_request_record("chatcmpl-next-window", _record()))
+    records = load_finished_request_records(request_record_paths(str(tmp_path)))
+    assert {"chatcmpl-eval", "chatcmpl-next-window"} <= set(records)
+
+
+def test_recover_retires_the_dead_runs_unreferenced_records(tmp_path):
+    """A crash loses rank 0's in-memory retired ids. Every loaded record that no survivor
+    references at recovery belongs to the dead run and has no consumer left, so the next
+    checkpoint must drop it from the fold instead of carrying it forward forever."""
+    group, records = _token_group(batch_id=0)
+    bank = RolloutBank(str(tmp_path))
+    bank.set_collection(5)
+    uid = bank.append(group)
+    bank.close()
+    # The dead run's closed window-5 backup: the group's records plus an evaluation record it
+    # had retired in memory only.
+    writer = FinishedRequestLedgerWriter(
+        request_record_backup_path(str(tmp_path), rank=0, iteration=5, tag="deadbeef")
+    )
+    for cid, rec in {**records, "chatcmpl-eval": next(iter(records.values()))}.items():
+        writer.append(cid, rec)
+    writer.close()
+
+    resumed = RolloutBank(str(tmp_path))
+    on_disk = load_finished_request_records(request_record_paths(str(tmp_path)))
+    assert [g.uid for g in resumed.recover(5, request_records=on_disk)] == [uid]
+    resumed.set_collection(5)
+    resumed.checkpoint(7, open_window=6)  # folds the dead run's window-5 file
+    assert set(load_finished_request_records(request_record_paths(str(tmp_path)))) == set(records)
+
+
+def test_placeholder_manifest_drops_the_released_call_ids(tmp_path):
+    """A failed episode's placeholder names the calls it made so the join can release their
+    records. The manifest must not reference them (nothing keeps them past the next checkpoint),
+    and the restored placeholder is a placeholder again."""
+    group, records = _token_group(batch_id=0)
+    failed = TokenRollout(
+        trajectory=[], reward=0.0, env_id="test", problem_id="p", completion_ids=["chatcmpl-gone"]
+    )
+    assert failed.is_placeholder
+    bank = RolloutBank(str(tmp_path))
+    bank.set_collection(3)
+    uid = bank.append(RolloutGroup(rollouts=[*group.rollouts, failed]))
+    (restored,) = bank.restore(trained_through=0, request_records=records)
+    manifest = json.loads((_segment_dir(tmp_path) / _LEDGER).read_text().splitlines()[-1])
+    assert manifest["group"]["rollouts"][-1]["completion_ids"] == []
+    assert restored.uid == uid
+    assert restored.rollouts[-1].is_placeholder and restored.rollouts[-1].completion_ids == []
+    _assert_group_matches(RolloutGroup(rollouts=restored.rollouts[:-1]), group)
+
+
+def test_old_format_bank_is_refused(tmp_path):
+    """A directory written by the previous on-disk format gets a message naming the format change
+    and the one remedy that works, not advice to recover a manifest that never existed there."""
+    (tmp_path / "MANIFEST.json").write_text("{}")
+    with pytest.raises(ValueError, match="earlier on-disk format"):
+        RolloutBank(str(tmp_path))
+
+
+def test_record_store_skips_records_that_fail_their_checks(tmp_path, caplog):
+    """A record whose arrays were corrupted or whose format version is foreign is skipped on its
+    own: the records around it still load, a fold copies the valid frames forward verbatim, and
+    the stager's rotate and close reach the writer when there is one."""
+
+    def tampered(uid, **changes):
+        frame = rollout_bank.pack_finished_request_record(uid, _record())
+        payload = {**msgpack.unpackb(frame, raw=False), **changes}
+        return msgpack.packb(payload, use_bin_type=True)
+
+    good = {
+        uid: rollout_bank.pack_finished_request_record(uid, _record(log_probs=[-0.25]))
+        for uid in "ad"
+    }
+    flipped = tampered("b", generated_log_probs=b"\xff" * 4)  # arrays no longer match the digest
+    foreign = tampered("c", format_version=_FORMAT_VERSION + 1)
+    path = request_record_backup_path(str(tmp_path), rank=0, iteration=1, tag="deadbeef")
+    os.makedirs(os.path.dirname(path))
+    with open(path, "wb") as f:
+        f.write(good["a"] + flipped + foreign + good["d"])
+    with caplog.at_level("WARNING", logger="megatron.rl.rollout_bank"):
+        loaded = load_finished_request_records([path])
+    assert set(loaded) == {"a", "d"} and loaded["d"].payload.generated_log_probs == [-0.25]
+    assert sum("Skipping an unreadable request record" in r.message for r in caplog.records) == 2
+    assert rollout_bank._packed_records([path]) == good
+
+    # The stager delegates rotate and close to its writer, and tolerates having none.
+    LedgerPayloadStager().rotate(path)
+    LedgerPayloadStager().close()
+    second = request_record_backup_path(str(tmp_path), rank=0, iteration=2, tag="deadbeef")
+    stager = LedgerPayloadStager(FinishedRequestLedgerWriter(path))
+    e, f = _record(log_probs=[-0.75]), _record(log_probs=[-1.0])
+    stager.stage("e", e.payload, finished_metadata=e)
+    stager.rotate(second)
+    stager.stage("f", f.payload, finished_metadata=f)
+    stager.close()
+    assert set(load_finished_request_records([path])) == {"a", "d", "e"}
+    assert set(load_finished_request_records([second])) == {"f"}
+
+
+def test_record_store_streams_a_file_past_the_unpacker_buffer_cap(tmp_path):
+    """A record file is read in chunks: one routing-replay frame larger than a read and the
+    file as a whole past msgpack's 100 MiB default cap load completely, the frame that follows
+    is cut at the right offset and copies forward verbatim, and a torn tail drops only itself."""
+    rows = (101 << 20) // (32 * 8 * 8) + 1  # a routing array just over the cap on its own
+    routing = np.arange(rows * 32 * 8, dtype=np.int64).reshape(rows, 32, 8)
+    records = {"big": _record(routing=routing), "small": _record([1, 2], [3], [-0.25])}
+    frames = {uid: rollout_bank.pack_finished_request_record(uid, r) for uid, r in records.items()}
+    assert len(frames["big"]) > max(100 << 20, rollout_bank._RECORD_READ_SIZE)
+    path = request_record_backup_path(str(tmp_path), rank=0, iteration=1, tag="deadbeef")
+    os.makedirs(os.path.dirname(path))
+    with open(path, "wb") as f:
+        f.write(frames["big"] + frames["small"] + frames["small"][:7])  # torn tail
+    loaded = load_finished_request_records([path])
+    assert set(loaded) == {"big", "small"}
+    assert np.array_equal(loaded["big"].payload.routing_indices, routing)
+    assert loaded["small"].payload.generated_log_probs == [-0.25]
+    assert rollout_bank._packed_records([path]) == frames
+
+
+def _admission(**fields):
+    """A Gym ``token_in`` admission continuing the held call ``u1`` (model call ``c1``)."""
+    return {
+        "capture_key": "r",
+        "model_call_id": "c2",
+        "mode": "token_in",
+        "parent_call_id": "c1",
+        "prev_len": 4,
+        "staging_chain": ["u1"],
+        **fields,
+    }
+
+
+_ROOT_ADMISSION = {"capture_key": "r", "model_call_id": "c1", "mode": "text"}
+_SPLICE_PARAMS = {PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [1, 2, 9, 2], PREFIX_EOS_TOKEN_ID_FIELD: [2]}
+
+
+@pytest.fixture
+def store():
+    master = PrefixStore("127.0.0.1", is_master=True)  # kept alive for the client's lifetime
+    yield PrefixStore("127.0.0.1", master.port)
+
+
+@pytest.mark.parametrize(
+    "parent_generated, media_count",
+    [
+        pytest.param([3, 2], None, id="exact-turn-ends-with-eos"),
+        pytest.param([3], None, id="cut-turn-takes-the-rendered-eos"),
+        pytest.param([3, 2], 1, id="multimodal-prefix"),
+    ],
+)
+def test_held_custody_round_trip(store, parent_generated, media_count):
+    """The stager publishes each admitted call and answers with a ``held`` receipt of ids and
+    lengths; the preparer splices the parent's exact tokens into the continuation (an exact turn
+    keeps its own EOS, a cut turn takes the rendered one), inlines them for the stager's check
+    and, with media placeholders, reports the already-expanded prefix length. Requests without an
+    admission pass through both untouched, and a forgotten parent fails the continuation."""
+    stager, preparer = LedgerPayloadStager(prefix_store=store), HeldPrefixPreparer(store)
+    media = {} if media_count is None else {PREFIX_MEDIA_COUNT_FIELD: media_count}
+    # Spans are (token position, epoch): admitted under epoch 3, continued under epoch 4.
+    parent = _record(
+        [1, 2], parent_generated, [-0.5] * len(parent_generated), policy_epoch=[(0, 3), (2, 4)]
+    )
+    prev_len = 2 + len(parent_generated)
+    result = stager.stage(
+        "u1",
+        parent.payload,
+        finished_metadata=parent,
+        offload_params={NG_CAPTURE_FIELD: _ROOT_ADMISSION},
+    )
+    assert result.response_metadata == {  # ids and lengths only: no digests
+        NG_COMMIT_COORDS_FIELD: {
+            "capture_key": "r",
+            "model_call_id": "c1",
+            "parent_call_id": None,
+            "prev_len": 0,
+            "delta_len": prev_len,
+            "cum_len": prev_len,
+            "weight_version": 3,
+            "disposition": "held",
+            "staging_key": "u1",
+        }
+    }
+    assert store.get("u1") == ([1, 2], parent_generated)  # published for the next turn's prefix
+
+    params = {NG_CAPTURE_FIELD: _admission(prev_len=prev_len), **_SPLICE_PARAMS, **media}
+    prepared = preparer.prepare_prompt([1, 2, 9, 2, 5], offload_params=params)
+    prefix = [1, 2, *parent_generated]
+    assert prepared.prompt == [1, 2, 3, 2, 5]
+    assert prepared.offload_params[NG_CAPTURE_FIELD]["required_prefix_token_ids"] == prefix
+    assert params[NG_CAPTURE_FIELD].get("required_prefix_token_ids") is None  # input left alone
+    assert prepared.offload_params.get(PREFIX_EXPANDED_TOKEN_COUNT_FIELD) == (
+        prev_len if media else None
+    )
+    child = _record(prepared.prompt, [7], [-0.25], policy_epoch=[(0, 4)])
+    result = stager.stage(
+        "u2", child.payload, finished_metadata=child, offload_params=prepared.offload_params
+    )
+    assert result.response_metadata[NG_COMMIT_COORDS_FIELD] == {
+        "capture_key": "r",
+        "model_call_id": "c2",
+        "parent_call_id": "c1",
+        "prev_len": prev_len,
+        "delta_len": 6 - prev_len,
+        "cum_len": 6,
+        "weight_version": 4,
+        "disposition": "held",
+        "staging_key": "u2",
+    }
+
+    # Without an admission the request passes through; a text root sheds the media count so the
+    # engine expands every placeholder itself.
+    passthroughs = (
+        (media, media),
+        ({NG_CAPTURE_FIELD: _ROOT_ADMISSION, **media}, {NG_CAPTURE_FIELD: _ROOT_ADMISSION}),
+    )
+    for passthrough, expected in passthroughs:
+        prepared = preparer.prepare_prompt([7, 8], offload_params=passthrough)
+        assert (prepared.prompt, prepared.offload_params) == ([7, 8], expected)
+    plain = stager.stage("u3", child.payload, finished_metadata=child)
+    assert plain == RequestPayloadStageResult() and store.get("u3") is None
+    assert set(stager.drain()) == {"u1", "u2", "u3"}
+    store.forget(["u1", "never"])
+    with pytest.raises(LookupError, match="does not hold"):  # forgotten, no cache
+        preparer.prepare_prompt([1, 2, 9, 2, 5], offload_params=params)
+
+
+@pytest.mark.parametrize(
+    "params, error, match",
+    [
+        pytest.param(
+            {NG_CAPTURE_FIELD: _admission(staging_chain=["absent"])},
+            LookupError,
+            "does not hold",
+            id="unresolved-chain",
+        ),
+        pytest.param(
+            {NG_CAPTURE_FIELD: _admission(staging_chain=[])},
+            ValueError,
+            "neither a prefix nor a staging chain",
+            id="no-chain",
+        ),
+        pytest.param(
+            {NG_CAPTURE_FIELD: _admission(prev_len=3)},
+            ValueError,
+            "expects a prefix of 3",
+            id="prefix-length-mismatch",
+        ),
+        pytest.param(
+            {PREFIX_TEMPLATE_TOKEN_IDS_FIELD: None},
+            ValueError,
+            "splice metadata",
+            id="no-splice-metadata",
+        ),
+        pytest.param(
+            {PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [1, 9]}, ValueError, "EOS", id="no-eos-in-template"
+        ),
+    ],
+)
+def test_preparer_refuses_a_continuation_it_cannot_splice(store, params, error, match):
+    """Anything the preparer cannot honor fails the request at admission, before any generation."""
+    store.put("u1", [1, 2], [3, 2])
+    offload_params = {NG_CAPTURE_FIELD: _admission(), **_SPLICE_PARAMS, **params}
+    with pytest.raises(error, match=match):
+        HeldPrefixPreparer(store).prepare_prompt([1, 2, 9, 2, 5], offload_params=offload_params)
+
+
+@pytest.mark.parametrize(
+    "admission, store_up",
+    [
+        pytest.param(_admission(), True, id="unresolved-chain"),  # no inlined prefix to check
+        pytest.param(_admission(required_prefix_token_ids=[9] * 4), True, id="prefix-mismatch"),
+        pytest.param({**_ROOT_ADMISSION, "mode": "candidate"}, True, id="unsupported-mode"),
+        pytest.param("bogus", True, id="malformed-admission"),
+        pytest.param(_ROOT_ADMISSION, False, id="dead-store"),
+    ],
+)
+def test_stager_answers_no_coordinates_when_it_cannot_vouch(
+    store, monkeypatch, caplog, admission, store_up
+):
+    """A call this worker cannot vouch for, a non-dict admission or a prefix store that stopped
+    answering gets no coordinates (Gym fails the call closed) and never fails the completion: the
+    record stays indexed for the ledger and the engine log says why."""
+    if not store_up:
+
+        def refuse(*_args, **_kwargs):
+            raise RuntimeError("store down")
+
+        monkeypatch.setattr(store, "put", refuse)
+    stager, record = LedgerPayloadStager(prefix_store=store), _record([1, 2, 3, 6], [7])
+    params = {NG_CAPTURE_FIELD: admission}
+    with caplog.at_level("WARNING"):
+        result = stager.stage("u9", record.payload, finished_metadata=record, offload_params=params)
+    assert result == RequestPayloadStageResult() and set(stager.drain()) == {"u9"}
+    published = store_up and isinstance(admission, dict)
+    assert store.get("u9") == (([1, 2, 3, 6], [7]) if published else None)
+    reason = "Custody receipt failed" if isinstance(admission, dict) else "malformed"
+    assert any(reason in message for message in caplog.messages)
 
 
 def _env_group(env_id, problem_id):

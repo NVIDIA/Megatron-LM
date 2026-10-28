@@ -3,7 +3,7 @@
 from collections import deque
 from typing import TypeAlias
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 #: An environment identifier, as reported by an agent's ``env_id`` attribute
 #: (see ``WeightedMultiTask._env_ids``).
@@ -50,10 +50,19 @@ class TokenRollout(AgentBaseModel):
     rollout_status: str = 'ok'
     failure_reason: str | None = None
 
+    @model_validator(mode="after")
+    def _one_request_per_turn(self):
+        if self.trajectory and len(self.completion_ids) != len(self.trajectory):
+            raise ValueError(
+                f"TokenRollout has {len(self.trajectory)} turns but "
+                f"{len(self.completion_ids)} completion ids; each turn needs its request id"
+            )
+        return self
+
     @property
     def is_placeholder(self) -> bool:
-        """An empty episode: no turns, and no requests to rebuild them from."""
-        return not self.trajectory and not self.completion_ids
+        """A failed episode: no turns; its completion ids name the calls it made."""
+        return self.trajectory is not None and not self.trajectory
 
 
 Rollouts = list[TokenRollout | Rollout]
