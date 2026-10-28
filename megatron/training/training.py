@@ -158,6 +158,7 @@ from megatron.training.checkpointing import (
     save_grads,
 )
 from megatron.training.config import FaultInjectorConfig, TrainingConfig
+from megatron.training.config.compat import data_sequence_length, model_topology
 from megatron.training.config.container import PretrainConfigContainer, update_train_iters
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.initialize import (
@@ -3235,8 +3236,13 @@ def dummy_train_step(data_iterator):
     cfg = get_run_config()
     args = get_args()
     tp_rank = mpu.get_tensor_model_parallel_rank()
-    has_cu_seqlens = getattr(args, 'sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
-    dynamic_cp = args.dynamic_context_parallel
+    # The data section's batch flags and length, and the model-parallel values (the model
+    # section's, or the arguments' for a container built without one).
+    flags = cfg.data.batch_flags()
+    topology = model_topology(cfg, args)
+    has_cu_seqlens = flags.has_cu_seqlens
+    dynamic_cp = topology.dynamic_context_parallel
+    seq_length = data_sequence_length(cfg, args)
 
     BATCH_KEYS = [
         "tokens", "labels", "loss_mask", "position_ids", "attention_mask",
@@ -3260,13 +3266,13 @@ def dummy_train_step(data_iterator):
                 broadcast_group=mpu.get_tensor_model_parallel_group(),
                 has_cu_seqlens=has_cu_seqlens,
                 dynamic_cp=dynamic_cp,
-                create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
-                cp_size=args.context_parallel_size,
+                create_attention_mask_in_dataloader=flags.create_attention_mask,
+                cp_size=topology.context_parallel_size,
                 tp_rank=tp_rank,
                 micro_batch_size=cfg.train.micro_batch_size,
-                seq_length=args.seq_length,
+                seq_length=seq_length,
                 mtp_on_this_rank=False,
-                pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+                pipeline_model_parallel_size=topology.pipeline_model_parallel_size,
                 is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
                 is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
             )

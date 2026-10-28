@@ -58,15 +58,22 @@ def model_topology(cfg: Any, args: Any) -> ModelTopology:
     )
 
 
-def model_layout(cfg: Any, args: Any) -> tuple[Any, Optional[int]]:
-    """``(pipeline_model_parallel_layout, mtp_num_layers)`` for the rank predicate: from the model
-    section, else from the transformer config the legacy arguments describe (what the predicate
-    built from the arguments before the container carried a model section)."""
+def model_transformer_config(cfg: Any, args: Any) -> Any:
+    """The transformer config the batch path reads (``get_batch``): the model section's when the
+    container has one, else the one the legacy arguments describe (what ``get_batch`` built from
+    the arguments on every call before the container carried a model section)."""
     transformer = _transformer(cfg)
     if transformer is None:
         from megatron.training.arguments import core_transformer_config_from_args
 
         transformer = core_transformer_config_from_args(args)
+    return transformer
+
+
+def model_layout(cfg: Any, args: Any) -> tuple[Any, Optional[int]]:
+    """``(pipeline_model_parallel_layout, mtp_num_layers)`` for the rank predicate, from
+    ``model_transformer_config``."""
+    transformer = model_transformer_config(cfg, args)
     return transformer.pipeline_model_parallel_layout, transformer.mtp_num_layers
 
 

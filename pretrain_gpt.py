@@ -58,8 +58,9 @@ from megatron.training.argument_utils import (  # noqa: F401  (core_gpt_dataset_
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.config.compat import data_sequence_length, model_transformer_config
 from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
-from megatron.training.global_vars import set_run_config
+from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import is_first_or_last_pipeline_stage
 from model_provider import model_provider
@@ -99,10 +100,14 @@ def get_batch(
 ):
     """Generate a batch."""
 
+    cfg = get_run_config()
     args = get_args()
-    config = core_transformer_config_from_args(args)
+    # The model section's transformer config (built from the arguments when the container has
+    # no model section) and the data section's batch flags; args feeds only the fallbacks.
+    config = model_transformer_config(cfg, args)
+    flags = cfg.data.batch_flags()
 
-    if args.sequence_packing_scheduler is not None:
+    if config.sequence_packing_scheduler is not None:
         if pg_collection is None:
             # Compatibility for direct entrypoint callers; Core receives explicit groups.
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(
@@ -120,16 +125,16 @@ def get_batch(
                 vp_size=config.virtual_pipeline_model_parallel_size or 1,
             ),
             vp_stage=vp_stage,
-            dynamic_cp=args.dynamic_context_parallel,
+            dynamic_cp=config.dynamic_context_parallel,
             pg_collection=pg_collection,
             config=config,
         )
 
-    cp_size = args.context_parallel_size
+    cp_size = config.context_parallel_size
+    seq_length = data_sequence_length(cfg, args)  # the packing path above needs no length
     tp_rank = mpu.get_tensor_model_parallel_rank()
-    is_sft = args.sft
-    has_cu_seqlens = is_sft or args.dataloader_inter_document_masking
-    create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
+    has_cu_seqlens = flags.has_cu_seqlens
+    create_attention_mask_in_dataloader = flags.create_attention_mask
     mtp_on_this_rank = mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,
         mtp_num_layers=config.mtp_num_layers,
@@ -137,7 +142,7 @@ def get_batch(
         vp_stage=vp_stage,
     )
     # Dynamic CP always uses the sequence-packing path above.
-    assert not args.dynamic_context_parallel
+    assert not config.dynamic_context_parallel
 
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
@@ -165,10 +170,10 @@ def get_batch(
         create_attention_mask_in_dataloader=create_attention_mask_in_dataloader,
         cp_size=cp_size,
         tp_rank=tp_rank,
-        micro_batch_size=args.micro_batch_size,
-        seq_length=args.seq_length,
+        micro_batch_size=cfg.train.micro_batch_size,
+        seq_length=seq_length,
         mtp_on_this_rank=mtp_on_this_rank,
-        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+        pipeline_model_parallel_size=config.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
     )
@@ -194,7 +199,7 @@ def get_batch(
         batch,
         dynamic_cp=False,
         cp_group=get_context_parallel_group(),
-        use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
+        use_per_sequence_balancing=flags.use_per_sequence_balancing,
     )
 
     # Return values in BATCH_KEYS order so callers can unpack into the fixed

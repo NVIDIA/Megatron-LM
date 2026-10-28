@@ -790,3 +790,90 @@ def test_set_global_variables_finalizes_a_dataset_section(
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
     global_vars.set_global_variables(args, loader_only, build_tokenizer=False)
     assert global_vars.get_run_config() is loader_only and loader_only._finalized
+
+
+def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
+    """dummy_train_step (the skip-iteration path) runs for any container: the batch flags and the
+    data length come from the data section, the model-parallel values from the model section when
+    there is one and from the arguments otherwise; the poisoned namespace shows which source won."""
+    from megatron.training import training
+    from megatron.training.config import DataConfig
+
+    calls = []
+
+    class _Machine:
+        def __init__(self):
+            self.runs = 0
+
+        def should_run_forward_backward(self, data_iterator):
+            self.runs += 1
+            return self.runs == 1
+
+    monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
+    monkeypatch.setattr(training, "get_rerun_state_machine", lambda: _Machine())
+    monkeypatch.setattr(
+        training, "get_batch_on_this_tp_rank", lambda batch, **kw: calls.append(kw) or {}
+    )
+    monkeypatch.setattr(training, "get_batch_on_this_cp_rank", lambda batch, **kw: batch)
+    monkeypatch.setattr(training, "get_context_parallel_group", lambda: None)
+    monkeypatch.setattr(training.mpu, "get_tensor_model_parallel_rank", lambda: 1)  # no iterator
+    monkeypatch.setattr(training.mpu, "get_tensor_model_parallel_src_rank", lambda: 0)
+    monkeypatch.setattr(training.mpu, "get_tensor_model_parallel_group", lambda: None)
+    monkeypatch.setattr(training.mpu, "is_pipeline_first_stage", lambda: True)
+    monkeypatch.setattr(training.mpu, "is_pipeline_last_stage", lambda: True)
+    args = SimpleNamespace(  # poisoned wherever the section or the model section rules
+        seq_length=64,
+        context_parallel_size=2,
+        pipeline_model_parallel_size=4,
+        dynamic_context_parallel=False,
+        sequence_packing_scheduler=None,
+        sft=True,
+        dataloader_inter_document_masking=True,
+        create_attention_mask_in_dataloader=False,
+    )
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    train = SimpleNamespace(micro_batch_size=3)
+
+    # No model section (pretrain_hybrid_flex.py) and a loader-only section: the topology and the
+    # length come from the arguments, the flags are the plain-GPT ones whatever args.sft says.
+    monkeypatch.setattr(
+        training,
+        "get_run_config",
+        lambda: SimpleNamespace(model=None, data=DataConfig(), train=train),
+    )
+    training.dummy_train_step(None)
+    kw = calls.pop()
+    assert (kw["cp_size"], kw["pipeline_model_parallel_size"], kw["dynamic_cp"]) == (2, 4, False)
+    assert kw["seq_length"] == 64 and kw["micro_batch_size"] == 3
+    assert kw["has_cu_seqlens"] is False and kw["create_attention_mask_in_dataloader"] is True
+
+    # A dataset section and a model section: the section's flags and length, the model's values.
+    dataset = GPTDatasetConfig(
+        sequence_length=16,
+        random_seed=1,
+        inter_document_masking=True,
+        create_attention_mask=False,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+    )
+    transformer = SimpleNamespace(
+        context_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        dynamic_context_parallel=True,
+        sequence_packing_scheduler=None,
+    )
+    monkeypatch.setattr(
+        training,
+        "get_run_config",
+        lambda: SimpleNamespace(
+            model=SimpleNamespace(transformer=transformer),
+            data=DataConfig(dataset=dataset, dataset_type=MockGPTDataset),
+            train=train,
+        ),
+    )
+    training.dummy_train_step(None)
+    kw = calls.pop()
+    assert (kw["cp_size"], kw["pipeline_model_parallel_size"], kw["dynamic_cp"]) == (1, 1, True)
+    assert kw["seq_length"] == 16
+    assert kw["has_cu_seqlens"] is True and kw["create_attention_mask_in_dataloader"] is False
