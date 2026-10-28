@@ -1388,6 +1388,16 @@ class TransformerConfig(ModelParallelConfig):
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""
 
+    mhc_norm_eps_inside_sqrt: bool = False
+    """Use rsqrt(mean(x**2) + layernorm_epsilon) for the mHC mapping norm."""
+
+    mhc_keep_mappings_in_fp32: bool = False
+    """Keep mHC coefficients and stream mixing in FP32 until the output cast."""
+
+    mhc_learned_output_contract: bool = True
+    """Contract residual streams to the ordinary hidden width using token-dependent gating;
+    otherwise average the streams."""
+
     use_fused_mhc: bool = False
     """Use fused kernels for mHC operations when supported.
 
@@ -1710,6 +1720,19 @@ class TransformerConfig(ModelParallelConfig):
     insert these joins. This feature is particularly useful when using with full-iteration CUDA
     graphs"""
 
+    fine_grained_offloading_buffer_size_gib: float = 0.0
+    """Fixed pinned activation buffer capacity per rank, in GiB; zero disables it.
+    Capacity in bytes must be a positive multiple of 256 bytes and is pinned at that
+    size, not rounded up to a power of two. The buffer is allocated once, at the first
+    forward pass, and never grows; running out raises an error. Space is reused only
+    once every backup has been reloaded, so the buffer must hold everything offloaded
+    between such points, with each tensor aligned to 256 bytes. That is one microbatch
+    when each backward finishes before the next forward starts (PP=1, or the last
+    pipeline stage without virtual pipeline stages, and no
+    overlap_moe_expert_parallel_comm); otherwise it is everything the rank offloads in
+    an iteration, across all microbatches and model chunks. This bounds the shared
+    offload buffer, not other host allocations or allocator caches."""
+
     @classmethod
     def from_config(cls, config: "TransformerConfig") -> Self:
         """Create this config type from an existing normalized transformer config.
@@ -1739,18 +1762,6 @@ class TransformerConfig(ModelParallelConfig):
         ):
             raise ValueError(
                 "attention_cp_layout='contiguous' is not yet supported with context parallelism."
-            )
-        if self.linear_cp_layout == "contiguous" and self.hybrid_context_parallel:
-            raise ValueError(
-                "hybrid_context_parallel is not supported with linear_cp_layout='contiguous'."
-            )
-        if (
-            self.sequence_packing_scheduler is not None
-            and self.context_parallel_size > 1
-            and self.linear_cp_layout != self.attention_cp_layout
-        ):
-            raise ValueError(
-                "The sequence-packing scheduler does not support CP layout conversion."
             )
         if (
             self.context_parallel_size > 1
@@ -2055,7 +2066,7 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "DSv4 context parallelism requires attention_cp_layout='contiguous'."
                 )
-            if self.hybrid_context_parallel:
+            if self.dynamic_context_parallel:
                 raise ValueError("DSv4 dynamic context parallelism is not supported yet.")
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
             if self.dsa_kernel_backend == "tilelang":
@@ -2184,9 +2195,13 @@ class TransformerConfig(ModelParallelConfig):
             )
 
             mxfp8_enabled = bool(self.fp8) and self.fp8_recipe == Fp8Recipe.mxfp8
-            if self.expert_tensor_parallel_size > 1:
+            if (
+                self.expert_tensor_parallel_size > 1
+                and self.inference_moe_token_dispatcher_type != "nvls"
+            ):
                 raise ValueError(
-                    "Inference-optimized MoE layers does not support expert tensor parallelism."
+                    "Inference-optimized MoE layers support expert tensor parallelism only "
+                    "with inference_moe_token_dispatcher_type='nvls'."
                 )
             if self.moe_expert_capacity_factor is not None:
                 raise ValueError("Inference-optimized MoE layers only support dropless MoE ")
@@ -2978,6 +2993,11 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.use_fused_mhc and not self.enable_mhc_connections:
             raise ValueError("use_fused_mhc requires enable_mhc_connections=True.")
+        if self.use_fused_mhc and (self.mhc_norm_eps_inside_sqrt or self.mhc_keep_mappings_in_fp32):
+            raise ValueError(
+                "use_fused_mhc does not support mhc_norm_eps_inside_sqrt or "
+                "mhc_keep_mappings_in_fp32; use the unfused mHC path."
+            )
 
         valid_mhc_fused_backends = ("auto", "native", "triton", "cutile")
         if self.mhc_fused_backend not in valid_mhc_fused_backends:
@@ -2987,13 +3007,6 @@ class TransformerConfig(ModelParallelConfig):
             )
         if self.mhc_fused_backend != "auto" and not self.use_fused_mhc:
             raise ValueError("mhc_fused_backend requires use_fused_mhc=True when set explicitly.")
-
-        if self.enable_mhc_connections and self.recompute_granularity == "full":
-            raise NotImplementedError(
-                "enable_mhc_connections is not yet compatible with full activation recompute. "
-                "Use selective recompute with 'mhc' in recompute_modules, or disable "
-                "activation recompute."
-            )
 
         if self.enable_mhc_connections and self.inference_fuse_tp_communication:
             raise NotImplementedError(
@@ -3038,6 +3051,24 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "mhc_init_gating_factor must be non-negative, got "
                     f"{self.mhc_init_gating_factor}."
+                )
+
+        buffer_size = self.fine_grained_offloading_buffer_size_gib
+        if buffer_size != 0:
+            buffer_bytes = buffer_size * 2**30
+            if not math.isfinite(buffer_bytes) or buffer_bytes <= 0:
+                raise ValueError("Pinned offload buffer requires a finite positive buffer_size_gib")
+            if not self.fine_grained_activation_offloading:
+                raise ValueError(
+                    "Pinned offload buffer requires fine_grained_activation_offloading"
+                )
+            capacity = int(buffer_bytes)
+            if capacity != buffer_bytes or capacity < 256 or capacity % 256:
+                raise ValueError(
+                    "Pinned offload buffer capacity must be a positive multiple of 256 bytes, "
+                    "so the size in GiB must be a multiple of 2**-22 (for example 152 or "
+                    f"152.5); got fine_grained_offloading_buffer_size_gib={buffer_size} "
+                    f"({buffer_bytes} bytes)"
                 )
 
         if self.fine_grained_activation_offloading:
@@ -3145,6 +3176,24 @@ class TransformerConfig(ModelParallelConfig):
                     f"(paged stash covers those activations). "
                     f"Remove: {moe_offload_conflict}"
                 )
+            if not self.use_transformer_engine_op_fuser:
+                if not self.moe_use_grouped_tensor:
+                    raise ValueError(
+                        "moe_paged_stash without use_transformer_engine_op_fuser requires "
+                        "moe_use_grouped_tensor=True."
+                    )
+                if (
+                    not self.bias_activation_fusion
+                    or not self.gated_linear_unit
+                    or self.activation_func not in (F.silu, quick_gelu)
+                    or self.moe_mlp_glu_interleave_size is not None
+                ):
+                    raise ValueError(
+                        "moe_paged_stash with the non-op-fuser GroupedTensor path requires "
+                        "fused SwiGLU or QuickGeGLU: set bias_activation_fusion=True, "
+                        "gated_linear_unit=True, activation_func to silu or quick_gelu, and "
+                        "moe_mlp_glu_interleave_size=None."
+                    )
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
@@ -3732,6 +3781,20 @@ class TransformerConfig(ModelParallelConfig):
                     'use cuda_graph_impl=transformer_engine instead.'
                 )
                 self.cuda_graph_impl = "transformer_engine"
+
+        if self.dynamic_context_parallel:
+            # Captured graphs bake in static communicators, so they cannot follow the
+            # per-microbatch CP group that dynamic context parallelism selects at runtime.
+            assert (
+                self.cuda_graph_impl == "none"
+            ), "Dynamic context parallelism not supported with CUDA Graph"
+            assert (
+                self.calculate_per_token_loss
+            ), "Dynamic context parallelism must be used with calculate_per_token_loss"
+            # The router z-loss still scales by the static TP x CP group, not the runtime one.
+            assert (
+                self.moe_z_loss_coeff is None
+            ), "Dynamic context parallelism not supported with moe_z_loss_coeff"
 
         if self.cuda_graph_scope is not None:
             assert self.cuda_graph_modules in (

@@ -485,6 +485,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             delta_offload_bytes_across_pp_ranks=self.config.delta_offload_bytes_across_pp_ranks,
             activation_offload_fraction=self.config.activation_offload_fraction,
             max_inflight_offloads=self.config.fine_grained_offloading_max_inflight_offloads,
+            buffer_size_gib=self.config.fine_grained_offloading_buffer_size_gib,
         )
         if self.disable_param_offloading:
             for param in self.decoder.parameters():
@@ -698,6 +699,23 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         packed_seq_params_by_layout = (
             cp_batch.packed_seq_params_by_layout if cp_batch is not None else None
         )
+        padding_mask_by_layout = None
+        if cp_batch is not None:
+            padding_mask_by_layout = {}
+            for layout, layout_batch in cp_batch.batches_by_layout.items():
+                layout_mask = layout_batch.get("padding_mask")
+                # Batch views are CP-local, before SP. Each layout can have a
+                # different padded length, so shard each mask independently.
+                # Keep cp_batch unchanged for consumers that still need CP-only data.
+                if layout_mask is not None and self.config.sequence_parallel:
+                    layout_mask = (
+                        tensor_parallel.scatter_to_sequence_parallel_region(
+                            layout_mask.transpose(0, 1).contiguous(), group=self.pg_collection.tp
+                        )
+                        .transpose(0, 1)
+                        .contiguous()
+                    )
+                padding_mask_by_layout[layout] = layout_mask
         cp_layout_plan = cp_batch.thd_plan if cp_batch is not None else None
 
         # Run decoder.
@@ -714,6 +732,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 rotary_pos_emb=rotary_pos_emb,
                 packed_seq_params=packed_seq_params,
                 padding_mask=padding_mask,
+                padding_mask_by_layout=padding_mask_by_layout,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
                 input_ids=hash_input_ids,
