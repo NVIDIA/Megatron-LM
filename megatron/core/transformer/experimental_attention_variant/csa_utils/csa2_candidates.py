@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Compact CSA2 candidate blocks for unpacked sequences."""
+"""Compact CSA2 candidate blocks for packed and unpacked sequences."""
 
 from dataclasses import dataclass
 
@@ -29,6 +29,26 @@ class CSA2CandidateBlocks:
         flags.scatter_(-1, self.indices.masked_fill(self.indices < 0, num_blocks).long(), True)
         return flags[..., :num_blocks].repeat_interleave(self.block_size, -1)[..., :num_keys]
 
+    def to_mask_thd(
+        self, query_sequence_ids: Tensor, key_sequence_ids: Tensor, key_local_positions: Tensor
+    ) -> Tensor:
+        """Expand sequence-local block IDs at physical packed key addresses."""
+        num_keys = key_local_positions.numel()
+        if num_keys == 0 or self.indices.shape[-1] == 0:
+            return torch.zeros(
+                (*self.indices.shape[:-1], num_keys), dtype=torch.bool, device=self.indices.device
+            )
+        num_blocks = (num_keys + self.block_size - 1) // self.block_size
+        flags = torch.zeros(
+            (*self.indices.shape[:-1], num_blocks + 1), dtype=torch.bool, device=self.indices.device
+        )
+        # Avoid a [query, candidate, key] broadcast for long packed sequences.
+        invalid = (self.indices < 0) | (self.indices >= num_blocks)
+        flags.scatter_(-1, self.indices.masked_fill(invalid, num_blocks).long(), True)
+        key_blocks = key_local_positions.div(self.block_size, rounding_mode="floor").long()
+        selected = flags.gather(-1, key_blocks.expand(*self.indices.shape[:-1], num_keys))
+        return selected & (query_sequence_ids[None, :, None] == key_sequence_ids[None, None, :])
+
 
 @torch.no_grad()
 def candidate_blocks_from_scores(
@@ -48,9 +68,20 @@ def candidate_blocks_from_scores(
     block_scores = block_scores.masked_fill(
         torch.arange(num_blocks, device=scores.device) == newest, torch.inf
     )
-    ids = block_scores.argsort(dim=-1, descending=True, stable=True)[
-        ..., : min(topk_blocks, num_blocks)
-    ]
+    topk = min(topk_blocks, num_blocks)
+    if topk == 0 or block_scores.numel() == 0:
+        ids = torch.empty(
+            *block_scores.shape[:-1], topk, dtype=torch.int64, device=block_scores.device
+        )
+    else:
+        flat_scores = block_scores.reshape(-1, block_scores.shape[-1])
+        max_sort_elements = 1 << 24
+        rows_per_chunk = max(1, max_sort_elements // flat_scores.shape[-1])
+        chunks = [
+            block.argsort(dim=-1, descending=True, stable=True)[..., :topk]
+            for block in flat_scores.split(rows_per_chunk, dim=0)
+        ]
+        ids = torch.cat(chunks, dim=0).reshape(*block_scores.shape[:-1], topk)
     valid = block_scores.gather(-1, ids) > -torch.inf
     sentinel = torch.iinfo(torch.int32).max
     ids = ids.masked_fill(~valid, sentinel).sort(-1).values
