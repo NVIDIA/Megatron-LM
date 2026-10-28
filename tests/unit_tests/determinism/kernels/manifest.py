@@ -502,10 +502,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/moe/megakernel/mok/runtime.py",
             "megatron/core/transformer/moe/megakernel/mok/weights.py",
         ),
+        tests=(K + "test_moe_kernels.py",),
         kind="dispatch",
-        exempt_reason="MOK forward/backward, schedule, and weight-descriptor kernels require "
-        "Blackwell GPUs and the optional qizhang/mcore-integration MOK build, which are not "
-        "available in the H100 determinism bucket. Routing conversion is replayed separately.",
+        notes="Real BF16/MXFP8 routed-only SiTU with dP/main-grad replay, native shared/latent "
+        "TP/SP, and legacy BF16 fused shared with output gate off/on; requires supported MOK/TE "
+        "on SM100/SM103 with EP4.",
     ),
     KernelEntry(
         name="moe_router",
