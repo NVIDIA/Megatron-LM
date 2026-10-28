@@ -1454,6 +1454,163 @@ class TestMultiTokenPredictionLayer:
         torch.testing.assert_close(main_hidden_states.grad, torch.ones_like(main_hidden_states))
         assert torch.count_nonzero(mtp_hidden_states.grad[seq_len:]) > 0
 
+    @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
+    def test_process_mtp_loss_early_backward_matches_deferred_path(
+        self, monkeypatch, calculate_per_token_loss
+    ):
+        """mtp_loss_early_backward must reproduce the deferred path's output and gradients
+        (including the MTP loss scale) while running each head's projection exactly once and
+        accumulating the output-weight gradient already during the forward pass."""
+        monkeypatch.setattr(MTPLossLoggingHelper, "save_metrics_to_tracker", lambda *a, **k: None)
+        monkeypatch.setattr(MTPLossAutoScaler, "main_loss_backward_scale", torch.tensor(0.5))
+        seq_len, batch_size, vocab_size, hidden_size, num_heads = 5, 2, 16, 8, 2
+        torch.manual_seed(_SEED)
+        base_hidden = torch.randn((1 + num_heads) * seq_len, batch_size, hidden_size)
+        base_weight = torch.randn(vocab_size, hidden_size)
+        labels = torch.randint(0, vocab_size, (batch_size, seq_len))
+        loss_mask = torch.ones(batch_size, seq_len)
+        loss_mask[0, -2:] = 0.0
+
+        def run(early_backward):
+            config = TransformerConfig(
+                mtp_num_layers=num_heads,
+                num_layers=2,
+                hidden_size=hidden_size,
+                num_attention_heads=2,
+                use_cpu_initialization=True,
+                calculate_per_token_loss=calculate_per_token_loss,
+                mtp_loss_early_backward=early_backward,
+            )
+            hidden_states = base_hidden.clone().requires_grad_(True)
+            output_weight = torch.nn.Parameter(base_weight.clone())
+            calls = {"output_layer": 0}
+
+            def output_layer(hidden, weight=None, runtime_gather_output=None):
+                calls["output_layer"] += 1
+                return torch.matmul(hidden, weight.t()), None
+
+            def compute_language_model_loss(labels, logits):
+                return (
+                    torch.nn.functional.cross_entropy(
+                        logits.float().view(-1, vocab_size),
+                        labels.transpose(0, 1).reshape(-1),
+                        reduction="none",
+                    )
+                    .view(seq_len, batch_size)
+                    .transpose(0, 1)
+                )
+
+            result = process_mtp_loss(
+                hidden_states=hidden_states,
+                labels=labels,
+                loss_mask=loss_mask,
+                output_layer=output_layer,
+                output_weight=output_weight,
+                is_training=True,
+                compute_language_model_loss=compute_language_model_loss,
+                config=config,
+                metric_avg_group=object(),
+            )
+            weight_grad_after_forward = (
+                None if output_weight.grad is None else output_weight.grad.clone()
+            )
+            assert hidden_states.grad is None
+            # Main-loss backward: unit upstream gradient on the returned hidden states.
+            result.backward(torch.ones_like(result))
+            return (
+                result.detach(),
+                hidden_states.grad,
+                output_weight.grad,
+                weight_grad_after_forward,
+                calls["output_layer"],
+            )
+
+        deferred = run(early_backward=False)
+        early = run(early_backward=True)
+
+        torch.testing.assert_close(early[0], deferred[0])
+        torch.testing.assert_close(early[1], deferred[1])
+        torch.testing.assert_close(early[2], deferred[2])
+        # Deferred: weight grad only exists after the main backward.
+        assert deferred[3] is None
+        # Early: the full MTP contribution to the weight grad is already there after forward.
+        torch.testing.assert_close(early[3], deferred[2])
+        # No recompute in either mode: one vocab projection per head.
+        assert deferred[4] == num_heads and early[4] == num_heads
+
+    def test_process_mtp_loss_early_backward_frees_head_graph_before_next_head(self):
+        """Each head's logits must be released (backward done) before the next head runs."""
+        config = TransformerConfig(
+            mtp_num_layers=2,
+            num_layers=2,
+            hidden_size=8,
+            num_attention_heads=2,
+            use_cpu_initialization=True,
+            mtp_loss_early_backward=True,
+        )
+        seq_len = 4
+        hidden_states = torch.randn(3 * seq_len, 1, config.hidden_size, requires_grad=True)
+        output_weight = torch.nn.Parameter(torch.randn(16, config.hidden_size))
+        weight_grad_snapshots = []
+
+        def output_layer(hidden, weight=None, runtime_gather_output=None):
+            # Entering head k: head k-1 must already have back-propagated into the weight.
+            weight_grad_snapshots.append(None if weight.grad is None else weight.grad.clone())
+            return torch.matmul(hidden, weight.t()), None
+
+        result = process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=torch.arange(seq_len).unsqueeze(0),
+            loss_mask=torch.ones(1, seq_len),
+            output_layer=output_layer,
+            output_weight=output_weight,
+            is_training=False,
+            compute_language_model_loss=lambda labels, logits: logits.square()
+            .sum(dim=-1)
+            .transpose(0, 1),
+            config=config,
+        )
+        assert weight_grad_snapshots[0] is None
+        assert weight_grad_snapshots[1] is not None
+        assert torch.count_nonzero(weight_grad_snapshots[1]) > 0
+        assert torch.count_nonzero(output_weight.grad - weight_grad_snapshots[1]) > 0
+
+        result.sum().backward()
+        # The injected head gradients reach the MTP head inputs through the main backward.
+        assert torch.count_nonzero(hidden_states.grad[seq_len:]) > 0
+
+    def test_process_mtp_loss_early_backward_is_skipped_without_grad(self):
+        """Under no_grad there is no graph to back-propagate; the plain path must be taken."""
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            num_layers=2,
+            hidden_size=8,
+            num_attention_heads=2,
+            use_cpu_initialization=True,
+            mtp_loss_early_backward=True,
+        )
+        seq_len = 4
+        hidden_states = torch.randn(2 * seq_len, 1, config.hidden_size)
+        output_weight = torch.nn.Parameter(torch.randn(16, config.hidden_size))
+        with torch.no_grad():
+            result = process_mtp_loss(
+                hidden_states=hidden_states,
+                labels=torch.arange(seq_len).unsqueeze(0),
+                loss_mask=torch.ones(1, seq_len),
+                output_layer=lambda hidden, weight=None, runtime_gather_output=None: (
+                    torch.matmul(hidden, weight.t()),
+                    None,
+                ),
+                output_weight=output_weight,
+                is_training=False,
+                compute_language_model_loss=lambda labels, logits: logits.square()
+                .sum(dim=-1)
+                .transpose(0, 1),
+                config=config,
+            )
+        assert output_weight.grad is None
+        torch.testing.assert_close(result, hidden_states[:seq_len])
+
 
 class TestMTPHiddenStateRollUnderParallelism:
     """Token-level checks on the HSM hidden-state roll for every sequence-sharding mode.
@@ -1956,8 +2113,8 @@ class TestMTPHiddenStateRollUnderParallelism:
 
         Also pins which packed-parameter shapes are recognised. One tensor used as both
         ``cu_seqlens_q`` and ``cu_seqlens_q_padded`` is what the training scripts build
-        when ``CP > 1`` and must be translated; genuinely different padded boundaries
-        are not handled and must leave the caller alone rather than be mistranslated.
+        when ``CP > 1`` and must be translated. Genuinely different padded boundaries
+        must also be translated, retaining repeated boundaries at local seams.
         """
         tp, cp = 2, 2
         if int(os.environ.get("WORLD_SIZE", "1")) < tp * cp:
@@ -2035,8 +2192,8 @@ class TestMTPHiddenStateRollUnderParallelism:
         )
         assert really_padded is not None
         expected_padded = {
-            (0, 0): [0, 4, 8, 8, 8],
-            (0, 1): [0, 0, 0, 4, 8],
+            (0, 0): [0, 4, 4, 4, 8, 8, 8, 8, 8],
+            (0, 1): [0, 0, 0, 0, 0, 4, 4, 4, 8],
             (1, 0): [0, 6, 8, 8, 8],
             (1, 1): [0, 0, 0, 6, 8],
         }[(get_pg_rank(cp_group), get_pg_rank(tp_group))]
@@ -2442,7 +2599,9 @@ class TestMultiTokenPrediction:
         set_args(args)
         # Temporary args/config duplication during the training-loop refactor:
         # migrated settings use config; remaining settings still use legacy args.
-        set_run_config(pretrain_cfg_container_from_args(args))
+        cfg = pretrain_cfg_container_from_args(args)
+        cfg.finalize()
+        set_run_config(cfg)
         initialize_runtime_services(args, build_tokenizer=False, training=True)
         return args
 
@@ -3399,11 +3558,145 @@ class TestMultiTokenPrediction:
             cu_seqlens_q_padded=cu_seqlens_padded,
             cu_seqlens_kv_padded=cu_seqlens_padded,
             qkv_format="thd",
+            pad_between_seqs=True,
         )
 
         rolled, _ = roll_tensor(tensor, shifts=-1, dims=-1, packed_seq_params=packed_seq_params)
 
         torch.testing.assert_close(rolled, expected)
+
+    def test_roll_tensor_rolls_trailing_slots_after_final_packed_sequence(self):
+        tensor = torch.arange(10)
+        logical = torch.tensor([0, 3], dtype=torch.int32)
+        physical = torch.tensor([0, 8], dtype=torch.int32)
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=logical,
+            cu_seqlens_kv=logical,
+            cu_seqlens_q_padded=physical,
+            cu_seqlens_kv_padded=physical,
+            qkv_format="thd",
+            pad_between_seqs=True,
+            total_tokens=tensor.numel(),
+        )
+
+        rolled, _ = roll_tensor(tensor, packed_seq_params=packed_seq_params)
+
+        torch.testing.assert_close(rolled, torch.tensor([1, 2, 0, 0, 0, 0, 0, 0, 9, 0]))
+
+    @pytest.mark.parametrize("dims", [-1, 0])
+    def test_roll_tensor_local_packed_gradients_with_trailing_slots(self, dims):
+        tensor = torch.arange(20, dtype=torch.float32).reshape(2, 10).movedim(-1, dims)
+        tensor.requires_grad_()
+        logical = torch.tensor([0, 3], dtype=torch.int32)
+        physical = torch.tensor([0, 8], dtype=torch.int32)
+        packed = PackedSeqParams(
+            cu_seqlens_q=logical,
+            cu_seqlens_kv=logical,
+            cu_seqlens_q_padded=physical,
+            cu_seqlens_kv_padded=physical,
+            qkv_format="thd",
+        )
+        weights = torch.arange(1, 21, dtype=torch.float32).reshape_as(tensor)
+
+        rolled, rolled_sum = roll_tensor(
+            tensor, dims=dims, packed_seq_params=packed, return_sum=False
+        )
+        assert rolled_sum is None
+        (rolled * weights).sum().backward()
+
+        expected_grad = torch.zeros_like(tensor)
+        expected_grad.select(dims, 1).copy_(weights.select(dims, 0))
+        expected_grad.select(dims, 2).copy_(weights.select(dims, 1))
+        expected_grad.select(dims, 9).copy_(weights.select(dims, 8))
+        torch.testing.assert_close(tensor.grad, expected_grad)
+
+    def test_roll_tensor_with_no_packed_documents_rolls_trailing_slots(self):
+        tensor = torch.arange(4)
+        boundaries = torch.tensor([0], dtype=torch.int32)
+        packed = PackedSeqParams(
+            cu_seqlens_q=boundaries,
+            cu_seqlens_kv=boundaries,
+            cu_seqlens_q_padded=boundaries,
+            cu_seqlens_kv_padded=boundaries,
+            qkv_format="thd",
+        )
+
+        rolled, rolled_sum = roll_tensor(tensor, packed_seq_params=packed)
+
+        torch.testing.assert_close(rolled, torch.tensor([1, 2, 3, 0]))
+        torch.testing.assert_close(rolled_sum, rolled.sum())
+
+    def test_roll_tensor_accepts_cpu_boundaries_with_cuda_tokens(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA is required")
+        tensor = torch.arange(10, device="cuda")
+        logical = torch.tensor([0, 3], dtype=torch.int32)
+        physical = torch.tensor([0, 8], dtype=torch.int32)
+        packed = PackedSeqParams(
+            cu_seqlens_q=logical,
+            cu_seqlens_kv=logical,
+            cu_seqlens_q_padded=physical,
+            cu_seqlens_kv_padded=physical,
+            qkv_format="thd",
+        )
+
+        rolled, _ = roll_tensor(tensor, packed_seq_params=packed)
+
+        torch.testing.assert_close(
+            rolled, torch.tensor([1, 2, 0, 0, 0, 0, 0, 0, 9, 0], device="cuda")
+        )
+
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_roll_tensor_rejects_misaligned_cp_document(self, device):
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA is required")
+
+        class CPGroup:
+            def size(self):
+                return 2
+
+        tensor = torch.tensor([7], device=device)
+        boundaries = torch.tensor([0, 2], dtype=torch.int32, device=device)
+        packed = PackedSeqParams(
+            cu_seqlens_q=boundaries, cu_seqlens_kv=boundaries, qkv_format="thd"
+        )
+
+        with pytest.raises(ValueError, match="divisible by twice the CP size"):
+            roll_tensor(tensor, cp_group=CPGroup(), packed_seq_params=packed)
+        torch.testing.assert_close(tensor + 1, tensor.new_tensor([8]))
+
+    def test_roll_tensor_packed_cp_gradients(self):
+        cp = 4
+        if int(os.environ.get("WORLD_SIZE", "1")) < cp:
+            pytest.skip(f"CP={cp} requires at least {cp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
+        cp_group = get_context_parallel_group()
+        cp_rank = get_pg_rank(cp_group)
+        tensor = torch.tensor([1.0, 2.0, 3.0, 4.0], device="cuda", requires_grad=True)
+        weights = torch.tensor([1.0, 2.0, 3.0, 4.0], device="cuda")
+        boundaries = torch.tensor([0, 16], dtype=torch.int32, device="cuda")
+        packed = PackedSeqParams(
+            cu_seqlens_q=boundaries, cu_seqlens_kv=boundaries, qkv_format="thd"
+        )
+
+        rolled, rolled_sum = roll_tensor(
+            tensor, cp_group=cp_group, packed_seq_params=packed, return_sum=False
+        )
+        assert rolled_sum is None
+        expected = torch.tensor(
+            [2.0, 3.0 if cp_rank == cp - 1 else 1.0, 4.0, 0.0 if cp_rank == 0 else 3.0],
+            device="cuda",
+        )
+        torch.testing.assert_close(rolled, expected)
+        unpacked_rolled, _ = roll_tensor(tensor.detach(), cp_group=cp_group, return_sum=False)
+        torch.testing.assert_close(unpacked_rolled, expected)
+        (rolled * weights).sum().backward()
+
+        expected_grad = torch.tensor(
+            [0.0, 1.0, 2.0 if cp_rank == cp - 1 else 0.0, 3.0], device="cuda"
+        )
+        torch.testing.assert_close(tensor.grad, expected_grad)
+        Utils.destroy_model_parallel()
 
     def test_roll_tensor_with_attention_padded_packed_sequences(self):
         cp = 4
@@ -3435,6 +3728,7 @@ class TestMultiTokenPrediction:
             cu_seqlens_q_padded=cu_seqlens_padded,
             cu_seqlens_kv_padded=cu_seqlens_padded,
             qkv_format="thd",
+            pad_between_seqs=True,
         )
 
         rolled, _ = roll_tensor(
@@ -3442,6 +3736,54 @@ class TestMultiTokenPrediction:
         )
 
         torch.testing.assert_close(rolled, expected)
+
+        # pretrain_gpt supplies the physical boundaries as both arrays and
+        # leaves pad_between_seqs unset.
+        physical_only = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens_padded,
+            cu_seqlens_kv=cu_seqlens_padded,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            qkv_format="thd",
+        )
+        rolled_physical_only, _ = roll_tensor(
+            tensor, cp_group=cp_group, packed_seq_params=physical_only
+        )
+        torch.testing.assert_close(rolled_physical_only, expected)
+
+        unpadded = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens_padded, cu_seqlens_kv=cu_seqlens_padded, qkv_format="thd"
+        )
+        rolled_unpadded, _ = roll_tensor(tensor, cp_group=cp_group, packed_seq_params=unpadded)
+        torch.testing.assert_close(rolled_unpadded, expected)
+
+        # Fixed-size RL metadata may contain empty documents anywhere, while
+        # trailing local slots beyond the final boundary form another segment.
+        tensor_with_tail = torch.cat((tensor, torch.tensor([99, 100], device="cuda")))
+        physical_with_empty = torch.tensor([0, 0, 8, 8, 24, 24], dtype=torch.int32, device="cuda")
+        logical_with_empty = torch.tensor([0, 0, 3, 3, 13, 13], dtype=torch.int32, device="cuda")
+        packed_with_empty = PackedSeqParams(
+            cu_seqlens_q=logical_with_empty,
+            cu_seqlens_kv=logical_with_empty,
+            cu_seqlens_q_padded=physical_with_empty,
+            cu_seqlens_kv_padded=physical_with_empty,
+            qkv_format="thd",
+            pad_between_seqs=True,
+            total_tokens=tensor_with_tail.numel() * cp,
+        )
+        rolled_with_tail, _ = roll_tensor(
+            tensor_with_tail, cp_group=cp_group, packed_seq_params=packed_with_empty
+        )
+        expected_with_tail = torch.cat((expected, torch.tensor([100, 0], device="cuda")))
+        torch.testing.assert_close(rolled_with_tail, expected_with_tail)
+
+        unpadded_with_tail = PackedSeqParams(
+            cu_seqlens_q=physical_with_empty, cu_seqlens_kv=physical_with_empty, qkv_format="thd"
+        )
+        rolled_unpadded_with_tail, _ = roll_tensor(
+            tensor_with_tail, cp_group=cp_group, packed_seq_params=unpadded_with_tail
+        )
+        torch.testing.assert_close(rolled_unpadded_with_tail, expected_with_tail)
         Utils.destroy_model_parallel()
 
 
@@ -3981,7 +4323,9 @@ class TestMultiTokenPredictionHybrid:
         set_args(args)
         # Temporary args/config duplication during the training-loop refactor:
         # migrated settings use config; remaining settings still use legacy args.
-        set_run_config(pretrain_cfg_container_from_args(args))
+        cfg = pretrain_cfg_container_from_args(args)
+        cfg.finalize()
+        set_run_config(cfg)
         initialize_runtime_services(args, build_tokenizer=False, training=True)
         return args
 
@@ -4556,14 +4900,24 @@ class TestRollTensorWithCPSubgroup:
         assert seen_groups, "CP boundary exchange must go through batch_isend_irecv"
         assert all(group is cp_group for group in seen_groups)
 
-    def test_roll_tensor_packed_seq_cp_boundary_exchange(self):
+    @pytest.mark.parametrize("dims", [-1, 0])
+    def test_roll_tensor_packed_seq_cp_boundary_exchange(self, monkeypatch, dims):
         cp_group = get_context_parallel_group()
         cp_size = cp_group.size()
         cp_rank = torch.distributed.get_rank(group=cp_group)
 
+        seen_batches = []
+        real_batch_isend_irecv = torch.distributed.batch_isend_irecv
+
+        def spy_batch_isend_irecv(ops):
+            seen_batches.append([op.group for op in ops])
+            return real_batch_isend_irecv(ops)
+
+        monkeypatch.setattr(torch.distributed, "batch_isend_irecv", spy_batch_isend_irecv)
+
         seq_lengths = [8, 16]  # each divisible by 2 * cp_size
         cu_seqlens = torch.tensor([0, 8, 24], dtype=torch.int32, device="cuda")
-        full = torch.arange(1 * 24, dtype=torch.float32, device="cuda").reshape(1, 24)
+        full = torch.arange(2 * 24, dtype=torch.float32, device="cuda").reshape(2, 24)
 
         packed_seq_params = PackedSeqParams(cu_seqlens_q=cu_seqlens)
         # Oracle: single-rank packed semantics (per-sequence roll) on the full tensor.
@@ -4580,14 +4934,17 @@ class TestRollTensorWithCPSubgroup:
                 start += length
             return torch.cat(pieces, dim=-1)
 
-        expected_local = shard_packed(expected_full)
-        local = shard_packed(full).contiguous()
+        expected_local = shard_packed(expected_full).movedim(-1, dims)
+        local = shard_packed(full).movedim(-1, dims).contiguous()
         rolled, rolled_sum = roll_tensor(
-            local, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+            local, shifts=-1, dims=dims, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
 
         assert torch.equal(rolled, expected_local)
         assert rolled_sum == expected_local.sum()
+        assert len(seen_batches) == 1, "All packed documents must share one boundary exchange"
+        assert seen_batches[0]
+        assert all(group is cp_group for group in seen_batches[0])
 
 
 class TestLearnedOutputContract:

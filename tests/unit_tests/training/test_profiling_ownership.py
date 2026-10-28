@@ -15,6 +15,7 @@ from megatron.training import argument_utils, arguments, checkpointing, global_v
 from megatron.training.argument_utils import profiling_config_from_args
 from megatron.training.config import ProfilingConfig
 from megatron.training.config.container import ConfigContainerBase
+from megatron.training.state import TrainState
 from megatron.training.utils import start_memory_history_recording
 
 
@@ -54,18 +55,22 @@ def inline_profiler(monkeypatch, run_config):
     """Exercise the real train preamble/loop, stopping before the first train step."""
     args, _ = cli_config("--micro-batch-size", "1")
     remove_profiling_args(args)
-    args.iteration = args.consumed_train_samples = args.num_floating_point_operations_so_far = 0
+    train_state = TrainState()
     args.train_iters = 10
+    run_config.train.train_iters = 10
+    run_config.train.micro_batch_size = 1
     args.train_sync_interval = 0
     args.gpu_sniff_test_interval = args.check_weight_hash_across_dp_replicas_interval = None
     args.log_straggler = args.manual_gc = False
     monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_train_state", lambda: train_state)
     monkeypatch.setattr(training, "get_timers", Mock(return_value=Mock()))
     monkeypatch.setattr(training, "get_energy_monitor", lambda: None)
     monkeypatch.setattr(training, "get_one_logger", lambda: None)
     monkeypatch.setattr(training, "get_attr_wrapped_model", Mock(return_value=Mock()))
     monkeypatch.setattr(training, "get_rerun_state_machine", Mock(return_value=Mock()))
     monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
+    monkeypatch.setattr(training, "get_current_global_batch_size", lambda: 1)
     monkeypatch.setattr(training, "get_forward_backward_func", Mock())
     monkeypatch.setattr(training, "one_logger_utils", Mock())
     monkeypatch.setattr(training, "should_disable_forward_pre_hook", lambda _: False)
@@ -88,7 +93,7 @@ def inline_profiler(monkeypatch, run_config):
 
     def start(config, *, iteration=0, rank=0, tensorboard_dir=None):
         run_config.profiling = config
-        args.iteration = iteration
+        train_state.iteration = train_state.resume_iteration = iteration
         args.tensorboard_dir = "stale"
         run_config.logger.tensorboard_dir = tensorboard_dir
         monkeypatch.setattr(training.torch.distributed, "get_rank", lambda: rank)
@@ -370,14 +375,13 @@ def test_checkpoint_profiling_does_not_override_current_run(monkeypatch, options
     args.rank = 0
     args.load = "checkpoint"
     saved_args = SimpleNamespace(profile=True, profile_step_start=100, profile_ranks=[99])
-    state = {"args": saved_args, "iteration": 17, "checkpoint_version": 3.0}
+    state = {"args": saved_args, "checkpoint_version": 3.0}
     monkeypatch.setattr(
         checkpointing,
         "_load_base_checkpoint",
         Mock(return_value=(state, "checkpoint", False, None)),
     )
     checkpointing.load_args_from_checkpoint(args)
-    assert args.iteration == 17
     assert asdict(profiling_config_from_args(args)) == asdict(config)
 
 
@@ -429,11 +433,14 @@ def test_training_log_memory_snapshot_without_profiling_args(
     config.memory_snapshot_path = "owned.pickle"
     remove_profiling_args(args)
     args.data_parallel_size = args.world_size = args.gtp_weight_remat_size = 1
-    args.consumed_train_samples = args.skipped_train_samples = 0
+    train_state = TrainState()
     args.train_iters = 1
+    run_config.train.train_iters = 1
+    run_config.train.micro_batch_size = 1
     timers = Mock()
     timers.return_value.elapsed.return_value = 1.0
     monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_train_state", lambda: train_state)
     monkeypatch.setattr(training, "get_timers", lambda: timers)
     for getter in (
         "get_tensorboard_writer",

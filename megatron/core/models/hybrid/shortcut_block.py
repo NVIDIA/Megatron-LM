@@ -32,7 +32,7 @@ from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequ
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualRead
+from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualRead
 from megatron.core.typed_torch import apply_module
 
 # Layer symbols that may precede a shortcut MoE
@@ -193,14 +193,14 @@ class ShortcutMoEBlock(MegatronModule):
                 layer_number=moe_layer.layer_number,
                 branch_name="shortcut_routed",
             )
-            outer_connection = moe_layer._get_mlp_residual_connection()
-            if outer_connection is None:
+            outer_read = moe_layer._get_mlp_residual_connection(operation="read")
+            if outer_read is None:
                 raise ValueError(
                     "A wide-residual shortcut read requires an outer MoE residual connection."
                 )
             if (
                 self.shortcut_residual_read.residual_stream_hidden_size
-                != outer_connection.residual_stream_hidden_size
+                != outer_read.residual_stream_hidden_size
             ):
                 raise ValueError(
                     "The shortcut read and outer MoE residual connection must consume the "
@@ -444,6 +444,7 @@ class ShortcutMoEBlock(MegatronModule):
         packed_sequence_cp_metadata=None,
         attn_recompute_context: ResidualStreamRecomputeContext | None = None,
         moe_recompute_context: ResidualStreamRecomputeContext | None = None,
+        padding_mask_by_layout=None,
     ):
         """Run the eager schedule with each physical layer's quantization context.
 
@@ -484,9 +485,13 @@ class ShortcutMoEBlock(MegatronModule):
             )
         moe_hidden_states = hidden_states
         moe_packed_seq_params = packed_seq_params
+        moe_padding_mask = padding_mask
         if cp_layout_state is not None:
             moe_hidden_states, moe_packed_seq_params = cp_layout_state.prepare_layer(
                 self.moe_local_idx, moe_hidden_states
+            )
+            moe_padding_mask = cp_layout_state.get_layer_padding_mask(
+                self.moe_local_idx, padding_mask, padding_mask_by_layout
             )
 
         # Launch the moe_router
@@ -496,7 +501,7 @@ class ShortcutMoEBlock(MegatronModule):
             )
             route_input, route_probs = self._moe_router_preprocess(
                 shortcut_hidden=moe_hidden_states,
-                padding_mask=padding_mask,
+                padding_mask=moe_padding_mask,
                 packed_seq_params=moe_packed_seq_params,
                 recompute_context=attn_recompute_context,
             )
@@ -575,7 +580,7 @@ class ShortcutMoEBlock(MegatronModule):
             shared_expert_output, moe_unflatten_mbs, mlp_residual, mlp_state = (
                 self._moe_shared_experts(
                     hidden_states=attn_layer_output,
-                    padding_mask=padding_mask,
+                    padding_mask=moe_padding_mask,
                     packed_seq_params=moe_packed_seq_params,
                     recompute_context=moe_recompute_context,
                 )
