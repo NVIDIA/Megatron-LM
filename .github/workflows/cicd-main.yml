@@ -285,6 +285,11 @@ jobs:
           HAS_RUN_TESTS=$(echo "$LABELS"      | jq 'any(. == "Run tests")')
           HAS_RUN_FUNCTIONAL=$(echo "$LABELS" | jq 'any(. == "Run functional tests")')
           FUNCTIONAL_COVERAGE=$(echo "$LABELS" | jq 'any(. == "Collect functional coverage")')
+          # Keep full-suite approval and serialization in the existing queue
+          # policy: the coverage label alone must not expand the test matrix.
+          if [ "$HAS_RUN_FUNCTIONAL" != "true" ]; then
+            FUNCTIONAL_COVERAGE=false
+          fi
           HAS_LTS=$(echo "$LABELS"            | jq 'any(. == "container::lts")')
           HAS_MBRIDGE=$(echo "$LABELS"        | jq 'any(. == "Run MBridge tests")')
           HAS_NEMO_RL=$(echo "$LABELS"        | jq 'any(. == "Run NeMoRL tests")')

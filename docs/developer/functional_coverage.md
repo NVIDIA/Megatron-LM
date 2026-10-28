@@ -1,9 +1,12 @@
 # Functional-test coverage baselines
 
-Add the **Collect functional coverage** PR label before the synthetic PR push
+Add both **Collect functional coverage** and **Run functional tests** PR labels before the synthetic PR push
 (or rerun CI after applying it). This opt-in selects the merge-queue functional
 matrix: `scope=L1`, `cadence=mergegroup`, one repeat, and lightweight mode off.
-Existing maintainer/runner gates still apply. Normal PR and merge-queue runs do
+The existing full-suite queue policy, including `ALLOW_PR_RUN_ALL_TESTS` and
+functional-run serialization, still applies. The coverage label alone does not
+enable collection or expand the matrix. Existing maintainer/runner gates still
+apply. Normal PR and merge-queue runs do
 not collect functional coverage without this label. No recipes are removed.
 
 The collector runs inside each disposable test container. A temporary `.pth`

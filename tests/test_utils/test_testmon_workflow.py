@@ -1059,13 +1059,15 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
     assert all(entry["plan_artifact"] == "" for entry in matrix if entry["mode"] == "full")
 
 
-@pytest.mark.parametrize("other_labels", [[], ["Run tests"], ["Run functional tests"]])
+@pytest.mark.parametrize("other_labels", [[], ["Run tests"]])
 def test_functional_coverage_selects_full_merge_queue_matrix(
     tmp_path: Path, configure_environment: dict[str, str], other_labels: list[str]
 ) -> None:
     """Coverage requests keep full training and the same cadence as merge queue."""
     result, outputs = _run_configure(
-        tmp_path, configure_environment, ["Collect functional coverage", *other_labels]
+        tmp_path,
+        configure_environment,
+        ["Collect functional coverage", "Run functional tests", *other_labels],
     )
     assert result.returncode == 0, result.stderr
     assert outputs["functional_coverage"] == "true"
@@ -1078,11 +1080,12 @@ def test_functional_coverage_selects_full_merge_queue_matrix(
     assert outputs["lightweight"] == "false"
 
 
-def test_functional_coverage_is_opt_in(
-    tmp_path: Path, configure_environment: dict[str, str]
+@pytest.mark.parametrize("labels", [[], ["Collect functional coverage"]])
+def test_functional_coverage_requires_full_suite_queue_label(
+    tmp_path: Path, configure_environment: dict[str, str], labels: list[str]
 ) -> None:
-    """Unlabelled PRs retain their normal instrumentation and selection defaults."""
-    result, outputs = _run_configure(tmp_path, configure_environment, [])
+    """Coverage alone cannot bypass the full-suite queue approval policy."""
+    result, outputs = _run_configure(tmp_path, configure_environment, labels)
     assert result.returncode == 0, result.stderr
     assert outputs["functional_coverage"] == "false"
     assert outputs["scope"] == "L0"
