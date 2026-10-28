@@ -32,6 +32,7 @@ from megatron.core.process_groups_config import (
 from megatron.core.transformer.cuda_graphs import create_cudagraphs, set_current_microbatch
 from megatron.core.transformer.moe.paged_stash import paged_stash_reset
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
+from megatron.core.transformer.utils import sync_pipeline_gradient_boundaries
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
     get_attr_wrapped_model,
@@ -626,6 +627,10 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
         for x in input_tensor:
             if x is None:
                 input_tensor_grad.append(None)
+            elif x.grad is None and x.requires_grad:
+                # The input sat before a frozen-prefix boundary, so autograd never
+                # reached it. Send zeros to keep P2P with the previous stage in step.
+                input_tensor_grad.append(torch.zeros_like(x))
             else:
                 input_tensor_grad.append(x.grad)
 
@@ -1150,6 +1155,9 @@ def forward_backward_pipelining_with_interleaving(
             payload_plans=payload_plans,
             control_group=get_attr_wrapped_model(model[0], "pipeline_control_group"),
         )
+    # Received inputs always require grad; agree on the frozen-prefix boundary across
+    # stages before the first microbatch so frozen stages can skip their backward.
+    sync_pipeline_gradient_boundaries(model, getattr(pg_collection, "pp", None))
     # Typed P2P releases payload references when posting the send; it retains the
     # detached wire buffers itself. Do not pseudo-deallocate its terminal scalar loss.
     deallocate_pipeline_outputs = config.deallocate_pipeline_outputs and not typed_pipeline
@@ -2422,6 +2430,10 @@ def forward_backward_pipelining_without_interleaving(
             payload_plans=payload_plans,
             control_group=get_attr_wrapped_model(model, "pipeline_control_group"),
         )
+    # Received inputs always require grad; agree on the frozen-prefix boundary across
+    # stages before the first microbatch so frozen stages can skip their backward.
+    if not is_multimodule:
+        sync_pipeline_gradient_boundaries(model, getattr(pg_collection, "pp", None))
     # Typed P2P owns payload release, including asynchronous send-buffer lifetimes.
     deallocate_pipeline_outputs = config.deallocate_pipeline_outputs and payload_factory is None
 
