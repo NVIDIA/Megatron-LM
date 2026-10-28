@@ -119,6 +119,9 @@ def _setup_model(
     args.no_load_rng = True
     args.load_main_params_from_ckpt = True
     set_args(args)
+    # The fixture built the run config before these save/load settings were chosen; the setup
+    # load below reads the registered checkpoint section, not the namespace.
+    sync_checkpoint_config(args)
     torch.manual_seed(1234)
     Utils.initialize_model_parallel()
     model, optimizer, scheduler = setup_model_and_optimizer(

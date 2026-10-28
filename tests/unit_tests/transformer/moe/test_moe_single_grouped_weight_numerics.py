@@ -467,6 +467,9 @@ class TestMoESingleGroupedWeightNumerics:
             args.no_load_rng = True
             args.load_main_params_from_ckpt = True
         set_args(args)
+        # The fixture built the run config before the save/load settings above were chosen; the
+        # setup load reads the registered checkpoint section, not the namespace.
+        sync_checkpoint_config(args)
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, expert_model_parallel_size=args.expert_model_parallel_size
