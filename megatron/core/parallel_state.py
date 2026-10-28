@@ -2313,7 +2313,9 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
             for_expert_parallelism=True
         )
 
-        # Add to the ProcessGroupCollection:
+        # initialize_model_parallel() returns the registered collection itself, so add the
+        # groups to a copy:
+        pg_collection = copy.copy(pg_collection)
         pg_collection.dp_cp_ag = dp_cp_ag
         pg_collection.expt_dp_ag = expt_dp_ag
     """
