@@ -73,7 +73,7 @@ def test_iteration_and_weak_references():
 
 
 def test_explicit_reset_and_exhaustion():
-    """Only reset starts another pass; lookahead and iteration never advance it."""
+    """Sequential traversal requires reset; unique events can select their position."""
     module = nn.Module()
     a = ExecutionEvent(module=module, phase=Phase.FORWARD)
     b = ExecutionEvent(module=module, phase=Phase.BACKWARD)
@@ -89,7 +89,12 @@ def test_explicit_reset_and_exhaustion():
         assert list(order)[order.position :] == []
         with pytest.raises(RuntimeError, match='exceeded'):
             order.advance()
+    assert order.advance(b) == b
+    assert order.advance(a) == a
     order.reset_cursor(1)
+    with pytest.raises(RuntimeError, match="diverged"):
+        order.advance(a)
+    assert order.position == 1
     assert order.advance() == b
     empty = ExecutionOrder()
     assert list(empty) == []
