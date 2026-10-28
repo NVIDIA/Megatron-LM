@@ -102,7 +102,17 @@ def add_mimo_args(parser):
     group.add_argument('--language-model-checkpoint', type=str, default=None, help='Path to language model checkpoint to load')
     # energon dataloader related args
     group.add_argument('--packing-buffer-size', type=int, default=None, help='Packing buffer size when using sequence packing')
-    
+    group.add_argument(
+        '--finetune-whisper-encoder',
+        action='store_true',
+        help='Train the HF Whisper tower and average its gradient across TP',
+    )
+    group.add_argument(
+        '--all-audio-clips',
+        action='store_true',
+        help='Keep every audio clip instead of the first turn and first file',
+    )
+
     return parser
 
 

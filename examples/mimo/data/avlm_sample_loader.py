@@ -1,4 +1,23 @@
-import io
+def _all_audio_clips() -> bool:
+    try:
+        from megatron.training import get_args
+
+        return bool(getattr(get_args(), "all_audio_clips", False))
+    except Exception:
+        return False
+
+
+def reject_clip_list(audio, all_clips: bool) -> None:
+    if isinstance(audio, (list, tuple)) and not all_clips:
+        raise ValueError("encode_sample rejects a list of audio clips")
+
+
+def _collapse_extra_audio(context: str) -> str:
+    if context.count("<audio>") > 1:
+        parts = context.split("<audio>")
+        return parts[0] + "<audio>" + "".join(parts[1:])
+    return context
+
 
 def sample_loader(raw: dict) -> dict:
     """
@@ -55,31 +74,54 @@ def sample_loader(raw: dict) -> dict:
 
     jsn_content = raw["json"]
     conversation = jsn_content["conversations"]
-    
+
     # Get raw image bytes
     image_bytes = raw["img"]
 
-    # Get raw audio bytes
-    audio_names = [audio_name.split('.', 1)[1] for audio_name in jsn_content["audios"]] # example of audio_name file: "100_100.synthesized_683016ff-bb67-4a12-a873-a7e5d4132903.wav.flac" -> "synthesized_683016ff-bb67-4a12-a873-a7e5d4132903.wav"
-    audio_name = audio_names[0]  # for now, take only the first audio
-    audio_bytes = raw[audio_name]
+    # example: "100_100.synthesized_....wav.flac" -> "synthesized_....wav"
+    audio_names = [audio_name.split(".", 1)[1] for audio_name in jsn_content["audios"]]
 
-    # process conversation, take only the first turn
-    context = conversation[0]["value"]
-    answers = conversation[1]["value"]
+    if not _all_audio_clips():
+        # First file and first turn. Extra "<audio>" tags in that turn collapse.
+        context = _collapse_extra_audio(conversation[0]["value"])
+        answers = conversation[1]["value"]
+        return dict(
+            __key__=raw["__key__"],
+            context=context,
+            answers=answers,
+            image=image_bytes,
+            audio=raw[audio_names[0]],
+        )
 
-    # check that context only contains one "<audio>"
-    # if contains more than one, replace all occurrences with a single one
-    if context.count("<audio>") > 1:
-        parts = context.split("<audio>")
-        context = parts[0] + "<audio>" + "".join(parts[1:])
-
+    if len(conversation) % 2 != 0:
+        raise ValueError(f"conversations are not paired for {raw['__key__']}")
+    contexts = []
+    answers = []
+    user_tags = 0
+    for turn in range(0, len(conversation), 2):
+        user = conversation[turn]["value"]
+        assistant = conversation[turn + 1]["value"]
+        if "<audio>" in assistant:
+            raise ValueError(f"assistant turn contains <audio> for {raw['__key__']}")
+        user_tags += user.count("<audio>")
+        contexts.append(user)
+        answers.append(assistant)
+    if user_tags != len(audio_names):
+        raise ValueError(
+            f"audio tag count {user_tags} != file count {len(audio_names)} "
+            f"for {raw['__key__']}"
+        )
+    blobs = []
+    for name in audio_names:
+        if name not in raw:
+            raise ValueError(f"missing audio blob {name} for {raw['__key__']}")
+        blobs.append(raw[name])
     return dict(
         __key__=raw["__key__"],
-        context=context,
+        context=contexts,
         answers=answers,
         image=image_bytes,
-        audio=audio_bytes,
+        audio=blobs,
     )
 
 def part_filter(part: str) -> bool:

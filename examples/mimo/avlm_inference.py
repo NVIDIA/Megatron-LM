@@ -18,7 +18,10 @@ from examples.mimo.model_providers.llava_avlm import model_provider_llava_avlm
 from megatron.core import dist_checkpointing, parallel_state, tensor_parallel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.training import print_rank_0
-from examples.mimo.data.utils.calculate_audio_tokens import calculate_num_audio_tokens
+from examples.mimo.data.utils.calculate_audio_tokens import (
+    capped_whisper_lengths,
+    expand_audio_placeholders,
+)
 
 def init_distributed(tp_size: int = 1, pp_size: int = 1):
     if torch.distributed.is_initialized():
@@ -88,9 +91,10 @@ def get_input_data(
     processed_audios = audio_processor(audio_tensor, sampling_rate=16000)
     processed_audios = torch.tensor(processed_audios["input_features"])
     processed_audios = processed_audios.squeeze(0) # remove batch dim
-    num_audio_tokens = calculate_num_audio_tokens(audio_tensor.unsqueeze(0), "openai/whisper-base")
+    mel_frames, num_audio_tokens = capped_whisper_lengths(int(audio_tensor.shape[-1]))
     audios_seq_lengths = torch.tensor(num_audio_tokens)
-    prompt = prompt.replace("<audio>", "<audio>" * num_audio_tokens)
+    audios_feature_lengths = torch.tensor(mel_frames)
+    prompt = expand_audio_placeholders(prompt, [num_audio_tokens])
 
     # process image
     processed_images = image_processor(
@@ -113,10 +117,17 @@ def get_input_data(
     processed_images = processed_images.unsqueeze(0).to(device)
     processed_audios = processed_audios.unsqueeze(0).to(device)
     audios_seq_lengths = audios_seq_lengths.unsqueeze(0).to(device)
+    audios_feature_lengths = audios_feature_lengths.unsqueeze(0).to(device)
     tokens = processed_prompt_inputs["input_ids"].to(device)
     modality_inputs = {
         "images": {"clip_encoder": {"pixel_values": processed_images}},
-        "audios": {"whisper_encoder": {"input_features": processed_audios, "seq_lengths": audios_seq_lengths}}
+        "audios": {
+            "whisper_encoder": {
+                "input_features": processed_audios,
+                "seq_lengths": audios_seq_lengths,
+                "feature_lengths": audios_feature_lengths,
+            }
+        },
     }
     batch_data = {
         "tokens": tokens,
