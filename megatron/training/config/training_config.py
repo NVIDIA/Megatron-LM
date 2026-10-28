@@ -597,11 +597,17 @@ class CheckpointConfig:
     loading a bit (double rank0 ckpt load).
     """
 
-    ckpt_convert_format: Literal["torch", "torch_dist"] | None = None
+    ckpt_convert_format: Literal["torch", "torch_dist", "fsdp_dtensor"] | None = None
     """Checkpoint format for conversion."""
 
     ckpt_convert_save: str | None = None
     """Save directory for converted checkpoint."""
+
+    moe_scheduler_export_logical_checkpoint: bool = False
+    """With checkpoint conversion, restore logical expert order and export without scheduler state.
+    Load the home checkpoint with its original topology and scheduler configuration.
+    Optimizer masters/state are required and are preserved in the converted checkpoint.
+    """
 
     ckpt_convert_update_legacy_dist_opt_format: bool = False
     """When loading a checkpoint, update the legacy format for the distributed optimizer,

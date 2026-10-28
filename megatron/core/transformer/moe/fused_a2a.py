@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Portions of this code are from DeepSeek DeepEP project
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
@@ -32,6 +32,26 @@ except ImportError:
     HAVE_DEEP_EP_V2 = False
 
 import torch
+
+try:
+    from transformer_engine.pytorch.tensor import QuantizedTensor
+
+    HAVE_TE_QUANTIZED_TENSOR = True
+except ImportError:
+    QuantizedTensor = None
+    HAVE_TE_QUANTIZED_TENSOR = False
+
+try:
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor.float8_blockwise_tensor import Float8BlockwiseQTensor
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+
+    HAVE_TE_FP8_EXPERT_WEIGHTS = True
+except ImportError:
+    Float8BlockwiseQTensor = None
+    MXFP8Tensor = None
+    tex = None
+    HAVE_TE_FP8_EXPERT_WEIGHTS = False
 
 _buffer = None
 _elastic_buffer = None
@@ -793,7 +813,315 @@ class HybridEPCombine(torch.autograd.Function):
         return dispatched_hidden, None, None, None, None
 
 
+@internal_api
+class HybridEPExpertDispatch(torch.autograd.Function):
+    '''
+    Fused expert-weight dispatch using the HybridEP backend.
+    '''
+
+    expert_dispatch_buffer = None
+
+    @staticmethod
+    def forward(
+        ctx,
+        routing_map,
+        group,
+        handle,
+        num_local_idle_experts,
+        num_sms_dispatch_api,
+        num_sms_combine_api,
+        num_dispatched_weights,
+        weight_chunk_size,
+        *expert_weights,
+    ):
+        '''
+        Forward pass of fused expert-weight dispatch.
+        '''
+        if not HAVE_HYBRIDEP:
+            raise RuntimeError(
+                "HybridEP expert dispatch requires a DeepEP build with HybridEPBuffer."
+            )
+        if len(expert_weights) == 0:
+            raise ValueError("HybridEP expert dispatch requires at least one expert weight.")
+        if num_dispatched_weights is None:
+            num_dispatched_weights = num_local_idle_experts
+        if num_dispatched_weights <= 0:
+            raise ValueError("num_dispatched_weights must be positive.")
+        if weight_chunk_size <= 0:
+            raise ValueError("weight_chunk_size must be positive.")
+
+        num_total_experts = routing_map.shape[1]
+        num_local_home_experts = len(expert_weights)
+        weight_list = []
+        scale_list = []
+        weight_shape = expert_weights[0].shape
+        fp8_dispatch = False
+        quantized_tensor_class = None
+
+        for weight in expert_weights:
+            if (
+                HAVE_TE_QUANTIZED_TENSOR
+                and QuantizedTensor is not None
+                and isinstance(weight, QuantizedTensor)
+            ):
+                if not HAVE_TE_FP8_EXPERT_WEIGHTS:
+                    raise RuntimeError(
+                        "HybridEP FP8 expert dispatch requires TransformerEngine FP8 tensor "
+                        "wrappers."
+                    )
+                quantized_tensor_class = weight.__class__
+                row_weight, col_weight = weight.get_data_tensors()
+                metadata = weight.get_metadata()
+                row_scale, col_scale = (
+                    metadata['rowwise_scale_inv'].view(torch.float32),
+                    metadata['columnwise_scale_inv'].view(torch.float32),
+                )
+                weight_list.extend([row_weight.ravel(), col_weight.ravel()])
+                scale_list.extend([row_scale.ravel(), col_scale.ravel()])
+                fp8_dispatch = True
+            else:
+                weight_list.append(weight.ravel())
+
+        weight_tensor = torch.stack(weight_list, dim=0).reshape(num_local_home_experts, -1)
+        if weight_tensor.shape[1] % weight_chunk_size != 0:
+            raise ValueError(
+                "Expert weight flattened size must be divisible by weight_chunk_size, "
+                f"got {weight_tensor.shape[1]} and {weight_chunk_size}."
+            )
+        num_chunks_per_weight = weight_tensor.shape[1] // weight_chunk_size
+        weight_tensor = weight_tensor.reshape(
+            num_local_home_experts * num_chunks_per_weight, weight_chunk_size
+        )
+
+        if fp8_dispatch:
+            scale_tensor = torch.stack(scale_list, dim=0)
+            scale_tensor = scale_tensor.reshape(num_local_home_experts * num_chunks_per_weight, -1)
+        else:
+            scale_tensor = None
+
+        routing_map = (
+            routing_map.reshape(num_local_home_experts, 1, num_total_experts)
+            .expand(-1, num_chunks_per_weight, -1)
+            .reshape(num_local_home_experts * num_chunks_per_weight, num_total_experts)
+            .contiguous()
+        )
+
+        if HybridEPExpertDispatch.expert_dispatch_buffer is None:
+            seq_len, hidden_dim = weight_tensor.shape
+            kwargs = {}
+            if num_sms_dispatch_api is not None:
+                kwargs['num_sms_dispatch_api'] = num_sms_dispatch_api
+            if num_sms_combine_api is not None:
+                kwargs['num_sms_combine_api'] = num_sms_combine_api
+            HybridEPExpertDispatch.expert_dispatch_buffer = HybridEPBuffer(
+                group=group,
+                hidden_dim=hidden_dim,
+                max_num_of_tokens_per_rank=seq_len,
+                num_local_experts=num_local_idle_experts,
+                use_fp8=fp8_dispatch,
+                **kwargs,
+            )
+
+        num_permuted_tokens = num_dispatched_weights * num_chunks_per_weight
+        if fp8_dispatch:
+            assert scale_tensor.dtype == torch.float32
+            assert weight_tensor.shape[1] // scale_tensor.shape[1] == 128
+
+        if handle is None:
+            dispatched_weight, _, dispatched_scaling_factor, _, handle = (
+                HybridEPExpertDispatch.expert_dispatch_buffer.dispatch_with_permute(
+                    hidden=weight_tensor,
+                    routing_map=routing_map,
+                    probs=None,
+                    scaling_factor=scale_tensor,
+                    pad_multiple=None,
+                    num_permuted_tokens=num_permuted_tokens,
+                    non_blocking=True,
+                )
+            )
+        else:
+            dispatched_weight, _, dispatched_scaling_factor, _, handle = (
+                HybridEPExpertDispatch.expert_dispatch_buffer.dispatch_with_permute(
+                    hidden=weight_tensor,
+                    scaling_factor=scale_tensor,
+                    handle=handle,
+                    pad_multiple=None,
+                    num_permuted_tokens=num_permuted_tokens,
+                )
+            )
+
+        if fp8_dispatch:
+            dispatched_raw_weight = dispatched_weight.chunk(num_dispatched_weights, dim=0)
+            dispatched_raw_scale = dispatched_scaling_factor.chunk(num_dispatched_weights, dim=0)
+            dispatched_weight_list = []
+            for idx in range(num_dispatched_weights):
+                row_weight, col_weight = dispatched_raw_weight[idx].chunk(2, dim=0)
+                row_scale, col_scale = dispatched_raw_scale[idx].chunk(2, dim=0)
+                if quantized_tensor_class is MXFP8Tensor:
+                    weight_tensor = MXFP8Tensor(
+                        weight_shape,
+                        torch.bfloat16,
+                        rowwise_data=row_weight.reshape(weight_shape),
+                        rowwise_scale_inv=row_scale.view(torch.uint8).reshape(weight_shape[0], -1),
+                        columnwise_data=col_weight.reshape(weight_shape),
+                        columnwise_scale_inv=col_scale.view(torch.uint8).reshape(
+                            -1, weight_shape[1]
+                        ),
+                        fp8_dtype=tex.DType.kFloat8E4M3,
+                        quantizer=None,
+                    )
+                elif quantized_tensor_class is Float8BlockwiseQTensor:
+                    weight_tensor = Float8BlockwiseQTensor(
+                        weight_shape,
+                        torch.bfloat16,
+                        rowwise_data=row_weight.reshape(weight_shape),
+                        rowwise_scale_inv=row_scale.reshape(weight_shape[0], -1),
+                        columnwise_data=col_weight.reshape(weight_shape),
+                        columnwise_scale_inv=col_scale.reshape(-1, weight_shape[1]),
+                        fp8_dtype=tex.DType.kFloat8E4M3,
+                        quantizer=None,
+                        is_2D_scaled=False,
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Unsupported FP8 expert weight type: {quantized_tensor_class}."
+                    )
+                dispatched_weight_list.append(weight_tensor)
+        else:
+            dispatched_weight_list = [
+                weight.reshape(weight_shape)
+                for weight in dispatched_weight.chunk(num_dispatched_weights, dim=0)
+            ]
+
+        ctx.handle = handle
+        ctx.fp8_dispatch = fp8_dispatch
+        ctx.num_chunks_per_weight = num_chunks_per_weight
+        ctx.num_local_idle_experts = num_local_idle_experts
+        ctx.num_local_home_experts = num_local_home_experts
+        ctx.weight_shape = weight_shape
+        ctx.expert_weights = expert_weights
+        return (*dispatched_weight_list, handle)
+
+    @staticmethod
+    def backward(ctx, *grad_expert_weights_and_handle):
+        '''
+        Backward pass of fused expert-weight dispatch.
+        '''
+        grad_expert_weights = grad_expert_weights_and_handle[:-1]
+        if ctx.fp8_dispatch:
+            ctx.handle[-2].hidden_dim //= 2
+
+        expert_grad_tensor = torch.stack(grad_expert_weights, dim=0).reshape(
+            ctx.num_local_idle_experts * ctx.num_chunks_per_weight, -1
+        )
+        combined_expert_grad, _ = (
+            HybridEPExpertDispatch.expert_dispatch_buffer.combine_with_unpermute(
+                hidden=expert_grad_tensor, probs=None, handle=ctx.handle, pad_multiple=None
+            )
+        )
+        weight_grad_list = [
+            weight_grad.reshape(ctx.weight_shape)
+            for weight_grad in combined_expert_grad.chunk(ctx.num_local_home_experts, dim=0)
+        ]
+
+        grad_list = []
+        for weight, weight_grad in zip(ctx.expert_weights, weight_grad_list):
+            main_grad = getattr(weight, "main_grad", None)
+            if main_grad is not None:
+                main_grad.add_(weight_grad)
+                weight.grad_added_to_main_grad = True
+                grad_list.append(None)
+            else:
+                grad_list.append(weight_grad)
+
+        return None, None, None, None, None, None, None, None, *grad_list
+
+
+def _canonical_route_sum(routes):
+    """Accumulate a route multiset in a placement-independent FP32 order.
+
+    Logical-to-physical remapping can reorder routes. Even an FP32 sum of BF16
+    contributions may land on opposite sides of a BF16 rounding boundary. Sort
+    the values for each feature before reducing; neither expert IDs nor their
+    physical ownership then affect this reduction. This is the opt-in precision
+    path, with additional temporary sorting storage and work.
+    """
+    ordered = routes.sort(dim=1).values
+    # A parallel sum may use several interleaved accumulators, losing small
+    # values even after sorting. Explicit additions preserve the chosen order.
+    total = torch.zeros_like(ordered[:, 0], dtype=torch.float32)
+    for contribution in ordered.unbind(dim=1):
+        total = total + contribution.float()
+    return total.to(routes.dtype)
+
+
+class _HybridEPRouteReduce(torch.autograd.Function):
+    """Sum routes without retaining sort indices for the backward pass."""
+
+    @staticmethod
+    def forward(ctx, routes):
+        ctx.topk = routes.shape[1]
+        return _canonical_route_sum(routes)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # A sum has the same derivative for every route, regardless of sorting.
+        return grad_output.unsqueeze(1).expand(-1, ctx.topk, -1)
+
+
+class _HybridEPRouteExpand(torch.autograd.Function):
+    """Keep route gradients separate until one FP32 input-gradient reduction."""
+
+    @staticmethod
+    def forward(ctx, hidden, topk):
+        ctx.num_tokens, ctx.hidden_size = hidden.shape
+        ctx.topk = topk
+        return hidden.repeat_interleave(topk, dim=0)
+
+    @staticmethod
+    def backward(ctx, grad_hidden):
+        grad_hidden = grad_hidden.reshape(ctx.num_tokens, ctx.topk, ctx.hidden_size)
+        return _canonical_route_sum(grad_hidden), None
+
+
+class _HybridEPRouteHandle(tuple):
+    """Retain the backend tuple contract, including the final overflow flag."""
+
+    def __new__(cls, handle, num_tokens, topk):
+        result = super().__new__(cls, handle)
+        result.num_tokens = num_tokens
+        result.topk = topk
+        return result
+
+
 if HAVE_HYBRIDEP:
+
+    @internal_api
+    def hybrid_ep_expert_dispatch(
+        routing_map,
+        group,
+        handle,
+        num_local_idle_experts,
+        num_sms_dispatch_api,
+        num_sms_combine_api,
+        num_dispatched_weights,
+        weight_chunk_size,
+        *expert_weights,
+    ):
+        '''
+        Perform fused expert-weight dispatch using the HybridEP backend.
+        '''
+        return HybridEPExpertDispatch.apply(
+            routing_map,
+            group,
+            handle,
+            num_local_idle_experts,
+            num_sms_dispatch_api,
+            num_sms_combine_api,
+            num_dispatched_weights,
+            weight_chunk_size,
+            *expert_weights,
+        )
 
     @internal_api
     def hybrid_ep_dispatch(
@@ -812,6 +1140,7 @@ if HAVE_HYBRIDEP:
         num_sms_preprocessing_api=108,
         topk_idx=None,
         num_of_experts=None,
+        preserve_route_precision=False,
     ):
         '''
         Perform fused dispatch for "permute + dispatch a2a + permute" using the
@@ -849,8 +1178,24 @@ if HAVE_HYBRIDEP:
                 Dense top-k expert indices with shape [num_tokens, topk].
             num_of_experts (int, optional):
                 Total number of experts. Required when topk_idx is provided.
+            preserve_route_precision (bool):
+                Keep expert routes separate through communication, then sum in canonical FP32 order.
+                Avoids layout-dependent intermediate BF16 rounding in forward and dgrad;
+                increases token communication/metadata capacity by up to router top-k.
         '''
-        return HybridEPDispatch.apply(
+        if preserve_route_precision:
+            if topk_idx is None or not HAVE_HYBRIDEP_DENSE_ROUTING:
+                raise ValueError("Route precision requires HybridEP compact top-k indices.")
+            num_tokens, topk = topk_idx.shape
+            indices = topk_idx.long()
+            selected_probs = probs.gather(1, indices.clamp_min(0)).masked_fill(indices < 0, 0)
+            probs = probs.new_zeros(num_tokens * topk, probs.shape[1]).scatter(
+                1, indices.reshape(-1, 1).clamp_min(0), selected_probs.reshape(-1, 1)
+            )
+            x = _HybridEPRouteExpand.apply(x, topk)
+            routing_map = None
+            topk_idx = topk_idx.reshape(-1, 1)
+        result = HybridEPDispatch.apply(
             x,
             routing_map,
             probs,
@@ -867,6 +1212,16 @@ if HAVE_HYBRIDEP:
             topk_idx,
             num_of_experts,
         )
+        if preserve_route_precision:
+            hidden, probabilities, scales, counts, handle = result
+            return (
+                hidden,
+                probabilities,
+                scales,
+                counts,
+                _HybridEPRouteHandle(handle, num_tokens, topk),
+            )
+        return result
 
     @internal_api
     def hybrid_ep_combine(x, handle, num_permuted_tokens, pad_multiple, fused=False):
@@ -886,9 +1241,14 @@ if HAVE_HYBRIDEP:
                 The alignment multiple required for FP8 GEMM. If not provided, no padding
                 is performed.
         '''
-        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple, fused)
+        result = HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple, fused)
+        if isinstance(handle, _HybridEPRouteHandle):
+            result = result.reshape(handle.num_tokens, handle.topk, result.shape[-1])
+            result = _HybridEPRouteReduce.apply(result)
+        return result
 
 else:
+    hybrid_ep_expert_dispatch = None
     hybrid_ep_dispatch = None
     hybrid_ep_combine = None
 

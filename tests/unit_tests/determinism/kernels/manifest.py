@@ -465,6 +465,36 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "Transport replay checks BF16/MXFP8 weights and FP32/BF16 gradients with scoped allocators.",
     ),
     KernelEntry(
+        name="moescheduler_planners_and_replica_transport",
+        sources=(
+            "megatron/core/transformer/moe/echo_moe_scheduler.py",
+            "megatron/core/transformer/moe/eplb_moe_scheduler.py",
+            "megatron/core/transformer/moe/replica_weight_triton.py",
+        ),
+        tests=("tests/unit_tests/transformer/moe/test_scheduler_determinism.py",),
+        kind="triton",
+        notes="GB200 multi-rank replay of placement, rerouting/probability backward, "
+        "BF16/MXFP8 peer-TMA weights/scales and replica gradient accumulation, under "
+        "side-stream pressure. Real MoELayer replay covers router, HybridEP, grouped "
+        "expert GEMMs and distributed Adam. Fixed topology and input shapes only.",
+    ),
+    KernelEntry(
+        name="moescheduler_dispatch",
+        sources=(
+            "megatron/core/transformer/moe/moe_scheduler.py",
+            "megatron/core/transformer/moe/moonep_moe_scheduler.py",
+            "megatron/core/transformer/moe/moe_scheduler_plan.py",
+            "megatron/core/transformer/moe/moe_scheduler_runtime.py",
+            "megatron/core/transformer/moe/moonep_execution_runtime.py",
+            "megatron/core/transformer/moe/moonep_peer_transport.py",
+        ),
+        tests=("tests/unit_tests/transformer/moe/test_scheduler_determinism.py",),
+        kind="dispatch",
+        notes="The orchestrator selects ECHO/EPLB/MoonEP planners and replica transports; "
+        "its Triton import only validates availability. Replay exercises those backends "
+        "through the real MoELayer and its scheduler.",
+    ),
+    KernelEntry(
         name="moe_utils",
         sources=("megatron/core/transformer/moe/moe_utils.py",),
         tests=(K + "test_moe_kernels.py",),
@@ -479,6 +509,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_moe_kernels.py",
             "tests/unit_tests/transformer/moe/test_virtual_experts.py",
+            "tests/unit_tests/transformer/moe/test_scheduler_determinism.py",
         ),
         kind="torch.compile",
         notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing.",
@@ -489,7 +520,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/moe/token_dispatcher.py",
             "megatron/core/transformer/moe/moe_layer.py",
         ),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(
+            "tests/unit_tests/transformer/moe/test_scheduler_determinism.py",
+            K + "test_moe_kernels.py",
+        ),
         kind="torch-op",
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
         "virtual-expert routing metadata and probability gradients replay under stream contention.",
@@ -497,14 +531,20 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_experts",
         sources=("megatron/core/transformer/moe/experts.py",),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(
+            "tests/unit_tests/transformer/moe/test_scheduler_determinism.py",
+            K + "test_moe_kernels.py",
+        ),
         kind="te-wrapper",
         notes="TEGroupedMLP / SequentialMLP on uneven expert loads; real BF16 SwiGLU/SiTU op-fuser replay without recompute and explicit unfused checkpoint replay, with fused-recompute rejection checked.",
     ),
     KernelEntry(
         name="moe_fused_a2a",
         sources=("megatron/core/transformer/moe/fused_a2a.py",),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(
+            "tests/unit_tests/transformer/moe/test_scheduler_determinism.py",
+            K + "test_moe_kernels.py",
+        ),
         kind="external-lib",
         notes="DeepEP flex dispatcher cell (skipped without deep_ep / >=2 GPUs). HybridEP and NCCL-EP backends are not yet "
         "replayed bit-exactly here.",
@@ -672,6 +712,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/training/utils/common_utils.py",
         ),
         tests=(
+            "tests/unit_tests/transformer/moe/test_scheduler_determinism.py",
             K + "test_optimizer_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
         ),
