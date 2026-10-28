@@ -10,6 +10,18 @@ from megatron.core.transformer.hyper_connection import HyperConnectionModule, _p
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
+@pytest.fixture(autouse=True)
+def fresh_mhc_compile_cache():
+    """Keep the bitwise grad/no-grad checks independent of earlier tests."""
+    # compute_mappings runs mHC's torch.compile'd compute_h and Sinkhorn helpers, and the
+    # grad and no-grad (checkpoint forward) passes compile separate variants. If earlier
+    # tests in this process exhausted the default recompile budget, one pass falls back
+    # to eager kernels that round differently. Keep the default budget.
+    torch.compiler.reset()
+    yield
+    torch.compiler.reset()
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("eps_inside_sqrt", [False, True])
