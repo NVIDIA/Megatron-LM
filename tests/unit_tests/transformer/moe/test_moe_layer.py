@@ -62,9 +62,8 @@ class TestMoELayerInit:
             monkeypatch.setattr(
                 moe_layer_module, "MoEAllGatherTokenDispatcher", fail_if_constructed
             )
-            monkeypatch.setattr(
-                moe_layer_module, "build_megakernel_backend", lambda **kwargs: backend
-            )
+
+            monkeypatch.setattr(moe_layer_module, "build_megakernel_backend", lambda **_: backend)
 
             layer = MoELayer(config, submodules)
 
@@ -125,6 +124,7 @@ class TestMoELayerInit:
         )
         assert isinstance(submodules, MoESubmodules)
         moe_layer = MoELayer(self.transformer_config, submodules)
+        assert moe_layer.megakernel_fuses_shared_expert is False
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("moe_token_dispatcher_type", ["allgather", "alltoall"])
