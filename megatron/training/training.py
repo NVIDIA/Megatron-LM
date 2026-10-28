@@ -3359,10 +3359,11 @@ def _get_model_pg_collection(
 def _reduce_microbatch_losses(losses_reduced, *, is_sft, sft_loss_log_mode, group):
     """Average the per-microbatch losses of a step for reporting.
 
-    ``is_sft`` is the data section's SFT family (``cfg.data.batch_flags().is_sft``): SFT
-    runs average over the trainable tokens of the global batch (or, with
-    ``--sft-loss-log-mode microbatch``, over the valid per-microbatch means), the others keep
-    the per-microbatch mean. Reporting only; gradient normalization is elsewhere.
+    ``is_sft`` is the data section's SFT family (``cfg.data.batch_flags().is_sft``). For the
+    two-element (numerator, token count) values: SFT runs average over the trainable tokens of
+    the global batch (or, with ``--sft-loss-log-mode microbatch``, over the valid per-microbatch
+    means), the others take the ratio of the global sums; one-element values keep the legacy
+    per-microbatch mean. Reporting only; gradient normalization is elsewhere.
     """
     loss_reduced = {}
     for key in losses_reduced[0].keys():
