@@ -655,27 +655,46 @@ def _get_all_rng_states():
 def _get_recompute_rng_states():
     """Get the rng states that an output-discarding checkpoint restores for its rebuild.
 
-    Graph-safe trackers hold live generator states that keep advancing after this call.
-    Outside CUDA graph capture, the generator states are cloned, so an eager rebuild replays
-    the forward random stream (for example a dropout mask) and leaves the live generators
-    untouched. During capture, the live states are kept: the capture owns their advancement.
+    Returns the live states, as ``_get_all_rng_states``, plus the contents of every live
+    generator state they hold. Graph-safe trackers hand out live generator states that keep
+    advancing after this call, so a rebuild must rewind their contents: restoring the handles
+    alone would replay a dropout mask from the advanced position. During capture no contents
+    are recorded, since the capture owns the generators' advancement.
     """
-    cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker = _get_all_rng_states()
+    rng_states = _get_all_rng_states()
     if (
         not is_graph_safe_cuda_rng_tracker(get_cuda_rng_tracker())
         or torch.cuda.is_current_stream_capturing()
     ):
-        return cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker
+        return rng_states, ()
+    _, cuda_rng_state, cuda_rng_state_tracker = rng_states
+    generators = [
+        state
+        for state in (cuda_rng_state, *cuda_rng_state_tracker.values())
+        if isinstance(state, torch.Generator)
+    ]
+    return rng_states, tuple((generator, generator.get_state()) for generator in generators)
 
-    def snapshot(state):
-        # Byte-tensor states are already copies; only generator states advance in place.
-        return state.clone_state() if isinstance(state, torch.Generator) else state
 
-    return (
-        cpu_rng_state,
-        snapshot(cuda_rng_state),
-        {name: snapshot(state) for name, state in cuda_rng_state_tracker.items()},
-    )
+@contextlib.contextmanager
+def _replay_rng_states(rng_states, generator_contents):
+    """Run a rebuild from the forward rng states, then leave every live state as it was.
+
+    Rewinding the live generator objects, instead of swapping in copies, keeps any aliasing
+    between them: inside ``tracker.fork()`` the default state is the forked tracker state.
+    """
+    with _fork_rng():
+        current_contents = [
+            (generator, generator.get_state()) for generator, _ in generator_contents
+        ]
+        for generator, contents in generator_contents:
+            generator.set_state(contents)
+        try:
+            _set_all_rng_states(*rng_states)
+            yield
+        finally:
+            for generator, contents in current_contents:
+                generator.set_state(contents)
 
 
 def _set_all_rng_states(cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker):
@@ -951,7 +970,7 @@ class _RecomputeRegion:
         self._function = function
         self._layout = _ArgLayout(args)
         # Taken before the function draws any random number.
-        self._rng_states = _get_recompute_rng_states()
+        self._rng_states, self._rng_contents = _get_recompute_rng_states()
         self._te_context = _TERecomputeContext(use_te_context)
         self._retained_storage_ptrs = (
             frozenset(t.untyped_storage().data_ptr() for t in self._layout.tensors_of(args))
@@ -1006,14 +1025,14 @@ class _RecomputeRegion:
             )
 
         leaves = self._unstash_inputs()
-        with _fork_rng():
-            _set_all_rng_states(*self._rng_states)
+        with _replay_rng_states(self._rng_states, self._rng_contents):
             with torch.enable_grad(), self._te_context.second_pass(), suspend_tensor_observations():
                 outputs = _as_tuple(self._function(*self._layout.rebuild(leaves)))
 
         self._share_rebuilt_storages(outputs)
         self._rebuilt = (outputs, leaves)
-        self._function = self._layout = self._rng_states = self._te_context = None
+        self._function = self._layout = self._rng_states = self._rng_contents = None
+        self._te_context = None
         self._output_aliases = ()
         self.state = _RegionState.REBUILT
 
