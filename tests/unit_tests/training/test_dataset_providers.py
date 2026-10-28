@@ -224,6 +224,11 @@ def _layout_from_args(args):
         context_parallel_size=args.context_parallel_size,
         sequence_parallel=args.sequence_parallel,
         dynamic_context_parallel=args.dynamic_context_parallel,
+        # What the shared rank predicate reads from the model section (the real config's values
+        # for these arguments).
+        sequence_packing_scheduler=args.sequence_packing_scheduler,
+        pipeline_model_parallel_layout=args.pipeline_model_parallel_layout,
+        mtp_num_layers=args.mtp_num_layers,
         gtp_weight_remat_size=args.gtp_weight_remat_size,
         gtp_remat_num_sequence_shards=args.gtp_remat_num_sequence_shards,
         cuda_graph_impl="none",
@@ -584,36 +589,66 @@ def test_scripts_delegate_to_the_shared_provider_body(monkeypatch):
         assert {"vp_stage", "is_packed_sequence"} <= set(parameters)
 
 
-def test_shared_rank_predicate_reads_the_registered_arguments(monkeypatch):
+def test_shared_rank_predicate_reads_the_registered_run_config(monkeypatch):
     """providers.is_dataset_built_on_rank, the predicate pretrain_gpt and pretrain_hybrid pass and the
-    default of build_gpt_datasets, applies the rule to the registered arguments and the transformer
-    config built from them, read at call time from global_vars and arguments (where tests patch
-    them; tests/unit_tests/data/test_get_batch.py does the same on eight GPUs)."""
+    default of build_gpt_datasets, applies the rule to the registered run config: the model section
+    when the container has one; the arguments and the transformer config built from them otherwise
+    (tests/unit_tests/data/test_get_batch.py does the same on eight GPUs)."""
     rule_calls = []
-    monkeypatch.setattr(
-        global_vars, "_GLOBAL_ARGS", SimpleNamespace(sequence_packing_scheduler=None)
-    )
-    monkeypatch.setattr(
-        arguments,
-        "core_transformer_config_from_args",
-        lambda args: SimpleNamespace(pipeline_model_parallel_layout="layout", mtp_num_layers=None),
-    )
     monkeypatch.setattr(
         providers,
         "is_dataset_built_on_rank_explicit",
         lambda *a, **k: rule_calls.append((a, k)) or False,
     )
+    args = SimpleNamespace(
+        sequence_packing_scheduler="dp_balanced",
+        context_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        dynamic_context_parallel=False,
+    )
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
+    # No model section: the arguments and the transformer config they describe.
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", SimpleNamespace(model=None))
+    monkeypatch.setattr(
+        arguments,
+        "core_transformer_config_from_args",
+        lambda ns: SimpleNamespace(pipeline_model_parallel_layout="from-args", mtp_num_layers=None),
+    )
     assert providers.is_dataset_built_on_rank(vp_stage=2) is False
-    assert rule_calls == [
-        (
-            (2, False),
-            {
-                "sequence_packing_scheduler": None,
-                "pipeline_model_parallel_layout": "layout",
-                "mtp_num_layers": None,
-            },
-        )
-    ]
+    assert rule_calls.pop() == (
+        (2, False),
+        {
+            "sequence_packing_scheduler": "dp_balanced",
+            "pipeline_model_parallel_layout": "from-args",
+            "mtp_num_layers": None,
+        },
+    )
+    # A model section: its transformer config, whatever the arguments say.
+    transformer = SimpleNamespace(
+        sequence_packing_scheduler=None,
+        pipeline_model_parallel_layout="from-model",
+        mtp_num_layers=2,
+        context_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        dynamic_context_parallel=False,
+    )
+    monkeypatch.setattr(
+        global_vars,
+        "_GLOBAL_RUN_CONFIG",
+        SimpleNamespace(model=SimpleNamespace(transformer=transformer)),
+    )
+    monkeypatch.setattr(
+        arguments, "core_transformer_config_from_args", lambda ns: pytest.fail("args path used")
+    )
+    assert providers.is_dataset_built_on_rank(vp_stage=1, is_packed_sequence=True) is False
+    assert rule_calls.pop() == (
+        (1, True),
+        {
+            "sequence_packing_scheduler": None,
+            "pipeline_model_parallel_layout": "from-model",
+            "mtp_num_layers": 2,
+        },
+    )
 
 
 def test_rank_rule_gates_on_tensor_parallel_rank():
