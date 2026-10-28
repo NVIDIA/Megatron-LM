@@ -71,13 +71,19 @@ def _load_backend(config: TransformerConfig) -> Optional[ModuleType]:
     return _BACKEND
 
 
+_DECLINED_HOOKS_WARNED: set = set()
+
+
 def _log_declined_hook(config: TransformerConfig, hook_name: str, reason: str) -> None:
-    """Emit one debug breadcrumb when a selected fused hook falls back."""
-    if not _LOGGER.isEnabledFor(logging.DEBUG):
+    """Warn once per backend, hook and reason when a selected fused hook falls back."""
+    backend = _get_dsa_kernel_backend(config)
+    key = (backend, hook_name, reason)
+    if key in _DECLINED_HOOKS_WARNED:
         return
-    _LOGGER.debug(
-        "DSA fused backend %s %s declined; falling back (%s).",
-        _get_dsa_kernel_backend(config),
+    _DECLINED_HOOKS_WARNED.add(key)
+    _LOGGER.warning(
+        "DSA fused backend %s %s declined; falling back to the PyTorch reference path (%s).",
+        backend,
         hook_name,
         reason,
     )
