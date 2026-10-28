@@ -439,7 +439,7 @@ class ProcessGroupCollection:
         block of ``global_process_group_fallback()``. Pass the model's collection to the code
         that needs it instead, or read the registered one with
         ``parallel_state.get_registered_process_groups()``, which returns that collection
-        itself rather than a new one.
+        itself rather than a new one; set fields on a ``copy.copy()`` of it.
 
         Args:
             required_pgs (List[str], optional): List of process group names to initialize.

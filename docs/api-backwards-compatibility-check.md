@@ -148,7 +148,7 @@ replacement:
 | Virtual-pipeline rank and size getters and setters | The `vp_stage` of the model chunk, passed explicitly, and the `virtual_pipeline_model_parallel_size` of the model's configuration |
 | Rank and size overrides, such as `set_tensor_model_parallel_rank()` | A `ProcessGroupCollection` whose groups have that rank and size, passed to the code that needs it or registered with `register_process_groups()` |
 | `get_global_memory_buffer()`, `destroy_global_memory_buffer()`, `_set_global_memory_buffer()` | The same functions in `megatron.core.utils` |
-| `ProcessGroupCollection.use_mpu_process_groups()` | The `ProcessGroupCollection` that the caller passes, or `parallel_state.get_registered_process_groups()` for the groups that `initialize_model_parallel()` or `register_process_groups()` registered for the run. It returns the registered collection itself, not a new one, so copy it before setting a field |
+| `ProcessGroupCollection.use_mpu_process_groups()` | The `ProcessGroupCollection` that the caller passes, or `parallel_state.get_registered_process_groups()` for the groups that `initialize_model_parallel()` or `register_process_groups()` registered for the run. It returns the registered collection itself, not a new one, so set a field such as `dp_cp_ag` on a `copy.copy()` of it: `copy.deepcopy()` returns the same collection, and `dataclasses.replace()` returns one without groups |
 
 Bootstrap, teardown and the registry are not deprecated: `initialize_model_parallel()`,
 `destroy_model_parallel()`, `is_initialized()`, `model_parallel_is_initialized()`,
