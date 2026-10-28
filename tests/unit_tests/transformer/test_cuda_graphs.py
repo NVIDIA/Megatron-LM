@@ -2382,6 +2382,35 @@ class TestSkipFp8WeightUpdateTensor:
             self._reset_skip_tensor()
 
 
+class TestDeleteCudaGraphsRunners:
+    """Unit tests for delete_cuda_graphs runner cleanup behavior."""
+
+    def test_delete_cuda_graphs_resets_captured_runners(self):
+        """delete_cuda_graphs resets runners after capture clears cudagraph_record."""
+        from unittest.mock import Mock
+
+        runner = Mock(spec=_CudaGraphRunner)
+        runner.cudagraph_created = True
+        runner.fwd_graph = Mock()
+        runner.bwd_graph = Mock()
+        runner.mempool = Mock()
+
+        # Simulate capturing runners and clearing cudagraph_record
+        _CudagraphGlobalRecord.cudagraph_record = [(runner, "fwd", (), {}, None)]
+        _CudagraphGlobalRecord.cudagraph_created_runners = [runner]
+        _CudagraphGlobalRecord.cudagraph_created = True
+        _CudagraphGlobalRecord.cudagraph_record = []
+
+        delete_cuda_graphs()
+
+        assert not runner.cudagraph_created
+        assert runner.fwd_graph is None
+        assert runner.bwd_graph is None
+        assert runner.mempool is None
+        assert _CudagraphGlobalRecord.cudagraph_created_runners == []
+        assert not _CudagraphGlobalRecord.cudagraph_created
+
+
 if __name__ == "__main__":
 
     test = TestParallelTransformerBlockCudagraphs()
