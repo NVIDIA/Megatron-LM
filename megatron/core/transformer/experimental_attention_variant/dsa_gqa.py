@@ -24,6 +24,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossLoggingHelper,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
+    _apply_rope_at_positions,
     dsa_dense_indexer_loss,
     dsa_min_memory_gqa,
     dsa_min_memory_gqa_forward_only,
@@ -475,39 +476,28 @@ class SimplifiedDSGQAIndexer(MegatronModule):
         """Apply indexer RoPE using each dynamic token's absolute request position."""
         if self.rotary_pos_emb is None or self.index_rotary_dim == 0:
             return q
-        active_tokens = inference_context.active_token_count
-        rotary_seq_len = (
-            1
-            if active_tokens == 0
-            else int(inference_context.token_to_position_in_request[:active_tokens].max().item())
-            + 1
+
+        n = q.size(0)
+        gpu_view = inference_context.gpu_view
+        # Both positions and padding can change while replaying the same padded graph.
+        valid = (
+            gpu_view.token_to_block_idx[:n] != inference_context.kv_block_allocator.dummy_block_idx
         )
-        if _dsa_rope_setting(self.config, "rope_type") == "rope":
-            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False), 1.0
-        else:
-            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
-        q_nope, q_pe = torch.split(
-            q, [self.index_head_dim - self.index_rotary_dim, self.index_rotary_dim], dim=-1
+        positions = (
+            gpu_view.token_to_position_in_request[:n]
+            if indexer_key
+            else gpu_view.token_to_pos_ids[:n]
+        ).masked_fill(~valid, 0)
+
+        q = _apply_rope_at_positions(
+            q,
+            positions,
+            self.index_head_dim,
+            self.index_rotary_dim,
+            self.rotary_pos_emb,
+            self.config.rotary_interleaved,
         )
-        q_pe = q_pe.clone()
-        if active_tokens > 0:
-            positions = (
-                inference_context.gpu_view.token_to_position_in_request[:active_tokens]
-                if indexer_key
-                else inference_context.gpu_view.token_to_pos_ids[:active_tokens]
-            )
-            q_pe[:active_tokens] = apply_rotary_pos_emb(
-                q_pe[:active_tokens],
-                rotary_pos_emb[positions],
-                config=self.config,
-                cu_seqlens=None,
-                mscale=mscale,
-                cp_group=self.pg_collection.cp,
-            )
-        q = torch.cat((q_nope, q_pe), dim=-1)
-        if active_tokens < q.size(0):
-            q[active_tokens:] = 0
-        return q
+        return q.masked_fill(~valid[:, None, None, None], 0)
 
     def forward_qk_dynamic(
         self, hidden_states: torch.Tensor, use_rope: bool, inference_context

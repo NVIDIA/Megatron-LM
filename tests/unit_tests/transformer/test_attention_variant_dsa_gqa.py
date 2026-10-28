@@ -1150,6 +1150,118 @@ class TestDSGQADynamicInference:
         yield
         Utils.destroy_model_parallel()
 
+    @pytest.mark.parametrize("rope_variant", ["plain", "interleaved", "scaled", "yarn"])
+    @pytest.mark.parametrize("rotary_percent", [0.5, 1.0])
+    @pytest.mark.parametrize("capture_active", [0, 3])
+    def test_indexer_rope_graph_replay(self, rope_variant, rotary_percent, capture_active):
+        from megatron.core.extensions.transformer_engine import TELinear
+        from megatron.core.models.common.embeddings import apply_rotary_pos_emb
+        from megatron.core.transformer.spec_utils import ModuleSpec
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=2,
+            num_query_groups=1,
+            kv_channels=64,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+            add_bias_linear=False,
+            apply_rope_fusion=False,
+            rotary_interleaved=rope_variant == "interleaved",
+            experimental_attention_variant="dsa",
+            dsa_indexer_mode="simplified",
+            dsa_indexer_head_dim=64,
+            dsa_indexer_topk=4,
+            dsa_indexer_loss_coeff=0.1,
+        )
+        config.rope_type = "yarn" if rope_variant == "yarn" else "rope"
+        config.rotary_percent = rotary_percent
+        config.rotary_base = 10000.0
+        config.rotary_seq_len_interpolation_factor = 2.0 if rope_variant == "scaled" else None
+        config.use_rope_scaling = rope_variant == "scaled"
+        config.rope_scaling_factor = 4.0
+        config.rotary_scaling_factor = 8.0
+        config.original_max_position_embeddings = 4096
+        config.beta_fast = 32.0
+        config.beta_slow = 1.0
+        config.mscale = 1.0
+        config.mscale_all_dim = 0.0
+        indexer = SimplifiedDSGQAIndexer(
+            config,
+            SimplifiedDSGQAIndexerSubmodules(
+                linear_q=ModuleSpec(module=TELinear), linear_k=ModuleSpec(module=TELinear)
+            ),
+        ).eval()
+        context = DynamicInferenceContext(
+            model_config=config,
+            inference_config=InferenceConfig(
+                max_sequence_length=262144,
+                max_requests=8,
+                max_tokens=1024,
+                block_size_tokens=256,
+                buffer_size_gb=0.01,
+                unified_memory_level=0,
+                num_cuda_graphs=None,
+                use_flashinfer_fused_rope=False,
+            ),
+        )
+        hidden = torch.randn(8, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+
+        def update_metadata(count, offset):
+            context.active_token_count = count
+            context.token_to_block_idx[:8] = context.kv_block_allocator.dummy_block_idx
+            context.token_to_block_idx[:count] = 0
+            context.token_to_pos_ids[:8] = 0
+            context.token_to_position_in_request[:8] = 0
+            positions = torch.arange(count) % 3 + offset
+            context.token_to_position_in_request[:count] = positions
+            context.token_to_pos_ids[:count] = positions + (7 if offset else 0)
+            context.transfer_bookkeeping_to_gpu()
+
+        update_metadata(capture_active, 0)
+        with torch.no_grad():
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    indexer.forward_qk_dynamic(hidden, True, context)
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = indexer.forward_qk_dynamic(hidden, True, context)
+
+            for count, offset in ((3, 0), (8, 0), (2, 4096), (0, 8192), (5, 200000)):
+                update_metadata(count, offset)
+                hidden.normal_()
+                graph.replay()
+                eager = indexer.forward_qk_dynamic(hidden, True, context)
+                projected = indexer.forward_qk(hidden, use_rope=False)
+                table = indexer.rotary_pos_emb(max(offset + 10, 3), packed_seq=False)
+                frequencies, mscale = table if config.rope_type == "yarn" else (table, 1.0)
+                positions = (context.token_to_pos_ids, context.token_to_position_in_request)
+                for actual, dynamic, raw, position in zip(captured, eager, projected, positions):
+                    torch.testing.assert_close(actual, dynamic, atol=0, rtol=0)
+                    expected = torch.zeros_like(raw)
+                    if count:
+                        nope, pe = torch.split(
+                            raw[:count],
+                            [
+                                indexer.index_head_dim - indexer.index_rotary_dim,
+                                indexer.index_rotary_dim,
+                            ],
+                            dim=-1,
+                        )
+                        rotated = apply_rotary_pos_emb(
+                            pe,
+                            frequencies[position[:count].to(device="cuda")],
+                            config=config,
+                            cp_group=indexer.pg_collection.cp,
+                            mscale=mscale,
+                        )
+                        expected[:count] = torch.cat((nope, rotated), dim=-1)
+                    torch.testing.assert_close(actual, expected, atol=0.001, rtol=0.01)
+
     @pytest.mark.parametrize("packed", [False, True])
     @pytest.mark.parametrize("fused", [False, True])
     def test_dynamic_query_rope_uses_token_positions_with_padding(self, packed, fused):
