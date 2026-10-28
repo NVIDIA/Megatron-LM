@@ -48,13 +48,12 @@ class ResidualConnection(nn.Module, ABC):
 
     ``operation`` fixes an instance to one operation at construction.
 
-    Both modes enter the module once per logical operation, so forward overrides and module
-    hooks surround the same dispatch boundary. Replay implementations call eager arithmetic or
-    smaller algorithm-specific regions directly, without re-entering this module. Subclasses
-    changing numerical implementations must keep their eager and checkpoint paths consistent.
+    Both modes call this module once per logical operation. Replay runs the computation
+    without repeating this module's ``forward`` or hooks. Subclasses must keep eager and
+    checkpointed computations equivalent.
 
-    Hooks and forward overrides run outside the replay regions. They must not mutate
-    checkpoint-owned output storage in place: replay reconstructs the original arithmetic.
+    Hooks and forward overrides must not modify checkpoint-owned output storage in place:
+    replay restores the original values.
     """
 
     def __init__(
@@ -127,15 +126,12 @@ class ResidualConnection(nn.Module, ABC):
         ``branch_input_dtype`` is read-only. ``None`` preserves the connection's natural read
         dtype; otherwise compatible connections may produce that dtype directly in a fused read.
 
-        ``execution_context`` carries objects needed for the current read or write. For example,
-        mHC passes the layer's ``HyperConnectionModule`` and bias/dropout fusion setting here.
-        The layer registers the module and its learned parameters; the read/write operations use
-        that module for this call without storing it as a child module of their own. If the layer's
-        mHC module is replaced, subsequent calls use the replacement passed by the layer.
+        ``execution_context`` supplies per-call dependencies, such as mHC's parameter-owning
+        module and fusion setting. Supplied modules remain registered with their caller;
+        this connection uses them without registering them as children.
 
-        ``recompute_context`` selects the concrete checkpoint implementation when present.
-        Otherwise the explicit eager implementation runs. Eager methods never receive this
-        context; checkpoint methods choose their own replay boundaries.
+        ``recompute_context=None`` selects eager execution. Otherwise, the connection uses
+        its checkpoint implementation, which chooses what to replay.
         """
 
         match self.operation:
