@@ -6,6 +6,7 @@ from typing import List, Union
 
 import torch
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
     any_sharding_strategy_in,
     find_megatron_fsdp,
@@ -390,6 +391,9 @@ def combined_forward_backward_step(
             assert isinstance(
                 f_schedule_plan, AbstractSchedulePlan
             ), "first output of forward_step_func must be one instance of AbstractSchedulePlan"
+
+        if any(isinstance(module, FsdpModule) for module in f_model.modules()):
+            f_schedule_plan.register_fsdp_hooks(f_model)
 
         # Wire per-layer FSDP parameter release callbacks.  The EP overlap
         # schedule bypasses normal FSDP forward/backward hooks, so we release
