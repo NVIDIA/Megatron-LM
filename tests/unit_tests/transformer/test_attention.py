@@ -543,11 +543,16 @@ def _test_parallel_attention_correctness(
         mock_args.save_tokenizer_assets = False
         set_args(mock_args)
 
+        # These tests compare raw per-module gradients and reduce CP/SP
+        # explicitly. DDP hooks instead move .grad into .main_grad and clear
+        # it, which makes direct gradient inspection race-dependent.
         # Initialize baseline model
         init_basic_mock_args(mock_args, 1, 1, bf16=True)
         mock_args.context_parallel_size = 1
         mock_args.sequence_parallel = 1
-        gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
+        gpt_model = unwrap_model(
+            get_model(initialize_gpt_model, config=transformer_config, wrap_with_ddp=False)
+        )
 
         # Initialize args and save checkpoint
         init_checkpointing_mock_args(mock_args, ckpt_dir, False)
@@ -595,7 +600,9 @@ def _test_parallel_attention_correctness(
         init_basic_mock_args(mock_args, tp, 1, bf16=True)
         mock_args.context_parallel_size = build_time_cp
         mock_args.sequence_parallel = sp
-        gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
+        gpt_model = unwrap_model(
+            get_model(initialize_gpt_model, config=transformer_config, wrap_with_ddp=False)
+        )
         with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
             load_checkpoint(gpt_model, None, None)
 
