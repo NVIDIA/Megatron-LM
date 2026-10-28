@@ -89,7 +89,11 @@ class DistributedDataParallelConfig:
 
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
     """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
-       set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
+       set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True, or for an FP4
+       model with fp4_param_gather whose non-expert linears keep MXFP8 params
+       (TransformerConfig.fp4_dense_mxfp8_param). In the FP4 case only the buffers that hold MXFP8
+       params reuse the grad buffer; NVFP4 and high-precision buffers keep their own param
+       buffer."""
 
     use_megatron_fsdp: bool = False
     """If true, use the FSDP code path for DDP."""
@@ -345,7 +349,10 @@ class DistributedDataParallelConfig:
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
 
         if self.reuse_grad_buf_for_mxfp8_param_ag:
-            assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
+            # With fp4_param_gather, the MXFP8 params are the non-expert linears of an FP4 model.
+            assert (
+                self.fp8_param_gather or self.fp4_param_gather
+            ), "Reuse grad buffer only when keeping params in MXFP8."
 
         if self.grad_buffer_offload and self.reuse_grad_buf_for_mxfp8_param_ag:
             raise ValueError(

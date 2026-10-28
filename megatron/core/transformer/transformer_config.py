@@ -847,6 +847,16 @@ class TransformerConfig(ModelParallelConfig):
     """Python import path to a callable quantizer factory, e.g., package.module.quantizer_factory.
     Required when fp4_recipe is custom."""
 
+    fp4_dense_mxfp8: bool = False
+    """With fp4, run the non-expert linear layers (attention, shared experts, dense MLPs, MTP
+    projections) in MXFP8 (E4M3), while the routed experts keep the FP4 recipe. A module's own
+    quant_recipe entry takes precedence."""
+
+    fp4_dense_mxfp8_param: bool = False
+    """With fp4_dense_mxfp8 and fp4_param, keep the primary weights of the MXFP8 linear layers in
+    MXFP8 instead of BF16 weights plus a cached MXFP8 copy. Their parameter all-gather then
+    reuses the gradient buffer, so the DDP config needs reuse_grad_buf_for_mxfp8_param_ag."""
+
     high_priority_a2a_comm_stream: bool = False
     """If True, the communication stream created by set_streams for combined 1f1b
     a2a overlap is created with CUDA high priority."""
@@ -2166,6 +2176,12 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.fp4 and self.fp8:
             raise ValueError("fp4 and fp8 cannot be used simultaneously. Please choose one.")
+
+        if self.fp4_dense_mxfp8 and not self.fp4:
+            raise ValueError("fp4_dense_mxfp8 must be used together with fp4 mode.")
+
+        if self.fp4_dense_mxfp8_param and not (self.fp4_dense_mxfp8 and self.fp4_param):
+            raise ValueError("fp4_dense_mxfp8_param requires fp4_dense_mxfp8 and fp4_param.")
 
         if self.fp4 and self.fp4_recipe == Fp4Recipe.custom:
             if not self.fp4_quantizer_factory:

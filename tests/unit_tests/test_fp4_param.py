@@ -12,10 +12,12 @@ from transformer_engine.pytorch.fp8 import check_nvfp4_support
 import megatron.core.parallel_state as ps
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.enums import ModelType
-from megatron.core.fp4_utils import is_nvfp4tensor
+from megatron.core.fp4_utils import is_grouped_nvfp4tensor, is_nvfp4tensor
+from megatron.core.fp8_utils import is_mxfp8tensor
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
@@ -92,7 +94,9 @@ class TestFP4Param:
         model_parallel_cuda_manual_seed(_SEED)
         args = get_args()
         config = core_transformer_config_from_args(args)
-        transformer_layer_spec = layer_spec_fn()
+        transformer_layer_spec = layer_spec_fn(
+            num_experts=args.num_experts, moe_grouped_gemm=args.moe_grouped_gemm
+        )
         return GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
@@ -230,20 +234,33 @@ class TestFP4Param:
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 
         num_fp4_params = 0
-        for _, param in gpt_model[0].named_parameters():
+        num_mxfp8_params = 0
+        for name, param in gpt_model[0].named_parameters():
             if not inference:
                 assert param.requires_grad
                 assert param.main_grad is not None
-            if is_nvfp4tensor(param):
+            if is_nvfp4tensor(param) or is_grouped_nvfp4tensor(param):
                 num_fp4_params += 1
+                assert not args.fp4_dense_mxfp8 or ".experts." in name, name
+            if is_mxfp8tensor(param):
+                num_mxfp8_params += 1
+                assert ".experts." not in name, name
 
         # Verify the number of fp4 params.
         fp4_layers = args.num_layers
         if kwargs.get("first_last_layers_bf16", False):
             fp4_layers -= kwargs["num_layers_at_start_in_bf16"]
             fp4_layers -= kwargs["num_layers_at_end_in_bf16"]
-        # Each layer has 4 GEMM weights: qkv, proj, fc1, fc2.
-        if fp4_param_gather:
+        if args.fp4_dense_mxfp8:
+            # Non-expert linears are MXFP8 (qkv and proj per layer); routed experts keep NVFP4.
+            if fp4_param_gather:
+                assert num_fp4_params > 0
+            if args.fp4_dense_mxfp8_param:
+                assert num_mxfp8_params == 2 * args.num_layers
+            else:
+                assert num_mxfp8_params == 0
+        elif fp4_param_gather:
+            # Each layer has 4 GEMM weights: qkv, proj, fc1, fc2.
             assert num_fp4_params == 4 * fp4_layers
 
         loss_list = []
@@ -277,6 +294,18 @@ class TestFP4Param:
                 if should_disable_forward_pre_hook(args):
                     enable_forward_pre_hook(gpt_model)
                     cuda_graph_helper.cuda_graph_set_manual_hooks()
+
+            # With reuse_grad_buf_for_mxfp8_param_ag and overlapped param gather, the MXFP8 params
+            # all-gather through the zeroed grad buffer, so stage the main params into it, as
+            # the training loop does.
+            if (
+                not inference
+                and args.reuse_grad_buf_for_mxfp8_param_ag
+                and args.overlap_param_gather
+            ):
+                for optim_instance in getattr(optimizer, "chained_optimizers", [optimizer]):
+                    if isinstance(optim_instance, DistributedOptimizer):
+                        optim_instance._copy_main_params_to_param_buffer()
 
             gpt_model[0].set_is_first_microbatch()
             output = gpt_model[0].forward(
@@ -387,6 +416,45 @@ class TestFP4Param:
             "num_layers_at_end_in_bf16": 1,
         }
         self.run_test(tp_size=tp_size, **kwargs)
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(
+        get_device_arch_version() < 10, reason="NVFP4 is supported since Blackwell architecture"
+    )
+    @pytest.mark.skipif(not is_nvfp4_available, reason=reason_for_no_nvfp4)
+    @pytest.mark.skipif(not is_te_min_version("2.7.0.dev0"), reason="TE 2.7.0.dev0 is required")
+    @pytest.mark.parametrize("dense_param", [False, True])
+    @pytest.mark.parametrize("dp_overlap", [(False, False), (True, True)])
+    def test_nvfp4_moe_dense_mxfp8(self, dense_param, dp_overlap):
+        """MXFP8 non-expert linears with NVFP4 routed experts (fp4_dense_mxfp8).
+
+        With dense_param, the non-expert linears keep MXFP8 params, all-gathered through the
+        grad buffer, next to the NVFP4 expert params on their own param buffer. Losses must match
+        BF16 params with the same compute recipes.
+        dp_overlap: (overlap_param_gather, overlap_grad_reduce)
+        """
+        kwargs = {
+            "overlap_param_gather": dp_overlap[0],
+            "overlap_grad_reduce": dp_overlap[1],
+            "expert_model_parallel_size": 2,
+            "num_experts": 4,
+            "moe_grouped_gemm": True,
+            "moe_token_dispatcher_type": "alltoall",
+            "moe_router_topk": 2,
+            "moe_router_load_balancing_type": "none",
+            "moe_aux_loss_coeff": 0.0,
+            "moe_ffn_hidden_size": 256,
+            "fp4_dense_mxfp8": True,
+        }
+        loss_list = self._run_test_helper(
+            1,
+            fp4_param_gather=True,
+            fp4_dense_mxfp8_param=dense_param,
+            reuse_grad_buf_for_mxfp8_param_ag=dense_param,
+            **kwargs,
+        )
+        loss_list_ref = self._run_test_helper(1, fp4_param_gather=False, **kwargs)
+        torch.testing.assert_close(loss_list, loss_list_ref, atol=1e-2, rtol=1e-2)
 
     def run_determinism_test(self, tp_size, fp4_param_gather: bool, **kwargs):
         """
