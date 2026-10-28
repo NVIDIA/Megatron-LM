@@ -1073,3 +1073,95 @@ def test_the_loop_reads_the_data_length_from_the_section(container_factory, monk
     assert calls.pop()["seq_length"] == 64
     args.seq_length = None
     assert "dl.sequence_length" not in global_vars.build_telemetry_resource_attrs(args)
+
+
+@pytest.mark.parametrize("entry_point", ["gpt", "hybrid", "hybrid_flex"])
+def test_get_batch_ignores_the_poisoned_data_arguments(monkeypatch, entry_point):
+    """The three scripts' get_batch read the batch flags and the data length from the section and
+    the model-parallel values from the model section (hybrid-flex: from the transformer config the
+    arguments describe); every data-owned value on args is poisoned and must not surface in the
+    captured call."""
+    from megatron.training import arguments
+    from megatron.training.config import DataConfig
+
+    if entry_point == "gpt":
+        import pretrain_gpt as script
+    elif entry_point == "hybrid":
+        import pretrain_hybrid as script
+    else:
+        from megatron.elastification import pretrain_hybrid_flex as script
+
+    dataset = GPTDatasetConfig(
+        sequence_length=16,
+        random_seed=1,
+        inter_document_masking=True,
+        create_attention_mask=False,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+    )
+    transformer = SimpleNamespace(
+        sequence_packing_scheduler=None,
+        dynamic_context_parallel=False,
+        context_parallel_size=1,
+        pipeline_model_parallel_size=3,
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=None,
+        virtual_pipeline_model_parallel_size=None,
+        linear_cp_layout="zigzag",
+        attention_cp_layout="zigzag",
+        sequence_parallel=False,
+        tensor_model_parallel_size=1,
+    )
+    model = None if entry_point == "hybrid_flex" else SimpleNamespace(transformer=transformer)
+    cfg = SimpleNamespace(
+        model=model,
+        data=DataConfig(dataset=dataset, dataset_type=MockGPTDataset),
+        train=SimpleNamespace(micro_batch_size=5),
+    )
+    args = SimpleNamespace(  # poisoned: none of these may reach the batch path
+        sft=True,
+        dataloader_inter_document_masking=False,
+        create_attention_mask_in_dataloader=True,
+        micro_batch_size=99,
+        seq_length=4096,
+        sequence_packing_scheduler="dp_balanced",
+        dynamic_context_parallel=True,
+        context_parallel_size=8,
+        pipeline_model_parallel_size=8,
+    )
+    monkeypatch.setattr(script, "get_args", lambda: args)
+    monkeypatch.setattr(script, "get_run_config", lambda: cfg)
+    # hybrid-flex has no model section: its transformer config is built from the arguments.
+    monkeypatch.setattr(arguments, "core_transformer_config_from_args", lambda ns: transformer)
+    monkeypatch.setattr(script, "is_first_or_last_pipeline_stage", lambda vp_stage: True)
+    monkeypatch.setattr(script, "mtp_on_this_rank_func", lambda **kw: False)
+    monkeypatch.setattr(script.mpu, "get_tensor_model_parallel_rank", lambda: 1)  # no iterator
+    monkeypatch.setattr(script.mpu, "get_tensor_model_parallel_src_rank", lambda: 0)
+    monkeypatch.setattr(script.mpu, "get_tensor_model_parallel_group", lambda: None)
+    monkeypatch.setattr(script.mpu, "is_pipeline_first_stage", lambda: True)
+    monkeypatch.setattr(script.mpu, "is_pipeline_last_stage", lambda: True)
+    monkeypatch.setattr(script, "get_context_parallel_group", lambda: None)
+    tp_calls, cp_calls = [], []
+    monkeypatch.setattr(
+        script,
+        "get_batch_on_this_tp_rank",
+        lambda batch, **kw: tp_calls.append(kw) or dict.fromkeys(script.BATCH_KEYS),
+    )
+    monkeypatch.setattr(script, "flatten_batch_for_packed_sequences", lambda batch: batch)
+    if entry_point == "hybrid":
+        monkeypatch.setattr(
+            script, "get_batches_on_this_cp_rank", lambda batch, **kw: cp_calls.append(kw) or batch
+        )
+    else:
+        monkeypatch.setattr(
+            script, "get_batch_on_this_cp_rank", lambda batch, **kw: cp_calls.append(kw) or batch
+        )
+    script.get_batch(None)
+    tp = tp_calls.pop()
+    assert tp["has_cu_seqlens"] is True  # inter-document masking from the section, not args.sft
+    assert tp["create_attention_mask_in_dataloader"] is False
+    assert tp["micro_batch_size"] == 5 and tp["seq_length"] == 16
+    assert (tp["cp_size"], tp["pipeline_model_parallel_size"]) == (1, 3)
+    assert tp["dynamic_cp"] is False
+    assert cp_calls.pop()["use_per_sequence_balancing"] is True  # masking without SFT
