@@ -1,9 +1,5 @@
 [
     {
-        "user": "janEbert",
-        "date": "2026-10-21"
-    },
-    {
         "user": "maanug-nv",
         "date": "2026-10-28"
     },
@@ -46,5 +42,9 @@
     {
         "user": "janEbert",
         "date": "2027-01-06"
+    },
+    {
+        "user": "maanug-nv",
+        "date": "2027-01-13"
     }
 ]
