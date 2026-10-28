@@ -421,16 +421,23 @@ def test_dev_hybrid_factory_preserves_static_stack_and_config_semantics(qk_layer
 
     original_dsa = hybrid_stack_spec.submodules.dsa_layer
     original_csa = hybrid_stack_spec.submodules.csa_layer
+    original_csa_qk = hybrid_stack_spec.submodules.csa_qk_layernorm_layer
     stack_spec = hybrid_dsv4_stack_spec(_make_config(qk_layernorm=qk_layernorm))
     assert isinstance(stack_spec, ModuleSpec)
     assert stack_spec is not hybrid_stack_spec
     assert hybrid_stack_spec.submodules.dsa_layer is original_dsa
     assert hybrid_stack_spec.submodules.csa_layer is original_csa
+    assert hybrid_stack_spec.submodules.csa_qk_layernorm_layer is original_csa_qk
     assert "compress_ratio" not in original_csa.submodules.self_attention.params
 
+    # HybridStack builds 'C' layers from csa_qk_layernorm_layer when qk_layernorm is enabled,
+    # so that slot must carry the same config-aware attention (incl. linear_o_group_proj).
+    o_group_proj = stack_spec.submodules.csa_layer.submodules.self_attention.submodules
+    o_group_proj = o_group_proj.linear_o_group_proj
     for layer_name, ratio in (
         ("dsa_layer", None),
         ("csa_layer", 4),
+        ("csa_qk_layernorm_layer", 4),
         ("hca_layer", 128),
         ("window_layer", 0),
     ):
@@ -442,6 +449,7 @@ def test_dev_hybrid_factory_preserves_static_stack_and_config_semantics(qk_layer
             assert attention.params["compress_ratio"] == ratio
         assert (attention.submodules.q_layernorm is IdentityOp) is (not qk_layernorm)
         assert (attention.submodules.kv_layernorm is IdentityOp) is (not qk_layernorm)
+        assert attention.submodules.linear_o_group_proj is o_group_proj
 
 
 @pytest.mark.parametrize("variant", [None, "dsa"])
@@ -1002,7 +1010,11 @@ class TestDSv4HybridGroupedOutput:
         assert (isinstance(reloaded_weight, TEQuantizedTensor)) == quantized_weight
         assert reloaded_weight.shape == runtime_weight.shape
         tolerances = {"rtol": 0.125, "atol": 0.0675} if quantized_weight else {}
-        torch.testing.assert_close(reloaded_weight, runtime_weight, **tolerances)
+        # MXFP8 quantization runs on GPU, so a quantized reload lands on CUDA even though the
+        # BF16 reference was built with use_cpu_initialization.
+        torch.testing.assert_close(
+            reloaded_weight, runtime_weight.to(reloaded_weight.device), **tolerances
+        )
         reloaded_state_dict = reloaded_attn.state_dict()
         assert reloaded_state_dict["linear_o_group_proj"].shape == checkpoint_shape
         assert "linear_o_group_proj.weight" not in reloaded_state_dict
@@ -1063,6 +1075,9 @@ class TestDSv4HybridGroupedOutput:
         )
         with init_context:
             attn = _build_attention(config, layer_number=1, pg_collection=pg)
+        # use_cpu_initialization leaves BF16 weights on CPU; training moves them to the GPU
+        # before forward, and BatchedLinear requires input and weight on the same device.
+        attn = attn.cuda()
         module = attn.linear_o_group_proj
         weight = module.weight
         assert isinstance(module, te_batched_linear)
@@ -1163,9 +1178,19 @@ class TestDSv4HybridGroupedOutput:
         torch.manual_seed(_SEED)
         model_parallel_cuda_manual_seed(_SEED)
 
+        from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+
         te_ops = getattr(te_pytorch, "ops", None)
         if te_ops is not None:
             monkeypatch.delattr(te_ops, "BatchedLinear", raising=False)
+        # HybridModel's static spec resolves BatchedLinear once at import time.
+        for layer_spec in (
+            hybrid_stack_spec.submodules.csa_layer,
+            hybrid_stack_spec.submodules.csa_qk_layernorm_layer,
+        ):
+            monkeypatch.setattr(
+                layer_spec.submodules.self_attention.submodules, "linear_o_group_proj", None
+            )
         config = _make_config(output_projection_groups=8, output_projection_lora_rank=64)
         pg = ProcessGroupCollection.use_mpu_process_groups()
         init_context = (
@@ -1178,6 +1203,7 @@ class TestDSv4HybridGroupedOutput:
         with pytest.warns(UserWarning, match="upgrade Transformer Engine.*performance regression"):
             with init_context:
                 attn = _build_attention(config, layer_number=1, pg_collection=pg)
+        attn = attn.cuda()  # use_cpu_initialization leaves the weights on CPU
         assert not attn._uses_te_batched_linear
         weight = attn._linear_o_group_proj_weight
         assert weight is attn.linear_o_group_proj

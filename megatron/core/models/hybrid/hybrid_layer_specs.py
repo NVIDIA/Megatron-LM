@@ -39,6 +39,9 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant import (
+    deepseek_v4_hybrid_attention_module_specs as dsv4_hybrid_specs,
+)
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
@@ -103,6 +106,7 @@ _csa_indexer = partial(
     ),
 )
 _csa_qk_norm = TESpecProvider().layer_norm(for_qk=True)
+_dsv4_o_group_proj = dsv4_hybrid_specs.get_dsv4_o_group_proj_spec()
 
 
 # MTP block spec - provides norms and projection only.
@@ -273,6 +277,7 @@ hybrid_stack_spec = ModuleSpec(
                                 compressor=_csa_compressor, indexer=_csa_indexer
                             ),
                         ),
+                        linear_o_group_proj=_dsv4_o_group_proj,
                         linear_proj=TERowParallelLinear,
                         q_layernorm=IdentityOp,
                         kv_layernorm=IdentityOp,
@@ -299,6 +304,7 @@ hybrid_stack_spec = ModuleSpec(
                                 compressor=_csa_compressor, indexer=_csa_indexer
                             ),
                         ),
+                        linear_o_group_proj=_dsv4_o_group_proj,
                         linear_proj=TERowParallelLinear,
                         q_layernorm=_csa_qk_norm,
                         kv_layernorm=_csa_qk_norm,
@@ -713,10 +719,16 @@ def hybrid_dsv4_stack_spec(config):
             ),
         )
 
+    # HybridStack builds 'C' layers from csa_qk_layernorm_layer when qk_layernorm is enabled.
+    # The DSv4 attention spec already selects the qk-norm form from config, so both slots share
+    # one layer; leaving csa_qk_layernorm_layer at the static default would silently drop the
+    # config-aware attention (e.g. TE BatchedLinear) for every CSA layer.
+    csa_layer = _wrap_dsv4_layer(compress_ratio=4)
     submodules = dataclasses.replace(
         hybrid_stack_spec.submodules,
         dsa_layer=_wrap_dsv4_layer(),  # 'D': array-driven (or window) DSv4 attention
-        csa_layer=_wrap_dsv4_layer(compress_ratio=4),  # 'C': CSA
+        csa_layer=csa_layer,  # 'C': CSA
+        csa_qk_layernorm_layer=csa_layer,  # 'C' with qk_layernorm
         hca_layer=_wrap_dsv4_layer(compress_ratio=128),  # 'H': HCA
         window_layer=_wrap_dsv4_layer(compress_ratio=0),  # 'W': sliding-window-only
     )
