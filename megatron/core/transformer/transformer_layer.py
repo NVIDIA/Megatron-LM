@@ -925,14 +925,26 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
     ) -> ResidualConnection | None:
         """Return the optional architecture-owned self-attention reader or writer."""
 
-        return None
+        match operation:
+            case "read":
+                return getattr(self, "residual_read_self_attn", None)
+            case "write":
+                return getattr(self, "residual_write_self_attn", None)
+            case _:
+                raise ValueError(f"Unsupported residual connection operation: {operation}.")
 
     def _get_residual_connection_for_mlp(
         self, operation: ResidualConnectionOperation
     ) -> ResidualConnection | None:
         """Return the optional architecture-owned MLP reader or writer."""
 
-        return None
+        match operation:
+            case "read":
+                return getattr(self, "residual_read_mlp", None)
+            case "write":
+                return getattr(self, "residual_write_mlp", None)
+            case _:
+                raise ValueError(f"Unsupported residual connection operation: {operation}.")
 
     def _read_residual_connection(
         self,
