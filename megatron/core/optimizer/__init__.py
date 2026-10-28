@@ -333,6 +333,7 @@ def _get_param_groups(
 
     # Map (pg_overrides, is_expert_parallel, is_dsa_indexer) to params.
     params_map = {}
+    model_order: Dict[int, int] = {}
 
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
@@ -365,6 +366,10 @@ def _get_param_groups(
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
+            # Position in the model's own parameter order, which is the order the groups
+            # that preceded the indexer split were filled in. Kept to reconstruct the
+            # numbering such a checkpoint used; see _tag_pre_split_param_index.
+            model_order[id(param)] = len(model_order)
 
     # Distributed checkpoint requires all ranks to have the same param groups,
     # so we need to align the param groups across ranks, otherwise we may have
@@ -384,6 +389,8 @@ def _get_param_groups(
     # element; treat a missing element as False so ordering stays total either way.
     def _key_order(key):
         return (key[0] is not None, key[0], key[1], key[2] if len(key) > 2 else False)
+
+    _tag_pre_split_param_index(params_map, params_key, model_order, _key_order)
 
     for key in sorted(params_key, key=_key_order):
         param_override_tuple, is_expert_parallel = key[0], key[1]
@@ -429,6 +436,45 @@ def _get_param_groups(
         param_groups.append(param_group)
 
     return param_groups
+
+
+def _tag_pre_split_param_index(params_map, params_key, model_order, key_order) -> None:
+    """Tag each parameter with the index it had before the indexer got its own group.
+
+    Torch identifies a parameter in a saved state dict by its position once the groups are
+    flattened in order, so splitting a group renumbers everything after the split point and a
+    checkpoint written earlier no longer lines up. Pairing the two needs the old number, and
+    it cannot be worked out when the checkpoint is read: the optimizer holds no reference to
+    the model by then, and the saved state carries integers rather than names.
+
+    Here both halves are available. ``key_order`` is the order the groups were laid out in,
+    and ``model_order`` is the order the parameters were walked in -- which is the order a
+    single group was filled. Collapsing ``is_dsa_indexer`` out of the key merges the groups
+    that used to be one, and sorting their members by model order reproduces the interleaving
+    of indexer and backbone parameters that the old group had.
+
+    Numbered separately for expert-parallel and dense parameters, because those go to
+    different optimizers and torch numbers from zero within each.
+
+    The index is written onto the parameter rather than onto the group, so it stays out of the
+    checkpoint: it describes the model in front of us, not anything that was saved.
+    """
+    collapsed = {}
+    for key in params_key:
+        collapsed.setdefault((key[0], key[1]), []).append(key)
+
+    for is_expert_parallel in (False, True):
+        subset = [k for k in collapsed if k[1] == is_expert_parallel]
+        next_index = 0
+        # (param_override_tuple, is_expert_parallel) ordered exactly as _key_order would,
+        # with the is_dsa_indexer element absent -- which is the ordering of the groups that
+        # preceded the split.
+        for collapsed_key in sorted(subset, key=lambda k: key_order((k[0], k[1]))):
+            members = [p for key in collapsed[collapsed_key] for p in params_map.get(key, [])]
+            members.sort(key=lambda param: model_order[id(param)])
+            for param in members:
+                param.pre_split_param_index = next_index
+                next_index += 1
 
 
 def _get_param_groups_and_buffers(

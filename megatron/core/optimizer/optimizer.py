@@ -200,6 +200,52 @@ def _missing_param_group_message(identifier: tuple, saved_groups: Dict[tuple, Di
     )
 
 
+PRE_SPLIT_PARAM_INDEX_ATTR = 'pre_split_param_index'
+
+
+def _expand_pre_split_param_groups(
+    current_groups: List[Dict], needed_groups: List[tuple], saved_groups: Dict[tuple, Dict]
+) -> List[Dict]:
+    """Rebuild the one saved group into the several the optimizer now has.
+
+    A checkpoint written before the indexer split numbered its parameters over a grouping
+    that no longer exists, and torch matches saved state to live parameters by flattened
+    position. Handing each of today's groups the saved numbers of *its own* parameters makes
+    those positions agree again, so every parameter is given back its own state.
+
+    The numbers are read off the parameters, where ``_tag_pre_split_param_index`` put them
+    when the groups were built -- see there for why they cannot be derived at this point.
+    """
+    final_groups = []
+    for group, identifier in zip(current_groups, needed_groups):
+        source = find_saved_param_group(identifier, saved_groups)
+        if source is None:
+            message = _missing_param_group_message(identifier, saved_groups)
+            if _is_dsa_indexer_identifier(identifier):
+                message += _PRE_SPLIT_CHECKPOINT_HINT
+            raise ValueError(message)
+
+        indices = [getattr(p, PRE_SPLIT_PARAM_INDEX_ATTR, None) for p in group['params']]
+        if any(index is None for index in indices):
+            raise ValueError(
+                _missing_param_group_message(identifier, saved_groups)
+                + "\n\nThis checkpoint has fewer parameter groups than the optimizer, which "
+                "needs each parameter's index under the earlier grouping to pair the saved "
+                "state back up. These parameters were not tagged with one, so the checkpoint "
+                "cannot be matched; start from fresh optimizer state."
+            )
+        final_groups.append({**source, 'params': indices})
+
+    assigned = [index for group in final_groups for index in group['params']]
+    if sorted(assigned) != list(range(len(assigned))):
+        raise ValueError(
+            f"Pre-split parameter indices do not form a contiguous numbering "
+            f"(got {len(set(assigned))} distinct of {len(assigned)}); they do not describe "
+            "a single earlier grouping and would pair the saved state up wrongly."
+        )
+    return final_groups
+
+
 def find_saved_param_group(identifier: tuple, saved_groups: Dict[tuple, Dict]) -> Optional[Dict]:
     """Find the saved group for ``identifier``, falling back across the DSA indexer split.
 
@@ -826,14 +872,14 @@ class MegatronOptimizer(ABC):
         # checkpoint with MORE groups is fine and intended: this filters down to the ones the
         # current optimizer has.
         if len(state_dict_groups) < len(current_groups):
-            message = (
-                f"Checkpoint has {len(state_dict_groups)} parameter group(s) but this "
-                f"optimizer has {len(current_groups)}.\n"
-                f"Parameter group key definition: {param_group_identifier_keys}"
+            # Fewer groups than the optimizer is the pre-split case: one group where there
+            # are now two. Rebuild the missing side rather than pairing positionally, which
+            # would drop the surplus and let torch reject the result several frames away with
+            # "loaded state dict has a different number of parameter groups". A checkpoint
+            # with MORE groups is fine and handled by the loop below, which filters down.
+            return _expand_pre_split_param_groups(
+                current_groups, needed_groups, loaded_groups_map
             )
-            if any(_is_dsa_indexer_identifier(key) for key in needed_groups):
-                message += _PRE_SPLIT_CHECKPOINT_HINT
-            raise ValueError(message)
 
         final_groups = []
         for key, params in zip(needed_groups, params_in_state_dict_order):
