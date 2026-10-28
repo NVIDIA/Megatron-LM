@@ -27,7 +27,8 @@ class MambaInferenceStateConfig:
 
     layer_type_list: List[str]
     """
-    A list of strings that indicates the layer type (Mamba / GDN / Attention / MLP) for each layer.
+    A list of strings that indicates the layer type (Mamba / GDN / Attention / MLP) for each
+    physical layer. Bracketed layer groups (e.g. `[M*E]`) are flattened into their members.
     See `megatron/core/models/hybrid/hybrid_layer_allocation.py` for the list of symbols.
     """
 
@@ -78,11 +79,18 @@ class MambaInferenceStateConfig:
         ssm_states_dtype: Optional[torch.dtype] = None,
     ) -> Optional["MambaInferenceStateConfig"]:
         """Return recurrent inference state config for a Mamba or GDN hybrid model."""
-        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+        from megatron.core.models.hybrid.hybrid_layer_allocation import (
+            Symbols,
+            flatten_layer_type_list,
+        )
         from megatron.core.ssm.ssm_inference import ssm_chunking
 
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
+        if layer_type_list is not None:
+            # Recurrent state is per physical layer, so look inside bracketed groups,
+            # which HybridStack reports as tuples of symbols.
+            layer_type_list = flatten_layer_type_list(layer_type_list)
         recurrent_symbols = (Symbols.MAMBA, Symbols.GDN)
         if layer_type_list is not None and any(
             symbol in layer_type_list for symbol in recurrent_symbols
@@ -124,8 +132,9 @@ class MambaInferenceStateConfig:
             # gated off for GDP (batch-invariant chunk lengths, prefix-cache
             # extraction offsets). A future cross-rank consumer must reconcile
             # these across the PP group.
-            # Align layers with layer_type_list (Shortcut-MoE registers each pair as one module).
-            chunking = ssm_chunking(decoder.layer_type_list, decoder.physical_layers())
+            # Align layers with the flattened layer_type_list (Shortcut-MoE registers each pair
+            # as one module, and a bracketed group as one nested stack).
+            chunking = ssm_chunking(layer_type_list, decoder.physical_layers())
             if chunking is None:
                 mamba_chunk_size = 128
                 ssm_chunk_alignment = mamba_chunk_size
