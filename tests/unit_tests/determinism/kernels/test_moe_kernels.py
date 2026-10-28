@@ -448,6 +448,9 @@ def test_virtual_expert_planner_graph_replay(virtual_expert_planner_group, ep_si
                             f"graph {num_tokens=} {topk=} {alignment=} {skew=} {replay=} {label}",
                             errors,
                         )
+                    # Peers can overwrite this symmetric window in their next planner launch.
+                    # Finish inspecting it on every rank before any rank advances.
+                    dist.barrier(group=group, device_ids=[device.index])
         _report(errors, dist.group.WORLD)
     finally:
         workspace.destroy()
