@@ -45,6 +45,8 @@ jobs:
     permissions:
       contents: read
     outputs:
+      main_sha: ${{ steps.merge-main.outputs.main_sha }}
+      source_tree: ${{ steps.merge-main.outputs.tree }}
       matrix: ${{ steps.plan.outputs.matrix }}
       has_tests: ${{ steps.plan.outputs.has_tests }}
     steps:
@@ -54,6 +56,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ inputs.sha }}
+          fetch-depth: 0
 
       - name: Setup Python
         id: python
@@ -96,6 +99,14 @@ jobs:
           artifact-ids: ${{ inputs.unit_test_pr_files_artifact_id }}
           path: ${{ steps.pr-files-directory.outputs.path }}
           merge-multiple: true
+
+      - name: Merge latest main locally
+        id: merge-main
+        shell: bash -e -u -o pipefail {0}
+        env:
+          SOURCE_SHA: ${{ inputs.sha }}
+          PR_FILES_DIR: ${{ steps.pr-files-directory.outputs.path }}
+        run: python .github/scripts/prepare_testmon_merge.py
 
       - name: Select affected tests for all buckets
         id: plan
@@ -162,6 +173,8 @@ jobs:
           container-image: ${{ inputs.container-image }}
           platform: ${{ inputs.platform }}
           sha: ${{ inputs.sha }}
+          unit_testmon_main_sha: ${{ needs.select.outputs.main_sha }}
+          unit_testmon_source_tree: ${{ needs.select.outputs.source_tree }}
           unit_testmon_mode: ${{ matrix.mode || 'full' }}
           unit_testmon_target_branch: ${{ inputs.unit_testmon_target_branch }}
           unit_testmon_plan_artifact: ${{ matrix.plan_artifact }}

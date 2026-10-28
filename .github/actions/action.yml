@@ -82,6 +82,14 @@ inputs:
     description: "Artifact containing the CPU-selected plan.json for this bucket."
     required: false
     default: ""
+  unit_testmon_main_sha:
+    description: "Pinned main commit merged locally before CPU selection."
+    required: false
+    default: ""
+  unit_testmon_source_tree:
+    description: "Merged workspace tree inspected by the CPU selector."
+    required: false
+    default: ""
 runs:
   using: "composite"
   steps:
@@ -93,6 +101,15 @@ runs:
       uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       with:
         ref: ${{ inputs.sha }}
+
+    - name: Merge the same main commit used by Testmon
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_main_sha != ''
+      shell: bash -e -u -o pipefail {0}
+      env:
+        SOURCE_SHA: ${{ inputs.sha }}
+        MAIN_SHA: ${{ inputs.unit_testmon_main_sha }}
+        EXPECTED_TREE: ${{ inputs.unit_testmon_source_tree }}
+      run: python3 .github/scripts/prepare_testmon_merge.py
 
     - name: Change ownership of /home/runner/
       shell: bash

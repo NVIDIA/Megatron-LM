@@ -806,7 +806,9 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
     outputs = {"has_tests": str(has_tests).lower()}
     assert workflow["jobs"]["select"]["runs-on"] == "ubuntu-latest"
     assert workflow["jobs"]["select"]["name"] == "unit tests selection"
-    assert workflow["jobs"]["select"]["if"] == "inputs.unit_testmon_mode == 'enforce'"
+    assert workflow["jobs"]["select"]["if"] == (
+        "inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_target_branch == 'main'"
+    )
     for step in workflow["jobs"]["select"]["steps"]:
         assert "unit_testmon_mode" not in step.get("if", "")
     for platform, parser_job, output in (
@@ -831,7 +833,7 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
     needs = SimpleNamespace(
         select=SimpleNamespace(result="success", outputs=SimpleNamespace(**outputs))
     )
-    inputs = SimpleNamespace(unit_testmon_mode="enforce")
+    inputs = SimpleNamespace(unit_testmon_mode="enforce", unit_testmon_target_branch="main")
     context = {"needs": needs, "inputs": inputs}
     assert eval(expression, {"__builtins__": {}}, context) == has_tests
     assert workflow["jobs"]["run"]["strategy"]["matrix"]["include"] == (
