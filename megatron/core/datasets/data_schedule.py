@@ -581,14 +581,15 @@ def _sequence_parallel_tp_cp_group(
     config,
     tp_group: torch.distributed.ProcessGroup,
     dynamic_cp: bool,
-    local_cp_size: int,
+    local_cp_size: int | None,
     dynamic_tp_cp_group_func: Optional[Callable[..., torch.distributed.ProcessGroup]],
     tp_cp_group: Optional[torch.distributed.ProcessGroup],
 ) -> Optional[torch.distributed.ProcessGroup]:
     """Return the TP x CP group sequence parallelism needs, or None without it."""
-    if not (config.sequence_parallel and tp_group.size() > 1):
+    if not (getattr(config, "sequence_parallel", False) and tp_group.size() > 1):
         return None
     if dynamic_cp:
+        assert local_cp_size is not None, "dynamic CP requires a runtime CP size"
         if dynamic_tp_cp_group_func is None:
             raise ValueError(
                 "dynamic_tp_cp_group_func is required for dynamic CP with sequence parallelism"
@@ -637,6 +638,8 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     if pg_collection is None:
         raise ValueError("pg_collection is required for sequence packing")
+    if dynamic_cp and config is None:
+        raise ValueError("config is required for dynamic CP")
     tp_group = pg_collection.tp
     pp_group = pg_collection.pp
     cp_group = pg_collection.cp

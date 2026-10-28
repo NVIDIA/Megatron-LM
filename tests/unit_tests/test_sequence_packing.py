@@ -578,6 +578,7 @@ def _gather_tensor_from_all_ranks(tensor):
         (1, 1, 4, True, 2),
         (1, 1, 4, True, 1),
         (2, 1, 2, True, 2),
+        (2, 1, 2, True, 1),
     ],
 )
 def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, local_cp_size):
@@ -650,12 +651,22 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
             vp_stage=None,
             dynamic_cp=dynamic_cp,
             pg_collection=pg_collection,
+            config=SimpleNamespace(sequence_parallel=tp > 1),
         )
 
         # Unpack the result. Scheduler THD always returns padding_mask.
         tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params, padding_mask = (
             result
         )
+        if dynamic_cp and tp > 1:
+            runtime_cp = set(torch.distributed.get_process_group_ranks(packed_seq_params.cp_group))
+            runtime_tp_cp = set(
+                torch.distributed.get_process_group_ranks(packed_seq_params.tp_cp_group)
+            )
+            tp_ranks = set(torch.distributed.get_process_group_ranks(pg_collection.tp))
+            assert len(runtime_tp_cp) == tp * local_cp_size
+            assert runtime_cp <= runtime_tp_cp and tp_ranks <= runtime_tp_cp
+            assert packed_seq_params.tp_cp_group is pg_collection.dynamic_tp_cp[local_cp_size]
 
         # Get parallel state info
         tp_rank = parallel_state.get_tensor_model_parallel_rank()

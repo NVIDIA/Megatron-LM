@@ -1120,7 +1120,7 @@ class MLASelfAttention(MultiLatentAttention):
                 and not self.checkpoint_core_attention
                 and kv.ndim == 4
                 and cu_seqlens_kv is None
-                and self.pg_collection.cp.size() == 1
+                and runtime_cp_group.size() == 1
                 and kv.shape[0] % 128 == 0
                 and kv.dtype == torch.bfloat16
                 and k_pos_emb.dtype == torch.bfloat16
