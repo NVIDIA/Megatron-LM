@@ -1,0 +1,27 @@
+---
+title: Optimizer CPU Offload
+description: Explains how to offload the optimizer to the CPU in Megatron Core and which flags to use for the best performance.
+---
+
+{/*
+   Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+   NVIDIA CORPORATION and its licensors retain all intellectual property
+   and proprietary rights in and to this software, related documentation
+   and any modifications thereto. Any use, reproduction, disclosure or
+   distribution of this software and related documentation without an express
+   license agreement from NVIDIA CORPORATION is strictly prohibited.
+*/}
+
+## How to use ?
+
+Add these flags to enable optimizer cpu offload in MCore.
+
+```bash
+--optimizer-cpu-offload
+--optimizer-offload-fraction 1.0
+--use-precision-aware-optimizer
+```
+
+## Configuration Recommendations
+
+Gradient copy from GPU to CPU, CPU optimizer step, and subsequent parameter copy from CPU to GPU can be time-consuming operations, and it is recommended to use the flag `--overlap-cpu-optimizer-d2h-h2d` to execute them concurrently.

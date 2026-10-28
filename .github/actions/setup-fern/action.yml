@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The single place the Node and Fern CLI versions are set for every Fern workflow.
+#
+# The caller must check out this action first. The version in fern.config.json is
+# checked against a strict semver pattern before it reaches `npm install`, so a
+# pull request cannot change it into an arbitrary package spec.
+
+name: 'Set up Fern CLI'
+description: 'Installs Node and the fern-api version pinned in fern.config.json'
+author: 'NVIDIA'
+
+inputs:
+  config-path:
+    description: 'Path to the fern.config.json that pins the fern-api version'
+    required: false
+    default: 'docs/fern/fern.config.json'
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      with:
+        node-version: '20'
+
+    - name: Install Fern CLI
+      shell: bash
+      env:
+        CONFIG_PATH: ${{ inputs.config-path }}
+      run: |
+        set -euo pipefail
+        VERSION=$(jq -r '.version // empty' "$CONFIG_PATH")
+        if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+          echo "::error::Invalid fern-api version '${VERSION}' in ${CONFIG_PATH}"
+          exit 1
+        fi
+        npm install -g "fern-api@${VERSION}"

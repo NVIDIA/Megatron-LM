@@ -1,0 +1,156 @@
+navigation:
+  - page: Megatron Core User Guide
+    path: ./v0.20.0-content/index.mdx
+    slug: /
+  - section: About Megatron Core
+    contents:
+      - page: Overview
+        path: ./v0.20.0-content/get-started/overview.mdx
+      - page: Release Notes and Roadmaps
+        path: ./v0.20.0-content/get-started/releasenotes.mdx
+  - section: Get Started
+    contents:
+      - page: Installation
+        path: ./v0.20.0-content/get-started/install.mdx
+      - page: Your First Training Run
+        path: ./v0.20.0-content/get-started/quickstart.mdx
+  - section: Basic Usage
+    contents:
+      - page: Data Preparation
+        path: ./v0.20.0-content/user-guide/data-preparation.mdx
+      - page: Training Examples
+        path: ./v0.20.0-content/user-guide/training-examples.mdx
+      - section: Parallelism Strategies Guide
+        path: ./v0.20.0-content/user-guide/parallelism-guide.mdx
+        contents:
+          - page: Context Parallel Overview
+            path: ./v0.20.0-content/user-guide/features/context_parallel.mdx
+          - page: Custom Pipeline Model Parallel Layout
+            path: ./v0.20.0-content/user-guide/features/pipeline_parallel_layout.mdx
+          - page: Generalized Tensor Parallelism (GTP)
+            path: ./v0.20.0-content/api-guide/core/generalized_tensor_parallel.mdx
+  - section: Supported Models
+    contents:
+      - section: Supported Models
+        path: ./v0.20.0-content/models/index.mdx
+        contents:
+          - page: Language Models
+            path: ./v0.20.0-content/models/llms.mdx
+          - page: Multimodal Models
+            path: ./v0.20.0-content/models/multimodal.mdx
+          - page: Llama, Mistral and other Llama-like model support in Megatron-LM
+            path: ./v0.20.0-content/llama_mistral.mdx
+  - section: Advanced Features
+    contents:
+      - page: Deterministic Training
+        path: ./v0.20.0-content/user-guide/deterministic-training.mdx
+      - section: Mixture of Experts
+        path: ./v0.20.0-content/user-guide/features/moe.mdx
+        contents:
+          - page: Multi-Token Prediction (MTP)
+            path: ./v0.20.0-content/user-guide/features/multi_token_prediction.mdx
+          - page: Multi-Latent Attention
+            path: ./v0.20.0-content/user-guide/features/multi_latent_attention.mdx
+          - page: "Design Document: MoE Router Replay Feature"
+            path: ./v0.20.0-content/api-guide/router_replay.mdx
+            : router-replay
+      - page: Megatron-FSDP
+        path: ./v0.20.0-content/user-guide/features/megatron_fsdp.mdx
+      - page: Distributed Optimizer
+        path: ./v0.20.0-content/user-guide/features/dist_optimizer.mdx
+      - page: Weighted Checkpoint Merge
+        path: ./v0.20.0-content/user-guide/features/checkpoint-merge.mdx
+      - page: Optimizer CPU Offload
+        path: ./v0.20.0-content/user-guide/features/optimizer_cpu_offload.mdx
+      - page: Fine-Grained Activation Offloading
+        path: ./v0.20.0-content/user-guide/features/fine_grained_activation_offloading.mdx
+      - page: Data Loading at Scale
+        path: ./v0.20.0-content/user-guide/data-loading.mdx
+      - page: Megatron Energon
+        path: ./v0.20.0-content/user-guide/features/megatron_energon.mdx
+      - page: Megatron RL
+        path: ./v0.20.0-content/user-guide/features/megatron_rl.mdx
+      - page: Tokenizers
+        path: ./v0.20.0-content/user-guide/features/tokenizers.mdx
+      - page: GDN Elementwise Fusion
+        path: ./v0.20.0-content/developer/gdn_ew_fusion.mdx
+  - section: Inference
+    contents:
+      - page: Inference User Guide
+        path: ./v0.20.0-content/mcore-inference-user-guide.mdx
+  - section: Observability
+    path: ./v0.20.0-content/user-guide/observability/index.mdx
+    contents:
+      - page: Configuration
+        path: ./v0.20.0-content/user-guide/observability/configuration.mdx
+      - page: Span Groups
+        path: ./v0.20.0-content/user-guide/observability/span-groups.mdx
+      - page: Metrics
+        path: ./v0.20.0-content/user-guide/observability/metrics.mdx
+      - page: Pipeline-Parallel Trace Correlation
+        path: ./v0.20.0-content/user-guide/observability/pipeline-parallel.mdx
+      - page: Extending Instrumentation
+        path: ./v0.20.0-content/user-guide/observability/extending.mdx
+  - section: Developer Guide
+    contents:
+      - page: Contributing to Megatron-LM
+        path: ./v0.20.0-content/developer/contribute.mdx
+      - page: How to Submit a PR
+        path: ./v0.20.0-content/developer/submit.mdx
+      - page: Oncall Overview
+        path: ./v0.20.0-content/developer/oncall.mdx
+      - page: Generating Docs Locally
+        path: ./v0.20.0-content/developer/generate_docs.mdx
+  - section: API Reference
+    contents:
+      - section: API Guide
+        path: ./v0.20.0-content/api-guide/index.mdx
+        contents:
+          - section: Model APIs
+            path: ./v0.20.0-content/api-guide/models/index.mdx
+            contents:
+              - section: models package
+                path: ./v0.20.0-content/api-guide/models/models.mdx
+                contents:
+                  - page: models.gpt package
+                    path: ./v0.20.0-content/api-guide/models/models.gpt.mdx
+                  - page: models.t5 package
+                    path: ./v0.20.0-content/api-guide/models/models.t5.mdx
+                  - page: models.bert package
+                    path: ./v0.20.0-content/api-guide/models/models.bert.mdx
+          - section: Core APIs
+            path: ./v0.20.0-content/api-guide/core/index.mdx
+            contents:
+              - page: transformer package
+                path: ./v0.20.0-content/api-guide/core/transformer.mdx
+              - page: tensor_parallel package
+                path: ./v0.20.0-content/api-guide/core/tensor_parallel.mdx
+                slug: tensr-parallel
+              - page: pipeline_parallel package
+                path: ./v0.20.0-content/api-guide/core/pipeline_parallel.mdx
+              - page: fusions package
+                path: ./v0.20.0-content/api-guide/core/fusions.mdx
+              - page: distributed package
+                path: ./v0.20.0-content/api-guide/core/distributed.mdx
+              - page: datasets package
+                path: ./v0.20.0-content/api-guide/core/datasets.mdx
+              - section: dist_checkpointing package
+                path: ./v0.20.0-content/api-guide/core/dist_checkpointing.mdx
+                contents:
+                  - page: dist_checkpointing.strategies package
+                    path: ./v0.20.0-content/api-guide/core/dist_checkpointing.strategies.mdx
+          - section: Internal Utilities
+            path: ./v0.20.0-content/api-guide/internal/index.mdx
+            contents:
+              - page: Microbatches Calculator
+                path: ./v0.20.0-content/api-guide/internal/num_microbatches_calculator.mdx
+              - page: Optimizer Parameters Scheduler
+                path: ./v0.20.0-content/api-guide/internal/optimizer_param_scheduler.mdx
+      - link: Python API Reference
+        href: https://docs.nvidia.com/megatron-core/developer-guide/latest/apidocs/index.html
+  - section: Resources
+    contents:
+      - page: Migrate from GPTModel to HybridModel
+        path: ./v0.20.0-content/user-guide/hybrid-model-migration.mdx
+      - page: Discussions
+        path: ./v0.20.0-content/advanced/index.mdx

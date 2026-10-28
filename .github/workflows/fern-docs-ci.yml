@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Validates Fern docs configuration on pull requests.
+
+name: Fern docs (check)
+
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - '.github/actions/setup-fern/**'
+      - '.github/workflows/fern-docs-ci.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Check nightly navigation is up to date
+        run: |
+          python -m pip install --no-cache-dir PyYAML
+          python docs/fern/scripts/fern_nav.py generate --check
+
+      - name: Checkout frozen version content
+        run: python3 docs/fern/scripts/fern_versions.py extract-content
+
+      - name: Set up Fern CLI
+        uses: ./.github/actions/setup-fern
+
+      - name: Validate Fern configuration
+        working-directory: ./docs/fern
+        run: fern check
