@@ -1084,7 +1084,7 @@ _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
 _ASYNC_PARALLEL_GRAPH_SCENARIOS = tuple(
     scenario
     for scenario in _ASYNC_PARALLEL_SCENARIOS
-    if scenario.name not in {"moe-ep2-nccl", "moe-ep2-etp2-local-allgather"}
+    if scenario.name not in {"tp2-pp2-sp-dp2", "moe-ep2-nccl", "moe-ep2-etp2-local-allgather"}
 ) + (
     _variant(
         "moe-ep2-nccl",
@@ -3276,8 +3276,6 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
     @torch.inference_mode()
     def test_eager_matches_actual_replay_for_parallel_pair(self, scenario):
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        if scenario.name == "tp2-pp2-sp-dp2" and world_size != 8:
-            pytest.skip("the TP2/PP2/DP2 owner requires exactly eight GPUs")
         if world_size < 4:
             pytest.skip("parallel CUDA-graph pair owners require at least four GPUs")
         config = scenario.config
