@@ -233,8 +233,6 @@ class TestLanguageModelRotaryGraphInputs(_CudaGraphTestBase):
         eager_b = _run_gpt(reference, *batch_b, weight)
         _run_gpt(graphed, *batch_a, weight)  # the eager warmup step before the capture
         self.helper.create_cudagraphs()
-        for layer in graphed.decoder.layers:
-            assert layer._cuda_graph_has_rotary_pos_emb is True
 
         _assert_same(_run_gpt(graphed, *batch_a, weight), eager_a)
         _assert_same(_run_gpt(graphed, *batch_b, weight), eager_b)
@@ -277,10 +275,10 @@ class TestLanguageModelRotaryGraphInputs(_CudaGraphTestBase):
         graphed, _ = self._graphed_and_reference("mrope")
         weight = torch.randn(_MBS, _SEQ, _VOCAB, device="cuda")
         self.helper.create_cudagraphs()
-        for layer in graphed.decoder.layers:
-            assert layer._cuda_graph_has_rotary_pos_emb is False
         with pytest.raises(RuntimeError, match="captured without a rotary_pos_emb input"):
             _run_gpt(graphed, *_gpt_batch("mrope", 0), weight)
+        for layer in graphed.decoder.layers:
+            assert layer._cuda_graph_has_rotary_pos_emb is False
 
         layer = graphed.decoder.layers[0]
         layer._cuda_graph_has_rotary_pos_emb = True
@@ -379,15 +377,15 @@ class TestVisionRotaryGraphInputs(_CudaGraphTestBase):
         eager_a = _run_vision(reference, hidden_states, rope_a, weight)
         eager_b = _run_vision(reference, hidden_states, rope_b, weight)
         _run_vision(graphed, hidden_states, rope_a, weight)  # the eager step before the capture
-        _, sample_kwargs = self.helper._get_sample_arguments(order=[1, -1])
-        for sample in sample_kwargs:
-            assert sample["rotary_pos_emb"].shape == (_VISION_SEQ, 1, 1, _HEAD_DIM)
-            assert sample["rotary_pos_emb"].dtype == torch.float32
         self.helper.create_cudagraphs()
 
         _assert_same(_run_vision(graphed, hidden_states, rope_a, weight), eager_a)
         _assert_same(_run_vision(graphed, hidden_states, rope_b, weight), eager_b)
         _assert_different(eager_a, eager_b)
+        _, sample_kwargs = self.helper._get_sample_arguments(order=[1, -1])
+        for sample in sample_kwargs:
+            assert sample["rotary_pos_emb"].shape == (_VISION_SEQ, 1, 1, _HEAD_DIM)
+            assert sample["rotary_pos_emb"].dtype == torch.float32
 
     def test_capture_without_eager_step_raises_on_rotary(self):
         """Without an eager step, the graphs have no rotary input, and a replay with one raises
