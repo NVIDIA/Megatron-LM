@@ -454,3 +454,326 @@ def mamba_state_selective_copy(
         STATE_SIZE=state_size,
         BLOCK_SIZE=BLOCK_SIZE,
     )
+
+
+# ---------------------------------------------------------------------------
+# Kernel 5: Per-depth attention metadata for the MTP draft loop
+# ---------------------------------------------------------------------------
+@triton.jit
+def _mtp_draft_step_metadata_kernel(
+    # Draft-loop state (read-only)
+    OFFSETS_PTR,
+    SRC_BLOCK_TABLE_PTR,
+    # Per-token KV write maps
+    TOKEN_TO_BLOCK_IDX_PTR,
+    TOKEN_TO_LOCAL_POS_PTR,
+    TOKEN_TO_REQUEST_IDX_PTR,
+    TOKEN_TO_POS_IN_REQUEST_PTR,
+    TOKEN_TO_POS_IDS_PTR,
+    # Per-request length staging
+    STAGED_QUERY_LENGTHS_PTR,
+    STAGED_KV_LENGTHS_PTR,
+    # Per-request MHA read metadata
+    MHA_QUERY_LENGTHS_PTR,
+    MHA_CU_QUERY_PTR,
+    MHA_KV_LENGTHS_PTR,
+    MHA_CU_KV_PTR,
+    MHA_BLOCK_TABLE_PTR,
+    # Strides / limits
+    src_block_table_stride,
+    mha_block_table_stride,
+    num_block_columns,
+    active_request_count,
+    padded_count,
+    dummy_block_idx,
+    # Compile-time constants
+    BLOCK_SIZE_TOKENS: tl.constexpr,
+    BLOCK_R: tl.constexpr,  # next_power_of_2(padded_count)
+    BLOCK_C: tl.constexpr,  # block-table columns copied per iteration
+):
+    """Write one draft depth's KV write maps and MHA read metadata.
+
+    Grid: (1,). One program covers every request slot, since the cumulative lengths span
+    requests. Each of the first `active_request_count` slots writes one token at its MTP
+    position P (from OFFSETS) and attends over P + 1 keys. Slots in
+    [active_request_count, padded_count) are padding: their tokens go to the dummy block and
+    their requests get zero lengths and a -1 block table.
+    """
+    rows = tl.arange(0, BLOCK_R)
+    real = rows < active_request_count
+    padded = rows < padded_count
+
+    # --- Per-token KV write maps (one token per request) ---
+    positions = tl.load(OFFSETS_PTR + rows, mask=real, other=0)
+    block_col = positions // BLOCK_SIZE_TOKENS
+    destinations = tl.load(
+        SRC_BLOCK_TABLE_PTR + rows.to(tl.int64) * src_block_table_stride + block_col,
+        mask=real,
+        other=0,
+    )
+    block_idx = tl.where(real, destinations.to(tl.int64), dummy_block_idx)
+    tl.store(TOKEN_TO_BLOCK_IDX_PTR + rows, block_idx, mask=padded)
+    local_pos = tl.where(real, positions % BLOCK_SIZE_TOKENS, 0)
+    tl.store(TOKEN_TO_LOCAL_POS_PTR + rows, local_pos, mask=padded)
+    tl.store(TOKEN_TO_REQUEST_IDX_PTR + rows, rows, mask=real)
+    tl.store(TOKEN_TO_POS_IN_REQUEST_PTR + rows, positions, mask=real)
+    tl.store(TOKEN_TO_POS_IDS_PTR + rows, positions.to(tl.int64), mask=real)
+
+    # --- Per-request lengths: query_length = 1, kv_length = P + 1 (write-then-attend) ---
+    query_lengths = tl.where(real, 1, 0)
+    kv_lengths = tl.where(real, positions + 1, 0)
+    tl.store(STAGED_QUERY_LENGTHS_PTR + rows, query_lengths, mask=real)
+    tl.store(STAGED_KV_LENGTHS_PTR + rows, kv_lengths, mask=real)
+    tl.store(MHA_QUERY_LENGTHS_PTR + rows, query_lengths, mask=padded)
+    tl.store(MHA_KV_LENGTHS_PTR + rows, kv_lengths, mask=padded)
+
+    # Cumulative lengths: entry 0 is 0, entry r + 1 sums slots 0..r. Padding slots add zero,
+    # so they repeat the last real total.
+    tl.store(MHA_CU_QUERY_PTR + rows, tl.zeros_like(rows), mask=rows == 0)
+    tl.store(MHA_CU_KV_PTR + rows, tl.zeros_like(rows), mask=rows == 0)
+    tl.store(MHA_CU_QUERY_PTR + 1 + rows, tl.cumsum(query_lengths, axis=0), mask=padded)
+    tl.store(MHA_CU_KV_PTR + 1 + rows, tl.cumsum(kv_lengths, axis=0), mask=padded)
+
+    # --- Block table: real rows copy the draft loop's table, padding rows get -1 ---
+    real_2d = real[:, None]
+    padded_2d = padded[:, None]
+    src_rows = rows.to(tl.int64)[:, None] * src_block_table_stride
+    dst_rows = rows.to(tl.int64)[:, None] * mha_block_table_stride
+    for col_start in range(0, num_block_columns, BLOCK_C):
+        cols = (col_start + tl.arange(0, BLOCK_C))[None, :]
+        col_mask = cols < num_block_columns
+        values = tl.load(SRC_BLOCK_TABLE_PTR + src_rows + cols, mask=real_2d & col_mask, other=0)
+        values = tl.where(real_2d, values, -1)
+        tl.store(
+            MHA_BLOCK_TABLE_PTR + dst_rows + cols,
+            values.to(MHA_BLOCK_TABLE_PTR.dtype.element_ty),
+            mask=padded_2d & col_mask,
+        )
+
+
+def mtp_draft_step_metadata(
+    gpu_view,
+    offsets,
+    block_table,
+    staged_query_lengths,
+    staged_kv_lengths,
+    active_request_count,
+    padded_count,
+    block_size_tokens,
+    dummy_block_idx,
+):
+    """Launch the per-depth MTP draft metadata kernel.
+
+    Writes exactly what `MTPMetadata.stage_decode_lengths`, `write_token_maps` and
+    `write_mha_metadata` write for one draft depth, in a single launch and without host
+    syncs.
+
+    Args:
+        gpu_view: `ContextGPUView` whose token maps and `mha_*` buffers are written.
+        offsets: `(>=active_request_count,)` int32 MTP write position per request. Must be
+            non-negative.
+        block_table: `(>=active_request_count, num_block_columns)` draft-loop block table.
+        staged_query_lengths, staged_kv_lengths: `(>=active_request_count,)` int32 staging
+            buffers, written with the per-request query and KV lengths.
+        active_request_count: Requests that draft this depth.
+        padded_count: Request (and token) slots the forward launches over, including padding.
+        block_size_tokens: KV block size, in tokens.
+        dummy_block_idx: Scratch block that padding tokens write to.
+    """
+    if padded_count == 0:
+        return
+    assert active_request_count <= padded_count
+    num_block_columns = gpu_view.mha_block_table.shape[1]
+    assert block_table.shape[1] == num_block_columns
+
+    _mtp_draft_step_metadata_kernel[(1,)](
+        offsets,
+        block_table,
+        gpu_view.token_to_block_idx,
+        gpu_view.token_to_local_position_within_kv_block,
+        gpu_view.token_to_request_idx,
+        gpu_view.token_to_position_in_request,
+        gpu_view.token_to_pos_ids,
+        staged_query_lengths,
+        staged_kv_lengths,
+        gpu_view.mha_query_lengths,
+        gpu_view.mha_cu_query_seq_lengths,
+        gpu_view.mha_kv_seq_lengths,
+        gpu_view.mha_cu_kv_seq_lengths,
+        gpu_view.mha_block_table,
+        src_block_table_stride=block_table.stride(0),
+        mha_block_table_stride=gpu_view.mha_block_table.stride(0),
+        num_block_columns=num_block_columns,
+        active_request_count=active_request_count,
+        padded_count=padded_count,
+        dummy_block_idx=dummy_block_idx,
+        BLOCK_SIZE_TOKENS=block_size_tokens,
+        BLOCK_R=triton.next_power_of_2(padded_count),
+        BLOCK_C=min(triton.next_power_of_2(num_block_columns), 64),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Kernel 6: Attention metadata for the CUDA-graphed MTP commit pass
+# ---------------------------------------------------------------------------
+@triton.jit
+def _mtp_commit_step_metadata_kernel(
+    # Per-request input (read-only)
+    ACCEPTED_COUNTS_PTR,
+    BASE_POSITIONS_PTR,
+    SRC_BLOCK_TABLE_PTR,
+    # Per-token KV write maps
+    TOKEN_TO_BLOCK_IDX_PTR,
+    TOKEN_TO_LOCAL_POS_PTR,
+    TOKEN_TO_REQUEST_IDX_PTR,
+    TOKEN_TO_POS_IN_REQUEST_PTR,
+    TOKEN_TO_POS_IDS_PTR,
+    # Per-request MHA read metadata
+    MHA_QUERY_LENGTHS_PTR,
+    MHA_CU_QUERY_PTR,
+    MHA_KV_LENGTHS_PTR,
+    MHA_CU_KV_PTR,
+    MHA_BLOCK_TABLE_PTR,
+    # Strides / limits
+    src_block_table_stride,
+    mha_block_table_stride,
+    num_block_columns,
+    active_request_count,
+    padded_count,
+    dummy_block_idx,
+    # Compile-time constants
+    SLOTS: tl.constexpr,  # num_speculative_tokens: commit rows per request
+    BLOCK_SIZE_TOKENS: tl.constexpr,
+    BLOCK_R: tl.constexpr,  # next_power_of_2(padded_count)
+    BLOCK_S: tl.constexpr,  # next_power_of_2(SLOTS)
+    BLOCK_C: tl.constexpr,  # block-table columns copied per iteration
+):
+    """Write the fixed-shape commit-pass metadata for a decode-only step.
+
+    Grid: (1,). Request r owns token rows r*SLOTS .. r*SLOTS+SLOTS-1. Request r accepted a_r
+    drafts, so its refreshed run starts at MTP position `start_r = base_r - 1 - a_r`; slot j
+    writes position start_r + j when j < a_r and the dummy block otherwise. Every real request
+    attends with SLOTS query rows over `start_r + SLOTS` keys, so causal (bottom-right aligned)
+    masking lets slot j see keys up to start_r + j. Requests at or past active_request_count are
+    padding: dummy-block writes, zero lengths, and a -1 block table.
+    """
+    rows = tl.arange(0, BLOCK_R)
+    real = rows < active_request_count
+    padded = rows < padded_count
+
+    accepted = tl.load(ACCEPTED_COUNTS_PTR + rows, mask=real, other=0).to(tl.int32)
+    base = tl.load(BASE_POSITIONS_PTR + rows, mask=real, other=1).to(tl.int32)
+    starts = base - 1 - accepted
+
+    # --- Per-token KV write maps ---
+    slots = tl.arange(0, BLOCK_S)
+    slot_in_range = (slots < SLOTS)[None, :]
+    tokens = rows[:, None] * SLOTS + slots[None, :]
+    token_mask = padded[:, None] & slot_in_range
+    positions = starts[:, None] + slots[None, :]
+    writes = real[:, None] & (slots[None, :] < accepted[:, None]) & slot_in_range
+    destinations = tl.load(
+        SRC_BLOCK_TABLE_PTR
+        + rows.to(tl.int64)[:, None] * src_block_table_stride
+        + positions // BLOCK_SIZE_TOKENS,
+        mask=writes,
+        other=0,
+    )
+    block_idx = tl.where(writes, destinations.to(tl.int64), dummy_block_idx)
+    local_pos = tl.where(writes, positions % BLOCK_SIZE_TOKENS, 0)
+    request_positions = tl.where(real[:, None], positions, 0)
+    tl.store(TOKEN_TO_BLOCK_IDX_PTR + tokens, block_idx, mask=token_mask)
+    tl.store(TOKEN_TO_LOCAL_POS_PTR + tokens, local_pos, mask=token_mask)
+    tl.store(
+        TOKEN_TO_REQUEST_IDX_PTR + tokens, rows[:, None] + tl.zeros_like(tokens), mask=token_mask
+    )
+    tl.store(TOKEN_TO_POS_IN_REQUEST_PTR + tokens, request_positions, mask=token_mask)
+    tl.store(TOKEN_TO_POS_IDS_PTR + tokens, request_positions.to(tl.int64), mask=token_mask)
+
+    # --- Per-request lengths and their cumulative sums ---
+    query_lengths = tl.where(real, SLOTS, 0)
+    kv_lengths = tl.where(real, starts + SLOTS, 0)
+    tl.store(MHA_QUERY_LENGTHS_PTR + rows, query_lengths, mask=padded)
+    tl.store(MHA_KV_LENGTHS_PTR + rows, kv_lengths, mask=padded)
+    tl.store(MHA_CU_QUERY_PTR + rows, tl.zeros_like(rows), mask=rows == 0)
+    tl.store(MHA_CU_KV_PTR + rows, tl.zeros_like(rows), mask=rows == 0)
+    tl.store(MHA_CU_QUERY_PTR + 1 + rows, tl.cumsum(query_lengths, axis=0), mask=padded)
+    tl.store(MHA_CU_KV_PTR + 1 + rows, tl.cumsum(kv_lengths, axis=0), mask=padded)
+
+    # --- Block table: real rows copy the source table, padding rows get -1 ---
+    real_2d = real[:, None]
+    padded_2d = padded[:, None]
+    src_rows = rows.to(tl.int64)[:, None] * src_block_table_stride
+    dst_rows = rows.to(tl.int64)[:, None] * mha_block_table_stride
+    for col_start in range(0, num_block_columns, BLOCK_C):
+        cols = (col_start + tl.arange(0, BLOCK_C))[None, :]
+        col_mask = cols < num_block_columns
+        values = tl.load(SRC_BLOCK_TABLE_PTR + src_rows + cols, mask=real_2d & col_mask, other=0)
+        values = tl.where(real_2d, values, -1)
+        tl.store(
+            MHA_BLOCK_TABLE_PTR + dst_rows + cols,
+            values.to(MHA_BLOCK_TABLE_PTR.dtype.element_ty),
+            mask=padded_2d & col_mask,
+        )
+
+
+def mtp_commit_step_metadata(
+    gpu_view,
+    accepted_counts,
+    base_positions,
+    block_table,
+    active_request_count,
+    padded_count,
+    num_slots,
+    block_size_tokens,
+    dummy_block_idx,
+):
+    """Launch the graphed commit-pass metadata kernel.
+
+    Lays the commit pass out as `num_slots` token rows per request (so its shape depends only on
+    `padded_count`) and writes the token maps and MHA metadata for it, without host syncs.
+
+    Args:
+        gpu_view: `ContextGPUView` whose token maps and `mha_*` buffers are written.
+        accepted_counts: `(>=active_request_count,)` drafts each request accepted this step.
+        base_positions: `(>=active_request_count,)` position of each request's next draft
+            (one past its last committed token).
+        block_table: `(>=active_request_count, num_block_columns)` block ids per request.
+        active_request_count: Real (decode) requests.
+        padded_count: Request slots the forward launches over, including padding.
+        num_slots: Commit rows per request (`num_speculative_tokens`).
+        block_size_tokens: KV block size, in tokens.
+        dummy_block_idx: Scratch block that unused and padding rows write to.
+    """
+    if padded_count == 0:
+        return
+    assert active_request_count <= padded_count
+    num_block_columns = gpu_view.mha_block_table.shape[1]
+    assert block_table.shape[1] == num_block_columns
+
+    _mtp_commit_step_metadata_kernel[(1,)](
+        accepted_counts,
+        base_positions,
+        block_table,
+        gpu_view.token_to_block_idx,
+        gpu_view.token_to_local_position_within_kv_block,
+        gpu_view.token_to_request_idx,
+        gpu_view.token_to_position_in_request,
+        gpu_view.token_to_pos_ids,
+        gpu_view.mha_query_lengths,
+        gpu_view.mha_cu_query_seq_lengths,
+        gpu_view.mha_kv_seq_lengths,
+        gpu_view.mha_cu_kv_seq_lengths,
+        gpu_view.mha_block_table,
+        src_block_table_stride=block_table.stride(0),
+        mha_block_table_stride=gpu_view.mha_block_table.stride(0),
+        num_block_columns=num_block_columns,
+        active_request_count=active_request_count,
+        padded_count=padded_count,
+        dummy_block_idx=dummy_block_idx,
+        SLOTS=num_slots,
+        BLOCK_SIZE_TOKENS=block_size_tokens,
+        BLOCK_R=triton.next_power_of_2(padded_count),
+        BLOCK_S=triton.next_power_of_2(num_slots),
+        BLOCK_C=min(triton.next_power_of_2(num_block_columns), 64),
+    )
