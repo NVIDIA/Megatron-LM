@@ -41,7 +41,6 @@ MODEL_ARGS:
   --pipeline-model-parallel-size: 2
   --defer-embedding-wgrad-compute: true
   --wgrad-deferral-limit: 2
-  --deterministic-mode: true
   --attention-softmax-in-fp32: true
   --use-checkpoint-opt_param-scheduler: true
   --use-mcore-models: true

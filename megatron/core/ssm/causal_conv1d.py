@@ -48,7 +48,7 @@ def assert_causal_conv1d_deterministic(deterministic_mode):
 
     assert _use_causal_conv1d_deterministic_mode(), (
         "deterministic_mode requires a deterministic causal_conv1d backward. Enable it with "
-        "torch.use_deterministic_algorithms(True) (which --deterministic-mode does) or "
+        "torch.use_deterministic_algorithms(True) (which deterministic mode does) or "
         "CAUSAL_CONV1D_DETERMINISTIC=1."
     )
     # https://github.com/Dao-AILab/causal-conv1d/pull/88 added the deterministic reduction.

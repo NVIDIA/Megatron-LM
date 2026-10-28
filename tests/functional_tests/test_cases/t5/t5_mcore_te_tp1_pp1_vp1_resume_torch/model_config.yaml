@@ -48,7 +48,6 @@ MODEL_ARGS:
   --eval-iters: 10
   --distributed-backend: nccl
   --data-cache-path: ${DATA_CACHE_PATH}
-  --deterministic-mode: true
   --attention-softmax-in-fp32: true
   --ckpt-format: torch
   --attention-backend: unfused

@@ -9,7 +9,7 @@ the kernels Megatron ships itself: the Mamba2 varlen chunked scan (``ssd_*`` ker
 ``causal_conv1d_update``, the varlen causal conv, the Gated Delta Product varlen chunk scan
 (``gdp/*`` kernels) and its decode kernels -- single-token and speculative, where a step
 carries several draft tokens and the kernels snapshot the conv and recurrent state after
-each of them -- and the torch gated-delta-rule path that ``--deterministic-mode`` selects
+each of them -- and the torch gated-delta-rule path that deterministic mode selects
 instead of FLA.
 
 Autotuning is the mechanism that can break replay here: ``megatron.core.tuning`` pins a
@@ -50,7 +50,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(autouse=True)
 def ssm_deterministic(monkeypatch):
-    """Pin the SSM autotuner / workspace path like ``--deterministic-mode`` does."""
+    """Pin the SSM autotuner / workspace path like deterministic mode does."""
     monkeypatch.setattr(tuning_policy, "_deterministic_override", True)
 
 
@@ -711,7 +711,7 @@ def test_torch_chunk_gated_delta_rule_cuda_graph(
 
 
 def test_torch_chunk_gated_delta_rule_replays_fwd_bwd():
-    """The path ``--deterministic-mode`` selects for GDN (FLA is not deterministic)."""
+    """The path deterministic mode selects for GDN (FLA is not deterministic)."""
     from megatron.core.ssm.gated_delta_net.gdn import torch_chunk_gated_delta_rule
 
     seeded()

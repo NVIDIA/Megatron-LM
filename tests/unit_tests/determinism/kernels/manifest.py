@@ -172,7 +172,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/fusions/fused_cross_entropy.py",),
         tests=(K + "test_fused_activations.py",),
         kind="torch.compile",
-        notes="Rejected by --deterministic-mode (op catalog); the replay test records its status as xfail(strict=False).",
+        notes="Rejected by deterministic mode (op catalog); the replay test records its status as xfail(strict=False).",
     ),
     KernelEntry(
         name="te_fused_cross_entropy",
@@ -843,7 +843,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="dispatch",
         exempt_reason="TE gather_along_first_dim / reduce_scatter_along_first_dim of weights and "
         "wgrads in generalized tensor parallelism; multi-rank NCCL collectives pinned by "
-        "NCCL_ALGO=Ring under --deterministic-mode, not exercised by the determinism model tests.",
+        "NCCL_ALGO=Ring in deterministic mode, not exercised by the determinism model tests.",
     ),
     KernelEntry(
         name="te_thd_partitioned_indices",

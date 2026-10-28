@@ -299,7 +299,9 @@ def _parse_validate(argv):
     from megatron.training.arguments import parse_args, validate_args
 
     saved = sys.argv
-    sys.argv = ["pytest"] + argv
+    # The Nemotron recipe uses fused cross entropy and MoE router aux loss, which
+    # deterministic mode (on by default) rejects.
+    sys.argv = ["pytest"] + argv + ["--disable-deterministic-mode"]
     try:
         args = parse_args(
             lambda parser: add_hetero_grid_args(add_model_provider_args(parser)),

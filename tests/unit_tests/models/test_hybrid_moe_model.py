@@ -602,6 +602,8 @@ class TestHybridMoEModel:
         args.te_rng_tracker = True
         args.tensor_model_parallel_size = 2
         args.vocab_size = 131072
+        # Cross entropy loss fusion is rejected by deterministic mode.
+        args.deterministic_mode = False
 
         validate_args(args)
         set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)

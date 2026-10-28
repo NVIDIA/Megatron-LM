@@ -21,7 +21,6 @@ BEFORE_SCRIPT: |
   export NCCL_IB_TIMEOUT=22
   uv run --no-sync python -m torch.distributed.run --nproc_per_node=8 \
     examples/post_training/modelopt/quantize.py \
-    --deterministic-mode \
     --micro-batch-size 1 \
     --save-interval 100000 \
     --bf16 \
@@ -182,7 +181,6 @@ MODEL_ARGS:
   --no-gradient-accumulation-fusion: true
   --distributed-timeout-minutes: 30
   # Etc
-  --deterministic-mode: true
   --exit-interval: 10
 TEST_TYPE: regular
 METRICS:

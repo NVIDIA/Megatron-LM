@@ -52,6 +52,7 @@ def test_parallel_gated_delta_net_correctness(
         activation_func=F.silu,
         bf16=True,
         experimental_attention_variant="gated_delta_net",
+        deterministic_mode=False,
         linear_attention_freq=[1],
         transformer_impl="transformer_engine",
     )

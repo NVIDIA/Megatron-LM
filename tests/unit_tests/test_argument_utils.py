@@ -60,6 +60,7 @@ class CapturingTransformerConfig:
     moe_use_norm_before_up_proj: bool = False
     hash_moe_vocab_size: int | None = None
     wide_residual: object = None
+    deterministic_mode: bool = True
 
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
@@ -79,6 +80,25 @@ def _minimal_training_args(monkeypatch):
     args.tokenizer_type = 'NullTokenizer'
     args.vocab_size = 1024
     return args
+
+
+@pytest.mark.parametrize(
+    "flags, expected",
+    [
+        ([], True),
+        (["--deterministic-mode"], True),
+        (["--disable-deterministic-mode"], False),
+        (["--deterministic-mode", "--disable-deterministic-mode"], False),
+        (["--disable-deterministic-mode", "--deterministic-mode"], False),
+    ],
+)
+def test_cli_determinism_reaches_transformer_config(flags, expected):
+    parser = add_megatron_arguments(ArgumentParser())
+    args = parser.parse_args(flags)
+    args.params_dtype = torch.float32
+    config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
+    assert args.deterministic_mode is expected
+    assert config.deterministic_mode is expected
 
 
 def test_moe_norm_flag_reaches_transformer_config():

@@ -1532,6 +1532,8 @@ def test_parallel_multi_latent_attention_correctness(
         apply_rope_fusion=apply_rope_fusion,
         hidden_dropout=0.0,
         attention_dropout=0.0,
+        # deterministic_mode is on by default; this test needs NVTE_ALLOW_NONDETERMINISTIC_ALGO=1.
+        deterministic_mode=False,
     )
 
     with TempNamedDir(tmp_path_dist_ckpt / 'test_parallel_mla', sync=True) as ckpt_dir:

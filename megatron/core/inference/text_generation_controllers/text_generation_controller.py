@@ -335,7 +335,7 @@ class TextGenerationController(MTPControllerMixin):
         # unique generation seed (avoids identical samples when the same prompt is
         # assigned to multiple DP ranks, which can corrupt RL training). Controlled by
         # InferenceConfig.offset_sampling_seed_by_dp_rank, but deactivated when enabling
-        # --deterministic-mode (model_config.deterministic_mode).
+        # deterministic mode (model_config.deterministic_mode).
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
         seed = self.model_config.inference_sampling_seed
         offset_by_dp = (

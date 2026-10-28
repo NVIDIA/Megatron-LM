@@ -188,6 +188,7 @@ def _make_gdn_config(**overrides):
         "experimental_attention_variant": "gated_delta_net",
         "linear_attention_freq": [1],
         "transformer_impl": "transformer_engine",
+        "deterministic_mode": False,
     }
     config_kwargs.update(overrides)
     return TransformerConfig(**config_kwargs)
@@ -866,6 +867,7 @@ def test_te_gdn_matches_previous_fla_path():
             bf16=True,
             experimental_attention_variant="gated_delta_net",
             gdn_kernel_backend="transformer_engine",
+            deterministic_mode=False,
             linear_attention_freq=[1],
             transformer_impl="transformer_engine",
         )
@@ -1034,6 +1036,7 @@ def test_parallel_gated_delta_net_correctness(
         bf16=True,
         experimental_attention_variant="gated_delta_net",
         gdn_kernel_backend=gdn_kernel_backend,
+        deterministic_mode=False,
         linear_attention_freq=[1],
         transformer_impl="transformer_engine",
     )

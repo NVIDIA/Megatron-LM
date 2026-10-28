@@ -115,7 +115,6 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
     --transformer-impl transformer_engine \
     --tensor-model-parallel-size 1 \
     --pipeline-model-parallel-size 1 \
-    --deterministic-mode \
     --ckpt-format torch_dist \
     --bf16 \
     --num-layers 24 \

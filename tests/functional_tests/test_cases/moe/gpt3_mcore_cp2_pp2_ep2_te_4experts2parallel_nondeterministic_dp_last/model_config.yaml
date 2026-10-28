@@ -60,5 +60,6 @@ MODEL_ARGS:
   --use-tp-pp-dp-mapping: true
   --async-save: true
   --use-persistent-ckpt-worker: true
+  --disable-deterministic-mode: true
 TEST_TYPE: regular
 LAUNCHER: ft_launcher
