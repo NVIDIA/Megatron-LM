@@ -5,8 +5,9 @@
 Operator level: token permute / unpermute (torch and TE-fused, both branches of the
 ``torch.are_deterministic_algorithms_enabled()`` switch), chunk sorting, top-k routing (torch
 and TE-fused), group-limited routing, the load-balancing aux loss (torch and TE-fused), and
-the router gating GEMM, and virtual-expert planning against a CPU oracle in eager and CUDA
-graphs. Module level: ``TopKRouter``, ``TEGroupedMLP`` / ``SequentialMLP`` on
+the router gating GEMM, the padding-route masking that megakernel backends must reproduce
+(``drop_padding_routes``), and virtual-expert planning against a CPU oracle, both in eager and
+CUDA graphs. Module level: ``TopKRouter``, ``TEGroupedMLP`` / ``SequentialMLP`` on
 deliberately uneven expert loads (including an empty expert), and a full ``MoELayer`` through
 the all-gather and all-to-all dispatchers (plus the flex/DeepEP dispatcher from
 ``fused_a2a.py`` when the dependency and the GPUs are available), and the inference
@@ -780,6 +781,122 @@ def test_router_gating_linear_replays(router_dtype, with_bias):
         contention=True,
         what="router_gating_linear",
     )
+
+
+# --- megakernel padding routes --------------------------------------------------------------
+
+
+def _padding_mask(pattern, batch_size, seq_length):
+    """Batch-first ``[batch_size, seq_length]`` padding mask, True for padding tokens."""
+    if pattern == "none":
+        return torch.zeros(batch_size, seq_length, dtype=torch.bool, device="cuda")
+    if pattern == "all":
+        return torch.ones(batch_size, seq_length, dtype=torch.bool, device="cuda")
+    if pattern == "right":
+        # Right padding of a partial, a full, a one-token and an empty sequence.
+        lengths = torch.tensor([3 * seq_length // 4 + 1, seq_length, 1, 0], device="cuda")
+        return torch.arange(seq_length, device="cuda") >= lengths[:batch_size, None]
+    assert pattern == "random", pattern
+    return torch.rand(batch_size, seq_length, device="cuda") < 0.6
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "batch_size,pattern,layout",
+    [
+        (2, "none", "bool"),
+        (2, "all", "bool"),
+        (1, "right", "bool"),
+        (4, "right", "bool"),
+        (4, "random", "int"),
+        (4, "random", "strided"),
+    ],
+)
+def test_drop_padding_routes_replays(dtype, batch_size, pattern, layout):
+    """Padding tokens lose every route; real tokens keep theirs bit for bit, gradient included.
+
+    ``drop_padding_routes`` is the reference for the ``padding_mask`` that ``MoELayer`` passes to
+    a megakernel backend: padding tokens get no routes, so their routed output and their probs
+    gradient are zero.
+    """
+    seeded()
+    seq_length = NUM_TOKENS // batch_size
+    routing_map, probs = _routing()
+    probs = probs.to(dtype)
+    # Padded rows must come out as +0.0 whatever they hold; real rows keep every bit.
+    probs[[0, -1], 0] = float("nan")
+    probs[[0, -1], 1] = -0.0
+    probs.requires_grad_()
+    mask = _padding_mask(pattern, batch_size, seq_length)
+    padding_mask = {"bool": mask, "int": mask.int(), "strided": mask.t().contiguous().t()}[layout]
+    upstream = torch.randn_like(probs)
+    originals = (probs.detach().clone(), routing_map.clone(), padding_mask.clone())
+
+    outputs, grads = assert_replays_bit_exact(
+        moe_utils.drop_padding_routes,
+        (probs, routing_map, padding_mask),
+        grad_outputs={"out[0]": upstream},
+        replays=3,
+        contention=True,
+        what=f"drop_padding_routes[{dtype}, batch={batch_size}, {pattern}, {layout}]",
+    )
+
+    # Hidden states are sequence-first, so token t is mask[t % batch_size, t // batch_size].
+    tokens = torch.arange(NUM_TOKENS, device="cuda")
+    padded = mask[tokens % batch_size, tokens // batch_size]
+    masked_probs, masked_map = outputs["out[0]"], outputs["out[1]"]
+    assert bytes_equal(masked_probs[padded], torch.zeros_like(originals[0][padded]))
+    assert not masked_map[padded].any()
+    assert bytes_equal(masked_probs[~padded], originals[0][~padded])
+    assert torch.equal(masked_map[~padded], routing_map[~padded])
+    assert bytes_equal(grads["in[0]"], upstream.masked_fill(padded[:, None], 0))
+    # The caller's routing result and mask are left untouched.
+    moe_utils.drop_padding_routes(probs, routing_map, padding_mask)
+    for tensor, original in zip((probs, routing_map, padding_mask), originals):
+        assert bytes_equal(tensor, original)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_drop_padding_routes_graph_replay(dtype):
+    """A captured ``drop_padding_routes`` applies whatever mask its static buffer holds.
+
+    In the TE graph of a megakernel MoE layer (``cuda_graph_modules`` containing ``moe``), the
+    padding mask is a static buffer: all padding during the warm-up, then each microbatch's
+    mask, copied in before its replay. Outputs and the probs gradient must match eager bit for
+    bit on every replay.
+    """
+    seeded()
+    batch_size, seq_length = 4, NUM_TOKENS // 4
+    routing_map, probs = _routing()
+    probs = probs.to(dtype).requires_grad_()
+    upstream = torch.randn_like(probs)
+    static_mask = _padding_mask("all", batch_size, seq_length)
+
+    def run():
+        masked_probs, masked_map = moe_utils.drop_padding_routes(probs, routing_map, static_mask)
+        (probs_grad,) = torch.autograd.grad(masked_probs, probs, upstream)
+        return masked_probs.detach(), masked_map, probs_grad
+
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        run()
+    torch.cuda.current_stream().wait_stream(side_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+
+    names = ("probs", "routing map", "probs gradient")
+    for pattern in ("all", "right", "none", "random", "right"):
+        static_mask.copy_(_padding_mask(pattern, batch_size, seq_length))
+        expected = run()
+        for replay in range(2):
+            graph.replay()
+            torch.cuda.synchronize()
+            for name, actual, reference in zip(names, captured, expected):
+                assert bytes_equal(
+                    actual, reference
+                ), f"{name} of graph replay {replay} with {pattern} padding differs from eager"
 
 
 # --- modules --------------------------------------------------------------------------------
