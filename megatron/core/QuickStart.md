@@ -35,7 +35,7 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
 
 <br>
 
-**NOTE:** All of the following steps are in the [run_simple_mcore_train_loop.py](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/run_simple_mcore_train_loop.py) script. To run the ``run_simple_mcore_train_loop.py`` script:
+**NOTE:** The following steps are based on the [run_simple_mcore_train_loop.py](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/run_simple_mcore_train_loop.py) script. To run the ``run_simple_mcore_train_loop.py`` script:
 
     ```
     PYTHONPATH=$PYTHON_PATH:./megatron torchrun --nproc-per-node 2 examples/run_simple_mcore_train_loop.py
@@ -215,13 +215,13 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
 
 1. Add the main function:
 
-    The following code snippet is the main function that needs to go into your script. It runs the model for five iterations, saves, and loads it. Every Megatron Core call that needs process groups gets them from the collection that `initialize_distributed` returns: the RNG seeding, the model, `DistributedDataParallel`, the schedule and `finalize_model_grads`.
+    The following code snippet is the main function that needs to go into your script. It runs the model for five iterations, saves, and loads it. Every Megatron Core call that needs process groups gets them from the collection that `initialize_distributed` returns: the RNG seeding, the model, `DistributedDataParallel`, the optimizer, the schedule and `finalize_model_grads`.
 
     ```python
     from pathlib import Path
-    from torch.optim import Adam
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+    from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
     from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
     from megatron.core.utils import get_pg_rank, get_pg_size
@@ -259,7 +259,12 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
             pg_collection=pg_collection,
         )
 
-        optim = Adam(gpt_model.parameters())
+        # DistributedDataParallel accumulates the gradients in its own buffer and leaves no
+        # param.grad for a torch.optim optimizer, so update the weights with the Megatron Core
+        # optimizer, which reads that buffer.
+        optim = get_megatron_optimizer(
+            OptimizerConfig(optimizer='adam', lr=1e-3), [gpt_model], pg_collection=pg_collection
+        )
         
         train_iterator = get_train_data_iterator()
         
@@ -267,6 +272,7 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
 
         # Running the model for 5 iterations
         for _ in range(5):
+            gpt_model.zero_grad_buffer()
             optim.zero_grad()
             
             losses_reduced = forward_backward_func(
