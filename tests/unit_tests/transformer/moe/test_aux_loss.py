@@ -608,7 +608,19 @@ class TestRouterAuxLoss:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_global_aux_loss_with_float16_module(self):
+    @pytest.mark.parametrize(
+        "aux_loss_fusion",
+        [
+            False,
+            pytest.param(
+                True,
+                marks=pytest.mark.skipif(
+                    not HAVE_ROUTER_FUSION, reason="TE fused router ops not available"
+                ),
+            ),
+        ],
+    )
+    def test_global_aux_loss_with_float16_module(self, aux_loss_fusion):
         """The global aux loss tracker must stay exact when Float16Module casts the router."""
 
         def pop_global_aux_loss():
@@ -618,9 +630,13 @@ class TestRouterAuxLoss:
             return loss
 
         router = self.new_router(
-            moe_router_load_balancing_type="global_aux_loss", moe_aux_loss_coeff=1.0
+            moe_router_load_balancing_type="global_aux_loss",
+            moe_aux_loss_coeff=1.0,
+            moe_router_aux_loss_fusion=aux_loss_fusion,
         ).cuda()
         router = Float16Module(router.config, router).module
+        assert router.global_tokens_per_expert.dtype == torch.int64
+        assert router.ga_steps.dtype == torch.int64
 
         # Identical microbatches leave the running average, and so the loss, unchanged.
         # bf16 can count microbatches only up to 256.
