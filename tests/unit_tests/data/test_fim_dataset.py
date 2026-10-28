@@ -1,10 +1,12 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import numpy as np
 import pytest
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.utils import compile_helpers, get_blend_from_list
+from megatron.core.datasets.indexed_dataset import IndexedDataset, IndexedDatasetBuilder
+from megatron.core.datasets.utils import Split, compile_helpers, get_blend_from_list
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from tests.unit_tests.test_utilities import Utils
@@ -82,6 +84,64 @@ def test_fim_gpt_dataset(spm_rate, split_sample):
         assert prefix_id == tokens[0]
         assert suffix_id == tokens[1]
         assert middle_id in tokens
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<split>alpha beta",
+        "alpha<split><split>beta",
+        "<split><split><split>",
+        "alpha<split>beta",
+        "alpha beta<split>",
+    ],
+)
+@pytest.mark.parametrize("fim_rate", [0.0, 1.0])
+def test_fim_preserves_split_tokens(tmp_path, text, fim_rate):
+    compile_helpers()
+    tokenizer = MegatronTokenizer.from_pretrained(
+        tokenizer_path="/opt/data/tokenizers/huggingface",
+        metadata_path={"library": "huggingface"},
+        additional_special_tokens=["<prefix>", "<middle>", "<suffix>", "<pad>", "<eod>", "<split>"],
+        include_special_tokens=False,
+    )
+    token_ids = tokenizer.tokenize(text)
+    split_token = "<split>"
+    split_id = tokenizer._tokenizer.tokens_to_ids(split_token)
+    assert split_id in token_ids
+    prefix = str(tmp_path / "sample")
+    builder = IndexedDatasetBuilder(prefix + ".bin")
+    builder.add_item(torch.tensor(token_ids, dtype=torch.int32))
+    builder.end_document()
+    builder.finalize(prefix + ".idx")
+    config = GPTFIMDatasetConfig(
+        random_seed=1234,
+        sequence_length=len(token_ids) - 1,
+        blend=([prefix], None),
+        split="1,0,0",
+        tokenizer=tokenizer,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        fim_extra_tokens={
+            "prefix": "<prefix>",
+            "middle": "<middle>",
+            "suffix": "<suffix>",
+            "pad": "<pad>",
+            "eod": "<eod>",
+        },
+        fim_rate=fim_rate,
+        fim_spm_rate=0.0,
+        fim_fragment_rate=0.0,
+        fim_split_sample=split_token,
+        path_to_cache=str(tmp_path / "cache"),
+    )
+    dataset = GPTFIMDataset(
+        IndexedDataset(prefix), prefix, np.array([0], dtype=np.int32), 1, Split.train, config
+    )
+    sample = dataset[0]
+    assert sample["tokens"].tolist() == token_ids[:-1]
+    assert sample["labels"].tolist() == token_ids[1:]
 
 
 if __name__ == "__main__":
