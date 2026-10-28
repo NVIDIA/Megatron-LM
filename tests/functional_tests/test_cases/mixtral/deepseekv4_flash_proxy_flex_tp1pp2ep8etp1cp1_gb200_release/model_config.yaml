@@ -15,6 +15,37 @@ ENV_VARS:
   NVSHMEM_IB_ENABLE_IBGDA: 0
   NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: 8
   USE_MNNVL: 1
+BEFORE_SCRIPT: |
+  # Hash routing needs the real vocabulary before HybridModel config validation.
+  # Write a private runtime config per node; the harness's .tmp file is shared.
+  TRAINING_PARAMS_PATH=$(uv run --no-sync python - <<'PY'
+  import contextlib
+  import os
+  import sys
+  import tempfile
+  from pathlib import Path
+
+  import yaml
+
+  config = yaml.safe_load(Path(os.environ["TRAINING_PARAMS_PATH"]).read_text())
+  args = config["MODEL_ARGS"]
+  with contextlib.redirect_stdout(sys.stderr):
+      from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+      from megatron.training.config import TokenizerConfig
+
+      tokenizer = build_tokenizer(TokenizerConfig(
+          tokenizer_type=args["--tokenizer-type"],
+          tokenizer_model=args["--tokenizer-model"],
+      ))
+  args["--vocab-size"] = tokenizer.vocab_size
+  output = Path(os.environ["OUTPUT_PATH"])
+  output.mkdir(parents=True, exist_ok=True)
+  with tempfile.NamedTemporaryFile(mode="w", dir=output, prefix="dsv4-", suffix=".yaml", delete=False) as runtime:
+      yaml.safe_dump(config, runtime, sort_keys=False)
+  print(runtime.name)
+  PY
+  )
+  export TRAINING_PARAMS_PATH
 TEST_TYPE: "release"
 LAUNCHER: ft_launcher
 MODEL_ARGS:
@@ -106,7 +137,7 @@ MODEL_ARGS:
   --adam-beta2: 0.95
 
   # Natural routing is required for convergence; do not force load balancing.
-  # Hash vocabulary size is derived from the convergence tokenizer.
+  # BEFORE_SCRIPT supplies the convergence tokenizer vocabulary size.
   --moe-num-hash-layers: 3
   # Add MoE args
   --num-experts: 64 # full Flash has 256 experts
@@ -186,6 +217,7 @@ MODEL_ARGS:
   --fp8-format: e4m3
   --fp8-recipe: mxfp8
   --fp8-param-gather: true
+  --reuse-grad-buf-for-mxfp8-param-ag: true
   --moe-router-padding-for-quantization: true
 
   # enable experimental
