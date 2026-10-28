@@ -159,6 +159,37 @@ def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(process_grou
         )
 
 
+def test_meta_materialization_preserves_delayed_wgrad_marker():
+    """Meta materialization keeps TE's delayed-wgrad marker on replaced Parameters.
+
+    FsdpModule registers backward_dw() hooks only for parameters marked with
+    skip_backward_post_hook. If materialization drops the marker, it registers
+    AccumulateGrad hooks instead and reduces before the delayed wgrad exists.
+    """
+
+    class ReplacingResetLinear(torch.nn.Module):
+        """Mimics TE modules whose reset_parameters() installs new Parameter objects."""
+
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.empty(4, 4))
+            # Transformer Engine marks delayed-wgrad weights at construction time.
+            self.weight.skip_backward_post_hook = True
+
+        def reset_parameters(self):
+            self.weight = torch.nn.Parameter(torch.zeros_like(self.weight))
+
+    with torch.device("meta"):
+        module = ReplacingResetLinear()
+    meta_weight = module.weight
+
+    mcore_fsdp_adapter._materialize_meta_module(module, torch.device("cpu"))
+
+    assert module.weight is not meta_weight
+    assert not module.weight.is_meta
+    assert module.weight.skip_backward_post_hook is True
+
+
 def test_wraps_fsdp_unit_modules_before_root(process_group_collection):
     config = TransformerConfig(
         num_layers=1,
