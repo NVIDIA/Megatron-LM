@@ -61,6 +61,7 @@ def _layer(wide, fp32, dropout=0.0):
     )
     layer.layer_number = 1
     layer.hidden_dropout = dropout
+    layer.recompute_mamba_mixer = False
     layer.norm = nn.LayerNorm(8, dtype=torch.bfloat16)
     layer.mixer = _Mixer(torch.bfloat16)
     layer.mamba_bda = get_bias_dropout_add
