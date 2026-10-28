@@ -194,7 +194,7 @@ def test_preprocess_data_gpt():
             "/opt/data/tokenizers/megatron/gpt2-merges.txt",
             "--append-eod",
             "--workers",
-            "10",
+            "2",
             "--log-interval",
             "1",
         ]
