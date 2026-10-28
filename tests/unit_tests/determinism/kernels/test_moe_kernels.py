@@ -9,7 +9,8 @@ the router gating GEMM, and virtual-expert planning against a CPU oracle in eage
 graphs. Module level: ``TopKRouter``, ``TEGroupedMLP`` / ``SequentialMLP`` on
 deliberately uneven expert loads (including an empty expert), and a full ``MoELayer`` through
 the all-gather and all-to-all dispatchers (plus the flex/DeepEP dispatcher from
-``fused_a2a.py`` when the dependency and the GPUs are available), and the inference
+``fused_a2a.py`` when the dependency and the GPUs are available), HybridEP dispatch + combine
+on the static receive budget (including the CUDA-graph case that skips setup), and the inference
 ``MoELayer`` through FlashInfer per-token NVFP4 experts on Blackwell.
 """
 
@@ -42,7 +43,10 @@ from megatron.core.transformer.moe.experts import (
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.ops.virtual_expert_triton import VirtualExpertPlannerWorkspace
 from megatron.core.transformer.moe.router import TopKRouter
-from megatron.core.transformer.moe.token_dispatcher import _VirtualExpertHybridEPManager
+from megatron.core.transformer.moe.token_dispatcher import (
+    _HybridEPManager,
+    _VirtualExpertHybridEPManager,
+)
 from megatron.core.transformer.moe.virtual_expert_load_balancer import (
     VirtualExpertLoadBalancer,
     plan_virtual_expert_routes,
@@ -65,7 +69,12 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 HAVE_TE = moe_utils.HAVE_TE
 HAVE_TE_PERMUTE = HAVE_TE and moe_utils.fused_permute is not None
 HAVE_TE_ROUTER = HAVE_TE and is_te_min_version("2.7.0")
-from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_DEEP_EP_V2
+from megatron.core.transformer.moe.fused_a2a import (
+    HAVE_DEEP_EP,
+    HAVE_DEEP_EP_V2,
+    HAVE_HYBRIDEP_DENSE_ROUTING,
+    reset_hybrid_ep_buffer,
+)
 
 NUM_TOKENS, HIDDEN, NUM_EXPERTS, TOPK = 16384, 2048, 64, 8
 
@@ -1466,3 +1475,70 @@ class TestMoEModules:
                 )
             finally:
                 torch.utils.deterministic.fill_uninitialized_memory = prev_fill
+
+    @pytest.mark.skipif(not HAVE_HYBRIDEP_DENSE_ROUTING, reason="HybridEP dense routing missing")
+    def test_hybridep_static_budget_replays_without_setup_metadata(self):
+        """HybridEP dispatch + combine on the factor-derived receive budget, as a CUDA-graphed
+        ``moe_preprocess`` drives it: the first round runs ``setup_metadata``; the second
+        restores only the graph's tensor attributes, so dispatch must rebuild the budget."""
+        ep = 4
+        if Utils.world_size % ep:
+            pytest.skip(f"needs a world size divisible by EP={ep}")
+        self._init(ep=ep)
+        seeded()
+        group = parallel_state.get_expert_model_parallel_group()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            num_moe_experts=ep,
+            expert_model_parallel_size=ep,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+            # Holds every rank sending all of its tokens to one rank, so nothing is dropped.
+            moe_expert_rank_capacity_factor=float(ep),
+            moe_grouped_gemm=True,
+            moe_use_grouped_tensor=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        tokens = 256
+        budget = tokens * ep
+        budget += -budget % moe_utils.get_align_size_for_quantization(config)
+        # Top-1 routing: combine copies each token back without a cross-rank reduction.
+        ids = torch.randint(0, ep, (tokens, 1), device="cuda")
+        probs = torch.zeros((tokens, ep), device="cuda").scatter_(1, ids, 1.0)
+        budgets = []
+        try:
+            manager = _HybridEPManager(group, 1, ep, config)
+
+            def roundtrip(hidden):
+                manager.setup_metadata(ids, probs)
+                graph_attrs = (manager.routing_map, manager.topk_idx, manager.token_probs)
+                outputs = []
+                for _ in range(2):
+                    manager.routing_map, manager.topk_idx, manager.token_probs = graph_attrs
+                    dispatched = manager.dispatch(hidden)
+                    budgets.append(manager.num_permuted_tokens)
+                    outputs.append(manager.combine(dispatched))
+                return tuple(outputs)
+
+            hidden = torch.randn((tokens, 128), device="cuda", dtype=torch.bfloat16)
+            hidden = (hidden + group.rank()).requires_grad_()
+            ref_out, ref_grad = assert_replays_bit_exact(
+                roundtrip,
+                (hidden,),
+                replays=3,
+                contention=True,
+                what="HybridEP static-budget dispatch/combine",
+            )
+            # Without the rebuild, the second round falls back to the host-syncing dynamic path.
+            assert all(isinstance(b, int) and b == budget for b in budgets), budgets
+            assert not manager.over_budget.any()
+            for name in ("out[0]", "out[1]"):
+                assert bytes_equal(ref_out[name], hidden.detach()), name
+            assert bytes_equal(ref_grad["in[0]"], torch.full_like(hidden, 2))
+        finally:
+            reset_hybrid_ep_buffer()
