@@ -12,8 +12,10 @@ import megatron.core.models.common.utils as node_utils
 import megatron.core.models.hybrid.fine_grained_callables as hybrid_callables
 import megatron.core.pipeline_parallel.utils as schedule_utils
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
 @pytest.fixture
@@ -58,7 +60,12 @@ def _moe_layer(config, *, shared=False):
         shared_experts=torch.nn.Linear(2, 2, bias=False) if shared else None,
         backward_dw=Mock(),
     )
-    return SimpleNamespace(config=config, mlp=mlp, recompute_pre_mlp_layernorm=False)
+    layer = SimpleNamespace(
+        config=config, mlp=mlp, recompute_pre_mlp_layernorm=False, is_moe_layer=True
+    )
+    layer._maybe_unflatten_for_moe = partial(TransformerLayer._maybe_unflatten_for_moe, layer)
+    layer._maybe_reflatten_from_moe = partial(TransformerLayer._maybe_reflatten_from_moe, layer)
+    return layer
 
 
 def _chunk_state():
@@ -281,6 +288,71 @@ def test_moe_routing_receives_the_batch_first_padding_mask():
 
     assert received["route"] is padding_mask
     assert received["preprocess"] is padding_mask
+
+
+def test_moe_slots_unflatten_packed_microbatches_like_the_eager_path(cpu_streams):
+    """A packed [mbs*s, 1, h] batch reaches MoE as [s, mbs, h] and leaves flattened again."""
+    mbs, seq_len, hidden = 2, 3, 4
+    layer = _moe_layer(_config())
+    layer.training = True
+    layer.hidden_dropout = 0.0
+    layer.bias_dropout_add_exec_handler = nullcontext
+    layer.mlp_bda = lambda *args: lambda output, residual, dropout: output[0] + residual
+    layer._forward_pre_mlp_layernorm = lambda hidden_states: hidden_states * 2
+    layer.mlp_norm_manager = None
+    received = {}
+
+    def shared_experts_compute(hidden_states):
+        received["shared"] = hidden_states
+        return None
+
+    def route(hidden_states, padding_mask):
+        received["route"] = (hidden_states, padding_mask)
+        return hidden_states, None
+
+    def preprocess(hidden_states, probs, routing_map, padding_mask):
+        received["preprocess"] = (hidden_states, padding_mask)
+        return hidden_states, probs
+
+    layer.mlp.shared_experts_compute = shared_experts_compute
+    layer.mlp.route = route
+    layer.mlp.preprocess = preprocess
+    layer.mlp.routed_experts_compute = lambda tokens, probs: (tokens * 3, None)
+    layer.mlp.combine = lambda output: output
+    layer.mlp.postprocess = lambda output, shared: output
+    layer.mlp.token_dispatcher = SimpleNamespace(
+        _comm_manager=SimpleNamespace(get_number_of_tokens_per_expert=lambda: torch.tensor([2]))
+    )
+    node = SimpleNamespace(
+        layer_state=SimpleNamespace(),
+        chunk_state=_chunk_state(),
+        detach=lambda tensor: tensor.detach(),
+        is_mtp=False,
+        is_last_layer=False,
+    )
+    node.chunk_state.packed_seq_params = PackedSeqParams(tokens_per_sample=seq_len)
+    node.chunk_state.padding_mask = torch.tensor([[False, False, False, False, True, True]])
+    # Sample 0's tokens, then sample 1's, as inter-document masking flattens them.
+    hidden_states = torch.arange(mbs * seq_len * hidden, dtype=torch.float32).view(
+        mbs * seq_len, 1, hidden
+    )
+
+    tokens, probs = hybrid_callables._run_moe_preprocess(layer, node, hidden_states)
+    node.layer_state.dispatched_probs = probs
+    output = hybrid_callables._run_moe_combine(
+        layer, node, hybrid_callables._run_moe_experts(layer, node, tokens)
+    )
+
+    expected_moe_input = (hidden_states * 2).view(mbs, seq_len, hidden).transpose(0, 1)
+    expected_mask = torch.tensor([[False, False, False], [False, True, True]])
+    torch.testing.assert_close(received["shared"], expected_moe_input)
+    for name in ("route", "preprocess"):
+        moe_input, padding_mask = received[name]
+        torch.testing.assert_close(moe_input, expected_moe_input)
+        torch.testing.assert_close(padding_mask, expected_mask)
+    # Experts scale the normalized tokens by 3; bda adds the flattened residual back.
+    torch.testing.assert_close(output, hidden_states * 7)
+    assert node.layer_state.moe_unflatten_mbs is None
 
 
 @pytest.mark.parametrize("recompute", [False, True])
