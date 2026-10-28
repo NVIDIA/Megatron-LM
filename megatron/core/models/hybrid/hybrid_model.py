@@ -493,6 +493,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 "overlap_moe_expert_parallel_comm with HybridModel does not support "
                 "enable_mhc_connections or moe_shortcut_connection."
             )
+        # The common schedule plan replays layer segments for full recompute (#6429), but that
+        # replay has only been validated for GPTModel layers, not Mamba or grouped layers.
+        if self.config.recompute_granularity == "full":
+            raise ValueError(
+                "overlap_moe_expert_parallel_comm with HybridModel does not support "
+                "recompute_granularity='full' yet."
+            )
         # The schedule plan calls the layer callables directly and bypasses
         # ``HybridStack.forward``, which is where per-layer context-parallel layout
         # conversion happens and where chunkwise linear CP gets its packed-sequence
