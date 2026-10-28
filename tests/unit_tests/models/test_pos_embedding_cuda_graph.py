@@ -5,6 +5,7 @@
 import gc
 import types
 import weakref
+from contextlib import nullcontext
 
 import pytest
 import torch
@@ -19,6 +20,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
+    _CudagraphGlobalRecord,
     capture_constants,
     create_cudagraphs,
     delete_cuda_graphs,
@@ -291,6 +293,57 @@ def test_failed_capture_releases_rotary_constants(embedding_type):
         gc.collect()
         assert ref() is None
     finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("embedding_type", [RotaryEmbedding, YarnRotaryEmbedding])
+@pytest.mark.parametrize("cache_hit", [False, True])
+def test_unmanaged_rotary_capture_retains_constants(embedding_type, cache_hit, monkeypatch):
+    """Unowned constants survive cache/graph cleanup; owned constants follow their graph."""
+    Utils.initialize_model_parallel(1, 1)
+    monkeypatch.setattr(_CudagraphGlobalRecord, "unowned_capture_constants", {})
+    module = embedding_type(32, 1.0)
+    graphs = []
+    captured = []
+    try:
+        for seq_len, managed in ((16, False), (32, False), (64, True)):
+            expected = _embedding_tensor(module, seq_len) + 1
+            if not cache_hit:
+                module.clear_cache()
+            graph = torch.cuda.CUDAGraph()
+            graphs.append(graph)
+            owner = capture_constants(graph) if managed else nullcontext()
+            with owner, torch.cuda.graph(graph):
+                embedding = _embedding_tensor(module, seq_len)
+                ref = weakref.ref(embedding)
+                output = embedding + 1
+            del embedding
+            captured.append((ref, output, expected))
+
+        module.clear_cache()
+        delete_cuda_graphs()
+        gc.collect()
+        torch.cuda.empty_cache()
+        for graph, (ref, output, expected) in zip(graphs, captured):
+            assert ref() is not None
+            graph.replay()
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+        torch.cuda.synchronize()
+        for graph in graphs:
+            graph.reset()
+            release_capture_constants(graph)
+        gc.collect()
+        assert all(ref() is not None for ref, _, _ in captured[:2])
+        assert captured[2][0]() is None
+    finally:
+        torch.cuda.synchronize()
+        for graph in graphs:
+            graph.reset()
+            release_capture_constants(graph)
+        module.clear_cache()
+        # All external graphs in this test are destroyed, so the isolated registry is safe to clear.
+        _CudagraphGlobalRecord.unowned_capture_constants.clear()
         Utils.destroy_model_parallel()
 
 

@@ -605,6 +605,8 @@ class _CudagraphGlobalRecord:
         WeakKeyDictionary()
     )
     active_capture_constants: dict[int, torch.Tensor] | None = None
+    # Without a graph owner these references cannot be released safely before process exit.
+    unowned_capture_constants: dict[int, torch.Tensor] = {}
     captured_runners: WeakSet["_CudaGraphRunner"] = WeakSet()
 
     @classmethod
@@ -839,10 +841,19 @@ def capture_constants(owner_graph: torch.cuda.CUDAGraph) -> Iterator[None]:
 
 
 def register_capture_constant(tensor: torch.Tensor) -> None:
-    """Keep a tensor's storage alive for the capture currently managed by MCore."""
+    """Retain a capture constant for its graph, or process lifetime when no owner is known."""
+    if not torch.cuda.is_current_stream_capturing():
+        return
+
     constants = _CudagraphGlobalRecord.active_capture_constants
-    if constants is not None and torch.cuda.is_current_stream_capturing():
-        constants[id(tensor)] = tensor
+    if constants is None:
+        constants = _CudagraphGlobalRecord.unowned_capture_constants
+        if not constants:
+            logger.warning(
+                "CUDA graph captured outside capture_constants(); cached positional "
+                "embeddings it reads are retained for the process lifetime."
+            )
+    constants[id(tensor)] = tensor
 
 
 def release_capture_constants(owner_graph: torch.cuda.CUDAGraph) -> None:
