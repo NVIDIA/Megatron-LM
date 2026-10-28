@@ -182,10 +182,18 @@ def _run_moe_preprocess(layer, node: ScheduleNode, hidden_states: Tensor):
     if layer.config.fp32_residual_connection:
         residual = residual.float()
 
+    # Same routing inputs as the eager TransformerLayer._forward_mlp path: a packed batch
+    # flattened to [mbs*s, 1, h] is restored to [s, mbs, h] so the router computes its
+    # per-sample aux loss, and route and preprocess take the batch-first padding mask
+    # (dropless HybridEP excludes padded tokens). Combine flattens the output back.
+    pre_mlp_layernorm_output, padding_mask, _, moe_unflatten_mbs = layer._maybe_unflatten_for_moe(
+        pre_mlp_layernorm_output,
+        node.chunk_state.padding_mask,
+        None,
+        node.chunk_state.packed_seq_params,
+    )
+    node.layer_state.moe_unflatten_mbs = moe_unflatten_mbs
     shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
-    # Same routing inputs as the eager MoELayer.forward path: route and preprocess take the
-    # batch-first padding mask (dropless HybridEP excludes padded tokens).
-    padding_mask = node.chunk_state.padding_mask
     probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output, padding_mask)
     local_tokens, probs = layer.mlp.preprocess(
         pre_mlp_layernorm_output, probs, routing_map, padding_mask
@@ -234,6 +242,10 @@ def _run_moe_combine(layer, node: ScheduleNode, output: Tensor):
     shared_expert_output = node.layer_state.shared_expert_output
     output = layer.mlp.combine(output)
     output = layer.mlp.postprocess(output, shared_expert_output)
+    output = layer._maybe_reflatten_from_moe(
+        output, node.chunk_state.packed_seq_params, node.layer_state.moe_unflatten_mbs
+    )
+    node.layer_state.moe_unflatten_mbs = None
     # Inline bda instead of calling ``layer._forward_post_mlp``, which would register
     # a second pre_mlp_layernorm recompute hook on the combine output. The hook is
     # already registered on ``expert_output`` in ``_run_moe_experts``. A second one
