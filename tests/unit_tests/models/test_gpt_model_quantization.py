@@ -580,6 +580,7 @@ class TestGPTModelTEQuantizationConfig:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     @pytest.mark.parametrize(
         "experts_path",
