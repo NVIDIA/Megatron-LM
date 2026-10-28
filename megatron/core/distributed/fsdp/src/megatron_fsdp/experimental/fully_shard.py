@@ -40,7 +40,7 @@ def fully_shard_context(context: FsdpContext) -> Iterator[FsdpContext]:
     """Activate ``context`` for FSDP construction, finalizing it on successful exit."""
     if _FSDP_CONTEXT.get() is not None:
         raise RuntimeError("fully_shard_context does not support nesting.")
-    if context._is_finalized:
+    if context.is_finalized:
         raise RuntimeError("Cannot enter fully_shard_context after construction is finalized.")
     token = _FSDP_CONTEXT.set(context)
     try:

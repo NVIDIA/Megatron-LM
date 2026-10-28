@@ -98,6 +98,11 @@ class FsdpContext:
         else:
             self.reduce_scatter_stream = torch.cuda.Stream(device)
 
+    @property
+    def is_finalized(self) -> bool:
+        """Whether construction has completed for this context."""
+        return self._is_finalized
+
     def register_module(self, module: nn.Module) -> None:
         """Register a module after its FSDP initialization completes in this context."""
         if self._is_finalized:
