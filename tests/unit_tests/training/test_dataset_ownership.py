@@ -877,3 +877,44 @@ def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
     assert (kw["cp_size"], kw["pipeline_model_parallel_size"], kw["dynamic_cp"]) == (1, 1, True)
     assert kw["seq_length"] == 16
     assert kw["has_cu_seqlens"] is True and kw["create_attention_mask_in_dataloader"] is False
+
+
+def test_microbatch_loss_reduction_is_keyed_on_the_sft_family(monkeypatch):
+    """The reporting reductions of train_step, in _reduce_microbatch_losses: SFT averages over the
+    trainable tokens of the global batch (or over the valid per-microbatch means in 'microbatch'
+    mode, an all-masked microbatch excluded), the others keep the per-microbatch mean; the family
+    is the data section's, --sft-loss-log-mode stays a logging argument."""
+    import torch
+
+    from megatron.training import training
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, group=None: None)
+    pairs = [torch.tensor([3.0, 3.0]), torch.tensor([10.0, 1.0]), torch.tensor([0.0, 0.0])]
+    losses = [{"lm loss": p} for p in pairs]  # (sum, token count) per microbatch
+    token_weighted = training._reduce_microbatch_losses(
+        losses, is_sft=True, sft_loss_log_mode="token", group=None
+    )
+    assert token_weighted["lm loss"].item() == pytest.approx(13.0 / 4.0)
+    per_microbatch = training._reduce_microbatch_losses(
+        losses, is_sft=True, sft_loss_log_mode="microbatch", group=None
+    )
+    assert per_microbatch["lm loss"].item() == pytest.approx((1.0 + 10.0) / 2)  # masked mb skipped
+    plain = training._reduce_microbatch_losses(
+        losses, is_sft=False, sft_loss_log_mode="microbatch", group=None
+    )
+    assert plain["lm loss"].item() == pytest.approx(13.0 / 4.0)  # sum / sum, as before for non-SFT
+    masked = training._reduce_microbatch_losses(
+        [{"lm loss": torch.tensor([0.0, 0.0])}], is_sft=True, sft_loss_log_mode="token", group=None
+    )
+    assert masked["lm loss"].item() == 0.0
+    legacy = training._reduce_microbatch_losses(
+        [{"lm loss": torch.tensor([2.0])}, {"lm loss": torch.tensor([4.0])}],
+        is_sft=False,
+        sft_loss_log_mode="token",
+        group=None,
+    )
+    assert legacy["lm loss"].item() == pytest.approx(3.0)
+    with pytest.raises(ValueError, match="Invalid value shape"):
+        training._reduce_microbatch_losses(
+            [{"lm loss": torch.zeros(3)}], is_sft=False, sft_loss_log_mode="token", group=None
+        )

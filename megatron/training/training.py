@@ -3354,6 +3354,65 @@ def _get_model_pg_collection(
     return pg_collection
 
 
+def _reduce_microbatch_losses(losses_reduced, *, is_sft, sft_loss_log_mode, group):
+    """Average the per-microbatch losses of a step for reporting.
+
+    ``is_sft`` is the data section's SFT family (``cfg.data.batch_flags().is_sft``): SFT
+    runs average over the trainable tokens of the global batch (or, with
+    ``--sft-loss-log-mode microbatch``, over the valid per-microbatch means), the others keep
+    the per-microbatch mean. Reporting only; gradient normalization is elsewhere.
+    """
+    loss_reduced = {}
+    for key in losses_reduced[0].keys():
+        val = [x[key].view(-1) for x in losses_reduced]
+        if val[0].numel() == 2:
+            if is_sft and sft_loss_log_mode == 'microbatch':
+                # Some CP shards can legitimately contain no trainable tokens.
+                # Average only the valid per-microbatch losses.
+                val = torch.vstack(val)
+                numerators = val[:, 0]
+                denominators = val[:, 1]
+                valid = denominators > 0
+                if valid.any():
+                    local_sum = (numerators[valid] / denominators[valid]).sum()
+                    local_count = torch.tensor(
+                        float(valid.sum().item()),
+                        dtype=local_sum.dtype,
+                        device=local_sum.device,
+                    )
+                else:
+                    local_sum = torch.zeros_like(numerators[0])
+                    local_count = torch.zeros_like(denominators[0])
+
+                torch.distributed.all_reduce(local_sum, group=group)
+                torch.distributed.all_reduce(local_count, group=group)
+                loss_reduced[key] = torch.where(
+                    local_count > 0,
+                    local_sum / local_count.clamp(min=1),
+                    torch.zeros_like(local_sum),
+                )
+            elif is_sft:
+                # Average over the total number of tokens across the global batch.
+                val = torch.vstack(val).sum(dim=0)
+                torch.distributed.all_reduce(val, group=group)
+                loss_reduced[key] = torch.where(
+                    val[1] > 0,
+                    val[0] / val[1].clamp(min=1),
+                    torch.zeros_like(val[0]),
+                )
+            else:
+                val = torch.vstack(val).sum(dim=0)
+                torch.distributed.all_reduce(val, group=group)
+                loss_reduced[key] = val[0] / val[1]
+        elif val[0].numel() == 1:
+            # legacy behavior, we average over the number of microbatches
+            val = torch.cat(val).mean()
+            loss_reduced[key] = val
+        else:
+            raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
+    return loss_reduced
+
+
 def train_step(
     forward_step_func,
     data_iterator,
@@ -3658,54 +3717,12 @@ def train_step(
     if is_last_stage and losses_reduced:
         # Average loss across microbatches.
         # Last stage may have no loss (e.g. MIMO encoder-grid ranks).
-        loss_reduced = {}
-        for key in losses_reduced[0].keys():
-            val = [x[key].view(-1) for x in losses_reduced]
-            if val[0].numel() == 2:
-                if args.sft and args.sft_loss_log_mode == 'microbatch':
-                    # Some CP shards can legitimately contain no trainable tokens.
-                    # Average only the valid per-microbatch losses.
-                    val = torch.vstack(val)
-                    numerators = val[:, 0]
-                    denominators = val[:, 1]
-                    valid = denominators > 0
-                    if valid.any():
-                        local_sum = (numerators[valid] / denominators[valid]).sum()
-                        local_count = torch.tensor(
-                            float(valid.sum().item()),
-                            dtype=local_sum.dtype,
-                            device=local_sum.device,
-                        )
-                    else:
-                        local_sum = torch.zeros_like(numerators[0])
-                        local_count = torch.zeros_like(denominators[0])
-
-                    torch.distributed.all_reduce(local_sum, group=dp_cp_group)
-                    torch.distributed.all_reduce(local_count, group=dp_cp_group)
-                    loss_reduced[key] = torch.where(
-                        local_count > 0,
-                        local_sum / local_count.clamp(min=1),
-                        torch.zeros_like(local_sum),
-                    )
-                elif args.sft:
-                    # Average over the total number of tokens across the global batch.
-                    val = torch.vstack(val).sum(dim=0)
-                    torch.distributed.all_reduce(val, group=dp_cp_group)
-                    loss_reduced[key] = torch.where(
-                        val[1] > 0,
-                        val[0] / val[1].clamp(min=1),
-                        torch.zeros_like(val[0]),
-                    )
-                else:
-                    val = torch.vstack(val).sum(dim=0)
-                    torch.distributed.all_reduce(val, group=dp_cp_group)
-                    loss_reduced[key] = val[0] / val[1]
-            elif val[0].numel() == 1:
-                # legacy behavior, we average over the number of microbatches
-                val = torch.cat(val).mean()
-                loss_reduced[key] = val
-            else:
-                raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
+        loss_reduced = _reduce_microbatch_losses(
+            losses_reduced,
+            is_sft=cfg.data.batch_flags().is_sft,
+            sft_loss_log_mode=args.sft_loss_log_mode,
+            group=dp_cp_group,
+        )
         return (
             loss_reduced,
             skipped_iter,
