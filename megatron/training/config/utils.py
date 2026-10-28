@@ -7,7 +7,7 @@ import logging
 from functools import lru_cache
 from dataclasses import is_dataclass
 from dataclasses import fields as dataclass_fields
-from typing import Any, Callable
+from typing import Any
 
 from megatron.core.transformer import TransformerConfig
 
@@ -23,11 +23,7 @@ _TRANSFORMER_RUNTIME_FIELDS = frozenset(
 
 
 def serialize_dataclass(
-    config: Any,
-    *,
-    skip_fields: frozenset[str] = frozenset(),
-    encode_callables: bool = False,
-    value_serializer: Callable[[Any], Any] | None = None,
+    config: Any, *, skip_fields: frozenset[str] = frozenset(), encode_callables: bool = False
 ) -> dict[str, Any]:
     """Serialize dataclass fields recursively, with an importable class target.
 
@@ -37,8 +33,6 @@ def serialize_dataclass(
         encode_callables: Encode importable callables for dictionary round trips.
             Unresolvable callable fields are omitted. Otherwise callables pass
             through unchanged for the existing YAML representers.
-        value_serializer: Optional recursive conversion hook for container subclasses.
-            The hook owns traversal and exclusions within the children it converts.
 
     Returns:
         The dataclass fields and their class's ``_target_``.
@@ -46,10 +40,8 @@ def serialize_dataclass(
     if isinstance(config, TransformerConfig):
         skip_fields = skip_fields | _TRANSFORMER_RUNTIME_FIELDS
         encode_callables = True
-    convert = _value_converter(
-        skip_fields=skip_fields,
-        encode_callables=encode_callables,
-        value_serializer=value_serializer,
+    convert = functools.partial(
+        serialize_value, skip_fields=skip_fields, encode_callables=encode_callables
     )
     result = {"_target_": f"{config.__class__.__module__}.{config.__class__.__qualname__}"}
     for field in dataclass_fields(config):
@@ -68,21 +60,15 @@ def serialize_dataclass(
 
 
 def serialize_value(
-    value: Any,
-    *,
-    skip_fields: frozenset[str] = frozenset(),
-    encode_callables: bool = False,
-    value_serializer: Callable[[Any], Any] | None = None,
+    value: Any, *, skip_fields: frozenset[str] = frozenset(), encode_callables: bool = False
 ) -> Any:
-    """Serialize values using the same policies and child hook as serialize_dataclass."""
+    """Recursively serialize configs, dataclasses, collections, and model-spec inputs."""
     # Imported lazily: the container and model configs also use these helpers.
     from megatron.training.config.container import ConfigContainerBase
     from megatron.training.models.base import Serializable
 
-    convert = _value_converter(
-        skip_fields=skip_fields,
-        encode_callables=encode_callables,
-        value_serializer=value_serializer,
+    convert = functools.partial(
+        serialize_value, skip_fields=skip_fields, encode_callables=encode_callables
     )
     if not isinstance(value, type):
         if isinstance(value, ConfigContainerBase):
@@ -93,10 +79,7 @@ def serialize_value(
             return value.to_cfg_dict()
         if is_dataclass(value):
             return serialize_dataclass(
-                value,
-                skip_fields=skip_fields,
-                encode_callables=encode_callables,
-                value_serializer=value_serializer,
+                value, skip_fields=skip_fields, encode_callables=encode_callables
             )
     if encode_callables and callable(value):
         encoded = _encode_callable(value, convert)
@@ -106,22 +89,6 @@ def serialize_value(
     if isinstance(value, dict):
         return {key: convert(item) for key, item in value.items()}
     return value
-
-
-def _value_converter(*, skip_fields, encode_callables, value_serializer):
-    default_convert = functools.partial(
-        serialize_value, skip_fields=skip_fields, encode_callables=encode_callables
-    )
-    if value_serializer is None:
-        return default_convert
-
-    def convert(value):
-        converted = value_serializer(value)
-        # Legacy subclass hooks accept only the value. Preserve callable encoding
-        # within their returned collections as well as on direct dataclass fields.
-        return default_convert(converted) if encode_callables else converted
-
-    return convert
 
 
 def _encode_callable(value, convert):

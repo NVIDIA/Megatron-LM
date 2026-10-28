@@ -38,11 +38,7 @@ from megatron.training.config.training_config import (
     TrainingConfig,
     ValidationConfig,
 )
-from megatron.training.config.utils import (
-    sanitize_dataclass_config,
-    serialize_dataclass,
-    serialize_value,
-)
+from megatron.training.config.utils import sanitize_dataclass_config, serialize_dataclass
 from megatron.training.config.yaml_utils import safe_yaml_representers
 from megatron.training.models import (
     BertModelConfig,
@@ -180,12 +176,7 @@ class ConfigContainerBase:
         Returns:
             Dictionary representation of this config
         """
-        return serialize_dataclass(self, value_serializer=self._convert_value_to_dict)
-
-    @classmethod
-    def _convert_value_to_dict(cls, value: Any) -> Any:
-        """Convert nested values, retaining subclass customization during recursion."""
-        return serialize_value(value, value_serializer=cls._convert_value_to_dict)
+        return serialize_dataclass(self)
 
     def to_yaml(self, yaml_path: str) -> None:
         """
