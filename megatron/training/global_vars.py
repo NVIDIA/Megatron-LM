@@ -19,7 +19,6 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 from megatron.training.state import TrainState
 
@@ -197,15 +196,8 @@ def initialize_runtime_services(
 
     cfg = get_run_config()
     if build_tokenizer:
-        if training:
-            _build_tokenizer(
-                args,
-                tensor_model_parallel_size=cfg.model.transformer.tensor_model_parallel_size,
-                make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by,
-            )
-        else:
-            _build_tokenizer(args)
-    resolve_tokenizer_vocab_size(cfg, getattr(args, "padded_vocab_size", None))
+        _build_tokenizer(cfg, args)
+    resolve_tokenizer_vocab_size(cfg)
     _set_wandb_writer(args)
     _set_telemetry(args, include_training=training)
 
@@ -308,17 +300,38 @@ def _set_train_state():
     _GLOBAL_TRAIN_STATE = TrainState()
 
 
-def _build_tokenizer(
-    args, *, tensor_model_parallel_size=None, make_vocab_size_divisible_by=None
-):
+def _build_tokenizer(cfg, args):
     """Initialize tokenizer."""
+    from megatron.training.models import (
+        BertModelConfig,
+        GPTModelConfig,
+        HybridModelConfig,
+        LLaVAModelConfig,
+        MimoModelConfig,
+        T5ModelConfig,
+    )
+    from megatron.training.vocab_utils import build_tokenizer_and_pad_vocab_size
+
     global _GLOBAL_TOKENIZER
     _ensure_var_is_not_initialized(_GLOBAL_TOKENIZER, 'tokenizer')
-    _GLOBAL_TOKENIZER = build_tokenizer(
-        args,
-        tensor_model_parallel_size=tensor_model_parallel_size,
-        make_vocab_size_divisible_by=make_vocab_size_divisible_by,
-    )
+
+    if isinstance(
+        cfg.model,
+        (GPTModelConfig, HybridModelConfig, BertModelConfig, T5ModelConfig, LLaVAModelConfig, MimoModelConfig),
+    ):
+        make_vocab_size_divisible_by = cfg.model.make_vocab_size_divisible_by
+        tp_size = cfg.model.transformer.tensor_model_parallel_size
+    else:
+        make_vocab_size_divisible_by = args.make_vocab_size_divisible_by
+        tp_size = args.tensor_model_parallel_size
+
+    _GLOBAL_TOKENIZER = build_tokenizer_and_pad_vocab_size(cfg.tokenizer, make_vocab_size_divisible_by, tp_size)
+
+    # TODO (@maanug): remove this WAR once all reads from args.padded_vocab_size 
+    # have been updated to read from cfg.tokenizer.padded_vocab_size
+    if getattr(args, "padded_vocab_size", None) is None:
+        args.padded_vocab_size = cfg.tokenizer.padded_vocab_size
+
     # Resolve the declared model field once, before any args-to-config conversion.
     # The tokenizer includes added tokens; padded_vocab_size also includes TP padding.
     if (
@@ -331,10 +344,10 @@ def _build_tokenizer(
     return _GLOBAL_TOKENIZER
 
 
-def rebuild_tokenizer(args):
+def rebuild_tokenizer(cfg, args):
     global _GLOBAL_TOKENIZER
     _GLOBAL_TOKENIZER = None
-    return _build_tokenizer(args)
+    return _build_tokenizer(cfg, args)
 
 
 def _set_tensorboard_writer(args):

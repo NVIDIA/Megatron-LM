@@ -22,11 +22,11 @@ from megatron.training.argument_utils import model_config_from_args
 from megatron.training.models import BertModelConfig
 from megatron.training.global_vars import (
     get_run_config,
+    get_tokenizer,
     set_run_config,
 )
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec, bert_layer_local_spec
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.bert_dataset import BERTMaskedWordPieceDataset, BERTMaskedWordPieceDatasetConfig
 from megatron.core.datasets.utils import get_blend_from_list
@@ -144,8 +144,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     """Build train, valid, and test datasets."""
     cfg = get_run_config()
     args = get_args()
-
-    tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
 
     config = BERTMaskedWordPieceDatasetConfig(
         random_seed=cfg.rng.seed,

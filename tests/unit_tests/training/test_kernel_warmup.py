@@ -311,7 +311,7 @@ def pretrain_until_warmup(monkeypatch):
         cfg = Namespace(
             model=model_config,
             train=Namespace(micro_batch_size=9),
-            logger=Namespace(log_progress=False),
+            logger=Namespace(log_progress=False, tensor_metrics=[]),
             validate=lambda: None,
         )
         with pytest.raises(WarmupReached):

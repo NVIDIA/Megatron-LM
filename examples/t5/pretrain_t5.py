@@ -10,7 +10,6 @@ import torch
 
 import megatron
 from megatron.core import mpu, tensor_parallel
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.t5_dataset import (
     T5MaskedWordPieceDataset,
@@ -31,6 +30,7 @@ from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.vocab_utils import model_vocab_size
 from megatron.training.global_vars import (
     get_run_config,
+    get_tokenizer,
     set_run_config,
 )
 from pretrain_gpt import loss_func
@@ -208,8 +208,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples: int):
     """
     cfg = get_run_config()
     args = get_args()
-
-    tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
 
     config = T5MaskedWordPieceDatasetConfig(
         random_seed=cfg.rng.seed,

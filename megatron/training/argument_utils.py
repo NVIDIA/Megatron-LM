@@ -37,6 +37,7 @@ from megatron.training.config import (
     TokenizerConfig,
     TrainingConfig,
     ValidationConfig,
+    MultiModalTokenizerConfig,
 )
 from megatron.training.models import (
     BertModelConfig,
@@ -572,21 +573,21 @@ def _default_config_from_args(
 
 
 def resolve_tokenizer_vocab_size(
-    cfg: PretrainConfigContainer | InferenceConfigContainer, padded_vocab_size: int | None
-) -> None:
+    cfg: PretrainConfigContainer | InferenceConfigContainer) -> None:
     """Bind tokenizer-derived vocabulary after runtime tokenizer construction.
+        
+    Final padded_vocab_size value is resolved by tokenizer initialization,
+        and updated on cfg.tokenizer. including any CLI/checkpoint override.
+        None is valid only when the model does not require a tokenizer-derived size.
 
     Args:
         cfg: Previously constructed run configuration. Explicit model
             vocabulary is preserved; only unresolved model sizes are bound.
-        padded_vocab_size: Final size resolved by tokenizer initialization,
-            including any CLI/checkpoint override. None is valid only when the
-            model does not require a tokenizer-derived size.
 
     Raises:
         ValueError: A model's vocabulary remains unresolved.
     """
-    cfg.tokenizer.padded_vocab_size = padded_vocab_size
+    padded_vocab_size = cfg.tokenizer.padded_vocab_size
     if cfg.model is not None and hasattr(cfg.model, "vocab_size") and cfg.model.vocab_size is None:
         if padded_vocab_size is None:
             raise ValueError('Model vocabulary must be resolved before model construction')
@@ -639,7 +640,6 @@ def gpt_config_from_args(
     kwargs["make_vocab_size_divisible_by"] = args.make_vocab_size_divisible_by
     kwargs["rope_scaling"] = args.use_rope_scaling
     kwargs["rope_scaling_factor"] = args.rope_scaling_factor
-    kwargs["tp_comm_overlap_cfg"] = getattr(args, "tp_comm_overlap_cfg", None)
 
     kwargs["seq_len_interpolation_factor"] = args.rotary_seq_len_interpolation_factor
     kwargs["seq_length"] = args.max_position_embeddings
@@ -768,6 +768,13 @@ def hybrid_config_from_args(
     return model_config_cls(**kwargs)
 
 
+def tokenizer_config_from_args(args: Namespace) -> TokenizerConfig:
+    if hasattr(args, "image_tag_type"):
+        return _default_config_from_args(MultiModalTokenizerConfig, args)
+    else:
+        return _default_config_from_args(TokenizerConfig, args)
+
+
 def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
     """Normalize legacy CLI/YAML profiling inputs at the configuration boundary."""
     # Legacy args retain these fields temporarily during the training-loop refactor;
@@ -861,7 +868,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
         checkpoint=CheckpointConfig(**ckpt_kwargs),
         profiling=profiling_config_from_args(args),
-        tokenizer=_default_config_from_args(TokenizerConfig, args),
+        tokenizer=tokenizer_config_from_args(args),
         rl=_default_config_from_args(RLConfig, args),
 
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
@@ -926,7 +933,7 @@ def inference_cfg_container_from_args(
         inference=inference_cfg_from_args(args),
         dist=deepcopy(_default_config_from_args(DistributedInitConfig, args)),
         rng=_default_config_from_args(RNGConfig, args),
-        tokenizer=_default_config_from_args(TokenizerConfig, args),
+        tokenizer=tokenizer_config_from_args(args),
         logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
         profiling=profiling_config_from_args(args),
     )

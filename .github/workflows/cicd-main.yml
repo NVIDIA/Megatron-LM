@@ -660,6 +660,11 @@ jobs:
       - name: Test superseded merge-group cleanup
         run: python3 .github/scripts/test_cancel_superseded_merge_group_runs.py
 
+      - name: Test CODEOWNERS approvals and review labels
+        run: >-
+          uv run --no-project --python 3.12 --with codeowners --with pygithub
+          python tests/test_utils/python_scripts/test_codeowners_approval.py
+
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'

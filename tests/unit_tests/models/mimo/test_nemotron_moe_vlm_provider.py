@@ -24,10 +24,14 @@ from examples.mimo.model_providers.nemotron_moe_vlm import (
 from examples.mimo.model_providers.radio_encoder import RADIO_ENCODER_MODULE_NAME
 from examples.mimo.training.args import add_hetero_grid_args
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.enums import AttnBackend
-from megatron.training.argument_utils import model_config_from_args, resolve_tokenizer_vocab_size
+from megatron.training.argument_utils import (
+    model_config_from_args,
+    resolve_tokenizer_vocab_size,
+    tokenizer_config_from_args,
+)
 from megatron.training.global_vars import get_run_config
+from megatron.training.vocab_utils import build_tokenizer_and_pad_vocab_size
 
 pytestmark = pytest.mark.usefixtures("run_config")
 
@@ -319,8 +323,13 @@ def _parse_validate(argv):
     from megatron.training.models import MimoModelConfig
 
     cfg.model = model_config_from_args(args, model_config_cls=MimoModelConfig)
-    build_tokenizer(args)
-    resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
+    cfg.tokenizer = tokenizer_config_from_args(args)
+    build_tokenizer_and_pad_vocab_size(
+        cfg.tokenizer,
+        cfg.model.make_vocab_size_divisible_by,
+        cfg.model.transformer.tensor_model_parallel_size,
+    )
+    resolve_tokenizer_vocab_size(cfg)
     return args
 
 

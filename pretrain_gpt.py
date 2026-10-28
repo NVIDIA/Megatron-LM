@@ -33,7 +33,6 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.multi_token_prediction import get_mtp_ranks
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
@@ -62,6 +61,7 @@ from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.global_vars import (
     get_run_config,
+    get_tokenizer,
     set_run_config,
 )
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
@@ -458,7 +458,7 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
 def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
     """Build the GPT (or FIM) dataset config from parsed CLI args."""
     cfg = get_run_config()
-    tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]
