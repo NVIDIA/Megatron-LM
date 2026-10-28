@@ -2241,7 +2241,7 @@ def pretrain(
         train_state.do_train,
         train_state.do_valid,
         train_state.do_test,
-        args.dataloader_type,
+        cfg_container.data.dataloader.dataloader_type or 'single',
     )
 
     # Print setup timing.
@@ -6244,7 +6244,7 @@ def build_train_valid_test_data_iterators(
     )
 
     # Build iterators.
-    dl_type = args.dataloader_type
+    dl_type = cfg.data.dataloader.dataloader_type or 'single'  # unset selects single
     assert dl_type in ['single', 'cyclic', 'external']
 
     def _get_iterator(dataloader_type, dataloader):
