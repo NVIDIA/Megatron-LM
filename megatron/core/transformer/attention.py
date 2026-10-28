@@ -444,6 +444,15 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
 
+    def _needs_qkv_layernorm_output(self) -> bool:
+        """Whether this attention needs the normalized input of a norm fused into linear_qkv.
+
+        When True, ``linear_qkv`` must have been built with ``return_layernorm_output=True``;
+        the normalized activation is then passed to ``_get_core_attention_extra_kwargs`` as
+        ``qkv_layernorm_output``.
+        """
+        return False
+
     def _get_core_attention_extra_kwargs(
         self,
         hidden_states: Tensor,
@@ -458,8 +467,13 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         rotary_pos_cos_sin: Optional[Tensor],
         attn_mask_type: AttnMaskType,
         packed_seq_params: Optional[PackedSeqParams],
+        qkv_layernorm_output: Optional[Tensor] = None,
     ) -> dict:
-        """Hook for attention variants that need extra inputs in core attention."""
+        """Hook for attention variants that need extra inputs in core attention.
+
+        ``qkv_layernorm_output`` is the normalized input of a norm fused into ``linear_qkv``
+        when ``_needs_qkv_layernorm_output()`` is True, else None.
+        """
         return {}
 
     def _checkpointed_attention_forward(
@@ -1503,18 +1517,23 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             ), "fused_single_qkv_rope requested but not available/supported for the config."
 
         qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
+        needs_qkv_layernorm_output = self._needs_qkv_layernorm_output()
         with qkv_linear_manager as hidden_states:
             qkv_output = self.get_query_key_value_tensors(
                 hidden_states,
                 key_value_states,
                 split_qkv=split_qkv,
                 output_gate=self.config.attention_output_gate,
+                **({"return_layernorm_output": True} if needs_qkv_layernorm_output else {}),
             )
         # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
         qkv_output = qkv_linear_manager.group_offload(qkv_output, forced_released_tensors=[])
         attn_mask_type = self.attn_mask_type
         block_table = None
         gate = None
+        qkv_layernorm_output = None
+        if needs_qkv_layernorm_output:
+            *qkv_output, qkv_layernorm_output = qkv_output
         if split_qkv:
             if self.config.attention_output_gate:
                 query, key, value, gate = qkv_output
@@ -1681,6 +1700,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             rotary_pos_cos_sin=rotary_pos_cos_sin,
             attn_mask_type=attn_mask_type,
             packed_seq_params=packed_seq_params,
+            qkv_layernorm_output=qkv_layernorm_output,
         )
         core_attn_manager = off_interface(
             self.offload_core_attention and self.training, query, "core_attn"
@@ -1987,6 +2007,7 @@ class SelfAttention(Attention):
         key_value_states: Tensor | None = None,
         output_gate: bool = False,
         split_qkv: bool = True,
+        return_layernorm_output: bool = False,
     ) -> (
         tuple[Tensor, Tensor, Tensor, Tensor]
         | tuple[Tensor, Tensor, Tensor]
@@ -1996,10 +2017,22 @@ class SelfAttention(Attention):
         Derives `query`, `key` and `value` tensors from `hidden_states`.
         If `output_gate` is True, then also derives `gate` tensor.
         If `split_qkv=False`, then the unsplit mixed_qkv tensor is returned.
+        If `return_layernorm_output` is True, the normalized input of the norm fused into
+        `linear_qkv` (built with `return_layernorm_output=True`) is appended to the outputs.
         """
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
-        mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
+        linear_qkv_output = apply_module(self.linear_qkv)(hidden_states)
+        qkv_layernorm_output = None
+        if return_layernorm_output:
+            if len(linear_qkv_output) != 3:
+                raise RuntimeError(
+                    "return_layernorm_output requires linear_qkv built with "
+                    "return_layernorm_output=True, returning (output, bias, layernorm_output)."
+                )
+            mixed_qkv, _, qkv_layernorm_output = linear_qkv_output
+        else:
+            mixed_qkv, _ = linear_qkv_output
         num_query_heads_per_group = (
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition
         )
@@ -2067,6 +2100,8 @@ class SelfAttention(Attention):
 
             # Return unsplit mixed_qkv and split_arg_list
             if not split_qkv:
+                if return_layernorm_output:
+                    return mixed_qkv, split_arg_list, qkv_layernorm_output
                 return mixed_qkv, split_arg_list
 
             if SplitAlongDim is not None:
@@ -2109,8 +2144,12 @@ class SelfAttention(Attention):
                     self.world_size // self.config.num_query_groups
                 )
                 gate = gate[:, :, idx * size : (idx + 1) * size, :]
+            if return_layernorm_output:
+                return query, key, value, gate, qkv_layernorm_output
             return query, key, value, gate
 
+        if return_layernorm_output:
+            return query, key, value, qkv_layernorm_output
         return query, key, value
 
     def backward_dw(self) -> None:

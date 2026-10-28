@@ -1552,12 +1552,16 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         stride: int = 1,
         name: str | None = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        return_layernorm_output: bool = False,
     ):
         """
         Args:
             name (str | None): module instance name passed top-down from its paranet module
             pg_collection (ProcessGroupCollection | None): process groups used by this layer.
                 Falls back to the MPU global process groups when not given.
+            return_layernorm_output (bool): also return the normalized input that the GEMM
+                consumed, as a third output ``(output, bias, layernorm_output)``. Off by default,
+                which keeps the two-output contract.
         """
         if not HAVE_TE:
             raise ImportError(
@@ -1691,7 +1695,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 bias=bias,
                 return_bias=self.te_return_bias,
                 parallel_mode="column",
-                return_layernorm_output=False,
+                return_layernorm_output=return_layernorm_output,
                 zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
                 **extra_kwargs,
             )
@@ -1725,6 +1729,12 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
 
+    @classmethod
+    def supports_layernorm_output(cls, config: TransformerConfig) -> bool:
+        """Whether ``return_layernorm_output=True`` is supported for ``config``."""
+        del config
+        return True
+
     def finish_init(self, quantization_config: QuantizationConfig):
         """Post-init of quantization override"""
         if quantization_config is None:
@@ -1756,6 +1766,14 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             out = super().forward(x, is_first_microbatch=_is_first_microbatch)
 
         self.is_first_microbatch = False
+
+        # TE appends the normalized input last: (out, [bias,] layernorm_output). Return it as
+        # MCore's (output, bias, layernorm_output) for this opt-in path.
+        if self.return_layernorm_output:
+            if self.te_return_bias:
+                return out
+            output, layernorm_output = out
+            return output, None, layernorm_output
 
         # TE only returns a tuple when return_bias is True, otherwise
         # it returns a single Tensor, we always want to return two
