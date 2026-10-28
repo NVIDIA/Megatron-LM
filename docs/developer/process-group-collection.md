@@ -1,8 +1,9 @@
 # Building a `ProcessGroupCollection` for your own grid
 
-`initialize_model_parallel` builds one standard parallel grid and stores its groups in
-`parallel_state`. A framework that places a model on its own grid can build a
-`ProcessGroupCollection` for that grid instead, and pass it to the components that run on it.
+`initialize_model_parallel` builds one standard parallel grid, registers its groups in
+`parallel_state`, and returns their `ProcessGroupCollection`. A framework that places a model on
+its own grid can build a collection for that grid instead, and pass it to the components that run
+on it.
 This also covers several grids in one job, such as an encoder and a language model with different
 parallelism, or a separate inference layout.
 
@@ -125,13 +126,13 @@ config = TransformerConfig(
     pipeline_model_parallel_size=pgs.pp.size(),
 )
 config.finalize_model_grads_func = finalize_model_grads
-model_parallel_cuda_manual_seed(
-    seed, tp_rank=pgs.tp.rank(), ep_rank=pgs.ep.rank(), etp_rank=pgs.expt_tp.rank()
-)
+model_parallel_cuda_manual_seed(seed, pg_collection=pgs)
 
 model = GPTModel(
     config=config,
-    ...,
+    transformer_layer_spec=layer_spec,
+    vocab_size=vocab_size,
+    max_sequence_length=seq_length,
     pre_process=pgs.pp.rank() == 0,
     post_process=pgs.pp.rank() == pgs.pp.size() - 1,
     pg_collection=pgs,
@@ -153,14 +154,17 @@ Passed this way, the collection is enough to build and train a dense GPT model w
 Transformer Engine layer spec, without calling `initialize_model_parallel`. Some details:
 
 - Keep the parallel sizes in `TransformerConfig` equal to the group sizes.
-- `model_parallel_cuda_manual_seed` and `get_forward_backward_func` read whatever you do not pass
-  from `parallel_state`. Pass the ranks to the first (with GTP on, also the GTP ranks and sizes),
-  and `pp_size` and `vp_size` to the second.
+- Pass the collection to `model_parallel_cuda_manual_seed`, and `pp_size` and `vp_size` to
+  `get_forward_backward_func`. Without them, both fall back to `parallel_state` with a
+  `ProcessGroupFallbackWarning`. The seed reads `tp`, `ep`, `expt_tp`, `gtp_remat` and
+  `expt_gtp_remat`, so the collection must set all five.
 - Set `config.finalize_model_grads_func` as shown; the schedules call it with the collection.
 - With pipeline parallelism, the schedules take a `P2PCommunicator` for the pipeline group
   together with the collection.
-- The collection carries no Gloo groups. Pass `use_gloo_process_groups=False` to
-  `get_megatron_optimizer`; it raises an error otherwise.
-- Some layers still use [tier-4](parallel-state-deprecation.md#what-is-deprecated) global state,
-  which the collection does not cover. For example, the local (non-Transformer Engine) attention
-  uses the global memory buffer that `initialize_model_parallel` creates.
+- The example builds no Gloo groups. Pass `use_gloo_process_groups=False` to
+  `get_megatron_optimizer`, or set `intra_dp_cp_gloo`, and `intra_expt_dp_gloo` with experts, to
+  Gloo groups with the ranks of the groups that the distributed optimizer shards over. Without
+  them, `use_gloo_process_groups=True` raises an error.
+- The local (non-Transformer Engine) layers use the process-wide memory buffer of
+  `megatron.core.utils`. It does not depend on any process group and is created on first use, so
+  it needs no `initialize_model_parallel` either.

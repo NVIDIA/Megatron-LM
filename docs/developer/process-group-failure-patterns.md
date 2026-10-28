@@ -69,17 +69,21 @@ while they migrate. It must do four things:
 - build only the fields the component reads;
 - check that those fields are set.
 
+In Megatron Core, `resolve_process_groups()` does the last three:
+
 ```python
-        if pg_collection is None:
-            # Compatibility fallback for callers that do not pass a collection yet.
-            warnings.warn(
-                f"{type(self).__name__} was built without a pg_collection and uses the global "
-                "parallel grid. Pass the owning model's ProcessGroupCollection.",
-                FutureWarning,
-                stacklevel=2,
-            )
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
+        # Compatibility fallback for callers that do not pass a collection yet.
+        pg_collection = resolve_process_groups(
+            pg_collection,
+            owner=type(self).__name__,
+            required=("tp",),
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
 ```
+
+Outside Megatron Core, read the grid in a `global_process_group_fallback()` block instead. See
+[Fallbacks](parallel-state-deprecation.md#fallbacks-processgroupfallbackwarning).
 
 A hand-built collection that copies `parallel_state` accessors into the fields one by one is the
 same pattern, and needs the same treatment.
@@ -331,12 +335,15 @@ without notice.
 - Name the release that removes the fallback.
 - Make sure filters that quiet the other ranks let this category through.
 
-Keep the category specific, so that tests and strict runs can turn exactly these warnings into
-errors:
+`resolve_process_groups()`, `warn_global_process_group_fallback()` and
+`global_process_group_fallback()` in `megatron.core.process_groups_config` do the first three,
+and the filters that training installs on ranks other than 0 let their category through. That
+category, `ProcessGroupFallbackWarning`, is their own, so that tests and strict runs can turn
+exactly these warnings into errors:
 
 ```python
 with warnings.catch_warnings():
-    warnings.simplefilter("error", MyFallbackWarning)
+    enable_strict_process_group_fallbacks()
     build_model(pg_collection=pgs)  # raises if anything falls back to the global grid
 ```
 
