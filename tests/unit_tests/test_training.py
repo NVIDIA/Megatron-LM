@@ -286,18 +286,16 @@ class TestTraining:
         for vocab in range(1, 600000, 1000):
             for mult in [1, 17, 32, 64, 128]:
                 args.make_vocab_size_divisible_by = mult
-                assert old_round_impl(vocab, mult) == vocab_size_with_padding(vocab, args, False), (
-                    vocab,
-                    mult,
-                )
+                assert old_round_impl(vocab, mult) == vocab_size_with_padding(
+                    vocab, args.make_vocab_size_divisible_by, args.tensor_model_parallel_size, False
+                ), (vocab, mult)
 
         for vocab in range(1, 10_000, 500):
             for mult in range(1, 1024 + 1):
                 args.make_vocab_size_divisible_by = mult
-                assert old_round_impl(vocab, mult) == vocab_size_with_padding(vocab, args, False), (
-                    vocab,
-                    mult,
-                )
+                assert old_round_impl(vocab, mult) == vocab_size_with_padding(
+                    vocab, args.make_vocab_size_divisible_by, args.tensor_model_parallel_size, False
+                ), (vocab, mult)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()

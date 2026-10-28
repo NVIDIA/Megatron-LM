@@ -291,6 +291,12 @@ class LoggerConfig:
     log_interval: int = 100
     """Report loss and timing interval."""
 
+    tensor_metrics: list[str] = field(default_factory=list)
+    """Tensor metric specifications in `NAME:INTERVAL` form, such as
+    `layer-param-l2:10`. Multiple specifications may be supplied after one
+    `--tensor-metrics` flag.
+    """
+
     log_params_norm: bool = False
     """If set, calculate and log parameters norm."""
 
@@ -978,11 +984,29 @@ class TokenizerConfig:
         "HuggingFaceTokenizer",
         "Llama2Tokenizer",
         "TikTokenizer",
-        "MultimodalTokenizer",
         "NullTokenizer",
-        "NullMultimodalTokenizer",
         "SFTTokenizer",
-    ] = None
+        ] = field(
+                default=None,
+                metadata={
+                    "argparse_meta": {
+                        "choices": [
+                            "BertWordPieceLowerCase",
+                            "BertWordPieceCase",
+                            "GPT2BPETokenizer",
+                            "SentencePieceTokenizer",
+                            "GPTSentencePieceTokenizer",
+                            "HuggingFaceTokenizer",
+                            "Llama2Tokenizer",
+                            "TikTokenizer",
+                            "MultimodalTokenizer",
+                            "NullTokenizer",
+                            "NullMultimodalTokenizer",
+                            "SFTTokenizer",
+                        ]
+                    }
+                }
+            )
     """What type of tokenizer to use."""
 
     tokenizer_model: str = None
@@ -1031,3 +1055,28 @@ class TokenizerConfig:
 
     use_gigatoken: Optional[bool] = False
     """Whether to use faster implementation of tokenizers (gigatoken)"""
+
+    sft_tokenizer_prompt_format: str = "nemotron-h-aligned"
+    """SFT prompt format."""
+
+@dataclass(kw_only=True)
+class MultiModalTokenizerConfig(TokenizerConfig):
+    """Extended tokenizer config with additional settings for multimodal-model tokenizers."""
+
+    tokenizer_type: Literal[
+        "MultimodalTokenizer",
+        "NullMultimodalTokenizer",
+    ] = None
+    """What type of tokenizer to use."""
+
+    tokenizer_prompt_format: Literal["mistral", "llama3", "chatml", "nvlm-yi-34b", "qwen2p0", "qwen2p5", "llama3p1", "nemotron5", "nemotron5-aligned", "llama_nemotron_8b", "nemotron6-moe"] | None = None
+    """Prompt format to use with the tokenizer."""
+
+    image_tag_type: Literal["nvlm", "internvl", ""] | None = None
+    """Surround image tokens with tags."""
+
+    force_system_message: bool = False
+    """Force a specific system message."""
+
+    tokenizer_keep_history_thinking: bool = False
+    """Preserve thinking traces in conversation history."""

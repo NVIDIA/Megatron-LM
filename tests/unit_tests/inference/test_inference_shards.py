@@ -22,6 +22,7 @@ from megatron.core.inference.shards_spec import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import unwrap_model
+from megatron.training.argument_utils import tokenizer_config_from_args
 from megatron.training.config import RLConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -58,10 +59,12 @@ def test_serving_and_rl_build_shard_models_with_global_parallel_args(monkeypatch
         monkeypatch.setattr(utils, "get_args", lambda: args)
         load = Mock()
         monkeypatch.setattr(utils, "load_checkpoint", load)
+        tokenizer_cfg = tokenizer_config_from_args(args)
+        run_config.tokenizer = tokenizer_cfg
         serving = utils.get_model_for_inference(pg_collection=pg, checkpoint_group=pg.mp)
 
         # Exercise the separate RL builder too, starting with the training config.
-        training_config = utils.get_model_builder(args)._model_config
+        training_config = utils.get_model_builder(args, tokenizer_cfg)._model_config
         shard = SimpleNamespace(pg_collection=pg, spec=InferenceShardSpec(tp=1, role="decode"))
         monkeypatch.setattr(
             disagg, "build_inference_pg_collections_for_shards", lambda **kw: [shard]
