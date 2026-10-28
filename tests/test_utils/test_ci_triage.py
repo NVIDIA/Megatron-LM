@@ -144,6 +144,14 @@ def test_gb300_child_pipeline_matches_gb200_without_blocking(scope, tmp_path):
             for item in workloads
             if item.type != "build"
         )
+        if platform == "dgx_gb300" and scope in ("mr", "mr-slim"):
+            functional_workloads = [
+                item
+                for item in workloads
+                if item.type != "build" and "golden_platform" in item.spec
+            ]
+            assert len(functional_workloads) == (19 if scope == "mr" else 2)
+            assert all(item.spec["golden_platform"] == "dgx_gb300" for item in functional_workloads)
     assert inventories["dgx_gb300"]
     assert inventories["dgx_gb300"] == inventories["dgx_gb200"]
 
