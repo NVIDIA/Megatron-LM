@@ -32,7 +32,10 @@ def _hybrid_stack_stub(cp_layout_manager=None):
 
 def _overlap_model_stub(**config_overrides):
     config = dict(
-        cuda_graph_impl="none", enable_mhc_connections=False, moe_shortcut_connection=False
+        cuda_graph_impl="none",
+        enable_mhc_connections=False,
+        moe_shortcut_connection=False,
+        recompute_granularity=None,
     )
     config.update(config_overrides)
     model = torch.nn.Module()
@@ -107,6 +110,7 @@ def test_hybrid_ep_overlap_rejects_chunkwise_linear_cp(location):
         (dict(cuda_graph_impl="full_iteration"), "does not support CUDA graphs"),
         (dict(enable_mhc_connections=True), "does not support enable_mhc_connections"),
         (dict(moe_shortcut_connection=True), "moe_shortcut_connection"),
+        (dict(recompute_granularity="full"), "recompute_granularity='full'"),
     ],
 )
 def test_hybrid_ep_overlap_rejects_unsupported_features(config_overrides, message):
