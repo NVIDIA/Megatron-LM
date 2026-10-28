@@ -67,8 +67,7 @@ def _patch_hadamard_if_needed():
     """Patch hadamard_transform in the DSA module when the library is absent."""
     if not HAVE_HADAMARD:
         with patch(
-            'megatron.core.transformer.experimental_attention_variant.dsa.hadamard_transform',
-            _mock_hadamard_transform,
+            'megatron.core.ops.attention.dsa.modules.hadamard_transform', _mock_hadamard_transform
         ):
             yield
     else:

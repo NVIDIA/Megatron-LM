@@ -1287,9 +1287,7 @@ class TestHybridDSA:
         total_tokens = batch * args.seq_length
         sum_sq = batch * args.seq_length**2
 
-        from megatron.core.transformer.experimental_attention_variant.dsa import (
-            is_dsa_skip_topk_layer,
-        )
+        from megatron.core.ops.attention.dsa.modules import is_dsa_skip_topk_layer
 
         expected_indexer_layers = sum(1 for n in range(1, 6) if not is_dsa_skip_topk_layer(n, 1, 4))
         assert expected_indexer_layers == 2
@@ -1351,7 +1349,7 @@ class TestDSAKPool:
     @pytest.mark.parametrize("length", [3, 4, 7, 17, 33])
     @pytest.mark.parametrize("select_tail", [False, True])
     def test_attention_pairs_match_runtime_selection(self, length, select_tail):
-        from megatron.core.transformer.experimental_attention_variant.dsa import fused_qk_topk_kpool
+        from megatron.core.ops.attention.dsa.modules import fused_qk_topk_kpool
         from megatron.training.logging.dsa_flops import _dsa_kpool_attention_scale
 
         _, indices = fused_qk_topk_kpool(

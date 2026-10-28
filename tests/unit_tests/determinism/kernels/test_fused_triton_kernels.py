@@ -31,9 +31,7 @@ from megatron.core.fusions.fused_indices_converter import fused_indices_to_multi
 from megatron.core.fusions.fused_moe_residual_add import fused_moe_residual_add
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.fusions.fused_row_copy import contiguous_rows
-from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse import (
-    fused_csa_teacher_lse,
-)
+from megatron.core.ops.attention.csa.kernels.csa_teacher_lse import fused_csa_teacher_lse
 from megatron.core.transformer.moe.moe_utils import pad_routing_map
 from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
@@ -130,9 +128,7 @@ def test_csa_teacher_lse_replays():
 
 def test_dsa_weights_projection_replays():
     """Replay the DSA weights projection GEMM dispatch under stream contention."""
-    from megatron.core.transformer.experimental_attention_variant.dsa import (
-        _dsa_weights_proj_forward_gemm,
-    )
+    from megatron.core.ops.attention.dsa.modules import _dsa_weights_proj_forward_gemm
 
     seeded()
     x = torch.randn(4096, 256, device="cuda", dtype=torch.bfloat16)
@@ -150,7 +146,7 @@ def test_dsa_weights_projection_replays():
 
 def test_dsa_kpool_chunked_selection_replays(monkeypatch):
     """Replay the fixed-memory KPool score and top-k path across query chunks."""
-    from megatron.core.transformer.experimental_attention_variant import dsa
+    from megatron.core.ops.attention.dsa import modules as dsa
 
     seeded()
     monkeypatch.setattr(dsa, "_KPOOL_SCORE_CHUNK_BYTES", 128)

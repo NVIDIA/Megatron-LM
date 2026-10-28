@@ -6,7 +6,7 @@ from typing import cast
 import pytest
 import torch
 
-from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
+from megatron.core.ops.ssm.gdp.mixer import GatedDeltaProductMixer
 
 
 @pytest.mark.parametrize("cutedsl", [False, True])

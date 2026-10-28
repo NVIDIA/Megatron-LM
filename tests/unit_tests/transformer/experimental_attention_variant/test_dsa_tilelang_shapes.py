@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.transformer.experimental_attention_variant.ops import tilelang_dsa
+from megatron.core.ops.attention.dsa.kernels import tilelang_dsa
 
 
 @pytest.mark.parametrize("dim", [512, 576])

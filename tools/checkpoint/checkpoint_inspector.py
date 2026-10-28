@@ -1090,7 +1090,7 @@ def _gdp_split_names(num_householder: int, is_conv: bool) -> list[str]:
     """Sub-key order for a Gated DeltaProduct fused projection.
 
     Mirrors ``_get_in_proj_checkpoint_split_layout`` / ``_get_conv_checkpoint_split_layout``
-    in megatron/core/ssm/gated_delta_product.py. The fused tensor is exactly the
+    in megatron/core/ops/ssm/gdp/mixer.py. The fused tensor is exactly the
     concatenation of these sections along dim 0, in this order, so the order is the
     contract between the two directions — do not sort it.
 

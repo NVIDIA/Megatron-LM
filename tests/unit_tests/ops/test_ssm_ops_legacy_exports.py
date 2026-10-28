@@ -1,11 +1,14 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Test that the megatron.core.ssm.ops package exports the public API."""
+"""Test that the deprecated megatron.core.ssm.ops package keeps its historical exports."""
 
 import unittest
+import warnings
 
 try:
-    from megatron.core.ssm import ops as ssm_ops
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        from megatron.core.ssm import ops as ssm_ops
 
     HAVE_SSD_OPS = True
 except (ImportError, Exception):
@@ -14,7 +17,7 @@ except (ImportError, Exception):
 
 @unittest.skipIf(not HAVE_SSD_OPS, "SSD ops (Triton 3+) not available")
 class TestOpsPackagePublicAPI(unittest.TestCase):
-    """Ensure the ops package exposes the documented public API."""
+    """Ensure the deprecated ops package exposes its historical public API."""
 
     def test_all_exported(self):
         self.assertIn("mamba_chunk_scan_combined_varlen", ssm_ops.__all__)

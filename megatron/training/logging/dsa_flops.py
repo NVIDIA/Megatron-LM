@@ -5,7 +5,7 @@
 import math
 
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, parse_hybrid_pattern
-from megatron.core.transformer.experimental_attention_variant.dsa import is_dsa_skip_topk_layer
+from megatron.core.ops.attention.dsa.modules import is_dsa_skip_topk_layer
 
 
 def _dsa_sparse_core_scale(total_real_tokens, seqlen_squared_sum, dsa_indexer_topk):

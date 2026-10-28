@@ -5,16 +5,14 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from megatron.core.transformer.experimental_attention_variant.dsa import (
+from megatron.core.ops.attention.dsa.dsa_masking import generate_varlen_mask_params_for_positions
+from megatron.core.ops.attention.dsa.modules import (
     _compute_index_scores,
     _kpool_compress_keys,
     _kpool_compress_keys_per_seg,
     _kpool_fp8_input,
     fused_qk_topk_kpool,
     rotate_activation,
-)
-from megatron.core.transformer.experimental_attention_variant.dsa_masking import (
-    generate_varlen_mask_params_for_positions,
 )
 
 try:
@@ -34,8 +32,7 @@ def _mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tenso
 def patch_hadamard_if_needed():
     if not HAVE_HADAMARD:
         with patch(
-            "megatron.core.transformer.experimental_attention_variant.dsa.hadamard_transform",
-            _mock_hadamard_transform,
+            "megatron.core.ops.attention.dsa.modules.hadamard_transform", _mock_hadamard_transform
         ):
             yield
     else:
@@ -275,9 +272,7 @@ def test_kpool_chunked_topk_matches_full_score_reference(
             kwargs["cu_seqlens_kv"] = torch.tensor([0, 7, sk], device="cuda")
 
     args = (q, k, weights, 8, pool_size, gate, ape)
-    with patch(
-        "megatron.core.transformer.experimental_attention_variant.dsa._KPOOL_SCORE_CHUNK_BYTES", 128
-    ):
+    with patch("megatron.core.ops.attention.dsa.modules._KPOOL_SCORE_CHUNK_BYTES", 128):
         with torch.no_grad():
             scores, expected = fused_qk_topk_kpool(
                 *args,

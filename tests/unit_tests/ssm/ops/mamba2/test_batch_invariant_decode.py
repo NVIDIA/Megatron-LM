@@ -8,13 +8,13 @@ import torch
 try:
     from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
-    from megatron.core.ssm.ops.mamba2.batch_invariant_decode import (
+    from megatron.core.ops.ssm.mamba2.batch_invariant_decode import (
         BatchInvariantDecodeBuffers,
         _mamba_chunk_scan_decode_rows,
         batch_invariant_decode_buffered_scan,
     )
-    from megatron.core.ssm.ops.mamba2.batch_invariant_decode_rows import row_kernel_configs
-    from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
+    from megatron.core.ops.ssm.mamba2.batch_invariant_decode_rows import row_kernel_configs
+    from megatron.core.ops.ssm.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
 
     HAVE_BATCH_INVARIANT_DECODE = True
 except ImportError:
@@ -888,7 +888,7 @@ class TestBatchInvariantDecodeRowKernels(unittest.TestCase):
         C = torch.empty(1, 1, 128, device="cuda")
         self.assertIsNotNone(row_kernel_configs(C, 128))
         self.assertIsNotNone(row_kernel_configs(C[..., :16], 32))  # the dims of the class above
-        from megatron.core.ssm.ops.mamba2 import ssd_chunk_scan
+        from megatron.core.ops.ssm.mamba2 import ssd_chunk_scan
 
         kernel = ssd_chunk_scan._chunk_scan_fwd_kernel
         pinned = kernel.configs
@@ -921,7 +921,7 @@ class TestBatchInvariantDecodeRowKernels(unittest.TestCase):
         (the tile pipeline runs) or take that tile and match it bit for bit."""
         from triton.runtime.errors import OutOfResources
 
-        from megatron.core.ssm.ops.mamba2 import ssd_bmm, ssd_chunk_scan, ssd_chunk_state
+        from megatron.core.ops.ssm.mamba2 import ssd_bmm, ssd_chunk_scan, ssd_chunk_state
 
         entries, nheads, headdim, ngroups, dstate, chunk_size = 40, 4, 64, 2, 128, 128
         D = torch.randn(nheads, device="cuda")
@@ -1043,7 +1043,7 @@ class TestBatchInvariantDecodeRowKernels(unittest.TestCase):
         pipeline's outputs and states, and in bf16 the training scan's outputs."""
         from unittest.mock import patch
 
-        from megatron.core.ssm.ops.mamba2 import batch_invariant_decode as bid
+        from megatron.core.ops.ssm.mamba2 import batch_invariant_decode as bid
 
         nheads, headdim, ngroups, dstate, chunk_size, steps = 8, 64, 2, 128, 128, 300
         slots, prefill_lens = (7, 2, 5, 0, 9), (128, 1, 255, 64, 300)

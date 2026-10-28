@@ -76,6 +76,7 @@ from megatron.core.num_microbatches_calculator import (
     get_num_microbatches,
     update_num_microbatches,
 )
+from megatron.core.ops.attention.dsa.modules import DSAIndexerLossLoggingHelper
 from megatron.core.optimizer import (
     OptimizerConfig,
     ParamKey,
@@ -124,7 +125,6 @@ from megatron.core.rerun_state_machine import (
 )
 from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
-from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker

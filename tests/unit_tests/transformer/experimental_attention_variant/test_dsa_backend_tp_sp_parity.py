@@ -8,12 +8,8 @@ import torch
 
 import megatron.core.parallel_state as parallel_state
 from megatron.core.extensions.transformer_engine import TELinear, TENorm
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnBackend, AttnMaskType
-from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels
-from megatron.core.transformer.experimental_attention_variant.dsa import (
+from megatron.core.ops.attention.dsa import dsa_cudnn_kernels
+from megatron.core.ops.attention.dsa.modules import (
     DSAIndexer,
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
@@ -21,6 +17,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
@@ -75,7 +75,7 @@ def _skip_if_backend_unavailable(backend: str) -> None:
             pytest.skip(f"cuDNN fused DSA dependencies are unavailable: {', '.join(missing)}")
     elif backend == "tilelang":
         try:
-            from megatron.core.transformer.experimental_attention_variant.ops import tilelang_dsa
+            from megatron.core.ops.attention.dsa.kernels import tilelang_dsa
         except (ImportError, OSError, AttributeError) as exc:
             pytest.skip(f"TileLang DSA backend code is unavailable: {exc}")
 
@@ -384,9 +384,7 @@ def _record_backend_calls(backend: str, monkeypatch: pytest.MonkeyPatch):
         )
     else:
         try:
-            from megatron.core.transformer.experimental_attention_variant import (
-                dsa_tilelang_kernels,
-            )
+            from megatron.core.ops.attention.dsa import dsa_tilelang_kernels
         except (ImportError, OSError, AttributeError) as exc:
             pytest.skip(f"TileLang DSA backend code is unavailable: {exc}")
 

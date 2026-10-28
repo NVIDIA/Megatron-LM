@@ -11,13 +11,16 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
+from megatron.core.models.hybrid.dsa_layer_specs import (
+    dsa_gqa_indexer_spec,
+    dsa_stack_spec,
+    gdp_dsa_stack_spec,
+)
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     gated_delta_product_stack_spec,
     hybrid_stack_spec,
 )
-from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant.dsa import fused_qk_topk_naive
-from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
+from megatron.core.ops.attention.dsa.dsa_gqa import (
     DSGQACoreAttention,
     DSGroupedSelfAttention,
     SimplifiedDSGQAIndexer,
@@ -32,15 +35,12 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     compute_gqa_dsa_indexer_loss,
     unfused_grouped_dsa_fn,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa_layer_specs import (
-    dsa_gqa_indexer_spec,
-    dsa_stack_spec,
-    gdp_dsa_stack_spec,
-)
-from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
+from megatron.core.ops.attention.dsa.dsa_min_memory import (
     dsa_dense_indexer_loss,
     dsa_min_memory_gqa,
 )
+from megatron.core.ops.attention.dsa.modules import fused_qk_topk_naive
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -225,7 +225,7 @@ def test_dsa_layer_specs_import_without_transformer_engine():
         sys.modules["apex"] = None
 
         from megatron.core.extensions.transformer_engine import HAVE_TE
-        from megatron.core.transformer.experimental_attention_variant import dsa_layer_specs
+        from megatron.core.models.hybrid import dsa_layer_specs
 
         assert not HAVE_TE
         for spec in (dsa_layer_specs.dsa_stack_spec, dsa_layer_specs.gdp_dsa_stack_spec):
@@ -416,7 +416,7 @@ def test_transformer_config_rejects_simplified_mode_without_dsa_variant():
 
 
 def test_simplified_indexer_accepts_internal_tp_group_rewrite(monkeypatch):
-    import megatron.core.transformer.experimental_attention_variant.dsa_gqa as dsa_gqa
+    import megatron.core.ops.attention.dsa.dsa_gqa as dsa_gqa
 
     config = TransformerConfig(
         num_layers=1,
@@ -461,7 +461,7 @@ def test_simplified_indexer_accepts_internal_tp_group_rewrite(monkeypatch):
 
 
 def test_simplified_learned_k_builds_replicated_independent_projection(monkeypatch):
-    import megatron.core.transformer.experimental_attention_variant.dsa_gqa as dsa_gqa
+    import megatron.core.ops.attention.dsa.dsa_gqa as dsa_gqa
 
     config = TransformerConfig(
         num_layers=1,
@@ -505,7 +505,7 @@ def test_simplified_learned_k_builds_replicated_independent_projection(monkeypat
 
 
 def test_simplified_indexer_rope_matches_model_rotary_config(monkeypatch):
-    import megatron.core.transformer.experimental_attention_variant.dsa_gqa as dsa_gqa
+    import megatron.core.ops.attention.dsa.dsa_gqa as dsa_gqa
 
     config = TransformerConfig(
         num_layers=1,
@@ -851,8 +851,7 @@ def test_min_memory_backend_supports_no_grad_validation_forward(monkeypatch):
         return query.new_empty(query.size(0), query.size(1), query.size(2) * value.size(-1))
 
     monkeypatch.setattr(
-        "megatron.core.transformer.experimental_attention_variant.dsa_gqa."
-        "dsa_min_memory_gqa_forward_only",
+        "megatron.core.ops.attention.dsa.dsa_gqa.dsa_min_memory_gqa_forward_only",
         _fake_forward_only,
     )
 

@@ -219,8 +219,8 @@ def test_ci_tool_flags_unregistered_external_dispatch_file(tmp_path):
 @pytest.mark.parametrize(
     "path",
     [
-        "megatron/core/ssm/mamba_mixer.py",
-        "megatron/core/ssm/gated_delta_product.py",
+        "megatron/core/ops/ssm/mamba2/mixer.py",
+        "megatron/core/ops/ssm/gdp/mixer.py",
         "megatron/core/models/common/embeddings/rope_utils.py",
         "megatron/core/transformer/multi_latent_attention.py",
         "megatron/core/fp8_utils.py",

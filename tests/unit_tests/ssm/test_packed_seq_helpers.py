@@ -2,8 +2,8 @@
 
 import torch
 
+from megatron.core.ops.ssm.common.packed_seq import build_packed_seq_idx
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.ssm.packed_seq_helpers import build_packed_seq_idx
 
 
 def test_build_packed_seq_idx_covers_sequences_and_trailing_padding():

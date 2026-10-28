@@ -15,7 +15,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
+from megatron.core.ops.attention.dsa.dsa_min_memory import (
     _MAX_KEY_CHUNK,
     _MAX_QUERY_CHUNK,
     _SCORE_TILE_BUDGET_BYTES,
@@ -28,7 +28,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory imp
     dsa_min_memory_gqa,
     dsa_min_memory_gqa_forward_only,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_triton import (
+from megatron.core.ops.attention.dsa.dsa_min_memory_triton import (
     HAVE_TRITON,
     triton_indexer_loss_grad,
     triton_linear_wgrad,
@@ -107,7 +107,7 @@ def test_simplified_learned_k_only_persists_full_k_when_cached():
 
 
 def test_simplified_learned_k_bounds_selected_k_scratch(monkeypatch):
-    import megatron.core.transformer.experimental_attention_variant.dsa_min_memory as min_memory
+    import megatron.core.ops.attention.dsa.dsa_min_memory as min_memory
 
     torch.manual_seed(120)
     seqlen, batch_size, hidden_size = 70, 1, 11
@@ -712,9 +712,7 @@ def test_dense_teacher_allocation_stays_within_the_budget(num_query_heads, num_q
     change to _dense_teacher_logits_block that reintroduces an extra full-size copy fails here
     rather than at a user's OOM.
     """
-    from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
-        _dense_teacher_logits_block,
-    )
+    from megatron.core.ops.attention.dsa.dsa_min_memory import _dense_teacher_logits_block
 
     torch.manual_seed(31)
     device = torch.device("cuda")

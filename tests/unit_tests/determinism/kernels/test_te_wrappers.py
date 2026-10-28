@@ -23,6 +23,11 @@ from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP, mark_grouped_tensor
 from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
+from megatron.core.ops.attention.dsa.modules import (
+    _compute_index_scores,
+    _dsa_weights_proj_forward_gemm,
+    _DSAWeightsProjection,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
@@ -32,11 +37,6 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     te_supports_batch_invariant_grouped_gemm,
 )
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant.dsa import (
-    _compute_index_scores,
-    _dsa_weights_proj_forward_gemm,
-    _DSAWeightsProjection,
-)
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal

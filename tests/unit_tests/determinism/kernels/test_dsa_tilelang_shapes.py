@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from megatron.core.transformer.experimental_attention_variant.ops import tilelang_dsa
+from megatron.core.ops.attention.dsa.kernels import tilelang_dsa
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact
 
 
