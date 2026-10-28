@@ -155,11 +155,11 @@ Bootstrap, teardown and the registry are not deprecated: `initialize_model_paral
 
 - **Megatron Core's own calls do not warn.** Its compatibility fallbacks emit a
   `ProcessGroupFallbackWarning` for the caller that omitted its groups instead.
-  `tools/check_process_group_usage.py` ratchets Megatron Core's calls of the group, rank and size
-  accessors, so a new one fails the check. It does not track the stage predicates, the rank and
-  size overrides, the virtual-pipeline getters and setters, `get_all_ranks()`, the dynamic
-  context-parallel group maps or the memory-buffer aliases: a call of one of these in Megatron
-  Core neither warns nor fails the check.
+  `tools/check_process_group_usage.py` ratchets Megatron Core's calls of every deprecated
+  function outside `parallel_state.py` and `process_groups_config.py`: the group, rank and size
+  accessors, the stage predicates, the rank and size overrides, the virtual-pipeline getters and
+  setters, `get_all_ranks()`, the dynamic context-parallel group maps and the memory-buffer
+  aliases. A new call of any of them fails the check.
 - **A fallback outside Megatron Core** reads the grid inside
   `with global_process_group_fallback(owner, argument, deprecated_in=..., removed_in=...):`
   from `megatron.core.process_groups_config`. It emits one `ProcessGroupFallbackWarning` for the

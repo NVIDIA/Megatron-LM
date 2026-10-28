@@ -49,9 +49,8 @@ _ACCESSOR_REMOVED_IN = "0.23"
 
 # Calls from Megatron Core itself do not warn: its compatibility fallbacks emit a
 # ProcessGroupFallbackWarning for the caller that omitted its process groups instead.
-# tools/check_process_group_usage.py ratchets its calls of the group, rank and size accessors, but
-# not of the stage predicates, the overrides, the virtual-pipeline state, get_all_ranks, the
-# dynamic context-parallel group maps or the memory-buffer aliases.
+# tools/check_process_group_usage.py ratchets its calls of every deprecated function, so a new
+# one fails the check.
 _megatron_core_dir = os.path.dirname(__file__) + os.sep
 
 # Call sites that have warned in this process, as (accessor, file name, line number).
