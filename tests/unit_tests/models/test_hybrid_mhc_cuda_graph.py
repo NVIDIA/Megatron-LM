@@ -45,11 +45,11 @@ from megatron.core.transformer.cuda_graphs import (
 )
 from megatron.core.transformer.enums import AttnBackend, CudaGraphModule
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
-from megatron.core.transformer.module import convert_module_to_dtype_except_fp32_marked
-from megatron.core.transformer.transformer_layer import (
+from megatron.core.transformer.hyper_connection_transformer_layer import (
     HyperConnectionTransformerLayer,
-    TransformerLayer,
 )
+from megatron.core.transformer.module import convert_module_to_dtype_except_fp32_marked
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 

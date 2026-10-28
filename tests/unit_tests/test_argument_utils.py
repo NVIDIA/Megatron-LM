@@ -99,6 +99,23 @@ def test_moe_norm_flag_reaches_transformer_config():
     assert config.moe_use_norm_before_up_proj is True
 
 
+def test_no_megatron_fsdp_padded_shards_flag_reaches_ddp_config():
+    """--no-megatron-fsdp-padded-shards should disable padded shards in the DDP config."""
+    from megatron.training.training import get_megatron_ddp_config
+
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+
+    default_args = parser.parse_args([])
+    assert default_args.megatron_fsdp_padded_shards is True
+    assert get_megatron_ddp_config(default_args, use_torch_fsdp2=False).megatron_fsdp_padded_shards
+
+    disabled_args = parser.parse_args(["--no-megatron-fsdp-padded-shards"])
+    assert disabled_args.megatron_fsdp_padded_shards is False
+    ddp_config = get_megatron_ddp_config(disabled_args, use_torch_fsdp2=False)
+    assert ddp_config.megatron_fsdp_padded_shards is False
+
+
 @pytest.mark.parametrize('explicit_hash_vocab_size', [None, 100007])
 def test_hash_moe_vocab_is_initialized_before_config_conversion(
     monkeypatch, explicit_hash_vocab_size

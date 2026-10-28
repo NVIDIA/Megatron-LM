@@ -12,17 +12,17 @@ from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadat
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection_transformer_layer import (
+    _uses_mhc_attention_cuda_graph_split,
+    _validate_mhc_te_graph_inputs,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import (
     GraphableMegatronModule,
     MegatronModule,
     convert_module_to_dtype_except_fp32_marked,
 )
-from megatron.core.transformer.transformer_layer import (
-    TransformerLayer,
-    _uses_mhc_attention_cuda_graph_split,
-    _validate_mhc_te_graph_inputs,
-)
+from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
 class HyperConnectionHybridLayer(GraphableMegatronModule):
