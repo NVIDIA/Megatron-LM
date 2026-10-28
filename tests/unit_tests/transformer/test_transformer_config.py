@@ -10,13 +10,29 @@ from megatron.core.utils import is_te_min_version
 
 @pytest.mark.parametrize("config_cls", [TransformerConfig, MLATransformerConfig])
 @pytest.mark.parametrize("recompute_modules", [None, ["core_attn"], ["core_attn", "layernorm"]])
-@pytest.mark.parametrize("offload_modules", [["attn_proj"], ["core_attn", "attn_proj"]])
-def test_core_attn_recompute_rejects_projection_offload(
-    config_cls, recompute_modules, offload_modules
+def test_core_attn_recompute_allows_projection_offload(config_cls, recompute_modules):
+    """Checkpoint-owned outputs are skipped by projection activation offloading."""
+    config = config_cls(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        recompute_granularity="selective",
+        recompute_modules=recompute_modules,
+        fine_grained_activation_offloading=True,
+        offload_modules=["core_attn", "attn_proj"],
+    )
+    assert "core_attn" in config.recompute_modules
+    assert config.offload_modules == ["core_attn", "attn_proj"]
+
+
+@pytest.mark.parametrize("config_cls", [TransformerConfig, MLATransformerConfig])
+@pytest.mark.parametrize("recompute_modules", [None, ["core_attn"], ["core_attn", "layernorm"]])
+def test_core_attn_recompute_projection_offload_requires_core_attn_offload(
+    config_cls, recompute_modules
 ):
-    """Reject competing storage owners before attention modules are constructed."""
+    """Recomputation does not bypass projection offloading's independent prerequisite."""
     with pytest.raises(
-        ValueError, match="core_attn in recompute_modules cannot be combined with attn_proj"
+        ValueError, match="attn_proj cannot be set to offload_modules alone without core_attn"
     ):
         config_cls(
             num_layers=1,
@@ -25,46 +41,36 @@ def test_core_attn_recompute_rejects_projection_offload(
             recompute_granularity="selective",
             recompute_modules=recompute_modules,
             fine_grained_activation_offloading=True,
-            offload_modules=offload_modules,
+            offload_modules=["attn_proj"],
         )
 
 
-@pytest.mark.parametrize("config_cls", [TransformerConfig, MLATransformerConfig])
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        pytest.param({"fine_grained_activation_offloading": False}, id="offloading-disabled"),
-        pytest.param({"recompute_granularity": None}, id="recompute-disabled"),
-        pytest.param({"recompute_modules": ["layernorm"]}, id="other-recompute-module"),
-        pytest.param({"recompute_modules": []}, id="no-recompute-modules"),
-        pytest.param({"offload_modules": ["core_attn"]}, id="other-offload-module"),
-        pytest.param(
-            {
-                "recompute_granularity": "full",
-                "recompute_method": "uniform",
-                "recompute_num_layers": 1,
-            },
-            id="full-recompute",
-        ),
-    ],
-)
-def test_core_attn_recompute_offload_validation_allows_nonconflicting_configs(
-    config_cls, overrides
-):
-    """Module lists only conflict when both affected selective features are enabled."""
-    options = dict(
-        num_layers=1,
+def test_core_attn_recompute_full_memory_optimization_config():
+    recompute_modules = [
+        "core_attn",
+        "mla_up_proj",
+        "layernorm",
+        "moe_act",
+        "mlp",
+        "shared_experts",
+    ]
+    offload_modules = ["attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act"]
+    config = MLATransformerConfig(
+        num_layers=2,
         hidden_size=128,
         num_attention_heads=4,
+        num_moe_experts=4,
+        add_bias_linear=False,
+        moe_grouped_gemm=True,
+        moe_shared_expert_intermediate_size=128,
+        multi_latent_attention=True,
         recompute_granularity="selective",
-        recompute_modules=["core_attn"],
+        recompute_modules=recompute_modules,
         fine_grained_activation_offloading=True,
-        offload_modules=["core_attn", "attn_proj"],
+        offload_modules=offload_modules,
     )
-    options.update(overrides)
-    config = config_cls(**options)
-    assert config.recompute_granularity == options["recompute_granularity"]
-    assert config.offload_modules == options["offload_modules"]
+    assert config.recompute_modules == recompute_modules
+    assert config.offload_modules == offload_modules
 
 
 def _make_glu_interleave_config(**overrides):

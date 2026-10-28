@@ -3030,17 +3030,6 @@ class TransformerConfig(ModelParallelConfig):
                 f'Invalid choices for offload_modules: {invalid_modules}. '
                 f'Allowed modules are: {allowed_modules}'
             )
-            if (
-                self.recompute_granularity == "selective"
-                and "core_attn" in self.recompute_modules
-                and "attn_proj" in self.offload_modules
-            ):
-                raise ValueError(
-                    "core_attn in recompute_modules cannot be combined with attn_proj in "
-                    "offload_modules: core_attn recomputation discards the projection input "
-                    "whose storage is also managed by activation offloading. Remove core_attn "
-                    "from --recompute-modules or attn_proj from --offload-modules."
-                )
             if "attn_proj" in self.offload_modules and "core_attn" not in self.offload_modules:
                 raise ValueError(
                     "attn_proj cannot be set to offload_modules alone without core_attn "
