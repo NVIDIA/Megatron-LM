@@ -4682,22 +4682,20 @@ class AllGatherPipeline:
         outer_fsdp_group_param_gather: bool = False,
     ) -> List[int]:
         """Extend a bucket list using the communication-size heuristic. Buckets that need
-        neither a DP-Outer nor a DP-Shard all-gather count zero toward the size."""
+        neither a DP-Outer nor a DP-Shard all-gather count zero toward the size. Extension
+        stops once the prefetched size reaches `suggested_prefetch_size`, so the last bucket
+        group added may exceed it."""
         parameter_groups = self.buffer.parameter_groups
-        result = list(bucket_ids)
+        allgathered_bucket_ids = set(bucket_ids)
 
         def next_bucket_id():
             if prefetch_order == PrefetchOrder.FORWARD_PASS_ORDER:
-                candidate = result[0] + 1
-                for existing_bucket_id in result[1:]:
-                    if existing_bucket_id != candidate:
-                        break
+                candidate = min(allgathered_bucket_ids) + 1
+                while candidate in allgathered_bucket_ids:
                     candidate += 1
             else:
-                candidate = result[-1] - 1
-                for existing_bucket_id in reversed(result[:-1]):
-                    if existing_bucket_id != candidate:
-                        break
+                candidate = max(allgathered_bucket_ids) - 1
+                while candidate in allgathered_bucket_ids:
                     candidate -= 1
             if candidate < 0 or candidate >= self.buffer.num_buckets:
                 return None
@@ -4731,12 +4729,13 @@ class AllGatherPipeline:
                 if len(double_buffer_units) > 2:
                     break
 
-            new_bucket_ids = set(self.buffer.bucket_to_bucket_group[bucket_id]) - set(result)
+            new_bucket_ids = set(self.buffer.bucket_to_bucket_group[bucket_id])
+            new_bucket_ids -= allgathered_bucket_ids
             prefetched_size += sum(all_gather_size(new_id) for new_id in new_bucket_ids)
-            result = sorted(set(result) | new_bucket_ids)
+            allgathered_bucket_ids |= new_bucket_ids
             bucket_id = next_bucket_id()
 
-        return result
+        return sorted(allgathered_bucket_ids)
 
     def _group_buckets(self, bucket_ids: List[int]) -> Dict[int, List[int]]:
         """Group selected buckets by their coalesced collective group."""
