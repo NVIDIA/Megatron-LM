@@ -1026,3 +1026,50 @@ def test_packed_buffer_budget_is_checked_at_finalize(container_factory, monkeypa
         max_seqlen_per_dp_cp_rank=16,
     )
     cfg.finalize()
+
+
+def test_the_loop_reads_the_data_length_from_the_section(container_factory, monkeypatch):
+    """Three different numbers: the dataset's sequence_length (what the loop uses), a stale
+    args.seq_length (never read when the section has a dataset) and the model capacity. The
+    calculator and the OTel resource attributes receive the dataset's; a loader-only section
+    falls back to the namespace."""
+    from megatron.training.config.compat import data_sequence_length
+
+    args, cfg = container_factory(["--seq-length", "16", "--mock-data"], data=True)
+    args.rank = 0  # the calculator takes the rank from the namespace
+    cfg.model = _layout()
+    cfg.model.seq_length = 128
+    args.seq_length = 64  # stale, must not be read
+    assert data_sequence_length(cfg, args) == 16
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+    assert global_vars.build_telemetry_resource_attrs(args)["dl.sequence_length"] == 16
+    calls = []
+    monkeypatch.setattr(
+        global_vars, "init_num_microbatches_calculator", lambda **kw: calls.append(kw)
+    )
+    monkeypatch.setattr(global_vars, "get_batch_parallel_size", lambda ns: 1)
+    for name in (
+        "_set_tensorboard_writer",
+        "_set_one_logger",
+        "_set_adlr_autoresume",
+        "_set_timers",
+        "_set_energy_monitor",
+    ):
+        monkeypatch.setattr(global_vars, name, lambda ns: None)
+    monkeypatch.setattr(global_vars, "_set_train_state", lambda: None)
+    global_vars.initialize_training_runtime_services(args)
+    assert calls.pop()["seq_length"] == 16
+    del args.seq_length  # a GPT run never needs it
+    assert data_sequence_length(cfg, args) == 16
+    global_vars.initialize_training_runtime_services(args)
+    assert calls.pop()["seq_length"] == 16
+    # A loader-only section: the namespace is the source (the callback entry points).
+    args, loader_only = container_factory(["--seq-length", "64"])
+    args.rank = 0
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", loader_only)
+    assert data_sequence_length(loader_only, args) == 64
+    assert global_vars.build_telemetry_resource_attrs(args)["dl.sequence_length"] == 64
+    global_vars.initialize_training_runtime_services(args)
+    assert calls.pop()["seq_length"] == 64
+    args.seq_length = None
+    assert "dl.sequence_length" not in global_vars.build_telemetry_resource_attrs(args)

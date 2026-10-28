@@ -214,6 +214,8 @@ def initialize_runtime_services(
 
 def initialize_training_runtime_services(args: Namespace) -> None:
     """Initialize training-only services after the shared runtime services."""
+    from megatron.training.config.compat import data_sequence_length
+
     cfg = get_run_config()
     if cfg.train.step_batch_size_schedule is not None:
         # Imported here, as elsewhere in this module: megatron.training.utils imports back
@@ -229,7 +231,7 @@ def initialize_training_runtime_services(args: Namespace) -> None:
         data_parallel_size=get_batch_parallel_size(args),
         decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
         step_batch_size_schedule=cfg.train.step_batch_size_schedule,
-        seq_length=args.seq_length,
+        seq_length=data_sequence_length(cfg, args),
     )
     _set_tensorboard_writer(args)
     _set_one_logger(args)
@@ -553,7 +555,6 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
         ('dl.tensor_parallel.size', 'tensor_model_parallel_size'),
         ('dl.pipeline_parallel.size', 'pipeline_model_parallel_size'),
         ('dl.data_parallel.size', 'data_parallel_size'),
-        ('dl.sequence_length', 'seq_length'),
         ('megatron.num_layers', 'num_layers'),
         ('megatron.hidden_size', 'hidden_size'),
         ('megatron.num_attention_heads', 'num_attention_heads'),
@@ -569,6 +570,14 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
         val = getattr(args, arg_name, None)
         if val is not None:
             resource_attrs[attr] = val
+    # The data sequence length: the dataset's when the run config has a dataset section, else the
+    # namespace's (inference and loader-only runs), skipped like any other unset field.
+    dataset = getattr(getattr(cfg, 'data', None), 'dataset', None)
+    sequence_length = (
+        dataset.sequence_length if dataset is not None else getattr(args, 'seq_length', None)
+    )
+    if sequence_length is not None:
+        resource_attrs['dl.sequence_length'] = sequence_length
 
     # Derive precision from flags
     if getattr(args, 'fp16', False):
