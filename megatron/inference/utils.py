@@ -4,6 +4,7 @@ import logging
 import warnings
 from argparse import ArgumentParser, Namespace
 from copy import copy
+from functools import partial
 from typing import Literal, Optional
 
 import torch
@@ -185,7 +186,8 @@ def get_model_for_inference(
         # modelopt hooks (custom layer specs, calibration, etc.) have not been
         # ported to the new ``ModelBuilder`` API yet. ``_get_model`` also takes
         # care of running the modelopt-checkpoint auto-detection side effect.
-        model = _get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
+        # ``_get_model`` calls the provider with keyword arguments only, so bind ``args``.
+        model = _get_model(partial(modelopt_gpt_hybrid_builder, args), wrap_with_ddp=False)
     else:
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
