@@ -306,22 +306,37 @@ def vp_tp2_results():
     world_size = 2
     ctx = mp.get_context("spawn")
     queue = ctx.Queue()
-    with tempfile.NamedTemporaryFile(delete=True) as f:
-        store_path = f.name + ".store"
-    procs = [
-        ctx.Process(target=_vp_tp2_worker, args=(rank, world_size, store_path, queue))
-        for rank in range(world_size)
-    ]
-    for p in procs:
-        p.start()
-    by_rank = {}
-    for _ in procs:
-        status, rank, payload = queue.get(timeout=300)
-        assert status == "ok", f"rank {rank} failed:\n{payload}"
-        by_rank[rank] = torch.load(io.BytesIO(payload))
-    for p in procs:
-        p.join(timeout=120)
-    return by_rank
+    procs = []
+    try:
+        with tempfile.NamedTemporaryFile(delete=True) as f:
+            store_path = f.name + ".store"
+        procs = [
+            ctx.Process(target=_vp_tp2_worker, args=(rank, world_size, store_path, queue))
+            for rank in range(world_size)
+        ]
+        for p in procs:
+            p.start()
+        by_rank = {}
+        for _ in procs:
+            status, rank, payload = queue.get(timeout=300)
+            assert status == "ok", f"rank {rank} failed:\n{payload}"
+            by_rank[rank] = torch.load(io.BytesIO(payload))
+        for p in procs:
+            p.join(timeout=120)
+            assert p.exitcode == 0, f"worker {p.pid} did not exit cleanly: {p.exitcode}"
+        return by_rank
+    finally:
+        for p in procs:
+            if p.pid is None:
+                continue
+            if p.is_alive():
+                p.terminate()
+            p.join(timeout=5)
+            if p.is_alive():
+                p.kill()
+                p.join()
+        queue.close()
+        queue.join_thread()
 
 
 class TestRLUtils:
