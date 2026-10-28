@@ -225,8 +225,10 @@ def test_rotary_constants_follow_managed_graph_lifetime(embedding_type, training
         for _ in range(2):
             x = torch.randn(16, 1, 1, 32, device="cuda", requires_grad=training)
             expected = module.project(x, eager=True).detach().clone()
+            caller_stream = torch.cuda.current_stream()
             if training:
                 module.project(x).sum().backward()
+                assert torch.cuda.current_stream() == caller_stream
                 x.grad = None
             if not cache_hit:
                 module.rotary_pos_emb.clear_cache()
@@ -236,6 +238,7 @@ def test_rotary_constants_follow_managed_graph_lifetime(embedding_type, training
             else:
                 with torch.inference_mode():
                     module.project(x)
+                assert torch.cuda.current_stream() == caller_stream
             ref = module.embedding_ref
             module.rotary_pos_emb.clear_cache()
             gc.collect()

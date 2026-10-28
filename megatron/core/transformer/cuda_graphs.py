@@ -845,9 +845,9 @@ def register_capture_constant(tensor: torch.Tensor) -> None:
         constants[id(tensor)] = tensor
 
 
-def release_capture_constants(owner: object) -> None:
+def release_capture_constants(owner_graph: torch.cuda.CUDAGraph) -> None:
     """Release an owner's constants after all of its graphs have been destroyed."""
-    _CudagraphGlobalRecord.capture_constants.pop(owner, None)
+    _CudagraphGlobalRecord.capture_constants.pop(owner_graph, None)
 
 
 def delete_cuda_graphs():
@@ -2052,7 +2052,13 @@ class CudaGraphManager(torch.nn.Module):
         # Therefore modules will always execute in the same order, so cudagraphs
         # can both be reused and share a single mempool.
         self.reuse_cudagraphs = self.pg_collection.pp.size() == 1
-        self._initialize_mempool()
+        if CudaGraphManager.global_mempool is None:
+            self._initialize_mempool()
+            # Cudagraph stream capture requires no operations on the default stream prior to the
+            # capture, so change to a side stream.
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            torch.cuda.set_stream(stream)
 
         # Enable one hook for the eager recording phase. Repeated manager construction is
         # idempotent, and graph creation removes the hook before capture begins.
@@ -2061,18 +2067,13 @@ class CudaGraphManager(torch.nn.Module):
 
     @staticmethod
     def _initialize_mempool() -> None:
-        """Initialize the pool for a new capture generation, including after graph deletion."""
+        """Create and register the graph pool without changing the current CUDA stream."""
         if CudaGraphManager.global_mempool is None:
             CudaGraphManager.global_mempool = torch.cuda.graph_pool_handle()
             # Register the pool so GTP allocates GRAPHED-chain buffers + quantized
             # storage directly into it (created before the first graphed forward).
             if HAVE_GTP:
                 set_cuda_graph_mempool(torch.cuda.current_device(), CudaGraphManager.global_mempool)
-            # Cudagraph stream capture requires no operations on the default stream prior to the
-            # capture, so change to a side stream.
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            torch.cuda.set_stream(stream)
 
     def call_ddp_preforward_hook(self, module):
         """Call any DDP pre-forward hooks which are used to launch async data parallel
@@ -2096,6 +2097,7 @@ class CudaGraphManager(torch.nn.Module):
         length of 'self.cudagraph_runners'.
         Otherwise, we assign a mempool per microbatch, which allows cudagraphs to be reused
         over different microbatches by tracking their respective fwd and bwd passes.'''
+
         self._initialize_mempool()
         if self.need_backward and not _CudagraphGlobalRecord.cudagraph_created:
             _CudagraphGlobalRecord._enable_saved_tensors_observer()
