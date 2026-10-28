@@ -356,6 +356,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             )
             for _ in prompts
         ]
+        sampling_state = engine.controller.sampling_rng.get_state()
         direct_futures = [
             engine.add_request(request_id, prompt, params)
             for request_id, prompt, params in zip(
@@ -416,6 +417,8 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             == expected_sampling
             for params in lowered_params
         )
+        # Top-k 1 sampling breaks exact logit ties with the sampling RNG; replay the direct run's.
+        engine.controller.sampling_rng.set_state(sampling_state)
         with _as_adapter_client_rank():
             adapter_requests = await adapter._generate_with_persistent_engine(
                 lowered_prompts, media, lowered_params
@@ -605,6 +608,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             )
         ).engine
         prompts = [[3, 5, 7, 9], [2, 4, 6, 8, 10, 12]]
+        sampling_state = engine.controller.sampling_rng.get_state()
         direct = await _drive_engine(
             engine,
             [
@@ -637,6 +641,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             }
         )
         completed = {}
+        engine.controller.sampling_rng.set_state(sampling_state)
         with _as_adapter_client_rank():
             async for index, row in adapter.generate_async(data, greedy=True):
                 completed[index] = row
