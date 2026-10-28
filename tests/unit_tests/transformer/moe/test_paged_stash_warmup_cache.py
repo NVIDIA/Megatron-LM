@@ -27,6 +27,11 @@ def _manager(allocate):
         manager.stash_buffers = {}
 
     manager.allocate_stash_buffers = allocate_buffers
+    # paged_stash_reset delegates captured-state buffer setup to the manager. Bind the real
+    # implementation so the ordering assertions cover the production allocation path.
+    manager.prepare_stash_buffers = lambda config=None: PagedStashManager.prepare_stash_buffers(
+        manager, config
+    )
     return manager
 
 

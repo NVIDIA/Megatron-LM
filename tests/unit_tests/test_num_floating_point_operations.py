@@ -2471,6 +2471,65 @@ class TestDSAKPool:
             dsa_indexer_kpool=4,
         ) == pytest.approx(3 * (projections + compression + scoring))
 
+    @pytest.mark.parametrize("pool_size", [2, 4, 8])
+    @pytest.mark.parametrize("select_tail", [False, True])
+    @pytest.mark.parametrize("lengths", [(3, 3), (256, 256), (17, 19, 25)])
+    @pytest.mark.parametrize(
+        "mtp_layers, repeated, attention_layers, indexer_layers",
+        # Global layer numbers: decoder 1..5 index on layers 1 and 5. MTP layers
+        # 6..7 (repeated MTP reuses layer 6) share the most recent top-k.
+        [(2, False, 7, 2), (3, True, 8, 2)],
+    )
+    def test_standard_totals(
+        self,
+        pool_size,
+        select_tail,
+        lengths,
+        mtp_layers,
+        repeated,
+        attention_layers,
+        indexer_layers,
+    ):
+        """The public counter applies KPool selection, gate and compression terms."""
+        args = _make_dsa_args(dsa_indexer_loss_coeff=0)
+        args.num_layers = 5
+        args.mtp_num_layers = mtp_layers
+        args.mtp_use_repeated_layer = repeated
+        args.dsa_indexer_topk_freq = 4
+        args.dsa_indexer_skip_topk_offset = 1
+        args.dsa_indexer_kpool = 1
+        tokens, sum_sq = sum(lengths), sum(length**2 for length in lengths)
+        stats = dict(total_real_tokens_in_batch=tokens, seqlen_squared_sum_in_batch=sum_sq)
+        before = num_floating_point_operations(args, 2, **stats)
+        _, old_core = _dsa_golden_layer_terms(
+            args, tokens, sum_sq, attention_layers, indexer_layers
+        )
+        attention_scale, scoring_scale, compression_scale = _kpool_golden_scales(
+            sum_sq / tokens, pool_size, args.dsa_indexer_topk, select_tail
+        )
+        new_core = (
+            3
+            * attention_layers
+            * args.num_attention_heads
+            * (2 * args.kv_lora_rank + args.qk_pos_emb_head_dim)
+            * attention_scale
+            + indexer_layers * args.dsa_indexer_n_heads * args.dsa_indexer_head_dim * scoring_scale
+        )
+        extra_projection_and_compression = (
+            2
+            * tokens
+            * indexer_layers
+            * args.dsa_indexer_head_dim
+            * (args.hidden_size + compression_scale)
+        )
+        expected_delta = extra_projection_and_compression + sum_sq * (new_core - old_core)
+        args.dsa_indexer_kpool = pool_size
+        args.dsa_indexer_kpool_always_select_tail = select_tail
+        after = num_floating_point_operations(args, 2, **stats)
+        assert isinstance(after, int)
+        # Each public total is independently truncated to an integer.
+        assert after - before == pytest.approx(expected_delta, rel=0, abs=1)
+
     def test_invalid_indexer_loss(self):
         with pytest.raises(ValueError, match="indexer loss to be disabled"):
             dsa_indexer_flops(

@@ -169,6 +169,8 @@ from megatron.training.initialize import (
     write_args_to_tensorboard,
 )
 from megatron.training.kernel_warmup import warmup_training_kernels
+from megatron.training.logging.dsa_flops import _dsa_indexer_flops as _dsa_kpool_indexer_flops
+from megatron.training.logging.dsa_flops import _dsa_kpool_attention_scale
 
 # Retain the training.py import path used by existing multimodal callers.
 from megatron.training.logging.packed_sequence_stats import (
@@ -934,6 +936,10 @@ def _dsa_indexer_flops(
     dsa_indexer_loss_enabled: bool,
     dsa_indexer_use_sparse_loss=False,
     sparse_core_scale=1.0,
+    total_tokens=0,
+    seqlen_squared_sum=0,
+    dsa_indexer_topk=None,
+    dsa_indexer_kpool=1,
 ):
     """DSA lightning-indexer FLOPs coefficients, fwd/bwd expansion included.
 
@@ -988,7 +994,26 @@ def _dsa_indexer_flops(
     Returns ``(token_linear, core)`` INCLUDING the fwd/bwd and FMA factors.
     Multiply ``token_linear`` by the real token count and ``core`` by
     ``sum_i(L_i ** 2)``.
+
+    With KPool (``dsa_indexer_kpool > 1``) the indexer is forward only and
+    scores complete key pools plus a per-token gate; that case delegates to the
+    shared counter in ``megatron.training.logging.dsa_flops``, which needs the
+    batch statistics ``total_tokens`` and ``seqlen_squared_sum``.
     """
+    if dsa_indexer_kpool > 1:
+        return _dsa_kpool_indexer_flops(
+            total_tokens=total_tokens,
+            seqlen_squared_sum=seqlen_squared_sum,
+            hidden_size=hidden_size,
+            q_lora_rank=q_lora_rank,
+            n_heads=n_heads,
+            head_dim=head_dim,
+            num_indexer_layers=num_indexer_layers,
+            dsa_indexer_loss_enabled=dsa_indexer_loss_enabled,
+            dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
+            dsa_indexer_topk=dsa_indexer_topk,
+            dsa_indexer_kpool=dsa_indexer_kpool,
+        )
     if num_indexer_layers <= 0:
         return 0, 0
     if q_lora_rank is None:
@@ -2380,6 +2405,19 @@ def num_floating_point_operations(
             dsa_sparse_core_scale = _dsa_sparse_core_scale(
                 total_real_tokens_in_batch, seqlen_squared_sum_in_batch, args.dsa_indexer_topk
             )
+            dsa_indexer_kpool = getattr(args, "dsa_indexer_kpool", 1) or 1
+            if dsa_indexer_kpool > 1:
+                # KPool attends to the selected complete pools, expanded to their
+                # original tokens, plus (optionally) the incomplete tail pool.
+                dsa_attention_core_scale = _dsa_kpool_attention_scale(
+                    total_real_tokens_in_batch,
+                    seqlen_squared_sum_in_batch,
+                    args.dsa_indexer_topk,
+                    dsa_indexer_kpool,
+                    getattr(args, "dsa_indexer_kpool_always_select_tail", True),
+                )
+            else:
+                dsa_attention_core_scale = dsa_sparse_core_scale
             standard_self_attn_core_term = (
                 forward_backward_expansion_factor
                 * fma_expansion_factor
@@ -2387,7 +2425,7 @@ def num_floating_point_operations(
                     args.num_attention_heads * (args.kv_lora_rank + args.qk_pos_emb_head_dim) / 2
                     + args.num_attention_heads * args.kv_lora_rank / 2
                 )
-                * dsa_sparse_core_scale
+                * dsa_attention_core_scale
             )
             dsa_extra_term, dsa_extra_core_term = _dsa_indexer_flops(
                 hidden_size=args.hidden_size,
@@ -2404,6 +2442,10 @@ def num_floating_point_operations(
                 dsa_indexer_loss_enabled=(args.dsa_indexer_loss_coeff or 0.0) > 0,
                 dsa_indexer_use_sparse_loss=getattr(args, "dsa_indexer_use_sparse_loss", False),
                 sparse_core_scale=dsa_sparse_core_scale,
+                total_tokens=total_real_tokens_in_batch,
+                seqlen_squared_sum=seqlen_squared_sum_in_batch,
+                dsa_indexer_topk=args.dsa_indexer_topk,
+                dsa_indexer_kpool=dsa_indexer_kpool,
             )
         else:
             num_linear_attention_layers = 0

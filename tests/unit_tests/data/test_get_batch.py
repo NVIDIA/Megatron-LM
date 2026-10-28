@@ -1874,10 +1874,25 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
 
     cp_batch = get_batch(data_iterator)
     batch = cp_batch.get_batch()
-    attention_mask, labels, loss_mask, position_ids, tokens = [
-        batch[key] for key in ("attention_mask", "labels", "loss_mask", "position_ids", "tokens")
-    ]
-    padding_mask = batch.get("padding_mask")
+    # NOTE(nightly-sync 2026-10-27): main's DCP V2 rewrite (ea99fdfce) builds this batch in
+    # get_batch_on_this_rank_for_sequence_packing(return_context_parallel_batch=True), which
+    # keeps the packing/CP metadata in the batch view and omits keys that the scheduler does
+    # not produce (attention_mask). The merge kept that code path, so read BATCH_KEYS
+    # tolerantly as main's version of this test does, and keep dev's padding_mask and
+    # PackedSeqParams checks. The names are positional in pretrain_hybrid.BATCH_KEYS order.
+    (
+        attention_mask,
+        cu_seqlens,
+        cu_seqlens_padded,
+        hybrid_cp_group,
+        labels,
+        local_cp_size,
+        loss_mask,
+        max_seqlen,
+        padding_mask,
+        position_ids,
+        tokens,
+    ) = [batch.get(key) for key in pretrain_hybrid.BATCH_KEYS]
     packed_seq_params = cp_batch.get_packed_seq_params()
 
     assert padding_mask is not None
@@ -1889,11 +1904,9 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
     assert loss_mask is not None
     assert position_ids is not None
     assert attention_mask is None
-    # ContextParallelBatch moves packing/CP metadata into PackedSeqParams.
-    assert (
-        not {"cu_seqlens", "cu_seqlens_padded", "hybrid_cp_group", "max_seqlen", "local_cp_size"}
-        & batch.keys()
-    )
+    assert cu_seqlens is not None
+    assert max_seqlen is not None
+    assert local_cp_size is not None
 
     # Data iterator parameters (must match create_hybrid_cp_data_iterator)
     n_seqs = max(2, 2 * cp_size)
@@ -1937,7 +1950,34 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
     # Loss mask is all-ones (no masking in the HybridCP pretrain dataloader)
     assert loss_mask.sum().item() == seq_len_per_rank
 
-    # Sequence-packing metadata is returned through PackedSeqParams.
+    # cu_seqlens: 2-D int32 (1, n_seqs + 1) after flatten_batch_for_packed_sequences.
+    assert cu_seqlens.shape == (
+        1,
+        n_seqs + 1,
+    ), f"Expected cu_seqlens shape (1, {n_seqs + 1}), got {cu_seqlens.shape}"
+    assert cu_seqlens.dtype == torch.int32
+    assert cu_seqlens[0, 0].item() == 0
+    assert cu_seqlens[0, -1].item() == total_seq_len
+
+    # max_seqlen: scalar int32 equal to the per-sequence length in the iterator
+    assert max_seqlen.shape == (1,)
+    assert max_seqlen.dtype == torch.int32
+    assert max_seqlen.item() == seq_len_each
+
+    # local_cp_size: scalar int32 equal to cp_size
+    assert local_cp_size.shape == (1,)
+    assert local_cp_size.dtype == torch.int32
+    assert local_cp_size.item() == cp_size
+
+    # cp_size is parametrized over values greater than one.
+    assert cu_seqlens_padded is not None
+    assert cu_seqlens_padded.shape == (1, n_seqs + 1)
+    assert cu_seqlens_padded.dtype == torch.int32
+    assert cu_seqlens_padded[0, 0].item() == 0
+    assert cu_seqlens_padded[0, -1].item() == total_seq_len
+    assert hybrid_cp_group is not None
+
+    # The same sequence-packing metadata is also returned through PackedSeqParams.
     expected_cu_seqlens = torch.arange(
         0, total_seq_len + 1, seq_len_each, dtype=torch.int32, device=tokens.device
     )

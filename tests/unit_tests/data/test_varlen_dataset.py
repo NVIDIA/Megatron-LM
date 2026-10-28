@@ -9,6 +9,7 @@ varlen-specific contracts (auto-detect schema, normalize to messages,
 ValueError on unsupported shapes).
 """
 
+import importlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -1269,7 +1270,8 @@ def test_sbhd_padding_mask_is_partitioned_with_tokens(monkeypatch):
     tokens = torch.arange(16, dtype=torch.int64).view(1, 16)
     padding_mask = tokens >= 10
     batch = {"tokens": tokens.clone(), "padding_mask": padding_mask.clone()}
-    result = get_batch_on_this_cp_rank(batch, cp_group=object())
+    # Main's DCP V2 API (ea99fdfce) makes dynamic_cp a required argument.
+    result = get_batch_on_this_cp_rank(batch, dynamic_cp=False, cp_group=object())
 
     expected_indices = torch.tensor([2, 3, 12, 13])
     assert torch.equal(result["tokens"], tokens.index_select(1, expected_indices))
@@ -1694,3 +1696,46 @@ def test_packing_scheduler_dataloader_prefetches_next_global_batch(
     finally:
         destroy_global_vars()
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("entrypoint", ["pretrain_gpt", "pretrain_hybrid"])
+@pytest.mark.parametrize(
+    "sft, use_varlen_dataset, mock_data, expected_type, expected_packed",
+    [
+        (True, False, True, "MockSFTDataset", True),
+        (True, False, False, "SFTDataset", True),
+        (False, True, True, "MockVarlenDataset", True),
+        (False, True, False, "VarlenDataset", True),
+        (False, False, True, "MockGPTDataset", False),
+        (False, False, False, "GPTDataset", False),
+    ],
+)
+def test_datasets_provider_selects_dataset_type(
+    monkeypatch, entrypoint, sft, use_varlen_dataset, mock_data, expected_type, expected_packed
+):
+    """GPT and Hybrid pretraining select the same dataset type for each data mode."""
+    module = importlib.import_module(entrypoint)
+    args = SimpleNamespace(
+        sft=sft,
+        use_varlen_dataset=use_varlen_dataset,
+        mock_data=mock_data,
+        varlen_sbhd_validation=False,
+        fim_data=False,
+    )
+    built = {}
+
+    class _RecordingBuilder:
+        def __init__(self, dataset_type, num_samples, is_built_on_rank, config):
+            built.update(dataset_type=dataset_type, is_built_on_rank=is_built_on_rank)
+
+        def build(self):
+            return "train", "valid", "test"
+
+    monkeypatch.setattr(module, "get_args", lambda: args)
+    monkeypatch.setattr(module, "core_gpt_dataset_config_from_args", lambda _: None)
+    monkeypatch.setattr(module, "BlendedMegatronDatasetBuilder", _RecordingBuilder)
+    monkeypatch.setattr(module, "print_rank_0", lambda *_args, **_kwargs: None)
+
+    assert module.train_valid_test_datasets_provider([1, 1, 1]) == ("train", "valid", "test")
+    assert built["dataset_type"] is getattr(module, expected_type)
+    assert built["is_built_on_rank"].keywords["is_packed_sequence"] is expected_packed
