@@ -966,7 +966,7 @@ def test_dynamic_cp_singleton_runtime_group_keeps_the_batch_unsharded():
         patch("torch.distributed.get_rank", side_effect=lambda group: group.rank()),
     ):
         batch = get_batch_on_this_cp_rank(
-            batch, is_hybrid_cp=True, cp_group=static_cp_group, hybrid_cp_group_func=group_func
+            batch, dynamic_cp=True, cp_group=static_cp_group, dynamic_cp_group_func=group_func
         )
 
     assert requested_sizes == [1]
@@ -1024,7 +1024,7 @@ def test_layout_views_carry_the_runtime_tp_cp_group_under_dynamic_cp(is_hybrid_c
         cp_batch = get_batches_on_this_cp_rank(
             batch,
             boundary_layout="contiguous",
-            is_hybrid_cp=is_hybrid_cp,
+            dynamic_cp=is_hybrid_cp,
             cp_group=singleton,
             additional_layouts={"zigzag"},
             tp_cp_group=tp_cp_group,
