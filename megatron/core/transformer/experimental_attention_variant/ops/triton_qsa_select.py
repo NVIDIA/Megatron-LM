@@ -94,7 +94,15 @@ ID_BITS = 21
 _MAX_ID_CODE = (1 << ID_BITS) - 1
 
 
-@triton.autotune(configs=[triton.Config({}, num_warps=w) for w in [4, 8]], key=['BM', 'BN', 'DI'])
+@triton.autotune(
+    configs=[
+        triton.Config({'BM': bm, 'BN': bn, 'BK': bkk}, num_warps=w)
+        for bm, bn in [(64, 64), (128, 64), (64, 128), (128, 128)]
+        for bkk in [8, 16, 32]
+        for w in [4, 8]
+    ],
+    key=['NH', 'DI', 'HAS_LO'],
+)
 @triton.jit
 def _qsa_select_score_kernel(
     q,  # [s, NH, DI]
@@ -110,12 +118,13 @@ def _qsa_select_score_kernel(
     DI: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
+    BK: tl.constexpr,
     HAS_LO: tl.constexpr,
 ):
     i_m, i_n = tl.program_id(0), tl.program_id(1)
     o_m = i_m * BM + tl.arange(0, BM)
     o_n = i_n * BN + tl.arange(0, BN)
-    o_d = tl.arange(0, DI)
+    o_k = tl.arange(0, BK)
     m_m = o_m < s
     mt = tl.load(m_t + o_m, mask=m_m, other=0)
     if HAS_LO:
@@ -129,16 +138,22 @@ def _qsa_select_score_kernel(
         if (i_n + 1) * BN <= tl.min(tl.where(m_m, lo, nb)):
             return
     m_n = o_n < nb
-    b_k = tl.load(bk + o_n[None, :] * DI + o_d[:, None], mask=m_n[None, :], other=0.0).to(
-        tl.float32
-    )
     b_acc = tl.zeros([BM, BN], dtype=tl.float32)
     for h in tl.static_range(NH):
-        b_q = tl.load(
-            q + (o_m[:, None] * NH + h) * DI + o_d[None, :], mask=m_m[:, None], other=0.0
-        ).to(tl.float32)
-        # same arithmetic as the opt2 qsa_indexer_keys_kernel (bit-identical scores)
-        b_acc += tl.maximum(tl.dot(b_q, b_k, input_precision="ieee"), 0.0)
+        # Same arithmetic as the opt2 qsa_indexer_keys_kernel (bit-identical scores): the
+        # IEEE dot is a sequential fma chain over d, so carrying the accumulator through
+        # BK-wide slices of d reproduces it while keeping the operands small (a single
+        # DI-wide FMA dot spills its replicated operands).
+        b_s = tl.zeros([BM, BN], dtype=tl.float32)
+        for d0 in range(0, DI, BK):
+            b_q = tl.load(
+                q + (o_m[:, None] * NH + h) * DI + d0 + o_k[None, :], mask=m_m[:, None], other=0.0
+            ).to(tl.float32)
+            b_k = tl.load(
+                bk + o_n[None, :] * DI + d0 + o_k[:, None], mask=m_n[None, :], other=0.0
+            ).to(tl.float32)
+            b_s = tl.dot(b_q, b_k, b_s, input_precision="ieee")
+        b_acc += tl.maximum(b_s, 0.0)
     score = b_acc * scale
     vis = (o_n[None, :] < mt[:, None]) & (o_n[None, :] >= lo[:, None]) & m_m[:, None]
     col = o_n[None, :] - lo[:, None]
@@ -331,7 +346,7 @@ def qsa_select_topk_keys(
     for r0 in range(0, s, rc):
         r1 = min(r0 + rc, s)
         n = r1 - r0
-        grid = (triton.cdiv(n, 64), triton.cdiv(nb, 64))
+        grid = lambda meta, n=n: (triton.cdiv(n, meta['BM']), triton.cdiv(nb, meta['BN']))
         _qsa_select_score_kernel[grid](
             q[r0:r1],
             block_keys,
@@ -344,8 +359,6 @@ def qsa_select_topk_keys(
             DI**-0.5,
             NH=NH,
             DI=DI,
-            BM=64,
-            BN=64,
             HAS_LO=has_lo,
         )
         if impl == "cudnn":
