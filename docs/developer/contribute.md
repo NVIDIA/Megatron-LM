@@ -68,7 +68,7 @@ global parallel grid; Megatron-Core is moving to explicit passing via `ProcessGr
   adds in `megatron/core`. The job is report-only for now, so reviewers act on its report. See
   [The CI check](parallel-state-deprecation.md#the-ci-check).
 
-Full guidance, including the tier breakdown and reviewer notes:
+Full guidance, including the deprecated functions, the migration steps and reviewer notes:
 [parallel-state-deprecation.md](parallel-state-deprecation.md).
 
 ## Signing Your Work
