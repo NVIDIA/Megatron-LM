@@ -183,7 +183,7 @@ MODEL_ARGS:
 
   # Add mixed precision args
   --bf16: true
-  --fp8: e4m3
+  --fp8-format: e4m3
   --fp8-recipe: mxfp8
   --fp8-param-gather: true
   --moe-router-padding-for-quantization: true
