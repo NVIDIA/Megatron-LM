@@ -669,6 +669,13 @@ class TestTransformerConfig:
         config = TransformerConfig(num_layers=1, kv_channels=1)
         assert config.num_query_groups == 0
 
+    @pytest.mark.parametrize("chunk_size", [0, -1])
+    def test_mtp_loss_chunk_size_must_be_positive(self, chunk_size):
+        with pytest.raises(ValueError, match="mtp_loss_chunk_size must be positive or None"):
+            TransformerConfig(
+                num_layers=1, hidden_size=8, num_attention_heads=2, mtp_loss_chunk_size=chunk_size
+            )
+
 
 def test_offload_modules_fused_group_mlp_excludes_unfused_expert_knobs():
     """fused_group_mlp and expert_fc1 + moe_act are equivalent spellings, so combining them is
