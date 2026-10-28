@@ -31,7 +31,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .execution_order import ExecutionEvent, ExecutionOrder
+from .execution_order import ExecutionOrder
 from .module_utils import get_parameter_owner, is_in_backward
 from .parameter_group import (
     FsdpParameter,
@@ -282,7 +282,7 @@ class FsdpModule:
         # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
         # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
         if context.is_recording_execution_order and not is_recomputing:
-            context.execution_order.append((ref(cast(nn.Module, self)), Phase.FORWARD))
+            context.execution_order.append((cast(nn.Module, self), Phase.FORWARD))
         self.unshard(
             Phase.FORWARD, prefetch=not is_recomputing and not context.is_recording_execution_order
         )
@@ -328,9 +328,7 @@ class FsdpModule:
                         f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}."
                     )
 
-    def _prefetch_parameter_groups(
-        self, order: ExecutionOrder[ExecutionEvent], prefetch_size: int | None
-    ) -> None:
+    def _prefetch_parameter_groups(self, order: ExecutionOrder, prefetch_size: int | None) -> None:
         """Prefetch successors from ``order`` according to this module's budget.
 
         Successors are unsharded for this module's phase, which is the compute they
@@ -338,19 +336,15 @@ class FsdpModule:
         """
         if not order:
             return
-        order.advance((ref(cast(nn.Module, self)), self.phase))
+        order.advance((self, self.phase))
         if prefetch_size == 0:
             return
         prefetched_size = 0
         for index in range(order.position, len(order)):
-            module_ref, phase = order[index]
+            fsdp_module, phase = order[index]
             # Forward and backward retain their separate prefetch boundaries.
             if phase is not self.phase:
                 break
-            owner = module_ref()
-            if owner is None:
-                raise RuntimeError("A module in the FSDP execution order was destroyed.")
-            fsdp_module = cast(FsdpModule, owner)
             fsdp_module._unshard_parameter_groups(self.phase)
             prefetched_size += fsdp_module.num_parameter_elements
             if prefetch_size is None or prefetched_size >= prefetch_size:
@@ -435,7 +429,7 @@ class FsdpModule:
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
         if context.is_recording_execution_order:
-            context.execution_order.append((ref(cast(nn.Module, self)), Phase.BACKWARD))
+            context.execution_order.append((cast(nn.Module, self), Phase.BACKWARD))
         current_stream = context.current_stream()
         if self.is_root():
             context.register_post_backward_hook()
