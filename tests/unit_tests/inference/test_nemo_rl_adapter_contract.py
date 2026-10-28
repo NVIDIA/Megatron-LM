@@ -114,6 +114,8 @@ async def _drive_engine(engine, futures, witness=None):
 
 
 def _build_inference_mxfp8_env(test_case, config, *, quantize=True):
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("MXFP8 parameters need Blackwell (Transformer Engine cannot dequantize them)")
     config_class = dynamic_engine_tests.TransformerConfig
 
     def build_mxfp8_config(**kwargs):
@@ -134,6 +136,11 @@ def _build_inference_mxfp8_env(test_case, config, *, quantize=True):
     buffers = quantize_params_to_mxfp8(model.decoder, backend="triton") if quantize else None
     assert not quantize or buffers
     return env
+
+
+def _as_adapter_client_rank():
+    """Treat this rank's independent engine as a one-rank deployment, whose rank 0 submits."""
+    return mock.patch.object(torch.distributed, "get_rank", return_value=0)
 
 
 class _InProcessInferenceClient:
@@ -409,9 +416,10 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             == expected_sampling
             for params in lowered_params
         )
-        adapter_requests = await adapter._generate_with_persistent_engine(
-            lowered_prompts, media, lowered_params
-        )
+        with _as_adapter_client_rank():
+            adapter_requests = await adapter._generate_with_persistent_engine(
+                lowered_prompts, media, lowered_params
+            )
         await adapter.inference_client.driver
         output = adapter._parse_result_to_batched_data_dict(data, adapter_requests)
         assert [entry["prompt"] for entry in witness["adapter_submissions"]] == [
@@ -541,7 +549,8 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             }
         )
         lowered_prompts, media, params = adapter._prepare_data_for_generation(data, greedy=False)
-        replies = await adapter._generate_with_persistent_engine(lowered_prompts, media, params)
+        with _as_adapter_client_rank():
+            replies = await adapter._generate_with_persistent_engine(lowered_prompts, media, params)
         await adapter.inference_client.driver
         output = adapter._parse_result_to_batched_data_dict(data, replies)
         assert len(observed) == 1
@@ -628,8 +637,9 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             }
         )
         completed = {}
-        async for index, row in adapter.generate_async(data, greedy=True):
-            completed[index] = row
+        with _as_adapter_client_rank():
+            async for index, row in adapter.generate_async(data, greedy=True):
+                completed[index] = row
         assert set(completed) == {0, 1}
         for index, expected in enumerate(direct):
             row = completed[index]
@@ -645,6 +655,8 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
 @pytest.fixture
 def nemo_parallel(request, monkeypatch):
     topology = request.param
+    if Utils.world_size < 2 or Utils.world_size % (topology["tp"] * topology["pp"]):
+        pytest.skip("adapter topologies need at least two ranks, divisible by TP x PP")
     monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=topology["tp"],
@@ -693,8 +705,8 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
     async def test_real_adapter_parallel_topology(self, nemo_parallel):
         BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
         topology, synchronization_group = nemo_parallel
-        rank = torch.distributed.get_rank()
-        assert torch.distributed.get_world_size() == 2
+        rank, world_size = torch.distributed.get_rank(), torch.distributed.get_world_size()
+        replicas = world_size // (topology["tp"] * topology["pp"])
         uses_moe = topology["ep"] > 1 or topology.get("moe", False)
         config = DynamicEngineTestConfig(
             num_requests=0,
@@ -728,7 +740,10 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
             engine = self._build_test_env(config).engine
         engine.controller.tokenizer = _CoordinatorTokenizer()
         is_dp = topology["tp"] == topology["pp"] == topology["ep"] == 1
-        prompts = [[3, 5, 7, 9], [3, 5, 7, 9]] if is_dp else [[3, 5, 7, 9], [2, 4, 6, 8, 10]]
+        # The least-loaded router gives every data-parallel replica the same request count.
+        prompts = (
+            [[3, 5, 7, 9]] * replicas if is_dp else [[3, 5, 7, 9], [2, 4, 6, 8, 10]] * replicas
+        )
         params = [
             SamplingParams(
                 temperature=0.7 if is_dp else 0,
@@ -739,7 +754,7 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
                 num_tokens_to_generate=3,
                 termination_id=-1,
             )
-            for _ in (prompts[:1] if is_dp else prompts)
+            for _ in prompts[: 1 if is_dp else 2]
         ]
         initial_seed = engine.controller.sampling_rng.initial_seed()
         direct = await _drive_engine(
@@ -752,7 +767,7 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
             ],
         )
         direct_replies = [(reply.generated_tokens, reply.generated_log_probs) for reply in direct]
-        expected_by_dp, seeds_by_dp = [None, None], [None, None]
+        expected_by_dp, seeds_by_dp = [None] * world_size, [None] * world_size
         if is_dp:
             await asyncio.to_thread(
                 torch.distributed.all_gather_object,
@@ -766,7 +781,7 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
                 initial_seed,
                 group=synchronization_group,
             )
-            assert seeds_by_dp[1] == seeds_by_dp[0] + 1
+            assert seeds_by_dp == [seeds_by_dp[0] + dp_rank for dp_rank in range(world_size)]
         engine.controller.sampling_rng.manual_seed(initial_seed)
         adapter_forward_batches, model = [], engine.controller.inference_wrapped_model.model
         original_forward = model.forward
@@ -823,7 +838,7 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
                         timeout=30,
                     )
                     output = adapter._parse_result_to_batched_data_dict(data, replies)
-                    expected_replies = expected_by_dp if is_dp else direct_replies
+                    expected_replies = expected_by_dp if is_dp else direct_replies * replicas
                     actual_replies = [
                         (reply.generated_tokens, reply.generated_log_probs) for reply in replies
                     ]
