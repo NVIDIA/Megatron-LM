@@ -769,28 +769,25 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         )
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
-                    # Shard the root after all selected child units.
+                    # The root is always sharded after selected child units so it is not
+                    # wrapped twice when its type also appears in fsdp_unit_modules.
                     continue
                 if submodule in mhc_inner_layers_to_skip:
                     # fully_shard(wrapper) recursively collects these inner parameters.
                     continue
 
-                is_recompute_unit = submodule in mhc_recompute_fsdp_units
-                matches_unit_type = any(
+                if submodule in mhc_recompute_fsdp_units or any(
                     isinstance(submodule, module_type) for module_type in fsdp_unit_modules
-                )
-                if not (is_recompute_unit or matches_unit_type):
-                    continue
-
-                if config.init_model_with_meta_device:
-                    _materialize_owned_meta_modules(submodule, device)
-                fully_shard(
-                    submodule,
-                    mesh=dp_mesh,
-                    placements=dense_placements,
-                    grad_scale=dense_grad_scale,
-                    **common_fully_shard_kwargs,
-                )
+                ):
+                    if config.init_model_with_meta_device:
+                        _materialize_owned_meta_modules(submodule, device)
+                    fully_shard(
+                        submodule,
+                        mesh=dp_mesh,
+                        placements=dense_placements,
+                        grad_scale=dense_grad_scale,
+                        **common_fully_shard_kwargs,
+                    )
             if config.init_model_with_meta_device:
                 _materialize_owned_meta_modules(module, device)
             fully_shard(
