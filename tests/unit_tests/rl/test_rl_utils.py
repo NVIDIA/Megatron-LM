@@ -704,7 +704,10 @@ class TestRLUtils:
 
         colocated = MagicMock(side_effect=colocated)
         drained = {"dropped-cid": object(), **({"stray-cid": object()} if leftover else {})}
-        interface = SimpleNamespace(merge_global_request_ledgers=MagicMock(return_value=drained))
+        interface = SimpleNamespace(
+            merge_global_request_ledgers=MagicMock(return_value=drained),
+            forget_held_prefixes=MagicMock(),
+        )
         monkeypatch.setattr(
             rl_utils, "_ROLLOUT_PIPELINE", None if ready_batches is None else pipeline_stub
         )
@@ -751,6 +754,8 @@ class TestRLUtils:
             interface.merge_global_request_ledgers.assert_called_once_with(rotate_to=2)
             # The dropped group's record was popped; nothing else is left waiting.
             assert runtime_state.request_ledger == {}
+            # The prefix store stops holding the consumed calls' tokens.
+            interface.forget_held_prefixes.assert_called_once_with({"dropped-cid"})
         finally:
             loop.run_until_complete(rollout_generator.aclose())
             loop.close()

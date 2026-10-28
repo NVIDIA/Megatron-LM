@@ -27,6 +27,7 @@ from megatron.training.global_vars import (
 )
 from megatron.training.utils import print_rank_0
 
+from ..gym_capture import GymPromptPreparer, PrefixStoreClient, PrefixStoreServer
 from ..rollout_bank import (
     FinishedRequestLedgerWriter,
     LedgerPayloadStager,
@@ -92,6 +93,8 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
     _generation_lag: float = PrivateAttr(None)
     _request_record_backup_dir: str | None = PrivateAttr(None)
+    _prefix_store: PrefixStoreClient | None = PrivateAttr(None)
+    _prefix_store_server: PrefixStoreServer | None = PrivateAttr(None)
 
     @property
     def generation_lag(self) -> float:
@@ -152,7 +155,14 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
                     bank_dir, dist.get_rank(), get_train_state().iteration
                 )
             )
-        inference_engine.payload_stager = LedgerPayloadStager(writer)
+        # Gym admissions need the parent call's exact tokens on whichever engine continues it:
+        # rank 0 serves them for the job, every stager publishes, every preparer fetches.
+        prefix_store_server = PrefixStoreServer() if dist.get_rank() == 0 else None
+        address = [prefix_store_server.address if prefix_store_server else None]
+        dist.broadcast_object_list(address, src=0)
+        prefix_store = PrefixStoreClient(address[0])
+        inference_engine.payload_stager = LedgerPayloadStager(writer, prefix_store)
+        inference_engine.prompt_preparer = GymPromptPreparer(prefix_store)
         dp_addr = await inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=41521, launch_inference_coordinator=True,
         )
@@ -187,6 +197,8 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
         launched_server._inference_engine = inference_engine
         launched_server._generation_lag = generation_lag
         launched_server._request_record_backup_dir = bank_dir
+        launched_server._prefix_store = prefix_store
+        launched_server._prefix_store_server = prefix_store_server
 
         concurrency_limit = (
             get_pg_size(inference_engine.pg_collection.dp) * inference_engine.context.max_requests
@@ -235,6 +247,12 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
                 stop_text_gen_server,
             )
             stop_text_gen_server()
+            self._prefix_store_server.close()
+
+    def forget_held_prefixes(self, uids) -> None:
+        """Drop the prefix store's calls whose rollouts the trainer consumed."""
+        if dist.get_rank() == 0:
+            self._prefix_store.forget(uids)
 
     def set_generation_epoch(self, generation_epoch: int):
         if dist.get_rank() == 0:
