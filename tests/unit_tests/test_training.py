@@ -230,6 +230,8 @@ class TestTraining:
         save.assert_called_once()
 
     def test_build_train_valid_test_data_iterators(self, run_config):
+        # The provider yields iterators: the external loader type, now read from the section.
+        run_config.data.dataloader.dataloader_type = 'external'
         train_iter, valid_iter, test_iter = build_train_valid_test_data_iterators(
             mock_train_valid_test_datasets_provider
         )
@@ -256,6 +258,8 @@ class TestTraining:
         assert not _should_compute_params_norm(args, iteration=20, is_first_iteration=False)
 
     def test_build_train_valid_test_data_iterators_multi_full_validation(self, run_config):
+        # The provider yields iterators: the external loader type, now read from the section.
+        run_config.data.dataloader.dataloader_type = 'external'
         """multiple_validation_sets + full_validation builds a list of iterators
         (one per validation set) and sets cfg.validation.eval_iters to the per-loader
         lengths MAX-reduced across DP ranks."""

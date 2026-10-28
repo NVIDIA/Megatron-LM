@@ -3320,6 +3320,13 @@ def _add_data_args(parser):
                        help='Probability of producing a short sequence.')
     group.add_argument('--num-workers', type=int, default=2,
                        help="Dataloader number of workers.")
+    group.add_argument('--no-pin-memory', action='store_false', dest='pin_memory',
+                       help='Do not pin the dataloader memory (DataLoader(pin_memory=False)).')
+    group.add_argument('--no-persistent-workers', action='store_false',
+                       dest='persistent_workers',
+                       help='Do not keep the dataloader workers alive between epochs '
+                       '(DataLoader(persistent_workers=False)); with zero workers they are '
+                       'never kept.')
     group.add_argument('--reset-position-ids', action='store_true',
                        help='Reset posistion ids after end-of-document token.')
     group.add_argument('--reset-attention-mask', action='store_true',
