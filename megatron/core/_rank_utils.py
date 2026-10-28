@@ -150,12 +150,21 @@ def warn_single_rank(
         rank: The rank to warn on. Defaults to None, meaning the ranks configured by
             ``set_default_log_ranks`` (rank 0 unless it has been changed).
     """
-    with warnings.catch_warnings():
+    if torch.distributed.is_initialized():
+        current_rank = torch.distributed.get_rank()
+    else:
         # safe_get_rank warns when it can find no rank at all, which happens on a plain
         # import outside a launcher. Defaulting to rank 0 is the right answer here, and
         # letting that warning through would just swap it for the one being deduplicated.
-        warnings.simplefilter("ignore")
-        current_rank = safe_get_rank()
+        #
+        # Only reachable before torch distributed comes up. Entering catch_warnings bumps
+        # the global filter version, which clears every module's __warningregistry__ and
+        # so re-arms warnings that had already printed once. Paying that on a call made
+        # once per bucket per step made this helper multiply the log volume it exists to
+        # cut, so keep it off the initialized path.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            current_rank = safe_get_rank()
 
     should_warn = current_rank == rank if rank is not None else current_rank in _DEFAULT_LOG_RANKS
     if should_warn:

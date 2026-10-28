@@ -195,6 +195,21 @@ class TestWeightedSwigluKernels:
             out = batch_invariant.weighted_silu_mul_bounded(y, probs, bound, num_programs=np_)
             assert torch.equal(out[:live], ref[:live]), f"bits changed at num_programs={np_}"
 
+    def test_weighted_silu_mul_bounded_large_input_offset(self):
+        from megatron.core.inference.moe import batch_invariant
+
+        # The final input row begins at element 2**31.
+        rows, ffn = 262145, 4096
+        if torch.cuda.mem_get_info()[0] < 6.5 * 1024**3:
+            pytest.skip("requires 6.5 GiB of free GPU memory")
+        y = torch.zeros((rows, 2 * ffn), device="cuda", dtype=torch.bfloat16)
+        probs = torch.ones(rows, device="cuda", dtype=torch.float32)
+        y[-1] = 1
+        bound = torch.tensor(rows * ffn, device="cuda", dtype=torch.int64)
+        expected = _weighted_swiglu_reference(y[-1:], probs[-1:])[0]
+        out = batch_invariant.weighted_silu_mul_bounded(y, probs, bound)
+        assert torch.equal(out[-1], expected)
+
 
 # ---------------------------------------------------------------------------
 # _moe_sum options

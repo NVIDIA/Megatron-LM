@@ -9,7 +9,9 @@ on:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@c1a0837f362a1a696e647238ab1cf916b2a7cf4a # v1.8.6
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@037094bcc9138c72bc125418e6e3653f9e1c4160 # v1.11.0
+    with:
+      workflow_ref: 037094bcc9138c72bc125418e6e3653f9e1c4160 # pragma: allowlist secret
     if: github.repository == 'NVIDIA/Megatron-LM'
 
   codeowners-approval:
@@ -25,19 +27,25 @@ jobs:
         if: startsWith(github.ref, 'refs/heads/pull-request/')
         uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
-      - name: Checkout action
+      - name: Checkout approval scripts
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          repository: noamelf/codeowner-multi-approval-action
-          ref: v0.1
-          path: codeowner-multi-approval-action
+          persist-credentials: false
+          sparse-checkout: tests/test_utils/python_scripts
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: 0.7.2
 
       - name: Check Codeowners Approval
-        uses: ./codeowner-multi-approval-action
-        with:
-          pr-number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          repo-name: ${{ github.repository }}
-          github-token: ${{ secrets.PAT }}
+        env:
+          PR_NUMBER: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          GITHUB_TOKEN: ${{ secrets.PAT }}
+        run: >-
+          uv run --no-project --python 3.12 --with codeowners --with pygithub
+          python tests/test_utils/python_scripts/check_codeowners_approval.py
+          --pr-number "$PR_NUMBER" --repo-name "$GITHUB_REPOSITORY"
 
   multi-approval-bot-summary:
     needs: [pre-flight, codeowners-approval]

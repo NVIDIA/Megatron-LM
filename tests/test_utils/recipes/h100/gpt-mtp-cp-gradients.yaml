@@ -44,5 +44,5 @@ products:
   - test_case: [gpt_mtp_cp_gradients]
     products:
       - environment: [dev, lts]
-        scope: [mr-github]
+        scope: [mr-github, mr-github-slim]
         platforms: [dgx_h100]

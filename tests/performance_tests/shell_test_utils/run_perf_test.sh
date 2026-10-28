@@ -33,6 +33,8 @@ for ARG in "$@"; do
     export "$KEY"="$VAL"
 done
 
+export NVTE_FLASH_ATTN_V4=0
+
 : "${CONFIG_PATH:?CONFIG_PATH (path to model_config.yaml) is required}"
 : "${CHECKPOINT_LOAD_PATH:?CHECKPOINT_LOAD_PATH is required}"
 : "${RESULTS_ROOT:?RESULTS_ROOT is required}"
@@ -82,7 +84,7 @@ EP=$("$YQ" '.EP // 1' "$CONFIG_PATH")
 NUM_INPUT_TOKENS=$("$YQ" '.NUM_INPUT_TOKENS // 512' "$CONFIG_PATH")
 NUM_OUTPUT_TOKENS=$("$YQ" '.NUM_OUTPUT_TOKENS' "$CONFIG_PATH")
 NUM_WARMUP_ITERS=$("$YQ" '.NUM_WARMUP_ITERS // 2' "$CONFIG_PATH")
-NUM_TIMED_ITERS=$("$YQ" '.NUM_TIMED_ITERS // 5' "$CONFIG_PATH")
+NUM_TIMED_ITERS=$(PLATFORM="$PLATFORM" "$YQ" '.NUM_TIMED_ITERS_BY_PLATFORM[strenv(PLATFORM)] // .NUM_TIMED_ITERS // 5' "$CONFIG_PATH")
 # Prompt source: 'synthetic' (default, fixed-length "hello "*N) or 'gsm8k'
 # (real prompts from the vendored client/data/gsm8k_prompts.jsonl). MoE and
 # hybrid models should use 'gsm8k' — synthetic input gives misleading
@@ -112,6 +114,7 @@ echo "[run_perf_test] MODEL=$MODEL  TP=$TP PP=$PP DP=$DP EP=$EP  world_size=$WOR
 echo "[run_perf_test] coordinator workers: $COORDINATOR_WORKERS"
 echo "[run_perf_test] ISL=$NUM_INPUT_TOKENS  OSL=$NUM_OUTPUT_TOKENS"
 echo "[run_perf_test] batch sizes: ${BATCH_SIZES[*]}"
+echo "[run_perf_test] warmup iterations=$NUM_WARMUP_ITERS  timed iterations=$NUM_TIMED_ITERS"
 
 # ── Build model args (substituting ${CHECKPOINT_LOAD_PATH}) ───────────────────
 
@@ -134,6 +137,7 @@ MODEL_ARGS+=(
     --tensor-model-parallel-size "$TP"
     --pipeline-model-parallel-size "$PP"
     --expert-model-parallel-size "$EP"
+    --flash-attention-version 2
 )
 
 # ── Make image-bundled extras (mamba-ssm) visible to the cog venv ─────────────

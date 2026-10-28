@@ -21,8 +21,12 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     OffloadTensorPool,
     PipelineOffloadManager,
 )
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import (
+    CheckpointWithoutOutput,
+    model_parallel_cuda_manual_seed,
+)
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -44,6 +48,12 @@ def _make_chunk_handler_for_offload_checker(min_offloaded_tensor_size: int = 1):
     handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
     handler.min_offloaded_tensor_size = min_offloaded_tensor_size
     return handler
+
+
+@pytest.fixture(autouse=True)
+def reset_hybrid_ep():
+    yield
+    reset_hybrid_ep_buffer()
 
 
 def test_offload_summary_uses_explicit_process_group(monkeypatch):
@@ -118,15 +128,35 @@ def test_chunk_offload_handler_respects_tensor_opt_out_flags():
     assert not handler.tensor_need_offloading_checker(tensor)
 
 
-def _make_chunk_handler_for_offload_reload():
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_chunk_offload_handler_skips_checkpoint_without_output_storage():
+    """Checkpoint outputs and their views must not be copied or released by offload."""
+    handler = _make_chunk_handler_for_offload_checker()
+    Utils.initialize_model_parallel()
+    try:
+        input_tensor = torch.randn(8, device="cuda", requires_grad=True)
+        checkpoint = CheckpointWithoutOutput()
+        output = checkpoint.checkpoint(lambda tensor: tensor * 2, input_tensor)
+
+        assert not handler.tensor_need_offloading_checker(output)
+        assert not handler.tensor_need_offloading_checker(output.view(2, 4))
+        assert handler.tensor_need_offloading_checker(output.clone())
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def _make_chunk_handler_for_offload_reload(capacity_bytes=0):
     handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
-    handler.cpu_tensor_pool = OffloadTensorPool(device="cpu", pin_memory=True)
+    handler.cpu_tensor_pool = OffloadTensorPool(
+        device="cpu", pin_memory=True, capacity_bytes=capacity_bytes
+    )
     return handler
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
-def test_chunk_offload_handler_offloads_base_storage_for_covering_views():
-    handler = _make_chunk_handler_for_offload_reload()
+@pytest.mark.parametrize("capacity_bytes", [0, 2**20])
+def test_chunk_offload_handler_offloads_base_storage_for_covering_views(capacity_bytes):
+    handler = _make_chunk_handler_for_offload_reload(capacity_bytes)
 
     base = torch.randn(64, 96, device="cuda")
     view = base[:, :80]  # non-contiguous last-dim slice covering >50% of the storage
@@ -159,14 +189,18 @@ def test_chunk_offload_handler_offloads_base_storage_for_covering_views():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
-def test_chunk_offload_handler_gathers_low_coverage_views():
-    handler = _make_chunk_handler_for_offload_reload()
+@pytest.mark.parametrize("capacity_bytes", [0, 2**20])
+@pytest.mark.parametrize("use_cpu_pool", [False, True])
+def test_chunk_offload_handler_gathers_low_coverage_views(capacity_bytes, use_cpu_pool):
+    handler = _make_chunk_handler_for_offload_reload(capacity_bytes)
 
     base = torch.randn(64, 96, device="cuda")
     view = base[:, :8]  # covers well under BASE_OFFLOAD_MIN_COVERAGE of base
 
-    state = handler.offload(view)
-    _, cpu_backup, _, view_meta = state
+    state = handler.offload(view, use_cpu_pool=use_cpu_pool)
+    _, cpu_backup, uses_pool, view_meta = state
+    # Fixed storage also handles variable-shape groups that bypass the legacy cache.
+    assert uses_pool is bool(capacity_bytes or use_cpu_pool)
     # Low-coverage views fall back to the contiguous gather.
     assert view_meta is None
     assert cpu_backup.shape == view.shape
@@ -175,6 +209,11 @@ def test_chunk_offload_handler_gathers_low_coverage_views():
     torch.cuda.synchronize()
     assert reloaded.is_contiguous()
     assert torch.equal(reloaded, view)
+    status = handler.cpu_tensor_pool.get_pool_status()
+    assert status["global_stats"]["current_in_use"] == 0
+    if capacity_bytes:
+        assert status["pools"] == {}
+        assert status["fixed_buffer"]["capacity_bytes"] == capacity_bytes
 
 
 def _make_warmup_chunk(groups: List["OffloadTensorGroup"]) -> ChunkOffloadHandler:
@@ -409,6 +448,7 @@ def _build_gpt_model(
     offload_modules: Optional[List[str]],
     min_offloaded_tensor_size: int,
     is_mla: bool,
+    fine_grained_offloading_buffer_size_gib: float = 0.0,
 ) -> GPTModel:
     """Build a GPTModel that uses TE-based transformer layer spec."""
     model_parallel_cuda_manual_seed(seed)
@@ -431,6 +471,7 @@ def _build_gpt_model(
         fine_grained_activation_offloading=fine_grained_activation_offloading,
         offload_modules=offload_modules,
         min_offloaded_tensor_size=min_offloaded_tensor_size,
+        fine_grained_offloading_buffer_size_gib=fine_grained_offloading_buffer_size_gib,
     )
     gpt_model = GPTModel(
         config=transformer_config,
@@ -514,21 +555,25 @@ def _run_one_iter_and_capture(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.parametrize(
-    "is_moe, is_mla, offload_modules",
+    "is_moe, is_mla, offload_modules, buffer_size_gib",
     [
         # Dense GPT modules
-        (False, True, ["attn_norm"]),
-        (True, False, ["qkv_linear"]),
-        (True, False, ["core_attn"]),
+        (False, True, ["attn_norm"], 0.0),
+        (True, False, ["qkv_linear"], 0.0),
+        (True, False, ["core_attn"], 0.0),
         # # attn_proj depends on core_attn (validated in TransformerConfig.__post_init__)
-        (True, True, ["core_attn", "attn_proj"]),
-        (True, False, ["mlp_norm"]),
-        (True, False, ["expert_fc1"]),
-        (True, False, ["moe_act"]),
+        (True, True, ["core_attn", "attn_proj"], 0.0),
+        (True, False, ["mlp_norm"], 0.0),
+        (True, False, ["expert_fc1"], 0.0),
+        (True, False, ["moe_act"], 0.0),
+        # Non-power-of-two pinned storage with fixed and variable activation shapes.
+        (False, True, ["attn_norm"], 1.5),
+        (True, False, ["moe_act"], 1.5),
+        (True, False, ["core_attn", "attn_proj", "expert_fc1"], 1.5),
     ],
 )
 def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
-    is_moe: bool, is_mla: bool, offload_modules: List[str]
+    is_moe: bool, is_mla: bool, offload_modules: List[str], buffer_size_gib: float
 ):
     """
     Initialize a GPTModel and verify:
@@ -614,6 +659,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             offload_modules=offload_modules,
             min_offloaded_tensor_size=1024,  # force offloading for UT determinism
             is_mla=is_mla,
+            fine_grained_offloading_buffer_size_gib=buffer_size_gib,
         ).cuda()
         _restore_params(off_model, base_params)
         off_model.train()
@@ -638,6 +684,12 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             sum(mgr.offload_summary_bytes.get(k, 0) for k in offload_modules)
         )
         expected_offload_mib = expected_offload_bytes / (1024**2)
+        pool = mgr.cpu_tensor_pool
+        assert pool.uses_fixed_buffer == bool(buffer_size_gib)
+        if buffer_size_gib:
+            fixed = pool.get_pool_status()["fixed_buffer"]
+            assert fixed["capacity_bytes"] == int(buffer_size_gib * 2**30)
+            assert fixed["peak_live_bytes"] > 0
 
         _reset_cuda_memory()
         off_logits, off_grads, off_peak = _run_one_iter_and_capture(
@@ -647,6 +699,8 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             attention_mask=attention_mask,
             enable_offload_reset=True,
         )
+        if buffer_size_gib:
+            assert pool.get_pool_status()["fixed_buffer"]["live_bytes"] == 0
         del off_model
         _reset_cuda_memory()
 

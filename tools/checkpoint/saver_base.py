@@ -1,12 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import json
 import os
-from importlib.metadata import version
-from packaging.version import Version as PkgVersion
 import sys
-import torch
+from importlib.metadata import version
 
-from utils import _ConverterFakeProcessGroup, chunk_bias, chunk_weight
+import torch
+from packaging.version import Version as PkgVersion
+from utils import chunk_bias, chunk_weight, initialize_checkpoint_converter_fake_process_groups
+
 
 class MegatronCheckpointSaverBase:
     """Orchestrates saving a Megatron checkpoint using parameters received on a multiprocessing queue.
@@ -60,6 +61,8 @@ class MegatronCheckpointSaverBase:
             # These are arguments that we are either changing, or cause problems for validation if they are set
             # Note that some of these deal with T5 so will need to be changed if we support T5.
             args_to_keep = ['tensor_model_parallel_size', 'pipeline_model_parallel_size', 'expert_model_parallel_size', 'world_size', 'params_dtype',
+                            'tensor_parallel_num_weight_shards', 'gtp_weight_remat_size',
+                            'expert_tensor_parallel_num_weight_shards', 'expert_gtp_weight_remat_size',
                             'num_layers_per_virtual_pipeline_stage', 'virtual_pipeline_model_parallel_size',
                             'masked_softmax_fusion', 'bias_gelu_fusion', 'bias_dropout_fusion',
                             'sequence_parallel',
@@ -137,22 +140,30 @@ class MegatronCheckpointSaverBase:
         Initialize Megatron global variables and fused kernels.
         """
         try:
-            from megatron.training.global_vars import set_global_variables, get_args
             from megatron.core import mpu
+            from megatron.training.argument_utils import inference_cfg_container_from_args
+            from megatron.training.global_vars import (
+                get_args,
+                get_train_state,
+                set_global_variables,
+            )
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
 
-        set_global_variables(self.margs, build_tokenizer=self.build_tokenizer)
+        cfg = inference_cfg_container_from_args(self.margs, build_model_config=False)
+        set_global_variables(self.margs, cfg, build_tokenizer=self.build_tokenizer)
 
         # Megatron args. (i.e., 'margs')
         self.margs = get_args()
 
+        train_state = get_train_state()
+        train_state.iteration = self.md.iteration
         if hasattr(self.md, 'consumed_train_samples'):
-            self.margs.consumed_train_samples = self.md.consumed_train_samples
-            self.margs.consumed_valid_samples = self.md.consumed_valid_samples
-            print(f"Setting consumed_train_samples to {self.margs.consumed_train_samples}"
-                  f" and consumed_valid_samples to {self.margs.consumed_valid_samples}")
+            train_state.consumed_train_samples = self.md.consumed_train_samples
+            train_state.consumed_valid_samples = self.md.consumed_valid_samples
+            print(f"Setting consumed_train_samples to {train_state.consumed_train_samples}"
+                  f" and consumed_valid_samples to {train_state.consumed_valid_samples}")
         else:
             print("consumed_train_samples not provided.")
 
@@ -174,19 +185,12 @@ class MegatronCheckpointSaverBase:
         mpu.set_pipeline_model_parallel_rank(0)
         mpu.set_expert_model_parallel_rank(0)
         
-        # For backward compatibility during local parallel states refactoring
-        fake_tp_group = _ConverterFakeProcessGroup(size=self.args.target_tensor_parallel_size)
-        fake_pp_group = _ConverterFakeProcessGroup(size=self.args.target_pipeline_parallel_size)
-        fake_ep_group = _ConverterFakeProcessGroup(size=self.args.target_expert_parallel_size)
-        fake_dp_group = _ConverterFakeProcessGroup(size=1)
-        fake_dp_ep_group = _ConverterFakeProcessGroup(size=1)
-        mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
-        mpu._PIPELINE_MODEL_PARALLEL_GROUP = fake_pp_group
-        mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
-        mpu._DATA_PARALLEL_GROUP = fake_dp_group
-        mpu._DATA_PARALLEL_GROUP_WITH_CP = fake_dp_group
-        mpu._INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = fake_dp_group
-        mpu._EXPERT_DATA_PARALLEL_GROUP = fake_dp_ep_group
+        initialize_checkpoint_converter_fake_process_groups(
+            mpu,
+            self.args.target_tensor_parallel_size,
+            self.args.target_pipeline_parallel_size,
+            self.args.target_expert_parallel_size,
+        )
         
         try:
             import torch_llm_debug_tools
@@ -343,19 +347,21 @@ class MegatronCheckpointSaverBase:
         Save local models in self.models to a megatron checkpoint.
         """
         try:
-            from megatron.training.checkpointing import save_checkpoint
             from megatron.core import mpu
+            from megatron.training import get_train_state
+            from megatron.training.checkpointing import save_checkpoint
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
 
+        train_state = get_train_state()
         for pp_rank in range(self.args.target_pipeline_parallel_size):
             mpu.set_pipeline_model_parallel_rank(pp_rank)
             # initial the first module in pp stage to get the layer_num, pooler, lm_head. binary_head
             self.get_local_model(pp_rank,0,0)
             for ep_rank in range(self.args.target_expert_parallel_size):
                 for tp_rank in range(self.args.target_tensor_parallel_size):
-                    save_checkpoint(self.md.iteration, [self.get_local_model(pp_rank, ep_rank, tp_rank)], None, None, num_floating_point_operations_so_far=0,
+                    save_checkpoint(train_state.iteration, [self.get_local_model(pp_rank, ep_rank, tp_rank)], None, None, num_floating_point_operations_so_far=0,
                         pipeline_rank=pp_rank, pipeline_parallel=self.args.target_pipeline_parallel_size > 1,
                         expert_rank=ep_rank, expert_parallel=self.args.target_expert_parallel_size > 1,
                         tensor_rank=tp_rank)
@@ -387,7 +393,7 @@ class MegatronCheckpointSaverBase:
             if true_vocab_size is not None:
                 # figure out what our padded vocab size is
                 orig_vocab_size = orig_word_embed.shape[0]
-                self.margs.padded_vocab_size = vocab_size_with_padding(true_vocab_size, self.margs)
+                self.margs.padded_vocab_size = vocab_size_with_padding(true_vocab_size, self.margs.make_vocab_size_divisible_by, self.margs.tensor_model_parallel_size)
 
                 # Cut out extra padding we don't need
                 if orig_vocab_size > self.margs.padded_vocab_size:

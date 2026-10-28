@@ -5,6 +5,7 @@ import sys
 import types
 from argparse import ArgumentError, ArgumentParser, Namespace
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Callable, Literal, Optional, Union
 from unittest.mock import MagicMock, patch
 
@@ -13,10 +14,12 @@ import torch
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.training.argument_utils import (
     ArgumentGroupFactory,
     TypeInferenceError,
+    _default_config_from_args,
     core_transformer_config_from_args,
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
@@ -24,6 +27,7 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import add_megatron_arguments, parse_args, validate_args
 from megatron.training.config import PretrainConfigContainer
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
+from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
 
 @dataclass
@@ -54,6 +58,8 @@ class CapturingTransformerConfig:
     """Minimal config that records kwargs produced by core_transformer_config_from_args."""
 
     moe_use_norm_before_up_proj: bool = False
+    hash_moe_vocab_size: int | None = None
+    wide_residual: object = None
 
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
@@ -91,6 +97,178 @@ def test_moe_norm_flag_reaches_transformer_config():
     )
 
     assert config.moe_use_norm_before_up_proj is True
+
+
+def test_no_megatron_fsdp_padded_shards_flag_reaches_ddp_config():
+    """--no-megatron-fsdp-padded-shards should disable padded shards in the DDP config."""
+    from megatron.training.training import get_megatron_ddp_config
+
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+
+    default_args = parser.parse_args([])
+    assert default_args.megatron_fsdp_padded_shards is True
+    assert get_megatron_ddp_config(default_args, use_torch_fsdp2=False).megatron_fsdp_padded_shards
+
+    disabled_args = parser.parse_args(["--no-megatron-fsdp-padded-shards"])
+    assert disabled_args.megatron_fsdp_padded_shards is False
+    ddp_config = get_megatron_ddp_config(disabled_args, use_torch_fsdp2=False)
+    assert ddp_config.megatron_fsdp_padded_shards is False
+
+
+@pytest.mark.parametrize('explicit_hash_vocab_size', [None, 100007])
+def test_hash_moe_vocab_is_initialized_before_config_conversion(
+    monkeypatch, explicit_hash_vocab_size
+):
+    from megatron.training import global_vars, vocab_utils
+
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.params_dtype = torch.float32
+    args.moe_num_hash_layers = 1
+    args.hash_moe_vocab_size = explicit_hash_vocab_size
+    args.vocab_size = 100000
+    tokenizer = SimpleNamespace(vocab_size=100003)
+    cfg = MagicMock()
+    cfg.tokenizer = SimpleNamespace(pad_vocab_size=True, padded_vocab_size=100352)
+    monkeypatch.setattr(global_vars, '_GLOBAL_TOKENIZER', None)
+    monkeypatch.setattr(vocab_utils, 'build_tokenizer', lambda _args: tokenizer)
+
+    global_vars._build_tokenizer(cfg, args)
+    config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
+
+    expected = 100003 if explicit_hash_vocab_size is None else explicit_hash_vocab_size
+    assert config.hash_moe_vocab_size == expected
+    assert args.hash_moe_vocab_size == expected
+    assert args.vocab_size == 100000
+    assert cfg.tokenizer.padded_vocab_size == 100352
+
+
+# ---------------------------------------------------------------------------
+# Tests for the Megatron-FSDP v2 pipeline-output dealloc opt-out
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "fsdp_kwargs, expected",
+    [
+        ({}, True),
+        ({"use_megatron_fsdp": True, "megatron_fsdp_version": 1}, True),
+        ({"use_megatron_fsdp": True, "megatron_fsdp_version": 2}, False),
+    ],
+)
+def test_deallocate_pipeline_outputs_follows_mfsdp_version(fsdp_kwargs, expected):
+    """The Python-args path keeps the pseudo-free on except for Megatron-FSDP v2."""
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    # params_dtype has no CLI flag of its own; validate_args normally derives it.
+    args.params_dtype = torch.float32
+    for name, value in fsdp_kwargs.items():
+        setattr(args, name, value)
+
+    config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
+
+    assert config.deallocate_pipeline_outputs is expected
+
+
+@pytest.mark.parametrize(
+    "fsdp_kwargs, expected",
+    [
+        ({}, True),
+        ({"use_megatron_fsdp": True, "megatron_fsdp_version": 1}, True),
+        ({"use_megatron_fsdp": True, "megatron_fsdp_version": 2}, False),
+    ],
+)
+def test_yaml_deallocate_pipeline_outputs_follows_mfsdp_version(fsdp_kwargs, expected):
+    """The YAML path reads the FSDP flags from the outer namespace before rebinding."""
+    language_model = Namespace(
+        **vars(TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4))
+    )
+    language_model.params_dtype = torch.float32
+    language_model.activation_func = "gelu"
+    language_model.embedding_init_method = "xavier_uniform"
+
+    # ``core_transformer_config_from_yaml`` merges the ``language_model`` and
+    # ``model_parallel`` sections, and this fixture already carries every
+    # TransformerConfig field in ``language_model``; repeating one here raises
+    # ``TypeError: got multiple values for keyword argument``.
+    args = SimpleNamespace(
+        language_model=language_model, model_parallel=SimpleNamespace(), **fsdp_kwargs
+    )
+
+    config = core_transformer_config_from_yaml(args)
+
+    assert config.deallocate_pipeline_outputs is expected
+
+
+def test_wide_residual_cli_builds_typed_config():
+    """Flat training arguments should build the nested core configuration."""
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+
+    disabled_args = parser.parse_args([])
+    disabled_args.params_dtype = torch.float32
+    disabled_config = core_transformer_config_from_args(
+        disabled_args, config_class=CapturingTransformerConfig
+    )
+    assert disabled_config.wide_residual is None
+
+    enabled_args = parser.parse_args(
+        [
+            '--wide-residual',
+            '3',
+            '--wide-residual-streamwise-sigmoid-init-scale',
+            '0.02',
+            '--wide-residual-learned-retention',
+            '--wide-residual-retention-init',
+            '0.998',
+            '--wide-residual-retention-max-forget',
+            '0.2',
+        ]
+    )
+    enabled_args.params_dtype = torch.float32
+    enabled_config = core_transformer_config_from_args(
+        enabled_args, config_class=CapturingTransformerConfig
+    )
+
+    assert isinstance(enabled_config.wide_residual, WideResidualConfig)
+    assert enabled_config.wide_residual.num_streams == 3
+    assert enabled_config.wide_residual.streamwise_sigmoid_init_scale == 0.02
+    assert enabled_config.wide_residual.learned_retention
+    assert enabled_config.wide_residual.retention_init == 0.998
+    assert enabled_config.wide_residual.retention_max_forget == 0.2
+
+
+@pytest.mark.parametrize(
+    'option',
+    [
+        ['--wide-residual-streamwise-sigmoid-init-scale', '0.02'],
+        ['--wide-residual-learned-retention'],
+        ['--wide-residual-retention-init', '0.998'],
+        ['--wide-residual-retention-max-forget', '0.2'],
+    ],
+)
+def test_wide_residual_controls_require_wide_residual(option):
+    """Dependent controls must not be silently ignored when wide residuals are disabled."""
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    args = parser.parse_args(option)
+    args.params_dtype = torch.float32
+
+    with pytest.raises(ValueError, match='require --wide-residual'):
+        core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
+
+
+def test_wide_residual_cli_rejects_yaml_config(monkeypatch):
+    """The experimental YAML path must not silently discard wide-residual CLI controls."""
+    monkeypatch.setattr(
+        sys, 'argv', ['test_argument_utils.py', '--yaml-cfg', 'unused.yaml', '--wide-residual', '3']
+    )
+
+    with pytest.raises(ValueError, match='cannot be combined with --yaml-cfg'):
+        parse_args()
 
 
 def test_moe_norm_flag_requires_latent_size(monkeypatch):
@@ -455,6 +633,36 @@ class TestArgumentGroupFactoryExclusion:
         assert hasattr(args, 'enabled')
 
 
+class TestArgumentGroupFactoryPrefix:
+    """Test prefixed argument names."""
+
+    def test_prefix_applies_to_names_and_destinations(self):
+        """Test that every flag and destination carries the prefix."""
+        parser = ArgumentParser()
+        factory = ArgumentGroupFactory(DummyConfig, prefix="dummy")
+
+        factory.build_group(parser, title="Test Group")
+        args = parser.parse_args(
+            ["--dummy-name", "custom", "--dummy-enabled", "--no-dummy-disabled-feature"]
+        )
+
+        assert args.dummy_name == "custom"
+        assert args.dummy_enabled is True
+        assert args.dummy_disabled_feature is False
+        assert not hasattr(args, "name")
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--name", "custom"])
+
+    def test_default_config_from_args_reads_prefixed_arguments(self):
+        """Test that the same prefix maps parsed arguments back onto the dataclass."""
+        parser = ArgumentParser()
+        ArgumentGroupFactory(DummyConfig, prefix="dummy").build_group(parser, title="Test Group")
+
+        args = parser.parse_args(["--dummy-count", "7"])
+
+        assert _default_config_from_args(DummyConfig, args, prefix="dummy") == DummyConfig(count=7)
+
+
 class TestArgumentGroupFactoryOptional:
     """Test handling of Optional types."""
 
@@ -573,6 +781,19 @@ class TestArgumentGroupFactoryHelpers:
         result = factory._extract_type(Optional[str])
         assert result == {"type": str}
 
+    @pytest.mark.parametrize('annotation', [int | None, None | int, Union[None, int]])
+    def test_extract_type_optional_order(self, annotation):
+        factory = ArgumentGroupFactory(DummyConfig)
+        assert factory._extract_type(annotation) == {"type": int}
+
+    @pytest.mark.parametrize(
+        'annotation', [int | list[int | None] | None, int | None | list[int | None]]
+    )
+    def test_extract_type_ambiguous_union_needs_metadata(self, annotation):
+        factory = ArgumentGroupFactory(DummyConfig)
+        with pytest.raises(TypeInferenceError, match="Unions not supported by argparse"):
+            factory._extract_type(annotation)
+
     def test_extract_type_list(self):
         """Test type extraction for list types."""
         factory = ArgumentGroupFactory(DummyConfig)
@@ -582,6 +803,14 @@ class TestArgumentGroupFactoryHelpers:
 
         result = factory._extract_type(list[str])
         assert result == {"type": str, "nargs": "+"}
+
+    def test_extract_type_variable_length_tuple(self):
+        """Test type extraction for variable-length tuples of one type."""
+        factory = ArgumentGroupFactory(DummyConfig)
+
+        assert factory._extract_type(tuple[str, ...]) == {"type": str, "nargs": "+"}
+        with pytest.raises(TypeInferenceError, match="Unsupported type"):
+            factory._extract_type(tuple[str, int])
 
     def test_extract_type_literal(self):
         """Test type extraction for Literal types."""
@@ -864,6 +1093,19 @@ class TestArgumentGroupFactoryArgparseMeta:
         with pytest.raises(ArgumentError, match="invalid choice"):
             args = parser.parse_args(['--unsupported-with-metadata', 'baz'])
 
+    def test_eval_iters_cli_remains_scalar(self, capsys):
+        from megatron.training.config import ValidationConfig
+
+        parser = ArgumentParser(exit_on_error=False)
+        ArgumentGroupFactory(ValidationConfig).build_group(parser)
+
+        assert parser.parse_args([]).eval_iters == 100
+        assert parser.parse_args(['--eval-iters', '7']).eval_iters == 7
+        with pytest.raises(ArgumentError, match="invalid int value"):
+            parser.parse_args(['--eval-iters', 'invalid'])
+        assert ValidationConfig(eval_iters=[7, None]).eval_iters == [7, None]
+        assert 'Inferring the appropriate argparse argument type' not in capsys.readouterr().out
+
 
 class TestMegatronNetworkArgumentGeneration:
     """Test Megatron's TransformerConfig-derived argument group."""
@@ -907,6 +1149,30 @@ class TestMegatronNetworkArgumentGeneration:
     def test_mhc_fused_backend_rejects_unknown_choice(self):
         with pytest.raises(ArgumentError, match="invalid choice"):
             self._parser().parse_args(["--mhc-fused-backend", "cuda"])
+
+    def test_keep_mtp_in_bf16_flag(self):
+        assert self._parser().parse_args([]).keep_mtp_in_bf16 is False
+        assert self._parser().parse_args(["--keep-mtp-in-bf16"]).keep_mtp_in_bf16
+
+    def test_train_full_dataset_flag(self):
+        from megatron.training.arguments import _add_training_args
+        from megatron.training.config import TrainingConfig
+
+        # This remains a CLI option until dataset options get their own config.
+        assert "train_full_dataset" not in TrainingConfig.__dataclass_fields__
+        parser = _add_training_args(ArgumentParser(exit_on_error=False))
+        assert parser.parse_args([]).train_full_dataset is False
+        assert parser.parse_args(["--train-full-dataset"]).train_full_dataset is True
+
+
+def test_sft_loss_log_mode_argument():
+    from megatron.training.arguments import _add_sft_args
+
+    parser = _add_sft_args(ArgumentParser(exit_on_error=False))
+    assert parser.parse_args([]).sft_loss_log_mode == "token-weighted"
+    assert (
+        parser.parse_args(["--sft-loss-log-mode", "microbatch"]).sft_loss_log_mode == "microbatch"
+    )
 
 
 class TestMegatronMLAArgumentGeneration:
@@ -1176,8 +1442,25 @@ class TestPretrainContainerFromArgsStructure:
         mock_ddp.return_value = mock_ddp_instance
         args = _make_args()
         result = pretrain_cfg_container_from_args(args)
-        mock_ddp.assert_called_once_with(args)
+        mock_ddp.assert_called_once_with(args, use_torch_fsdp2=False)
         assert result.ddp is mock_ddp_instance
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_distributed_cli_flags_keep_their_config_owners(self, monkeypatch, enabled):
+        parser = ArgumentParser()
+        add_megatron_arguments(parser)
+        args = parser.parse_args(["--use-megatron-fsdp", "--fake-process-group"] if enabled else [])
+        monkeypatch.setattr(
+            "megatron.training.training.get_megatron_optimizer_config",
+            lambda args: (OptimizerConfig(), {}),
+        )
+
+        cfg = pretrain_cfg_container_from_args(args)
+
+        assert args.use_megatron_fsdp is enabled
+        assert cfg.ddp.use_megatron_fsdp is enabled
+        assert cfg.dist.fake_process_group is enabled
+        assert not hasattr(cfg.dist, "use_megatron_fsdp")
 
 
 class TestCheckpointConfigMapping:

@@ -15,8 +15,11 @@
 """DBuffer placement definitions.
 
 DBuffer uses PyTorch DTensor's ``Placement``, ``Replicate``, and ``Partial``
-types directly. ``Flat`` and ``BlockAtomic`` are DBuffer-specific dim-0
-``Shard`` placements whose local storage is part of one flattened buffer.
+types directly. ``RowAtomic``, ``BlockAtomic``, and ``TensorAtomic`` are
+DBuffer-specific dim-0 ``Shard`` placements whose local storage is part of one
+flattened buffer. ``RowAtomic`` and ``BlockAtomic`` split the flattened buffer into
+equal-size per-rank shards; ``TensorAtomic`` instead assigns every logical
+tensor as a whole to one owner rank, so per-rank shards may differ in size.
 
 =============  =============  ====================
 Source         Destination    DBuffer operation
@@ -28,23 +31,36 @@ sharded        ``Replicate``  ``allgather()``
 =============  =============  ====================
 """
 
+import enum
 from collections.abc import Iterable
 
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
-__all__ = ["BlockAtomic", "Flat", "changed_mesh_axis"]
+__all__ = ["BlockAtomic", "RowAtomic", "ShardLayout", "TensorAtomic", "changed_mesh_axis"]
 
 
-class Flat(Shard):
-    """DBuffer-specific flattened dim-0 shard placement."""
+class ShardLayout(enum.Enum):
+    """How a ``RowAtomic`` / ``BlockAtomic`` group is split into per-rank segments."""
+
+    PADDED = "padded"
+    """Equal segments. The group is padded to a multiple of ``dp_size * LCM(row sizes)``
+    (times the block size for ``BlockAtomic``)."""
+
+    UNPADDED = "unpadded"
+    """No padding. Tensors are packed back to back and segments end on the row/block
+    boundary nearest to an even split."""
+
+
+class RowAtomic(Shard):
+    """DBuffer-specific dim-0 shard placement that keeps each row intact."""
 
     def __init__(self) -> None:
         super().__init__(0)
 
     def __eq__(self, other: object) -> bool:
-        # PyTorch Shard.__eq__ compares only dim, so distinguish Flat from BlockAtomic.
-        return isinstance(other, Shard) and other.dim == 0 and not isinstance(other, BlockAtomic)
+        # PyTorch Shard.__eq__ compares only dim; DBuffer placements compare by type.
+        return isinstance(other, RowAtomic)
 
 
 class BlockAtomic(Shard):
@@ -62,6 +78,26 @@ class BlockAtomic(Shard):
 
     def __repr__(self) -> str:
         return f"BlockAtomic(block_size={self.block_size})"
+
+
+class TensorAtomic(Shard):
+    """Dim-0 shard placement that assigns each logical tensor as a whole to one rank.
+
+    With ``fully_shard``, use ``TensorAtomic()`` in ``Placements`` and supply only
+    ``fully_shard_context(parameter_to_owner=...)``. Each parameter group derives
+    its tensor owners from that mapping and passes them to
+    ``layout_builder.build_for_tensor_atomic``. Ownership is encoded by the layout's
+    offsets; this placement stores no owner assignments.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(0)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, TensorAtomic)
+
+    def __repr__(self) -> str:
+        return "TensorAtomic()"
 
 
 def changed_mesh_axis(

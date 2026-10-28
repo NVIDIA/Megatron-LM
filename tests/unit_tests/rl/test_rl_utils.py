@@ -1,7 +1,11 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import io
 import itertools
+import math
+import tempfile
+import traceback
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -9,12 +13,17 @@ from unittest.mock import MagicMock, call, patch
 import numpy as np
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
@@ -36,35 +45,79 @@ from megatron.core.transformer.cuda_graphs import (
 )
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+from megatron.core.utils import get_pg_size
 from megatron.rl import rl_utils
 from megatron.rl.agent.api import Rollout, RolloutGroup, TokenRollout
 from megatron.rl.inference import ReturnsRaw
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
+from megatron.training.argument_utils import (
+    _default_config_from_args,
+    pretrain_cfg_container_from_args,
+)
 from megatron.training.arguments import parse_args, validate_args
+from megatron.training.config import RLConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
+from megatron.training.state import TrainState
+from megatron.training.training import _pop_samples_seen
 from tests.unit_tests.test_utilities import Utils
 
 BATCH = 2
 SEQ = 4
-VOCAB = 754
+VOCAB = 768
+
+
+def test_disagg_refit_reads_migrated_rl_config(monkeypatch):
+    """Refit uses RLConfig while shard layout remains a launch argument."""
+    rl_config = RLConfig(refit_method="nccl", refit_execution_batch_bytes=4096)
+    monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=rl_config))
+    args = SimpleNamespace(inference_shards="tp=1,role=prefill+tp=1,role=decode", world_size=2)
+    model, inference_model = object(), object()
+    with (
+        patch.object(rl_utils, "disagg_refit_pools", return_value=(2, 1)) as pools,
+        patch.object(rl_utils, "prepare_swap_model_weights") as prepare,
+        patch.object(rl_utils, "swap_model_weights") as swap,
+    ):
+        assert rl_utils.refit_inference_model(model, inference_model, args) == 2
+    pools.assert_called_once_with(args.inference_shards, args.world_size)
+    prepare.assert_called_once_with(
+        src_model=model,
+        target_model=inference_model,
+        num_dst_pools=2,
+        dst_pool_index=1,
+        execution_batch_bytes=4096,
+    )
+    swap.assert_called_once_with(
+        model,
+        inference_model,
+        "nccl",
+        num_dst_pools=2,
+        dst_pool_index=1,
+        execution_batch_bytes=4096,
+    )
+    with rl_utils.inference_model_alloc_context():
+        pass
 
 
 class MockModel(LanguageModule):
-    def __init__(self, batch=BATCH, seq=SEQ, vocab=VOCAB):
+    def __init__(self, batch=BATCH, seq=SEQ, vocab=VOCAB, dtype=torch.float32):
         self.batch = batch
         self.seq = seq
         self.vocab = vocab
+        self.dtype = dtype
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.config = TransformerConfig(
             num_attention_heads=8, num_layers=8, pipeline_dtype=torch.bfloat16
         )
         self.model_type = ModelType.encoder_or_decoder
 
-    def __call__(self, x, position_ids, attention_mask, **kwargs):
+    def __call__(self, x, position_ids, attention_mask, runtime_gather_output=True, **kwargs):
         del position_ids
         del attention_mask
         batch, seq = x.shape
-        mock_model_outputs = torch.ones((batch, seq, self.vocab), device=x.device)
+        tp_size = get_pg_size(self.pg_collection.tp)
+        width = self.vocab if runtime_gather_output else self.vocab // tp_size
+        mock_model_outputs = torch.ones((batch, seq, width), device=x.device, dtype=self.dtype)
         return mock_model_outputs
 
     def load_state_dict(self, params):
@@ -195,6 +248,82 @@ def cleanup_global_state():
     destroy_num_microbatches_calculator()
 
 
+# (dtype, chunk_tokens, sliced) cases shared by the in-process and spawned-TP2 parity runs.
+_VP_CASES = [
+    (dtype, chunk_tokens, sliced)
+    for dtype in (torch.float32, torch.bfloat16)
+    for chunk_tokens in (None, 3)
+    for sliced in (False, True)
+]
+
+
+def _vp_inputs(dtype, sliced):
+    """Deterministic parity inputs; the spawned TP2 workers rebuild the identical tensors."""
+    torch.manual_seed(0)
+    batch, seq, vocab = 2, 17, 64
+    logits = torch.randn(batch, seq, vocab, dtype=dtype)
+    tokens = torch.randint(0, vocab, (batch, seq))
+    grad_out = torch.randn(batch, seq - 1 if sliced else seq, dtype=dtype)
+    return logits, tokens, grad_out
+
+
+def _vp_view(logits, tokens, sliced):
+    """The call-site shape get_logprobs uses: logits[:, :-1, :] against the shifted tokens."""
+    return (logits[:, :-1, :], tokens[:, 1:]) if sliced else (logits, tokens)
+
+
+def _vp_tp2_worker(rank, world_size, store_path, result_queue):
+    """One rank of a gloo TP group: forward logprobs and local-shard grads for every case."""
+    try:
+        store = dist.FileStore(store_path, world_size)
+        dist.init_process_group(backend="gloo", store=store, rank=rank, world_size=world_size)
+        tp_group = dist.new_group(ranks=list(range(world_size)), backend="gloo")
+        results = {}
+        for dtype, chunk_tokens, sliced in _VP_CASES:
+            logits, tokens, grad_out = _vp_inputs(dtype, sliced)
+            partition = logits.size(-1) // world_size
+            shard = slice(rank * partition, (rank + 1) * partition)
+            local = logits[..., shard].clone().requires_grad_(True)
+            got = rl_utils.vocab_parallel_selective_log_softmax(
+                *_vp_view(local, tokens, sliced), tp_group=tp_group, chunk_tokens=chunk_tokens
+            )
+            got.backward(grad_out)
+            results[(dtype, chunk_tokens, sliced)] = (got.detach(), local.grad)
+        # Ship plain bytes: shared-memory tensor handles would dangle once this process exits.
+        buffer = io.BytesIO()
+        torch.save(results, buffer)
+        result_queue.put(("ok", rank, buffer.getvalue()))
+    except Exception:  # pragma: no cover
+        result_queue.put(("err", rank, traceback.format_exc()))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.fixture(scope="module")
+def vp_tp2_results():
+    """{rank: {case: (logprobs, shard_grad)}} from a single 2-process gloo run over _VP_CASES."""
+    world_size = 2
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    with tempfile.NamedTemporaryFile(delete=True) as f:
+        store_path = f.name + ".store"
+    procs = [
+        ctx.Process(target=_vp_tp2_worker, args=(rank, world_size, store_path, queue))
+        for rank in range(world_size)
+    ]
+    for p in procs:
+        p.start()
+    by_rank = {}
+    for _ in procs:
+        status, rank, payload = queue.get(timeout=300)
+        assert status == "ok", f"rank {rank} failed:\n{payload}"
+        by_rank[rank] = torch.load(io.BytesIO(payload))
+    for p in procs:
+        p.join(timeout=120)
+    return by_rank
+
+
 class TestRLUtils:
     """Test class for RL utilities."""
 
@@ -228,7 +357,7 @@ class TestRLUtils:
             setattr(args, key, value)
 
         args = validate_args(args)
-        set_global_variables(args, False)
+        set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
         return args
 
     @pytest.mark.parametrize(
@@ -275,10 +404,14 @@ class TestRLUtils:
 
     def test_rl_granularity_defaults(self):
         args = self.create_test_args(perform_rl_step=True, grpo_prompts_per_step=8)
+        cfg = _default_config_from_args(RLConfig, args)
 
-        assert args.rl_submission_granularity == "B"
-        assert args.rl_consumption_granularity == "B"
-        assert args.rl_generation_lag == 0
+        assert cfg.rl_submission_granularity == "B"
+        assert cfg.rl_consumption_granularity == "B"
+        assert cfg.rl_generation_lag == 0
+        # The derived lag lives on the section; validate_args leaves the parsed flag untouched.
+        assert args.rl_generation_lag is None
+        assert not hasattr(args, "grpo_samples_per_iteration")
         assert not hasattr(args, "rl_parallel_generation_tasks")
 
     @pytest.mark.parametrize(
@@ -364,6 +497,7 @@ class TestRLUtils:
         get_environment_rollouts to consume banked groups without inference."""
         n_prompts = 4
         fake_groups = [[f"group_{i}"] for i in range(n_prompts)]
+        train_state = TrainState(iteration=1)
         loop = asyncio.new_event_loop()
 
         async def gen():
@@ -379,7 +513,9 @@ class TestRLUtils:
         monkeypatch.setattr(rl_utils, "colocated_inference", colocated)
         monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", rollout_generator)
         monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
-        monkeypatch.setattr(rl_utils, "get_args", lambda: SimpleNamespace(curr_iteration=1))
+        monkeypatch.setattr(rl_utils, "get_args", lambda: SimpleNamespace())
+        monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
+        monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=RLConfig()))
         monkeypatch.setattr(
             rl_utils, "get_nvtx_range", lambda: lambda *args, **kwargs: nullcontext()
         )
@@ -456,6 +592,41 @@ class TestRLUtils:
         with pytest.raises(AssertionError, match=match):
             self.create_test_args(perform_rl_step=True, **overrides)
 
+    def test_rl_optimizer_offload_configures_grad_buffer_layout(self):
+        args = self.create_test_args(
+            perform_rl_step=True,
+            nccl_ub=True,
+            rl_offload_optimizer_during_inference=True,
+            rl_training_cuda_graphs=False,
+        )
+        cfg = pretrain_cfg_container_from_args(args)
+        assert not cfg.ddp.grad_buffer_offload
+        cfg.rl.rl_offload_optimizer_during_inference = False
+        cfg.validate()
+        assert not cfg.ddp.grad_buffer_offload
+        cfg.rl.rl_offload_optimizer_during_inference = True
+        cfg.validate()
+        assert not cfg.ddp.grad_buffer_offload
+        cfg.rl.finalize_ddp_config(cfg.ddp)
+        assert cfg.ddp.grad_buffer_offload
+
+    def test_rl_optimizer_offload_rejects_mxfp8_grad_buffer_aliasing(self):
+        args = self.create_test_args(
+            perform_rl_step=True,
+            rl_offload_optimizer_during_inference=True,
+            rl_training_cuda_graphs=False,
+            fp8_param_gather=True,
+            use_distributed_optimizer=True,
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+        )
+        cfg = pretrain_cfg_container_from_args(args)
+        # Global setup validates the config, so introduce the invalid combination afterward.
+        cfg.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
+        with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
+            cfg.validate()
+        assert not cfg.ddp.grad_buffer_offload
+
     @pytest.mark.parametrize(
         "flag", ["--rl-submission-granularity", "--rl-consumption-granularity"]
     )
@@ -464,13 +635,16 @@ class TestRLUtils:
         with pytest.raises(SystemExit):
             parse_args(ignore_unknown_args=False)
 
-    def _patch_rl_inference_mode_deps(self, monkeypatch, args):
+    def _patch_rl_inference_mode_deps(self, monkeypatch, args, rl_config, *, iteration=0):
         interface = MagicMock()
         interface.resume.return_value = object()
         interface.suspend.return_value = object()
         loop = SimpleNamespace(run_until_complete=MagicMock())
+        train_state = TrainState(iteration=iteration)
 
         monkeypatch.setattr(rl_utils, "get_args", lambda: args)
+        monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
+        monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=rl_config))
         monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
         monkeypatch.setattr(
             rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
@@ -520,14 +694,14 @@ class TestRLUtils:
         lang_module = DummyLangModule(layer_config)
         model = [SimpleNamespace(config=config, module=lang_module)]
         args = SimpleNamespace(
-            rl_training_cuda_graphs=False,
             num_experts=num_experts,
-            curr_iteration=11,
             cuda_graph_impl="local",
             cuda_graph_modules=[CudaGraphModule.attn],
             inference_cuda_graph_scope=InferenceCudaGraphScope.block,
         )
-        interface, _ = self._patch_rl_inference_mode_deps(monkeypatch, args)
+        interface, _ = self._patch_rl_inference_mode_deps(
+            monkeypatch, args, RLConfig(rl_training_cuda_graphs=False), iteration=11
+        )
         toggle_cuda_graphs = self._make_toggle_cuda_graphs_mock()
         monkeypatch.setattr(rl_utils, "toggle_cuda_graphs", toggle_cuda_graphs)
 
@@ -542,6 +716,7 @@ class TestRLUtils:
             call(lang_module, "local"),
             call(lang_module, "none"),
         ]
+        interface.set_generation_epoch.assert_called_once_with(11)
         expected_modules = (
             [
                 CudaGraphModule.mamba,
@@ -574,23 +749,22 @@ class TestRLUtils:
         eval_only/* wandb path. --skip-train alone still runs the RL loop with monotonically
         advancing iteration, so its evals log against the global step (see PR #6043)."""
         args = SimpleNamespace(
-            do_train=do_train,
-            skip_train=skip_train,
-            world_size=1,
-            cuda_graph_impl="none",
-            rl_offload_optimizer_during_inference=False,
-            langrl_env_config=None,
+            skip_train=skip_train, world_size=1, cuda_graph_impl="none", seq_length=SEQ
+        )
+        train_state = TrainState(do_train=do_train)
+        rl_config = RLConfig(
             rl_prompts_per_eval=1,
             rl_default_temperature=1.0,
             rl_default_top_p=1.0,
             rl_default_top_k=0,
-            seq_length=SEQ,
         )
         response = SimpleNamespace(env_id="env", metrics=lambda: {"reward": [1.0, 0.5]}, results=[])
         agent = SimpleNamespace(run_evaluation=lambda request: [response])
         wandb_writer = MagicMock()
 
         monkeypatch.setattr(rl_utils, "get_args", lambda: args)
+        monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
+        monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=rl_config))
         monkeypatch.setattr(
             rl_utils, "megatron_rl_inference_mode", lambda *_a, **_k: nullcontext(MagicMock())
         )
@@ -664,6 +838,7 @@ class TestRLUtils:
         layer_config = config if share_config else SimpleNamespace(flash_decode=True)
         model = DummyLogprobsModel(config, layer_config)
         monkeypatch.setattr(rl_utils, "get_args", lambda: SimpleNamespace(fp16=False, bf16=False))
+        monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=RLConfig()))
         monkeypatch.setattr(
             rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
         )
@@ -694,22 +869,157 @@ class TestRLUtils:
         indirect=["initialize_model_parallel"],
     )
     @pytest.mark.parametrize("use_sequence_packing", [False])
-    def test_get_logprobs(self, initialize_model_parallel, use_sequence_packing):
-        """Test that getting logprobs at least does not crash."""
+    @pytest.mark.parametrize("batch_invariant", [False, True])
+    def test_get_logprobs(
+        self, initialize_model_parallel, use_sequence_packing, batch_invariant, monkeypatch
+    ):
+        """get_logprobs runs end to end and honors the output-dtype contract that
+        compute_logprobs_batch asserts: fp32 under --batch-invariant-mode (where it falls back to
+        the gathered path), the logits dtype otherwise."""
         self.create_test_args(rl_use_sequence_packing=use_sequence_packing)
+        monkeypatch.setattr(rl_utils, "is_batch_invariant_mode_enabled", lambda: batch_invariant)
 
-        model = MockModel()
-        tokens = torch.ones((BATCH, SEQ), dtype=torch.long)
+        model = MockModel(dtype=torch.bfloat16)
+        # CUDA tokens (MockModel follows x.device): the vocab-parallel path
+        # all-reduces over the NCCL-only TP group, which rejects CPU tensors.
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # Spread the ids over the vocab so the targets land on every TP rank's shard.
+        num_tokens = BATCH * SEQ
+        tokens = torch.arange(num_tokens, device=device).view(BATCH, SEQ) * (VOCAB // num_tokens)
         logprobs = rl_utils.get_logprobs(
             model, tokens, position_ids=None, sequence_packing=use_sequence_packing
         )
         if is_pp_last_stage(model.pg_collection.pp):
             # We chop off 1 element from the sequence dimension.
             assert logprobs.shape == (BATCH, SEQ - 1)
-            # As we return ones as logits, all logprobs should be the same.
-            assert torch.all(logprobs == logprobs[0, 0]).item()
+            assert logprobs.dtype == (torch.float32 if batch_invariant else torch.bfloat16)
+            # Uniform logits: every token has logprob -log(VOCAB), whichever rank owns its id.
+            torch.testing.assert_close(logprobs, torch.full_like(logprobs, -math.log(VOCAB)))
         else:
-            assert logprobs.shape == (BATCH, SEQ, VOCAB)
+            # Non-last stages return the model output as is: vocab-sharded unless gathered.
+            vocab = VOCAB if batch_invariant else VOCAB // get_pg_size(model.pg_collection.tp)
+            assert logprobs.shape == (BATCH, SEQ, vocab)
+
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [pytest.param((tp, 1), id=f"tp{tp}-pp1") for tp in [1, 2, 4] if tp <= Utils.world_size],
+        indirect=["initialize_model_parallel"],
+    )
+    def test_get_logprobs_mtp(self, initialize_model_parallel, monkeypatch):
+        """An MTP model trained through get_logprobs must give the same MTP loss, acceptance
+        counts and MTP-layer gradients whether the main logits stay vocab-parallel (the default
+        path) or are gathered (the --batch-invariant-mode fallback): process_mtp_loss keeps its
+        own logits vocab-sharded either way, so the vocab-parallel cross-entropy never sees a
+        TP-times larger vocabulary (loss +ln(TP), wrong gradients). RL derives the MTP labels
+        from the tokens, so the metrics must cover every position but the two rolled off the
+        end of the sequence."""
+        _, _, tp, _ = initialize_model_parallel
+        self.create_test_args(tensor_model_parallel_size=tp, bf16=True)
+
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            tensor_model_parallel_size=tp,
+            use_cpu_initialization=True,
+            mtp_num_layers=1,
+            # Both passes run in training mode (process_mtp_loss records its metrics and
+            # attaches the loss only then), so they must see identical activations.
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            bf16=True,
+        )
+        layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        torch.manual_seed(0)  # Identical CPU-initialized weights (and tokens) on every rank.
+        gpt_model = GPTModel(
+            config=config,
+            transformer_layer_spec=layer_spec,
+            mtp_block_spec=get_gpt_mtp_block_spec(config, layer_spec, use_transformer_engine=True),
+            vocab_size=VOCAB,
+            max_sequence_length=32,
+        ).cuda()
+        # Float16Module takes get_logprobs' fp32_output argument, as in RL training.
+        model = Float16Module(config, gpt_model)
+        mtp_params = {name: p for name, p in model.named_parameters() if "mtp.layers." in name}
+        assert mtp_params
+
+        # batch 1: get_logprobs' default PackedSeqParams describe a single thd sequence.
+        batch_size, seq_length = 1, 32
+        tokens = torch.randint(0, VOCAB, (batch_size, seq_length), dtype=torch.long).cuda()
+        position_ids = torch.arange(seq_length).unsqueeze(0).expand(batch_size, -1).cuda()
+
+        results = {}
+        for batch_invariant in (False, True):
+            monkeypatch.setattr(
+                rl_utils, "is_batch_invariant_mode_enabled", lambda flag=batch_invariant: flag
+            )
+            model.zero_grad(set_to_none=True)
+            MTPLossLoggingHelper.clean_metrics_in_tracker()
+            logprobs = rl_utils.get_logprobs(model, tokens, position_ids=position_ids)
+            logprobs.sum().backward()
+            tracker = MTPLossLoggingHelper.tracker
+            assert all(p.grad is not None for p in mtp_params.values())
+            results[batch_invariant] = (
+                logprobs.detach().float(),
+                {k: tracker[k].clone() for k in ("loss_values", "correct_values", "total_values")},
+                {name: p.grad.clone() for name, p in mtp_params.items()},
+            )
+
+        vp_logprobs, vp_metrics, vp_grads = results[False]
+        gathered_logprobs, gathered_metrics, gathered_grads = results[True]
+        assert vp_logprobs.shape == (batch_size, seq_length - 1)
+        # bf16 logits: the same tolerance as test_vocab_parallel_selective_log_softmax.
+        torch.testing.assert_close(vp_logprobs, gathered_logprobs, atol=5e-2, rtol=5e-2)
+        # One MTP layer: the labels roll once (derived from the tokens), the layer rolls again.
+        expected_total = torch.full_like(vp_metrics["total_values"], batch_size * (seq_length - 2))
+        torch.testing.assert_close(vp_metrics["total_values"], expected_total)
+        for key in ("loss_values", "correct_values", "total_values"):
+            torch.testing.assert_close(vp_metrics[key], gathered_metrics[key], atol=1e-3, rtol=1e-3)
+        # MTP-layer parameters get their gradient from the MTP loss alone.
+        for name, grad in vp_grads.items():
+            torch.testing.assert_close(grad, gathered_grads[name], atol=1e-5, rtol=2e-2)
+
+    @pytest.mark.parametrize("dtype, chunk_tokens, sliced", _VP_CASES)
+    @pytest.mark.parametrize("tp_world", [1, 2])
+    def test_vocab_parallel_selective_log_softmax(
+        self, dtype, chunk_tokens, sliced, tp_world, vp_tp2_results
+    ):
+        """vocab_parallel_selective_log_softmax must be a numerically-safe drop-in for
+        selective_log_softmax: forward/backward parity with the gathered-path implementation,
+        in-process on full logits (tp_world=1) and on TP-sharded logits over a spawned gloo
+        group (tp_world=2: every rank must return the full-sequence logprobs and its own vocab
+        shard of the reference gradient), with and without chunking, on the non-contiguous
+        ``logits[:, :-1, :]`` view get_logprobs actually passes (whose sliced-away position must
+        receive no gradient), and without mutating the input."""
+        logits, tokens, grad_out = _vp_inputs(dtype, sliced)
+        # fp32 stats vs selective_log_softmax's native bf16 log_softmax diverge by more than
+        # reduction-order noise; vp is the more accurate one (see commit message).
+        atol = 1e-5 if dtype == torch.float32 else 5e-2
+
+        reference = logits.clone().requires_grad_(True)
+        want = rl_utils.selective_log_softmax(*_vp_view(reference, tokens, sliced))
+        want.backward(grad_out)
+
+        if tp_world == 1:
+            local = logits.clone().requires_grad_(True)
+            got = rl_utils.vocab_parallel_selective_log_softmax(
+                *_vp_view(local, tokens, sliced), chunk_tokens=chunk_tokens
+            )
+            got.backward(grad_out)
+            torch.testing.assert_close(local.detach(), logits)  # forward must not mutate the input
+            shards = {0: (got.detach(), local.grad)}
+        else:
+            case = (dtype, chunk_tokens, sliced)
+            shards = {rank: results[case] for rank, results in vp_tp2_results.items()}
+
+        partition = logits.size(-1) // len(shards)
+        for rank, (got, grad) in shards.items():
+            assert got.dtype == dtype
+            torch.testing.assert_close(got.float(), want.float(), atol=atol, rtol=atol)
+            want_grad = reference.grad[..., rank * partition : (rank + 1) * partition]
+            torch.testing.assert_close(grad.float(), want_grad.float(), atol=atol, rtol=atol)
+            if sliced:
+                assert torch.all(grad[:, -1, :] == 0)
 
     @pytest.mark.parametrize(
         "ratio, advantage, clamp_eps, kl_beta, entropy_weight, expected",
@@ -794,6 +1104,66 @@ class TestRLUtils:
         )
         torch.testing.assert_close(truncated_from_above, expected_above)
         torch.testing.assert_close(truncated_from_below, expected_below)
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="train_rl.py's loss_func runs on CUDA"
+    )
+    @pytest.mark.parametrize("packing", [False, True])
+    def test_forward_step_reports_samples_seen(self, monkeypatch, packing):
+        """train_rl.py's loss function reports the microbatch's sequence count as _samples_seen:
+        the sequences packed into the bin, or the batch size; the loop sums the reports."""
+        with patch("logging.basicConfig"):  # train_rl.py reconfigures the root logger on import
+            import train_rl
+
+        class Timer:  # the straggler detector: a context manager that also takes bdata=
+            def __call__(self, **kwargs):
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        tokens = torch.zeros(3, SEQ + 1, dtype=torch.long, device="cuda")
+        values = torch.zeros(3, SEQ, device="cuda")
+        monkeypatch.setattr(train_rl, "stimer", Timer())
+        monkeypatch.setattr(train_rl, "get_timers", MagicMock)
+        monkeypatch.setattr(train_rl, "get_rerun_state_machine", MagicMock)
+        monkeypatch.setattr(train_rl, "get_rl_runtime_state", rl_utils.RLRuntimeState)
+        monkeypatch.setattr(train_rl, "is_pipeline_last_stage", lambda: True)
+        monkeypatch.setattr(train_rl, "get_logprobs", lambda *a, **k: values)
+        monkeypatch.setattr(train_rl, "calculate_grpo_loss", lambda **k: (values,) * 6)
+        monkeypatch.setattr(
+            train_rl,
+            "get_run_config",
+            lambda: SimpleNamespace(rl=RLConfig(rl_use_sequence_packing=packing)),
+        )
+        monkeypatch.setattr(
+            train_rl,
+            "get_args",
+            lambda: SimpleNamespace(
+                check_for_nan_in_loss_and_grad=False, check_for_spiky_loss=False
+            ),
+        )
+        if packing:
+            seq_indices = [11, 12, 13, 14, 15]
+            monkeypatch.setattr(
+                train_rl,
+                "load_packed_data_by_index",
+                lambda *a: (tokens, values, values, values, tokens, values, None, [0], [SEQ])
+                + (seq_indices, MagicMock()),
+            )
+            batch, expected = (torch.tensor(0),), len(seq_indices)
+        else:
+            mask = torch.zeros(3, SEQ + 1, device="cuda")  # forward_step drops its first column
+            batch, expected = (tokens, values, values, mask, tokens, values, values), 3
+
+        _, loss_fn = train_rl.forward_step(iter([batch]), MagicMock())
+        report = loss_fn(values)[2]
+
+        assert report["_samples_seen"].item() == expected
+        assert _pop_samples_seen([report, dict(report)]).item() == 2 * expected
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",
@@ -1305,16 +1675,59 @@ class TestRLUtils:
         )
         torch.testing.assert_close(aligned, expected, rtol=0, atol=0)
 
+    def test_grad_buffer_offload_deregistration_failure_preserves_storage(self):
+        buffers = [
+            MagicMock(nccl_mem_pool=object(), nccl_grad_pool_is_separate=True) for _ in range(3)
+        ]
+        pools = [buffer.nccl_mem_pool for buffer in buffers]
+        error = RuntimeError("second pool deregistration failed")
+        buffers[1].deregister_grad_pool_for_offload.side_effect = error
+        model = SimpleNamespace(buffers=buffers[:1], expert_parallel_buffers=buffers[1:])
+
+        with pytest.raises(RuntimeError, match="second pool deregistration failed") as exc_info:
+            DistributedDataParallel.offload_grad_buffers(
+                model, synchronize=False, empty_cache=False
+            )
+
+        assert exc_info.value is error
+        assert any("abort this run and do not retry" in note for note in error.__notes__)
+        buffers[0].deregister_grad_pool_for_offload.assert_called_once_with()
+        buffers[1].deregister_grad_pool_for_offload.assert_called_once_with()
+        buffers[2].deregister_grad_pool_for_offload.assert_not_called()
+        for buffer, pool in zip(buffers, pools):
+            buffer.offload_to_cpu.assert_not_called()
+            buffer.release_offloaded_grad_pool.assert_not_called()
+            assert buffer.nccl_mem_pool is pool
+
     @pytest.mark.parametrize(
-        "initialize_model_parallel",
+        "initialize_model_parallel,nccl_ub,grad_buffer_offload,registration_failure",
         [
-            pytest.param((tp, pp), id=f"tp{tp}-pp{pp}")
-            for tp, pp in itertools.product([1, 2], [1, 2])
-            if tp * pp <= Utils.world_size
+            *[
+                pytest.param((tp, pp), False, True, None, id=f"ordinary-tp{tp}-pp{pp}")
+                for tp, pp in itertools.product([1, 2], [1, 2])
+                if tp * pp <= Utils.world_size
+            ],
+            pytest.param((1, 1), True, True, None, id="nccl-ub-offload-layout"),
+            pytest.param(
+                (1, 1), True, True, "gradient", id="nccl-ub-gradient-registration-failure"
+            ),
+            pytest.param(
+                (1, 1),
+                True,
+                True,
+                "gradient-cleanup",
+                id="nccl-ub-gradient-registration-cleanup-failure",
+            ),
+            pytest.param(
+                (1, 1), True, True, "parameter", id="nccl-ub-parameter-registration-failure"
+            ),
+            pytest.param((1, 1), True, False, None, id="nccl-ub-shared-pool-rejected"),
         ],
         indirect=["initialize_model_parallel"],
     )
-    def test_grad_buffer_offload(self, initialize_model_parallel):
+    def test_grad_buffer_offload(
+        self, initialize_model_parallel, nccl_ub, grad_buffer_offload, registration_failure
+    ):
         """Test that grad buffer offload/restore correctly frees and restores GPU memory."""
         world_size, dp, tp, pp = initialize_model_parallel
         self.create_test_args(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
@@ -1337,7 +1750,54 @@ class TestRLUtils:
             use_distributed_optimizer=True,
             overlap_grad_reduce=False,
             bucket_size=None,  # Single bucket for simplicity
+            nccl_ub=nccl_ub,
+            grad_buffer_offload=grad_buffer_offload,
         )
+
+        if registration_failure is not None:
+            registration_error = RuntimeError(
+                f"initial {registration_failure.split('-')[0]} registration failed"
+            )
+            register_side_effect = (
+                [None, registration_error]
+                if registration_failure == "parameter"
+                else registration_error
+            )
+            deregister_side_effect = (
+                RuntimeError("registration cleanup failed")
+                if registration_failure == "gradient-cleanup"
+                else None
+            )
+            with (
+                patch(
+                    "megatron.core.distributed.param_and_grad_buffer.nccl_allocator.register_mem_pool",
+                    side_effect=register_side_effect,
+                ) as register_mock,
+                patch(
+                    "megatron.core.distributed.param_and_grad_buffer.nccl_allocator.deregister_mem_pool",
+                    side_effect=deregister_side_effect,
+                ) as deregister_mock,
+            ):
+                with pytest.raises(RuntimeError, match=str(registration_error)) as exc_info:
+                    DistributedDataParallel(
+                        transformer_config, ddp_config=ddp_config, module=gpt_model
+                    )
+                assert exc_info.value is registration_error
+                assert "Failed to register NCCL memory pool." in exc_info.value.__notes__
+            if registration_failure == "parameter":
+                assert register_mock.call_count == 2
+                failed_param_pool = register_mock.call_args_list[1].args[0]
+                registered_grad_pool = register_mock.call_args_list[0].args[0]
+                assert deregister_mock.call_args_list == [
+                    call(failed_param_pool, register_mock.call_args_list[1].args[1]),
+                    call(registered_grad_pool, register_mock.call_args_list[0].args[1]),
+                ]
+            else:
+                assert register_mock.call_count == 1
+                deregister_mock.assert_called_once_with(
+                    register_mock.call_args.args[0], register_mock.call_args.args[1]
+                )
+            return
 
         ddp_model = DistributedDataParallel(
             transformer_config, ddp_config=ddp_config, module=gpt_model
@@ -1348,6 +1808,21 @@ class TestRLUtils:
         # Verify initial storage is allocated
         initial_sizes = [buf.grad_data.storage().size() for buf in all_buffers]
         assert all(size > 0 for size in initial_sizes), "Expected non-zero initial storage"
+        initial_grad_pool_ids = [
+            buf.nccl_mem_pool.id if buf.nccl_mem_pool is not None else None for buf in all_buffers
+        ]
+        initial_param_pool_ids = [
+            buf.param_nccl_mem_pool.id if buf.param_nccl_mem_pool is not None else None
+            for buf in all_buffers
+        ]
+
+        if nccl_ub and not grad_buffer_offload:
+            with pytest.raises(RuntimeError, match="requires a separate NCCL gradient pool"):
+                ddp_model.offload_grad_buffers()
+            assert [buf.grad_data.storage().size() for buf in all_buffers] == initial_sizes
+            for buf in all_buffers:
+                buf.deregister_nccl_mem_pools()
+            return
 
         # Offload grad buffers to CPU
         ddp_model.offload_grad_buffers()
@@ -1355,6 +1830,50 @@ class TestRLUtils:
         # Verify storage is released
         for buf in all_buffers:
             assert buf.grad_data.storage().size() == 0, "Expected zero storage after offload"
+        if nccl_ub:
+            assert all(buf.nccl_mem_pool is None for buf in all_buffers)
+            assert [buf.param_nccl_mem_pool.id for buf in all_buffers] == initial_param_pool_ids
+
+            restore_error = torch.cuda.OutOfMemoryError("registration failed")
+            with (
+                patch(
+                    "megatron.core.distributed.param_and_grad_buffer.nccl_allocator.register_mem_pool",
+                    side_effect=restore_error,
+                ) as register_mock,
+                patch(
+                    "megatron.core.distributed.param_and_grad_buffer.nccl_allocator.deregister_mem_pool"
+                ) as deregister_mock,
+            ):
+                with pytest.raises(
+                    torch.cuda.OutOfMemoryError, match="registration failed"
+                ) as exc_info:
+                    ddp_model.restore_grad_buffers()
+                assert exc_info.value is restore_error
+                assert "Failed to register NCCL memory pool." in exc_info.value.__notes__
+                assert (
+                    "Failed to reload gradient buffer into NCCL memory pool."
+                    in exc_info.value.__notes__
+                )
+            deregister_mock.assert_called_once_with(
+                register_mock.call_args.args[0], register_mock.call_args.args[1]
+            )
+            assert all(buf.grad_data.storage().size() == 0 for buf in all_buffers)
+            assert all(buf.nccl_mem_pool is None for buf in all_buffers)
+
+            with (
+                patch(
+                    "megatron.core.distributed.param_and_grad_buffer.nccl_allocator.register_mem_pool",
+                    side_effect=RuntimeError("original registration failed"),
+                ),
+                patch(
+                    "megatron.core.distributed.param_and_grad_buffer.nccl_allocator.deregister_mem_pool",
+                    side_effect=RuntimeError("registration cleanup failed"),
+                ),
+            ):
+                with pytest.raises(RuntimeError, match="original registration failed"):
+                    ddp_model.restore_grad_buffers()
+            assert all(buf.grad_data.storage().size() == 0 for buf in all_buffers)
+            assert all(buf.nccl_mem_pool is None for buf in all_buffers)
 
         # Restore grad buffers to GPU
         ddp_model.restore_grad_buffers()
@@ -1364,6 +1883,44 @@ class TestRLUtils:
         assert (
             initial_sizes == restored_sizes
         ), f"Expected restored sizes {restored_sizes} to match initial {initial_sizes}"
+        if nccl_ub:
+            assert all(
+                buf.nccl_mem_pool.id != initial_id
+                for buf, initial_id in zip(all_buffers, initial_grad_pool_ids)
+            )
+            assert [buf.param_nccl_mem_pool.id for buf in all_buffers] == initial_param_pool_ids
+            for buf in all_buffers:
+                grad_ptr = buf.grad_data.data_ptr()
+                grad_bytes = buf.grad_data.untyped_storage().nbytes()
+                pool_ranges = [
+                    (
+                        (segment["address"], segment["total_size"])
+                        if isinstance(segment, dict)
+                        else (segment.address, segment.total_size)
+                    )
+                    for segment in buf.nccl_mem_pool.snapshot()
+                ]
+                assert any(
+                    begin <= grad_ptr and grad_ptr + grad_bytes <= begin + size
+                    for begin, size in pool_ranges
+                )
+
+        # Exercise the real DDP collective path after restore, not only allocator metadata.
+        for buf in all_buffers:
+            rank = torch.distributed.get_rank(group=buf.data_parallel_group)
+            buf.grad_data.fill_(rank + 1)
+        ddp_model.finish_grad_sync()
+        for buf in all_buffers:
+            rank = torch.distributed.get_rank(group=buf.data_parallel_group)
+            world_size = torch.distributed.get_world_size(group=buf.data_parallel_group)
+            shard_size = buf.grad_data.numel() // world_size
+            local_shard = buf.grad_data.narrow(0, rank * shard_size, shard_size)
+            expected = torch.full_like(local_shard, (world_size + 1) / 2)
+            torch.testing.assert_close(local_shard, expected, rtol=0, atol=0)
+
+        if nccl_ub:
+            for buf in all_buffers:
+                buf.deregister_nccl_mem_pools()
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",

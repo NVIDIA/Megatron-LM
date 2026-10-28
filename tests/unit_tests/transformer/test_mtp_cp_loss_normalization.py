@@ -75,7 +75,6 @@ def _run_loss(
         loss_mask=mask,
         output_layer=output_layer,
         output_weight=None,
-        runtime_gather_output=True,
         is_training=training,
         compute_language_model_loss=lambda targets, values: F.cross_entropy(
             values.permute(1, 2, 0), targets, reduction="none"
@@ -105,7 +104,7 @@ def _run_loss(
     )
 
 
-def _case(depth, packed, device, cp_group):
+def _case(depth, packed, device, cp_group, layout="zigzag", early_backward=False):
     # Different DP replicas deliberately use different examples. Only CP peers
     # should contribute to the normalization collective.
     first_cp_rank = torch.distributed.get_process_group_ranks(cp_group)[0]
@@ -121,29 +120,41 @@ def _case(depth, packed, device, cp_group):
         mtp_loss_scaling_factor=0.3,
         calculate_per_token_loss=True,
         cross_entropy_loss_fusion=False,
+        attention_cp_layout=layout,
+        mtp_loss_early_backward=early_backward,
     )
-    boundaries = [0, 8, 16] if packed else [0, 16]
+    boundaries = ([0, 4, 12, 16] if layout == "contiguous" else [0, 8, 16]) if packed else [0, 16]
     params = (
         PackedSeqParams(qkv_format="thd", cu_seqlens_q=torch.tensor(boundaries, device=device))
         if packed
         else None
     )
     rank = cp_group.rank()
-    indices = []
-    for start, end in zip(boundaries[:-1], boundaries[1:]):
-        chunk = (end - start) // 4
-        indices.extend(range(start + rank * chunk, start + (rank + 1) * chunk))
-        indices.extend(range(start + (3 - rank) * chunk, start + (4 - rank) * chunk))
+    if layout == "contiguous":
+        # Contiguous CP shards the whole pack; documents can cross rank boundaries.
+        indices = list(range(rank * 8, (rank + 1) * 8))
+    else:
+        indices = []
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            chunk = (end - start) // 4
+            indices.extend(range(start + rank * chunk, start + (rank + 1) * chunk))
+            indices.extend(range(start + (3 - rank) * chunk, start + (4 - rank) * chunk))
     indices = torch.tensor(indices, device=device)
     return hidden, weight, labels, config, params, indices
 
 
+@pytest.mark.parametrize("layout", ["zigzag", "contiguous"])
+@pytest.mark.parametrize("early_backward", [False, True])
 @pytest.mark.parametrize("depth", [1, 3])
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("per_token", [False, True])
-def test_mtp_cp_gradients_match_unpartitioned(cp_group, device, depth, packed, per_token):
+def test_mtp_cp_gradients_match_unpartitioned(
+    cp_group, device, depth, packed, per_token, layout, early_backward
+):
     """CP partitioning must preserve token, hidden-state, and shared-head gradients."""
-    hidden, weight, labels, config, params, indices = _case(depth, packed, device, cp_group)
+    hidden, weight, labels, config, params, indices = _case(
+        depth, packed, device, cp_group, layout, early_backward
+    )
     config.calculate_per_token_loss = per_token
     for mask in _masks(device):
         replica_offset = torch.distributed.get_process_group_ranks(cp_group)[0]
@@ -169,19 +180,28 @@ def test_mtp_cp_gradients_match_unpartitioned(cp_group, device, depth, packed, p
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("per_token", [False, True])
 @pytest.mark.parametrize("conditioning", ["boundary", "all_valid", "all_invalid"])
-def test_mtp_cp_conditioning_mask_gradients(cp_group, device, packed, per_token, conditioning):
+@pytest.mark.parametrize("layout", ["zigzag", "contiguous"])
+@pytest.mark.parametrize("early_backward", [False, True])
+def test_mtp_cp_conditioning_mask_gradients(
+    cp_group, device, packed, per_token, conditioning, layout, early_backward
+):
     """Cumulative conditioning validity must determine each depth's CP-wide denominator."""
-    hidden, weight, labels, config, params, indices = _case(3, packed, device, cp_group)
+    hidden, weight, labels, config, params, indices = _case(
+        3, packed, device, cp_group, layout, early_backward
+    )
     config.calculate_per_token_loss = per_token
-    boundaries = [0, 8, 16] if packed else [0, 16]
+    boundaries = ([0, 4, 12, 16] if layout == "contiguous" else [0, 8, 16]) if packed else [0, 16]
     mask = torch.ones_like(labels, dtype=torch.float64)
     # Also exclude a target independently of conditioning validity.
     mask[:, -2] = 0
     input_mask = torch.ones_like(labels, dtype=torch.bool)
     if conditioning == "boundary":
         # The first token on CP rank 1 invalidates conditioning paths on rank 0.
-        for start, end in zip(boundaries[:-1], boundaries[1:]):
-            input_mask[:, start + (end - start) // 4] = False
+        if layout == "contiguous":
+            input_mask[:, 8] = False
+        else:
+            for start, end in zip(boundaries[:-1], boundaries[1:]):
+                input_mask[:, start + (end - start) // 4] = False
     elif conditioning == "all_invalid":
         input_mask.zero_()
 

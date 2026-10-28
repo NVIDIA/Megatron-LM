@@ -12,6 +12,7 @@ import argparse
 import copy
 import json
 import os
+from itertools import product
 from pathlib import Path
 
 import torch
@@ -61,7 +62,7 @@ def _batches(mask_name):
         }
 
 
-def _train(cp_size, per_token, depth, initial_state=None):
+def _train(cp_size, per_token, depth, early_backward, initial_state=None):
     parallel_state.initialize_model_parallel(context_parallel_size=cp_size)
     torch.manual_seed(6103)
     model_parallel_cuda_manual_seed(6103)
@@ -72,6 +73,7 @@ def _train(cp_size, per_token, depth, initial_state=None):
         ffn_hidden_size=256,
         mtp_num_layers=depth,
         mtp_loss_scaling_factor=1.0,
+        mtp_loss_early_backward=early_backward,
         calculate_per_token_loss=per_token,
         context_parallel_size=cp_size,
         hidden_dropout=0.0,
@@ -182,10 +184,10 @@ def main():
     torch.distributed.init_process_group("nccl")
     assert torch.distributed.get_world_size() == 2, "Launch with exactly two GPUs"
     results = []
-    for per_token in (False, True):
-        for depth in (1, 3):
-            state, reference = _train(1, per_token, depth)
-            _, actual = _train(2, per_token, depth, state)
+    for early_backward in (False, True):
+        for per_token, depth in product((False, True), (1, 3)):
+            state, reference = _train(1, per_token, depth, early_backward)
+            _, actual = _train(2, per_token, depth, early_backward, state)
             for mask_name, expected_grads in reference.items():
                 failures = []
                 worst_relative_error = 0.0
@@ -201,6 +203,7 @@ def main():
                         failures.append(name)
                 results.append(
                     {
+                        "early_backward": early_backward,
                         "per_token": per_token,
                         "depth": depth,
                         "mask": mask_name,

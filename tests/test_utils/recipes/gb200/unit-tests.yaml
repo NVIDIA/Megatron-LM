@@ -44,6 +44,7 @@ spec:
     ENVIRONMENT={environment}
     BUCKET="{test_case}"
     UNIT_TEST_REPEAT={n_repeat}
+    export NVTE_FLASH_ATTN_V4=0
     export GPUS_PER_NODE={gpus}
 
     if [[ "$TAG" == "latest" ]]; then
@@ -72,9 +73,11 @@ spec:
         echo "No unit-test coverage data was produced; skipping coverage export."
     fi
 
-# GB200 selection is marker-driven. find_test_cases.py excludes the dedicated
-# M2N bucket from the catch-all bucket, so each marked test runs only once.
+# GB200 selection is marker-driven. find_test_cases.py excludes dedicated
+# buckets from the catch-all bucket, so each marked test runs only once.
 # Keep M2N in a separate process: NCCL caches the test fixture's transport settings.
+# Keep inference in a separate process: the MFSDP v2 fixtures select the NCCL
+# symmetric-memory backend process-wide, and the NVLS dispatcher needs the CUDA backend.
 products:
   - test_case: [tests/unit_tests/**/*.py]
     products:
@@ -84,6 +87,27 @@ products:
         n_repeat: [1]
         time_limit: [1800]
   - test_case: [tests/unit_tests/resharding/test_nccl_m2n_copy_service.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/inference/**/*.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/ssm/test_gated_delta_net.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/generalized_tensor_parallel/**/*.py]
     products:
       - environment: [dev]
         tag: [latest]
