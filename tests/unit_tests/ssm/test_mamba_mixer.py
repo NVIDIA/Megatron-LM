@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from einops import rearrange
 
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.inference.utils import InferenceMode
@@ -24,7 +25,14 @@ class TestMambaMixer:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def get_mixer(self, tp_size=1, cp_size=1, use_mem_eff_path=True):
+    def get_mixer(
+        self,
+        tp_size=1,
+        cp_size=1,
+        use_mem_eff_path=True,
+        batch_invariant=False,
+        params_dtype=torch.float32,
+    ):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size,
             pipeline_model_parallel_size=1,
@@ -39,7 +47,10 @@ class TestMambaMixer:
             num_attention_heads=1,
             use_cpu_initialization=True,
             use_mamba_mem_eff_path=use_mem_eff_path,
+            params_dtype=params_dtype,
         )
+        # Only the mixer's decode caches depend on it; skip the full mode validation.
+        transformer_config.batch_invariant_mode = batch_invariant
         assert isinstance(hybrid_stack_spec.submodules, HybridStackSubmodules)
         assert isinstance(hybrid_stack_spec.submodules.mamba_layer.submodules, MambaLayerSubmodules)
         assert isinstance(
@@ -123,6 +134,61 @@ class TestMambaMixer:
         torch.testing.assert_close(mixer._A_neg_exp_cache, -torch.exp(mixer.A_log.float()))
         assert mixer._A_neg_exp_cache.data_ptr() == cache_ptr
         assert not mixer._A_neg_exp_cache_stale
+
+    @pytest.mark.parametrize("batch_invariant", [False, True], ids=["default", "bi"])
+    @pytest.mark.parametrize("refresh_on_eval", [False, True], ids=["direct", "eval"])
+    def test_refreshes_fp32_param_caches_in_place(self, refresh_on_eval, batch_invariant):
+        """Inference reads FP32 conv weight/bias (and, in batch-invariant mode, A and
+        dt_bias) from caches that hold exactly the per-step values and refresh in place."""
+        mixer = self.get_mixer(batch_invariant=batch_invariant, params_dtype=torch.bfloat16)
+        caches = [mixer._conv_weight_fp32_cache, mixer._conv_bias_fp32_cache]
+        if batch_invariant:
+            caches += [mixer._A_neg_exp_cache, mixer._bi_dt_bias_cache]
+        ptrs = [c.data_ptr() for c in caches]
+
+        with torch.no_grad():
+            for p in (mixer.A_log, mixer.dt_bias, mixer.conv1d_weight, mixer.conv1d_bias):
+                p.add_(0.5)
+        if refresh_on_eval:
+            mixer.train()
+            mixer.eval()
+        else:
+            mixer.refresh_cache()
+            mixer.eval()  # already refreshed: eval() must not need to refresh again
+
+        with torch.no_grad():
+            got = list(
+                mixer._get_conv_params(mixer.conv1d_weight, mixer.conv1d_bias, torch.float32)
+            )
+            bi = mixer._get_batch_invariant_decode_params()
+        expected = [
+            rearrange(mixer.conv1d_weight, "d 1 w -> d w").float(),
+            mixer.conv1d_bias.float(),
+        ]
+        if batch_invariant:
+            got += list(bi)
+            expected += [-torch.exp(mixer.A_log.float()), mixer.dt_bias.float()]
+        else:
+            assert bi is None
+        for g, e in zip(got, expected):
+            assert torch.equal(g, e)
+        assert [c.data_ptr() for c in got] == ptrs
+        # Grad mode (and training) computes the values per call instead.
+        weight, _ = mixer._get_conv_params(mixer.conv1d_weight, mixer.conv1d_bias, torch.float32)
+        assert weight.data_ptr() != ptrs[0]
+        assert mixer._get_batch_invariant_decode_params() is None
+
+    def test_no_batch_invariant_caches_by_default(self):
+        mixer = self.get_mixer().eval()
+        assert mixer._bi_dt_bias_cache is None
+        with torch.no_grad():
+            assert mixer._get_batch_invariant_decode_params() is None
+            # FP32 parameters need no cast, so the conv kernels read them directly.
+            weight, bias = mixer._get_conv_params(
+                mixer.conv1d_weight, mixer.conv1d_bias, torch.float32
+            )
+        assert weight.data_ptr() == mixer.conv1d_weight.data_ptr()
+        assert bias.data_ptr() == mixer.conv1d_bias.data_ptr()
 
 
 class TestMambaMixerErrorChecks:
