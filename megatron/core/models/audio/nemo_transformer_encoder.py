@@ -2,9 +2,9 @@
 #
 # Vendored from NeMo ASR transformer_encoder (custom / experimental module).
 # Kept verbatim where possible (comments, MultiHeadAttention with use_cache, helper classes
-# `GPTConfig`, `GELU`, `compute_rope_params`, `apply_rope`, `MultiHeadAttentionWithFA`) so this
-# file can be diffed against the NeMo source. `flash_attn_func` is imported lazily so this
-# module imports without flash-attn installed.
+# `GPTConfig`, `GELU`, `compute_rope_params`, `apply_rope`) so this file can be diffed against
+# the NeMo source. `flash_attn_func` and v2 `flash_attn_varlen_func` are imported lazily so
+# this module imports without flash-attn installed. The "fa" path honors sequence lengths.
 
 import logging
 from dataclasses import dataclass
@@ -27,6 +27,18 @@ def _flash_attn_func(*args, **kwargs):
     except ImportError as exc:
         raise ImportError(
             "flash_attn is required for MultiHeadAttentionWithFA. "
+            "Install flash-attn or use MultiHeadAttentionWithSDPA instead."
+        ) from exc
+    return _impl(*args, **kwargs)
+
+
+def _flash_attn_varlen_func(*args, **kwargs):
+    """Lazy import shim for flash-attn v2 ``flash_attn_varlen_func`` (not ``flash_attn.cute``)."""
+    try:
+        from flash_attn import flash_attn_varlen_func as _impl
+    except ImportError as exc:
+        raise ImportError(
+            "flash_attn is required for MultiHeadAttentionWithFA variable-length sequences. "
             "Install flash-attn or use MultiHeadAttentionWithSDPA instead."
         ) from exc
     return _impl(*args, **kwargs)
@@ -235,7 +247,7 @@ def apply_rope(x, cos, sin):
 
 
 class MultiHeadAttentionWithFA(nn.Module):
-    """Multi-head attention using the flash-attention ``flash_attn_func`` backend."""
+    """Multi-head attention using flash-attention v2 dense or variable-length kernels."""
 
     def __init__(
         self,
@@ -260,30 +272,87 @@ class MultiHeadAttentionWithFA(nn.Module):
         self.window_size = _causal_window_size(causal_mask, left_context)
         self.out_proj = nn.Linear(self.d_out, self.d_out)
 
-    def forward(self, x):
-        """Run flash-attention over ``x`` and project the result."""
-        B, num_tokens, d_in = x.shape
-        H = self.num_heads
+    def forward(self, x, lengths=None):
+        """Run flash-attention over ``x`` and project the result.
 
-        keys = self.w_key(x).view(B, num_tokens, H, self.head_dim)  # Bxnum_tokens x Hx head_dim
-        queries = self.w_query(x).view(B, num_tokens, H, self.head_dim)
-        values = self.w_value(x).view(B, num_tokens, H, self.head_dim)
+        Args:
+            x: Attention input of shape ``(B, T, dim_in)``.
+            lengths: Optional per-sequence lengths of shape ``(B,)``. ``None``, and
+                lengths that are all equal to ``T``, keep dense ``flash_attn_func``.
+                Unequal lengths are packed and passed to v2 ``flash_attn_varlen_func``
+                through ``cu_seqlens``. A zero token count returns zeros and calls neither.
+        """
+        B, num_tokens, _ = x.shape
+        H = self.num_heads
+        T = num_tokens
+        lengths32 = None
+        if lengths is not None:
+            if not torch.is_tensor(lengths):
+                raise ValueError(
+                    f"lengths must be a tensor of shape {(B,)}, got {type(lengths).__name__}"
+                )
+            lengths32 = lengths.to(device=x.device, dtype=torch.int32)
+            if lengths32.shape != (B,):
+                raise ValueError(f"Expected lengths of shape {(B,)}, got {tuple(lengths32.shape)}")
+            if bool(((lengths32 < 0) | (lengths32 > T)).any()):
+                raise ValueError(
+                    f"lengths must satisfy 0 <= length <= {T}, "
+                    f"got {lengths32.detach().cpu().tolist()}"
+                )
+            total_tokens = int(lengths32.sum())
+        else:
+            total_tokens = B * T
+
+        # T == 0 makes every length equal T. Skip flash before that dense check.
+        if total_tokens == 0:
+            return x.new_zeros(B, T, self.d_out)
 
         dropout = 0 if self.training == False else self.dropout
-        flash_kwargs = {}
-        if self.window_size is not None:
-            flash_kwargs["window_size"] = self.window_size
-        output = _flash_attn_func(
-            queries, keys, values, dropout_p=dropout, causal=self.causal_mask, **flash_kwargs
+        if lengths32 is None or bool((lengths32 == T).all()):
+            # queries/keys/values: (B, T, H, head_dim)
+            keys = self.w_key(x).view(B, num_tokens, H, self.head_dim)
+            queries = self.w_query(x).view(B, num_tokens, H, self.head_dim)
+            values = self.w_value(x).view(B, num_tokens, H, self.head_dim)
+
+            flash_kwargs = {}
+            if self.window_size is not None:
+                flash_kwargs["window_size"] = self.window_size
+            output = _flash_attn_func(
+                queries, keys, values, dropout_p=dropout, causal=self.causal_mask, **flash_kwargs
+            )
+
+            # Bxnum_tokens x Hx head_dim
+
+            output = output.contiguous().view(B, num_tokens, self.d_out)
+            output = self.out_proj(output)
+            return output
+
+        # Broadcast (B, 1) against (1, T). A 1-D compare selects the wrong rows when B == T.
+        valid = torch.arange(T, device=x.device).unsqueeze(0) < lengths32.unsqueeze(1)
+        x_packed = x[valid]
+        queries = self.w_query(x_packed).view(total_tokens, H, self.head_dim)
+        keys = self.w_key(x_packed).view(total_tokens, H, self.head_dim)
+        values = self.w_value(x_packed).view(total_tokens, H, self.head_dim)
+        # int32 cumsum promotes to int64. v2 TORCH_CHECKs kInt32, so cast after the pad.
+        cu_seqlens = torch.nn.functional.pad(lengths32.cumsum(0), (1, 0)).to(dtype=torch.int32)
+        max_seqlen = int(lengths32.max())
+        # Positional cu_seqlens is the v2 API. flash_attn.cute's 4th positional is qv.
+        output = _flash_attn_varlen_func(
+            queries,
+            keys,
+            values,
+            cu_seqlens,
+            cu_seqlens,
+            max_seqlen,
+            max_seqlen,
+            dropout_p=dropout,
+            causal=self.causal_mask,
+            window_size=self.window_size or (-1, -1),
         )
-
-        # Bxnum_tokens x Hx head_dim
-
-        output = output.contiguous().view(B, num_tokens, self.d_out)
-
-        output = self.out_proj(output)
-
-        return output
+        projected = self.out_proj(output.contiguous().view(total_tokens, self.d_out))
+        full = x.new_zeros(B, T, self.d_out)
+        full[valid] = projected
+        return full
 
 
 class MultiHeadAttentionWithTE(nn.Module):
@@ -653,7 +722,7 @@ class TransformerBlock(nn.Module):
         elif self.attn_impl == "sdpa":
             attn_output = self.mha(pre_norm, attn_mask=attn_mask, use_cache=use_cache)
         else:  # "fa"
-            attn_output = self.mha(pre_norm)
+            attn_output = self.mha(pre_norm, lengths=lengths)
 
         attn_output = x + self.dropout(attn_output)
 
