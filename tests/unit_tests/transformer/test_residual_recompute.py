@@ -677,8 +677,9 @@ class TestResidualStreamRecomputeIntegration:
         assert operation_counts == {"connections": 4, "norms": 4, "branches": 2}
 
     @pytest.mark.parametrize("checkpointed", [False, True])
+    @pytest.mark.parametrize("dropout_probability", [0.0, 0.25])
     def test_wide_connection_hooks_and_forward_override_preserve_values_and_aliases(
-        self, checkpointed
+        self, checkpointed, dropout_probability
     ):
         """Hooks surround the logical call; replay only rebuilds WR's numerical operations."""
         config = _wide_recompute_config()
@@ -720,15 +721,17 @@ class TestResidualStreamRecomputeIntegration:
 
         value = torch.randn(4, 2, 24, device="cuda", requires_grad=True)
         expected_value = value.detach().clone().requires_grad_(True)
-        expected_branch, expected_state = reference[0](expected_value * 1.25 + 0.1)
-        expected_branch = expected_branch * 1.125 + 0.05
-        expected = reference[1](
-            expected_branch.sin() * 1.25 + 0.1,
-            state=expected_state,
-            dropout_probability=0.0,
-            training=True,
-        )
-        expected = (expected * 0.875 + 0.07).tanh()
+        # Use the same dropout mask without consuming RNG ahead of the actual forward.
+        with torch.random.fork_rng(devices=[value.device.index] if value.is_cuda else []):
+            expected_branch, expected_state = reference[0](expected_value * 1.25 + 0.1)
+            expected_branch = expected_branch * 1.125 + 0.05
+            expected = reference[1](
+                expected_branch.sin() * 1.25 + 0.1,
+                state=expected_state,
+                dropout_probability=dropout_probability,
+                training=True,
+            )
+            expected = (expected * 0.875 + 0.07).tanh()
 
         context = build_residual_stream_recompute_plan(1, 1)[0]
         if checkpointed:
@@ -739,13 +742,17 @@ class TestResidualStreamRecomputeIntegration:
                 branch.sin(),
                 state=state,
                 recompute_context=context,
-                dropout_probability=0.0,
+                dropout_probability=dropout_probability,
                 training=True,
             )
         else:
             branch, state = actual[0](value)
-            output = actual[1](branch.sin(), state=state, dropout_probability=0.0, training=True)
+            output = actual[1](
+                branch.sin(), state=state, dropout_probability=dropout_probability, training=True
+            )
         output = output.tanh()  # A live terminal boundary outside the two replayed operations.
+        rng_state = torch.get_rng_state()
+        cuda_rng_state = torch.cuda.get_rng_state(value.device) if value.is_cuda else None
         assert state[0] is actual[0].forward_input
         assert actual[0].forward_state is state
         for connection in actual:
@@ -762,6 +769,11 @@ class TestResidualStreamRecomputeIntegration:
         assert state[0].untyped_storage().size() > 0
         output.square().sum().backward()
         expected.square().sum().backward()
+        torch.testing.assert_close(torch.get_rng_state(), rng_state, rtol=0, atol=0)
+        if cuda_rng_state is not None:
+            torch.testing.assert_close(
+                torch.cuda.get_rng_state(value.device), cuda_rng_state, rtol=0, atol=0
+            )
         assert all(tensor.untyped_storage().size() > 0 for tensor in managed)
         torch.testing.assert_close(value.grad, expected_value.grad)
         _assert_matching_gradients(reference, actual)

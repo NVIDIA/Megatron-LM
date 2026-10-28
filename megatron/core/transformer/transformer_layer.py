@@ -1048,9 +1048,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 and recompute_context.is_block_end
                 and self._get_mlp_residual_connection(operation="write") is None
             )
-            write_context = None if is_terminal_write else recompute_context
+            write_recompute_context = None if is_terminal_write else recompute_context
             grad_scope = (
-                self.bias_dropout_add_exec_handler() if write_context is None else nullcontext()
+                self.bias_dropout_add_exec_handler()
+                if write_recompute_context is None
+                else nullcontext()
             )
             with grad_scope:
                 hidden_states = apply_module(residual_connection)(
@@ -1058,7 +1060,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                     state=attn_state,
                     dropout_probability=self.hidden_dropout,
                     training=self.training,
-                    recompute_context=write_context,
+                    recompute_context=write_recompute_context,
                 )
         else:
             with self.bias_dropout_add_exec_handler():
@@ -1580,13 +1582,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         elif residual_connection is not None:
             if not mlp_state:
                 raise RuntimeError("Missing state for the MLP residual connection.")
-            write_context = (
+            write_recompute_context = (
                 recompute_context
                 if recompute_context is not None and not recompute_context.is_block_end
                 else None
             )
             grad_scope = (
-                self.bias_dropout_add_exec_handler() if write_context is None else nullcontext()
+                self.bias_dropout_add_exec_handler()
+                if write_recompute_context is None
+                else nullcontext()
             )
             with grad_scope:
                 hidden_states = apply_module(residual_connection)(
@@ -1594,7 +1598,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                     state=mlp_state,
                     dropout_probability=self.hidden_dropout,
                     training=self.training,
-                    recompute_context=write_context,
+                    recompute_context=write_recompute_context,
                 )
         else:
             with self.bias_dropout_add_exec_handler():

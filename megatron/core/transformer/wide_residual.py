@@ -184,7 +184,12 @@ class StreamwiseSigmoidWideResidualRead(nn.Module):
 
 
 class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
-    """Streamwise residual maps restricted to a read or write at construction."""
+    """Streamwise residual maps restricted to a read or write at construction.
+
+    Override ``_compute_read`` or ``_compute_write`` to customize arithmetic shared by
+    eager execution and checkpoint replay. State or replay-policy changes belong in
+    the corresponding eager and checkpoint methods.
+    """
 
     def __init__(
         self,
@@ -233,16 +238,23 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
         """Read in branch precision before promoting the carried residual."""
 
         del execution_context
-        branch_input = streamwise_sigmoid_read(
+        branch_input = self._compute_read(hidden_states, branch_input_dtype=branch_input_dtype)
+        # Full-model FP32-residual inputs are normally already FP32. Preserve the defensive
+        # promotion for direct low-precision inputs, after the read has consumed its input.
+        residual_stream = hidden_states.float() if fp32_residual_connection else hidden_states
+        return branch_input, (residual_stream,)
+
+    def _compute_read(
+        self, hidden_states: Tensor, *, branch_input_dtype: torch.dtype | None
+    ) -> Tensor:
+        """Compute the branch input for eager execution and checkpoint replay."""
+
+        return streamwise_sigmoid_read(
             hidden_states,
             self.read_map(return_logits=True),
             self.num_streams,
             output_dtype=branch_input_dtype,
         )
-        # Full-model FP32-residual inputs are normally already FP32. Preserve the defensive
-        # promotion for direct low-precision inputs, after the read has consumed its input.
-        residual_stream = hidden_states.float() if fp32_residual_connection else hidden_states
-        return branch_input, (residual_stream,)
 
     def _eager_write(
         self,
@@ -254,6 +266,20 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
         execution_context: object | None,
     ) -> Tensor:
         del execution_context
+        return self._compute_write(
+            branch_output, state, dropout_probability=dropout_probability, training=training
+        )
+
+    def _compute_write(
+        self,
+        branch_output: ResidualBranchOutput,
+        state: ResidualConnectionState,
+        *,
+        dropout_probability: float,
+        training: bool,
+    ) -> Tensor:
+        """Compute the residual update for eager execution and checkpoint replay."""
+
         residual_stream = state[0]
         if isinstance(branch_output, tuple):
             branch_update, bias = branch_output
@@ -305,32 +331,20 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
         Adapter hooks surround the outer module call, not this arithmetic reconstruction.
         """
 
-        def run_read(stream: Tensor) -> tuple[Tensor, ...]:
-            branch_input, state = self._eager_read(
-                stream,
-                fp32_residual_connection=False,
-                branch_input_dtype=branch_input_dtype,
-                execution_context=execution_context,
-            )
-            if state[0].shape != stream.shape:
-                raise ValueError(
-                    "Residual connection read returned an incompatible carried stream."
-                )
-            return (branch_input, *state[1:])
+        del execution_context
 
-        outputs = context.checkpoint(run_read, hidden_states)
-        if torch.is_tensor(outputs):
-            outputs = (outputs,)
-        if not isinstance(outputs, tuple) or not outputs:
-            raise TypeError("Checkpointed residual read must return a non-empty tensor tuple.")
-        if not all(torch.is_tensor(output) for output in outputs):
-            raise TypeError("Checkpointed residual read state must contain only tensors.")
+        def run_read(stream: Tensor) -> Tensor:
+            return self._compute_read(stream, branch_input_dtype=branch_input_dtype)
+
+        branch_input = context.checkpoint(run_read, hidden_states)
+        if not torch.is_tensor(branch_input):
+            raise TypeError("Checkpointed residual read must return a tensor.")
 
         # This mirrors WR's defensive state promotion. Normal full-model
         # FP32-residual inputs are already FP32, making .float() an alias rather than a cast kernel;
         # direct/custom low-precision inputs still need the conversion to preserve replay state.
         residual_stream = hidden_states.float() if fp32_residual_connection else hidden_states
-        return outputs[0], (residual_stream, *outputs[1:])
+        return branch_input, (residual_stream,)
 
     def _checkpoint_write(
         self,
@@ -344,6 +358,7 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
     ) -> Tensor:
         """Replay WR's whole write, whose output has independent storage."""
 
+        del execution_context
         if isinstance(branch_output, tuple):
             output, bias = branch_output
             return_tuple = True
@@ -355,12 +370,8 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
             branch_update: Tensor, branch_bias: Tensor | None, *connection_state: Tensor
         ) -> Tensor:
             value = (branch_update, branch_bias) if return_tuple else branch_update
-            return self._eager_write(
-                value,
-                connection_state,
-                dropout_probability=dropout_probability,
-                training=training,
-                execution_context=execution_context,
+            return self._compute_write(
+                value, connection_state, dropout_probability=dropout_probability, training=training
             )
 
         hidden_states = context.checkpoint(run_write, output, bias, *state)
