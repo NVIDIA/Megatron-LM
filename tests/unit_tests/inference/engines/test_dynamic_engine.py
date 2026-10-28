@@ -2,16 +2,18 @@
 
 import asyncio
 import gc
+import hashlib
 import logging
 import math
 import os
 import random
 import threading
 import types
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import dataclass, field
-from functools import partial
+from functools import partial, wraps
 from typing import Dict, List, Optional, Tuple
 from unittest import mock
 
@@ -24,6 +26,8 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.activations import squared_relu
+from megatron.core.inference.apis.async_llm import MegatronAsyncLLM
+from megatron.core.inference.apis.llm import MegatronLLM
 from megatron.core.inference.batch_dimensions_utils import TOKEN_ROUNDER
 from megatron.core.inference.config import (
     AsyncScheduleMode,
@@ -42,9 +46,11 @@ from megatron.core.inference.contexts.dynamic_context import (
     RequestOverflowError,
     TokenOverflowError,
 )
+from megatron.core.inference.disaggregation.engine import StateHandoffDynamicInferenceEngine
 from megatron.core.inference.engines import DynamicInferenceEngine, dynamic_engine
 from megatron.core.inference.engines.dynamic_engine import EngineState, RequestEntry
 from megatron.core.inference.headers import Headers
+from megatron.core.inference.inference_client import InferenceClient, InferenceRequestAborted
 from megatron.core.inference.inference_request import (
     PREFIX_EOS_TOKEN_ID_FIELD,
     PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
@@ -65,6 +71,9 @@ from megatron.core.inference.inference_request import (
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
+    VLMInferenceWrapper,
+)
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -73,16 +82,20 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
+    get_gpt_layer_local_submodules,
     get_gpt_layer_with_inference_spec,
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
+from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.engines.ssm_test_helpers import (
@@ -98,6 +111,19 @@ try:
     HAVE_TORCH_MEMORY_SAVER = True
 except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
+
+
+def _async_inference_mode(function):
+    """Keep inference mode active while an async test coroutine executes."""
+
+    @wraps(function)
+    async def wrapped(*args, **kwargs):
+        # torch.inference_mode's regular decorator exits as soon as an async
+        # function returns its coroutine, before that coroutine is awaited.
+        with torch.inference_mode():
+            return await function(*args, **kwargs)
+
+    return wrapped
 
 
 class _ImageOnlyCapabilityWrapper:
@@ -1333,6 +1359,19 @@ def mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
     )
 
 
+class _StreamingTransportTokenizer:
+    """Pickle-safe tokenizer for the real coordinator transport test."""
+
+    vocab_size = 100
+    bos = None
+
+    def tokenize(self, prompt):
+        return prompt if isinstance(prompt, list) else [ord(char) % 99 for char in prompt]
+
+    def detokenize(self, tokens, **_kwargs):
+        return "".join(f"<{token}>" for token in tokens)
+
+
 @dataclass
 class DynamicEngineTestConfig:
     """Test configuration args."""
@@ -1357,6 +1396,8 @@ class DynamicEngineTestConfig:
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
     expert_model_parallel_size: int = 1
+    expert_tensor_parallel_size: int = 1
+    num_moe_experts: Optional[int] = None
     # EP process groups can also exercise dense models; build MoE layers only
     # when a test explicitly owns that model behavior.
     use_moe_layer_spec: bool = False
@@ -1373,6 +1414,7 @@ class DynamicEngineTestConfig:
     cuda_graph_mixed_prefill_count: Optional[int] = 16
     cuda_graph_max_tokens: int = 512
     fp8: bool = False
+    fp8_recipe: str = "tensorwise"
     hidden_size: Optional[int] = None
     model_provider: str = "gpt"
     flash_attention_version: Optional[int] = 2
@@ -1388,6 +1430,7 @@ class DynamicEngineTestConfig:
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
     enable_prefix_caching: bool = False
+    kv_transport_backend: str = "nixl"
     # Hybrid (Mamba) models need a Mamba-state cache budget for prefix caching to skip any
     # prefill. Left None, `DynamicInferenceContext` logs a warning and runs in memory-only
     # mode: prefixes are deduplicated but `prefix_skip_tokens` is forced to 0, so every token
@@ -1402,6 +1445,8 @@ class DynamicEngineTestConfig:
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
     inference_moe_token_dispatcher_type: str = "nccl"
+    inference_grouped_gemm_backend: str = "vllm"
+    inference_moe_nvfp4_recipe: Optional[str] = None
     moe_enable_routing_replay: bool = False
     # If False, do not build cuda graphs in the tests, even if
     # num_cuda_graphs is set.
@@ -1601,6 +1646,7 @@ class DynamicInferenceEngineTestBase:
                 static_kv_memory_pointers=test_config.static_kv_memory_pointers,
                 enable_chunked_prefill=test_config.enable_chunked_prefill,
                 enable_prefix_caching=test_config.enable_prefix_caching,
+                kv_transport_backend=test_config.kv_transport_backend,
                 prefix_caching_mamba_gb=test_config.prefix_caching_mamba_gb,
                 prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
                 use_flashinfer_fused_rope=test_config.use_flashinfer_fused_rope,
@@ -1620,7 +1666,7 @@ class DynamicInferenceEngineTestBase:
 
     @classmethod
     @torch.inference_mode()
-    def _build_test_env(cls, test_config):
+    def _build_test_env(cls, test_config, engine_cls=DynamicInferenceEngine):
         clear_nvte_env_vars()
         set_rounder(4)
 
@@ -1665,7 +1711,10 @@ class DynamicInferenceEngineTestBase:
                     else (
                         "fp32"
                         if test_config.transformer_impl == "inference_optimized"
-                        and test_config.expert_model_parallel_size > 1
+                        and (
+                            test_config.num_moe_experts is not None
+                            or test_config.expert_model_parallel_size > 1
+                        )
                         else None
                     )
                 ),
@@ -1681,17 +1730,22 @@ class DynamicInferenceEngineTestBase:
                 tensor_model_parallel_size=test_config.tensor_model_parallel_size,
                 pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
                 expert_model_parallel_size=test_config.expert_model_parallel_size,
+                expert_tensor_parallel_size=test_config.expert_tensor_parallel_size,
                 num_moe_experts=(
-                    None
-                    if test_config.expert_model_parallel_size == 1
-                    else test_config.expert_model_parallel_size
+                    test_config.num_moe_experts
+                    if test_config.num_moe_experts is not None
+                    else (
+                        None
+                        if test_config.expert_model_parallel_size == 1
+                        else test_config.expert_model_parallel_size
+                    )
                 ),
                 sequence_parallel=test_config.sequence_parallel,
                 pipeline_dtype=torch.bfloat16,
                 add_bias_linear=test_config.expert_model_parallel_size == 1
                 and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
-                fp8_recipe="tensorwise" if test_config.fp8 else None,
+                fp8_recipe=test_config.fp8_recipe if test_config.fp8 else None,
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_modules=test_config.cuda_graph_modules,
                 inference_cuda_graph_scope=(
@@ -1704,12 +1758,17 @@ class DynamicInferenceEngineTestBase:
                 activation_func=(
                     squared_relu
                     if test_config.transformer_impl == "inference_optimized"
-                    and test_config.expert_model_parallel_size > 1
+                    and (
+                        test_config.num_moe_experts is not None
+                        or test_config.expert_model_parallel_size > 1
+                    )
                     else torch.nn.functional.gelu
                 ),
                 inference_moe_token_dispatcher_type=(
                     test_config.inference_moe_token_dispatcher_type
                 ),
+                inference_grouped_gemm_backend=test_config.inference_grouped_gemm_backend,
+                inference_moe_nvfp4_recipe=test_config.inference_moe_nvfp4_recipe,
                 moe_enable_routing_replay=test_config.moe_enable_routing_replay,
                 normalization=(
                     "RMSNorm"
@@ -1783,17 +1842,22 @@ class DynamicInferenceEngineTestBase:
                 tensor_model_parallel_size=test_config.tensor_model_parallel_size,
                 pipeline_model_parallel_size=pp_size,
                 expert_model_parallel_size=test_config.expert_model_parallel_size,
+                expert_tensor_parallel_size=test_config.expert_tensor_parallel_size,
                 num_moe_experts=(
-                    None
-                    if test_config.expert_model_parallel_size == 1
-                    else test_config.expert_model_parallel_size
+                    test_config.num_moe_experts
+                    if test_config.num_moe_experts is not None
+                    else (
+                        None
+                        if test_config.expert_model_parallel_size == 1
+                        else test_config.expert_model_parallel_size
+                    )
                 ),
                 sequence_parallel=test_config.sequence_parallel,
                 pipeline_dtype=torch.bfloat16,
                 add_bias_linear=test_config.expert_model_parallel_size == 1
                 and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
-                fp8_recipe="tensorwise" if test_config.fp8 else None,
+                fp8_recipe=test_config.fp8_recipe if test_config.fp8 else None,
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_modules=test_config.cuda_graph_modules,
                 inference_cuda_graph_scope=(
@@ -1836,6 +1900,59 @@ class DynamicInferenceEngineTestBase:
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
             ).cuda()
+        elif test_config.model_provider == "vlm":
+            assert test_config.tensor_model_parallel_size == 1
+            assert test_config.pipeline_model_parallel_size == 1
+            transformer_config = TransformerConfig(
+                params_dtype=torch.bfloat16,
+                num_layers=2,
+                hidden_size=64,
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                inference_rng_tracker=True,
+                pipeline_dtype=torch.bfloat16,
+                inference_sampling_seed=test_config.random_seed,
+                transformer_impl="transformer_engine",
+            )
+            vision_config = TransformerConfig(
+                params_dtype=torch.bfloat16,
+                num_layers=1,
+                hidden_size=16,
+                num_attention_heads=2,
+                use_cpu_initialization=True,
+                transformer_impl="transformer_engine",
+            )
+            projection_config = TransformerConfig(
+                params_dtype=torch.bfloat16,
+                num_layers=1,
+                hidden_size=64,
+                ffn_hidden_size=32,
+                num_attention_heads=1,
+                use_cpu_initialization=True,
+                transformer_impl="local",
+            )
+            language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+            projection_submodules = deepcopy(get_submodules(get_gpt_layer_local_submodules().mlp))
+            assert isinstance(projection_submodules, MLPSubmodules)
+            transformer_config.language_model_type = "dummy"
+            vision_config.vision_model_type = "radio"
+            model = LLaVAModel(
+                language_transformer_config=transformer_config,
+                language_transformer_layer_spec=language_layer_spec,
+                language_vocab_size=test_config.vocab_size,
+                language_max_sequence_length=test_config.max_sequence_length,
+                vision_transformer_config=vision_config,
+                vision_transformer_layer_spec=deepcopy(language_layer_spec),
+                drop_vision_class_token=True,
+                vision_projection_config=projection_config,
+                vision_projection_layer_spec=projection_submodules,
+                img_h=28,
+                img_w=28,
+                patch_dim=14,
+                dynamic_resolution=True,
+                class_token_len=0,
+                radio_disable_cpe=True,
+            ).cuda()
         else:
             raise ValueError(f"Invalid model provider {test_config.model_provider}")
 
@@ -1855,7 +1972,11 @@ class DynamicInferenceEngineTestBase:
         )
 
         # Inference model wrapper.
-        inference_wrapped_model = GPTInferenceWrapper(model, inference_context)
+        inference_wrapped_model = (
+            VLMInferenceWrapper(model, inference_context)
+            if test_config.model_provider == "vlm"
+            else GPTInferenceWrapper(model, inference_context)
+        )
 
         # Note: the following is taken from AbstractModelInferenceWrapper.prep_model_for_inference().
         inference_wrapped_model.model_is_pipeline_parallel = not (
@@ -1863,17 +1984,20 @@ class DynamicInferenceEngineTestBase:
         )
 
         # Text generation controller.
+        tokenizer = types.SimpleNamespace(
+            vocab_size=test_config.vocab_size,
+            unk_token_id=0,
+            detokenize=lambda tokens, **_kwargs: "".join(f"<{token}>" for token in tokens),
+            convert_tokens_to_ids=lambda token: 98 if token == "<image>" else 0,
+        )
         text_generation_controller = TextGenerationController(
-            inference_wrapped_model=inference_wrapped_model,
-            tokenizer=types.SimpleNamespace(
-                vocab_size=test_config.vocab_size, detokenize=lambda tokens: "tokenized_prompt"
-            ),
+            inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
         )
 
         delete_cuda_graphs()
 
         # Inference engine.
-        engine = DynamicInferenceEngine(text_generation_controller, inference_context)
+        engine = engine_cls(text_generation_controller, inference_context)
 
         # Test env.
         env = DynamicEngineTestEnv(config=test_config, requests=requests, engine=engine)
@@ -3682,6 +3806,627 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         delete_cuda_graphs()
         reset_rounder()
         Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @_async_inference_mode
+    async def test_real_coordinator_streams_before_completion_and_matches_greedy(self):
+        """Cross real model steps, coordinator routing, and two independent clients."""
+        config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=513,
+            max_prompt_length=514,
+            num_tokens_to_generate=128,
+            num_gap_steps=0,
+            top_k=1,
+            context_max_requests=4,
+            context_max_tokens=256,
+            context_block_size_tokens=256,
+            enable_chunked_prefill=True,
+            enable_prefix_caching=True,
+        )
+        env = self._build_test_env(config)
+        env.engine.controller.tokenizer = _StreamingTransportTokenizer()
+
+        async def generate(prompt, params):
+            # Step on this loop: generate() would step on a helper thread, which starts on device 0.
+            future = env.engine.add_request(int(next(env.engine.request_counter)), prompt, params)
+            while not future.done():
+                await env.engine.async_step()
+            return future.result()
+
+        shared_prefix = [3, 5, 7, 11] * 64
+        prompts = [
+            [*shared_prefix, *([13, 17, 19, 23] * 65)[:257]],
+            [*shared_prefix, *([29, 31, 37, 41, 43] * 52)[:258]],
+        ]
+        baseline_params = [
+            SamplingParams(
+                num_tokens_to_generate=128,
+                termination_id=-1,
+                top_k=1,
+                return_log_probs=True,
+                top_n_logprobs=2,
+                skip_prompt_log_probs=True,
+                return_prompt_tokens=True,
+            ),
+            SamplingParams(
+                num_tokens_to_generate=48, termination_id=-1, top_k=1, return_prompt_tokens=True
+            ),
+        ]
+        baseline_tokens = []
+        for prompt, params in zip(prompts, baseline_params, strict=True):
+            completed = await generate(prompt, params)
+            baseline_tokens.append(list(completed.generated_tokens))
+        string_prompt = "serve"
+        string_baseline = await generate(
+            string_prompt,
+            SamplingParams(
+                num_tokens_to_generate=24, termination_id=-1, top_k=1, return_prompt_tokens=True
+            ),
+        )
+        env.engine.reset()
+        await generate(
+            shared_prefix, SamplingParams(num_tokens_to_generate=1, termination_id=-1, top_k=1)
+        )
+        chunked_request_ids = []
+        schedule_chunked_prefill = env.engine.schedule_chunked_prefill
+
+        def observe_chunked_prefill():
+            schedule_chunked_prefill()
+            if env.engine.context.chunked_prefill_request_id >= 0:
+                chunked_request_ids.append(env.engine.context.chunked_prefill_request_id)
+
+        env.engine.schedule_chunked_prefill = observe_chunked_prefill
+        # Send requests that share a prefix to the same engine at any data-parallel size.
+        env.engine.context.prefix_caching_routing_alpha = 0.0
+
+        coordinator_addr = await env.engine.start_listening_to_data_parallel_coordinator(
+            hostname="127.0.0.1"
+        )
+        rank = torch.distributed.get_rank()
+        clients = []
+        primary_client = None
+        rank_zero_error = None
+        streamed_global_ids = set()
+        try:
+            if rank == 0:
+                primary_client = InferenceClient(coordinator_addr)
+                peer_client = InferenceClient(coordinator_addr)
+                clients = [primary_client, peer_client]
+                for client in clients:
+                    client.start(loop=asyncio.get_running_loop(), connect_timeout_seconds=30)
+
+                stream_params = [
+                    SamplingParams(
+                        num_tokens_to_generate=128,
+                        termination_id=-1,
+                        top_k=1,
+                        return_log_probs=True,
+                        top_n_logprobs=2,
+                        skip_prompt_log_probs=True,
+                        return_prompt_tokens=True,
+                        streaming_interval=2,
+                    ),
+                    SamplingParams(
+                        num_tokens_to_generate=48,
+                        termination_id=-1,
+                        top_k=1,
+                        return_prompt_tokens=True,
+                        streaming_interval=3,
+                    ),
+                ]
+                streams = [
+                    client.add_request_streaming(prompt, params)
+                    for client, prompt, params in zip(clients, prompts, stream_params, strict=True)
+                ]
+                assert [stream.request_id for stream in streams] == [0, 0]
+
+                async def collect(stream, expect_logprobs):
+                    partials = []
+                    final = None
+                    first_partial_was_live = False
+                    final_count = 0
+                    async for item in stream:
+                        if "partial" in item:
+                            partial = item["partial"]
+                            if not partials:
+                                first_partial_was_live = not stream.finished
+                            assert partial["new_tokens"]
+                            if expect_logprobs:
+                                assert len(partial["new_tokens"]) == len(partial["new_log_probs"])
+                                assert len(partial["new_tokens"]) == len(
+                                    partial["new_top_n_logprobs"]
+                                )
+                            else:
+                                assert "new_log_probs" not in partial
+                                assert "new_top_n_logprobs" not in partial
+                            partials.append(partial)
+                        else:
+                            final_count += 1
+                            final = item["final"]
+                    assert first_partial_was_live
+                    assert len(partials) >= 2
+                    assert final_count == 1
+                    assert final is not None
+                    streamed_prefix = []
+                    histories = []
+                    for partial in partials:
+                        streamed_prefix.extend(partial["new_tokens"])
+                        histories.append(list(streamed_prefix))
+                    final_tokens = list(final["generated_tokens"])
+                    assert all(final_tokens[: len(history)] == history for history in histories)
+                    return partials, final
+
+                collected = await asyncio.wait_for(
+                    asyncio.gather(collect(streams[0], True), collect(streams[1], False)),
+                    timeout=120,
+                )
+                partials, finals = zip(*collected, strict=True)
+                assert [list(final["generated_tokens"]) for final in finals] == baseline_tokens
+                assert partials[0][0]["request_id"] != partials[1][0]["request_id"]
+                for request_partials, final in zip(partials, finals, strict=True):
+                    assert {partial["request_id"] for partial in request_partials} == {
+                        final["request_id"]
+                    }
+                assert len(finals[0]["generated_log_probs"]) == len(finals[0]["generated_tokens"])
+                assert len(finals[0]["generated_top_n_logprobs"]) == len(
+                    finals[0]["generated_tokens"]
+                )
+                assert any(final["num_cached_tokens"] >= len(shared_prefix) for final in finals)
+                streamed_global_ids = {
+                    partial["request_id"]
+                    for request_partials in partials
+                    for partial in request_partials
+                }
+                for client in clients:
+                    assert client.streams == {}
+                    assert client.request_submission_times == {}
+
+                class CurrentLoopBridge:
+                    def __init__(self, loop):
+                        self.loop = loop
+
+                    async def run_async(self, coroutine):
+                        return await coroutine
+
+                    def run_sync(self, coroutine):
+                        return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result()
+
+                def high_level(cls):
+                    llm = cls.__new__(cls)
+                    llm._is_primary_rank = True
+                    llm._use_coordinator = True
+                    llm._shutdown_called = False
+                    llm._loop_manager = CurrentLoopBridge(asyncio.get_running_loop())
+                    llm._coord_runtime = types.SimpleNamespace(client=primary_client)
+                    return llm
+
+                high_level_params = SamplingParams(
+                    num_tokens_to_generate=24, termination_id=-1, top_k=1, return_prompt_tokens=True
+                )
+                async_result = await high_level(MegatronAsyncLLM).generate(
+                    prompts[0], high_level_params
+                )
+                sync_llm = high_level(MegatronLLM)
+                # The sync facade blocks while its bridge schedules on the client loop.
+                [sync_result] = await asyncio.to_thread(
+                    sync_llm.generate,
+                    string_prompt,
+                    SamplingParams(
+                        num_tokens_to_generate=24,
+                        termination_id=-1,
+                        top_k=1,
+                        return_prompt_tokens=True,
+                    ),
+                )
+                assert list(async_result["generated_tokens"]) == baseline_tokens[0][:24]
+                assert list(sync_result["generated_tokens"]) == list(
+                    string_baseline.generated_tokens
+                )
+
+                cancelled_stream = primary_client.add_request_streaming(
+                    prompts[1],
+                    SamplingParams(
+                        num_tokens_to_generate=128, termination_id=-1, top_k=1, streaming_interval=1
+                    ),
+                )
+                survivor_stream = peer_client.add_request_streaming(
+                    prompts[0],
+                    SamplingParams(
+                        num_tokens_to_generate=128, termination_id=-1, top_k=1, streaming_interval=2
+                    ),
+                )
+                first_cancelled_item = await asyncio.wait_for(anext(cancelled_stream), timeout=30)
+                assert "partial" in first_cancelled_item
+                cancel_ack = primary_client.abort_request_and_wait(cancelled_stream.request_id)
+
+                async def drain_cancelled():
+                    with pytest.raises(InferenceRequestAborted):
+                        async for _ in cancelled_stream:
+                            pass
+
+                cancel_results = await asyncio.wait_for(
+                    asyncio.gather(cancel_ack, drain_cancelled(), collect(survivor_stream, False)),
+                    timeout=120,
+                )
+                _, survivor_result = cancel_results[2]
+                assert list(survivor_result["generated_tokens"]) == baseline_tokens[0]
+                assert cancelled_stream.request_id not in primary_client.streams
+                assert cancelled_stream.request_id not in primary_client.request_submission_times
+                assert cancelled_stream.request_id not in primary_client._pending_source_requests
+        except BaseException as error:
+            rank_zero_error = error
+        finally:
+            if rank == 0 and primary_client is not None:
+                primary_client.pause_engines()
+            await asyncio.wait_for(env.engine.wait_until(EngineState.PAUSED), timeout=30)
+            if rank == 0 and primary_client is not None:
+                primary_client.stop_engines()
+            await asyncio.wait_for(asyncio.shield(env.engine.engine_loop_task), timeout=30)
+            if rank == 0 and primary_client is not None:
+                primary_client.shutdown_coordinator()
+                for client in clients:
+                    client.stop()
+                process = env.engine.inference_coordinator_process
+                process.join(timeout=10)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+
+        # With data parallelism the coordinator may route a request to any rank's engine.
+        witnesses = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(
+            witnesses,
+            (
+                env.engine.context.async_sched_step_count,
+                env.engine._prefill_tokens_skipped,
+                chunked_request_ids,
+            ),
+        )
+        if rank_zero_error is not None:
+            raise rank_zero_error
+        if rank == 0:
+            assert sum(witness[0] for witness in witnesses) > 0
+            assert sum(witness[1] for witness in witnesses) >= len(shared_prefix)
+            assert streamed_global_ids & set().union(*(witness[2] for witness in witnesses))
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        int(os.environ.get("WORLD_SIZE", "1")) != 2,
+        reason="the real KV handoff test requires exactly two distributed ranks",
+    )
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("kv_transport_backend", ["nccl", "nixl"])
+    @torch.inference_mode()
+    def test_real_kv_handoff_streams_imported_decode_and_matches_greedy(self, kv_transport_backend):
+        """Transfer real prompt KV by push and pull backends, then stream decode."""
+        rank = torch.distributed.get_rank()
+        config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=8,
+            max_prompt_length=8,
+            num_tokens_to_generate=6,
+            max_sequence_length=24,
+            top_k=1,
+            enable_prefix_caching=True,
+            kv_transport_backend=kv_transport_backend,
+            context_block_size_tokens=256,
+            context_max_requests=4,
+            context_max_tokens=32,
+        )
+        prompt = [11, 12, 13, 14, 15, 16, 17, 18]
+
+        baseline_env = self._build_test_env(config)
+        baseline_params = SamplingParams(num_tokens_to_generate=6, termination_id=-1, top_k=1)
+        baseline_future = baseline_env.engine.add_request(70, prompt, baseline_params)
+        for _ in range(32):
+            if baseline_future.done():
+                break
+            baseline_env.engine.step_modern()
+        assert baseline_future.done()
+        baseline_tokens = list(baseline_future.result().generated_tokens)
+        del baseline_future, baseline_env
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        role = "prefill" if rank == 0 else "decode"
+        env = self._build_test_env(config, engine_cls=StateHandoffDynamicInferenceEngine)
+        engine = env.engine
+        engine.setup_kv_transfer(role)
+        if role == "decode":
+            engine.use_coordinator = True
+            engine.is_mp_coordinator = True
+            engine.socket_for_receiving_requests = mock.MagicMock()
+
+        decode_meta = [engine._kv_peer_metas if role == "decode" else None]
+        torch.distributed.broadcast_object_list(decode_meta, src=1)
+
+        handoff = [None]
+        if role == "prefill":
+            prefill_params = SamplingParams(
+                num_tokens_to_generate=0,
+                termination_id=-1,
+                top_k=1,
+                do_kv_handoff=True,
+                skip_prompt_log_probs=True,
+            )
+            prefill_future = engine.add_request(71, prompt, prefill_params)
+            for _ in range(32):
+                if prefill_future.done():
+                    break
+                engine.step_modern()
+            assert prefill_future.done()
+            prefilled = prefill_future.result()
+            assert prefilled.generated_tokens == []
+            assert prefilled.disaggregated_params["kv_meta"]["resume_tokens"]
+            handoff[0] = prefilled.disaggregated_params
+        torch.distributed.broadcast_object_list(handoff, src=0)
+
+        decode_future = None
+        pending = None
+        if role == "decode":
+            # Match native KV_TRANSFER_READY -> SEND_KV ordering around the backend calls.
+            if kv_transport_backend == "nccl":
+                engine._notify_kv_transfer_ready = lambda _rid, _cached: (
+                    torch.distributed.barrier()
+                )
+            stream_params = SamplingParams(
+                num_tokens_to_generate=6,
+                termination_id=-1,
+                top_k=1,
+                streaming=True,
+                streaming_interval=1,
+            )
+            decode_future = engine.add_request_with_kv_handoff(
+                71, prompt, stream_params, handoff[0]["kv_meta"], handoff[0]["block_ids"]
+            )
+            assert len(engine._pending_kv_imports) == 1
+            pending = engine._pending_kv_imports[0]
+            assert pending.handle is not None
+        else:
+            if kv_transport_backend == "nccl":
+                # Both ranks enter the production backend concurrently (isend versus irecv).
+                torch.distributed.barrier()
+                engine.push_handoff_kv(71, [decode_meta[0]])
+                assert engine.pending_kv_push_count == 1
+        torch.distributed.barrier()
+
+        if role == "prefill":
+            if kv_transport_backend == "nccl":
+                for _, handles in engine._pending_kv_pushes:
+                    for handle in handles:
+                        handle.wait()
+        else:
+            pending.handle.wait()
+        torch.distributed.barrier()
+
+        block_ids = handoff[0]["block_ids"] if role == "prefill" else pending.local_blocks
+        transferred = engine.context.memory_buffer[:, :, block_ids].contiguous()
+        block_digest = hashlib.sha256(
+            transferred.view(torch.uint8).cpu().numpy().tobytes()
+        ).hexdigest()
+        digests = [None, None]
+        torch.distributed.all_gather_object(digests, block_digest)
+        assert digests[0] == digests[1]
+
+        if role == "prefill":
+            assert engine._poll_pending_kv_pushes() == int(kv_transport_backend == "nccl")
+            engine.release_handoff_blocks(71)
+            assert engine.pinned_handoff_block_count == 0
+        else:
+            assert engine._poll_pending_kv_imports() == 1
+            assert engine._admit_pending_kv_imports() == 1
+            assert not decode_future.done()
+            assert engine.has_unfinished_requests()
+
+            wire_calls = engine.socket_for_receiving_requests.send_multipart.call_args_list
+            partial_frames = [
+                call.args[0]
+                for call in wire_calls
+                if msgpack.unpackb(call.args[0][0], raw=False)[0]
+                == Headers.ENGINE_REPLY_PARTIAL.value
+            ]
+            assert len(partial_frames) == 1
+            imported_partial = msgpack.unpackb(partial_frames[0][1], raw=False)
+            assert imported_partial["request_id"] == 71
+            assert imported_partial["new_tokens"] == handoff[0]["kv_meta"]["resume_tokens"][:1]
+            streamed_tokens = list(imported_partial["new_tokens"])
+            sent_calls = len(wire_calls)
+
+            for _ in range(32):
+                if decode_future.done():
+                    break
+                engine.step_modern()
+                calls = engine.socket_for_receiving_requests.send_multipart.call_args_list
+                for call in calls[sent_calls:]:
+                    frames = call.args[0]
+                    if (
+                        msgpack.unpackb(frames[0], raw=False)[0]
+                        == Headers.ENGINE_REPLY_PARTIAL.value
+                    ):
+                        streamed_tokens.extend(msgpack.unpackb(frames[1], raw=False)["new_tokens"])
+                sent_calls = len(calls)
+            assert decode_future.done()
+
+            engine._loop.run_until_complete(asyncio.sleep(0))
+            decoded = decode_future.result()
+            assert decoded.generated_tokens == baseline_tokens
+            assert streamed_tokens == decoded.generated_tokens[: len(streamed_tokens)]
+            assert streamed_tokens != decoded.generated_tokens
+            final_frames = [
+                call.args[0]
+                for call in engine.socket_for_receiving_requests.send_multipart.call_args_list
+                if msgpack.unpackb(call.args[0][0], raw=False)[0] == Headers.ENGINE_REPLY.value
+            ]
+            assert len(final_frames) == 1
+            assert msgpack.unpackb(final_frames[0][1], raw=False)["request_id"] == 71
+            assert not engine.requests
+            assert not engine._pending_kv_imports
+
+        torch.distributed.barrier()
+        if kv_transport_backend == "nixl":
+            engine._kv_transfer_agent.close()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("modality", ["image", "video"])
+    @torch.inference_mode()
+    def test_real_vlm_media_stream_matches_nonstreaming(self, modality):
+        """Real vision and language forwards execute before live media-token partials."""
+        config = DynamicEngineTestConfig(
+            model_provider="vlm",
+            num_requests=0,
+            min_prompt_length=6,
+            max_prompt_length=6,
+            num_tokens_to_generate=8,
+            max_sequence_length=32,
+            top_k=1,
+            context_max_requests=4,
+            context_max_tokens=32,
+        )
+        env = self._build_test_env(config)
+        engine = env.engine
+        model = engine.controller.inference_wrapped_model.model
+        prompt = [11, 98, 13]
+        frame_count = 1 if modality == "image" else 2
+        media = torch.linspace(
+            -1, 1, frame_count * 4 * 3 * 14 * 14, dtype=torch.bfloat16, device="cuda"
+        ).reshape(1, frame_count * 4, 3 * 14 * 14)
+        media_kwargs = {
+            "imgs": media,
+            "imgs_sizes": torch.tensor([[28, 28]] * frame_count, dtype=torch.int32, device="cuda"),
+        }
+        if modality == "video":
+            media_kwargs["num_frames"] = torch.tensor([frame_count], dtype=torch.int32)
+
+        runtime = Counter()
+        active_request = [None]
+
+        def vision_forwarded(_module, _args, _output):
+            runtime["vision-forwards"] += 1
+
+        def language_forwarded(_module, _args, kwargs):
+            runtime["language-forwards"] += 1
+            request = active_request[0]
+            decoder_input = kwargs.get("decoder_input")
+            step_image_token_mask = engine.context.current_image_token_mask()
+            if (
+                request is None
+                or decoder_input is None
+                or decoder_input.shape[0] <= 1
+                or step_image_token_mask is None
+            ):
+                return
+            step_image_token_mask = step_image_token_mask[0]
+            image_positions = step_image_token_mask >= 0
+            if not image_positions.any():
+                return
+            image_indices = step_image_token_mask[image_positions]
+            image_embeddings = request.image_embeddings.permute(1, 0, 2).reshape(
+                -1, decoder_input.shape[-1]
+            )
+            runtime["vision-injections"] += int(
+                torch.equal(decoder_input[:, 0][image_positions], image_embeddings[image_indices])
+            )
+
+        vision_hook = model.vision_model.register_forward_hook(vision_forwarded)
+        language_hook = model.language_model.register_forward_pre_hook(
+            language_forwarded, with_kwargs=True
+        )
+
+        def submit_and_drain(request_id, *, streaming, refit_epoch=None):
+            params = SamplingParams(
+                num_tokens_to_generate=8,
+                termination_id=-1,
+                top_k=1,
+                streaming=streaming,
+                streaming_interval=1,
+                return_prompt_tokens=True,
+            )
+            future = engine.add_request(request_id, prompt, params, **media_kwargs)
+            active_request[0] = engine.get_request(request_id)
+            assert active_request[0].image_embeddings.is_cuda
+            assert torch.isfinite(active_request[0].image_embeddings).all()
+            assert int((active_request[0].image_token_mask >= 0).sum()) == (
+                active_request[0].image_embeddings.shape[0]
+                * active_request[0].image_embeddings.shape[1]
+            )
+            partial_history = []
+            first_partial_live = False
+            refit_delivered = False
+            sent = 0
+            while not future.done():
+                engine.step_modern()
+                if not streaming:
+                    continue
+                calls = engine.socket_for_receiving_requests.send_multipart.call_args_list
+                for call in calls[sent:]:
+                    frames = call.args[0]
+                    header, request_ids = msgpack.unpackb(frames[0], raw=False)
+                    if header != Headers.ENGINE_REPLY_PARTIAL.value:
+                        continue
+                    assert request_ids == [request_id]
+                    partial = msgpack.unpackb(frames[1], raw=False)
+                    if not partial_history:
+                        first_partial_live = not future.done() and engine.has_unfinished_requests()
+                    partial_history.extend(partial["new_tokens"])
+                    if refit_epoch is not None and not refit_delivered:
+                        vision_forwards = runtime["vision-forwards"]
+                        engine.socket_for_receiving_requests.recv_multipart.side_effect = [
+                            [
+                                msgpack.packb(
+                                    [Headers.SET_GENERATION_EPOCH.value, refit_epoch],
+                                    use_bin_type=True,
+                                )
+                            ],
+                            dynamic_engine.zmq.Again,
+                        ]
+                        assert engine.schedule_requests() == 1
+                        assert runtime["vision-forwards"] == vision_forwards + 1
+                        assert engine.get_request(request_id).policy_epoch[-1][1] == refit_epoch
+                        refit_delivered = True
+                sent = len(calls)
+            assert refit_delivered is (refit_epoch is not None)
+            return future.result(), partial_history, first_partial_live
+
+        try:
+            baseline, _, _ = submit_and_drain(0, streaming=False)
+            engine.reset()
+            engine.use_coordinator = True
+            engine.is_mp_coordinator = True
+            engine.socket_for_receiving_requests = mock.MagicMock()
+            engine.model_parallel_publisher_socket = mock.MagicMock()
+            streamed, history, first_partial_live = submit_and_drain(
+                1, streaming=True, refit_epoch=7
+            )
+
+            assert runtime["vision-forwards"] == 3
+            assert runtime["language-forwards"] > 0
+            assert runtime["vision-injections"] == 2
+            assert streamed.policy_epoch[-1][1] == 7
+            assert first_partial_live
+            assert history
+            assert history == streamed.generated_tokens[: len(history)]
+            assert history != streamed.generated_tokens
+            assert streamed.generated_tokens == baseline.generated_tokens
+            final_frames = [
+                call.args[0]
+                for call in engine.socket_for_receiving_requests.send_multipart.call_args_list
+                if msgpack.unpackb(call.args[0][0], raw=False)[0] == Headers.ENGINE_REPLY.value
+            ]
+            assert len(final_frames) == 1
+            assert msgpack.unpackb(final_frames[0][1], raw=False)["request_id"] == 1
+        finally:
+            vision_hook.remove()
+            language_hook.remove()
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -6352,6 +7097,104 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ]
         assert record[-1].policy_epoch == expected_policy_epoch
         assert record[-1].kv_cache_epoch is None
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_streamed_partials_follow_generation_epoch_messages(self):
+        """Epoch control messages stamp live requests, and streamed partials follow them."""
+        PROMPT_LEN = 8
+        NUM_TOKENS = 8
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=PROMPT_LEN,
+            max_prompt_length=PROMPT_LEN,
+            num_tokens_to_generate=NUM_TOKENS,
+        )
+        env = self._build_test_env(test_config)
+        engine = env.engine
+        engine.use_coordinator = True
+        engine.is_mp_coordinator = True
+        engine.socket_for_receiving_requests = mock.MagicMock()
+        engine.model_parallel_publisher_socket = mock.MagicMock()
+        streaming_history = {0: [], 1: []}
+        partial_epochs = Counter()
+        current_epoch = [None]
+
+        for i in range(2):
+            prompt_tokens = torch.randint(
+                0,
+                test_config.vocab_size - 1,
+                (PROMPT_LEN,),
+                dtype=torch.int64,
+                device=torch.cuda.current_device(),
+            )
+            engine._add_request(
+                DynamicInferenceRequest(
+                    request_id=i,
+                    prompt_tokens=prompt_tokens,
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=NUM_TOKENS,
+                        termination_id=-1,
+                        streaming=True,
+                        streaming_interval=1,
+                    ),
+                )
+            )
+
+        def step_and_capture():
+            sent = len(engine.socket_for_receiving_requests.send_multipart.call_args_list)
+            result = engine.step_modern()
+            calls = engine.socket_for_receiving_requests.send_multipart.call_args_list
+            for call in calls[sent:]:
+                frames = call.args[0]
+                if msgpack.unpackb(frames[0], raw=False)[0] != Headers.ENGINE_REPLY_PARTIAL.value:
+                    continue
+                for frame in frames[1:]:
+                    partial = msgpack.unpackb(frame, raw=False)
+                    request_id = partial["request_id"]
+                    assert request_id in engine.requests
+                    request = engine.get_request(request_id)
+                    if current_epoch[0] is not None:
+                        assert request.policy_epoch[-1][1] == current_epoch[0]
+                        partial_epochs[(request_id, current_epoch[0])] += 1
+                    streaming_history[request_id].extend(partial["new_tokens"])
+            return result
+
+        def set_epoch(epoch):
+            """Deliver the production epoch control message to the scheduler."""
+            message = [
+                msgpack.packb([Headers.SET_GENERATION_EPOCH.value, epoch], use_bin_type=True)
+            ]
+            engine.socket_for_receiving_requests.recv_multipart.side_effect = [
+                message,
+                dynamic_engine.zmq.Again,
+            ]
+            assert engine.schedule_requests() == 1
+            assert engine._generation_epoch == epoch
+            current_epoch[0] = epoch
+
+        step_and_capture()
+        finished_requests = []
+        for epoch, steps in ((0, 2), (1, 3), (2, None)):
+            set_epoch(epoch)
+            while steps is None or steps > 0:
+                if not engine.has_unfinished_requests():
+                    break
+                finished_requests.extend(step_and_capture()["finished_requests"])
+                steps = None if steps is None else steps - 1
+
+        assert set(partial_epochs) == {
+            (request_id, epoch) for request_id in streaming_history for epoch in (0, 1, 2)
+        }
+        assert len(finished_requests) == 2
+        for finished_request in finished_requests:
+            assert [epoch for _, epoch in finished_request.policy_epoch] == [0, 1, 2]
+            history = streaming_history[finished_request.request_id]
+            assert history == finished_request.generated_tokens[: len(history)]
+            assert len(history) < len(finished_request.generated_tokens)
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
