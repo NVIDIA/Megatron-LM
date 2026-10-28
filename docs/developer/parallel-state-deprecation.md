@@ -288,8 +288,12 @@ pg_collection = build_dense_pg_collection(tp=2, pp=2, dp=2)
 parallel_state.register_process_groups(pg_collection)
 ```
 
-A process registers one collection. A job with several grids passes each model its own
-collection.
+The accessors then return the groups that the collection sets, and the accessor of a group that
+it does not set reports that group as not initialized. With the `HyperCommGrid` example
+registered, the data-parallel accessors and `use_mpu_process_groups()` return the ranks that
+`initialize_model_parallel()` gives, except for the Gloo groups, which the example does not
+build, and the GTP groups, which it leaves `None`. A process registers one collection. A job with
+several grids passes each model its own collection.
 
 **2. Pass the collection to every Megatron Core API that takes one.** The model, RNG seeding,
 DDP, the optimizer, the schedule and gradient finalization each fall back to the global grid
@@ -330,6 +334,9 @@ losses = forward_backward_func(
 )
 ```
 
+`get_megatron_optimizer()` uses Gloo groups by default, which the collection of
+`initialize_model_parallel()` has. With a collection that has none, such as the `HyperCommGrid`
+example, pass `use_gloo_process_groups=False`.
 [Passing the collection](process-group-collection.md#passing-the-collection) lists more details.
 
 For inference, the dynamic engine takes the groups of the model it serves. Pass the collection
@@ -356,13 +363,17 @@ from [Select the matching group](#select-the-matching-group):
 
 ```python
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage
-from megatron.core.utils import get_pg_rank, get_pg_size
 
-tp_size = get_pg_size(pg_collection.tp)  # was get_tensor_model_parallel_world_size()
-dp_rank = get_pg_rank(pg_collection.dp_gtp_remat)  # was get_data_parallel_rank()
+tp_size = pg_collection.tp.size()  # was get_tensor_model_parallel_world_size()
+dp_rank = pg_collection.dp_gtp_remat.rank()  # was get_data_parallel_rank()
 if is_pp_last_stage(pg_collection.pp):  # was is_pipeline_last_stage()
     loss = reduce_loss(output)
 ```
+
+Call `rank()` and `size()` on a group that the collection must set, so that a missing field
+fails instead of returning a wrong value. `get_pg_rank()` and `get_pg_size()` return 0 and 1 for a
+field that is `None` or not set; use them only for a group that can be absent, such as
+`gtp_remat` on a grid without GTP.
 
 **4. Stop using `use_mpu_process_groups()`.** Use the collection from step 1, or
 `get_registered_process_groups()` where nothing passes one. Copy it with `copy.copy()` before

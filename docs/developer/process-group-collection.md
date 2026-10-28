@@ -64,6 +64,14 @@ def build_dense_pg_collection(tp: int, pp: int, dp: int, rank_offset: int = 0):
     pgs.tp_ep = pgs.tp
     pgs.tp_ep_pp = pgs.mp
     pgs.expt_dp = pgs.dp
+    # Without GTP and with one distributed-optimizer instance, the GTP-inclusive and
+    # per-instance groups have the ranks of the groups above, as in initialize_model_parallel.
+    pgs.dp_gtp_remat = pgs.dp
+    pgs.dp_cp_gtp_remat = pgs.dp_cp
+    pgs.intra_dp_cp = pgs.dp_cp
+    pgs.expt_dp_gtp_remat = pgs.expt_dp
+    pgs.intra_expt_dp = pgs.expt_dp
+    pgs.tp_ep_pp_with_egtp_remat = pgs.tp_ep_pp
 
     # Word embeddings live on the first and last pipeline stages, position embeddings on the
     # first. new_group is collective, so every rank creates every group.
@@ -89,7 +97,9 @@ pipeline_model_parallel_size=2)` assigns.
 
 Set every field that the components you call read. An unset field reads as `None`, and some
 components still treat `None` as "use the global group". If an axis is not used, set its field
-to `None` explicitly, as the example does for GTP.
+to `None` explicitly, as the example does for GTP. A registered collection also serves the
+`parallel_state` accessors, and the accessor of a field that is not set reports its group as not
+initialized, so also set the fields that code which still reads `parallel_state` uses.
 
 The example sets the fields that a dense GPT model uses when it is trained with
 `DistributedDataParallel`, `get_megatron_optimizer`, and the Megatron Core schedules:
@@ -102,6 +112,8 @@ The example sets the fields that a dense GPT model uses when it is trained with
 | `embd`, `pos_embd` | Embedding gradient reduction across pipeline stages; `None` on ranks outside the group |
 | `ep`, `expt_tp`, `tp_ep`, `tp_ep_pp`, `expt_dp` | Expert groups; DDP and the optimizer require some of them even without experts |
 | `gtp_remat`, `expt_gtp_remat` | GTP weight rematerialization; `None` when off |
+| `dp_gtp_remat`, `dp_cp_gtp_remat`, `expt_dp_gtp_remat`, `tp_ep_pp_with_egtp_remat` | The data-parallel and expert groups that include the GTP peers; the same groups as `dp`, `dp_cp`, `expt_dp` and `tp_ep_pp` when GTP is off. The data-parallel accessors return them by default, and the fallbacks read them |
+| `intra_dp_cp`, `intra_expt_dp` | The data-parallel groups of one distributed-optimizer instance; `dp_cp` and `expt_dp` with one instance |
 
 Other layouts need more:
 
@@ -112,8 +124,9 @@ Other layouts need more:
   ranks. `build_inference_pg_collection` in `megatron/core/inference/shards.py` uses a second
   grid; `examples/mimo/training/topology.py` registers an expert view on the same grid with
   `HyperCommGrid.register_view`, and also covers GTP and one grid per module.
-- **More than one distributed-optimizer instance:** also set `intra_dp_cp`, `intra_expt_dp`, and
-  `inter_dist_opt`.
+- **More than one distributed-optimizer instance:** set `intra_dp_cp` and `intra_expt_dp` to the
+  data-parallel groups within one instance, `intra_dist_opt` to the ranks of one instance, and
+  `inter_dist_opt` to the group across the instances.
 
 ## Passing the collection
 
