@@ -81,7 +81,7 @@ def _validated(extra):
 @pytest.fixture
 def warnings_log(monkeypatch):
     log = []
-    monkeypatch.setattr(argument_utils, "_warn", log.append)
+    monkeypatch.setattr(argument_utils, "warn_rank_0", log.append)
     return log
 
 

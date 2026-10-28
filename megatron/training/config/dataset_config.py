@@ -25,11 +25,21 @@ nothing here runs for them.
 from dataclasses import dataclass, field, fields
 from typing import Any
 
-from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
-from megatron.core.datasets.gpt_fim_dataset import GPTFIMDatasetConfig
+from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
+from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
+from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 
 DATALOADER_TYPES = ("single", "cyclic", "external")
-DATASET_FAMILIES = ("gpt", "fim", "varlen", "sft")
+# Family -> (dataset class, mock dataset class or None): the legacy family flags select the class
+# and DataConfig.validate() checks the class against the config.
+DATASET_CLASSES: dict[str, tuple[type, type | None]] = {
+    "gpt": (GPTDataset, MockGPTDataset),
+    "fim": (GPTFIMDataset, None),
+    "varlen": (VarlenDataset, MockVarlenDataset),
+    "sft": (SFTDataset, MockSFTDataset),
+}
+DATASET_FAMILIES = tuple(DATASET_CLASSES)
 
 # Fields of the dataset config that other container sections own: the parallel layout (the model
 # config) and the validation flags (the validation config). PretrainConfigContainer writes them at
@@ -92,39 +102,25 @@ class DataloaderConfig:
             self.persistent_workers = False
 
 
-def _dataset_class_table() -> dict[str, tuple[type, type | None]]:
-    """Family -> (dataset class, mock dataset class). Imported lazily: the dataset modules are not
-    part of the config import path."""
-    from megatron.core.datasets.gpt_dataset import GPTDataset, MockGPTDataset
-    from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset
-    from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
-    from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
-
-    return {
-        "gpt": (GPTDataset, MockGPTDataset),
-        "fim": (GPTFIMDataset, None),
-        "varlen": (VarlenDataset, MockVarlenDataset),
-        "sft": (SFTDataset, MockSFTDataset),
-    }
-
-
-def dataset_class_for(family: str, mock: bool) -> type | None:
-    """The dataset class of a family, or its mock class (``None`` when the family has none)."""
-    if family not in DATASET_FAMILIES:
+def dataset_type_from_family(family: str, mock: bool) -> type | None:
+    """The dataset class of a family, or its mock class (``None`` when the family has none); the
+    inverse of ``dataset_family_from_type``."""
+    if family not in DATASET_CLASSES:
         raise ValueError(f"dataset family must be one of {DATASET_FAMILIES}, got {family!r}.")
-    real, mock_class = _dataset_class_table()[family]
+    real, mock_class = DATASET_CLASSES[family]
     return mock_class if mock else real
 
 
-def classify_dataset_class(dataset_type: Any) -> tuple[str, bool]:
-    """``(family, is_mock)`` of one of the seven supported dataset classes."""
-    for family, (real, mock_class) in _dataset_class_table().items():
+def dataset_family_from_type(dataset_type: Any) -> tuple[str, bool]:
+    """``(family, is_mock)`` of one of the seven supported dataset classes; the inverse of
+    ``dataset_type_from_family``."""
+    for family, (real, mock_class) in DATASET_CLASSES.items():
         if dataset_type is real:
             return family, False
         if mock_class is not None and dataset_type is mock_class:
             return family, True
     known = sorted(
-        cls.__name__ for pair in _dataset_class_table().values() for cls in pair if cls is not None
+        cls.__name__ for pair in DATASET_CLASSES.values() for cls in pair if cls is not None
     )
     raise ValueError(
         f"dataset_type must be one of the dataset classes {known} (in YAML: "
@@ -140,7 +136,7 @@ def has_data_source(dataset: GPTDatasetConfig) -> bool:
 
 def is_packed_sequence(dataset_type: type, dataset: GPTDatasetConfig) -> bool:
     """Packed (THD) samples: built on every pipeline stage, and get_batch expects cu_seqlens."""
-    family, _mock = classify_dataset_class(dataset_type)
+    family, _mock = dataset_family_from_type(dataset_type)
     if family == "sft":
         return True
     if family == "varlen":
@@ -151,7 +147,7 @@ def is_packed_sequence(dataset_type: type, dataset: GPTDatasetConfig) -> bool:
 def resolve_dataset_class(
     dataset: GPTDatasetConfig | None, dataset_type: type | None
 ) -> type | None:
-    """The dataset class for a section, checked against the config.
+    """The dataset class the config entails, or the given one checked against the config.
 
     Read-only: ``DataConfig.validate()`` calls it and ``DataConfig.finalize()`` commits its result.
     With no class given, a ``GPTFIMDatasetConfig`` with a source resolves to ``GPTFIMDataset``, a
@@ -169,16 +165,16 @@ def resolve_dataset_class(
     if dataset_type is None:
         family = config_family or "gpt"
         if source:
-            return dataset_class_for(family, mock=False)
-        mock_class = dataset_class_for(family, mock=True)
+            return dataset_type_from_family(family, mock=False)
+        mock_class = dataset_type_from_family(family, mock=True)
         if mock_class is None:
             raise ValueError(
                 f"No data source is declared and there is no mock dataset for the {family} "
                 "family; declare blend or blend_per_split."
             )
         return mock_class
-    family, mock = classify_dataset_class(dataset_type)
-    real, mock_class = _dataset_class_table()[family]
+    family, mock = dataset_family_from_type(dataset_type)
+    real, mock_class = DATASET_CLASSES[family]
     if mock and source:
         raise ValueError(
             f"{dataset_type.__name__} is a mock dataset and takes no data source; drop blend / "
@@ -263,7 +259,7 @@ class DataConfig:
             )
         self.dataset.validate()
 
-    def dataset_build(self) -> tuple[type, GPTDatasetConfig, bool]:
+    def builder_inputs(self) -> tuple[type, GPTDatasetConfig, bool]:
         """``(dataset class, dataset config with its tokenizer, is_packed_sequence)`` for the
         builder."""
         if self.dataset is None or self.dataset_type is None:

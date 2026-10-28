@@ -56,7 +56,7 @@ class BlendedMegatronDatasetBuilder(object):
         self.config = config
 
         # The config may have been completed after construction (its tokenizer bound later):
-        # validate it, which also derives the fields that follow from it, before reading it.
+        # validate it before it is read.
         self.config.validate()
 
         log_single_rank(

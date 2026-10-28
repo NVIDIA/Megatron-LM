@@ -6,10 +6,11 @@
 (the dataset config bound to the run's tokenizer, the loader settings and the dataset class)
 and hands the dataset config to ``BlendedMegatronDatasetBuilder`` as is. Each script keeps a
 ``train_valid_test_datasets_provider`` of the legacy shape that calls it with its rank predicate:
-``dataset_built_on_rank`` below is the GPT and hybrid rule (a packed dataset is built on every
-pipeline stage, the others on the first and last stages and on the multi-token-prediction ranks),
-applied to the registered arguments by ``is_dataset_built_on_rank``, the predicate ``pretrain_gpt.py``
-and ``pretrain_hybrid.py`` pass; hybrid-flex passes its own.
+``is_dataset_built_on_rank_explicit`` below is the GPT and hybrid rule with its inputs spelled out
+(a packed dataset is built on every pipeline stage, the others on the first and last stages and on
+the multi-token-prediction ranks); ``is_dataset_built_on_rank`` applies it to the registered
+arguments and is the predicate ``pretrain_gpt.py`` and ``pretrain_hybrid.py`` pass; hybrid-flex
+passes its own.
 """
 
 from functools import partial
@@ -20,7 +21,7 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
 
 
-def dataset_built_on_rank(
+def is_dataset_built_on_rank_explicit(
     vp_stage: Optional[int],
     is_packed_sequence: bool,
     *,
@@ -28,7 +29,8 @@ def dataset_built_on_rank(
     pipeline_model_parallel_layout: Any,
     mtp_num_layers: Optional[int],
 ) -> bool:
-    """Whether the dataset should be built on the current rank (the GPT and hybrid rule).
+    """Whether the dataset should be built on the current rank: the GPT and hybrid rule, with the
+    run's inputs given explicitly (``is_dataset_built_on_rank`` reads them from the arguments).
 
     Only tensor-parallel rank 0 builds. With a sequence-packing scheduler only the first and last
     pipeline stages do (the scheduler sends the packing metadata to the middle stages itself); a
@@ -54,16 +56,17 @@ def dataset_built_on_rank(
 def is_dataset_built_on_rank(
     vp_stage: Optional[int] = None, is_packed_sequence: bool = False
 ) -> bool:
-    """``dataset_built_on_rank`` applied to the registered arguments: the predicate ``pretrain_gpt.py``
-    and ``pretrain_hybrid.py`` pass, and the default of ``build_gpt_datasets``. The arguments and the
-    transformer config are read at call time from ``megatron.training.global_vars`` and
-    ``megatron.training.arguments``, which is where tests patch them."""
+    """``is_dataset_built_on_rank_explicit`` applied to the registered arguments: the predicate
+    ``pretrain_gpt.py`` and ``pretrain_hybrid.py`` pass, and the default of ``build_gpt_datasets``.
+    The arguments and the transformer config are read at call time from
+    ``megatron.training.global_vars`` and ``megatron.training.arguments``, which is where tests
+    patch them."""
     from megatron.training.arguments import core_transformer_config_from_args
     from megatron.training.global_vars import get_args
 
     args = get_args()
     config = core_transformer_config_from_args(args)
-    return dataset_built_on_rank(
+    return is_dataset_built_on_rank_explicit(
         vp_stage,
         is_packed_sequence,
         sequence_packing_scheduler=args.sequence_packing_scheduler,
@@ -97,7 +100,7 @@ def build_gpt_datasets(
         data_config = get_run_config().data
     if built_on_rank is None:
         built_on_rank = is_dataset_built_on_rank
-    dataset_type, config, is_packed_sequence = data_config.dataset_build()
+    dataset_type, config, is_packed_sequence = data_config.builder_inputs()
 
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 

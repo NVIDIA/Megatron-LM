@@ -100,8 +100,8 @@ def test_validate_needs_the_tokenizer_and_asserts_only(tokenizer):
         _config(
             varlen_sbhd_validation=True, dynamic_context_parallel=True
         ).validate_without_tokenizer()
-    # The deprecated alias (#7047): warned about, rejected next to the canonical flag and counted
-    # by the exclusion, but not rewritten (validate asserts only; the builders of the config
+    # The deprecated alias (#7047): warned about, rejected together with the canonical flag and
+    # counted by the exclusion, but not rewritten (validate asserts only; the builders of the config
     # normalize it: validate_args on the CLI, the training container for a section).
     alias = _config(hybrid_context_parallel=True)
     with pytest.warns(DeprecationWarning, match="hybrid_context_parallel is deprecated"):

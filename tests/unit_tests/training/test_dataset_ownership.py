@@ -167,7 +167,7 @@ def container_factory(monkeypatch):
 @pytest.fixture
 def warnings_log(monkeypatch):
     log = []
-    monkeypatch.setattr(argument_utils, "_warn", log.append)
+    monkeypatch.setattr(argument_utils, "warn_rank_0", log.append)
     return log
 
 
@@ -396,7 +396,7 @@ def test_loader_only_is_the_default_for_other_entry_points(container_factory):
     cfg.finalize()
     assert data.dataset is None and data.dataset_type is None
     with pytest.raises(ValueError, match="no dataset"):
-        data.dataset_build()
+        data.builder_inputs()
     serialized = cfg.to_dict()
     assert serialized["data"]["dataset"] is None and serialized["data"]["dataset_type"] is None
     restored = PretrainConfigContainer.from_dict(serialized)
@@ -755,7 +755,7 @@ def test_runtime_services_bind_the_tokenizer_to_a_finalized_dataset_config(
     global_vars._bind_dataset_tokenizer(unbound)  # no tokenizer (build_tokenizer=False)
     assert unbound.data.dataset.tokenizer is None
     with pytest.raises(RuntimeError, match="no tokenizer bound"):
-        unbound.data.dataset_build()
+        unbound.data.builder_inputs()
 
 
 def test_set_global_variables_finalizes_a_dataset_section(
@@ -782,7 +782,7 @@ def test_set_global_variables_finalizes_a_dataset_section(
     global_vars.set_global_variables(args, cfg)
     assert global_vars.get_run_config() is cfg and cfg._finalized
     assert cfg.data.dataset.tokenizer is tokenizer
-    dataset_type, config, _ = cfg.data.dataset_build()
+    dataset_type, config, _ = cfg.data.builder_inputs()
     assert dataset_type is MockGPTDataset and config is cfg.data.dataset
     for name in globals_:
         monkeypatch.setattr(global_vars, name, None)

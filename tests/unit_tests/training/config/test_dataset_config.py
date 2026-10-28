@@ -19,8 +19,8 @@ from megatron.training.config import DataConfig, DataloaderConfig
 from megatron.training.config.container import ConfigContainerBase
 from megatron.training.config.dataset_config import (
     CONTAINER_WRITTEN_FIELDS,
-    classify_dataset_class,
-    dataset_class_for,
+    dataset_family_from_type,
+    dataset_type_from_family,
     has_data_source,
     is_packed_sequence,
     resolve_dataset_class,
@@ -95,10 +95,10 @@ def test_the_section_holds_megatron_cores_config(tokenizer):
     data.finalize()
     assert data.dataset_type is MockGPTDataset
     with pytest.raises(RuntimeError, match="no tokenizer bound"):
-        data.dataset_build()
+        data.builder_inputs()
     data.bind_tokenizer(tokenizer)  # runs Core's validate()
     assert data.dataset.tokenizer is tokenizer and data.dataset.token_dtype_code == 8
-    dataset_type, config, packed = data.dataset_build()
+    dataset_type, config, packed = data.builder_inputs()
     assert dataset_type is MockGPTDataset and config is data.dataset and packed is False
     data.bind_tokenizer(tokenizer)  # idempotent for the same tokenizer
     with pytest.raises(RuntimeError, match="another tokenizer"):
@@ -163,7 +163,7 @@ def test_fim_config_is_megatron_cores(tokenizer):
     data.finalize()
     assert data.dataset_type is GPTFIMDataset
     data.bind_tokenizer(tokenizer)
-    assert data.dataset_build()[0] is GPTFIMDataset
+    assert data.builder_inputs()[0] is GPTFIMDataset
     DataConfig(dataset=_fim(fim_rate=0.0, fim_spm_rate=0.0)).bind_tokenizer(
         tokenizer
     )  # 0.0 is a rate
@@ -312,11 +312,11 @@ def test_explicit_classes_accepted(dataset, dataset_type):
 
 
 def test_class_table_and_packedness():
-    assert dataset_class_for("gpt", mock=True) is MockGPTDataset
-    assert dataset_class_for("fim", mock=True) is None
-    assert classify_dataset_class(MockVarlenDataset) == ("varlen", True)
+    assert dataset_type_from_family("gpt", mock=True) is MockGPTDataset
+    assert dataset_type_from_family("fim", mock=True) is None
+    assert dataset_family_from_type(MockVarlenDataset) == ("varlen", True)
     with pytest.raises(ValueError, match="dataset family"):
-        dataset_class_for("bert", mock=False)
+        dataset_type_from_family("bert", mock=False)
     plain = _dataset()
     assert is_packed_sequence(SFTDataset, plain) and is_packed_sequence(MockSFTDataset, plain)
     assert is_packed_sequence(VarlenDataset, plain) and is_packed_sequence(MockVarlenDataset, plain)
@@ -338,7 +338,7 @@ def test_loader_only_section():
         data.dataloader.dataloader_type == "single" and data.dataloader.persistent_workers is False
     )
     with pytest.raises(ValueError, match="no dataset"):
-        data.dataset_build()
+        data.builder_inputs()
 
 
 def test_finalize_commits_the_class_and_dataset_build_needs_the_tokenizer(tokenizer):
@@ -348,9 +348,9 @@ def test_finalize_commits_the_class_and_dataset_build_needs_the_tokenizer(tokeni
     data.finalize()
     assert data.dataset_type is MockGPTDataset and data.dataloader.dataloader_type == "cyclic"
     with pytest.raises(RuntimeError, match="no tokenizer bound"):
-        data.dataset_build()
+        data.builder_inputs()
     data.bind_tokenizer(tokenizer)
-    dataset_type, config, packed = data.dataset_build()
+    dataset_type, config, packed = data.builder_inputs()
     assert dataset_type is MockGPTDataset and config is data.dataset and packed is False
     data.finalize()  # idempotent
     assert data.dataset_type is MockGPTDataset
@@ -358,7 +358,7 @@ def test_finalize_commits_the_class_and_dataset_build_needs_the_tokenizer(tokeni
     sft.validate()
     sft.finalize()
     sft.bind_tokenizer(tokenizer)
-    assert sft.dataset_build()[2] is True
+    assert sft.builder_inputs()[2] is True
 
 
 def test_dataloader_config_validation():

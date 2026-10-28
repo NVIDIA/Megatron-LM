@@ -295,7 +295,7 @@ def _signature(config, names):
 @pytest.fixture
 def warnings_log(monkeypatch):
     log = []
-    monkeypatch.setattr(argument_utils, "_warn", log.append)
+    monkeypatch.setattr(argument_utils, "warn_rank_0", log.append)
     return log
 
 
@@ -321,7 +321,7 @@ def test_entry_points_build_the_dataset_config_pretrain_gpt_built(
         dataset_class = packed = None
     else:
         data = _ready(cfg)
-        dataset_class, actual, packed = data.dataset_build()
+        dataset_class, actual, packed = data.builder_inputs()
         assert actual is data.dataset and actual.tokenizer is tokenizer
     if case in MIXED_FIM_CASES:
         # Documented exception: the dataset class and every shared field are unchanged; the unused
@@ -385,7 +385,7 @@ def test_fields_the_legacy_factories_left_out_are_forwarded(monkeypatch, corpus,
     if entry_point == "prepare_cache":
         actual = _entry_point(entry_point).core_gpt_dataset_config_from_args(args)
     else:
-        _, actual, _ = _ready(cfg).dataset_build()
+        _, actual, _ = _ready(cfg).builder_inputs()
     names = [f.name for f in fields(GPTDatasetConfig) if f.name != "tokenizer"]
     changed = {name for name in names if getattr(actual, name) != getattr(own, name)}
     assert changed == LEGACY_OMISSIONS[entry_point]
@@ -416,7 +416,7 @@ def test_provider_path_builds_no_second_tokenizer(monkeypatch, corpus, entry_poi
     if hasattr(module, "build_tokenizer"):
         monkeypatch.setattr(module, "build_tokenizer", Mock(side_effect=AssertionError("rebuilt")))
     data = _ready(cfg)
-    _, config, _ = data.dataset_build()
+    _, config, _ = data.builder_inputs()
     assert config.tokenizer is global_vars.get_tokenizer() is tokenizer
 
 
@@ -599,7 +599,9 @@ def test_shared_rank_predicate_reads_the_registered_arguments(monkeypatch):
         lambda args: SimpleNamespace(pipeline_model_parallel_layout="layout", mtp_num_layers=None),
     )
     monkeypatch.setattr(
-        providers, "dataset_built_on_rank", lambda *a, **k: rule_calls.append((a, k)) or False
+        providers,
+        "is_dataset_built_on_rank_explicit",
+        lambda *a, **k: rule_calls.append((a, k)) or False,
     )
     assert providers.is_dataset_built_on_rank(vp_stage=2) is False
     assert rule_calls == [
@@ -623,7 +625,7 @@ def test_rank_rule_gates_on_tensor_parallel_rank():
     try:
         expected = mpu.get_tensor_model_parallel_rank() == 0
         layout = dict(pipeline_model_parallel_layout=None, mtp_num_layers=None)
-        rule = providers.dataset_built_on_rank
+        rule = providers.is_dataset_built_on_rank_explicit
         assert rule(None, False, sequence_packing_scheduler=None, **layout) is expected
         assert rule(None, True, sequence_packing_scheduler=None, **layout) is expected
         assert rule(None, False, sequence_packing_scheduler="dp_balanced", **layout) is expected
@@ -633,9 +635,9 @@ def test_rank_rule_gates_on_tensor_parallel_rank():
 
 def test_legacy_wrapper_is_the_shared_helper(monkeypatch, corpus):
     """pretrain_gpt and pretrain_hybrid expose argument_utils.core_gpt_dataset_config_from_args
-    itself; hybrid-flex and the cache tool wrap it (the run's tokenizer; the class pinned to
-    GPTDataset). The helper takes the seed from the arguments, validates, and binds the tokenizer
-    it is given."""
+    itself; the cache tool wraps it (the class pinned to GPTDataset) and hybrid-flex builds the
+    same standalone section through its own factory (the varlen check). The helper takes the seed
+    from the arguments, validates, and binds the tokenizer it is given."""
     shared = argument_utils.core_gpt_dataset_config_from_args
     assert _entry_point("gpt").core_gpt_dataset_config_from_args is shared
     assert _entry_point("hybrid").core_gpt_dataset_config_from_args is shared

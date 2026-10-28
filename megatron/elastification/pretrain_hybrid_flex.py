@@ -39,7 +39,6 @@ from megatron.core.utils import (
 )
 from megatron.elastification.arguments import add_flextron_args
 from megatron.training import (
-    argument_utils,
     get_args,
     get_timers,
     get_tokenizer,
@@ -474,29 +473,28 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     ) and mpu.get_tensor_model_parallel_rank() == 0
 
 
-def _reject_varlen(args):
-    """``get_batch`` keys the packed-sequence metadata on ``--sft`` and the rank predicate above
-    builds on the first and last stages only, so a varlen dataset cannot be consumed here; the
-    request is an error instead of a silent plain-GPT run (``pretrain_hybrid.py`` supports it)."""
+def flex_data_config_from_args(args, *, standalone=False):
+    """``cfg.data`` for this entry point: the shared factory, less the varlen family.
+
+    ``get_batch`` keys the packed-sequence metadata on ``--sft`` and the rank predicate above builds
+    on the first and last stages only, so a varlen dataset cannot be consumed here; the request is
+    an error instead of a silent plain-GPT run (``pretrain_hybrid.py`` supports it)."""
     if getattr(args, "use_varlen_dataset", False):
         raise ValueError(
             "pretrain_hybrid_flex.py does not support --use-varlen-dataset (its batch path has no "
             "varlen packing support); use pretrain_hybrid.py for varlen data."
         )
-
-
-def flex_data_config_from_args(args, *, standalone=False):
-    """``cfg.data`` for this entry point: the shared factory, less the varlen family."""
-    _reject_varlen(args)
     return gpt_data_config_from_args(args, standalone=standalone)
 
 
 def core_gpt_dataset_config_from_args(args):
-    """The legacy call shape for this entry point: the shared
-    ``argument_utils.core_gpt_dataset_config_from_args`` after the varlen check, bound to the
-    run's tokenizer as before (the provider builds from ``cfg.data``)."""
-    _reject_varlen(args)
-    return argument_utils.core_gpt_dataset_config_from_args(args, tokenizer=get_tokenizer())
+    """The legacy call shape for this entry point: the standalone section of
+    ``flex_data_config_from_args`` (the varlen check included), validated and bound to the run's
+    tokenizer as before (the provider builds from ``cfg.data``)."""
+    data = flex_data_config_from_args(args, standalone=True)
+    data.validate()
+    data.bind_tokenizer(get_tokenizer())
+    return data.dataset
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):

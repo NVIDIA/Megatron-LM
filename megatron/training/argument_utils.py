@@ -44,8 +44,9 @@ from megatron.training.config import (
     TrainingConfig,
     ValidationConfig,
 )
-from megatron.training.config.dataset_config import dataset_class_for
+from megatron.training.config.dataset_config import dataset_type_from_family
 from megatron.training.models import GPTModelConfig, HybridModelConfig
+from megatron.training.utils import warn_rank_0
 
 # TODO: support arg renames
 
@@ -801,20 +802,6 @@ _DATASET_FIELD_SOURCES = {
     "varlen_mock_dataset_config_json": "varlen_mock_dataset_config_json",
     "varlen_sbhd_validation": "varlen_sbhd_validation",
 }
-_FIM_TOKEN_SOURCES = {
-    "prefix": "fim_prefix_token",
-    "middle": "fim_middle_token",
-    "suffix": "fim_suffix_token",
-    "pad": "fim_pad_token",
-    "eod": "fim_eod_token",
-}
-_SINGLE_SOURCE_MESSAGE = "A single data source must be provided in training mode, else None"
-
-
-def _warn(message: str) -> None:
-    from megatron.training.utils import warn_rank_0
-
-    warn_rank_0(message)
 
 
 def requested_dataset_family(args: Namespace) -> str:
@@ -832,7 +819,7 @@ def requested_dataset_family(args: Namespace) -> str:
             "packed-sequence dataset family. Pick one."
         )
     if len(selected) > 1:
-        _warn(f"{selected} were all requested; '{selected[0]}' wins, as in the providers.")
+        warn_rank_0(f"{selected} were all requested; '{selected[0]}' wins, as in the providers.")
     return selected[0] if selected else "gpt"
 
 
@@ -849,7 +836,7 @@ def _resolve_data_sources(args: Namespace):
         or getattr(args, "per_split_data_args_path", None) is not None
     )
     if getattr(args, "mock_data", False) and file_backed:
-        raise ValueError(_SINGLE_SOURCE_MESSAGE)
+        raise ValueError("A single data source must be provided in training mode, else None")
     blend, blend_per_split = get_blend_and_blend_per_split(args)
     sequences_per_dataset = None
     path = getattr(args, "per_dataset_sequences_path", None)
@@ -898,13 +885,13 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
     blend, blend_per_split, sequences_per_dataset = _resolve_data_sources(args)
     has_source = blend is not None or (blend_per_split is not None and any(blend_per_split))
     mock_requested = bool(getattr(args, "mock_data", False))
-    dataset_type = dataset_class_for(family, mock=False)
+    dataset_type = dataset_type_from_family(family, mock=False)
     if mock_requested or not has_source:
-        mock_class = dataset_class_for(family, mock=True)
+        mock_class = dataset_type_from_family(family, mock=True)
         if mock_class is not None:
             dataset_type = mock_class
             if not mock_requested:
-                _warn(
+                warn_rank_0(
                     f"No data source is declared; building the mock {family} dataset "
                     f"({mock_class.__name__})."
                 )
@@ -923,7 +910,13 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
         kwargs.update(
             fim_rate=args.fim_rate,
             fim_spm_rate=args.fim_spm_rate,
-            fim_extra_tokens={key: getattr(args, src) for key, src in _FIM_TOKEN_SOURCES.items()},
+            fim_extra_tokens={
+                "prefix": args.fim_prefix_token,
+                "middle": args.fim_middle_token,
+                "suffix": args.fim_suffix_token,
+                "pad": args.fim_pad_token,
+                "eod": args.fim_eod_token,
+            },
             fim_split_sample=args.fim_split_sample,
             fim_fragment_rate=args.fim_fragment_rate,
             fim_no_prefix=args.fim_no_prefix,

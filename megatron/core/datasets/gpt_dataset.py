@@ -69,9 +69,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
 
     hybrid_context_parallel: bool = False
     """Deprecated alias for ``dynamic_context_parallel``. ``validate_without_tokenizer()`` warns
-    about it and rejects it next to ``dynamic_context_parallel``; it does not rewrite it (nothing
-    is assigned there): normalize the alias where the config is built, as ``validate_args`` and
-    the training container do."""
+    about it and raises when it is set together with ``dynamic_context_parallel``; it does not
+    rewrite it (nothing is assigned there): normalize the alias where the config is built, as
+    ``validate_args`` and the training container do."""
 
     sequences_per_dataset: Optional[Dict[str, int]] = None
     """If provided, the sequence and document counts for each dataset. 
@@ -137,7 +137,7 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
 
     def validate_without_tokenizer(self) -> None:
         """The checks that need no tokenizer: the base class's, the three masking / loss booleans,
-        the deprecated ``hybrid_context_parallel`` alias (warned about, never next to
+        the deprecated ``hybrid_context_parallel`` alias (warned about, an error together with
         ``dynamic_context_parallel``, not rewritten) and the SBHD / dynamic-CP exclusion.
         ``validate()`` runs them first; a caller that checks a config before its tokenizer exists
         runs this alone."""
