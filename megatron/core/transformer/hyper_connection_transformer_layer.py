@@ -125,6 +125,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         self._mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None
 
     def __call__(self, *args, **kwargs):
+        # TODO(kwangjuna): Unify this entry point with WR's recompute manager
+        # in the follow-up layer PR.
         if kwargs.get("residual_stream_recompute_context") is not None:
             raise ValueError(
                 "mHC does not accept residual_stream_recompute_context; use mhc_recompute_manager."
