@@ -14,6 +14,7 @@ import torch
 
 from gpt_builders import gpt_builder
 from megatron.core.inference.shards import build_inference_pg_collection
+from megatron.core.parallel_state import get_registered_process_groups
 from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
 from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
 from megatron.core.resharding.copy_services.nccl_m2n_copy_service import NCCLM2NCopyService
@@ -231,13 +232,18 @@ def benchmark_collocated():
     dst_config = {'tp': dst_tp, 'pp': dst_pp, 'ep': dst_ep, 'dp': dst_dp}
     print_config_summary(args, src_config, dst_config, world_size, 'collocated')
 
-    # Build source model
+    # Build source model on the groups of the grid that initialize_megatron() registered
     print_rank_0("Building source model...")
+    src_pg_collection = get_registered_process_groups()
     src_model = get_training_model(
         lambda pre_process, post_process, **kwargs: model_provider(
-            pre_process=pre_process, post_process=post_process, parallel_output=False
+            pre_process=pre_process,
+            post_process=post_process,
+            parallel_output=False,
+            pg_collection=src_pg_collection,
         ),
-        wrap_with_ddp=False
+        wrap_with_ddp=False,
+        pg_collection=src_pg_collection,
     )
     src_model[0] = src_model[0].cuda()
 
@@ -360,13 +366,18 @@ def benchmark_non_collocated():
         src_model = None
         dst_model = None
     elif is_src_rank:
-        # Build source model
+        # Build source model on the groups of the grid that initialize_megatron() registered
         print_rank_0("Building source model...")
+        src_pg_collection = get_registered_process_groups()
         src_model = get_training_model(
             lambda pre_process, post_process, **kwargs: model_provider(
-                pre_process=pre_process, post_process=post_process, parallel_output=False
+                pre_process=pre_process,
+                post_process=post_process,
+                parallel_output=False,
+                pg_collection=src_pg_collection,
             ),
-            wrap_with_ddp=False
+            wrap_with_ddp=False,
+            pg_collection=src_pg_collection,
         )
         src_model[0] = src_model[0].cuda()
         dst_model = None
