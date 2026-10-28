@@ -32,8 +32,6 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
-pytestmark = pytest.mark.launch_on_gb200
-
 if HAVE_FLA_GDP_CP:
     import megatron.core.ssm.context_parallel.gdp as gdp_cp_module
 else:
@@ -126,7 +124,10 @@ def test_chunkwise_cp_keeps_heads_when_cp_exceeds_head_count(monkeypatch, build_
                 assert runtime.helper.conv1d_cp1 is mixer.conv1d
                 assert runtime.helper.dt_bias_cp1 is mixer.dt_bias
                 # The head-divisibility restriction still applies to headwise CP.
-                with pytest.raises(AssertionError, match="nheads must be evenly divisible"):
+                with pytest.raises(
+                    AssertionError,
+                    match="TP-local head count 2 must be divisible by runtime CP size 4",
+                ):
                     runtime.helper.for_context_parallel_group(_FakeGroup(rank=0, size=4))
             assert mixer.cp is base_helper
     finally:

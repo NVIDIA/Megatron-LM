@@ -147,6 +147,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
     def _get_feat_dim_split(self, cp_size: int) -> tuple[int, int, int, int]:
         """Return projection split sizes for the runtime head-parallel CP size."""
+        self._validate_runtime_cp_size(cp_size)
         return (
             (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // cp_size,
             self.v_dim_local_tp // cp_size,

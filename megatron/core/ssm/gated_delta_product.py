@@ -33,6 +33,7 @@ from megatron.core.ssm.context_parallel.gdp_common import gdp_chunkwise_context_
 from megatron.core.ssm.gdp_context_parallel import GDPContextParallel
 from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support, get_cu_seqlens
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
+from megatron.core.ssm.utils import _validate_dynamic_cp_head_geometry
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
@@ -355,6 +356,14 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         self.nheads_local_tp = self.nheads // tp_size
         self.d_inner_local_tp = self.d_inner // tp_size
         self.ngroups_local_tp = self.ngroups // tp_size
+
+        if self.config.linear_cp_mode != "chunkwise":
+            _validate_dynamic_cp_head_geometry(
+                config,
+                self.pg_collection,
+                head_counts={"GDP heads": self.nheads_local_tp},
+                group_count=self.ngroups_local_tp,
+            )
 
         # Assume sequence parallelism: input is already partitioned along the sequence dimension
         self.in_proj = build_module(
@@ -825,7 +834,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         cu_seqlens=None,
         preceding_rank_start=0,
         following_rank_stop=None,
-        runtime_cp: _GDPRuntimeCP | None = None,
+        *,
+        runtime_cp: _GDPRuntimeCP,
     ):
         """Run the selected chunked gated delta product kernel and return
         (core_attn_out, final_state).
@@ -834,8 +844,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         applies the query/key L2 norm itself. Its output is restored to ``(b, l, h, p)``
         here. The FLA kernel uses the batched layout and receives query/key tensors already
         normalized by ``_prepare_qkv``. Unpacked FLA leaves ``cu_seqlens`` unset."""
-        if runtime_cp is None:
-            runtime_cp = self._resolve_runtime_cp(None)
         if runtime_cp.chunkwise:
             assert self.chunkwise_cp_backend is not None
             core_attn_out = gdp_chunkwise_context_parallel(
@@ -900,7 +908,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         return metadata
 
     def _in_proj_preprocess(
-        self, hidden_states, packed_seq_params=None, runtime_cp: _GDPRuntimeCP | None = None
+        self, hidden_states, packed_seq_params=None, *, runtime_cp: _GDPRuntimeCP
     ):
         """Run the input projection, gather its output across CP ranks, switch to
         (b, l, d) layout, and split it into the z, VKQ, and ba groups.
@@ -909,8 +917,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         output and the intermediate CP-gathered/transposed copies of it are then freed
         inside the checkpoint, leaving only hidden_states saved for the backward pass.
         """
-        if runtime_cp is None:
-            runtime_cp = self._resolve_runtime_cp(packed_seq_params)
 
         zVKQba, _ = self.in_proj(hidden_states)
 
@@ -920,12 +926,10 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
 
         return self._preprocess(zVKQba, runtime_cp=runtime_cp)
 
-    def _preprocess(self, zVKQba, runtime_cp: _GDPRuntimeCP | None = None):
+    def _preprocess(self, zVKQba, *, runtime_cp: _GDPRuntimeCP):
         """Switch the (l, b, proj_dim) input projection to the batch-first layout the
         causal conv and the kernels expect, and split it into the z, VKQ, and ba groups.
         """
-        if runtime_cp is None:
-            runtime_cp = self._resolve_runtime_cp(None)
 
         zVKQba = rearrange(zVKQba, "l b d -> b l d").contiguous()
 
@@ -946,7 +950,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         conv_state=None,
         seq_idx=None,
         l2_norm_in_kernel=False,
-        runtime_cp: _GDPRuntimeCP | None = None,
+        *,
+        runtime_cp: _GDPRuntimeCP,
     ):
         """Run the causal conv on the VKQ slice and split/reshape it into query, key,
         and value.
@@ -964,8 +969,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         every caller whose kernel normalizes internally must set, such as the CuTeDSL
         path (``use_qk_l2norm_in_kernel``).
         """
-        if runtime_cp is None:
-            runtime_cp = self._resolve_runtime_cp(None)
 
         if runtime_cp.chunkwise:
             assert (
@@ -1102,11 +1105,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         ).unsqueeze(0)
 
     def _compute_gating(
-        self, ba: torch.Tensor, runtime_cp: _GDPRuntimeCP | None = None
+        self, ba: torch.Tensor, *, runtime_cp: _GDPRuntimeCP
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute the beta and g gating tensors from the ba slice."""
-        if runtime_cp is None:
-            runtime_cp = self._resolve_runtime_cp(None)
         b, a = torch.split(
             ba, [runtime_cp.nheads * self.num_householder, runtime_cp.nheads], dim=-1
         )
@@ -1133,13 +1134,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
 
         return beta, g
 
-    def _postprocess(
-        self, core_attn_out, z, packed_seq_params=None, runtime_cp: _GDPRuntimeCP | None = None
-    ):
+    def _postprocess(self, core_attn_out, z, packed_seq_params=None, *, runtime_cp: _GDPRuntimeCP):
         """Switch back to (l, b, d) layout, scatter across CP ranks, and apply the
         gated output norm."""
-        if runtime_cp is None:
-            runtime_cp = self._resolve_runtime_cp(packed_seq_params)
         y = rearrange(core_attn_out, "b l h p -> l b (h p)").contiguous()
         if not runtime_cp.chunkwise:
             assert runtime_cp.helper is not None
@@ -1253,7 +1250,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         # "b (l m) h p" is "n (s m) h p". ``_preprocess`` takes the sequence-first
         # layout that in_proj produces, so hand it back the (seq_len, n, proj_dim)
         # view.
-        z, VKQ, ba = self._preprocess(zVKQba.transpose(0, 1))
+        runtime_cp = self._resolve_runtime_cp(None)
+        z, VKQ, ba = self._preprocess(zVKQba.transpose(0, 1), runtime_cp=runtime_cp)
 
         # Decode runs the forked Triton `causal_conv1d_update` (not the pip
         # `causal_conv1d` used by the training path): it treats a `-1` index as
@@ -1319,7 +1317,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             return self.norm(y, z.contiguous()) if self.rmsnorm else y
 
         # ``_postprocess`` returns sequence-first; the transpose is free at l == 1.
-        return self._postprocess(core_attn_out, z).transpose(0, 1)
+        return self._postprocess(core_attn_out, z, runtime_cp=runtime_cp).transpose(0, 1)
 
     def ssm_prefill(
         self,
@@ -1365,7 +1363,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             intermediate_ssm_out is not None and metadata.gdp_intermediate_chunk_indices is not None
         )
 
-        z, VKQ, ba = self._preprocess(zVKQba)
+        runtime_cp = self._resolve_runtime_cp(None)
+        z, VKQ, ba = self._preprocess(zVKQba, runtime_cp=runtime_cp)
 
         # Read the incoming conv history BEFORE overwriting the cache rows below.
         # On a continuation chunk these are the tail tokens of the previous chunk;
@@ -1483,7 +1482,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
 
         # post_conv_ssm inside _postprocess is a no-op here: dynamic inference asserts
         # cp_size == 1.
-        return self._postprocess(core_attn_out, z)
+        return self._postprocess(core_attn_out, z, runtime_cp=runtime_cp)
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
         """
