@@ -860,9 +860,14 @@ class TEGroupedMLP(MegatronModule):
 
         def forward_pre_hook(module, *_) -> None:
             for submodule in chain(self.linear_fc1.modules(), self.linear_fc2.modules()):
-                for hook in submodule._forward_pre_hooks.values():
-                    # Assume that hook does not interact with input
-                    ret = hook(submodule, None)
+                for hook_id, hook in list(submodule._forward_pre_hooks.items()):
+                    # Assume that hook does not interact with input. Match PyTorch's
+                    # dispatch: hooks registered with with_kwargs=True (e.g. MFSDP v2's
+                    # combined-1F1B unshard hooks) take (module, args, kwargs).
+                    if hook_id in submodule._forward_pre_hooks_with_kwargs:
+                        ret = hook(submodule, (), {})
+                    else:
+                        ret = hook(submodule, ())
                     if ret is not None:
                         raise RuntimeError(
                             f"Applying a fused implementation for {self.__class__.__name__}, "

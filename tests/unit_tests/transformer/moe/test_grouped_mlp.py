@@ -608,6 +608,36 @@ def test_make_fused_impl_pre_forward_hook_dispatches_submodule_hooks():
     assert visited == {"fc1", "fc2"}
 
 
+def test_make_fused_impl_pre_forward_hook_dispatches_kwargs_hooks():
+    # MFSDP v2's combined-1F1B unshard hooks are registered with with_kwargs=True and
+    # take (module, args, kwargs); replaying them with two arguments raised TypeError.
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.linear_fc1 = torch.nn.Linear(2, 2)
+    module.linear_fc2 = torch.nn.Linear(2, 2)
+
+    calls = []
+
+    def kwargs_hook(submodule, args, kwargs):
+        calls.append(("kwargs", submodule, args, kwargs))
+
+    def plain_hook(submodule, args):
+        calls.append(("plain", submodule, args))
+
+    module.linear_fc1.register_forward_pre_hook(kwargs_hook, prepend=True, with_kwargs=True)
+    module.linear_fc1.register_forward_pre_hook(plain_hook)
+    module.linear_fc2.register_forward_pre_hook(kwargs_hook, prepend=True, with_kwargs=True)
+
+    hook = module._make_fused_impl_pre_forward_hook()
+    hook(object())
+
+    assert calls == [
+        ("kwargs", module.linear_fc1, (), {}),
+        ("plain", module.linear_fc1, ()),
+        ("kwargs", module.linear_fc2, (), {}),
+    ]
+
+
 def test_make_fused_impl_pre_forward_hook_rejects_input_modifying_hook():
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
