@@ -186,6 +186,8 @@ def _layout(**overrides):
         cuda_graph_impl="none",
     )
     layout.update(overrides)
+    # What Megatron Core derives at construction: a scheduler sets variable_seq_lengths.
+    layout.setdefault("variable_seq_lengths", layout["sequence_packing_scheduler"] is not None)
     return SimpleNamespace(transformer=SimpleNamespace(**layout), seq_length=4096)
 
 
@@ -1165,3 +1167,42 @@ def test_get_batch_ignores_the_poisoned_data_arguments(monkeypatch, entry_point)
     assert (tp["cp_size"], tp["pipeline_model_parallel_size"]) == (1, 3)
     assert tp["dynamic_cp"] is False
     assert cp_calls.pop()["use_per_sequence_balancing"] is True  # masking without SFT
+
+
+@pytest.mark.parametrize("scheduler_at_construction", [True, False])
+def test_a_scheduler_selected_after_construction_needs_variable_seq_lengths(
+    container_factory, scheduler_at_construction
+):
+    """Megatron Core derives variable_seq_lengths from the scheduler in ModelParallelConfig's
+    __post_init__; a scheduler assigned to a constructed config leaves it False, and the pipeline
+    would keep fixed shapes while the batch path packs. The container rejects that pair on a real
+    TransformerConfig; the constructor-time selection is the positive control."""
+    import torch
+
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from megatron.training.models.gpt import GPTModelConfig
+
+    transformer = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=8,
+        pipeline_model_parallel_size=2,
+        pipeline_dtype=torch.float32,
+        calculate_per_token_loss=True,
+        max_seqlen_per_dp_cp_rank=64,
+        sequence_packing_scheduler="dp_balanced" if scheduler_at_construction else None,
+    )
+    if not scheduler_at_construction:
+        transformer.sequence_packing_scheduler = "dp_balanced"  # after construction
+    _, cfg = container_factory(["--seq-length", "16", "--mock-data"], data=True)
+    cfg.data.dataset_type = MockVarlenDataset
+    cfg.model = GPTModelConfig(transformer=transformer, seq_length=64, vocab_size=16)
+    if scheduler_at_construction:
+        assert transformer.variable_seq_lengths is True
+        cfg.validate()
+    else:
+        assert transformer.variable_seq_lengths is False
+        with pytest.raises(ValueError, match="needs model.transformer.variable_seq_lengths=True"):
+            cfg.validate()
+        transformer.variable_seq_lengths = True  # the pair a Python caller must set together
+        cfg.validate()

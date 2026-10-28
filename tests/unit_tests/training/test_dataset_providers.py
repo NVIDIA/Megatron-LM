@@ -231,6 +231,7 @@ def _layout_from_args(args):
         mtp_num_layers=args.mtp_num_layers,
         calculate_per_token_loss=args.calculate_per_token_loss,
         max_seqlen_per_dp_cp_rank=args.max_seqlen_per_dp_cp_rank,
+        variable_seq_lengths=args.variable_seq_lengths,
         gtp_weight_remat_size=args.gtp_weight_remat_size,
         gtp_remat_num_sequence_shards=args.gtp_remat_num_sequence_shards,
         cuda_graph_impl="none",

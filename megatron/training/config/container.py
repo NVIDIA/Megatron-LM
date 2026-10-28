@@ -465,7 +465,8 @@ class PretrainConfigContainer(ConfigContainerBase):
         """Cross-section checks for the data section, placed by their inputs.
 
         With a model section, dataset or not: dynamic CP needs the single loader, and a packing
-        scheduler needs per-token loss. With a dataset: the model capacity covers the sample
+        scheduler needs per-token loss and ``variable_seq_lengths`` (Core derives the latter at
+        construction; a scheduler selected afterwards must set it). With a dataset: the model capacity covers the sample
         length, and a value given for one of the seven fields other sections own
         (``CONTAINER_WRITTEN_FIELDS``) must agree with that section (the container writes them at
         ``finalize()``; the arguments and the saved file leave them at Megatron Core's defaults).
@@ -495,6 +496,14 @@ class PretrainConfigContainer(ConfigContainerBase):
                     "model.transformer.calculate_per_token_loss=True: packed micro-batches carry "
                     "different numbers of trainable tokens, so the per-microbatch mean weights "
                     "them unevenly."
+                )
+            if scheduler is not None and not getattr(transformer, "variable_seq_lengths", False):
+                raise ValueError(
+                    f"model.transformer.sequence_packing_scheduler={scheduler!r} needs "
+                    "model.transformer.variable_seq_lengths=True: Megatron Core derives it at "
+                    "construction, so a scheduler selected afterwards leaves the pipeline on fixed "
+                    "shapes while the batch path packs; set both, or select the scheduler when the "
+                    "transformer config is constructed."
                 )
         dataset = self.data.dataset
         if dataset is None:
