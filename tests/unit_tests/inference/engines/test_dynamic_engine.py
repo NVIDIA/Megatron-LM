@@ -3377,6 +3377,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         )
         env = self._build_test_env(config)
         env.engine.controller.tokenizer = _StreamingTransportTokenizer()
+
+        async def generate(prompt, params):
+            # Step on this loop: generate() would step on a helper thread, which starts on device 0.
+            future = env.engine.add_request(int(next(env.engine.request_counter)), prompt, params)
+            while not future.done():
+                await env.engine.async_step()
+            return future.result()
+
         shared_prefix = [3, 5, 7, 11] * 64
         prompts = [
             [*shared_prefix, *([13, 17, 19, 23] * 65)[:257]],
@@ -3398,18 +3406,18 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ]
         baseline_tokens = []
         for prompt, params in zip(prompts, baseline_params, strict=True):
-            completed = env.engine.generate([prompt], params)[0]
+            completed = await generate(prompt, params)
             baseline_tokens.append(list(completed.generated_tokens))
         string_prompt = "serve"
-        string_baseline = env.engine.generate(
-            [string_prompt],
+        string_baseline = await generate(
+            string_prompt,
             SamplingParams(
                 num_tokens_to_generate=24, termination_id=-1, top_k=1, return_prompt_tokens=True
             ),
-        )[0]
+        )
         env.engine.reset()
-        env.engine.generate(
-            [shared_prefix], SamplingParams(num_tokens_to_generate=1, termination_id=-1, top_k=1)
+        await generate(
+            shared_prefix, SamplingParams(num_tokens_to_generate=1, termination_id=-1, top_k=1)
         )
         chunked_request_ids = []
         schedule_chunked_prefill = env.engine.schedule_chunked_prefill
@@ -3420,6 +3428,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 chunked_request_ids.append(env.engine.context.chunked_prefill_request_id)
 
         env.engine.schedule_chunked_prefill = observe_chunked_prefill
+        # Send requests that share a prefix to the same engine at any data-parallel size.
+        env.engine.context.prefix_caching_routing_alpha = 0.0
 
         coordinator_addr = await env.engine.start_listening_to_data_parallel_coordinator(
             hostname="127.0.0.1"
@@ -3428,6 +3438,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         clients = []
         primary_client = None
         rank_zero_error = None
+        streamed_global_ids = set()
         try:
             if rank == 0:
                 primary_client = InferenceClient(coordinator_addr)
@@ -3465,16 +3476,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     partials = []
                     final = None
                     first_partial_was_live = False
-                    active_steps = []
                     final_count = 0
                     async for item in stream:
                         if "partial" in item:
                             partial = item["partial"]
                             if not partials:
-                                first_partial_was_live = (
-                                    not stream.finished and env.engine.has_unfinished_requests()
-                                )
-                            active_steps.append(env.engine.context.step_count)
+                                first_partial_was_live = not stream.finished
                             assert partial["new_tokens"]
                             if expect_logprobs:
                                 assert len(partial["new_tokens"]) == len(partial["new_log_probs"])
@@ -3499,7 +3506,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                         histories.append(list(streamed_prefix))
                     final_tokens = list(final["generated_tokens"])
                     assert all(final_tokens[: len(history)] == history for history in histories)
-                    assert len(set(active_steps)) >= 2
                     return partials, final
 
                 collected = await asyncio.wait_for(
@@ -3517,16 +3523,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 assert len(finals[0]["generated_top_n_logprobs"]) == len(
                     finals[0]["generated_tokens"]
                 )
-                assert env.engine.context.async_sched_step_count > 0
-                assert env.engine._prefill_tokens_skipped >= len(shared_prefix)
                 assert any(final["num_cached_tokens"] >= len(shared_prefix) for final in finals)
-                assert chunked_request_ids
                 streamed_global_ids = {
                     partial["request_id"]
                     for request_partials in partials
                     for partial in request_partials
                 }
-                assert streamed_global_ids.intersection(chunked_request_ids)
                 for client in clients:
                     assert client.streams == {}
                     assert client.request_submission_times == {}
@@ -3622,8 +3624,22 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     process.terminate()
                     process.join(timeout=5)
 
+        # With data parallelism the coordinator may route a request to any rank's engine.
+        witnesses = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(
+            witnesses,
+            (
+                env.engine.context.async_sched_step_count,
+                env.engine._prefill_tokens_skipped,
+                chunked_request_ids,
+            ),
+        )
         if rank_zero_error is not None:
             raise rank_zero_error
+        if rank == 0:
+            assert sum(witness[0] for witness in witnesses) > 0
+            assert sum(witness[1] for witness in witnesses) >= len(shared_prefix)
+            assert streamed_global_ids & set().union(*(witness[2] for witness in witnesses))
 
     @pytest.mark.internal
     @pytest.mark.skipif(
