@@ -232,18 +232,14 @@ def get_current_iteration() -> int:
 def is_packed_sequence_run() -> bool:
     """Return whether the current run packs multiple documents per sequence.
 
-    Mirrors ``training.py``'s ``has_cu_seqlens`` formula
-    (``training.py:3059``): packing is active under ``--sft`` or
-    ``--dataloader-inter-document-masking``. Shared by the saver
-    (``LogitsSaverHooks``, to know whether to capture/persist
-    ``cu_seqlens_padded``) and the loader (``TeacherTarDataset``'s
-    document-aware CP reslicing requirement, and ``CachedLogitsKDLoss``'s
-    sequence-length-trim safety check) so the two can't drift out of sync.
+    ``get_batch``'s ``has_cu_seqlens``, read from the same source: the data section of the
+    registered run config (the SFT family, or inter-document masking). Shared by the saver
+    (``LogitsSaverHooks``, to know whether to capture/persist ``cu_seqlens_padded``) and the
+    loader (``TeacherTarDataset``'s document-aware CP reslicing requirement, and
+    ``CachedLogitsKDLoss``'s sequence-length-trim safety check) so the two can't drift out of
+    sync with the batch path.
     """
-    args = get_args()
-    return bool(
-        getattr(args, 'sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
-    )
+    return bool(get_run_config().data.batch_flags().has_cu_seqlens)
 
 
 def get_consumed_train_samples() -> int:
@@ -413,10 +409,7 @@ def pad_and_stack_cu_seqlens(cu_seqlens_list: List[torch.Tensor]) -> torch.Tenso
 
 
 def slice_tensor_for_cp_rank(
-    tensor: torch.Tensor,
-    cp_rank: int,
-    cp_size: int,
-    cu_seqlens: Optional[torch.Tensor] = None,
+    tensor: torch.Tensor, cp_rank: int, cp_size: int, cu_seqlens: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """Return this CP rank's zigzag sequence slice from a full sequence tensor.
 
