@@ -214,6 +214,13 @@ def check_checkpoint_args(
     _compare('num_layers')
     _compare('hidden_size')
     _compare('num_attention_heads')
+    if 'post_embedding_rmsnorm' not in skip_args:
+        checkpoint_value = getattr(checkpoint_args, 'post_embedding_rmsnorm', False)
+        args_value = getattr(args, 'post_embedding_rmsnorm', False)
+        assert checkpoint_value == args_value, (
+            f'post_embedding_rmsnorm value from checkpoint ({checkpoint_value}) is not equal to '
+            f'the input argument value ({args_value}).'
+        )
     if hasattr(args, 'gdp_num_householder'):
         _compare('gdp_num_householder', default=3)
     _compare('add_position_embedding', default=True)
@@ -2430,6 +2437,11 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('untie_embeddings_and_output_weights', force=True)
     _set_arg('apply_layernorm_1p', force=True)
     _set_arg('normalization', force=True)
+    # Missing flags in older checkpoints mean that the decoder input was not normalized.
+    # When using checkpoint arguments, restore that architecture over the CLI default.
+    if not hasattr(checkpoint_args, 'post_embedding_rmsnorm'):
+        setattr(checkpoint_args, 'post_embedding_rmsnorm', False)
+    _set_arg('post_embedding_rmsnorm', force=True)
     _set_arg('apply_query_key_layer_scaling', force=True)
     _set_arg('attention_dropout', force=True)
     _set_arg('hidden_dropout', force=True)

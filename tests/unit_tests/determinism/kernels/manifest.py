@@ -316,6 +316,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     # ---------------------------------------------------------------- Transformer Engine wrappers
     KernelEntry(
+        name="hybrid_decoder_entry_norm",
+        sources=("megatron/core/models/hybrid/hybrid_block.py",),
+        tests=(K + "test_te_wrappers.py",),
+        kind="dispatch",
+        notes="Optional decoder-entry TENorm forward, input gradients and gamma gradients "
+        "replayed through HybridStack with BF16 and FP32 residual inputs under contention.",
+    ),
+    KernelEntry(
         name="transformer_engine_wrappers",
         sources=("megatron/core/extensions/transformer_engine.py",),
         tests=(
