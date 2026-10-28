@@ -37,11 +37,7 @@ from megatron.core.transformer.residual_connection import (
     ResidualConnection,
     ResidualConnectionOperation,
 )
-from megatron.core.transformer.residual_recompute import (
-    ResidualStreamRecomputeContext,
-    checkpoint_residual_read,
-    checkpoint_residual_write,
-)
+from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -962,20 +958,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         )
         connection_state = ()
         if residual_connection is not None:
-            if recompute_context is None:
-                hidden_states, connection_state = apply_module(residual_connection)(
-                    hidden_states,
-                    fp32_residual_connection=self.config.fp32_residual_connection,
-                    branch_input_dtype=self.config.params_dtype,
-                )
-            else:
-                hidden_states, connection_state = checkpoint_residual_read(
-                    residual_connection,
-                    hidden_states,
-                    recompute_context,
-                    fp32_residual_connection=self.config.fp32_residual_connection,
-                    branch_input_dtype=self.config.params_dtype,
-                )
+            hidden_states, connection_state = apply_module(residual_connection)(
+                hidden_states,
+                fp32_residual_connection=self.config.fp32_residual_connection,
+                branch_input_dtype=self.config.params_dtype,
+                recompute_context=recompute_context,
+            )
 
         self.attn_norm_manager = self.off_interface(
             self.offload_attn_norm and recompute_context is None, hidden_states, "attn_norm"
@@ -1060,23 +1048,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 and recompute_context.is_block_end
                 and self._get_mlp_residual_connection(operation="write") is None
             )
-            if recompute_context is not None and not is_terminal_write:
-                hidden_states = checkpoint_residual_write(
-                    residual_connection,
+            write_context = None if is_terminal_write else recompute_context
+            grad_scope = (
+                self.bias_dropout_add_exec_handler() if write_context is None else nullcontext()
+            )
+            with grad_scope:
+                hidden_states = apply_module(residual_connection)(
                     attention_output_with_bias,
-                    attn_state,
-                    recompute_context,
+                    state=attn_state,
                     dropout_probability=self.hidden_dropout,
                     training=self.training,
+                    recompute_context=write_context,
                 )
-            else:
-                with self.bias_dropout_add_exec_handler():
-                    hidden_states = apply_module(residual_connection)(
-                        attention_output_with_bias,
-                        state=attn_state,
-                        dropout_probability=self.hidden_dropout,
-                        training=self.training,
-                    )
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
@@ -1266,20 +1249,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         )
         connection_state = ()
         if residual_connection is not None:
-            if recompute_context is None:
-                hidden_states, connection_state = apply_module(residual_connection)(
-                    hidden_states,
-                    fp32_residual_connection=self.config.fp32_residual_connection,
-                    branch_input_dtype=self.config.params_dtype,
-                )
-            else:
-                hidden_states, connection_state = checkpoint_residual_read(
-                    residual_connection,
-                    hidden_states,
-                    recompute_context,
-                    fp32_residual_connection=self.config.fp32_residual_connection,
-                    branch_input_dtype=self.config.params_dtype,
-                )
+            hidden_states, connection_state = apply_module(residual_connection)(
+                hidden_states,
+                fp32_residual_connection=self.config.fp32_residual_connection,
+                branch_input_dtype=self.config.params_dtype,
+                recompute_context=recompute_context,
+            )
 
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(
             hidden_states,
@@ -1605,23 +1580,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         elif residual_connection is not None:
             if not mlp_state:
                 raise RuntimeError("Missing state for the MLP residual connection.")
-            if recompute_context is not None and not recompute_context.is_block_end:
-                hidden_states = checkpoint_residual_write(
-                    residual_connection,
+            write_context = (
+                recompute_context
+                if recompute_context is not None and not recompute_context.is_block_end
+                else None
+            )
+            grad_scope = (
+                self.bias_dropout_add_exec_handler() if write_context is None else nullcontext()
+            )
+            with grad_scope:
+                hidden_states = apply_module(residual_connection)(
                     mlp_output_with_bias,
-                    mlp_state,
-                    recompute_context,
+                    state=mlp_state,
                     dropout_probability=self.hidden_dropout,
                     training=self.training,
+                    recompute_context=write_context,
                 )
-            else:
-                with self.bias_dropout_add_exec_handler():
-                    hidden_states = apply_module(residual_connection)(
-                        mlp_output_with_bias,
-                        state=mlp_state,
-                        dropout_probability=self.hidden_dropout,
-                        training=self.training,
-                    )
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(

@@ -1,6 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Mamba layer specialization for streamwise wide-residual connections."""
 
+from contextlib import nullcontext
+
 from torch import Tensor
 
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -10,11 +12,7 @@ from megatron.core.transformer.residual_connection import (
     ResidualBranchInput,
     ResidualConnectionState,
 )
-from megatron.core.transformer.residual_recompute import (
-    ResidualStreamRecomputeContext,
-    checkpoint_residual_read,
-    checkpoint_residual_write,
-)
+from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
@@ -97,20 +95,12 @@ class WideResidualMambaLayer(MambaLayer):
         """Read the wide stream and optionally replay its connected input normalization."""
 
         recompute_context = residual_stream_recompute_context
-        if recompute_context is None:
-            hidden_states, connection_state = apply_module(self.residual_read)(
-                hidden_states,
-                fp32_residual_connection=self.config.fp32_residual_connection,
-                branch_input_dtype=self.config.params_dtype,
-            )
-        else:
-            hidden_states, connection_state = checkpoint_residual_read(
-                self.residual_read,
-                hidden_states,
-                recompute_context,
-                fp32_residual_connection=self.config.fp32_residual_connection,
-                branch_input_dtype=self.config.params_dtype,
-            )
+        hidden_states, connection_state = apply_module(self.residual_read)(
+            hidden_states,
+            fp32_residual_connection=self.config.fp32_residual_connection,
+            branch_input_dtype=self.config.params_dtype,
+            recompute_context=recompute_context,
+        )
         # Validate the carried state before normalization can consume a hook-modified read.
         self.residual_read.residual_stream(connection_state)
 
@@ -131,21 +121,21 @@ class WideResidualMambaLayer(MambaLayer):
 
         if state is None:
             raise RuntimeError("Missing state for the Mamba residual connection.")
-        if recompute_context is not None and not recompute_context.is_block_end:
-            return checkpoint_residual_write(
-                self.residual_write,
-                mixer_out_with_bias,
-                state,
-                recompute_context,
-                dropout_probability=self.hidden_dropout,
-                training=self.training,
-            )
-        with self.bias_dropout_add_exec_handler():
+        write_context = (
+            recompute_context
+            if recompute_context is not None and not recompute_context.is_block_end
+            else None
+        )
+        grad_scope = (
+            self.bias_dropout_add_exec_handler() if write_context is None else nullcontext()
+        )
+        with grad_scope:
             return apply_module(self.residual_write)(
                 mixer_out_with_bias,
                 state=state,
                 dropout_probability=self.hidden_dropout,
                 training=self.training,
+                recompute_context=write_context,
             )
 
     def _pack_two_stage_output(
