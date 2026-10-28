@@ -1523,8 +1523,18 @@ def validate_args(args, defaults={}):
     if isinstance(args.moe_aux_loss_coeff, list) and len(args.moe_aux_loss_coeff) == 1:
         args.moe_aux_loss_coeff = args.moe_aux_loss_coeff[0]
 
-    # torch_dcp (torch.distributed.checkpoint) checkpointing format checks. The pairing of
-    # torch_dcp and fsdp_dtensor with their FSDP wrapper is checked by CheckpointConfig.validate_run().
+    # The checkpoint rules that need another section's value, for every CLI entry point whatever
+    # container it builds: the inference container has no ddp or optimizer section to check the
+    # FSDP pairings from, so a CLI run checks them here, from the arguments, as before.
+    checkpoint_config_from_args(args).validate_run(
+        use_distributed_optimizer=getattr(args, 'use_distributed_optimizer', False),
+        use_torch_fsdp2=getattr(args, 'use_torch_fsdp2', False),
+        use_megatron_fsdp=getattr(args, 'use_megatron_fsdp', False),
+        use_gloo_process_groups=getattr(args, 'use_gloo_process_groups', True),
+        overlap_param_gather=getattr(args, 'overlap_param_gather', False),
+    )
+
+    # torch_dcp (torch.distributed.checkpoint) checkpointing format checks.
     if args.ckpt_format == "torch_dcp":
         assert args.tensor_model_parallel_size <= 1, \
             "--ckpt-format torch_dcp is not tested with megatron tensor parallelism."

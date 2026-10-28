@@ -1570,3 +1570,40 @@ def test_the_glu_optimizer_guard_follows_the_saved_checkpoint_section(
     with pytest.raises(StopAtTheGuard):
         load_checkpoint([object()], optimizer, None, restore_training_state=True)
     assert decisions == [expected]
+
+
+def test_the_pretrained_fallback_folds_finetune_into_the_load_and_keeps_the_legacy_flag(
+    init_model_parallel, monkeypatch, run_config
+):
+    """A missing --load with --pretrained-checkpoint loads the pretrained directory weights-only:
+    the effective policy of that load carries finetune=True, the registered section is not
+    written, and the legacy namespace flag is set for the readers outside checkpointing.py
+    (examples/multimodal/dataloader_resume.py)."""
+    args = SimpleNamespace(
+        finetune=False,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        world_size=1,
+        data_parallel_size=1,
+        swiglu=False,
+        use_distributed_optimizer=False,
+    )
+    run_config.checkpoint.load = "/missing"
+    run_config.checkpoint.pretrained_checkpoint = "/pretrained"
+    run_config.checkpoint.load_rng = False
+    loads = []
+
+    def base_load(load_dir, run_args, *a, checkpoint, **k):
+        loads.append((load_dir, checkpoint.finetune))
+        return None, "", False, None  # Stop right after the fold: nothing to load.
+
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr(checkpointing, "checkpoint_exists", lambda path: path == "/pretrained")
+    monkeypatch.setattr(checkpointing, "unwrap_model", lambda value: value)
+    monkeypatch.setattr(
+        checkpointing, "_otel_managed_span", lambda *a, **k: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(checkpointing, "_load_base_checkpoint", base_load)
+    assert load_checkpoint([object()], None, None) == (0, 0)
+    assert loads and loads[0] == ("/pretrained", True)
+    assert run_config.checkpoint.finetune is False and args.finetune is True

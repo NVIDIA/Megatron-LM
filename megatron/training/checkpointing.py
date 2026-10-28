@@ -2820,7 +2820,8 @@ def load_checkpoint(
     load_dir = checkpoint.load if load_arg == 'load' else getattr(args, load_arg)
     loading_pretrained_checkpoint = False
     # Two derivations below may turn this load into a weights-only one; they are folded into the
-    # effective policy of this load, never written to the registered section or to args.
+    # effective policy of this load and never written to the registered section (the legacy
+    # namespace keeps receiving them for the readers outside this module).
     finetune = checkpoint.finetune
     override_ckpt_iteration = checkpoint.override_ckpt_iteration
 
@@ -2845,6 +2846,11 @@ def load_checkpoint(
             progress_iteration = read_frozen_resume_iteration(checkpoint.save)
             if progress_iteration > 0:
                 override_ckpt_iteration = progress_iteration
+        # The derived flags stay on the legacy namespace for the readers outside this module
+        # (examples/multimodal/dataloader_resume.py reads args.finetune after the load), as
+        # validate_args keeps its flips; the registered section is never written.
+        args.finetune = True
+        args.override_ckpt_iteration = override_ckpt_iteration
 
     # Finetuning directories
     pretrained_dir = checkpoint.pretrained_checkpoint
@@ -2857,6 +2863,7 @@ def load_checkpoint(
             raise FileNotFoundError('No checkpoint found in load directory or pretrained directory')
         finetune = True
         loading_pretrained_checkpoint = True
+        args.finetune = True  # Legacy namespace flag, see the --freeze-all-layers note above.
 
     checkpoint = dataclasses.replace(
         checkpoint, finetune=finetune, override_ckpt_iteration=override_ckpt_iteration

@@ -638,7 +638,7 @@ def _maybe_reroot_otel_interval():
     save_interval-sized chunks regardless of the resume offset in `iteration`).
     save_interval<=0 (no checkpointing) -> never re-roots (single trace, as before)."""
     global _otel_trace_interval_step
-    freq = getattr(get_args(), 'save_interval', None) or 0
+    freq = get_run_config().checkpoint.save_interval or 0
     if freq > 0 and (_otel_trace_interval_step % freq == 0):
         _reroot_otel_interval()
     _otel_trace_interval_step += 1

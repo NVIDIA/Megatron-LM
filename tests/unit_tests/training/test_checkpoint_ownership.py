@@ -468,6 +468,11 @@ def test_autoresume_saves_only_when_the_section_has_a_save_directory(
     monkeypatch.setattr(common_utils, "get_args", lambda: args)
     autoresume = SimpleNamespace(termination_requested=lambda: True, request_resume=Mock())
     monkeypatch.setattr(common_utils, "get_adlr_autoresume", lambda: autoresume)
+    monkeypatch.setattr(
+        common_utils,
+        "get_train_state",
+        lambda: SimpleNamespace(num_floating_point_operations_so_far=456),
+    )
     monkeypatch.setattr(common_utils.torch.distributed, "barrier", Mock())
     monkeypatch.setattr(common_utils.torch.distributed, "get_rank", lambda: 0)
     save = Mock()
@@ -475,6 +480,9 @@ def test_autoresume_saves_only_when_the_section_has_a_save_directory(
     with pytest.raises(SystemExit):
         common_utils.check_adlr_autoresume_termination(3, [], None, None)
     assert save.called is section_saves
+    if section_saves:
+        # The save gets the run's FLOP count, which save_checkpoint requires.
+        assert save.call_args.args == (3, [], None, None, 456)
 
 
 def test_pretrain_finalizes_the_container_before_fault_tolerance_reads_it():
@@ -503,8 +511,23 @@ CONSUMER_MODULES = (
 ARGS_MAINTAINERS = {("megatron/training/utils/common_utils.py", "update_use_dist_ckpt")}
 
 
+def _is_args(node):
+    """The legacy namespace: the `args` name or a `get_args()` call."""
+    if isinstance(node, ast.Name):
+        return node.id == "args"
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "get_args"
+        and not node.args
+    )
+
+
 def _args_reads(path, names, skip_functions):
-    """`args.<name>` and `getattr(args, "<name>")` uses outside the skipped functions."""
+    """Reads of a checkpoint name from the namespace (`args.<name>`, `get_args().<name>`,
+    `getattr(args, "<name>")`) outside the skipped functions. Writes are not reads: the derived
+    legacy flags `load_checkpoint` keeps on the namespace for readers outside the module are
+    allowed, as the flips `validate_args` keeps."""
     module = ast.parse(path.read_text())
     skipped = [
         range(node.lineno, node.end_lineno + 1)
@@ -515,9 +538,9 @@ def _args_reads(path, names, skip_functions):
     for node in ast.walk(module):
         if (
             isinstance(node, ast.Attribute)
-            and isinstance(node.value, ast.Name)
-            and node.value.id == "args"
+            and _is_args(node.value)
             and node.attr in names
+            and isinstance(node.ctx, ast.Load)
         ):
             name = node.attr
         elif (
@@ -525,8 +548,7 @@ def _args_reads(path, names, skip_functions):
             and isinstance(node.func, ast.Name)
             and node.func.id in ("getattr", "hasattr")
             and len(node.args) >= 2
-            and isinstance(node.args[0], ast.Name)
-            and node.args[0].id == "args"
+            and _is_args(node.args[0])
             and isinstance(node.args[1], ast.Constant)
             and node.args[1].value in names
         ):
@@ -545,3 +567,25 @@ def test_consumers_read_no_checkpoint_name_from_args():
         skip = {function for owner, function in ARGS_MAINTAINERS if owner == module}
         reads += _args_reads(root / module, set(CHECKPOINT_NAMES), skip)
     assert reads == []
+
+
+# ---- the cross-section rules reach every CLI entry point ----
+
+
+@pytest.mark.parametrize(
+    "argv, defaults, match",
+    [
+        (["--ckpt-format", "fsdp_dtensor"], None, "only tested with Megatron FSDP"),
+        # The inference entry points build a container without ddp or optimizer sections; the
+        # CLI check does not depend on which container the entry point builds.
+        (
+            ["--ckpt-format", "fsdp_dtensor"],
+            {"no_load_rng": True, "no_load_optim": True},
+            "only tested with Megatron FSDP",
+        ),
+        (["--ckpt-format", "torch_dcp"], None, "only tested with FSDP"),
+    ],
+)
+def test_validate_args_keeps_the_cross_section_checks_for_every_entry_point(argv, defaults, match):
+    with pytest.raises(AssertionError, match=match):
+        _validated(*argv, defaults=defaults)
