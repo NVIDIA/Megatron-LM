@@ -431,6 +431,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             ).clamp(min=dt_init_floor)
             # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
             inv_dt = dt + torch.log(-torch.expm1(-dt))
+            # Kept in FP32 for the same reason as A_log below.
             self.dt_bias = mark_keep_in_fp32(nn.Parameter(inv_dt))
 
             # Our initialization would set all Linear.bias to zero,
@@ -448,6 +449,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
                 self.nheads_local_tp, dtype=torch.float32, device=torch.cuda.current_device()
             ).uniform_(*A_init_range)
             A_log = torch.log(A)  # Keep A_log in fp32
+            # Float16Module casts every floating-point parameter to BF16 unless it is marked.
+            # A_log and dt_bias set each head's decay, exp(-exp(A_log) * softplus(x + dt_bias)),
+            # and BF16 rounding of these per-head scalars shifts the decay rate of the whole
+            # head. Every consumer already upcasts them to FP32, so keeping them in FP32 only
+            # removes that rounding.
             self.A_log = mark_keep_in_fp32(nn.Parameter(A_log))
             self.A_log._no_weight_decay = True
             setattr(self.A_log, "tensor_model_parallel", True)
