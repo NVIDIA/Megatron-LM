@@ -47,7 +47,7 @@ from megatron.training.argument_utils import (
     core_transformer_config_from_args,
 )
 from megatron.training.async_utils import init_persistent_async_worker
-from megatron.training.global_vars import get_run_config, get_train_state
+from megatron.training.global_vars import get_run_config, get_train_state, initialize_runtime_services
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
 logger = logging.getLogger(__name__)
@@ -69,6 +69,7 @@ def initialize_megatron(
     skip_dependency_compilation=False,
     *,
     training: bool = False,
+    build_tokenizer: bool = True,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -79,6 +80,7 @@ def initialize_megatron(
     use the C++ dataset helpers.
     `training` enables training rerun, checkpoint workers, autoresume and dataset
     compilation in addition to the shared distributed execution and RNG setup.
+    `build_tokenizer` is False for workloads that provide their own tokenization.
     Returns a function to finalize distributed env initialization
     (optionally, only when cfg.dist.lazy_mpu_init == True)
     """
@@ -104,6 +106,9 @@ def initialize_megatron(
             "inference initialization. Disable it until inference has a validated buffer-sizing "
             "contract. Inference-specific communication optimizations are unaffected."
         )
+
+    # Runtime services consume the validated config, before distributed/RNG setup.
+    initialize_runtime_services(args, build_tokenizer=build_tokenizer, training=training)
 
     # set logging level
     setup_logging()
@@ -229,9 +234,7 @@ def initialize_megatron(
             _initialize_tp_communicators(
                 transformer_config,
                 sequence_length=sequence_length,
-                micro_batch_size=(
-                    cfg.train.micro_batch_size if hasattr(cfg, "train") else args.micro_batch_size
-                ),
+                micro_batch_size=cfg.train.micro_batch_size,
                 tp_comm_overlap_cfg=tp_comm_overlap_cfg,
             )
 
@@ -428,6 +431,10 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
         inprocess_restart.maybe_force_nccl_backend_init(device_id)
+        if args.deterministic_mode:
+            from megatron.training.determinism import assert_nccl_algo_still_empty
+
+            assert_nccl_algo_still_empty()
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
@@ -458,7 +465,8 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 gtp_remat_num_sequence_shards=args.gtp_remat_num_sequence_shards,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
-                hybrid_context_parallel=args.hybrid_context_parallel,
+                dynamic_context_parallel=args.dynamic_context_parallel,
+                min_dynamic_context_parallel_size=args.min_dynamic_context_parallel_size,
                 expert_model_parallel_size=args.expert_model_parallel_size,
                 num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
                 expert_tensor_parallel_size=args.expert_tensor_parallel_size,
@@ -591,6 +599,7 @@ def set_jit_fusion_options(tp_size=None):
 
 def _warmup_jit_function(tp_size=None):
     """Compilie JIT functions before the main training steps"""
+    cfg = get_run_config()
     args = get_args()
     if args.bf16:
         dtype = torch.bfloat16
@@ -640,7 +649,7 @@ def _warmup_jit_function(tp_size=None):
     input = torch.rand(
         (
             args.seq_length // args.context_parallel_size,
-            args.micro_batch_size,
+            cfg.train.micro_batch_size,
             args.ffn_hidden_size // args.tensor_model_parallel_size,
         ),
         dtype=dtype,
@@ -684,12 +693,12 @@ def _warmup_jit_function(tp_size=None):
     else:
         seq_length = args.seq_length
     input = torch.rand(
-        (seq_length // args.context_parallel_size, args.micro_batch_size, args.hidden_size),
+        (seq_length // args.context_parallel_size, cfg.train.micro_batch_size, args.hidden_size),
         dtype=dtype,
         device="cuda",
     )
     residual = torch.rand(
-        (seq_length // args.context_parallel_size, args.micro_batch_size, args.hidden_size),
+        (seq_length // args.context_parallel_size, cfg.train.micro_batch_size, args.hidden_size),
         dtype=dtype,
         device="cuda",
     )

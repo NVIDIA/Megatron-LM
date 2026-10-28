@@ -340,6 +340,7 @@ def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):
 
     grouped_mlp = SimpleNamespace(
         _uses_mxfp8_weights=False,
+        _nvfp4_weights=None,
         _fc1_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
         _fc2_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
         _flashinfer_activation_type=object(),
@@ -386,6 +387,7 @@ def test_flashinfer_nvls_clears_routing_before_metadata_fence(monkeypatch):
         config=SimpleNamespace(
             inference_grouped_gemm_backend=InferenceGroupedGemmBackend.FLASHINFER
         ),
+        tp_size=1,
         ep_size=4,
     )
 

@@ -38,11 +38,9 @@ from megatron.training import (
     set_startup_timestamps,
 )
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
-from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.global_vars import (
     get_run_config,
-    initialize_runtime_services,
     set_run_config,
 )
 from pretrain_gpt import loss_func
@@ -74,6 +72,7 @@ def model_provider(
         model (megatron.core.models.multimodal.llava_model.LLaVAModel): A multimodal model
     """
     args = get_args()
+    cfg = get_run_config()
     vision_model_type = "clip"
 
     assert (
@@ -213,7 +212,7 @@ def model_provider(
     model = LLaVAModel(
         language_transformer_config=language_transformer_config,
         language_transformer_layer_spec=language_transformer_layer_spec,
-        language_vocab_size=args.padded_vocab_size,
+        language_vocab_size=cfg.tokenizer.padded_vocab_size,
         language_max_sequence_length=language_max_sequence_length,
         vision_transformer_config=vision_transformer_config,
         vision_transformer_layer_spec=vision_transformer_layer_spec,
@@ -506,8 +505,6 @@ if __name__ == "__main__":
     )
     full_config = pretrain_cfg_container_from_args(args)
     set_run_config(full_config)
-    initialize_runtime_services(args, training=True)
-    resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,

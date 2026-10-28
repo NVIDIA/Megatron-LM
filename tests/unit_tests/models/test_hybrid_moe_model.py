@@ -97,6 +97,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "disable_bf16_reduced_precision_matmul": False,
     "disable_parameter_transpose_cache": False,
     "distribute_saved_activations": False,
+    "dsa_fwd_use_dense_attn": False,
     "dsa_indexer_head_dim": None,
     "dsa_indexer_k_norm_epsilon": None,
     "dsa_indexer_k_norm_fp32": False,
@@ -104,6 +105,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "dsa_indexer_kpool_use_quantization": False,
     "dsa_indexer_kpool_always_select_tail": True,
     "dsa_indexer_loss_coeff": None,
+    "dsa_indexer_mode": "standard",
     "dsa_indexer_n_heads": None,
     "dsa_indexer_qk_proj_use_quantization": True,
     "dsa_indexer_rope_interleaved": False,
@@ -116,6 +118,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "dsa_indexer_use_sparse_loss": False,
     "dsa_indexer_weights_proj_use_quantization": True,
     "dsa_kernel_backend": "none",
+    "dsa_reset_indexer_on_load": False,
     "embedding_init_method": {},
     "embedding_init_method_std": 0.014,
     "enable_autocast": False,
@@ -204,6 +207,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "memory_efficient_layer_norm": False,
     "mhc_fused_backend": "auto",
     "mhc_init_gating_factor": 0.01,
+    "mhc_keep_mappings_in_fp32": False,
+    "mhc_learned_output_contract": True,
+    "mhc_norm_eps_inside_sqrt": False,
     "mhc_recompute_layer_num": None,
     "mhc_sinkhorn_iterations": 20,
     "microbatch_group_size_per_vp_stage": 1,
@@ -232,6 +238,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_use_norm_before_up_proj": False,
     "moe_layer_freq": 1,
     "moe_layer_recompute": False,
+    "moe_megakernel_backend": None,
+    "moe_megakernel_backend_config": None,
     "moe_num_hash_layers": 0,
     "moe_ncclep_zero_copy": False,
     "moe_pad_expert_input_to_capacity": False,
@@ -255,7 +263,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_padding_for_fp8": False,
     "moe_router_padding_for_quantization": False,
     "moe_router_pre_softmax": False,
+    "moe_router_qb_num_bins": 1000,
     "moe_router_quantile_balancing_ema": 0.0,
+    "moe_router_quantile_balancing_estimation_scope": "micro_batch",
     "moe_router_score_function": "sigmoid",
     "moe_router_skip_muon": True,
     "moe_router_topk": 6,
@@ -285,6 +295,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mtp_detach_heads": False,
     "mtp_hsm": False,
     "mtp_hybrid_override_pattern": None,
+    "mtp_loss_early_backward": False,
     "mtp_loss_scaling_factor": 0.1,
     "mtp_num_layers": None,
     "mtp_standalone": False,
@@ -378,7 +389,10 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "delta_offload_bytes_across_pp_ranks": 0,
     "activation_offload_fraction": 1.0,
     "fine_grained_offloading_max_inflight_offloads": None,
+    "fine_grained_offloading_buffer_size_gib": 0.0,
     "hybrid_context_parallel": False,
+    "dynamic_context_parallel": False,
+    "min_dynamic_context_parallel_size": 1,
     "max_seqlen_per_dp_cp_rank": None,
     "inference_cuda_graph_scope": {
         "__objclass__": "megatron.core.transformer.enums.InferenceCudaGraphScope",
@@ -390,6 +404,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_force_biased": None,
     "inference_grouped_gemm_backend": "vllm",
     "inference_flashinfer_mxfp8_token_capacity": None,
+    "inference_moe_nvfp4_recipe": None,
     "inference_moe_disable_fused_quant_kernels": False,
     "inference_moe_router_backend": "triton",
     "inference_moe_token_dispatcher_type": "nvls",
@@ -405,7 +420,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
 # Fields that are allowed to appear in the live config even if not yet in the golden.
-ALLOW_ADDED_FIELDS = set()
+ALLOW_ADDED_FIELDS = {"pad_packed_seq_alignment"}
 
 
 def serialize_config(cfg: Any) -> Dict[str, Any]:

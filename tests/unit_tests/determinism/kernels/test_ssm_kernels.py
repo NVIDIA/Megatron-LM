@@ -138,6 +138,61 @@ def test_mamba_chunk_scan_combined_varlen_replays():
     )
 
 
+def test_batch_invariant_decode_step_replays():
+    """One buffered batch-invariant decode step (chunk scan in target-rows mode, gated by the
+    current token's z) replays bit-exact, including a slot that crosses a chunk boundary."""
+    from megatron.core.ssm.ops.mamba2.batch_invariant_decode import (
+        BatchInvariantDecodeBuffers,
+        batch_invariant_decode_buffered_scan,
+    )
+
+    seeded()
+    slots, nheads, headdim, ngroups, dstate, chunk = 8, 16, 64, 2, 128, 128
+    bufs = BatchInvariantDecodeBuffers.allocate(
+        slots, chunk, nheads, headdim, ngroups, dstate, torch.device("cuda"), torch.float32
+    )
+    rows = (bufs.x, bufs.dt, bufs.B, bufs.C)
+    for t in rows:
+        t.normal_()
+    num_buffered = torch.randint(0, chunk, (slots,), dtype=torch.int32, device="cuda")
+    num_buffered[0] = chunk - 1  # this step fills slot 0's chunk
+    batch_indices = torch.arange(slots, dtype=torch.int32, device="cuda")
+    step = [
+        torch.randn(slots, 1, *shape, device="cuda")
+        for shape in ((nheads, headdim), (nheads, headdim), (nheads,), (ngroups, dstate))
+    ]
+    C = torch.randn(slots, 1, ngroups, dstate, device="cuda")
+    A = -torch.rand(nheads, device="cuda") - 0.5
+    D = torch.randn(nheads, device="cuda")
+    dt_bias = torch.rand(nheads, device="cuda")
+    ssm_state = torch.randn(slots, nheads, headdim, dstate, device="cuda")
+
+    def fn(x_buf, dt_buf, B_buf, C_buf, num_buffered, x, z, dt, B, C, ssm_state):
+        buffers = BatchInvariantDecodeBuffers(
+            x=x_buf,
+            dt=dt_buf,
+            B=B_buf,
+            C=C_buf,
+            num_buffered=num_buffered,
+            out=torch.empty(slots, nheads, headdim, device="cuda"),
+            target_rows=torch.empty(slots, dtype=torch.int32, device="cuda"),
+            chunk_flags=torch.empty(slots, dtype=torch.int32, device="cuda"),
+            chunk_starts=torch.empty(slots, dtype=torch.int32, device="cuda"),
+        )
+        y = batch_invariant_decode_buffered_scan(
+            buffers, x, z, dt, B, C, A, D, dt_bias, batch_indices, ssm_state
+        )
+        return y, ssm_state, num_buffered
+
+    assert_replays_bit_exact(
+        fn,
+        (*rows, num_buffered, *step, C, ssm_state),
+        replays=4,
+        backward=False,
+        what="batch_invariant_decode_buffered_scan",
+    )
+
+
 def test_selective_state_update_replays():
     from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
 
@@ -287,11 +342,11 @@ def test_causal_conv1d_varlen_replays(monkeypatch, cache_autotuning):
 # --- Gated Delta Product ----------------------------------------------------------------------
 
 
-def _gdp_case():
+def _gdp_case(M=2):
     from megatron.core.ssm.ops.gdp.chunk import chunk_gated_delta_product_varlen
 
     seeded()
-    T, H, K, V, M = 4096, 16, 128, 128, 2
+    T, H, K, V = 4096, 16, 128, 128
     bounds = [0, 1000, 2500, 4096]
     q = torch.randn(1, T, H, K, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(1, T * M, H, K, device="cuda", dtype=torch.bfloat16)
@@ -341,10 +396,11 @@ def test_chunk_gated_delta_product_varlen_is_pinned(monkeypatch):
     "elements, max |diff| 3.6e-2 bf16; final state ~0.13%, 2.9e-4). Recorded for the hybrid "
     "model owners; not gated until root-caused.",
 )
-def test_chunk_gated_delta_product_varlen_replays():
-    fn, args = _gdp_case()
+@pytest.mark.parametrize("M", [1, 2])  # M=1 is GDN's dynamic-inference prefill
+def test_chunk_gated_delta_product_varlen_replays(M):
+    fn, args = _gdp_case(M)
     assert_replays_bit_exact(
-        fn, args, replays=4, backward=False, what="chunk_gated_delta_product_varlen"
+        fn, args, replays=4, backward=False, what=f"chunk_gated_delta_product_varlen (M={M})"
     )
 
 
@@ -495,7 +551,7 @@ def test_fused_recurrent_gated_delta_rule_update_padding_replays():
 @pytest.mark.parametrize("S", [1, 4])
 def test_gdp_decode_prepare_replays(S):
     """``S`` is one plus the speculative draft length; ``S == 1`` is plain decode."""
-    from megatron.core.ssm.ops.gdp.decode_prepare import gdp_decode_prepare
+    from megatron.core.ssm.ops.gdp.prepare import gdp_decode_prepare
 
     seeded()
     n, M, H, G, P, N = 256, 2, 16, 4, 128, 128
@@ -511,6 +567,28 @@ def test_gdp_decode_prepare_replays(S):
         replays=4,
         backward=False,
         what=f"gdp_decode_prepare (S={S})",
+    )
+
+
+@pytest.mark.parametrize("T", [1, 4096])
+def test_gdp_prefill_prepare_replays(T):
+    """``T`` is the packed token count of a prefill step."""
+    from megatron.core.ssm.ops.gdp.prepare import gdp_prefill_prepare
+
+    seeded()
+    M, H, G, P, N = 3, 12, 12, 64, 128
+    x = torch.randn(1, T, M * H * P + M * G * N + G * N, device="cuda", dtype=torch.bfloat16)
+    # `ba` reaches the kernel as a slice of the input projection, so only its last
+    # dimension is contiguous and the token stride comes from the view, not the width.
+    ba = torch.randn(1, T, 2 * (M * H + H), device="cuda", dtype=torch.bfloat16)[..., : M * H + H]
+    A_log = torch.randn(H, device="cuda")
+    dt_bias = torch.randn(H, device="cuda")
+    assert_replays_bit_exact(
+        lambda x, ba, A_log, dt_bias: gdp_prefill_prepare(x, ba, A_log, dt_bias, M, H, G, P, N),
+        (x, ba, A_log, dt_bias),
+        replays=4,
+        backward=False,
+        what=f"gdp_prefill_prepare (T={T})",
     )
 
 
@@ -567,6 +645,69 @@ def test_gdn_torch_l2norm_matches_fla_and_replays(dtype, head_dim, compiled):
     assert_replays_bit_exact(
         normalize, (x.requires_grad_(True),), replays=3, contention=True, what="GDN torch L2 norm"
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("sequence_length", [64, 65])
+@pytest.mark.parametrize("with_initial_state", [False, True])
+@pytest.mark.parametrize("output_final_state", [False, True])
+def test_torch_chunk_gated_delta_rule_cuda_graph(
+    dtype, sequence_length, with_initial_state, output_final_state
+):
+    """Capture forward/backward and replay changed inputs without a CPU state allocation."""
+    from megatron.core.ssm.gated_delta_net.gdn import torch_chunk_gated_delta_rule
+
+    def make_inputs(seed):
+        seeded(seed)
+        shape = (2, sequence_length, 2, 8)
+        q = torch.nn.functional.normalize(torch.randn(shape, device="cuda"), dim=-1).to(dtype)
+        k = torch.nn.functional.normalize(torch.randn_like(q).float(), dim=-1).to(dtype)
+        v = torch.randn(2, sequence_length, 2, 12, device="cuda", dtype=dtype) * 0.1
+        g = -torch.rand(2, sequence_length, 2, device="cuda") * 0.1
+        beta = torch.rand_like(g).to(dtype)
+        values = [q, k, v, g, beta]
+        if with_initial_state:
+            values.append(torch.randn(2, 2, 8, 12, device="cuda") * 0.1)
+        return tuple(value.detach().requires_grad_(True) for value in values)
+
+    def forward_backward(values):
+        output, state = torch_chunk_gated_delta_rule(
+            *values[:5],
+            initial_state=values[5] if with_initial_state else None,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=False,
+        )
+        outputs = (output,) if state is None else (output, state)
+        loss = sum(value.float().sum() for value in outputs)
+        return (*outputs, *torch.autograd.grad(loss, values))
+
+    static_inputs = make_inputs(42)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            forward_backward(static_inputs)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = forward_backward(static_inputs)
+
+    for seed in (101, 102, 103):
+        inputs = make_inputs(seed)
+        expected = forward_backward(inputs)
+        with torch.no_grad():
+            for destination, source in zip(static_inputs, inputs):
+                destination.copy_(source)
+        graph.replay()
+        for actual, reference in zip(captured, expected):
+            assert torch.isfinite(actual).all()
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+        previous = tuple(value.detach().clone() for value in captured)
+        graph.replay()
+        for actual, reference in zip(captured, previous):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
 def test_torch_chunk_gated_delta_rule_replays_fwd_bwd():
