@@ -37,6 +37,7 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
     VLMInferenceWrapper,
 )
+from megatron.core.parallel_state import get_registered_process_groups
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage
 from megatron.core.process_groups_config import resolve_process_groups
 from megatron.core.utils import get_attr_wrapped_model
@@ -902,8 +903,14 @@ def eval_tasks():
             pg_collection=pg_collection,
         )
 
-    # Set up model and load checkpoint.
-    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=False)
+    # Set up model and load checkpoint. The model is built on the groups that
+    # initialize_megatron() registered.
+    model = get_model(
+        wrapped_model_provider,
+        model_type=ModelType.encoder_or_decoder,
+        wrap_with_ddp=False,
+        pg_collection=get_registered_process_groups(),
+    )
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None)
