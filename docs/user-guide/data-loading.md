@@ -107,6 +107,8 @@ torchrun --nproc_per_node=8 --nnodes=512 ... pretrain_gpt.py \
 | `--per-dataset-sequences-path` | None | **Set when blending many datasets** | Points to a JSON file mapping each dataset path to its `(sequence_count, document_count)`. Replaces per-file metadata reads with a single JSON lookup. Generate with `tools/build_sequences_per_dataset.py`. |
 | `--data-cache-path` | None | **Set** | Directory where index `.npy` files are cached. Must be on shared storage for multi-node jobs so all ranks can read it. |
 | `--num-workers` | 2 | **Keep as small as necessary** | Number of DataLoader worker processes. The goal is to satisfy: *time to process a batch > time to prepare a batch*. This hides dataloader work behind the training step. Increasing beyond what's needed wastes CPU and memory. |
+| `--no-pin-memory` | pinned | **Keep pinned** | Disables `pin_memory` on the DataLoader. Pinned host memory makes the host-to-device copies asynchronous; turn it off only when pinned memory is scarce. |
+| `--no-persistent-workers` | persistent with workers | **Keep persistent** | Tears the DataLoader workers down after each pass instead of keeping them alive (`persistent_workers=False`). With `--num-workers 0` there are no workers to keep, whatever the flag says. |
 | `--no-mmap-bin-files` | mmap on | **Test both** | Memory-mapping `.bin` files leverages the OS page cache, but the optimal setting is filesystem-dependent. Some large-scale production configurations disable mmap. Test with and without to determine what works best for your storage. |
 
 ### Object storage (S3 / Multi-Storage Client)

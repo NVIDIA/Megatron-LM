@@ -18,6 +18,8 @@ section.
 class the builder instantiates (``GPTDataset``, ``MockGPTDataset``, ``GPTFIMDataset``, ...). One rule
 serves every GPT entry point: the args-to-config factory forwards every data argument, the class
 follows the family flags, and the provider hands ``cfg.data.dataset`` to the builder unchanged.
+The loop reads the section through ``batch_flags()`` and ``yields_unpacked_samples()`` (and the
+data length through ``megatron.training.config.compat``), never through ``args``.
 Entry points with their own data pipeline carry a loader-only section (``dataset is None``) and
 nothing here runs for them.
 """
