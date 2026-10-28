@@ -301,6 +301,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         name="tensor_parallel_mappings",
         sources=("megatron/core/tensor_parallel/mappings.py",),
         tests=(
+            "tests/unit_tests/transformer/moe/test_moe_layer.py",
             C + "test_transformer_layer.py",
             C + "test_gpt_model.py",
             K + "test_csa_packed_kernels.py",
@@ -353,7 +354,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_utils",
         sources=("megatron/core/transformer/moe/moe_utils.py",),
-        tests=(K + "test_moe_kernels.py",),
+        tests=("tests/unit_tests/transformer/moe/test_routers.py", K + "test_moe_kernels.py"),
         kind="torch-op",
         notes="permute/unpermute (index_add_ vs scatter_add_), routing (index_put_ vs scatter), sort_chunks, aux loss, "
         "router gating GEMM, TE fused permutation/router kernels, global-batch quantile "
@@ -395,7 +396,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/moe/token_dispatcher.py",
             "megatron/core/transformer/moe/moe_layer.py",
         ),
-        tests=(K + "test_moe_kernels.py",),
+        tests=("tests/unit_tests/transformer/moe/test_moe_layer.py", K + "test_moe_kernels.py"),
         kind="torch-op",
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
         "virtual-expert routing metadata and probability gradients replay under stream contention.",

@@ -11,6 +11,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_submodules,
 )
+from megatron.core.tensor_parallel import mappings
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.spec_utils import get_submodules
@@ -470,6 +471,166 @@ class TestMoELayerRecompute:
         for name, param in moe_layer.named_parameters():
             if param.requires_grad:
                 assert param.grad is not None, f"Gradient for {name} should exist"
+
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+
+class TestMoELayerRecomputeSkipsCombineComm:
+    """The re-run of a checkpointed MoE layer skips the combine communication.
+
+    The gradients must be bitwise those of a re-run that communicates, and the re-run must issue
+    exactly one collective fewer per combine exchange (the forward of the combine). With latent
+    MoE, the re-run reuses the combined latent tensor kept by the forward pass.
+    """
+
+    @staticmethod
+    def _count_collectives(monkeypatch):
+        """Count the collectives issued while ``monkeypatch`` is active, by kind."""
+        counts = {"all_to_all": 0, "reduce_scatter": 0}
+
+        def counting(kind, function):
+            def wrapper(*args, **kwargs):
+                counts[kind] += 1
+                return function(*args, **kwargs)
+
+            return wrapper
+
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_to_all_single",
+            counting("all_to_all", torch.distributed.all_to_all_single),
+        )
+        monkeypatch.setattr(
+            torch.distributed,
+            "reduce_scatter",
+            counting("reduce_scatter", torch.distributed.reduce_scatter),
+        )
+        monkeypatch.setattr(
+            mappings,
+            "dist_reduce_scatter_func",
+            counting("reduce_scatter", mappings.dist_reduce_scatter_func),
+        )
+        return counts
+
+    @pytest.mark.parametrize("moe_token_dispatcher_type", ["allgather", "alltoall"])
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 1), (1, 2), (1, 4), (2, 2), (2, 4), (1, 8)])
+    @pytest.mark.parametrize("shared_expert_overlap", [False, True])
+    @pytest.mark.parametrize("latent", [None, "latent", "latent_norm"])
+    def test_recompute_skips_combine_comm(
+        self,
+        monkeypatch,
+        moe_token_dispatcher_type,
+        tp_size,
+        ep_size,
+        shared_expert_overlap,
+        latent,
+    ):
+        if tp_size * ep_size > Utils.world_size:
+            pytest.skip(f"needs {tp_size * ep_size} GPUs")
+        if shared_expert_overlap and moe_token_dispatcher_type != "alltoall":
+            pytest.skip("shared expert overlap needs the alltoall dispatcher")
+        if shared_expert_overlap and latent:
+            pytest.skip("shared expert overlap is not supported with latent MoE in training")
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size, expert_model_parallel_size=ep_size
+        )
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        num_moe_experts = 8
+        transformer_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_moe_experts=num_moe_experts,
+            moe_token_dispatcher_type=moe_token_dispatcher_type,
+            moe_router_load_balancing_type="aux_loss",
+            moe_router_topk=2,
+            moe_aux_loss_coeff=0.01,
+            moe_ffn_hidden_size=128,
+            moe_shared_expert_intermediate_size=128 if shared_expert_overlap or latent else None,
+            moe_shared_expert_overlap=shared_expert_overlap,
+            moe_latent_size=32 if latent else None,
+            moe_use_norm_before_up_proj=latent == "latent_norm",
+            add_bias_linear=False,
+            recompute_granularity="selective",
+            recompute_modules=["moe"],
+            tensor_model_parallel_size=tp_size,
+            expert_model_parallel_size=ep_size,
+            sequence_parallel=tp_size > 1,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        # The latent projections are Transformer Engine linears.
+        get_layer_submodules = (
+            get_gpt_layer_with_transformer_engine_submodules
+            if latent
+            else get_gpt_layer_local_submodules
+        )
+        submodules = get_submodules(
+            get_layer_submodules(num_experts=num_moe_experts, moe_grouped_gemm=False).mlp
+        )
+        moe_layer = MoELayer(transformer_config, submodules).cuda()
+        hidden_states = torch.randn(
+            32, 2, 64, device=torch.cuda.current_device(), dtype=torch.bfloat16
+        ).requires_grad_()
+        output_grad = torch.randn_like(hidden_states)
+
+        def forward_backward():
+            moe_layer.zero_grad(set_to_none=True)
+            hidden_states.grad = None
+            output, _ = moe_layer(hidden_states)
+            repeat_backward = latent == "latent_norm" and tp_size == ep_size == 1
+            with pytest.MonkeyPatch.context() as mp:
+                counts = self._count_collectives(mp)
+                output.backward(output_grad, retain_graph=repeat_backward)
+            grads = {name: p.grad.clone() for name, p in moe_layer.named_parameters()}
+            input_grad = hidden_states.grad.clone()
+            if repeat_backward:
+                moe_layer.zero_grad(set_to_none=True)
+                hidden_states.grad = None
+                output.backward(output_grad)
+                assert torch.equal(
+                    input_grad.contiguous().view(torch.uint8),
+                    hidden_states.grad.contiguous().view(torch.uint8),
+                )
+                for name, param in moe_layer.named_parameters():
+                    assert torch.equal(
+                        grads[name].contiguous().view(torch.uint8),
+                        param.grad.contiguous().view(torch.uint8),
+                    ), name
+            return output.detach().clone(), input_grad, grads, dict(counts)
+
+        output, input_grad, grads, counts = forward_backward()
+        assert not moe_layer.token_dispatcher.skip_combine_forward_comm
+        assert moe_layer._combined_latent is None
+
+        # Reference: the re-run communicates in the combine.
+        monkeypatch.setattr(MoELayer, "_skip_combine_comm_on_recompute", lambda self, fn: fn)
+        ref_output, ref_input_grad, ref_grads, ref_counts = forward_backward()
+
+        assert torch.equal(
+            output.contiguous().view(torch.uint8), ref_output.contiguous().view(torch.uint8)
+        )
+        assert torch.equal(
+            input_grad.contiguous().view(torch.uint8), ref_input_grad.contiguous().view(torch.uint8)
+        )
+        assert grads.keys() == ref_grads.keys()
+        for name in grads:
+            assert torch.equal(
+                grads[name].contiguous().view(torch.uint8),
+                ref_grads[name].contiguous().view(torch.uint8),
+            ), name
+
+        # Exactly the forward collectives of the combine are skipped in the backward pass.
+        if moe_token_dispatcher_type == "alltoall":
+            skipped = {"all_to_all": int(ep_size > 1), "reduce_scatter": int(tp_size > 1)}
+        else:
+            skipped = {"all_to_all": 0, "reduce_scatter": int(tp_size * ep_size > 1)}
+        for kind in counts:
+            assert ref_counts[kind] - counts[kind] == skipped[kind], (kind, counts, ref_counts)
 
         Utils.destroy_model_parallel()
 

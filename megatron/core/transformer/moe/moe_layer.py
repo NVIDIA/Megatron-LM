@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from typing import Callable, Optional, Protocol
 
 import torch
 
@@ -482,6 +482,8 @@ class MoELayer(BaseMoELayer):
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
         self.fwd_execution_map = ["route", "expert_compute", "postprocess"]
+        # The combined latent tensor kept for the recompute (_skip_combine_comm_on_recompute).
+        self._combined_latent: Optional[list] = None
 
         # Setup events and streams for delayed wgrad computation.
         self.setup_delayed_wgrad_for_dispatch_backward_overlap()
@@ -713,6 +715,7 @@ class MoELayer(BaseMoELayer):
 
         output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
+            output = self._reuse_combined_latent(output)
             if self.config.moe_use_norm_before_up_proj:
                 output = apply_module(self.fc2_norm)(output)
             output, _ = self.fc2_latent_proj(output)
@@ -849,7 +852,7 @@ class MoELayer(BaseMoELayer):
 
         if self.moe_layer_recompute and self.training:
             outputs = precision_aware_checkpoint(
-                custom_forward,
+                self._skip_combine_comm_on_recompute(custom_forward),
                 self.config,
                 self.tp_group,
                 hidden_states,
@@ -860,6 +863,58 @@ class MoELayer(BaseMoELayer):
             outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
 
         return outputs
+
+    def _skip_combine_comm_on_recompute(self, forward_fn: Callable) -> Callable:
+        """Wrap the checkpointed MoE forward so that its re-run skips the combine communication.
+
+        The checkpoint calls ``forward_fn`` once in the forward pass and once more in the backward
+        pass to rebuild the autograd graph. The re-run's combine returns zeros without
+        communicating, while its backward communicates as usual. Every rank re-runs the layer, so
+        all ranks of the combine group skip alike.
+
+        Without latent projections, nothing in the re-run reads the combined values: they only
+        flow through the unpermutation, the shared-expert add and the layer output, whose backward
+        passes do not use them, and the checkpoint starts the backward from the incoming output
+        gradient. With latent MoE, ``fc2_norm`` and ``fc2_latent_proj`` do read them, so the
+        forward pass keeps the unpermuted combined latent tensor and the re-run uses it in place
+        of the skipped combine (see ``_reuse_combined_latent``). The gradients are unchanged.
+        """
+        if not self.token_dispatcher.supports_skip_combine_forward_comm:
+            return forward_fn
+
+        num_calls = 0
+        combined_latent = [] if self.config.moe_latent_size else None
+
+        def wrapped_forward(*args, **kwargs):
+            nonlocal num_calls
+            num_calls += 1
+            # The first backward consumes the latent cache. A retained graph can
+            # run backward again: communicate normally then, without retaining a
+            # new activation or its recomputed autograd graph.
+            skip_combine = num_calls > 1 and (combined_latent is None or bool(combined_latent))
+            self.token_dispatcher.skip_combine_forward_comm = skip_combine
+            self._combined_latent = combined_latent if num_calls == 1 or skip_combine else None
+            try:
+                return forward_fn(*args, **kwargs)
+            finally:
+                self.token_dispatcher.skip_combine_forward_comm = False
+                self._combined_latent = None
+
+        return wrapped_forward
+
+    def _reuse_combined_latent(self, output: torch.Tensor) -> torch.Tensor:
+        """Keep the combined latent tensor in the forward pass and reuse it in the re-run.
+
+        Memory: one ``[tokens, moe_latent_size]`` activation per MoE layer and in-flight
+        micro-batch, held from the forward pass to the backward pass.
+        """
+        if self._combined_latent is None:
+            return output
+        if self.token_dispatcher.skip_combine_forward_comm:
+            # Re-run: the forward values of the skipped combine, its graph for the backward.
+            return _ReplaceForwardValue.apply(output, self._combined_latent.pop())
+        self._combined_latent.append(output)
+        return output
 
     def backward_dw(self, routed_experts: bool = True, shared_experts: bool = False):
         """Compute weight gradients for experts and shared experts."""
@@ -891,6 +946,20 @@ class MoELayer(BaseMoELayer):
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.shared_experts.linear_fc1)
+
+
+class _ReplaceForwardValue(torch.autograd.Function):
+    """Return ``value`` in the forward pass; pass the gradient through to ``input_``."""
+
+    @staticmethod
+    def forward(ctx, input_: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        """Forward function."""
+        return value
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Backward function."""
+        return grad_output, None
 
 
 class _RecordExpertDgradCompletion(torch.autograd.Function):
