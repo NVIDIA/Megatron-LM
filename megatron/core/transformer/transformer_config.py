@@ -318,6 +318,10 @@ class TransformerConfig(ModelParallelConfig):
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
 
+    gated_attention_proj_granularity: Literal['elementwise', 'headwise'] = "elementwise"
+    """Projection granularity for ``attention_output_gate`` (MLA output gating): one gate per
+    output element (``elementwise``) or one gate per attention head (``headwise``)."""
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 
@@ -1171,6 +1175,8 @@ class TransformerConfig(ModelParallelConfig):
         projections, ``parallel_mode="duplicated"``). Only beneficial when ``moe_latent_size``
         is large enough for the all-gather to amortize.
     """
+    moe_latent_up_projection_rmsnorm: bool = False
+    """Apply RMSNorm immediately before the duplicated MoE latent up-projection."""
 
     moe_flex_dispatcher_num_sms: Optional[int] = None
     """Number of SMs for the flex token dispatcher's dispatch/combine communication, for all
@@ -2326,6 +2332,9 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
+
+        if self.moe_latent_up_projection_rmsnorm and self.moe_latent_size is None:
+            raise ValueError("moe_latent_up_projection_rmsnorm requires moe_latent_size to be set.")
 
         if self.num_moe_experts is not None and self.moe_ffn_hidden_size is None:
             self.moe_ffn_hidden_size = self.ffn_hidden_size

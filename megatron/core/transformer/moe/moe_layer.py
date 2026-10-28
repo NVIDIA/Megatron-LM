@@ -66,9 +66,14 @@ except ImportError:
     HAVE_TRITON = False
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import TELinear, TENorm
+    from megatron.core.extensions.transformer_engine import (
+        TELinear,
+        TENorm,
+        TERMSNormDuplicatedLinear,
+        te_checkpoint,
+    )
 else:
-    TELinear, TENorm = None, None
+    TELinear, TENorm, TERMSNormDuplicatedLinear, te_checkpoint = None, None, None, None
 
 
 class ExpertsInterface(Protocol):
@@ -299,6 +304,11 @@ class MoELayer(BaseMoELayer):
         if self.config.moe_latent_size:
             assert HAVE_TE, "TransformerEngine is required for MoE latent projections."
             if self.config.transformer_impl == "inference_optimized":
+                if self.config.moe_latent_up_projection_rmsnorm:
+                    raise NotImplementedError(
+                        "The inference-optimized latent projection does not support "
+                        "RMSNorm followed by Linear."
+                    )
                 from megatron.core.tensor_parallel.inference_layers import InferenceLinear
 
                 linear_cls = InferenceLinear
@@ -328,13 +338,28 @@ class MoELayer(BaseMoELayer):
                 name=(name + ".fc1_latent_proj") if name is not None else None,
                 **linear_gtp_kwargs,
             )
+            # main's separate pre-up-proj norm (moe_use_norm_before_up_proj) and dev #6804's
+            # fused RMSNorm up-projection (moe_latent_up_projection_rmsnorm via
+            # TERMSNormDuplicatedLinear) are independent options; Kimi-K3 uses the latter.
             if self.config.moe_use_norm_before_up_proj:
                 self.fc2_norm = TENorm(
                     config=self.config,
                     hidden_size=self.config.moe_latent_size,
                     eps=self.config.layernorm_epsilon,
                 )
-            self.fc2_latent_proj = linear_cls(
+            fc2_linear_cls = (
+                TERMSNormDuplicatedLinear
+                if self.config.moe_latent_up_projection_rmsnorm
+                else linear_cls
+            )
+            # The TE GTP-remat kwargs only apply to the plain linear path; the duplicated
+            # RMSNorm wrapper takes its TP group instead and rejects gtp_remat_group.
+            fc2_extra_kwargs = (
+                {"tp_group": pg_collection.tp}
+                if fc2_linear_cls is TERMSNormDuplicatedLinear
+                else linear_gtp_kwargs
+            )
+            self.fc2_latent_proj = fc2_linear_cls(
                 self.config.moe_latent_size,
                 self.config.hidden_size,
                 parallel_mode="duplicated",
@@ -345,7 +370,7 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc2_latent_proj") if name is not None else None,
-                **linear_gtp_kwargs,
+                **fc2_extra_kwargs,
             )
             if linear_cls is TELinear:
                 # The duplicated operation has no TP execution group. TELinear uses

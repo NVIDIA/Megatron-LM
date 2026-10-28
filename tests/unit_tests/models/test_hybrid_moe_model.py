@@ -236,6 +236,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_input_jitter_eps": None,
     "moe_latent_size": None,
     "moe_use_norm_before_up_proj": False,
+    "moe_latent_up_projection_rmsnorm": False,
     "moe_layer_freq": 1,
     "moe_layer_recompute": False,
     "moe_num_hash_layers": 0,
