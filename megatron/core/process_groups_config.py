@@ -36,6 +36,17 @@ _warned_global_process_group_fallbacks: Set[Tuple[str, ...]] = set()
 # Fallbacks whose warning this thread is showing, in its "keys" attribute.
 _fallback_warnings_in_progress = threading.local()
 
+# ProcessGroupCollection.use_mpu_process_groups() builds a collection from the deprecated
+# parallel_state accessors, and is deprecated with them for callers outside Megatron Core.
+_USE_MPU_PROCESS_GROUPS_DEPRECATION = (
+    "megatron.core.process_groups_config.ProcessGroupCollection.use_mpu_process_groups() is "
+    f"deprecated since Megatron Core {parallel_state._ACCESSOR_DEPRECATED_IN} and will be "
+    f"removed in {parallel_state._ACCESSOR_REMOVED_IN}. Replace it with the "
+    "ProcessGroupCollection that the code which needs the groups receives from its caller, or "
+    "with megatron.core.parallel_state.get_registered_process_groups() for the groups that "
+    "initialize_model_parallel() or register_process_groups() registered for this run."
+)
+
 
 class ProcessGroupFallbackWarning(FutureWarning):
     """A Megatron Core component fell back to the global process groups in ``parallel_state``.
@@ -414,6 +425,7 @@ class ProcessGroupCollection:
         return self
 
     @classmethod
+    @parallel_state._deprecated_outside_megatron_core(_USE_MPU_PROCESS_GROUPS_DEPRECATION)
     def use_mpu_process_groups(cls, required_pgs: Optional[List[str]] = None):
         """
         Use the default process groups from parallel_state.
@@ -421,6 +433,13 @@ class ProcessGroupCollection:
         These are the groups registered with parallel_state.register_process_groups(), which
         initialize_model_parallel() calls. Each call returns a new collection; dp_cp_ag and
         expt_dp_ag are None.
+
+        Deprecated since Megatron Core 0.21 and removed in 0.23: called from outside Megatron
+        Core, it emits a ``ParallelStateDeprecationWarning`` once per call site, except in the
+        block of ``global_process_group_fallback()``. Pass the model's collection to the code
+        that needs it instead, or read the registered one with
+        ``parallel_state.get_registered_process_groups()``, which returns that collection
+        itself rather than a new one.
 
         Args:
             required_pgs (List[str], optional): List of process group names to initialize.

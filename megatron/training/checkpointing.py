@@ -54,7 +54,6 @@ from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     global_process_group_fallback,
     require_process_groups,
-    warn_global_process_group_fallback,
 )
 from megatron.core.rerun_state_machine import RerunState, get_rerun_state_machine
 from megatron.core.tokenizers import MegatronTokenizer
@@ -288,20 +287,13 @@ def _model_pg_collection(model):
         return None
 
 
-def _warn_global_grid_fallback(owner, argument):
-    """Warn that ``owner`` was called without ``argument`` and reads the global parallel grid.
+def _global_grid_fallback(owner, argument):
+    """Warn that ``owner`` was called without ``argument``, and return a block that reads the grid.
 
     Checkpointing keeps these fallbacks for callers that do not pass their process groups yet.
-    They warn from Megatron Core 0.21 on and are removed in 0.23.
-    """
-    warn_global_process_group_fallback(owner, argument, deprecated_in='0.21', removed_in='0.23')
-
-
-def _global_grid_fallback(owner, argument):
-    """Warn as ``_warn_global_grid_fallback`` does, and return a block that reads the grid.
-
-    The accessors of ``mpu`` called in the block belong to this fallback, so they do not warn
-    again.
+    They warn from Megatron Core 0.21 on and are removed in 0.23. The accessors of ``mpu`` and
+    ``ProcessGroupCollection.use_mpu_process_groups()`` called in the block belong to this
+    fallback, so they do not warn again.
     """
     return global_process_group_fallback(owner, argument, deprecated_in='0.21', removed_in='0.23')
 
@@ -329,10 +321,10 @@ def _checkpoint_pg_collection(model, pg_collection, owner):
         pg_collection = _model_pg_collection(model)
     if pg_collection is None:
         # Compatibility fallback for model classes that carry no collection.
-        _warn_global_grid_fallback(owner, 'pg_collection')
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=_CHECKPOINT_PROCESS_GROUPS
-        )
+        with _global_grid_fallback(owner, 'pg_collection'):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=_CHECKPOINT_PROCESS_GROUPS
+            )
     if isinstance(pg_collection, MultiModuleProcessGroupCollection):
         raise ValueError(
             'Checkpointing needs the process groups of the module that this rank saves or '

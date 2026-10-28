@@ -67,11 +67,12 @@ _in_warned_fallback: contextvars.ContextVar[bool] = contextvars.ContextVar(
 
 
 class ParallelStateDeprecationWarning(FutureWarning):
-    """A deprecated ``parallel_state`` function was called from outside Megatron Core.
+    """A deprecated function of the global grid was called from outside Megatron Core.
 
     The accessors of the global parallel grid (process groups, ranks, sizes and pipeline-stage
-    predicates), the overrides of its ranks and sizes, the virtual-pipeline rank and size, and
-    the aliases of the global memory buffer are deprecated since Megatron Core 0.21 and are
+    predicates), the overrides of its ranks and sizes, the virtual-pipeline rank and size, the
+    aliases of the global memory buffer, and ``ProcessGroupCollection.use_mpu_process_groups()``,
+    which builds a collection from the accessors, are deprecated since Megatron Core 0.21 and are
     removed in 0.23. The global grid belongs to a single model; code that needs process groups
     takes them from the ``ProcessGroupCollection`` its caller passes. Each warning names the
     replacement of the function it is about.
@@ -107,7 +108,24 @@ def _deprecated_accessor(replacement: str) -> Callable[[Callable], Callable]:
                 " Here pg_collection is the ProcessGroupCollection of the model that owns the "
                 "operation, which the code that needs the groups receives from its caller."
             )
+        return _deprecated_outside_megatron_core(message)(function)
 
+    return decorate
+
+
+def _deprecated_outside_megatron_core(message: str) -> Callable[[Callable], Callable]:
+    """Make a function emit ``message`` as a ParallelStateDeprecationWarning once per call site.
+
+    Calls from Megatron Core, calls in the block of global_process_group_fallback() and calls
+    that torch.compile traces do not warn. _deprecated_accessor builds the message of each
+    parallel_state function; ProcessGroupCollection.use_mpu_process_groups() passes its own.
+
+    Args:
+        message: The warning, which names the function, the releases that deprecate and remove
+            it, and its replacement.
+    """
+
+    def decorate(function: Callable) -> Callable:
         @functools.wraps(function)
         def deprecated_function(*args, **kwargs):
             # Dynamo cannot trace the ContextVar or the frame lookup below, so a compiled region
@@ -2290,13 +2308,12 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
                if for_expert_parallelism=False.
 
     Example:
-        # After initialize_model_parallel():
+        # After pg_collection = initialize_model_parallel(...):
         dp_cp_ag, expt_dp_ag = parallel_state.create_all_gather_groups(
             for_expert_parallelism=True
         )
 
-        # Add to ProcessGroupCollection:
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        # Add to the ProcessGroupCollection:
         pg_collection.dp_cp_ag = dp_cp_ag
         pg_collection.expt_dp_ag = expt_dp_ag
     """

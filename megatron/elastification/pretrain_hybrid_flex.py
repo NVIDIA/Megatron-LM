@@ -19,8 +19,8 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
+    global_process_group_fallback,
     resolve_process_groups,
-    warn_global_process_group_fallback,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer import TransformerConfig
@@ -96,10 +96,10 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
         HybridModel: The returned model
     """
     if pg_collection is None:
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "pretrain_hybrid_flex.model_provider", deprecated_in="0.21", removed_in="0.23"
-        )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        ):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     args = get_args()
     if has_nvidia_modelopt:

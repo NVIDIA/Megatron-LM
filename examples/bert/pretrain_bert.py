@@ -23,7 +23,6 @@ from megatron.core.models.bert.bert_model import BertModel
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     global_process_group_fallback,
-    warn_global_process_group_fallback,
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.spec_utils import import_module
@@ -174,12 +173,12 @@ def train_valid_test_datasets_provider(
             global parallel state, with a ProcessGroupFallbackWarning.
     """
     if pg_collection is None:
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "pretrain_bert.train_valid_test_datasets_provider",
             deprecated_in="0.21",
             removed_in="0.23",
-        )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
+        ):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
     if pg_collection.tp is None:
         raise ValueError("train_valid_test_datasets_provider requires pg_collection.tp")
     tp_group = pg_collection.tp

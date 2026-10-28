@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import sys
+import warnings
 from collections import defaultdict
 from contextlib import nullcontext
 from datetime import datetime, timedelta
@@ -95,6 +96,7 @@ from megatron.core.optimizer_param_scheduler import (
     get_canonical_lr_for_logging,
 )
 from megatron.core.parallel_state import (
+    ParallelStateDeprecationWarning,
     create_all_gather_groups,
     destroy_model_parallel,
     update_pg_timeout,
@@ -1583,12 +1585,12 @@ def _get_train_full_dataset_sample_count(args, dataset_provider, pg_collection=N
         else None
     )
     if pg_collection is None:
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "_get_train_full_dataset_sample_count", deprecated_in="0.21", removed_in="0.23"
-        )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["mp", "dp_gtp_remat", "dp_cp_gtp_remat"]
-        )
+        ):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=["mp", "dp_gtp_remat", "dp_cp_gtp_remat"]
+            )
     total_num_samples = reduce_max_stat_across_model_parallel_group(
         _reduce_sum_across_data_parallel_group(
             local_num_samples,
@@ -2399,10 +2401,10 @@ def wrap_model_chunks_with_ddp(
             compute_layout = None
         if compute_layout is not None:
             if pg_collection is None:
-                warn_global_process_group_fallback(
+                with global_process_group_fallback(
                     "wrap_model_chunks_with_ddp", deprecated_in="0.21", removed_in="0.23"
-                )
-                layout_pgs = ProcessGroupCollection.use_mpu_process_groups()
+                ):
+                    layout_pgs = ProcessGroupCollection.use_mpu_process_groups()
             else:
                 layout_pgs = pg_collection
             assert layout_pgs.dp_cp is not None, (
@@ -2564,7 +2566,12 @@ def _build_pg_collection_from_parallel_state(args):
     Megatron-FSDP uses to overlap the parameter all-gather with the gradient reduce-scatter.
     """
     cfg = get_run_config()
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    # Bootstrap read of the registered grid, which does not warn. The registered collection is
+    # not used directly: this function adds groups to the collection it returns, and a
+    # framework may have registered one that leaves fields unset, which this sets to None.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ParallelStateDeprecationWarning)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     if args.create_all_gather_group:
         timeout = (
@@ -2614,8 +2621,8 @@ def _get_model_pg_collection(model, pg_collection, *, owner="the training loop")
         return model_pg_collection
     if isinstance(pg_collection, ProcessGroupCollection):
         return pg_collection
-    warn_global_process_group_fallback(owner, deprecated_in="0.21", removed_in="0.23")
-    return ProcessGroupCollection.use_mpu_process_groups()
+    with global_process_group_fallback(owner, deprecated_in="0.21", removed_in="0.23"):
+        return ProcessGroupCollection.use_mpu_process_groups()
 
 
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None, ddp_config=None):
@@ -3340,12 +3347,12 @@ def dummy_train_step(data_iterator, pg_collection: ProcessGroupCollection | None
     cfg = get_run_config()
     args = get_args()
     if pg_collection is None:
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "dummy_train_step", deprecated_in="0.21", removed_in="0.23"
-        )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["tp", "pp", "cp", "dynamic_cp"]
-        )
+        ):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=["tp", "pp", "cp", "dynamic_cp"]
+            )
     tp_rank = pg_collection.tp.rank()
     has_cu_seqlens = getattr(args, 'sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
     dynamic_cp = args.dynamic_context_parallel
@@ -3878,10 +3885,10 @@ def training_log(
     # pg_collection.dp.
     memory_report_group = None
     if pg_collection is None:
-        warn_global_process_group_fallback("training_log", deprecated_in="0.21", removed_in="0.23")
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["mp", "pp", "dp", "dp_gtp_remat", "dp_cp_gtp_remat"]
-        )
+        with global_process_group_fallback("training_log", deprecated_in="0.21", removed_in="0.23"):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=["mp", "pp", "dp", "dp_gtp_remat", "dp_cp_gtp_remat"]
+            )
         # The rank of mpu.get_data_parallel_rank(), which spans the GTP weight-remat axis.
         memory_report_group = pg_collection.dp_gtp_remat
 

@@ -471,7 +471,12 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
     if device_count > 0 and not skip_model_parallel_init:
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            # Bootstrap read of the grid that the caller set up, which does not warn. A
+            # framework may have registered a collection that leaves fields unset; seeding
+            # requires each group it reads to be set, to None when its axis is off.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ParallelStateDeprecationWarning)
+                pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         else:
             if args.gtp_weight_remat_size > 1 or args.expert_gtp_weight_remat_size > 1:
                 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
