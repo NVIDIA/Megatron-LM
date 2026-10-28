@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+from functools import partial
 from typing import Literal
 
 import torch
@@ -266,26 +267,22 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
         execution_context: object | None,
     ) -> Tensor:
         del execution_context
+        output, bias = branch_output if isinstance(branch_output, tuple) else (branch_output, None)
         return self._compute_write(
-            branch_output, state, dropout_probability=dropout_probability, training=training
+            output, bias, *state, dropout_probability=dropout_probability, training=training
         )
 
     def _compute_write(
         self,
-        branch_output: ResidualBranchOutput,
-        state: ResidualConnectionState,
-        *,
+        branch_update: Tensor,
+        bias: Tensor | None,
+        *state: Tensor,
         dropout_probability: float,
         training: bool,
     ) -> Tensor:
         """Compute the residual update for eager execution and checkpoint replay."""
 
         residual_stream = state[0]
-        if isinstance(branch_output, tuple):
-            branch_update, bias = branch_output
-        else:
-            branch_update, bias = branch_output, None
-
         dropout_is_active = training and dropout_probability > 0.0
         defer_update_cast = (
             residual_stream.dtype == torch.float32
@@ -326,17 +323,15 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
     ) -> tuple[Tensor, ResidualConnectionState]:
         """Replay WR's read while retaining its incoming residual stream.
 
-        An optional branch-input dtype request is captured by the replay closure so eager execution
-        and backward reconstruction produce the same branch dtype.
+        Bind the requested branch-input dtype so eager execution and replay use the same dtype.
         Adapter hooks surround the outer module call, not this arithmetic reconstruction.
         """
 
         del execution_context
 
-        def run_read(stream: Tensor) -> Tensor:
-            return self._compute_read(stream, branch_input_dtype=branch_input_dtype)
-
-        branch_input = context.checkpoint(run_read, hidden_states)
+        branch_input = context.checkpoint(
+            partial(self._compute_read, branch_input_dtype=branch_input_dtype), hidden_states
+        )
         if not torch.is_tensor(branch_input):
             raise TypeError("Checkpointed residual read must return a tensor.")
 
@@ -359,22 +354,15 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
         """Replay WR's whole write, whose output has independent storage."""
 
         del execution_context
-        if isinstance(branch_output, tuple):
-            output, bias = branch_output
-            return_tuple = True
-        else:
-            output, bias = branch_output, None
-            return_tuple = False
-
-        def run_write(
-            branch_update: Tensor, branch_bias: Tensor | None, *connection_state: Tensor
-        ) -> Tensor:
-            value = (branch_update, branch_bias) if return_tuple else branch_update
-            return self._compute_write(
-                value, connection_state, dropout_probability=dropout_probability, training=training
-            )
-
-        hidden_states = context.checkpoint(run_write, output, bias, *state)
+        output, bias = branch_output if isinstance(branch_output, tuple) else (branch_output, None)
+        hidden_states = context.checkpoint(
+            partial(
+                self._compute_write, dropout_probability=dropout_probability, training=training
+            ),
+            output,
+            bias,
+            *state,
+        )
         if not torch.is_tensor(hidden_states):
             raise TypeError("Checkpointed residual write must return a tensor.")
         return hidden_states
