@@ -264,11 +264,20 @@ class DataConfig:
         Megatron Core's checks that need no tokenizer (``validate_without_tokenizer()``: the blend /
         split rules, the GPT booleans, the FIM rates and tokens) run here too, so a YAML or Python
         section fails at ``cfg.validate()``, before runtime initialization; the checks that need the
-        tokenizer run in ``bind_tokenizer()`` and in the builder.
+        tokenizer run in ``bind_tokenizer()`` and in the builder. Inter-document masking with the
+        dataloader attention mask is rejected here (the CLI normalizes the pair away).
         """
         self.dataloader.validate()
         if self.dataset is not None:
             self.dataset.validate_without_tokenizer()
+            if self.dataset.inter_document_masking and self.dataset.create_attention_mask:
+                raise ValueError(
+                    "data.dataset.inter_document_masking=True needs create_attention_mask=False: "
+                    "the dataset omits the attention mask under inter-document masking, and a "
+                    "batch path told to expect one waits for a broadcast that never comes "
+                    "(validate_args clears the flag for --dataloader-inter-document-masking; a "
+                    "Python or YAML section sets it explicitly)."
+                )
         resolve_dataset_class(self.dataset, self.dataset_type)
 
     def finalize(self) -> None:

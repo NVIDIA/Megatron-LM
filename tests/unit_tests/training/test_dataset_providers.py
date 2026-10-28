@@ -229,6 +229,8 @@ def _layout_from_args(args):
         sequence_packing_scheduler=args.sequence_packing_scheduler,
         pipeline_model_parallel_layout=args.pipeline_model_parallel_layout,
         mtp_num_layers=args.mtp_num_layers,
+        calculate_per_token_loss=args.calculate_per_token_loss,
+        max_seqlen_per_dp_cp_rank=args.max_seqlen_per_dp_cp_rank,
         gtp_weight_remat_size=args.gtp_weight_remat_size,
         gtp_remat_num_sequence_shards=args.gtp_remat_num_sequence_shards,
         cuda_graph_impl="none",
