@@ -33,13 +33,18 @@ from megatron.core.transformer.hyper_connection import (
 )
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.stateful_module import detach_state
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
     get_transformer_layer_offset,
 )
-from megatron.core.transformer.utils import sharded_state_dict_default
+from megatron.core.transformer.utils import (
+    first_local_layer_index,
+    resolve_gradient_boundary,
+    sharded_state_dict_default,
+)
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     WrappedTensor,
@@ -622,6 +627,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             # See set_input_tensor()
             hidden_states = self.input_tensor
 
+        self._gradient_boundary_resolved = resolve_gradient_boundary(self, hidden_states)
+        _, gradient_boundary_layer = self._gradient_boundary_resolved
+        first_local_layer = first_local_layer_index(self.layers)
+
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
         #   size (mbs) == 1, since in this case, 'hidden_states.transpose()'
@@ -729,7 +738,27 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # No intermediate_hidden_states requested: just hidden_states
                     hidden_states = checkpointed_result
             else:
+                # A boundary before this stage means trainable layers upstream, so the
+                # input keeps its graph; otherwise the graph is cut where it starts.
+                gradient_boundary_applied = (
+                    gradient_boundary_layer is None
+                    or first_local_layer is None
+                    or gradient_boundary_layer < first_local_layer
+                )
                 for l_no, layer in enumerate(self.layers):
+                    layer_at_or_after_boundary = (
+                        gradient_boundary_applied
+                        or gradient_boundary_layer is None
+                        or layer.layer_number - 1 >= gradient_boundary_layer
+                    )
+                    if layer_at_or_after_boundary and not gradient_boundary_applied:
+                        hidden_states = hidden_states.detach()
+                        shared_state_kwargs = {
+                            key: detach_state(value) for key, value in shared_state_kwargs.items()
+                        }
+                        if "mhc_state" in shared_state_kwargs:
+                            mhc_state = shared_state_kwargs["mhc_state"]
+                        gradient_boundary_applied = True
                     residual_accumulator = hidden_states
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
@@ -746,7 +775,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     else:
                         inner_quantization_context = nullcontext()
 
-                    mhc_manager = mhc_layer_managers[l_no]
+                    mhc_manager = mhc_layer_managers[l_no] if layer_at_or_after_boundary else None
                     if mhc_manager is not None:
                         mhc_manager.is_last_layer_in_recompute_block = (
                             mhc_is_last_in_recompute_block[l_no]
@@ -759,7 +788,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     extra_layer_kwargs = (
                         {"mhc_recompute_manager": mhc_manager} if mhc_manager is not None else {}
                     )
-                    with self.offload_context, inner_quantization_context:
+                    gradient_context = (
+                        nullcontext() if layer_at_or_after_boundary else torch.no_grad()
+                    )
+                    with self.offload_context, inner_quantization_context, gradient_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
@@ -794,6 +826,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # Extract intermediate embeddings using global layer index
                     if (l_no + layer_offset) in extract_layer_indices:
                         intermediate_hidden_states.append(hidden_states)
+
+                if not gradient_boundary_applied:
+                    # Every layer here lies before the boundary. Bias-dropout-add runs under
+                    # enable_grad, so drop the residual graph it leaves on the output and let
+                    # the pipeline schedule skip this stage's backward.
+                    hidden_states = hidden_states.detach()
 
         # Only contract if the final layer norm is in this stage
         if self.config.enable_mhc_connections and self.has_final_layernorm_in_this_stage():
