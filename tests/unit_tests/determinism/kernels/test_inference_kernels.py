@@ -246,68 +246,50 @@ def test_batch_invariant_inference_activations_replay():
 
 
 @pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
-@pytest.mark.parametrize("kernel", ["dense", "routed-rows"])
-def test_mxfp8_quantize_replays(kernel):
-    """The dense MXFP8 quantizer and its valid-token-gated row variant share one group kernel."""
-    seeded()
-    if kernel == "dense":
-        from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
-
-        x = torch.randn(16384, 8192, device="cuda", dtype=torch.bfloat16)
-
-        def fn(x):
-            data, scale = mxfp8_quantize(x)
-            return data.view(torch.uint8), scale.view(torch.uint8)
-
-    else:
-        from megatron.core.inference.moe.flashinfer_mxfp8 import quantize_routed_mxfp8_rows
-
-        x = torch.randn(4096, 2688, device="cuda", dtype=torch.bfloat16)
-        valid = _dev_scalar(2500)
-
-        def fn(x):
-            data, scale = quantize_routed_mxfp8_rows(x, valid, 2688)
-            return data[:2500].view(torch.uint8), scale[:2500]
-
-    assert_replays_bit_exact(fn, (x,), backward=False, what=f"mxfp8_quantize[{kernel}]")
-
-
-@pytest.mark.parametrize("kernel", ["routing-pack", "mxfp8-finalize", "bf16-combine"])
-def test_flashinfer_row_kernels_replay(kernel):
-    """The valid-token-gated glue around the FlashInfer MoE kernels replays bit-exactly."""
-    from megatron.core.inference.moe.flashinfer_bf16 import combine_valid_rows
-    from megatron.core.inference.moe.flashinfer_mxfp8 import (
-        finalize_routed_mxfp8_rows,
-        pack_routed_mxfp8_routing,
-    )
+def test_mxfp8_quantize_replays():
+    from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
 
     seeded()
-    rows, valid, hidden, topk, permuted_rows = 4096, 2500, 2688, 6, 20000
+    x = torch.randn(16384, 8192, device="cuda", dtype=torch.bfloat16)
+
+    def fn(x):
+        data, scale = mxfp8_quantize(x)
+        return data.view(torch.uint8), scale.view(torch.uint8)
+
+    assert_replays_bit_exact(fn, (x,), backward=False, what="mxfp8_quantize")
+
+
+def test_quantize_routed_mxfp8_input_replays():
+    """The valid-token-gated routed-layout MXFP8 quantizer replays bit-exactly."""
+    from megatron.core.inference.quantization.mxfp8_quantize import quantize_routed_mxfp8_input
+
+    seeded()
+    x = torch.randn(4096, 2688, device="cuda", dtype=torch.bfloat16)
+    valid = _dev_scalar(2500)
+
+    def fn(x):
+        data, scale = quantize_routed_mxfp8_input(x, 2688, valid)
+        return data[:2500].view(torch.uint8), scale[:2500]
+
+    assert_replays_bit_exact(fn, (x,), backward=False, what="quantize_routed_mxfp8_input")
+
+
+def test_flashinfer_routing_pack_replays():
+    """The valid-token-gated routing pack feeding the FlashInfer routed MoE replays bit-exactly."""
+    from megatron.core.inference.moe.flashinfer_mxfp8 import pack_routed_mxfp8_routing
+
+    seeded()
+    rows, valid, topk = 4096, 2500, 6
     valid_tokens = _dev_scalar(valid)
+    routing_map = torch.randint(-1, 128, (rows, topk), device="cuda", dtype=torch.int64)
     probs = torch.rand(rows, topk, device="cuda", dtype=torch.float32)
-    if kernel == "routing-pack":
-        routing_map = torch.randint(-1, 128, (rows, topk), device="cuda", dtype=torch.int64)
-        fn, args = lambda r, w: pack_routed_mxfp8_routing(r, w, valid_tokens), (routing_map, probs)
-    elif kernel == "mxfp8-finalize":
-        gemm2_output = torch.randn(permuted_rows, hidden, device="cuda", dtype=torch.bfloat16)
-        expanded_idx = torch.randint(-1, permuted_rows, (rows * topk,), device="cuda").int()
 
-        def fn(fc2_rows, idx, weights):
-            return finalize_routed_mxfp8_rows(fc2_rows, idx, weights, valid_tokens, hidden)[:valid]
+    def fn(routing_map, probs):
+        return pack_routed_mxfp8_routing(routing_map, probs, valid_tokens)
 
-        args = (gemm2_output, expanded_idx, probs)
-    else:
-        src = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
-        routing = torch.randint(0, 16, (rows, topk), device="cuda", dtype=torch.int32)
-
-        def fn(src):
-            out = torch.zeros(rows, hidden, device="cuda")
-            return combine_valid_rows(
-                src, routing, valid_tokens, out, local_expert_offset=4, num_local_experts=2
-            )[:valid]
-
-        args = (src,)
-    assert_replays_bit_exact(fn, args, backward=False, what=kernel)
+    assert_replays_bit_exact(
+        fn, (routing_map, probs), backward=False, what="pack_routed_mxfp8_routing"
+    )
 
 
 @pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")

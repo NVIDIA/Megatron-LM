@@ -58,11 +58,7 @@ from tests.unit_tests.determinism.kernels.harness import (
     deterministic_algorithms,
     seeded,
 )
-from tests.unit_tests.test_utilities import (
-    Utils,
-    is_flashinfer_routed_mxfp8_available,
-    prepare_routed_mxfp8_expert_weight,
-)
+from tests.unit_tests.test_utilities import Utils
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -573,13 +569,27 @@ def test_permute_unpermute_replay_under_deterministic_algorithms(fused, with_pro
         )
 
 
-@pytest.mark.skipif(
-    not is_flashinfer_routed_mxfp8_available(),
-    reason="FlashInfer routed MXFP8 needs Blackwell and FlashInfer >= 0.6.4",
-)
 def test_inference_grouped_mlp_flashinfer_mxfp8_replays():
     """InferenceGroupedMLP's FlashInfer MXFP8 path (quantize, TRT-LLM MoE, combine) replays bit-exactly."""
-    from megatron.core.inference.moe.flashinfer_mxfp8 import flashinfer_routed_mxfp8_moe
+    from megatron.core.inference.moe.flashinfer_mxfp8 import (
+        HAVE_FLASHINFER_ROUTED_MXFP8,
+        flashinfer_routed_mxfp8_moe,
+        prepare_routed_mxfp8_weights,
+    )
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+    if not HAVE_FLASHINFER_ROUTED_MXFP8 or torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("FlashInfer routed MXFP8 needs Blackwell and FlashInfer >= 0.6.4")
+
+    def prepare_routed_mxfp8_expert_weight(weight):
+        quantized = [MXFP8Tensor.from_bf16(expert, backend="triton") for expert in weight]
+        stacked = MXFP8Tensor(
+            data=torch.stack([expert.data for expert in quantized]).contiguous(),
+            scale=torch.stack([expert.scale for expert in quantized]).contiguous(),
+            backend="triton",
+            dtype=torch.bfloat16,
+        )
+        return prepare_routed_mxfp8_weights(stacked)
 
     seeded()
     num_experts, local_experts, hidden, intermediate, topk = 8, 2, 256, 256, 2

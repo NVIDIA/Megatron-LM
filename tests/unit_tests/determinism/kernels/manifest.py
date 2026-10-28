@@ -651,7 +651,6 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/moe/permute.py",
             "megatron/core/inference/moe/vllm_fused_moe.py",
             "megatron/core/inference/moe/fused_moe.py",
-            "megatron/core/inference/moe/flashinfer_bf16.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",
         ),
         tests=(K + "test_inference_kernels.py",),
@@ -659,6 +658,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
         training_path=False,
         notes="Batch-invariant paths replay bit-exactly; the atomic default unpermute is the negative control. "
         "ordered_reduce_scatter_v (multi-rank) is not replayed here.",
+    ),
+    KernelEntry(
+        name="inference_flashinfer_active_tokens",
+        sources=("megatron/core/inference/moe/flashinfer_active_tokens.py",),
+        tests=(K + "test_flashinfer_active_tokens.py",),
+        kind="triton",
+        training_path=False,
+        notes="Temporary stand-in for FlashInfer's num_active_tokens (flashinfer-ai/flashinfer#6783 "
+        "and #6784): persistent finalize / combine kernels over the live rows. Delete this entry "
+        "with the module once the FlashInfer floor ships the argument (unwind steps in the module "
+        "docstring).",
     ),
     KernelEntry(
         name="batch_invariant_kernels",
@@ -810,8 +820,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="MXFP8Tensor dispatches the Megatron quantize kernel (replayed: "
         "test_mxfp8_quantize_replays) or FlashInfer mxfp8_quantize / mm_mxfp8 / fused MoE, which need "
         "flashinfer on Blackwell and are not replayed in CI. flashinfer_mxfp8.py's valid-token-gated "
-        "row kernels are replayed in test_mxfp8_quantize_replays[routed-rows] and "
-        "test_flashinfer_row_kernels_replay.",
+        "routing pack is replayed in test_flashinfer_routing_pack_replays.",
     ),
     KernelEntry(
         name="inference_flashinfer_nvfp4_moe",
