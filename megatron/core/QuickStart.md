@@ -8,7 +8,7 @@ This guide for Megatron Core walks you through the following tasks:
 * Save the model using the distributed checkpoint format.
 * Load the model.
 
-**NOTE:** The following sample was tested using Megatron Core version 0.8.0 and NGC PyTorch Container version 24.02.
+**NOTE:** The following sample passes its process groups explicitly, which requires Megatron Core 0.21 or later.
 
 ### Set Up Your Environment
 
@@ -43,37 +43,41 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
 
 1. Initialize the distributed training and set up the model parallel:
 
-    The following utility, when called, initializes your distributed setup:
+    The following utility, when called, initializes your distributed setup. `initialize_model_parallel` returns the process groups of the parallel grid it builds, as a `ProcessGroupCollection`. The rest of the script passes that collection to Megatron Core explicitly, instead of letting each component read the global grid in `parallel_state`:
 
     ```python
     import os
     import torch
     from megatron.core import parallel_state
+    from megatron.core.process_groups_config import ProcessGroupCollection
 
-    def initialize_distributed(tensor_model_parallel_size = 1, pipeline_model_parallel_size = 1):
+    def initialize_distributed(tensor_model_parallel_size=1, pipeline_model_parallel_size=1) -> ProcessGroupCollection:
+        parallel_state.destroy_model_parallel()
+
         # Torch setup for distributed training
-        rank = int(os.environ['LOCAL_RANK'])
-        world_size = torch.cuda.device_count()
-        torch.cuda.set_device(rank)
-        torch.distributed.init_process_group(world_size=world_size, rank=rank)
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+        torch.cuda.set_device(local_rank)
+        torch.distributed.init_process_group(backend='nccl', rank=rank, world_size=world_size)
 
         # Megatron core distributed training initialization
-        parallel_state.initialize_model_parallel(tensor_model_parallel_size, pipeline_model_parallel_size)
+        return parallel_state.initialize_model_parallel(tensor_model_parallel_size, pipeline_model_parallel_size)
     ```
 
     <br>
 
 1. Set up the GPT model:
 
-    Use the following code snippet to create a GPT model. For a list of other configurations that you can pass into the model, open and review [transformer_config.py](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/transformer/transformer_config.py).
+    Use the following code snippet to create a GPT model on the process groups that `initialize_distributed` returns. For a list of other configurations that you can pass into the model, open and review [transformer_config.py](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/transformer/transformer_config.py).
 
     ```
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.core.models.gpt.gpt_model import GPTModel
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 
-    def model_provider():
-        """Build the model."""
+    def model_provider(pg_collection):
+        """Build the model on the process groups of its parallel grid."""
 
         transformer_config = TransformerConfig(
             num_layers=2, 
@@ -86,7 +90,8 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
             config=transformer_config, 
             transformer_layer_spec=get_gpt_layer_local_spec(), 
             vocab_size=100, 
-            max_sequence_length=64)
+            max_sequence_length=64,
+            pg_collection=pg_collection)
 
         return gpt_model
     ```
@@ -107,8 +112,8 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
 
     from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
     from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
-    from megatron.training.tokenizer.tokenizer import _NullTokenizer
     from megatron.core.datasets.utils import compile_helpers
+    from megatron.core.tokenizers import MegatronTokenizer
 
     _SEQUENCE_LENGTH = 64
 
@@ -126,7 +131,11 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
             reset_position_ids=False,
             reset_attention_mask=False,
             eod_mask_loss=False,
-            tokenizer=_NullTokenizer(vocab_size=_SEQUENCE_LENGTH),
+            tokenizer=MegatronTokenizer.from_pretrained(
+                metadata_path={"library": "null-text"},
+                vocab_size=_SEQUENCE_LENGTH,
+            ),
+            mid_level_dataset_surplus=0.005,
         )
 
         datasets = BlendedMegatronDatasetBuilder(
@@ -182,17 +191,23 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
     Megatron Core uses distributed checkpoints for loading and saving models. This allows you to convert the model from one parallel setting to another when you load it.
     For example, a model trained with tensor parallel size `2`, can be loaded again as a tensor model with parallel size `4`.
 
+    The main function below wraps the model in `DistributedDataParallel`, so these functions unwrap it first.
+
     ```python
     from megatron.core import dist_checkpointing
 
     def save_distributed_checkpoint(checkpoint_path, gpt_model):
-        sharded_state_dict = gpt_model.sharded_state_dict(prefix='')
+        # Access the underlying model if wrapped with DDP
+        model = gpt_model.module if hasattr(gpt_model, 'module') else gpt_model
+        sharded_state_dict = model.sharded_state_dict(prefix='')
         dist_checkpointing.save(sharded_state_dict=sharded_state_dict, checkpoint_dir=checkpoint_path)
 
     def load_distributed_checkpoint(checkpoint_path, gpt_model):
-        sharded_state_dict=gpt_model.sharded_state_dict(prefix='')
+        # Access the underlying model if wrapped with DDP
+        model = gpt_model.module if hasattr(gpt_model, 'module') else gpt_model
+        sharded_state_dict = model.sharded_state_dict(prefix='')
         checkpoint = dist_checkpointing.load(sharded_state_dict=sharded_state_dict, checkpoint_dir=checkpoint_path)
-        gpt_model.load_state_dict(checkpoint)
+        model.load_state_dict(checkpoint)
         return gpt_model
     ```
 
@@ -200,27 +215,55 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
 
 1. Add the main function:
 
-    The following code snippet is the main function that needs to go into your script. It runs the model for five iterations, saves, and loads it.  
+    The following code snippet is the main function that needs to go into your script. It runs the model for five iterations, saves, and loads it. Every Megatron Core call that needs process groups gets them from the collection that `initialize_distributed` returns: the RNG seeding, the model, `DistributedDataParallel`, the schedule and `finalize_model_grads`.
 
     ```python
     from pathlib import Path
     from torch.optim import Adam
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from megatron.core.distributed.finalize_model_grads import finalize_model_grads
     from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.utils import get_pg_rank, get_pg_size
 
     if __name__ == "__main__":
-        initialize_distributed(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
-        model_parallel_cuda_manual_seed(123)
+        pg_collection = initialize_distributed(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
+        # get_pg_rank and get_pg_size also accept the None that a grid without GTP weight
+        # rematerialization may hold in gtp_remat and expt_gtp_remat.
+        model_parallel_cuda_manual_seed(
+            123,
+            tp_rank=pg_collection.tp.rank(),
+            ep_rank=pg_collection.ep.rank(),
+            etp_rank=pg_collection.expt_tp.rank(),
+            gtp_remat_rank=get_pg_rank(pg_collection.gtp_remat),
+            egtp_remat_rank=get_pg_rank(pg_collection.expt_gtp_remat),
+            gtp_remat_world_size=get_pg_size(pg_collection.gtp_remat),
+            egtp_remat_world_size=get_pg_size(pg_collection.expt_gtp_remat),
+        )
 
-        gpt_model = model_provider()
+        gpt_model = model_provider(pg_collection)
         device = torch.device("cuda")
         gpt_model.to(device)
+
+        # Wrap the model with DistributedDataParallel for gradient synchronization. It provides
+        # the finish_grad_sync() method that finalize_model_grads() needs.
+        ddp_config = DistributedDataParallelConfig(
+            grad_reduce_in_fp32=False,
+            overlap_grad_reduce=False,
+            use_distributed_optimizer=False,
+        )
+        gpt_model = DistributedDataParallel(
+            config=gpt_model.config,
+            ddp_config=ddp_config,
+            module=gpt_model,
+            pg_collection=pg_collection,
+        )
 
         optim = Adam(gpt_model.parameters())
         
         train_iterator = get_train_data_iterator()
         
-        forward_backward_func = get_forward_backward_func()
+        forward_backward_func = get_forward_backward_func(pp_size=pg_collection.pp.size(), vp_size=None)
 
         # Running the model for 5 iterations
         for _ in range(5):
@@ -234,8 +277,14 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
                 seq_length=64,
                 micro_batch_size=8,
                 decoder_seq_length=64,
-                forward_only=False)
-        
+                forward_only=False,
+                pg_collection=pg_collection)
+
+            # All-reduce the gradients across the data-parallel ranks, and the gradients of
+            # parameters that are not tensor-parallel, such as LayerNorm, across the
+            # tensor-parallel ranks.
+            finalize_model_grads([gpt_model], pg_collection=pg_collection)
+
             optim.step()
 
             print(f'Losses reduced :  {losses_reduced}')
