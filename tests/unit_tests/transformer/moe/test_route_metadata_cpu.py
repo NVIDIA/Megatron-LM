@@ -29,7 +29,10 @@ def test_hash_ids_and_padding_use_owning_tp_group(monkeypatch):
     layer = object.__new__(moe_layer.MoELayer)
     torch.nn.Module.__init__(layer)
     layer.config = SimpleNamespace(
-        sequence_parallel=True, tensor_model_parallel_size=2, cuda_graph_impl="none"
+        sequence_parallel=True,
+        tensor_model_parallel_size=2,
+        cuda_graph_impl="none",
+        moe_megakernel_backend=None,
     )
     layer.tp_group = group
     layer.router = Router()
@@ -67,7 +70,10 @@ def test_flex_preprocess_aligns_padding_to_owning_sp_rank(monkeypatch, tp_rank):
     layer = object.__new__(moe_layer.MoELayer)
     torch.nn.Module.__init__(layer)
     layer.config = SimpleNamespace(
-        sequence_parallel=True, cuda_graph_impl="none", moe_latent_size=None
+        sequence_parallel=True,
+        cuda_graph_impl="none",
+        moe_latent_size=None,
+        moe_megakernel_backend=None,
     )
     layer.tp_group = group
     layer.token_dispatcher = Dispatcher()

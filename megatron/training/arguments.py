@@ -525,7 +525,7 @@ def validate_args(args, defaults={}):
             getattr(args, "gtp_weight_remat_size", 1),
         )
     )
-    (args.tensor_parallel_num_sequence_shards, args.gtp_remat_num_sequence_shards) = (
+    args.tensor_parallel_num_sequence_shards, args.gtp_remat_num_sequence_shards = (
         resolve_tensor_parallel_sequence_shards(
             args.tensor_model_parallel_size,
             args.tensor_parallel_num_sequence_shards,
@@ -3077,7 +3077,8 @@ def _add_network_size_args(parser):
         type=json.loads,
         default=None,
         metavar='JSON',
-        help='Backend-specific MoE megakernel options as a JSON object.',
+        help='MCore common options (shared_expert_mode) and backend-specific MoE '
+        'megakernel options as a JSON object.',
     )
 
     group = parser.add_argument_group(title='network size')

@@ -402,7 +402,9 @@ def test_checkpoint_uses_only_canonical_mcore_parameters(single_grouped, gated):
     assert mok.is_first_microbatch
 
 
-def _mock_backend(monkeypatch, *, single_grouped=False, gated=True, mxfp8=False, situ=False):
+def _mock_backend(
+    monkeypatch, *, single_grouped=False, gated=True, mxfp8=False, situ=False, routed_only=False
+):
     """Build the actual adapter while keeping these contract tests independent of MOK."""
     if mxfp8:
         from megatron.core import fp8_utils
@@ -441,9 +443,10 @@ def _mock_backend(monkeypatch, *, single_grouped=False, gated=True, mxfp8=False,
         moe_shared_expert_glu_interleave_size=None,
         moe_pad_expert_input_to_capacity=False,
         moe_shared_expert_gate=gated,
-        hidden_size=8,
+        hidden_size=16 if routed_only else 8,
+        moe_latent_size=8 if routed_only else None,
         moe_ffn_hidden_size=4,
-        moe_shared_expert_intermediate_size=4,
+        moe_shared_expert_intermediate_size=12 if routed_only else 4,
         moe_router_topk=2,
         activation_func_clamp_value=None,
         activation_func=situlu if situ else torch.nn.functional.silu,
@@ -453,9 +456,18 @@ def _mock_backend(monkeypatch, *, single_grouped=False, gated=True, mxfp8=False,
         fp8_recipe="mxfp8",
         fp8_param=mxfp8,
         moe_single_grouped_weight=single_grouped,
-        moe_megakernel_backend_config=None,
+        moe_megakernel_backend_config={
+            "shared_expert_mode": "native" if routed_only else "auto",
+            "fwd_num_comm_sms": 32,
+            "bwd_num_comm_sms": 40,
+        },
     )
-    module = mok_backend.MoKMegakernel(config, object(), experts, shared, 2)
+    original_options = config.moe_megakernel_backend_config.copy()
+    module = mok_backend.MoKMegakernel(
+        config, object(), experts, None if routed_only else shared, 2
+    )
+    assert config.moe_megakernel_backend_config == original_options
+    assert vars(module.mok_config) == {"fwd_num_comm_sms": 32, "bwd_num_comm_sms": 40}
     return module, shared, functional
 
 
@@ -473,6 +485,8 @@ def test_register_shared_output_gate_rejects_non_bf16_parameter(monkeypatch):
         pytest.param(True, False, True, torch.bfloat16, False, id="mxfp8-split-g-bf16"),
         pytest.param(True, True, True, torch.float32, True, id="mxfp8-single-g-fp32"),
         pytest.param(False, True, False, torch.bfloat16, False, id="bf16-single-u-bf16"),
+        pytest.param(False, True, None, torch.float32, True, id="routed-only-bf16"),
+        pytest.param(True, False, None, torch.bfloat16, True, id="routed-only-mxfp8"),
     ],
 )
 def test_gate_autograd_accumulation_and_ddp_hooks(
@@ -481,11 +495,20 @@ def test_gate_autograd_accumulation_and_ddp_hooks(
     from megatron.core.distributed import distributed_data_parallel as ddp_module
 
     module, shared, functional = _mock_backend(
-        monkeypatch, single_grouped=single_grouped, gated=gated, mxfp8=mxfp8, situ=situ
+        monkeypatch,
+        single_grouped=single_grouped,
+        gated=gated,
+        mxfp8=mxfp8,
+        situ=situ,
+        routed_only=gated is None,
     )
     gate = shared.gate_weight
     assert module.shared_output_gate_weight is gate
     parameters = tuple(module.parameters())
+    if gated is None:
+        assert module.hidden_size == 8  # Routed weights use latent size, not model hidden size.
+        assert module.shared_fc1_weight is module.shared_fc2_weight is None
+        assert not {id(p) for p in shared.parameters()} & {id(p) for p in parameters}
     for parameter in parameters:
         parameter.main_grad = torch.zeros_like(parameter, dtype=main_grad_dtype)
     expected = torch.full((1, 8), 0.25, dtype=main_grad_dtype)
@@ -506,6 +529,8 @@ def test_gate_autograd_accumulation_and_ddp_hooks(
         assert set(kwargs) == {"swiglu_limit"} | gate_keys | ({"situ_beta"} if situ else set())
         assert kwargs.get("situ_beta") == ((2.0, 8.0) if situ else None)
         assert kwargs.get("shared_output_gate_weight") is gate
+        if gated is None:
+            assert args[5:8] == (None, None, None)
         return args[3].clone(), object()
 
     def backward(*args, **kwargs):
@@ -514,6 +539,8 @@ def test_gate_autograd_accumulation_and_ddp_hooks(
             keys.add("shared_output_gate_main_grad")
         assert set(kwargs) == keys
         assert kwargs.get("shared_output_gate_weight") is gate
+        if gated is None:
+            assert kwargs["main_grads"][::2] == (None, None, None)
         gate_grad = kwargs.get("shared_output_gate_main_grad")
         if gated:
             assert gate_grad is gate_main_grad and gate_grad.dtype == main_grad_dtype
