@@ -729,20 +729,26 @@ def test_indexer_metrics_average_only_ratio4_layers(monkeypatch: pytest.MonkeyPa
         DSAIndexerLossLoggingHelper.tracker = {}
 
 
-def test_indexer_loss_cleanup_can_preserve_graph_reduction_groups():
-    """CUDA Graph replays keep stable group objects while clearing accumulated loss."""
-    reduce_group = object()
-    avg_group = object()
+def test_indexer_loss_cleanup_preserves_graph_accumulator_storage():
+    """Graph replay retains accumulation storage; runtime weights need no saved groups."""
+    values = torch.ones(2)
+    raw_values = torch.ones(2)
     DSAIndexerLossLoggingHelper.tracker = {
-        "values": torch.ones(2),
-        "reduce_group": reduce_group,
-        "avg_group": avg_group,
+        "values": values,
+        "raw_values": raw_values,
+        "requires_dp_cp": True,
     }
     try:
         DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=True)
-        assert torch.count_nonzero(DSAIndexerLossLoggingHelper.tracker["values"]) == 0
-        assert DSAIndexerLossLoggingHelper.tracker["reduce_group"] is reduce_group
-        assert DSAIndexerLossLoggingHelper.tracker["avg_group"] is avg_group
+        assert DSAIndexerLossLoggingHelper.tracker["values"] is values
+        assert DSAIndexerLossLoggingHelper.tracker["raw_values"] is raw_values
+        assert torch.count_nonzero(values) == 0
+        assert torch.count_nonzero(raw_values) == 0
+        assert "reduce_group" not in DSAIndexerLossLoggingHelper.tracker
+        assert "avg_group" not in DSAIndexerLossLoggingHelper.tracker
+        assert DSAIndexerLossLoggingHelper.tracker["requires_dp_cp"]
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+        assert not DSAIndexerLossLoggingHelper.tracker["requires_dp_cp"]
     finally:
         DSAIndexerLossLoggingHelper.tracker = {}
 
