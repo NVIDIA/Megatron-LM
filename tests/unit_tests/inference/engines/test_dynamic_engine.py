@@ -2008,8 +2008,9 @@ def test_post_process_eviction_requeues_prefix_cached_request_with_fresh_hashes(
     record = DynamicInferenceRequestRecord.from_request(request)
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.context = types.SimpleNamespace(
-        chunked_prefill_request_id=-1, kv_block_allocator=types.SimpleNamespace()
+        chunked_prefill_request_id=-1, max_tokens=16, kv_block_allocator=types.SimpleNamespace()
     )
+    engine.enable_chunked_prefill = False
     engine.requests = {request.request_id: types.SimpleNamespace(record=record)}
     engine.waiting_request_ids = deque()
     engine.finished_request_count = 0
@@ -2034,6 +2035,87 @@ def test_post_process_eviction_requeues_prefix_cached_request_with_fresh_hashes(
     assert list(engine.waiting_request_ids) == [request.request_id]
     assert len(record.requests) == 2
     _assert_prefix_cache_checkpoint(request, engine.get_request(request.request_id))
+
+
+@pytest.mark.parametrize("enable_chunked_prefill", [False, True])
+def test_post_process_eviction_fails_checkpoint_beyond_max_tokens(enable_chunked_prefill):
+    """Without chunked prefill, an evicted request whose checkpoint no longer fits one
+    step fails at once instead of blocking the queue; one that fits is requeued."""
+    params = SamplingParams(num_tokens_to_generate=8, termination_id=-1)
+    fits = DynamicInferenceRequest(
+        request_id=1,
+        prompt_tokens=torch.arange(1, 5),
+        sampling_params=params,
+        generated_tokens=[5, 6],
+    )
+    overflows = DynamicInferenceRequest(
+        request_id=2,
+        prompt_tokens=torch.arange(1, 7),
+        sampling_params=params,
+        generated_tokens=[7, 8, 9],
+    )
+    loop = asyncio.new_event_loop()
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(
+        chunked_prefill_request_id=-1,
+        max_tokens=8,
+        max_sequence_length=32,
+        kv_block_allocator=types.SimpleNamespace(),
+        remove_vlm_request_data=mock.Mock(),
+    )
+    engine.enable_chunked_prefill = enable_chunked_prefill
+    engine.requests = {
+        request.request_id: RequestEntry(
+            record=DynamicInferenceRequestRecord.from_request(request), future=loop.create_future()
+        )
+        for request in (fits, overflows)
+    }
+    engine.waiting_request_ids = deque()
+    engine.failed_request_ids = []
+    engine.finished_request_count = 0
+    engine.evicted_request_count = 0
+    engine.track_generated_token_events = False
+    engine.num_speculative_tokens = 0
+    engine.stop_word_being_finished_ids = set()
+    engine.rank = 0
+    engine.use_coordinator = False
+
+    # The second checkpoint holds 9 tokens, one more than max_tokens.
+    warns = (
+        nullcontext()
+        if enable_chunked_prefill
+        else pytest.warns(UserWarning, match="re-admitted after eviction")
+    )
+    with warns:
+        engine.post_process_requests(
+            request_ids=torch.empty(0, dtype=torch.int64),
+            finished_request_ids=torch.empty(0, dtype=torch.int64),
+            evict_request_ids=torch.tensor([1, 2], dtype=torch.int64),
+            step_time=0.0,
+            sample=torch.empty(0, dtype=torch.int64),
+            accepted_tokens=None,
+            log_probs=[],
+            consumed_chunked_prefill_request_id=-1,
+        )
+    failed_requests = engine._collect_failed_requests()
+    loop.close()
+
+    if enable_chunked_prefill:
+        assert sorted(engine.waiting_request_ids) == [1, 2]
+        assert failed_requests == []
+        return
+    assert list(engine.waiting_request_ids) == [1]
+    assert list(engine.requests) == [1]
+    (failed,) = failed_requests
+    assert failed.request_id == 2 and failed.status == Status.FAILED
+    assert failed.generated_tokens == [7, 8, 9]
+    event_types = [event.type for event in failed.events]
+    assert event_types[-3:] == [
+        DynamicInferenceEventType.EVICT,
+        DynamicInferenceEventType.ERROR_NONTRANSIENT,
+        DynamicInferenceEventType.FAIL,
+    ]
+    assert isinstance(failed.events[-2].payload, TokenOverflowError)
 
 
 def test_post_process_zero_token_handoff_keeps_resume_log_prob():
@@ -4210,6 +4292,99 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 resumed_and_streamed += 1
         assert resumed_and_streamed > 0, "no evicted request streamed after resuming"
         assert context.active_token_count == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_eviction_beyond_max_tokens_fails_without_blocking_queue(self) -> None:
+        """Without chunked prefill, an evicted request whose checkpoint exceeds
+        `max_tokens` fails instead of stalling at the head of the waiting queue.
+
+        Requests 0 and 1 have 15-token prompts, a 16-token step budget, and 6 usable
+        8-token blocks with no paused-block budget. Together they outgrow the pool, so
+        one is evicted after generating at least 2 tokens, and its checkpointed prompt
+        exceeds the budget. Every request, including short request 2, must finish.
+        """
+        block_size_tokens = 8
+        usable_block_count = 6
+        max_tokens = 16
+
+        def config(**kwargs):
+            return DynamicEngineTestConfig(
+                num_requests=0,
+                max_sequence_length=64,
+                context_block_size_tokens=block_size_tokens,
+                context_max_requests=2,
+                context_max_tokens=max_tokens,
+                model_provider="gpt",
+                **kwargs,
+            )
+
+        block_size_bytes = self._build_test_env(config()).engine.context.block_size_bytes
+        env = self._build_test_env(
+            config(
+                context_buffer_size_gb=(usable_block_count + 1.5) * block_size_bytes / 1024**3,
+                context_paused_buffer_size_gb=0.0,
+            )
+        )
+        engine = env.engine
+        assert engine.context.kv_block_allocator.pool_size == usable_block_count + 1
+        assert not engine.enable_chunked_prefill
+
+        # Paged attention kernels need 256-token blocks; scheduling needs no real logits.
+        def mock_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            logits = torch.zeros(
+                *tokens.shape, env.config.vocab_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            if env.config.materialize_only_last_token_logits:
+                logits = engine.context.last_token_logits(logits).unsqueeze(0)
+            return logits
+
+        engine.controller.inference_wrapped_model.model.forward = mock_forward
+
+        limits = {0: 12, 1: 12, 2: 4}
+        prompt_lengths = {0: 15, 1: 15, 2: 4}
+        for request_id, limit in limits.items():
+            engine._add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=torch.arange(
+                        1,
+                        prompt_lengths[request_id] + 1,
+                        dtype=torch.int64,
+                        device=torch.cuda.current_device(),
+                    ),
+                    sampling_params=SamplingParams(num_tokens_to_generate=limit, termination_id=-1),
+                )
+            )
+
+        finished = {}
+        for _ in range(200):
+            if not engine.has_unfinished_requests():
+                break
+            for request in engine.step_modern()["finished_requests"]:
+                finished[request.request_id] = request
+        assert not engine.has_unfinished_requests(), list(engine.waiting_request_ids)
+        assert sorted(finished) == [0, 1, 2]
+
+        failed = [request for request in finished.values() if request.status == Status.FAILED]
+        assert len(failed) == 1 and failed[0].request_id in (0, 1)
+        (failed,) = failed
+        assert len(failed.prompt_tokens) + len(failed.generated_tokens) > max_tokens
+        event_types = [event.type for event in failed.events]
+        assert event_types[-3:] == [
+            DynamicInferenceEventType.EVICT,
+            DynamicInferenceEventType.ERROR_NONTRANSIENT,
+            DynamicInferenceEventType.FAIL,
+        ]
+        assert isinstance(failed.events[-2].payload, TokenOverflowError)
+        for request_id, request in finished.items():
+            if request is not failed:
+                assert request.status == Status.COMPLETED, request_id
+                assert len(request.generated_tokens) == limits[request_id], request_id
 
     @pytest.mark.internal
     @pytest.mark.skipif(
