@@ -734,22 +734,15 @@ class TestResidualStreamRecomputeIntegration:
             expected = (expected * 0.875 + 0.07).tanh()
 
         context = build_residual_stream_recompute_plan(1, 1)[0]
-        if checkpointed:
-            branch, state = actual[0](
-                value, recompute_context=context, fp32_residual_connection=False
-            )
-            output = actual[1](
-                branch.sin(),
-                state=state,
-                recompute_context=context,
-                dropout_probability=dropout_probability,
-                training=True,
-            )
-        else:
-            branch, state = actual[0](value)
-            output = actual[1](
-                branch.sin(), state=state, dropout_probability=dropout_probability, training=True
-            )
+        recompute_context = context if checkpointed else None
+        branch, state = actual[0](value, recompute_context=recompute_context)
+        output = actual[1](
+            branch.sin(),
+            state=state,
+            recompute_context=recompute_context,
+            dropout_probability=dropout_probability,
+            training=True,
+        )
         output = output.tanh()  # A live terminal boundary outside the two replayed operations.
         rng_state = torch.get_rng_state()
         cuda_rng_state = torch.cuda.get_rng_state(value.device) if value.is_cuda else None

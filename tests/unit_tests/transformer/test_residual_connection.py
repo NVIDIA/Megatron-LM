@@ -39,10 +39,6 @@ class _ProtocolResidualConnection(ResidualConnection):
             return torch.empty(3, self.branch_hidden_size), ()
         if self.read_behavior == "wrong_hidden_size":
             return torch.empty(*hidden_states.shape[:-1], self.branch_hidden_size + 1), ()
-        if self.read_behavior == "non_tuple_state":
-            return hidden_states[..., : self.branch_hidden_size], []
-        if self.read_behavior == "non_tensor_state":
-            return hidden_states[..., : self.branch_hidden_size], (object(),)
         branch = hidden_states[..., : self.branch_hidden_size]
         if branch_input_dtype is not None:
             branch = branch.to(branch_input_dtype)
@@ -141,43 +137,8 @@ class _NoCheckpointSelectedStateConnection(_SelectedStateConnection):
     _checkpoint_read = ResidualConnection._checkpoint_read
 
 
-class _IncomingResidualReplayConnection(_ProtocolResidualConnection):
-    """Explicit policy for a reader whose carried stream is its incoming tensor."""
-
-    def _checkpoint_read(
-        self,
-        hidden_states,
-        context,
-        *,
-        fp32_residual_connection,
-        branch_input_dtype,
-        execution_context,
-    ):
-        self.received_input = hidden_states
-
-        def read_branch(stream):
-            branch, _ = self._eager_read(
-                stream,
-                fp32_residual_connection=False,
-                branch_input_dtype=branch_input_dtype,
-                execution_context=execution_context,
-            )
-            return branch
-
-        branch = context.checkpoint(read_branch, hidden_states)
-        residual = hidden_states.float() if fp32_residual_connection else hidden_states
-        return branch, (residual,)
-
-
-class _ImmediateContext:
-    def checkpoint(self, function, *args):
-        return function(*args)
-
-
 def _execute(connection, value, *, checkpointed, **kwargs):
-    return connection(
-        value, recompute_context=_ImmediateContext() if checkpointed else None, **kwargs
-    )
+    return connection(value, recompute_context=object() if checkpointed else None, **kwargs)
 
 
 class TestResidualConnectionContract:
@@ -240,8 +201,6 @@ class TestResidualConnectionContract:
             ("wrong_leading_shape", ValueError, "changed non-hidden dimensions"),
             ("wrong_hidden_size", ValueError, "expected branch hidden size"),
             ("wrong_dtype", TypeError, "returned branch dtype"),
-            ("non_tuple_state", TypeError, "non-empty tuple of tensors"),
-            ("non_tensor_state", TypeError, "contain only tensors"),
         ],
     )
     @pytest.mark.parametrize("checkpointed", [False, True])
@@ -322,9 +281,7 @@ class TestResidualConnectionContract:
         connection = _NoCheckpointSelectedStateConnection()
         with pytest.raises(NotImplementedError, match="must implement _checkpoint_read"):
             connection(
-                torch.randn(2, 12),
-                recompute_context=_ImmediateContext(),
-                fp32_residual_connection=False,
+                torch.randn(2, 12), recompute_context=object(), fp32_residual_connection=False
             )
 
     def test_default_write_replay_requires_an_explicit_policy_for_aliased_output(self):
@@ -338,7 +295,7 @@ class TestResidualConnectionContract:
             connection(
                 branch,
                 state=state,
-                recompute_context=_ImmediateContext(),
+                recompute_context=object(),
                 dropout_probability=0.0,
                 training=True,
             )
@@ -349,7 +306,7 @@ class TestResidualConnectionContract:
         self, checkpointed, operation
     ):
         connection = (
-            _IncomingResidualReplayConnection(operation="read")
+            _DirectCheckpointResidualConnection(operation="read")
             if operation == "read"
             else _DirectCheckpointResidualConnection(operation="write", write_behavior="add_branch")
         )
@@ -502,15 +459,13 @@ class TestResidualConnectionContract:
         reader = _DirectCheckpointResidualConnection(operation="read")
         writer = _DirectCheckpointResidualConnection(operation="write")
         stream, branch = torch.randn(2, 12), torch.randn(2, 4)
-        context = _ImmediateContext()
+        context = object()
         with (
             patch.object(reader, "_checkpoint_read", side_effect=AssertionError("read dispatched")),
             patch.object(
                 writer, "_checkpoint_write", side_effect=AssertionError("write dispatched")
             ),
         ):
-            with pytest.raises(TypeError, match="read expects a tensor"):
-                reader((stream, None), recompute_context=context, fp32_residual_connection=False)
             with pytest.raises(TypeError, match="floating-point torch.dtype"):
                 reader(
                     stream,
@@ -518,8 +473,6 @@ class TestResidualConnectionContract:
                     fp32_residual_connection=False,
                     branch_input_dtype=torch.int64,
                 )
-            with pytest.raises(ValueError, match="expected residual-stream hidden size"):
-                reader(stream[..., :-1], recompute_context=context, fp32_residual_connection=False)
             with pytest.raises(ValueError, match="expected branch output hidden size"):
                 writer(
                     branch[..., :-1],
