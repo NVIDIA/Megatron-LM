@@ -12,7 +12,12 @@ from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_paddi
 from megatron.training import training
 from megatron.training.checkpointing import save_grads
 from megatron.training.config import CheckpointConfig, TrainingConfig, ValidationConfig
-from megatron.training.global_vars import _set_train_state, destroy_global_vars, set_args
+from megatron.training.global_vars import (
+    _set_train_state,
+    destroy_global_vars,
+    get_train_state,
+    set_args,
+)
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.training import (
     _get_indexer_logging_layer_counts,
@@ -237,6 +242,20 @@ class TestTraining:
         valid_data = next(valid_iter)
         test_data = next(test_iter)
         assert (train_data, valid_data, test_data) == (1, 2, 3)
+
+    def test_build_train_valid_test_data_iterators_resume_without_eval_interval(self, run_config):
+        """Resuming without eval_interval should not count any consumed validation samples."""
+        run_config.train.train_samples = None
+        run_config.validation.eval_interval = None
+        train_state = get_train_state()
+        train_state.iteration = 10
+        train_state.consumed_train_samples = 0
+        train_state.consumed_valid_samples = 0
+
+        build_train_valid_test_data_iterators(mock_train_valid_test_datasets_provider)
+
+        assert train_state.consumed_train_samples == 10
+        assert train_state.consumed_valid_samples == 0
 
     def test_params_norm_is_computed_only_when_it_can_be_logged(self, run_config):
         args = SimpleNamespace(
