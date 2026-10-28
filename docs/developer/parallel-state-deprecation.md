@@ -33,7 +33,7 @@ removed in 0.23, under the N+2 policy in
 |---|---|
 | Group accessors: `get_*_group()`, `get_*_groups()`, the Gloo groups `get_*_group_gloo()`, and the dynamic context-parallel group maps | The matching field of the model's collection; see [Select the matching group](#select-the-matching-group) |
 | Rank and size accessors: `get_*_rank()`, `get_*_world_size()` and `get_all_ranks()` | `rank()` and `size()` of that field, or `get_pg_rank()` and `get_pg_size()` from `megatron.core.utils` for a group that can be `None`; for `get_all_ranks()`, the `rank()` of each group |
-| Global-rank accessors: `get_*_src_rank()`, `get_*_global_ranks()`, `get_pipeline_model_parallel_first_rank()` and its `last`, `next` and `prev` siblings | `torch.distributed.get_global_rank(group, 0)`, `torch.distributed.get_process_group_ranks(group)`, and `get_pp_first_rank(pp_group)` and its siblings in `megatron.core.pipeline_parallel.utils` |
+| Global-rank accessors: `get_*_src_rank()`, `get_*_global_ranks()`, `get_pipeline_model_parallel_first_rank()` and its `last`, `next` and `prev` siblings | `torch.distributed.get_global_rank(group, 0)`, `torch.distributed.get_process_group_ranks(group)`, and `get_pp_first_rank(pp_group)` and its siblings in `megatron.core.pipeline_parallel.utils`. The `next` and `prev` replacements do not wrap around; see [Select the matching group](#select-the-matching-group) |
 | Stage predicates: `is_pipeline_first_stage()`, `is_pipeline_last_stage()`, `is_rank_in_embedding_group()` and `is_rank_in_position_embedding_group()` | `is_pp_first_stage(pp_group)`, `is_pp_last_stage(pp_group)`, `is_vp_first_stage(vp_stage, vp_size)` and `is_vp_last_stage(vp_stage, vp_size)` in `megatron.core.pipeline_parallel.utils`; membership in `pg_collection.embd` or `pg_collection.pos_embd` |
 | Virtual-pipeline rank and size, and their setters | The `vp_stage` of the model chunk, passed explicitly, and `virtual_pipeline_model_parallel_size` in the model's configuration |
 | Rank and size overrides, which set the `_MPU_*` module variables: `set_tensor_model_parallel_rank()`, `set_expert_model_parallel_world_size()` and the other `set_*_rank()` and `set_*_world_size()` functions | A collection whose groups have that rank and size, passed to the code that needs it or registered with `register_process_groups()` |
@@ -104,6 +104,19 @@ A source or peer rank is a **global** rank, while `pg.rank()` is local to its gr
 For example, the first global rank in `pg` is `torch.distributed.get_global_rank(pg, 0)`.
 The data-parallel source-rank accessor uses the replicate `dp` / `dp_cp` group, even though the
 data-parallel group accessor defaults to the GTP-remat-inclusive group.
+
+The pipeline peer-rank accessors wrap around: on the last stage,
+`get_pipeline_model_parallel_next_rank()` returns the first stage's rank, and on the first stage,
+`get_pipeline_model_parallel_prev_rank()` returns the last stage's. `get_pp_next_rank(pp_group)`
+and `get_pp_prev_rank(pp_group)` return `None` there instead. Code that relies on the wrap-around,
+such as a send from the last stage to the first for the next virtual-pipeline chunk, takes the
+peers from the group's ranks, as the `next_rank` and `prev_rank` of `P2PCommunicator` do:
+
+```python
+ranks = torch.distributed.get_process_group_ranks(pp_group)
+next_rank = ranks[(pp_group.rank() + 1) % pp_group.size()]
+prev_rank = ranks[(pp_group.rank() - 1) % pp_group.size()]
+```
 
 The replacement assumes a valid group for a participating rank. Some legacy accessors also
 support cached rank/size overrides, uninitialized distributed state, or absent optional groups.

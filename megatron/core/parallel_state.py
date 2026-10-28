@@ -2357,6 +2357,9 @@ def get_pipeline_model_parallel_last_rank():
 def get_pipeline_model_parallel_next_rank():
     """Return the global rank that follows the caller in the pipeline.
 
+    It wraps around: on the last stage, it returns the first stage's rank. The replacement,
+    ``get_pp_next_rank(pg_collection.pp)``, returns None there instead.
+
     Deprecated: reads the global parallel state. Derive the global pipeline peer rank from the
     caller-provided pp group; preserve pipeline ordering. See
     docs/developer/parallel-state-deprecation.md for migration details and optional-group
@@ -2370,6 +2373,9 @@ def get_pipeline_model_parallel_next_rank():
 
 def get_pipeline_model_parallel_prev_rank():
     """Return the global rank that precedes the caller in the pipeline.
+
+    It wraps around: on the first stage, it returns the last stage's rank. The replacement,
+    ``get_pp_prev_rank(pg_collection.pp)``, returns None there instead.
 
     Deprecated: reads the global parallel state. Derive the global pipeline peer rank from the
     caller-provided pp group; preserve pipeline ordering. See
