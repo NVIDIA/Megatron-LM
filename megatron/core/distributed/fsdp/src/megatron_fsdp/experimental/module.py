@@ -442,6 +442,8 @@ class FsdpModule:
             # illegal during capture. Later modules are covered by the post-copy
             # fork each preceding module issues before its collective.
             context.reduce_scatter_stream.wait_stream(current_stream)
+            # finish_grad_sync() joins outer RS even when this backward has no outer work.
+            context.outer_reduce_scatter_stream.wait_stream(current_stream)
 
         self.unshard(Phase.BACKWARD, prefetch=True)
 

@@ -703,14 +703,21 @@ class FsdpParameterGroup:
                 fsdp_parameter.sharded.grad = main_grad.get_dtensor(index)
 
         if is_last_microbatch and self.pre_optimizer_main_grad is not self.main_grad:
-            # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
-            # reduce-scatter for HFSDP) into the persistent buffer's optimizer-layout
-            # view before binding the sharded parameter grads.
-            self.main_grad.redistribute(
-                self.main_weight.placements, out=self.pre_optimizer_main_grad
-            )
-            self._main_grad_is_stale = True
-            install_sharded_grads(self.pre_optimizer_main_grad)
+            grad_reduce_stream = torch.cuda.current_stream()
+            # HSDP/HFSDP use a multi-dimensional DP mesh; only their outer
+            # reduction moves to a separate stream. Plain ZeRO-1 keeps its RS stream.
+            if self.mesh.ndim > 1:
+                grad_reduce_stream = self._owning_module().context.outer_reduce_scatter_stream
+                grad_reduce_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(grad_reduce_stream):
+                # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
+                # reduce-scatter for HFSDP) into the persistent buffer's optimizer-layout
+                # view before binding the sharded parameter grads.
+                self.main_grad.redistribute(
+                    self.main_weight.placements, out=self.pre_optimizer_main_grad
+                )
+                self._main_grad_is_stale = True
+                install_sharded_grads(self.pre_optimizer_main_grad)
         else:
             # We could install pre_optimizer_main_grad unconditionally because
             # sharded.grad is only read by the optimizer. However, for consistency and
