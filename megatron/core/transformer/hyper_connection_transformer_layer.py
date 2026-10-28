@@ -6,15 +6,25 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 import torch
+from torch import Tensor
 
-from megatron.core import tensor_parallel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionExecutionContext,
+    HyperConnectionResidualConnection,
+)
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.residual_connection import (
+    ResidualBranchOutput,
+    ResidualConnection,
+    ResidualConnectionState,
+)
+from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
-from megatron.core.utils import make_viewless_tensor, nvtx_range_pop, nvtx_range_push
+from megatron.core.typed_torch import apply_module
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
@@ -96,19 +106,46 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             submodules.mlp_hyper_connection, config=self.config, layer_number=self.layer_number
         )
 
-        # Set per-call by __call__ from kwargs so forward can read it without re-piping
-        # the manager through the CUDA-graph kwarg path (CheckpointWithoutOutputManager
-        # is not a CUDA-graph-supported type and gets stripped during capture). Read by
-        # _run_input_layernorm, _apply_self_attn_bda_step, _pre_mlp_layernorm_and_residual, and
-        # _apply_mlp_bda_step — do not delete; appears unused only at the class level.
+        self.residual_read_self_attn = HyperConnectionResidualConnection(
+            self.config, operation="read", use_input_residual=True
+        )
+        self.residual_write_self_attn = HyperConnectionResidualConnection(
+            self.config, operation="write"
+        )
+        self.residual_read_mlp = HyperConnectionResidualConnection(
+            self.config, operation="read", use_input_residual=True
+        )
+        self.residual_write_mlp = HyperConnectionResidualConnection(self.config, operation="write")
+
+        # mHC has always bypassed this legacy hook, which cannot carry residual state.
+        self._legacy_forward_post_mlp = None
+
+        # Keep the manager out of CUDA-graph kwargs; norm wrappers and residual calls
+        # read the same per-call manager from this attribute.
         self._mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None
 
     def __call__(self, *args, **kwargs):
+        if kwargs.get("residual_stream_recompute_context") is not None:
+            raise ValueError(
+                "mHC does not accept residual_stream_recompute_context; use mhc_recompute_manager."
+            )
         # Pull the manager off kwargs before super().__call__ hands them to the
         # CUDA-graph machinery (which can't handle a CheckpointWithoutOutputManager).
         # forward() reads the value back from self.
         self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
         return super().__call__(*args, **kwargs)
+
+    def _residual_recompute_context(
+        self, *, is_mlp: bool = False
+    ) -> ResidualStreamRecomputeContext | None:
+        """Share the block manager; only the final MLP write ends a replay block."""
+        manager = self._mhc_recompute_manager
+        if manager is None:
+            return None
+        return ResidualStreamRecomputeContext(
+            manager,
+            is_block_end=is_mlp and getattr(manager, "is_last_layer_in_recompute_block", False),
+        )
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """Override to produce n-stream hidden_states of shape [s, b, n*C].
@@ -165,213 +202,61 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             submodules.append(self.mlp_hyper_connection)
         return submodules
 
+    def _read_residual_connection(
+        self,
+        connection: ResidualConnection,
+        hidden_states: Tensor,
+        *,
+        is_mlp: bool,
+        recompute_context: ResidualStreamRecomputeContext | None,
+    ) -> tuple[Tensor, ResidualConnectionState]:
+        """Read through the current owner, preserving its activation dtype."""
+        if recompute_context is not None:
+            raise ValueError(
+                "mHC does not accept residual_stream_recompute_context; use mhc_recompute_manager."
+            )
+        owner = self.mlp_hyper_connection if is_mlp else self.self_attention_hyper_connection
+        # This operation context must not select WR's norm/offload policy in the base.
+        return apply_module(connection)(
+            hidden_states,
+            execution_context=HyperConnectionExecutionContext(owner),
+            recompute_context=self._residual_recompute_context(is_mlp=is_mlp),
+        )
+
+    def _write_residual_connection(
+        self,
+        connection: ResidualConnection,
+        branch_output: ResidualBranchOutput,
+        state: ResidualConnectionState,
+        *,
+        is_mlp: bool,
+        recompute_context: ResidualStreamRecomputeContext | None,
+    ) -> Tensor:
+        """Write through the current owner within the base BDA gradient scope."""
+        if recompute_context is not None:
+            raise ValueError(
+                "mHC does not accept residual_stream_recompute_context; use mhc_recompute_manager."
+            )
+        owner = self.mlp_hyper_connection if is_mlp else self.self_attention_hyper_connection
+        return apply_module(connection)(
+            branch_output,
+            state=state,
+            dropout_probability=self.hidden_dropout,
+            training=self.training,
+            execution_context=HyperConnectionExecutionContext(
+                owner, self.config.bias_dropout_fusion
+            ),
+            recompute_context=self._residual_recompute_context(is_mlp=is_mlp),
+        )
+
     def _run_input_layernorm(self, hidden_states):
-        """HC input layernorm: hyper-connection pre-wrap + mHC-aware checkpoint.
-
-        Threads ``h_res`` and ``h_post`` (produced by the hyper-connection
-        pre-wrap) to ``_apply_self_attn_bda_step`` via the ``attn_state`` slot
-        in the return tuple. Also sets
-        ``self._input_layernorm_checkpoint_active`` for the post-self-attn
-        discard hook.
-
-        Returns ``(input_layernorm_output, residual, (h_res, h_post))`` where
-        ``residual`` is the n-stream hidden state captured before
-        aggregation — it flows to ``_apply_self_attn_bda_step`` via the base
-        skeleton's ``residual`` argument, and ``(h_res, h_post)`` flows via
-        ``attn_state``.
-        """
-        # Capture the n-stream residual BEFORE self_attention_hyper_connection
-        # aggregates n-stream -> single-stream. The fused bda kernel needs the
-        # original n-stream tensor.
-        residual = hidden_states
-
-        nvtx_range_push(suffix="self_attention_hyper_connection")
-        hidden_states, h_res, h_post = self.self_attention_hyper_connection(
+        """Use the shared attention schedule with the call's mHC norm manager."""
+        return super()._run_input_layernorm(
             hidden_states, mhc_recompute_manager=self._mhc_recompute_manager
         )
-        nvtx_range_pop(suffix="self_attention_hyper_connection")
-
-        self.attn_norm_manager = self.off_interface(
-            self.offload_attn_norm, hidden_states, "attn_norm"
-        )
-        self._input_layernorm_checkpoint_active = self.recompute_input_layernorm or (
-            self._mhc_recompute_manager is not None and self.mhc_checkpoint_input_layernorm
-        )
-        if self._input_layernorm_checkpoint_active:
-            self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                ckpt_manager=self._mhc_recompute_manager
-            )
-            with self.attn_norm_manager as hidden_states:
-                input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
-                    self.input_layernorm, hidden_states
-                )
-        else:
-            with self.attn_norm_manager as hidden_states:
-                input_layernorm_output = self.input_layernorm(hidden_states)
-
-        input_layernorm_output = self._reject_residual_returning_norm(
-            input_layernorm_output, "input_layernorm"
-        )
-        return input_layernorm_output, residual, (h_res, h_post)
-
-    @staticmethod
-    def _reject_residual_returning_norm(layernorm_output, norm_name):
-        """Reject layernorms that also return a residual.
-
-        Base ``TransformerLayer`` accepts a ``(output, residual)`` tuple from a
-        layernorm and uses the returned residual. mHC cannot: its residual must
-        be the n-stream tensor captured *before* the hyper-connection aggregates
-        n-stream -> single-stream, because ``fused_h_res_h_post_bda`` mixes it
-        with ``H_res``. A norm-supplied single-stream residual would silently
-        produce wrong shapes, so fail fast instead.
-        """
-        if isinstance(layernorm_output, tuple):
-            raise ValueError(
-                f"HyperConnectionTransformerLayer does not support a {norm_name} that "
-                f"returns a (output, residual) tuple. mHC requires the n-stream residual "
-                f"captured before hyper-connection aggregation. Use a layernorm submodule "
-                f"that returns only the normalized output."
-            )
-        return layernorm_output
-
-    def _apply_self_attn_bda_step(self, attention_output_with_bias, residual, attn_state=()):
-        """HC fused bias-dropout-add: combines apply_h_res + apply_h_post + bda.
-
-        Unpacks ``h_res`` and ``h_post`` from ``attn_state`` (threaded by
-        ``_run_input_layernorm`` via the base skeleton). Keeps the base class's
-        default so base-class call sites that pass only two arguments fail with a
-        readable message rather than a TypeError.
-        """
-        if not attn_state:
-            raise ValueError(
-                "HyperConnectionTransformerLayer._apply_self_attn_bda_step requires the "
-                "(h_res, h_post) attn_state produced by _run_input_layernorm. It was called "
-                "through a base-class path that does not thread mHC intermediates."
-            )
-        h_res, h_post = attn_state
-        nvtx_range_push(suffix="self_attention_fused_h_res_h_post_bda")
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.self_attention_hyper_connection.fused_h_res_h_post_bda(
-                h_res,
-                residual,
-                h_post,
-                attention_output_with_bias,
-                self.hidden_dropout,
-                self.training,
-                self.config.bias_dropout_fusion,
-                self._mhc_recompute_manager,
-            )
-        nvtx_range_pop(suffix="self_attention_fused_h_res_h_post_bda")
-        # HC omits forced_released_tensors — the n-stream residual is consumed
-        # by the fused kernel above, so the base class's "release residual after
-        # commit" trick doesn't apply.
-        hidden_states = self.attn_norm_manager.group_offload(hidden_states)
-        self.attn_norm_manager = None
-        return hidden_states
 
     def _pre_mlp_layernorm_and_residual(self, hidden_states):
-        """HC pre-mlp layernorm: hyper-connection pre-wrap + mHC-aware checkpoint.
-
-        Threads ``mlp_h_res`` and ``mlp_hc_h_post`` (produced by the
-        hyper-connection pre-wrap) to ``_apply_mlp_bda_step`` via the
-        ``mlp_state`` slot in the return tuple.
-
-        Returns ``(pre_mlp_layernorm_output, residual, (mlp_h_res, mlp_hc_h_post))``
-        where ``residual`` is the n-stream hidden state captured before
-        aggregation — it flows to ``_apply_mlp_bda_step`` via the base
-        skeleton's ``residual`` argument, and ``(mlp_h_res, mlp_hc_h_post)``
-        flows via ``mlp_state``.
-        """
-        # Capture the n-stream residual BEFORE mlp_hyper_connection
-        # aggregates n-stream -> single-stream. The fused bda kernel needs the
-        # original n-stream tensor.
-        residual = hidden_states
-
-        nvtx_range_push(suffix="mlp_hyper_connection")
-        hidden_states, mlp_h_res, mlp_hc_h_post = self.mlp_hyper_connection(
+        """Use the shared MLP schedule with the call's mHC norm manager."""
+        return super()._pre_mlp_layernorm_and_residual(
             hidden_states, mhc_recompute_manager=self._mhc_recompute_manager
         )
-        nvtx_range_pop(suffix="mlp_hyper_connection")
-
-        self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
-        checkpoint_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm or (
-            self._mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
-        )
-        if checkpoint_pre_mlp_layernorm:
-            self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                ckpt_manager=self._mhc_recompute_manager
-            )
-            with self.mlp_norm_manager as hidden_states:
-                pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
-                    self.pre_mlp_layernorm, hidden_states
-                )
-        else:
-            with self.mlp_norm_manager as hidden_states:
-                pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
-
-        pre_mlp_layernorm_output = self._reject_residual_returning_norm(
-            pre_mlp_layernorm_output, "pre_mlp_layernorm"
-        )
-        return pre_mlp_layernorm_output, residual, (mlp_h_res, mlp_hc_h_post)
-
-    def _apply_mlp_bda_step(self, mlp_output_with_bias, residual, mlp_state=()):
-        """HC fused bias-dropout-add for MLP: combines apply_h_res + apply_h_post + bda.
-
-        Unpacks ``mlp_h_res`` and ``mlp_hc_h_post`` from ``mlp_state`` (threaded
-        by ``_pre_mlp_layernorm_and_residual`` via the base skeleton). Computes the
-        per-call ``mhc_mlp_bda_manager`` from ``self._mhc_recompute_manager``:
-        the last layer of a recompute block does NOT pass the manager into the
-        fused-bda checkpoint — the block-end finalize hook handles its output
-        discard.
-
-        Keeps the base class's ``mlp_state`` default so base-class call sites that
-        pass only two arguments (``_te_cuda_graph_replay_impl``,
-        ``MoETransformerLayer._forward_mlp_postprocess``) fail with a readable
-        message rather than a TypeError.
-        """
-        if not mlp_state:
-            raise ValueError(
-                "HyperConnectionTransformerLayer._apply_mlp_bda_step requires the "
-                "(h_res, h_post) mlp_state produced by _pre_mlp_layernorm_and_residual. It "
-                "was called through a base-class path that does not thread mHC intermediates."
-            )
-        mlp_h_res, mlp_hc_h_post = mlp_state
-
-        is_last_in_recompute_block = bool(
-            self._mhc_recompute_manager is not None
-            and getattr(self._mhc_recompute_manager, "is_last_layer_in_recompute_block", False)
-        )
-        mhc_mlp_bda_manager = None if is_last_in_recompute_block else self._mhc_recompute_manager
-
-        if self.recompute_pre_mlp_layernorm or (
-            mhc_mlp_bda_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
-        ):
-            self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
-                mlp_output_with_bias[0]
-            )
-
-        nvtx_range_push(suffix="mlp_fused_h_res_h_post_bda")
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mlp_hyper_connection.fused_h_res_h_post_bda(
-                mlp_h_res,
-                residual,
-                mlp_hc_h_post,
-                mlp_output_with_bias,
-                self.hidden_dropout,
-                self.training,
-                self.config.bias_dropout_fusion,
-                mhc_mlp_bda_manager,
-            )
-        nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
-
-        # HC omits forced_released_tensors — the n-stream residual is consumed
-        # by the fused kernel above, so the base class's "release residual after
-        # commit" trick doesn't apply.
-        if self.mlp_norm_manager is not None:
-            hidden_states = self.mlp_norm_manager.group_offload(hidden_states)
-            self.mlp_norm_manager = None
-
-        output = make_viewless_tensor(
-            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
-        )
-        return output
