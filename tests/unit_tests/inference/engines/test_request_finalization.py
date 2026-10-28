@@ -10,7 +10,10 @@ import numpy as np
 import pytest
 import torch
 
+from megatron.core.inference.config import PrefixCachingEvictionPolicy
 from megatron.core.inference.contexts.kv_block_allocator import KVBlockAllocator
+from megatron.core.inference.contexts.prefix_cache_block_state import PrefixCacheBlockState
+from megatron.core.inference.contexts.prefix_cache_registry import PrefixCacheRegistry
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
@@ -38,8 +41,15 @@ async def test_finalization_precedes_reuse_but_publication_waits_for_bookkeeping
     context.active_request_metadata["termination_id"] = torch.tensor([1, 99])
     context.chunked_prefill_request_id = -1
     context.remove_vlm_request_data = mock.Mock()
+    pc_state = (
+        PrefixCacheBlockState(8, PrefixCachingEvictionPolicy.REF_ZERO) if prefix_caching else None
+    )
     allocator = KVBlockAllocator(
-        context, pool_size=8, paused_limit=0, enable_prefix_caching=prefix_caching
+        context,
+        pool_size=8,
+        paused_limit=0,
+        pc_state=pc_state,
+        prefix_cache_registry=PrefixCacheRegistry() if prefix_caching else None,
     )
     blocks = allocator.allocate_memory_blocks(4).clone()
     context.kv_block_allocator = allocator
