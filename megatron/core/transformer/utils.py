@@ -27,6 +27,163 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Pipeline boundary when no decoder layer is trainable: every layer lies before it.
+NO_TRAINABLE_LAYER = torch.iinfo(torch.int64).max
+
+
+def infer_gradient_boundary_layer(layers: Iterable[Any], input_requires_grad: bool) -> int | None:
+    """Find the first trainable layer after a frozen prefix.
+
+    When a pipeline stage contains only frozen layers, return the boundary just
+    after its local layers. This lets that stage run entirely under no_grad
+    while the next stage starts at the global boundary.
+    """
+    if input_requires_grad:
+        return None
+    last_layer = None
+    for index, layer in enumerate(layers):
+        last_layer = layer
+        if any(parameter.requires_grad for parameter in layer.parameters()):
+            return getattr(layer, "layer_number", index + 1) - 1
+    if last_layer is None:
+        return None
+    return getattr(last_layer, "layer_number", index + 1)
+
+
+def get_cached_gradient_boundary_layer(
+    module: Any, layers: Iterable[Any], input_requires_grad: bool
+) -> int | None:
+    """Infer a frozen-prefix boundary once per input-gradient mode.
+
+    PEFT/freeze decisions are expected to be complete before the first forward.
+    If a caller changes ``requires_grad`` later, it should call
+    :func:`reset_gradient_boundary_cache` before the next forward.
+    """
+    cache = getattr(module, "_gradient_boundary_layer_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(module, "_gradient_boundary_layer_cache", cache)
+    key = bool(input_requires_grad)
+    if key not in cache:
+        cache[key] = infer_gradient_boundary_layer(layers, key)
+    return cache[key]
+
+
+def first_local_layer_index(layers: Iterable[Any]) -> int | None:
+    """Global index of the first layer in ``layers``, or ``None`` when there are none."""
+    for index, layer in enumerate(layers):
+        return getattr(layer, "layer_number", index + 1) - 1
+    return None
+
+
+def resolve_gradient_boundary(block: Any, hidden_states: Any) -> tuple[bool, int | None]:
+    """Return ``(input_needs_grad, boundary)`` for one decoder-block forward.
+
+    ``boundary`` is the global index of the first layer that needs autograd, ``None``
+    when every layer does, or past the last layer when none does. Layers before it run
+    under ``no_grad`` and the block cuts the graph where it starts.
+
+    A pipeline stage receives its input over P2P as a tensor that always requires grad,
+    so it cannot tell from that tensor whether anything upstream is trainable. Once
+    :func:`sync_pipeline_gradient_boundaries` has agreed on a boundary across stages,
+    that boundary replaces the local inference on every stage after the first.
+    """
+    if getattr(block, "_pipeline_gradient_boundary_synced", False) and not getattr(
+        block, "pre_process", True
+    ):
+        boundary = block._pipeline_gradient_boundary_layer
+        start = first_local_layer_index(block.layers)
+        return boundary is None or start is None or boundary < start, boundary
+    input_needs_grad = bool(hidden_states.requires_grad)
+    return input_needs_grad, get_cached_gradient_boundary_layer(
+        block, block.layers, input_needs_grad
+    )
+
+
+def _decoder_of(model_chunk: Any) -> tuple[Any, Any]:
+    """Unwrap DDP/Float16 wrappers and return ``(model, decoder or None)``."""
+    unwrapped = model_chunk
+    while not hasattr(unwrapped, "decoder") and hasattr(unwrapped, "module"):
+        unwrapped = unwrapped.module
+    decoder = getattr(unwrapped, "decoder", None)
+    if decoder is None or not hasattr(decoder, "layers"):
+        return unwrapped, None
+    return unwrapped, decoder
+
+
+def sync_pipeline_gradient_boundaries(model: Any, pp_group: Any) -> None:
+    """Agree on one frozen-prefix boundary across pipeline stages.
+
+    The boundary is the minimum, over all stages, of the first decoder layer with a
+    trainable parameter, or 0 (no boundary) when a pre-process module such as the
+    embedding or a vision tower is trainable. When no decoder layer is trainable, for
+    example when only the final norm or the output layer is, it is
+    :data:`NO_TRAINABLE_LAYER` and every layer runs under ``no_grad``. It is stored on
+    every decoder, so stages that lie entirely before it run under ``no_grad`` and skip
+    their backward, as the first stage already does.
+
+    Every rank of ``pp_group`` must call this at the same point outside the forward
+    pass; the pipelined schedules call it before their first microbatch. The result is
+    cached: after changing ``requires_grad``, call :func:`reset_gradient_boundary_cache`
+    on every pipeline rank.
+    """
+    if (
+        pp_group is None
+        or not torch.distributed.is_available()
+        or not torch.distributed.is_initialized()
+        or torch.distributed.get_world_size(pp_group) <= 1
+    ):
+        return
+    chunks = model if isinstance(model, (list, tuple)) else [model]
+    pairs = [_decoder_of(chunk) for chunk in chunks]
+    if pairs and all(
+        decoder is not None and getattr(decoder, "_pipeline_gradient_boundary_synced", False)
+        for _, decoder in pairs
+    ):
+        return
+    local = NO_TRAINABLE_LAYER
+    for unwrapped, decoder in pairs:
+        if decoder is None:
+            continue
+        for index, layer in enumerate(decoder.layers):
+            if any(parameter.requires_grad for parameter in layer.parameters()):
+                local = min(local, getattr(layer, "layer_number", index + 1) - 1)
+                break
+        if getattr(decoder, "pre_process", False):
+            decoder_parameters = {id(parameter) for parameter in decoder.parameters()}
+            if any(
+                parameter.requires_grad and id(parameter) not in decoder_parameters
+                for parameter in unwrapped.parameters()
+            ):
+                local = 0
+    value = torch.tensor([local], dtype=torch.int64, device=torch.cuda.current_device())
+    torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.MIN, group=pp_group)
+    boundary = int(value.item())
+    # Only 0 means every layer needs autograd; NO_TRAINABLE_LAYER keeps them all frozen.
+    boundary = None if boundary == 0 else boundary
+    for _, decoder in pairs:
+        if decoder is not None:
+            decoder._pipeline_gradient_boundary_layer = boundary
+            decoder._pipeline_gradient_boundary_synced = True
+
+
+def reset_gradient_boundary_cache(model: Any) -> None:
+    """Forget cached frozen-prefix boundaries after ``requires_grad`` changes.
+
+    With pipeline parallelism, call it on every pipeline rank.
+    """
+    chunks = model if isinstance(model, (list, tuple)) else [model]
+    for chunk in chunks:
+        for submodule in chunk.modules():
+            for name in (
+                "_gradient_boundary_layer_cache",
+                "_pipeline_gradient_boundary_layer",
+                "_pipeline_gradient_boundary_synced",
+                "_gradient_boundary_resolved",
+            ):
+                if name in submodule.__dict__:
+                    delattr(submodule, name)
+
 
 def set_attention_backend(config: 'TransformerConfig') -> None:
     """Configure Transformer Engine attention backends from a transformer config."""
