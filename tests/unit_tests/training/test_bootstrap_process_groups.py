@@ -9,12 +9,14 @@ parallel_state accessors. The collection must be the one that use_mpu_process_gr
 field by field. These tests compare the two on the standard grid, on collections that a framework
 registers, and on grids set up without the registry, where bootstrap still reads the global grid,
 now with a deprecation warning. They also cover the all-gather groups of
---create-all-gather-group, which are built from the collection in any rank order.
+--create-all-gather-group, which are built from the collection in any rank order, and the
+deprecation of the overrides that --lazy-mpu-init sets.
 """
 
 import dataclasses
 import re
 import warnings
+from argparse import ArgumentParser
 from contextlib import contextmanager
 from datetime import timedelta
 from types import SimpleNamespace
@@ -30,7 +32,8 @@ from megatron.core.process_groups_config import (
     ProcessGroupFallbackWarning,
     enable_strict_process_group_fallbacks,
 )
-from megatron.training import initialize, training
+from megatron.training import arguments, global_vars, initialize, training
+from megatron.training.argument_utils import inference_cfg_container_from_args
 from tests.unit_tests.test_utilities import Utils
 
 FIELDS = {field.name for field in dataclasses.fields(ProcessGroupCollection)}
@@ -413,6 +416,64 @@ class TestBootstrapReads:
         assert pg_collection.pp is registered.pp and pg_collection.dp is registered.dp
         assert pg_collection.ep is None
         assert record == []
+
+
+class TestLazyMpuInit:
+    """--lazy-mpu-init sets the deprecated tensor-parallel overrides, with one warning."""
+
+    @pytest.fixture
+    def lazy_initialization(self, monkeypatch):
+        parser = ArgumentParser()
+        arguments.add_megatron_arguments(parser)
+        args = parser.parse_args([])
+        args.rank, args.world_size, args.tensor_model_parallel_size = 3, 4, 2
+        cfg = inference_cfg_container_from_args(args, build_model_config=False)
+        monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+        monkeypatch.setattr(initialize, "get_args", lambda: args)
+        for name in (
+            "initialize_runtime_services",
+            "setup_logging",
+            "initialize_rerun_state_machine",
+            "_initialize_distributed",
+            "_set_random_seed",
+            "set_default_log_ranks",
+            "print_rank_0",
+        ):
+            monkeypatch.setattr(initialize, name, Mock())
+        # Restore the overrides, and let every call site of a deprecated function warn again.
+        for name in ("_MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE", "_MPU_TENSOR_MODEL_PARALLEL_RANK"):
+            monkeypatch.setattr(parallel_state, name, getattr(parallel_state, name))
+        monkeypatch.setattr(parallel_state, "_warned_accessor_call_sites", set())
+        return cfg
+
+    @pytest.mark.parametrize("lazy", [False, True])
+    def test_overrides_warn_once(self, lazy_initialization, lazy):
+        lazy_initialization.dist.lazy_mpu_init = lazy
+
+        with _recorded_warnings() as record:
+            finish = initialize.initialize_megatron(
+                allow_no_cuda=True, skip_dependency_compilation=True
+            )
+
+        deprecations = [
+            warning for warning in record if warning.category is ParallelStateDeprecationWarning
+        ]
+        if not lazy:
+            assert finish is None and deprecations == []
+            return
+        assert callable(finish)
+        (deprecation,) = deprecations
+        message = str(deprecation.message)
+        assert message.startswith(
+            "megatron.core.parallel_state.set_tensor_model_parallel_world_size() and "
+            "set_tensor_model_parallel_rank() are deprecated since Megatron Core 0.21 and will be "
+            "removed in 0.23. --lazy-mpu-init calls them"
+        )
+        assert "get_registered_process_groups()" in message
+        # Attributed to the caller of initialize_megatron(), which chose --lazy-mpu-init.
+        assert deprecation.filename == __file__
+        assert parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE == 2
+        assert parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK == 3
 
 
 @pytest.mark.skipif(Utils.world_size < 2, reason="Requires a distributed run")

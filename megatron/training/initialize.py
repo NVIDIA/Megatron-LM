@@ -58,6 +58,19 @@ from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
 logger = logging.getLogger(__name__)
 
+# --lazy-mpu-init sets rank and size overrides of the global grid, which Megatron Core 0.21
+# deprecates with the accessors that read them, under the N+2 policy in
+# docs/api-backwards-compatibility-check.md.
+_LAZY_MPU_INIT_DEPRECATION = (
+    "megatron.core.parallel_state.set_tensor_model_parallel_world_size() and "
+    "set_tensor_model_parallel_rank() are deprecated since Megatron Core 0.21 and will be removed "
+    "in 0.23. --lazy-mpu-init calls them so that the parallel_state accessors return the "
+    "tensor-model-parallel size and rank before the function that initialize_megatron() returns "
+    "builds the parallel grid. Build the model after calling that function instead, on the "
+    "process groups that it registers: "
+    "megatron.core.parallel_state.get_registered_process_groups()."
+)
+
 # The data-parallel groups that a collection of the parallel grid must set: the parallel_state
 # accessors that ProcessGroupCollection.use_mpu_process_groups() reads them with assert it.
 _REQUIRED_GRID_GROUPS = ("dp", "dp_gtp_remat", "dp_cp", "dp_cp_gtp_remat", "intra_dp_cp")
@@ -226,8 +239,10 @@ def initialize_megatron(
         args.use_cpu_initialization = True
         # delayed initialization of DDP-related stuff
         # We only set basic DDP globals. Until the external DDP manager builds the grid, these
-        # overrides are the only source of the tensor-parallel size and rank; setting them is
-        # part of bootstrap, so the deprecation of the setters does not warn here.
+        # overrides are the only source of the tensor-parallel size and rank that the deprecated
+        # parallel_state accessors return. They are deprecated with those accessors: one warning
+        # reports both setters, which therefore do not warn themselves.
+        warnings.warn(_LAZY_MPU_INIT_DEPRECATION, ParallelStateDeprecationWarning, stacklevel=2)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", ParallelStateDeprecationWarning)
             mpu.set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
