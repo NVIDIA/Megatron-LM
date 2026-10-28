@@ -14,6 +14,7 @@ from megatron.core.datasets.data_schedule import (
     get_batch_on_this_rank_for_sequence_packing,
     wrap_data_iterator,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.training.global_vars import unset_global_variables
 from tests.unit_tests.test_utilities import Utils
@@ -45,6 +46,52 @@ def test_scheduler_sanitizes_thd_padding_values():
     assert torch.equal(batch['labels'], torch.tensor([12, 13, 0, 22, 0]))
     assert torch.equal(batch['loss_mask'], torch.tensor([1.0, 1.0, 0.0, 1.0, 0.0]))
     assert torch.equal(batch['position_ids'], torch.tensor([0, 1, 0, 0, 0]))
+
+
+@pytest.mark.parametrize("vp_stage", [0, 1])
+def test_contiguous_scheduler_preserves_logical_lengths_across_pipeline_stages(vp_stage):
+    """Data and metadata-only pipeline stages agree on real lengths and global capacity."""
+    Utils.initialize_model_parallel(1, 2, 2, context_parallel_size=2)
+    try:
+        groups = ProcessGroupCollection.use_mpu_process_groups()
+        logical = torch.tensor([0, 3, 5], dtype=torch.int32, device='cuda')
+        physical = torch.tensor([0, 4, 8], dtype=torch.int32, device='cuda')
+        batch = {
+            'cu_seqlens': logical,
+            'cu_seqlens_padded': physical,
+            'max_seqlen': 4,
+            'tokens': torch.arange(8, device='cuda'),
+            'labels': torch.arange(8, device='cuda'),
+            'loss_mask': torch.ones(8, device='cuda'),
+            'position_ids': torch.arange(8, device='cuda'),
+        }
+        tokens, labels, _, _, _, packed, padding = get_batch_on_this_rank_for_sequence_packing(
+            iter([batch]),
+            pg_collection=groups,
+            vpp_size=2,
+            vp_stage=vp_stage,
+            cp_layout='contiguous',
+            use_logical_qkv_seqlens=True,
+        )
+        assert torch.equal(packed.cu_seqlens_q, logical)
+        assert torch.equal(packed.cu_seqlens_q_padded, physical)
+        assert packed.total_tokens == 8
+        expected = torch.tensor([0, 1, 2, 0, 4, 5, 0, 0], device='cuda')
+        start = 4 * groups.cp.rank()
+        for data, owns_data in (
+            (tokens, groups.pp.rank() == 0 and vp_stage == 0),
+            (labels, groups.pp.rank() == 1 and vp_stage == 1),
+        ):
+            if owns_data:
+                assert torch.equal(data.flatten(), expected[start : start + 4])
+            else:
+                assert data is None
+        expected_padding = torch.tensor(
+            [False, False, False, True, False, False, True, True], device='cuda'
+        )
+        assert torch.equal(padding.flatten(), expected_padding[start : start + 4])
+    finally:
+        Utils.destroy_model_parallel()
 
 
 class MockVariableLengthSequencePackingDataIterator:

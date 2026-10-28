@@ -3530,6 +3530,10 @@ def _add_mla_args(parser):
 
 def _add_experimental_attention_variant_args(parser):
     group = parser.add_argument_group(title="experimental_attention_variant")
+    group.add_argument('--engram-config', type=str, default=None,
+                       help='V4.1 EngramConfig JSON (logical block IDs and table layout).')
+    group.add_argument('--engram-token-map', type=str, default=None,
+                       help='Torch int64 normalized token-map tensor from the released tokenizer.')
     # Linear attention
     group.add_argument('--linear-attention-freq', type=la_freq_type, default=None,
                        help='Frequency between LA (linear attention) layers and'

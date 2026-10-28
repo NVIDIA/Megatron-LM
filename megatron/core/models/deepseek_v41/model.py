@@ -28,12 +28,8 @@ class DeepSeekV41Model(HybridModel):
         pg_collection,
         token_map=None,
         tokenizer=None,
-        pipeline_control_group=None,
         **kwargs,
     ):
-        if get_pg_size(pg_collection.pp) > 1 and pipeline_control_group is None:
-            raise ValueError('V4.1 PP requires an explicitly created pipeline control group')
-        self.pipeline_control_group = pipeline_control_group
         pattern = kwargs.pop('hybrid_layer_pattern', config.hybrid_pattern)
         super().__init__(
             config=config,
@@ -144,11 +140,11 @@ class DeepSeekV41Model(HybridModel):
                 padded = packed_seq_params.cu_seqlens_q_padded
                 values.update(cu=cu.int(), cu_padded=(cu if padded is None else padded).int())
         else:
-            if incoming.boundary_id != f'v41:{adapter.start}':
+            if incoming.spec.boundary_id != f'v41:{adapter.start}':
                 raise ValueError('Received V4.1 payload belongs to another pipeline boundary')
             _, values = incoming.restore()
             codec = V41StateCodec(
-                self.config, BatchShape(*incoming.metadata), self.pg_collection.cp
+                self.config, BatchShape(*incoming.spec.metadata), self.pg_collection.cp
             )
             packed_seq_params = codec.packed(values)
         # CSA2 derives padding and causal visibility from packed prefixes. An SBHD

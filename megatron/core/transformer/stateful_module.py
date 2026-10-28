@@ -10,7 +10,8 @@ same tensor signature. The module never retains a forward's state mapping.
 
 import gc
 from contextlib import contextmanager
-from typing import Mapping
+from functools import partial
+from typing import Callable, Mapping
 
 import torch
 from torch import Tensor, nn
@@ -50,14 +51,30 @@ class StatefulModule(nn.Module):
         return (output, *self.outputs.pack(state))
 
     def run(
-        self, hidden: Tensor, state: Mapping[str, Tensor | None], *, recompute: bool = False
+        self,
+        hidden: Tensor,
+        state: Mapping[str, Tensor | None],
+        *,
+        recompute: bool = False,
+        checkpoint_fn: Callable | None = None,
     ) -> tuple[Tensor, dict[str, Tensor | None]]:
-        """Run eagerly or checkpoint explicit state, including parameter-only gradients."""
+        """Run eagerly or checkpoint explicit state, including parameter-only gradients.
+
+        ``checkpoint_fn(region, *tensors)`` replaces the default non-reentrant
+        checkpoint, e.g. with an FP8-aware ``te_checkpoint`` for quantized regions.
+        """
         args = (hidden, *self.inputs.pack(state))
         if recompute and torch.is_grad_enabled():
             if hidden.is_cuda and torch.cuda.is_current_stream_capturing():
                 raise ValueError("Stateful full recomputation cannot be nested in CUDA capture")
-            result = checkpoint(self, *args, use_reentrant=False, context_fn=_checkpoint_contexts)
+            if checkpoint_fn is None:
+                if _fp8_autocast_enabled():
+                    # Replay would run outside the forward's FP8 recipe state.
+                    raise ValueError("FP8 recomputation requires an FP8-aware checkpoint_fn")
+                checkpoint_fn = partial(
+                    checkpoint, use_reentrant=False, context_fn=_checkpoint_contexts
+                )
+            result = checkpoint_fn(self, *args)
         else:
             result = self(*args)
         return self.restore_result(result, state)
@@ -69,6 +86,14 @@ class StatefulModule(nn.Module):
             updated.pop(field.key, None)
         updated.update(self.outputs.unpack(result[1:]))
         return result[0], updated
+
+
+def _fp8_autocast_enabled() -> bool:
+    try:
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+    except ImportError:
+        return False
+    return FP8GlobalStateManager.is_fp8_enabled()
 
 
 def _checkpoint_contexts():
@@ -108,6 +133,20 @@ def _checkpoint_contexts():
                 rng._unset_checkpointing()
 
     return forward(), replay()
+
+
+class _GraphInputGrad(torch.autograd.Function):
+    """Give shared producers gradients independent of a graph's reusable buffers."""
+
+    @staticmethod
+    def forward(ctx, tensor):
+        """Alias the input so its gradient passes through this node."""
+        return tensor.view_as(tensor)
+
+    @staticmethod
+    def backward(ctx, gradient):
+        """Copy the gradient out of the graph's reusable static buffer."""
+        return gradient.clone()
 
 
 class _GraphOutputs(torch.autograd.Function):
@@ -150,9 +189,9 @@ class StatefulGraphs:
     """Capture independent graph slots for outstanding pipeline microbatches.
 
     Each slot has its own graph memory pool and retains no caller state mapping.
-    Graphs share model parameters. Input shapes, dtype, strides and gradient
-    activity match capture; all differentiable outputs must be consumed. State
-    fields whose backward activity can change require distinct capture profiles.
+    Graphs share model parameters. Input shapes, dtype, strides, gradient activity
+    and training mode match capture; all differentiable outputs must be consumed.
+    State fields whose backward activity can change require distinct capture profiles.
     """
 
     def __init__(
@@ -166,6 +205,7 @@ class StatefulGraphs:
         num_warmup_iters: int = 3,
         debug_checks: bool = False,
         capture_kwargs: Mapping | None = None,
+        make_forward_pre_hook=None,
     ) -> None:
         if not hidden.is_cuda or slots < 1:
             raise ValueError("Stateful CUDA graphs require a CUDA sample and positive slot count")
@@ -194,6 +234,10 @@ class StatefulGraphs:
             raise ValueError(f"Unsupported stateful graph backend: {backend}")
         self.region, self.device = region, hidden.device
         self.debug_checks = debug_checks
+        # The backends' own eval fallback only sees the unregistered slot wrappers,
+        # so every replay compares the live module tree with the captured mode.
+        self._modules = tuple(region.module.modules())
+        self._modes = tuple(module.training for module in self._modules)
         samples = (hidden, *region.inputs.pack(state))
         self._signature = tuple(self._tensor_signature(t) for t in samples)
         self._busy = [False] * slots
@@ -203,6 +247,13 @@ class StatefulGraphs:
         self._recorded = [False] * slots
         self._callables = []
         self._wrappers = []
+        self._manual_forward_hooks = []
+        if make_forward_pre_hook is not None:
+            self.setup_manual_hooks(make_forward_pre_hook)
+            # Lazy capture may follow an asynchronous parameter gather. Drain it
+            # before capture suppresses the ordinary DDP parameter-owner hooks.
+            for hook, module in self._manual_forward_hooks:
+                hook(module)
         for _ in range(slots):
             wrapper = StatefulModule(region.module, region.inputs.fields, region.outputs.fields)
             wrapper.training = region.training
@@ -239,6 +290,9 @@ class StatefulGraphs:
             for p in self.region.parameters()
         ]
         backups = [None if main is None else main.clone() for _, _, main, _ in saved]
+        # Router statistics and other registered state must count real invocations,
+        # not the extra forward/backward calls used to build each graph slot.
+        buffers = [(buffer, buffer.clone()) for buffer in self.region.buffers()]
         was_capturing = cuda_graphs.is_graph_capturing()
         # DDP retains AccumulateGrad nodes created before the capture stream.
         # Match MCore's full-graph setup, but restore this process-global switch.
@@ -257,6 +311,9 @@ class StatefulGraphs:
             fused.extend(p for p, _, _, _ in saved if getattr(p, "grad_added_to_main_grad", False))
         finally:
             try:
+                with torch.no_grad():
+                    for buffer, value in buffers:
+                        buffer.copy_(value)
                 for (p, grad, main, flag), backup in zip(saved, backups):
                     if main is not None:
                         main.copy_(backup)
@@ -303,7 +360,10 @@ class StatefulGraphs:
             tuple(tensor.shape),
             tensor.dtype,
             tensor.device,
-            tensor.stride(),
+            # Singleton dimensions do not advance the storage offset.
+            tuple(
+                stride if size != 1 else 0 for size, stride in zip(tensor.shape, tensor.stride())
+            ),
             tensor.requires_grad,
         )
 
@@ -333,7 +393,16 @@ class StatefulGraphs:
             wrapper.forward = StatefulModule.forward.__get__(wrapper, StatefulModule)
         self._callables.clear()
         self._wrappers.clear()
+        self._manual_forward_hooks.clear()
         gc.collect()
+
+    def setup_manual_hooks(self, make_hook_func):
+        """Run parameter-gather pre-hooks for the captured parameter owners."""
+        self._manual_forward_hooks = [
+            (make_hook_func(), module)
+            for module in self.region.module.modules()
+            if next(module.parameters(recurse=False), None) is not None
+        ]
 
     def run(
         self, hidden: Tensor, state: Mapping[str, Tensor | None], *, slot: int = 0
@@ -341,6 +410,8 @@ class StatefulGraphs:
         """Replay one reserved slot and publish its side outputs into a fresh mapping."""
         if not 0 <= slot < len(self._callables) or self._busy[slot]:
             raise RuntimeError("Graph slot is invalid or still belongs to an outstanding backward")
+        if tuple(module.training for module in self._modules) != self._modes:
+            raise ValueError("Stateful graph training mode differs from capture")
         if self.debug_checks:
             self.validate_module()
         args = (hidden, *self.region.inputs.pack(state))
@@ -348,6 +419,9 @@ class StatefulGraphs:
             raise ValueError("Stateful graph input profile differs from capture")
         if self._recorded[slot]:
             torch.cuda.current_stream(self.device).wait_event(self._events[slot])
+        for hook, module in self._manual_forward_hooks:
+            hook(module)
+        args = (args[0], *(_GraphInputGrad.apply(t) if t.requires_grad else t for t in args[1:]))
         outputs = self._callables[slot](*args)
         if torch.is_grad_enabled() and any(t.requires_grad for t in outputs):
             self._busy[slot] = True

@@ -15,7 +15,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.pipeline_payload import (
-    PipelinePayload,
+    TensorStatePayload,
     backward_pipeline_payload,
 )
 from megatron.core.pipeline_parallel.typed_p2p_communication import TypedP2PCommunicator
@@ -59,8 +59,8 @@ Shape = Union[List[int], torch.Size]
 def _prepare_pipeline_payload_plans(
     forward_step_func, data_iterators, models, num_microbatches, forward_only
 ):
-    # Optional training-entry-point hook: stage data and host descriptors before
-    # any P2P is posted. The core schedule never interprets model/batch metadata.
+    # Training-entry-point hook: stage data and host descriptors before any P2P is
+    # posted. The core schedule never interprets model/batch metadata.
     prepare = getattr(forward_step_func, "prepare_pipeline_inputs", None)
     if prepare is not None:
         data_iterators = [
@@ -68,10 +68,11 @@ def _prepare_pipeline_payload_plans(
             for iterator, model in zip(data_iterators, models)
         ]
     plans = [getattr(iterator, "pipeline_payload_plan", None) for iterator in data_iterators]
-    if all(plan is None for plan in plans):
-        return data_iterators, None
     if any(plan is None or len(plan.incoming) != num_microbatches for plan in plans):
-        raise ValueError("Every typed pipeline chunk must plan every microbatch")
+        raise ValueError(
+            "Typed pipeline stages require a PipelinePayloadPlan for every chunk and microbatch; "
+            "provide forward_step_func.prepare_pipeline_inputs"
+        )
     return data_iterators, plans
 
 
@@ -208,10 +209,6 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
     if (out is None) or (not deallocate_pipeline_outputs):
         return
 
-    if isinstance(out, PipelinePayload):
-        out.release_output()
-        return
-
     # Handle dict format (multi-module pipelines)
     if isinstance(out, dict):
         for value in out.values():
@@ -262,7 +259,7 @@ def custom_backward(output, grad_output):
     )
 
 
-def get_tensor_device(tensor: Union[torch.Tensor, PipelinePayload, Dict[str, torch.Tensor]]):
+def get_tensor_device(tensor: Union[torch.Tensor, TensorStatePayload, Dict[str, torch.Tensor]]):
     """Get the device of a tensor or a dictionary of tensors."""
     if isinstance(tensor, dict):
         return next(iter(tensor.values())).device
@@ -581,7 +578,9 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
         config.timers('backward-compute', log_level=2).start()
 
     # Typed P2P returns raw payloads and gradient tuples; all outputs share one backward.
-    if isinstance(input_tensor, PipelinePayload) or isinstance(output_tensor, PipelinePayload):
+    if isinstance(input_tensor, TensorStatePayload) or isinstance(
+        output_tensor, TensorStatePayload
+    ):
         try:
             return backward_pipeline_payload(
                 input_tensor, output_tensor, output_tensor_grad, config.grad_scale_func
@@ -1145,10 +1144,9 @@ def forward_backward_pipelining_with_interleaving(
             pg_collection.pp,
             config,
             payload_factories,
+            payload_plans,
             forward_only=forward_only,
             device=first_parameter.device if first_parameter is not None else None,
-            payload_plans=payload_plans,
-            control_group=get_attr_wrapped_model(model[0], "pipeline_control_group"),
         )
     # Typed P2P releases payload references when posting the send; it retains the
     # detached wire buffers itself. Do not pseudo-deallocate its terminal scalar loss.
@@ -1445,9 +1443,6 @@ def forward_backward_pipelining_with_interleaving(
         # microbatch_id offset with number of released microbatches that have completed backprop.
         offset = num_released_microbatches(virtual_microbatch_id, model_chunk_id)
         input_tensor = input_tensors[model_chunk_id][microbatch_id - offset]
-        if typed_pipeline:
-            input_tensor = p2p_communicator.resolve_forward(input_tensor)
-            input_tensors[model_chunk_id][microbatch_id - offset] = input_tensor
 
         return input_tensor
 
@@ -2417,10 +2412,9 @@ def forward_backward_pipelining_without_interleaving(
             pg_collection.pp,
             config,
             payload_factory,
+            payload_plans,
             forward_only=forward_only,
             device=first_parameter.device if first_parameter is not None else None,
-            payload_plans=payload_plans,
-            control_group=get_attr_wrapped_model(model, "pipeline_control_group"),
         )
     # Typed P2P owns payload release, including asynchronous send-buffer lifetimes.
     deallocate_pipeline_outputs = config.deallocate_pipeline_outputs and payload_factory is None
