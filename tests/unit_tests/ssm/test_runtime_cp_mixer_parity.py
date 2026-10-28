@@ -40,7 +40,9 @@ def test_runtime_cp_full_mixer_matches_static_cp(variant):
         cp_group = parallel_state.get_dynamic_data_context_parallel_groups(group_size=2)
         groups = ProcessGroupCollection.use_mpu_process_groups()
         chunkwise = variant == "gdp_chunkwise"
-        heads = max(4, Utils.world_size)
+        # One-Householder GDP needs eight heads to keep its CP2 projected
+        # convolution view aligned to causal-conv1d's eight-element stride.
+        heads = max(4 if variant == "mamba" else 8, Utils.world_size)
         config = TransformerConfig(
             num_layers=1,
             hidden_size=128,
