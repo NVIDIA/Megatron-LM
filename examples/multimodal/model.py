@@ -82,7 +82,7 @@ def model_provider(
             pixel_shuffle=args.pixel_shuffle,
             use_tile_tags=args.use_tile_tags,
             max_num_tiles=args.max_num_tiles,
-            tokenizer_type=cfg.tokenizer.tokenizer_prompt_format,
+            tokenizer_type=cfg_container.tokenizer.tokenizer_prompt_format,
         )
         old_seq_length = args.seq_length
         args.seq_length = args.encoder_seq_length = num_image_embeddings
@@ -262,7 +262,7 @@ def model_provider(
     tokenizer = get_tokenizer()
     image_token_index = tokenizer.image_token_index
 
-    tile_tags = _get_tile_tags(args, tokenizer, cfg.tokenizer.tokenizer_prompt_format)
+    tile_tags = _get_tile_tags(args, tokenizer, cfg_container.tokenizer.tokenizer_prompt_format)
 
     model = LLaVAModel(
         language_transformer_config=language_config,
@@ -298,7 +298,7 @@ def model_provider(
         conv_merging=getattr(args, "conv_merging", False),
         tile_tags=tile_tags,
         max_num_tiles=args.max_num_tiles,
-        tokenizer_type=cfg.tokenizer.tokenizer_prompt_format,
+        tokenizer_type=cfg_container.tokenizer.tokenizer_prompt_format,
         use_vision_backbone_fp8_arch=getattr(args, "use_vision_backbone_fp8_arch", False),
         dynamic_resolution=getattr(args, "dynamic_resolution", False),
         class_token_len=getattr(args, "class_token_len", None),

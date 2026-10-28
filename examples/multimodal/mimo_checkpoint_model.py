@@ -195,7 +195,7 @@ def model_provider(
         conv_merging=args.conv_merging,
         dynamic_resolution=args.dynamic_resolution,
         max_num_tiles=args.max_num_tiles,
-        tokenizer_type=cfg.tokenizer.tokenizer_prompt_format,
+        tokenizer_type=cfg_container.tokenizer.tokenizer_prompt_format,
         pg_collection=pg_collection,
         vp_stage=vp_stage,
     )

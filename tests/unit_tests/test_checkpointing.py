@@ -566,7 +566,11 @@ def test_check_checkpoint_args_rejects_wide_residual_mismatch():
 
 @pytest.mark.parametrize(
     "section,name,current,other",
-    [("train", "global_batch_size", 8, 16), ("rng", "data_parallel_random_init", True, False)],
+    [
+        ("train", "global_batch_size", 8, 16),
+        ("rng", "data_parallel_random_init", True, False),
+        ("tokenizer", "tokenizer_type", "GPT2BPETokenizer", "SentencePieceTokenizer"),
+    ],
 )
 @pytest.mark.parametrize(
     "saved_source", ["legacy", "missing_section", "missing_field", "config", "config_only"]
@@ -586,6 +590,10 @@ def test_check_checkpoint_args_uses_config_owner(
         **{name: other},
     )
     owner = getattr(run_config, section)
+    if section == "tokenizer":
+        run_config.tokenizer.vocab_file = "vocab.json"
+        args.max_position_embeddings = 128
+        args.make_vocab_size_divisible_by = 128
     assert hasattr(owner, name)
     setattr(owner, name, current)
     checkpoint_args = SimpleNamespace(**vars(args))

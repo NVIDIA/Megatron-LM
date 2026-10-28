@@ -354,6 +354,9 @@ class MegatronCheckpointSaverBase:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
 
+        # Keep legacy checkpoint metadata consistent with the converted vocabulary.
+        self.margs.padded_vocab_size = self.cfg.tokenizer.padded_vocab_size
+
         train_state = get_train_state()
         for pp_rank in range(self.args.target_pipeline_parallel_size):
             mpu.set_pipeline_model_parallel_rank(pp_rank)

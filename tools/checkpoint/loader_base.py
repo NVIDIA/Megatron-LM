@@ -158,8 +158,8 @@ class MegatronCheckpointLoaderBase:
         """Determine the 'true' (non-padded) vocab size."""
         if self.args.true_vocab_size is not None:
             return self.args.true_vocab_size
-        elif self.cfg.tokenizer.vocab_file is not None:
-            vocab = json.load(open(self.cfg.tokenizer.vocab_file))
+        elif self.args.vocab_file is not None:
+            vocab = json.load(open(self.args.vocab_file))
             return len(vocab)
         else:
             return None
@@ -169,8 +169,8 @@ class MegatronCheckpointLoaderBase:
         If both --true-vocab-size and --vocab-file are specified, verify they match.
         Return False (and exit) if they don't match; True otherwise.
         """
-        if self.args.true_vocab_size is not None and self.cfg.tokenizer.vocab_file is not None:
-            vocab = json.load(open(self.cfg.tokenizer.vocab_file))
+        if self.args.true_vocab_size is not None and self.args.vocab_file is not None:
+            vocab = json.load(open(self.args.vocab_file))
             if len(vocab) != self.args.true_vocab_size:
                 print("Both --true-vocab-size and --vocab-file specified but vocab sizes do not match. Aborting.")
                 return False
