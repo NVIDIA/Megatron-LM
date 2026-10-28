@@ -25,6 +25,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
     RowAtomic,
     TensorAtomic,
@@ -319,7 +320,7 @@ def test_rejects_delayed_te_weight_gradient(distributed_setup):
     x = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
     model(x).float().square().mean().backward()
     assert model.weight.grad is None
-    assert model.phase is FsdpModule.Phase.BACKWARD
+    assert model.phase is Phase.BACKWARD
 
     with pytest.raises(RuntimeError, match="caller_managed_grad_sync=True"):
         model.backward_dw()
@@ -382,16 +383,16 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
 
     # Backward completes each module before recomputing the previous one, so
     # every module-local phase must be cleared after its matching backward.
-    assert model.phase is FsdpModule.Phase.RESTING
-    assert model.fc1.phase is FsdpModule.Phase.RESTING
-    assert model.fc2.phase is FsdpModule.Phase.RESTING
+    assert model.phase is Phase.RESTING
+    assert model.fc1.phase is Phase.RESTING
+    assert model.fc2.phase is Phase.RESTING
 
     # A second forward after backward runs in the forward phase again, so
     # forward-order prefetch resumes and the module phases return to resting.
     model(x).sum().backward()
-    assert model.phase is FsdpModule.Phase.RESTING
-    assert model.fc1.phase is FsdpModule.Phase.RESTING
-    assert model.fc2.phase is FsdpModule.Phase.RESTING
+    assert model.phase is Phase.RESTING
+    assert model.fc1.phase is Phase.RESTING
+    assert model.fc2.phase is Phase.RESTING
 
 
 @pytest.mark.parametrize("set_to_none", [True, False])
@@ -795,7 +796,7 @@ def test_fully_shard_preserves_parameter_attributes(distributed_setup):
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = nn.Linear(8, 8, bias=False, device=device)
-    attributes = {"use_muon": False}
+    attributes = {"use_muon": False, "is_wide_residual_retention_parameter": True}
     for name, value in attributes.items():
         setattr(model.weight, name, value)
 

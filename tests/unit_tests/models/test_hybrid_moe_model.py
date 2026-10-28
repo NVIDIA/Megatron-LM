@@ -207,6 +207,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "memory_efficient_layer_norm": False,
     "mhc_fused_backend": "auto",
     "mhc_init_gating_factor": 0.01,
+    "mhc_keep_mappings_in_fp32": False,
+    "mhc_learned_output_contract": True,
+    "mhc_norm_eps_inside_sqrt": False,
     "mhc_recompute_layer_num": None,
     "mhc_sinkhorn_iterations": 20,
     "microbatch_group_size_per_vp_stage": 1,
@@ -384,7 +387,10 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "delta_offload_bytes_across_pp_ranks": 0,
     "activation_offload_fraction": 1.0,
     "fine_grained_offloading_max_inflight_offloads": None,
+    "fine_grained_offloading_buffer_size_gib": 0.0,
     "hybrid_context_parallel": False,
+    "dynamic_context_parallel": False,
+    "min_dynamic_context_parallel_size": 1,
     "max_seqlen_per_dp_cp_rank": None,
     "inference_cuda_graph_scope": {
         "__objclass__": "megatron.core.transformer.enums.InferenceCudaGraphScope",
@@ -396,6 +402,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_force_biased": None,
     "inference_grouped_gemm_backend": "vllm",
     "inference_flashinfer_mxfp8_token_capacity": None,
+    "inference_moe_nvfp4_recipe": None,
     "inference_moe_disable_fused_quant_kernels": False,
     "inference_moe_token_dispatcher_type": "nvls",
     "moe_mlp_glu_interleave_size": None,
@@ -410,7 +417,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
 # Fields that are allowed to appear in the live config even if not yet in the golden.
-ALLOW_ADDED_FIELDS = set()
+ALLOW_ADDED_FIELDS = {"pad_packed_seq_alignment"}
 
 
 def serialize_config(cfg: Any) -> Dict[str, Any]:

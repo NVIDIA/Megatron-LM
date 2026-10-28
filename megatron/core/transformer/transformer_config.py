@@ -1380,6 +1380,16 @@ class TransformerConfig(ModelParallelConfig):
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""
 
+    mhc_norm_eps_inside_sqrt: bool = False
+    """Use rsqrt(mean(x**2) + layernorm_epsilon) for the mHC mapping norm."""
+
+    mhc_keep_mappings_in_fp32: bool = False
+    """Keep mHC coefficients and stream mixing in FP32 until the output cast."""
+
+    mhc_learned_output_contract: bool = True
+    """Contract residual streams to the ordinary hidden width using token-dependent gating;
+    otherwise average the streams."""
+
     use_fused_mhc: bool = False
     """Use fused kernels for mHC operations when supported.
 
@@ -1519,12 +1529,31 @@ class TransformerConfig(ModelParallelConfig):
     True to disable fusion and use separate kernel launches (useful for debugging)."""
 
     inference_flashinfer_mxfp8_token_capacity: int | None = None
-    """Optional fixed token-row capacity for FlashInfer routed MXFP8 MoE.
+    """Optional fixed token-row capacity for FlashInfer routed MXFP8 and per-token
+    NVFP4 MoE (inference_moe_nvfp4_recipe).
 
     Decode-only dynamic-inference graphs use this fixed prefix when their
     host-known EP-wide token ceiling fits. Prefill, mixed, static-inference,
     and oversized decode graphs retain the full dispatcher buffer. Requires
     the NVLS inference dispatcher and EP > 1.
+    """
+
+    inference_moe_nvfp4_recipe: Optional[Literal['per_token']] = None
+    """NVFP4 recipe for routed experts during inference; None keeps them in BF16.
+    Options:
+    - 'per_token': NVFP4 weights x NVFP4 activations with one FP32 scale per token.
+
+    BF16 expert weights are quantized to NVFP4 (one FP32 global scale per expert)
+    when the MoE layer first runs and requantized in place by
+    refresh_flashinfer_nvfp4_weights() when they change; 'per_token' quantizes
+    activations online, so no calibration is required. Uses the
+    FlashInfer CuTe DSL grouped GEMMs (requires nvidia-cutlass-dsl) and requires
+    transformer_impl='inference_optimized', inference_grouped_gemm_backend='flashinfer',
+    non-gated squared-ReLU or gated SiLU (SwiGLU) experts without GLU clamping, offset or
+    interleaving, BF16 expert parameters, and FlashInfer >= 0.7.0 on
+    Blackwell (SM100/SM103). The BF16 expert weights stay resident as the refit
+    destination alongside the padded NVFP4 copy. Supports batch_invariant_mode (with
+    the NVLS dispatcher when EP > 1), like FlashInfer MXFP8.
     """
 
     inference_moe_token_dispatcher_type: Literal['nccl', 'nvls'] = 'nvls'
@@ -1683,6 +1712,19 @@ class TransformerConfig(ModelParallelConfig):
     insert these joins. This feature is particularly useful when using with full-iteration CUDA
     graphs"""
 
+    fine_grained_offloading_buffer_size_gib: float = 0.0
+    """Fixed pinned activation buffer capacity per rank, in GiB; zero disables it.
+    Capacity in bytes must be a positive multiple of 256 bytes and is pinned at that
+    size, not rounded up to a power of two. The buffer is allocated once, at the first
+    forward pass, and never grows; running out raises an error. Space is reused only
+    once every backup has been reloaded, so the buffer must hold everything offloaded
+    between such points, with each tensor aligned to 256 bytes. That is one microbatch
+    when each backward finishes before the next forward starts (PP=1, or the last
+    pipeline stage without virtual pipeline stages, and no
+    overlap_moe_expert_parallel_comm); otherwise it is everything the rank offloads in
+    an iteration, across all microbatches and model chunks. This bounds the shared
+    offload buffer, not other host allocations or allocator caches."""
+
     @classmethod
     def from_config(cls, config: "TransformerConfig") -> Self:
         """Create this config type from an existing normalized transformer config.
@@ -1712,18 +1754,6 @@ class TransformerConfig(ModelParallelConfig):
         ):
             raise ValueError(
                 "attention_cp_layout='contiguous' is not yet supported with context parallelism."
-            )
-        if self.linear_cp_layout == "contiguous" and self.hybrid_context_parallel:
-            raise ValueError(
-                "hybrid_context_parallel is not supported with linear_cp_layout='contiguous'."
-            )
-        if (
-            self.sequence_packing_scheduler is not None
-            and self.context_parallel_size > 1
-            and self.linear_cp_layout != self.attention_cp_layout
-        ):
-            raise ValueError(
-                "The sequence-packing scheduler does not support CP layout conversion."
             )
         if (
             self.context_parallel_size > 1
@@ -2023,7 +2053,7 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "DSv4 context parallelism requires attention_cp_layout='contiguous'."
                 )
-            if self.hybrid_context_parallel:
+            if self.dynamic_context_parallel:
                 raise ValueError("DSv4 dynamic context parallelism is not supported yet.")
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
             if self.dsa_kernel_backend == "tilelang":
@@ -2138,15 +2168,27 @@ class TransformerConfig(ModelParallelConfig):
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError("num_moe_experts must be non None to use expert-parallel.")
 
+        if self.inference_moe_nvfp4_recipe is not None and (
+            self.transformer_impl != "inference_optimized" or self.num_moe_experts is None
+        ):
+            raise ValueError(
+                "inference_moe_nvfp4_recipe requires transformer_impl='inference_optimized' "
+                "and an MoE model (num_moe_experts set)."
+            )
+
         if self.transformer_impl == "inference_optimized" and self.num_moe_experts is not None:
             self.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.from_config(
                 self.inference_grouped_gemm_backend
             )
 
             mxfp8_enabled = bool(self.fp8) and self.fp8_recipe == Fp8Recipe.mxfp8
-            if self.expert_tensor_parallel_size > 1:
+            if (
+                self.expert_tensor_parallel_size > 1
+                and self.inference_moe_token_dispatcher_type != "nvls"
+            ):
                 raise ValueError(
-                    "Inference-optimized MoE layers does not support expert tensor parallelism."
+                    "Inference-optimized MoE layers support expert tensor parallelism only "
+                    "with inference_moe_token_dispatcher_type='nvls'."
                 )
             if self.moe_expert_capacity_factor is not None:
                 raise ValueError("Inference-optimized MoE layers only support dropless MoE ")
@@ -2161,15 +2203,54 @@ class TransformerConfig(ModelParallelConfig):
                     "to avoid costly dtype conversions during decode."
                 )
 
+            if self.inference_moe_nvfp4_recipe is not None:
+                if self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER:
+                    raise ValueError(
+                        "inference_moe_nvfp4_recipe requires "
+                        "inference_grouped_gemm_backend='flashinfer', got "
+                        f"'{self.inference_grouped_gemm_backend}'."
+                    )
+                if self.activation_func != (F.silu if self.gated_linear_unit else squared_relu):
+                    raise ValueError(
+                        "inference_moe_nvfp4_recipe supports only non-gated squared-ReLU or "
+                        "gated SiLU (SwiGLU) experts. Set activation_func=squared_relu with "
+                        "gated_linear_unit=False, or activation_func=F.silu with "
+                        "gated_linear_unit=True."
+                    )
+                if self.activation_func_tanh_clamp_scale is not None:
+                    raise ValueError(
+                        "inference_moe_nvfp4_recipe does not support "
+                        "activation_func_tanh_clamp_scale: the FlashInfer per-token NVFP4 "
+                        "kernels only implement unclamped Relu2 and SwiGLU."
+                    )
+                if self.gated_linear_unit and (
+                    self.activation_func_clamp_value is not None
+                    or self.glu_linear_offset != 0.0
+                    or self.moe_mlp_glu_interleave_size is not None
+                ):
+                    raise ValueError(
+                        "inference_moe_nvfp4_recipe supports only plain SwiGLU: "
+                        "activation_func_clamp_value, glu_linear_offset and "
+                        "moe_mlp_glu_interleave_size must be unset."
+                    )
+                if self.fp8 or self.fp4_param:
+                    raise ValueError(
+                        "inference_moe_nvfp4_recipe quantizes BF16 expert weights and "
+                        "cannot be combined with FP8 inference or fp4_param."
+                    )
+
             # Gated linear units (SwiGLU/GeGLU) are supported by the torch and vLLM
-            # grouped-GEMM backends.
-            if self.gated_linear_unit and self.inference_grouped_gemm_backend not in (
-                InferenceGroupedGemmBackend.TORCH,
-                InferenceGroupedGemmBackend.VLLM,
+            # grouped-GEMM backends, and SwiGLU by FlashInfer per-token NVFP4.
+            if (
+                self.gated_linear_unit
+                and self.inference_grouped_gemm_backend
+                not in (InferenceGroupedGemmBackend.TORCH, InferenceGroupedGemmBackend.VLLM)
+                and self.inference_moe_nvfp4_recipe is None
             ):
                 raise ValueError(
                     "--transformer-impl='inference_optimized' supports gated linear units "
                     "(SwiGLU/GeGLU) only with --inference-grouped-gemm-backend torch or vllm, "
+                    "or with inference_moe_nvfp4_recipe, "
                     f"got '{self.inference_grouped_gemm_backend}'."
                 )
 
@@ -2201,14 +2282,14 @@ class TransformerConfig(ModelParallelConfig):
                     )
                 if (
                     self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER
-                    or not mxfp8_enabled
+                    or not (mxfp8_enabled or self.inference_moe_nvfp4_recipe is not None)
                     or self.inference_moe_token_dispatcher_type != "nvls"
                     or self.expert_model_parallel_size <= 1
                 ):
                     raise ValueError(
                         "inference_flashinfer_mxfp8_token_capacity requires "
                         "inference_grouped_gemm_backend='flashinfer', FP8 enabled with "
-                        "fp8_recipe='mxfp8', "
+                        "fp8_recipe='mxfp8' or inference_moe_nvfp4_recipe, "
                         "inference_moe_token_dispatcher_type='nvls' and "
                         "expert_model_parallel_size > 1"
                     )
@@ -2226,11 +2307,13 @@ class TransformerConfig(ModelParallelConfig):
                 if (
                     self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
                     and not mxfp8_enabled
+                    and self.inference_moe_nvfp4_recipe is None
                 ):
                     raise ValueError(
                         "batch_invariant_mode currently supports the FlashInfer grouped-GEMM "
-                        "backend only for an MXFP8 model configuration. Selectively BF16 "
-                        "expert layers within that configuration remain supported."
+                        "backend only for an MXFP8 model configuration or "
+                        "inference_moe_nvfp4_recipe. Selectively BF16 expert layers within "
+                        "an MXFP8 configuration remain supported."
                     )
                 if (
                     self.expert_model_parallel_size > 1
@@ -2897,6 +2980,11 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.use_fused_mhc and not self.enable_mhc_connections:
             raise ValueError("use_fused_mhc requires enable_mhc_connections=True.")
+        if self.use_fused_mhc and (self.mhc_norm_eps_inside_sqrt or self.mhc_keep_mappings_in_fp32):
+            raise ValueError(
+                "use_fused_mhc does not support mhc_norm_eps_inside_sqrt or "
+                "mhc_keep_mappings_in_fp32; use the unfused mHC path."
+            )
 
         valid_mhc_fused_backends = ("auto", "native", "triton", "cutile")
         if self.mhc_fused_backend not in valid_mhc_fused_backends:
@@ -2906,13 +2994,6 @@ class TransformerConfig(ModelParallelConfig):
             )
         if self.mhc_fused_backend != "auto" and not self.use_fused_mhc:
             raise ValueError("mhc_fused_backend requires use_fused_mhc=True when set explicitly.")
-
-        if self.enable_mhc_connections and self.recompute_granularity == "full":
-            raise NotImplementedError(
-                "enable_mhc_connections is not yet compatible with full activation recompute. "
-                "Use selective recompute with 'mhc' in recompute_modules, or disable "
-                "activation recompute."
-            )
 
         if self.enable_mhc_connections and self.inference_fuse_tp_communication:
             raise NotImplementedError(
@@ -2957,6 +3038,24 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "mhc_init_gating_factor must be non-negative, got "
                     f"{self.mhc_init_gating_factor}."
+                )
+
+        buffer_size = self.fine_grained_offloading_buffer_size_gib
+        if buffer_size != 0:
+            buffer_bytes = buffer_size * 2**30
+            if not math.isfinite(buffer_bytes) or buffer_bytes <= 0:
+                raise ValueError("Pinned offload buffer requires a finite positive buffer_size_gib")
+            if not self.fine_grained_activation_offloading:
+                raise ValueError(
+                    "Pinned offload buffer requires fine_grained_activation_offloading"
+                )
+            capacity = int(buffer_bytes)
+            if capacity != buffer_bytes or capacity < 256 or capacity % 256:
+                raise ValueError(
+                    "Pinned offload buffer capacity must be a positive multiple of 256 bytes, "
+                    "so the size in GiB must be a multiple of 2**-22 (for example 152 or "
+                    f"152.5); got fine_grained_offloading_buffer_size_gib={buffer_size} "
+                    f"({buffer_bytes} bytes)"
                 )
 
         if self.fine_grained_activation_offloading:
@@ -3064,6 +3163,24 @@ class TransformerConfig(ModelParallelConfig):
                     f"(paged stash covers those activations). "
                     f"Remove: {moe_offload_conflict}"
                 )
+            if not self.use_transformer_engine_op_fuser:
+                if not self.moe_use_grouped_tensor:
+                    raise ValueError(
+                        "moe_paged_stash without use_transformer_engine_op_fuser requires "
+                        "moe_use_grouped_tensor=True."
+                    )
+                if (
+                    not self.bias_activation_fusion
+                    or not self.gated_linear_unit
+                    or self.activation_func not in (F.silu, quick_gelu)
+                    or self.moe_mlp_glu_interleave_size is not None
+                ):
+                    raise ValueError(
+                        "moe_paged_stash with the non-op-fuser GroupedTensor path requires "
+                        "fused SwiGLU or QuickGeGLU: set bias_activation_fusion=True, "
+                        "gated_linear_unit=True, activation_func to silu or quick_gelu, and "
+                        "moe_mlp_glu_interleave_size=None."
+                    )
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
@@ -3652,6 +3769,20 @@ class TransformerConfig(ModelParallelConfig):
                 )
                 self.cuda_graph_impl = "transformer_engine"
 
+        if self.dynamic_context_parallel:
+            # Captured graphs bake in static communicators, so they cannot follow the
+            # per-microbatch CP group that dynamic context parallelism selects at runtime.
+            assert (
+                self.cuda_graph_impl == "none"
+            ), "Dynamic context parallelism not supported with CUDA Graph"
+            assert (
+                self.calculate_per_token_loss
+            ), "Dynamic context parallelism must be used with calculate_per_token_loss"
+            # The router z-loss still scales by the static TP x CP group, not the runtime one.
+            assert (
+                self.moe_z_loss_coeff is None
+            ), "Dynamic context parallelism not supported with moe_z_loss_coeff"
+
         if self.cuda_graph_scope is not None:
             assert self.cuda_graph_modules in (
                 "full",
@@ -3981,15 +4112,83 @@ class TransformerConfig(ModelParallelConfig):
                 'flex',
             ], 'overlap_moe_expert_parallel_comm is supported with alltoall/flex token dispatcher'
 
-            assert (
-                self.recompute_granularity != 'full'
-            ), 'disable full recomputation when enabling overlap_moe_expert_parallel_comm'
-            assert (
-                self.recompute_method is None
-            ), 'disable recomputation method when enabling overlap_moe_expert_parallel_comm'
-            assert (
-                self.recompute_num_layers is None
-            ), 'recompute_num_layers must be None when enabling overlap_moe_expert_parallel_comm'
+            if self.recompute_granularity == "full":
+                # Full recompute runs per layer segment; recompute_method /
+                # recompute_num_layers keep their non-overlap meaning and are validated
+                # by the shared checks in __post_init__. See
+                # megatron/core/models/common/model_chunk_schedule_plan.py.
+                # Segment replay is currently supported only in eager execution,
+                # including when the generic full-iteration graph checks allow recompute.
+                assert self.cuda_graph_impl == "none", (
+                    "overlap_moe_expert_parallel_comm full recompute is not yet supported "
+                    "together with CUDA graphs (cuda_graph_impl != \"none\")."
+                )
+                # The replay is hand-rolled rather than a checkpoint primitive, so it
+                # cannot shard the retained segment input across TP ranks.
+                assert not self.distribute_saved_activations, (
+                    "overlap_moe_expert_parallel_comm full recompute does not support "
+                    "distribute_saved_activations: the segment replay does not go through "
+                    "a checkpoint primitive, so the retained input is not sharded."
+                )
+                # MTP is segmented under both methods here, so unlike
+                # MultiTokenPredictionLayer._checkpointed_forward there is no 'block'
+                # exemption. The 'uniform' restriction below is config parity with that
+                # function's own assert, not a constraint of this schedule - multi-layer
+                # decoder segments hand the MTP bridge over correctly.
+                if self.mtp_num_layers and self.recompute_method == "uniform":
+                    assert (
+                        self.recompute_num_layers == 1
+                    ), "recompute_num_layers must be 1 for MTP recompute"
+                # With dropout the forward RNG stream is interleaved across microbatches
+                # in the 1F1B schedule and cannot yet be faithfully replayed.
+                assert self.attention_dropout == 0.0 and self.hidden_dropout == 0.0, (
+                    "overlap_moe_expert_parallel_comm full recompute currently requires "
+                    "attention_dropout==0 and hidden_dropout==0 (RNG replay across the "
+                    "interleaved 1F1B schedule is not yet supported for nonzero dropout)"
+                )
+                # Delayed-scaling FP8 accumulates amax into a persistent amax_history
+                # across microbatches. Both the initial no_grad forward and the
+                # backward-time recompute run under the delayed FP8 autocast, and this
+                # path does not enter TE's activation-recompute (recompute_phase)
+                # machinery that te_checkpoint uses to snapshot and restore FP8 metadata,
+                # so the recompute would update amax_history a second time and silently
+                # diverge. Current-scaling recipes (tensorwise / mxfp8 / blockwise) derive
+                # scales from the current tensor each pass, so the replayed forward
+                # re-derives identical scales; only delayed scaling is rejected here.
+                # self.fp8 is checked because fp8_recipe defaults to 'delayed' in BF16
+                # configs, where no FP8 autocast runs at all.
+                assert not (self.fp8 and self.fp8_recipe == Fp8Recipe.delayed), (
+                    "overlap_moe_expert_parallel_comm full recompute is not yet supported "
+                    "with delayed-scaling FP8 (fp8_recipe=\"delayed\"): the backward-time "
+                    "recompute would double-update the persistent amax_history. Use a "
+                    "current-scaling recipe (tensorwise / mxfp8 / blockwise) instead."
+                )
+                # The offload manager pairs a forward-pushed group with the backward that
+                # pops it. Under full recompute the initial forward saves nothing and the
+                # replay pushes its groups immediately before its own backward, which does
+                # not fit that pairing.
+                assert not self.fine_grained_activation_offloading, (
+                    "overlap_moe_expert_parallel_comm full recompute is not yet supported "
+                    "together with fine_grained_activation_offloading."
+                )
+                # Paged stash numbers layers and indexes its captured pipeline schedule from a
+                # process-wide manager (PagedStashManager.current_layer /
+                # current_schedule_index), advanced on every group commit. Under full recompute
+                # the initial no_grad forward and the segment replay both commit the same layer
+                # while only the replay registers a backward, and the segment snapshots do not
+                # cover that manager, so its bookkeeping no longer matches the execution order.
+                assert not self.moe_paged_stash, (
+                    "overlap_moe_expert_parallel_comm full recompute is not yet supported "
+                    "together with moe_paged_stash."
+                )
+            else:
+                assert self.recompute_method is None, (
+                    "disable recomputation method when enabling " "overlap_moe_expert_parallel_comm"
+                )
+                assert self.recompute_num_layers is None, (
+                    "recompute_num_layers must be None when enabling "
+                    "overlap_moe_expert_parallel_comm"
+                )
             assert (
                 "moe" not in self.recompute_modules
             ), 'disable moe in recompute_modules when enabling overlap_moe_expert_parallel_comm'

@@ -20,6 +20,7 @@ import math
 import os
 import sys
 from collections import defaultdict
+from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -44,7 +45,7 @@ from megatron.core import mpu, tensor_parallel
 
 # First-party.
 from megatron.core._rank_utils import safe_get_rank
-from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper, wrap_data_iterator
+from megatron.core.datasets.data_schedule import wrap_data_iterator
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -99,7 +100,7 @@ from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
     destroy_model_parallel,
     get_context_parallel_group,
-    get_hybrid_data_context_parallel_groups,
+    get_dynamic_data_context_parallel_groups,
     update_pg_timeout,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -165,6 +166,7 @@ from megatron.training.initialize import (
     write_args_to_tensorboard,
 )
 from megatron.training.kernel_warmup import warmup_training_kernels
+from megatron.training.logging.dsa_flops import dsa_indexer_flops, dsa_layer_flops
 
 # Retain the training.py import path used by existing multimodal callers.
 from megatron.training.logging.packed_sequence_stats import (
@@ -212,6 +214,8 @@ from .utils import (
     to_empty_if_meta_device,
     update_use_dist_ckpt,
 )
+
+_TensorMetricObserverCallback = Callable[..., None]
 
 # Optional dependencies. Each is guarded so the module imports cleanly when the
 # dependency is unavailable; the ``has_*``/``HAVE_*`` flags gate later usage.
@@ -998,7 +1002,7 @@ def num_floating_point_operations(
 
     def hybrid_flops(total_tokens, seqlen_squared_sum, hidden_size,
                      num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
-                     gdp_num_householder,
+                     num_dsa_layers, gdp_num_householder,
                      num_gdn_layers=0,
                      mamba_state_dim=128, mamba_head_dim=64,
                      mamba_num_groups=8, mamba_num_heads=128,
@@ -1012,7 +1016,7 @@ def num_floating_point_operations(
                      gdn_num_qk_heads=16, gdn_num_v_heads=32,
                      gdn_conv_kernel_dim=4, gdn_use_gdn2=False,
                      vocab_size=256000, mtp_num_layers=0):
-        """Calculate total FLOPs for the hybrid model."""
+        """Calculate total training FLOPs for the hybrid model, including DSA."""
         mamba_flops = (
             gated_delta_product_layer_flops(total_tokens, hidden_size,
                                             gdp_num_householder,
@@ -1023,7 +1027,26 @@ def num_floating_point_operations(
                                    mamba_state_dim, mamba_head_dim,
                                    mamba_num_groups, mamba_num_heads)
         )
+        dsa_attention_flops = (
+            dsa_layer_flops(
+                total_tokens=total_tokens,
+                seqlen_squared_sum=seqlen_squared_sum,
+                hidden_size=hidden_size,
+                num_attention_heads=num_attn_heads,
+                q_lora_rank=args.q_lora_rank,
+                kv_lora_rank=args.kv_lora_rank,
+                qk_head_dim=args.qk_head_dim,
+                qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
+                v_head_dim=args.v_head_dim,
+                dsa_indexer_topk=args.dsa_indexer_topk,
+                dsa_indexer_kpool=getattr(args, "dsa_indexer_kpool", 1),
+                dsa_indexer_kpool_always_select_tail=getattr(
+                    args, "dsa_indexer_kpool_always_select_tail", True
+                ),
+            ) if num_dsa_layers else 0
+        )
         flops_fwd = (
+                num_dsa_layers * dsa_attention_flops +
                 num_attn_layers * attn_layer_flops(total_tokens, seqlen_squared_sum,
                                                    hidden_size, num_attn_heads, gqa,
                                                    gqa_groups, kv_channels) +
@@ -1039,7 +1062,26 @@ def num_floating_point_operations(
                                                   gdn_conv_kernel_dim, gdn_use_gdn2) +
                 (2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
         )
-        return flops_fwd * 3
+        # The indexer has its own loss-dependent backward cost.
+        indexer_flops = (
+            dsa_indexer_flops(
+                total_tokens=total_tokens,
+                seqlen_squared_sum=seqlen_squared_sum,
+                hidden_size=hidden_size,
+                q_lora_rank=args.q_lora_rank,
+                dsa_indexer_n_heads=args.dsa_indexer_n_heads,
+                dsa_indexer_head_dim=args.dsa_indexer_head_dim,
+                dsa_indexer_topk=args.dsa_indexer_topk,
+                num_dsa_layers=num_dsa_layers,
+                dsa_indexer_loss_coeff=args.dsa_indexer_loss_coeff,
+                dsa_indexer_use_sparse_loss=getattr(args, "dsa_indexer_use_sparse_loss", False),
+                dsa_indexer_skip_topk_offset=args.dsa_indexer_skip_topk_offset,
+                dsa_indexer_topk_freq=args.dsa_indexer_topk_freq,
+                hybrid_layer_pattern=args.hybrid_layer_pattern,
+                dsa_indexer_kpool=getattr(args, "dsa_indexer_kpool", 1),
+            ) if num_dsa_layers else 0
+        )
+        return flops_fwd * 3 + indexer_flops
 
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
@@ -1113,6 +1155,11 @@ def num_floating_point_operations(
         # causal mask of packed attention.
         if args.multi_latent_attention:
             assert not args.group_query_attention
+        if args.experimental_attention_variant == "dsa":
+            # DSA attention and its indexer are counted separately below.
+            standard_self_attn_term = 0
+            standard_self_attn_core_term = 0
+        elif args.multi_latent_attention:
             '''
             Basic arithmetic
             let B is batch size, s is seq_len, h is embedding dim,
@@ -1346,6 +1393,45 @@ def num_floating_point_operations(
             # ragged ``sum(L_i^2)`` and so undercounts the BSHD figure correctly.
             + seqlen_squared_sum_in_batch * self_attn_core_term
         )
+        if args.experimental_attention_variant == "dsa":
+            total_floating_point_operations += (
+                num_layers
+                * dsa_layer_flops(
+                    total_tokens=total_real_tokens_in_batch,
+                    seqlen_squared_sum=seqlen_squared_sum_in_batch,
+                    hidden_size=args.hidden_size,
+                    num_attention_heads=args.num_attention_heads,
+                    q_lora_rank=args.q_lora_rank,
+                    kv_lora_rank=args.kv_lora_rank,
+                    qk_head_dim=args.qk_head_dim,
+                    qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
+                    v_head_dim=args.v_head_dim,
+                    dsa_indexer_topk=args.dsa_indexer_topk,
+                    dsa_indexer_kpool=getattr(args, "dsa_indexer_kpool", 1),
+                    dsa_indexer_kpool_always_select_tail=getattr(
+                        args, "dsa_indexer_kpool_always_select_tail", True
+                    ),
+                )
+                * forward_backward_expansion_factor
+            )
+            # Pass all DSA layers; the helper counts only layers that compute an index.
+            total_floating_point_operations += dsa_indexer_flops(
+                total_tokens=total_real_tokens_in_batch,
+                seqlen_squared_sum=seqlen_squared_sum_in_batch,
+                hidden_size=args.hidden_size,
+                q_lora_rank=args.q_lora_rank,
+                dsa_indexer_n_heads=args.dsa_indexer_n_heads,
+                dsa_indexer_head_dim=args.dsa_indexer_head_dim,
+                dsa_indexer_topk=args.dsa_indexer_topk,
+                num_dsa_layers=num_layers,
+                dsa_indexer_loss_coeff=args.dsa_indexer_loss_coeff,
+                dsa_indexer_use_sparse_loss=getattr(args, "dsa_indexer_use_sparse_loss", False),
+                dsa_indexer_skip_topk_offset=args.dsa_indexer_skip_topk_offset,
+                dsa_indexer_topk_freq=args.dsa_indexer_topk_freq,
+                mtp_num_layers=mtp_num_layers,
+                mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
+                dsa_indexer_kpool=getattr(args, "dsa_indexer_kpool", 1),
+            )
         return total_floating_point_operations
 
     def _uses_gated_delta_product_spec(args):
@@ -1375,8 +1461,11 @@ def num_floating_point_operations(
             Symbols,
             get_hybrid_layer_counts,
         )
-        num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers = (
-            itemgetter(Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)(
+        num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers, num_dsa_layers = (
+            itemgetter(
+                Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE,
+                Symbols.DS_ATTENTION,
+            )(
                 get_hybrid_layer_counts(args.hybrid_layer_pattern)
             )
         )
@@ -1393,6 +1482,7 @@ def num_floating_point_operations(
             num_mamba_layers=num_mamba_layers,
             num_mlp_layers=num_mlp_layers,
             num_moe_layers=num_moe_layers,
+            num_dsa_layers=num_dsa_layers,
             num_gdn_layers=num_gdn_layers,
             mamba_state_dim=args.mamba_state_dim,
             mamba_head_dim=args.mamba_head_dim,
@@ -1535,17 +1625,6 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
-def wrap_hybrid_cp_data_iterator(train_data_iterator, config):
-    """Wrap the training data iterator for hybrid context parallelism.
-
-    The rerun state machine asserts that every training data iterator is a
-    RerunDataIterator; a raw iter() around HybridCPDataLoaderWrapper would
-    strip the wrapping applied at dataloader build time and fail that assert
-    on the first train step.
-    """
-    return RerunDataIterator(iter(HybridCPDataLoaderWrapper(train_data_iterator, config)))
-
-
 def _get_train_full_dataset_sample_count(args, dataset_provider):
     """Measure the training horizon without restoring a temporary dataloader.
 
@@ -1599,6 +1678,7 @@ def pretrain(
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
     skip_model_parallel_init=False,
     callbacks: list[Callback] | CallbackManager | None = None,
+    tensor_metric_observer: _TensorMetricObserverCallback | None = None,
     *,
     build_tokenizer: bool = True,
 ):
@@ -1643,6 +1723,11 @@ def pretrain(
             torch.distributed.init_process_group
         inprocess_call_wrapper: an optional instance of inprocess.CallWrapper,
             it is automatically injected when in-process restart is in use
+        tensor_metric_observer: Optional callback invoked immediately before each optimizer step.
+            Observers exposing `observe_forward_backward` also receive a context around the
+            forward-backward execution. The callback runs on every rank and owns tensor selection,
+            metric execution, and sinks. It overrides any observer selected by
+            `cfg_container.logger.tensor_metrics`.
         build_tokenizer: whether startup builds the shared tokenizer. Disable for
             workloads that provide their own tokenization, such as heterogeneous MiMo.
     """
@@ -1691,6 +1776,11 @@ def pretrain(
     args = get_args()
     train_state = get_train_state()
     timers = get_timers()
+
+    if tensor_metric_observer is None and cfg_container.logger.tensor_metrics:
+        from .tensor_metrics.observer import build_tensor_metric_observer
+
+        tensor_metric_observer = build_tensor_metric_observer(cfg_container.logger.tensor_metrics)
 
     # OTel span setup (_start_otel_job_spans) is deferred until after
     # kernel warmup below, where program_start/main_entry/pretrain_entry
@@ -2136,6 +2226,7 @@ def pretrain(
                     p2p_communicator=p2p_communicator,
                     pg_collection=pg_collection,
                     callback_manager=callback_manager,
+                    tensor_metric_observer=tensor_metric_observer,
                 )
             except Exception:
                 # OTel: an uncaught training exception (a real hardware/CUDA/NCCL
@@ -3118,6 +3209,8 @@ def setup_model_and_optimizer(
     if args.ckpt_convert_format is not None:
         load_ckpt_format = args.ckpt_format
         args.ckpt_format = args.ckpt_convert_format
+        if args.ckpt_format != "torch_dist":
+            args.verify_integrity = False
         args.save = os.path.join(args.ckpt_convert_save, args.ckpt_convert_format)
         update_use_dist_ckpt(args)
 
@@ -3143,7 +3236,7 @@ def dummy_train_step(data_iterator):
     args = get_args()
     tp_rank = mpu.get_tensor_model_parallel_rank()
     has_cu_seqlens = getattr(args, 'sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
-    is_hybrid_cp = args.hybrid_context_parallel
+    dynamic_cp = args.dynamic_context_parallel
 
     BATCH_KEYS = [
         "tokens", "labels", "loss_mask", "position_ids", "attention_mask",
@@ -3166,7 +3259,7 @@ def dummy_train_step(data_iterator):
                 broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
                 broadcast_group=mpu.get_tensor_model_parallel_group(),
                 has_cu_seqlens=has_cu_seqlens,
-                is_hybrid_cp=is_hybrid_cp,
+                dynamic_cp=dynamic_cp,
                 create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
                 cp_size=args.context_parallel_size,
                 tp_rank=tp_rank,
@@ -3179,9 +3272,9 @@ def dummy_train_step(data_iterator):
             )
             batch = get_batch_on_this_cp_rank(
                 batch,
-                is_hybrid_cp=is_hybrid_cp,
+                dynamic_cp=dynamic_cp,
                 cp_group=get_context_parallel_group(),
-                hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
+                dynamic_cp_group_func=get_dynamic_data_context_parallel_groups,
             )
 
 
@@ -3240,13 +3333,46 @@ def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
     return samples_seen_in_iteration
 
 
-def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
+def _get_model_pg_collection(
+    model_chunk,
+) -> ProcessGroupCollection | MultiModuleProcessGroupCollection:
+    """Return a model's process groups, falling back to the MPU compatibility collection."""
+    while not hasattr(model_chunk, "pg_collection"):
+        model_chunk = getattr(model_chunk, "module", None)
+        if model_chunk is None:
+            return ProcessGroupCollection.use_mpu_process_groups()
+
+    pg_collection = model_chunk.pg_collection
+    if pg_collection is None:
+        return ProcessGroupCollection.use_mpu_process_groups()
+    return pg_collection
+
+
+def train_step(
+    forward_step_func,
+    data_iterator,
+    model,
+    optimizer,
+    opt_param_scheduler,
+    config,
+    forward_backward_func,
+    iteration=None,
+    pg_collection: Optional[
+        ProcessGroupCollection | MultiModuleProcessGroupCollection
+    ] = None,
+    p2p_communicator: Optional[P2PCommunicator] = None,
+    tensor_metric_observer: _TensorMetricObserverCallback | None = None,
+):
     """Single training step.
 
     pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
         preserves the default behavior. Reductions source per-rank groups from the model.
     p2p_communicator: optional communicator forwarded to the schedule for cross-grid P2P; None
         preserves the default behavior.
+    tensor_metric_observer: optional callback invoked after backward and immediately before the
+        optimizer step. The callback sees finalized but not necessarily unscaled gradients.
+        Observers exposing `observe_forward_backward` also receive a context around the
+        forward-backward execution for short-lived tensors.
     """
     cfg = get_run_config()
     args = get_args()
@@ -3260,6 +3386,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         _otel_step_tracer = get_telemetry().tracer
 
     rerun_state_machine = get_rerun_state_machine()
+    packed_data_iterator = None
+    has_wrapped_data_iterator = False
+    scheduled_num_microbatches = get_num_microbatches()
+    rerun_data_iterator = data_iterator
     save_params_in_this_iteration = (args.save_params_interval is not None and
                                      (iteration + 1) % args.save_params_interval == 0)
     save_activations_in_this_iteration = (args.save_activations_interval is not None and
@@ -3270,7 +3400,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
                                      (iteration + 1) % args.save_dgrads_interval == 0)
-    while rerun_state_machine.should_run_forward_backward(data_iterator):
+    while rerun_state_machine.should_run_forward_backward(rerun_data_iterator):
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -3325,18 +3455,28 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     optim_instance._copy_main_params_to_param_buffer()
 
         if getattr(config, "sequence_packing_scheduler", None) is not None:
-            (
-                data_iterator,
-                scheduled_num_microbatches,
-                total_real_tokens_in_batch,
-                seqlen_squared_sum_in_batch,
-            ) = wrap_data_iterator(data_iterator, config, get_num_microbatches())
-            set_seqlen_stats_in_iteration(
-                total_real_tokens_in_batch,
-                seqlen_squared_sum_in_batch,
-            )
+            if not has_wrapped_data_iterator:
+                (
+                    packed_data_iterator,
+                    scheduled_num_microbatches,
+                    total_real_tokens_in_batch,
+                    seqlen_squared_sum_in_batch,
+                ) = wrap_data_iterator(
+                    data_iterator,
+                    config,
+                    get_num_microbatches(),
+                    pg_collection=get_attr_wrapped_model(model[0], "pg_collection"),
+                )
+                set_seqlen_stats_in_iteration(
+                    total_real_tokens_in_batch,
+                    seqlen_squared_sum_in_batch,
+                )
+                has_wrapped_data_iterator = True
+                rerun_data_iterator = packed_data_iterator
+            forward_backward_data_iterator = packed_data_iterator
         else:
             scheduled_num_microbatches = get_num_microbatches()
+            forward_backward_data_iterator = data_iterator
 
         # Forward pass.
         if save_activations_in_this_iteration:
@@ -3350,10 +3490,21 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             span_cm("megatron.train.iteration.forward_backward", tracer=_otel_step_tracer, num_microbatches=scheduled_num_microbatches)
             if _otel_sg_enabled('forward_backward') and _otel_step_tracer is not None else nullcontext()
         )
-        with grad_context, _fb_cm:
+        tensor_metric_context = nullcontext()
+        observe_forward_backward = getattr(
+            tensor_metric_observer, "observe_forward_backward", None
+        )
+        if observe_forward_backward is not None:
+            metric_pg_collection = _get_model_pg_collection(model[0])
+            tensor_metric_context = observe_forward_backward(
+                model=model,
+                iteration=iteration,
+                pg_collection=metric_pg_collection,
+            )
+        with grad_context, tensor_metric_context, _fb_cm:
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step_func,
-                data_iterator=data_iterator,
+                data_iterator=forward_backward_data_iterator,
                 model=model,
                 num_microbatches=scheduled_num_microbatches,
                 seq_length=args.seq_length,
@@ -3404,7 +3555,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
-        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0, None
+        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0, None, scheduled_num_microbatches
 
     # Empty unused memory.
     if cfg.train.empty_unused_memory_level >= 1:
@@ -3421,6 +3572,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     samples_seen_in_iteration = _get_samples_seen_in_iteration(
         losses_reduced, args, model_pg_collection
     )
+
+    if tensor_metric_observer is not None:
+        metric_pg_collection = _get_model_pg_collection(model[0])
+        tensor_metric_observer(
+            model=model,
+            optimizer=optimizer,
+            iteration=iteration,
+            pg_collection=metric_pg_collection,
+        )
 
     # Update parameters.
 
@@ -3449,9 +3609,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         _save_state_dict(attr_name="data", label="params")
 
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
-    pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
-    if pg_collection is None:
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    pg_collection = _get_model_pg_collection(model[0])
     for _required in ("mp", "pp", "dp_cp"):
         assert getattr(pg_collection, _required, None) is not None, (
             f"model pg_collection used by train_step must define {_required}"
@@ -3552,6 +3710,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             num_zeros_in_grad,
             log_max_attention_logit,
             samples_seen_in_iteration,
+            scheduled_num_microbatches,
         )
     return (
         {},
@@ -3563,6 +3722,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         num_zeros_in_grad,
         log_max_attention_logit,
         samples_seen_in_iteration,
+        scheduled_num_microbatches,
     )
 
 
@@ -3610,6 +3770,7 @@ def training_log(
     model=None,
     callback_manager: CallbackManager | None = None,
     packed_sequence_stats: Optional[Dict[str, float]] = None,
+    num_microbatches: int | None = None,
 ):
     """Log training information such as losses, timing, ...."""
     callback_manager = normalize_callbacks(callback_manager)
@@ -3663,6 +3824,7 @@ def training_log(
             'dataloader-next',
             'batch-generator',
             'forward-backward',
+            'tensor-metrics',
             'layernorm-grads-all-reduce',
             'embedding-grads-all-reduce',
             'all-grads-sync',
@@ -3781,7 +3943,7 @@ def training_log(
     # Log MoE metrics.
     moe_log_string = ""
     if args.num_experts is not None:
-        moe_loss_scale = 1 / get_num_microbatches()
+        moe_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         track_names = []
         if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
@@ -3853,7 +4015,7 @@ def training_log(
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
-        mtp_loss_scale = 1 / get_num_microbatches()
+        mtp_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
@@ -4285,13 +4447,6 @@ def save_checkpoint_and_time(
                 report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_gtp_remat_group)
         num_checkpoints_memory_reported += 1
 
-        if args.fp8:
-            # Run garbage collection after checkpoint saving to free memory from
-            # dequantized bf16 tensors that were temporarily created during fp8
-            # model checkpoint saving.
-            with _otel_managed_span('checkpoint', 'megatron.checkpoint.gc_collect', is_goodput_span=True):
-                gc.collect()
-
         # timers.log reports min & max across ranks -> a collective. Sitting right
         # after the per-rank-imbalanced save (and outside the save spans), it's a
         # prime spot for the fast ranks to serialize waiting for the slowest saver.
@@ -4566,6 +4721,7 @@ def train(
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
     callback_manager: CallbackManager | None = None,
+    tensor_metric_observer: _TensorMetricObserverCallback | None = None,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
 
@@ -4573,6 +4729,7 @@ def train(
         preserves the default behavior.
     pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
         preserves the default behavior.
+    tensor_metric_observer: optional callback forwarded to each training step.
     """
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
@@ -4699,9 +4856,6 @@ def train(
 
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
-
-    if args.hybrid_context_parallel:
-        train_data_iterator = wrap_hybrid_cp_data_iterator(train_data_iterator, config)
 
     if cfg.profiling.run_workload_inspector_server:
         try:
@@ -5131,6 +5285,7 @@ def train(
             num_zeros_in_grad = 0
             max_attention_logit = None
             samples_seen_in_iteration = None
+            scheduled_num_microbatches = get_num_microbatches()
             _step_span = None
         else:
 
@@ -5151,7 +5306,16 @@ def train(
             )
             # OTel: optional per-step span wrapping the real train_step.
             with _first_iter_span_cm, _otel_managed_span('step', 'megatron.train.iteration', is_goodput_span=True, **{'megatron.iteration': iteration}) as _step_span:
-                ft_integration.on_training_step_start()
+                # Iterations that run the periodic router tensor-metrics reduction are timed
+                # under a separate, generous section so their (potentially minutes-long) cost is
+                # not charged to the tight "step" hang-detection timeout.
+                ft_integration.on_training_step_start(
+                    is_tensor_metrics_iteration=(
+                        tensor_metric_observer is not None
+                        and hasattr(tensor_metric_observer, "has_due_metrics")
+                        and tensor_metric_observer.has_due_metrics(iteration)
+                    )
+                )
                 (
                     loss_dict,
                     skipped_iter,
@@ -5162,10 +5326,12 @@ def train(
                     num_zeros_in_grad,
                     max_attention_logit,
                     samples_seen_in_iteration,
+                    scheduled_num_microbatches,
                 ) = train_step(
                     forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
                     pg_collection=pg_collection,
                     p2p_communicator=p2p_communicator,
+                    tensor_metric_observer=tensor_metric_observer,
                 )
                 ft_integration.on_training_step_end()
                 if _maybe_raise_workload_exception is not None and iteration != start_iteration:
@@ -5360,6 +5526,7 @@ def train(
                     model=model,
                     callback_manager=callback_manager,
                     packed_sequence_stats=packed_sequence_stats,
+                    num_microbatches=scheduled_num_microbatches,
                 )
             # OTel: close the iteration-report super-span (parents params_norm + log;
             # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).
@@ -5659,9 +5826,17 @@ def evaluate(
             if getattr(config, "sequence_packing_scheduler", None) is not None:
                 try:
                     (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
-                        wrap_data_iterator(data_iterator, config, eval_num_microbatches)
+                        wrap_data_iterator(
+                            data_iterator,
+                            config,
+                            eval_num_microbatches,
+                            pg_collection=eval_pgc,
+                        )
                     )
                 except StopIteration:
+                    # A finite validation iterator can end between scheduled global batches.
+                    # No eval step has started yet, so only restore the timers disabled above.
+                    config.timers = get_timers()
                     break
             else:
                 packed_data_iterator = data_iterator
