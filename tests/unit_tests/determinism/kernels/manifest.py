@@ -128,10 +128,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="paged_stash_marker_propagation",
         sources=("megatron/core/extensions/transformer_engine.py",),
-        tests=(K + "test_fused_activations.py", R + 'test_activation_replay.py'),
+        tests=(
+            K + "test_fused_activations.py",
+            R + 'test_activation_replay.py',
+            K + "test_te_wrappers.py",
+        ),
         kind="dispatch",
         notes="Propagates TE's grouped-tensor marker across fused-activation views and casts; "
-        "the marked SwiGLU and QuickGeGLU replay test covers values and gradients.",
+        "the marked SwiGLU and QuickGeGLU replay test covers values and gradients. "
+        "Direct marker calls replay values and gradients in test_te_wrappers.py.",
     ),
     KernelEntry(
         name="fused_bias_gelu",
