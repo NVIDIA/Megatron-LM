@@ -3828,6 +3828,10 @@ def _add_logits_distillation_args(parser):
     group.add_argument('--logits-save-dtype', type=str, default='fp16',
                        choices=['fp16', 'bf16', 'fp32'],
                        help='Dtype for on-disk top-K log-probabilities.')
+    group.add_argument('--logits-save-encoding-metric', type=str, default='kl',
+                       choices=['kl', 'tail'],
+                       help='Choose the FP16 cache encoding per token by minimum round-trip '
+                            'coarse KL (default) or absolute tail probability error.')
     # -- Student loading --
     group.add_argument('--logits-load-dir', type=str, default=None,
                        help='Directory to load logits.')

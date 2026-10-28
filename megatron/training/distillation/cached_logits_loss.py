@@ -1,11 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """
-Offline knowledge distillation loss using cached teacher top-K log-probabilities.
+Offline knowledge distillation using cached teacher top-K distributions.
 
-This module provides a loss function that loads pre-computed teacher top-K
-log-probabilities from disk (as saved by ``LogitsSaverHooks`` in ``logits_saver.py``)
-and computes forward KL divergence against live student logits.
+Version-3 caches store reference logits and an explicit tail; version 4 selects
+an encoding per token. Both use a stable coarse forward KL against live student
+logits. Versions 1 and 2 retain their original top-K log-probability representation
+and loss semantics.
 
 Design highlights
 -----------------
@@ -89,6 +90,7 @@ from megatron.core import parallel_state
 from megatron.core._rank_utils import safe_get_rank
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.training import get_args
+from megatron.training.distillation.reference_logits import reference_logits_kl_div
 from megatron.training.distillation.utils import (
     BATCHED_TAR_RE,
     CACHED_LOGITS_LOGPROB_SENTINEL,
@@ -261,6 +263,9 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
                 f"No batched tar shards (or unreadable metadata) found in '{logprobs_dir}'."
             )
         self._meta = meta
+        self.format_version = meta.get("saver", {}).get("format_version", 1)
+        if self.format_version not in (2, 3, 4):
+            raise ValueError(f"Unsupported cached-logits format_version={self.format_version}")
         self._plan = self._build_plan(meta, dp_size=dp_size)
 
         # Whether this load run needs document-aware CP reslicing -- mirrors
@@ -419,7 +424,9 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
 
     def _decode_entry(self, entry: V2LogprobsTarEntry) -> _StreamCacheEntry:
         """Decode one tar payload into a monolithic ``(values, indices)`` pair."""
-        values, indices, cu_seqlens_padded = decode_logprobs_payload(entry.data)
+        values, indices, cu_seqlens_padded = decode_logprobs_payload(
+            entry.data, expected_format_version=self.format_version
+        )
         span = entry.end_sample - entry.start_sample
         if span != self._plan.gbs_save:
             raise RuntimeError(
@@ -897,7 +904,7 @@ class LegacyTeacherTarDataset(TeacherTarDataset):
         # decode_logprobs_payload dispatches on format_version; for the v1
         # tars this dataset handles, it returns lists and no cu_seqlens
         # (v1 never carries it -- see the class docstring).
-        values_list, indices_list, _ = decode_logprobs_payload(entry.data)
+        values_list, indices_list, _ = decode_logprobs_payload(entry.data, expected_format_version=1)
         return entry.iteration, values_list, indices_list
 
     def _discover_shards(self, already_processed: set, dp_save: int) -> List[str]:
@@ -1043,6 +1050,8 @@ def make_teacher_tar_dataset(
     """
     meta = peek_first_logprobs_metadata(logprobs_dir)
     fmt = (meta or {}).get("saver", {}).get("format_version", 1)
+    if fmt not in (1, 2, 3, 4):
+        raise ValueError(f"Unsupported cached-logits format_version={fmt}")
     cls: type = TeacherTarDataset if fmt >= 2 else LegacyTeacherTarDataset
     return cls(
         logprobs_dir,
@@ -1072,8 +1081,23 @@ def topk_kl_div(
     tp_rank: int,
     tp_group: dist.ProcessGroup,
     add_ghost_token: bool = False,
+    cache_format_version: int = 2,
 ) -> torch.Tensor:
-    """Compute the KL divergence between student and teacher's top-K log-probs."""
+    """Compute per-token KL with format-specific normalization and tail handling."""
+    if cache_format_version in (3, 4):
+        if not add_ghost_token:
+            raise ValueError("Reference-logits caches require the aggregated tail category.")
+        return reference_logits_kl_div(
+            student_logits,
+            teacher_topk_logprobs,
+            teacher_topk_indices,
+            tp_size,
+            tp_rank,
+            tp_group,
+            cache_format_version=cache_format_version,
+        ).transpose(0, 1).contiguous()
+    if cache_format_version not in (1, 2):
+        raise ValueError(f"Unsupported cached-logits loss format_version={cache_format_version}")
     student_logits = student_logits.float()
     teacher_topk_logprobs = teacher_topk_logprobs.float()
 
@@ -1214,6 +1238,12 @@ class CachedLogitsKDLoss:
         # ---- current iteration's teacher data (pinned CPU tensors) ----
         self._current_values: Optional[List[torch.Tensor]] = None
         self._current_indices: Optional[List[torch.Tensor]] = None
+        self._cache_format_version = 1
+
+    @property
+    def loss_is_tp_replicated(self) -> bool:
+        """Whether each TP rank already reports the complete coarse loss."""
+        return self._cache_format_version in (3, 4)
 
     def _init_dataloader(self, start_sample: int) -> None:
         """Create the DataLoader starting from global sample *start_sample*."""
@@ -1242,6 +1272,7 @@ class CachedLogitsKDLoss:
             msc_prefetch_depth=self._msc_prefetch_depth,
             ignore_hash=self._ignore_hash,
         )
+        self._cache_format_version = getattr(dataset, "format_version", 1)
         # Remote shard discovery uses a per-PP-stage collective, so keep the
         # iterable in the main training process (all last-PP ranks participate).
         loader = torch.utils.data.DataLoader(
@@ -1384,6 +1415,7 @@ class CachedLogitsKDLoss:
             self.tp_rank,
             self.tp_group,
             add_ghost_token=True,
+            cache_format_version=self._cache_format_version,
         )
 
 
@@ -1456,8 +1488,9 @@ class LossFuncCallable:
 
             loss_kd = self.kd_func(logits)
             loss_kd = self._mask_loss(loss_kd, loss_mask)
-            # Requires extra TP reduction
-            dist.all_reduce(loss_kd, group=parallel_state.get_tensor_model_parallel_group())
+            # Legacy loss returns shard-local terms; v3/v4 are already replicated.
+            if not getattr(self.kd_func, "loss_is_tp_replicated", False):
+                dist.all_reduce(loss_kd, group=parallel_state.get_tensor_model_parallel_group())
         except StopIteration as e:
             # Last-PP ranks all hit this; keep the failure loud but avoid a
             # full traceback storm across TP×DP×CP.
