@@ -820,7 +820,7 @@ class TestNVLSAllGatherVDispatcher:
                 not _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR
                 or not te_supports_batch_invariant_grouped_gemm()
             ):
-                pytest.skip("Requires TE grouped-tensor API, SM100, and cuBLASLt 13.5.1")
+                pytest.skip("Requires TE grouped-tensor API, SM100 or SM103, and cuBLASLt 13.5.1")
 
         torch.manual_seed(2028)
         torch.cuda.manual_seed(2028)

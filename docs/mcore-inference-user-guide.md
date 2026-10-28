@@ -156,8 +156,9 @@ workload rather than generalizing from any single comparison.
 > bf16 bindings: `uv pip install -e .[batch_invariant]`. Context parallelism and
 > attention dropout are not supported in either case. MXFP8 training uses
 > `batch_invariant_backend="te_native"`. Legacy TE GroupedLinear remains the
-> default. On SM100 with cuBLASLt 13.5.1, `moe_use_grouped_tensor=True` opts into
-> TE device-metadata grouped GEMM and its required 256-row expert padding.
+> default. On SM100 or SM103 with cuBLASLt 13.5.1,
+> `moe_use_grouped_tensor=True` opts into TE device-metadata grouped GEMM and
+> its required 256-row expert padding.
 > This requires a TE build exposing `GroupedLinear(use_grouped_tensor=...)`;
 > the old environment switch alone is not sufficient. Other GPU/library pairs
 > are rejected: this path requires a full workspace, so its forward invariance
@@ -1086,8 +1087,8 @@ is the opposite of the `MegatronLLM` constructor default.
   bitwise TE training-policy parity.
   It requires unfused permute/unpermute and excludes context parallelism and
   attention dropout. Device-metadata training GEMM is opt-in via
-  `moe_use_grouped_tensor=True`, restricted to SM100 with cuBLASLt 13.5.1
-  and a TE build exposing that constructor argument.
+  `moe_use_grouped_tensor=True`, restricted to SM100 or SM103 with cuBLASLt
+  13.5.1 and a TE build exposing that constructor argument.
 - **MXFP8 fused quantization supports squared-ReLU only.** SwiGLU uses separate
   BF16 activation and MXFP8 quantization kernels; it does not fall back to BF16 GEMM.
 - **Disaggregated handoff supports generated-token log-probs only.** Set

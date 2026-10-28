@@ -1668,6 +1668,11 @@ _TE_GROUPED_WORKSPACE_FN_ORIG = None
 _TE_NATIVE_ENV_ORIG: dict = {}
 
 
+# (SM capability, cuBLASLt version) pairs on which TE device-metadata grouped GEMM passed
+# test_device_metadata_batch_invariant_training. Add a pair only after that test passes on it.
+_TE_GROUPED_GEMM_VALIDATED_PAIRS = (((10, 0), 130501), ((10, 3), 130501))
+
+
 def te_supports_batch_invariant_grouped_gemm(device: int | None = None) -> bool:
     """Whether TE device-metadata GEMM has been validated on this GPU/library pair.
 
@@ -1676,9 +1681,8 @@ def te_supports_batch_invariant_grouped_gemm(device: int | None = None) -> bool:
     """
     import transformer_engine_torch as tex
 
-    return (
-        torch.cuda.get_device_capability(device) == (10, 0) and tex.get_cublasLt_version() == 130501
-    )
+    pair = (torch.cuda.get_device_capability(device), tex.get_cublasLt_version())
+    return pair in _TE_GROUPED_GEMM_VALIDATED_PAIRS
 
 
 @lru_cache(maxsize=None)
@@ -1686,8 +1690,8 @@ def _get_te_native_grouped_workspace(device: int, layout: str) -> torch.Tensor:
     """Keep TE's required full workspace only on the validated grouped-GEMM path."""
     if not te_supports_batch_invariant_grouped_gemm(device):
         raise RuntimeError(
-            "Batch-invariant TE device-metadata grouped GEMM requires SM100 and "
-            "cuBLASLt 13.5.1. Use moe_use_grouped_tensor=False on other versions."
+            "Batch-invariant TE device-metadata grouped GEMM requires SM100 or SM103 "
+            "and cuBLASLt 13.5.1. Use moe_use_grouped_tensor=False on other versions."
         )
     # Keep TN/NN/NT allocations separate: cuBLAS retains layout-specific metadata
     # in this workspace, and sharing it can corrupt forward/backward graph replay.
