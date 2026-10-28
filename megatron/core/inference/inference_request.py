@@ -1243,6 +1243,7 @@ class DynamicInferenceRequestRecord:
                 decoder_seq_length=old_request.decoder_seq_length,
                 image_embeddings=old_request.image_embeddings,
                 image_token_mask=old_request.image_token_mask,
+                deferred_image_embedding_count=old_request.deferred_image_embedding_count,
             )
         else:
             new_request = DynamicInferenceRequest(**common_kwargs)
@@ -1546,3 +1547,6 @@ class DynamicVLMInferenceRequest(DynamicInferenceRequest, VLMInferenceRequest):
     video_fps: Optional[List[float]] = None
     media_tokens_preexpanded: bool = False
     media_cache_key: Optional[str] = None
+    deferred_image_embedding_count: Optional[int] = None
+    """Embedding count of an image request admitted without encoding; the engine encodes it
+    together with the other waiting requests right before prefill and clears this afterwards."""
