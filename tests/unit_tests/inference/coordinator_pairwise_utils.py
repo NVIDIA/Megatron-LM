@@ -37,8 +37,10 @@ async def until(predicate, timeout=30):
     """Wait for an observed state, not for a presumed scheduling delay."""
 
     async def poll():
+        # Sleep briefly rather than spin: a busy loop holds the GIL and starves the
+        # coordinator thread, badly so under CI's coverage tracing.
         while not predicate():
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.001)
 
     await asyncio.wait_for(poll(), timeout)
 
