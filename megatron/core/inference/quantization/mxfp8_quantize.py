@@ -302,6 +302,81 @@ def mxfp8_quantize_rows(
     return out_data, out_scale.view(torch.float8_e8m0fnu)
 
 
+# Persistent grid for the routed-layout quantizer; each CTA strides over the live rows, so idle
+# CTAs cost nothing at decode. GB300, 65,536 live rows: 2048 CTAs x 8 warps 94 us (512 x 4: 196 us).
+_ROUTED_ROWS_CTAS = 2048
+
+
+@triton.jit
+def _mxfp8_quant_routed_rows_kernel(
+    src_ptr,  # [rows, K] bf16/fp16/fp32 input
+    out_ptr,  # [rows, padded_K] e4m3 output; columns >= K are zeroed
+    scale_ptr,  # [rows, padded_K // 32] e8m0 scales in linear layout; groups >= K // 32 are zeroed
+    n_rows_ptr,  # scalar int32 CUDA tensor: only rows [0, n_rows) are written
+    K,  # logical hidden size (multiple of 32)
+    padded_K,  # row stride of out_ptr (multiple of 128)
+    BLOCK_K: tl.constexpr,  # next_power_of_2(padded_K)
+    BLOCK_GROUPS: tl.constexpr,  # BLOCK_K // 32
+    NUM_PROGRAMS: tl.constexpr,  # persistent grid size
+):
+    """Quantize the live rows to MXFP8 in the row-major layout the TRT-LLM routed MoE reads."""
+    pid = tl.program_id(0)
+    n_rows = tl.load(n_rows_ptr)
+    padded_groups = padded_K // 32
+    offs = tl.arange(0, BLOCK_K)
+    load_mask = offs < K
+    store_mask = offs < padded_K
+    group_offs = tl.arange(0, BLOCK_GROUPS)
+    group_mask = group_offs < padded_groups
+    for row in tl.range(pid, n_rows, NUM_PROGRAMS):
+        row64 = tl.cast(row, tl.int64)
+        # Padding columns load as 0, so they quantize to 0 with a 0 scale exponent.
+        x = tl.load(src_ptr + row64 * K + offs, mask=load_mask, other=0.0).to(tl.float32)
+        out_fp8, scale_exp = _mxfp8_quantize_groups(x, BLOCK_GROUPS)
+        tl.store(out_ptr + row64 * padded_K + offs, out_fp8, mask=store_mask)
+        tl.store(scale_ptr + row64 * padded_groups + group_offs, scale_exp, mask=group_mask)
+
+
+def quantize_routed_mxfp8_input(
+    hidden_states: torch.Tensor, padded_hidden_size: int, valid_tokens: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize rows [0, valid_tokens) of `hidden_states` for the TRT-LLM routed MXFP8 MoE.
+
+    Returns row-major e4m3 data of shape [rows, padded_hidden_size] and uint8 e8m0 scales of
+    shape [rows, padded_hidden_size // 32] in the kernel's linear layout. Padding columns of the
+    live rows are zero; rows at or beyond valid_tokens are left uninitialized. Quantized values
+    are bitwise identical to `mxfp8_quantize`.
+    """
+    if not HAVE_TRITON:
+        raise RuntimeError("quantize_routed_mxfp8_input requires triton.")
+    rows, hidden_size = hidden_states.shape
+    assert hidden_size % MXFP8_BLOCK_SIZE == 0, f"hidden size {hidden_size} must be divisible by 32"
+    assert (
+        padded_hidden_size >= hidden_size and padded_hidden_size % 128 == 0
+    ), f"padded hidden size {padded_hidden_size} must be a multiple of 128, at least {hidden_size}"
+    assert hidden_states.is_contiguous() and valid_tokens.is_cuda and valid_tokens.numel() == 1
+    device = hidden_states.device
+    data = torch.empty(rows, padded_hidden_size, dtype=torch.float8_e4m3fn, device=device)
+    scale = torch.empty(
+        rows, padded_hidden_size // MXFP8_BLOCK_SIZE, dtype=torch.uint8, device=device
+    )
+    BLOCK_K = triton.next_power_of_2(padded_hidden_size)
+    num_programs = max(1, min(rows, _ROUTED_ROWS_CTAS))
+    _mxfp8_quant_routed_rows_kernel[(num_programs,)](
+        hidden_states,
+        data,
+        scale,
+        valid_tokens,
+        hidden_size,
+        padded_hidden_size,
+        BLOCK_K=BLOCK_K,
+        BLOCK_GROUPS=BLOCK_K // MXFP8_BLOCK_SIZE,
+        NUM_PROGRAMS=num_programs,
+        num_warps=8,
+    )
+    return data, scale
+
+
 def mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a 2D tensor to MXFP8 with fused scale swizzle.
 
