@@ -868,7 +868,9 @@ def delete_cuda_graphs():
     for runner in runners:
         assert isinstance(runner, _CudaGraphRunner)
 
-        for graph in (runner.fwd_graph, runner.bwd_graph):
+        # Some callers (e.g., test_cuda_graphs.py) delete graph attributes
+        # before the global teardown runs.
+        for graph in (getattr(runner, "fwd_graph", None), getattr(runner, "bwd_graph", None)):
             if graph is not None:
                 graph.reset()
                 release_capture_constants(graph)
