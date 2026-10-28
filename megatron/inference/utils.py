@@ -479,7 +479,9 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
 
 
 def get_dynamic_inference_engine(
-    model: MegatronModule | None = None, engine_class: type[DynamicInferenceEngine] | None = None
+    model: MegatronModule | None = None,
+    engine_class: type[DynamicInferenceEngine] | None = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> DynamicInferenceEngine:
     """Build a dynamic inference engine.
 
@@ -488,13 +490,15 @@ def get_dynamic_inference_engine(
         engine_class: Optional engine implementation override. When omitted,
             the core factory selects the implementation from the inference
             configuration.
+        pg_collection: Process groups to build and load the model on when ``model`` is
+            omitted, such as the groups that initialize_megatron() registered,
+            ``parallel_state.get_registered_process_groups()``. Omitting both is deprecated:
+            get_model_for_inference() then builds the groups from the global parallel state,
+            with a ProcessGroupFallbackWarning.
     """
     args = get_args()
     if model is None:
-        # The groups of the grid that initialize_megatron() registered.
-        model = get_model_for_inference(
-            pg_collection=parallel_state.get_registered_process_groups()
-        )
+        model = get_model_for_inference(pg_collection=pg_collection)
     tokenizer = build_tokenizer(args)
 
     inference_config = get_inference_config_from_model_and_args(model, args)
