@@ -36,13 +36,16 @@ class ExecutionOrder:
     def __init__(self, items: Iterable[ExecutionEvent] = ()) -> None:
         """Create an execution sequence, preserving repeated occurrences."""
         self._items: list[tuple[ref[nn.Module], Phase]] = []
+        self._unique_index: dict[tuple[ref[nn.Module], Phase], int | None] = {}
         self._position = 0
         for item in items:
             self.append(item)
 
     def append(self, item: ExecutionEvent) -> None:
         """Append an occurrence."""
-        self._items.append((ref(item.module), item.phase))
+        key = (ref(item.module), item.phase)
+        self._unique_index[key] = None if key in self._unique_index else len(self._items)
+        self._items.append(key)
 
     def __iter__(self) -> Iterator[ExecutionEvent]:
         """Iterate over occurrences in execution order."""
@@ -69,8 +72,21 @@ class ExecutionOrder:
             raise RuntimeError("A module in the FSDP execution order was destroyed.")
         return ExecutionEvent(module=module, phase=phase)
 
-    def advance(self) -> ExecutionEvent:
-        """Consume the next occurrence; the caller owns cursor resets."""
+    def advance(self, item: ExecutionEvent | None = None) -> ExecutionEvent:
+        """Consume the next occurrence or locate a supplied event.
+
+        Unique events select their position; repeated events must match the cursor.
+        """
+        if item is not None:
+            key = (ref(item.module), item.phase)
+            index = self._unique_index.get(key)
+            if index is None:
+                if not self._items or self._items[self._position % len(self._items)] != key:
+                    raise RuntimeError(
+                        "FSDP module calls diverged from the expected prefetch order."
+                    )
+                index = self._position % len(self._items)
+            self._position = index
         if self._position >= len(self._items):
             raise RuntimeError("Calls exceeded the execution order; reset its cursor first.")
         result = self[self._position]

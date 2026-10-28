@@ -49,8 +49,6 @@ class FsdpContext:
     execution_order: ExecutionOrder
     # Topology metadata must not keep modules alive after construction.
     _roots: WeakKeyDictionary[nn.Module, None]
-    # Forward/backward entry offsets for each root in the construction order.
-    _root_execution_offsets: WeakKeyDictionary[nn.Module, dict[Phase, int]]
     # Names are relative to each FSDP root and absent until finalization.
     _module_names: WeakKeyDictionary[nn.Module, str]
     # The optimizer runs on the current stream and must wait for reductions on
@@ -105,7 +103,6 @@ class FsdpContext:
         # Construction-only; empty after finalization.
         self._registered_modules: list[nn.Module] = []
         self._roots = WeakKeyDictionary()
-        self._root_execution_offsets = WeakKeyDictionary()
         self._module_names = WeakKeyDictionary()
         self.parameter_to_owner = parameter_to_owner
         self._is_finalized = False
@@ -159,7 +156,6 @@ class FsdpContext:
             if root in children:
                 continue
             self._roots[root] = None
-            self._root_execution_offsets[root] = {Phase.FORWARD: len(self.execution_order)}
             for name, module in root.named_modules():
                 if module not in registered_modules:
                     continue
@@ -167,7 +163,6 @@ class FsdpContext:
                 self.execution_order.append(ExecutionEvent(module=module, phase=Phase.FORWARD))
 
         for root in reversed(list(self._roots)):
-            self._root_execution_offsets[root][Phase.BACKWARD] = len(self.execution_order)
             _collect_backward_order(root, registered_modules, self.execution_order)
 
         self._registered_modules.clear()
@@ -178,15 +173,6 @@ class FsdpContext:
         """Return whether ``module`` is an outermost FSDP module in this context."""
         self.ensure_finalized()
         return module in self._roots
-
-    def reset_execution_order(self, root: nn.Module, phase: Phase) -> None:
-        """Reset the cursor to this root's entry in the construction order.
-
-        VPP chunks share a context but may run repeatedly before another chunk.
-        Reset to this root's entry rather than the beginning of the shared order.
-        Schedulers bypassing root hooks must manage their own traversal lifecycle.
-        """
-        self.execution_order.reset_cursor(self._root_execution_offsets[root][phase])
 
     def module_name(self, module: nn.Module) -> str:
         """Return ``module``'s name relative to its FSDP root."""
