@@ -10,6 +10,7 @@ import megatron.core.models.hybrid.hybrid_block as hybrid_block_module
 import megatron.core.transformer.utils as transformer_utils
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
+from megatron.core.inference.config import MambaInferenceStateConfig
 from megatron.core.models.hybrid.fine_grained_callables import build_hybrid_stack_callables
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
@@ -284,6 +285,58 @@ def test_group_inference_offsets_match_flat_layers(monkeypatch, layer_pattern, p
 
     assert offsets[1] == offsets[0]
     assert len(set(offsets[1])) == len(offsets[1])
+
+
+@pytest.mark.parametrize("layer_pattern", ["[M*E][M*E]", "*[M-]M", "[*-][MM]"])
+def test_group_inference_state_matches_flat_layers(monkeypatch, layer_pattern):
+    """Dynamic inference reads a grouped stack per physical layer, like its ungrouped pattern."""
+
+    class BuiltLayer(torch.nn.Module):
+
+        def __init__(self, config, layer_number):
+            super().__init__()
+            self.config = config
+            self.layer_number = layer_number
+            self.mixer = SimpleNamespace(chunk_size=64, ssm_inference_chunk_size=64)
+
+        def mamba_state_shapes_per_request(self):
+            return (self.layer_number,), (self.layer_number, 1)
+
+    monkeypatch.setattr(
+        hybrid_block_module,
+        "build_module",
+        lambda module_spec, **kwargs: BuiltLayer(kwargs["config"], kwargs["layer_number"]),
+    )
+    flat_pattern = layer_pattern.replace('[', '').replace(']', '')
+    config = TransformerConfig(num_layers=len(flat_pattern), hidden_size=64, num_attention_heads=4)
+    results = []
+    for pattern in (flat_pattern, layer_pattern):
+        stack = HybridStack(
+            config,
+            hybrid_stack_spec.submodules,
+            layer_config_list=validate_segment_layers(pattern, config),
+            post_process=False,
+            pg_collection=_make_pg_collection(),
+        )
+        model = SimpleNamespace(
+            decoder=stack,
+            config=SimpleNamespace(params_dtype=torch.bfloat16, batch_invariant_mode=False),
+        )
+        state_config = MambaInferenceStateConfig.from_model(model)
+        assert state_config is not None
+        results.append(
+            (
+                [layer.layer_number for layer in stack.physical_layers()],
+                state_config.layer_type_list,
+                state_config.conv_states_shape,
+                state_config.ssm_states_shape,
+                state_config.mamba_chunk_size,
+            )
+        )
+
+    assert results[1] == results[0]
+    assert results[1][1] == list(flat_pattern)
+    assert results[1][4] == 64
 
 
 def test_hybrid_stack_rejects_layer_config_subclasses(monkeypatch):

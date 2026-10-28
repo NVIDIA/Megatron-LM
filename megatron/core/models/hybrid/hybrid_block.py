@@ -524,12 +524,13 @@ class HybridStack(MegatronModule):
         return tuple(pairs)
 
     @property
-    def layer_type_list(self) -> list[str]:
+    def layer_type_list(self) -> list[LayerPatternItem]:
         """Return layer symbols derived from the per-layer configs.
 
         This property exists for backwards-compatibility reasons so callers that read
         ``HybridStack.layer_type_list`` continue to work. ``layer_config_list`` remains
-        the source of truth.
+        the source of truth. A bracketed group is one tuple of symbols; callers that need
+        one symbol per physical layer use ``flatten_layer_type_list``.
         """
         return get_layer_type_list_from_layer_config_list(self.layer_config_list)
 
@@ -585,16 +586,20 @@ class HybridStack(MegatronModule):
         self.input_tensor = input_tensor
 
     def physical_layers(self) -> tuple[nn.Module, ...]:
-        """Return one layer per layer_type_list entry, in execution order.
+        """Return one layer per physical layer, in execution order.
 
         self.layers holds what runs: Shortcut-MoE registers each paired layer and the MoE
-        after it as a single ShortcutMoEBlock. This unpacks those pairs, so the result lines up
-        index-for-index with layer_type_list and layer_config_list.
+        after it as a single ShortcutMoEBlock, and a bracketed group is one nested
+        HybridStack. This unpacks both, so the result lines up index-for-index with
+        ``flatten_layer_type_list(layer_type_list)`` and
+        ``flatten_layer_type_list(layer_config_list)``.
         """
         physical_layers = []
         for layer in self.layers:
             if isinstance(layer, ShortcutMoEBlock):
                 physical_layers.extend((layer.compute_layer, layer.moe_layer))
+            elif isinstance(layer, HybridStack):
+                physical_layers.extend(layer.physical_layers())
             else:
                 physical_layers.append(layer)
         return tuple(physical_layers)
@@ -604,12 +609,9 @@ class HybridStack(MegatronModule):
         Returns the recurrent mixer's conv and SSM state shapes per input sequence
         if this block contains Mamba or GDN layers (this may not be the case with PP > 1).
         """
-        for layer_config, layer in zip(self.layer_config_list, self.physical_layers(), strict=True):
-            if is_layer_group(layer_config):
-                state_shapes = layer.mamba_state_shapes_per_request()
-                if state_shapes is not None:
-                    return state_shapes
-                continue
+        for layer_config, layer in zip(
+            flatten_layer_type_list(self.layer_config_list), self.physical_layers(), strict=True
+        ):
             if type(layer_config) is layer_utils.MambaLayerConfig:
                 return layer.mamba_state_shapes_per_request()
             if type(layer_config) is layer_utils.GDNLayerConfig:
