@@ -918,7 +918,9 @@ def num_floating_point_operations(
     # Multimodal --seq-length describes the encoder, while the language model
     # runs at --decoder-seq-length. Plain language models leave the latter unset.
     llm_seq_length = (
-        args.decoder_seq_length if args.decoder_seq_length is not None else args.seq_length
+        args.decoder_seq_length
+        if args.decoder_seq_length is not None
+        else data_sequence_length(cfg, args)
     )
 
     # Defaults: BSHD layout assumption (full causal mask, every sample length =
@@ -1912,7 +1914,7 @@ def pretrain(
     warmup_training_kernels(
         cfg_container.model,
         warmup_tp_group,
-        seq_length=args.seq_length,
+        seq_length=data_sequence_length(cfg_container, args),
         micro_batch_size=cfg_container.train.micro_batch_size,
     )
     print_rank_0("Finished training-kernel warmup.")
@@ -3545,7 +3547,7 @@ def train_step(
             # Distillation shape-adjust reads parallel_state; only for modelopt-enabled runs.
             adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
                 model,
-                seq_length=args.seq_length,
+                seq_length=data_sequence_length(cfg, args),
                 micro_batch_size=cfg.train.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
             )
@@ -3640,7 +3642,7 @@ def train_step(
                 data_iterator=forward_backward_data_iterator,
                 model=model,
                 num_microbatches=scheduled_num_microbatches,
-                seq_length=args.seq_length,
+                seq_length=data_sequence_length(cfg, args),
                 micro_batch_size=cfg.train.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=forward_only,
@@ -3950,7 +3952,7 @@ def training_log(
     )
 
     # Track app tag & app tag ID
-    one_logger_utils.track_app_tag(batch_size, args.world_size, args.seq_length)
+    one_logger_utils.track_app_tag(batch_size, args.world_size, data_sequence_length(cfg, args))
 
     total_iterations = total_loss_dict[advanced_iters_key] + total_loss_dict[skipped_iters_key]
     if packed_sequence_stats and wandb_writer:
@@ -4275,7 +4277,7 @@ def training_log(
             from megatron.core.telemetry.training_metrics import record_training_metrics
             _avg_loss = _otel_loss_snapshot
             _tokens_per_sec = (
-                batch_size * args.seq_length / elapsed_time_per_iteration
+                batch_size * data_sequence_length(cfg, args) / elapsed_time_per_iteration
                 if elapsed_time_per_iteration > 0 else None
             )
             _mem_gb = torch.cuda.max_memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else None
@@ -4362,7 +4364,7 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
         num_floating_point_operations_so_far - start_num_floating_point_operations
     ) / (elapsed_time * 10**12 * llm_world_size)
 
-    tokens_so_far = train_state.consumed_train_samples * args.seq_length
+    tokens_so_far = train_state.consumed_train_samples * data_sequence_length(get_run_config(), args)
     saved_ckpt_prefix = 'Saving async checkpoint' if args.async_save else 'Saved checkpoint'
     append_to_progress_log(
         args.save,
@@ -4940,7 +4942,7 @@ def train(
         iteration=iteration,
         consumed_train_samples=train_state.consumed_train_samples,
         train_samples=cfg.train.train_samples,
-        seq_length=args.seq_length,
+        seq_length=data_sequence_length(cfg, args),
         train_iters=cfg.train.train_iters,
         save=args.save,
         async_save=args.async_save,
@@ -5083,7 +5085,7 @@ def train(
             'num_floating_point_operations_so_far': train_state.num_floating_point_operations_so_far,
             'consumed_train_samples': train_state.consumed_train_samples,
             'world_size': getattr(args, 'mimo_llm_world_size', args.world_size),
-            'seq_length': args.seq_length,
+            'seq_length': data_sequence_length(cfg, args),
         }
 
     # Cache into one-logger for callback.
@@ -5150,7 +5152,7 @@ def train(
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
             config=config,
-            seq_length=args.seq_length,
+            seq_length=data_sequence_length(cfg, args),
             micro_batch_size=cfg.train.micro_batch_size,
             optimizers=[optimizer],
         )
@@ -5808,7 +5810,7 @@ def evaluate(
         # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
         adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
             model,
-            seq_length=args.seq_length,
+            seq_length=data_sequence_length(cfg, args),
             micro_batch_size=eval_micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
         )
@@ -5860,7 +5862,7 @@ def evaluate(
                     data_iterator=packed_data_iterator,
                     model=model,
                     num_microbatches=scheduled_eval_num_microbatches,
-                    seq_length=args.seq_length,
+                    seq_length=data_sequence_length(cfg, args),
                     micro_batch_size=eval_micro_batch_size,
                     decoder_seq_length=args.decoder_seq_length,
                     forward_only=True,
@@ -5921,7 +5923,7 @@ def evaluate(
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=eval_num_microbatches,
-                seq_length=args.seq_length,
+                seq_length=data_sequence_length(cfg, args),
                 micro_batch_size=eval_micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
