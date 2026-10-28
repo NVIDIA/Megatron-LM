@@ -31,7 +31,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .execution_order import ExecutionEvent, ExecutionOrder
+from .execution_order import ExecutionOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import (
     FsdpParameter,
@@ -334,9 +334,7 @@ class FsdpModule:
                         f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}."
                     )
 
-    def _prefetch_parameter_groups(
-        self, order: ExecutionOrder[ExecutionEvent], prefetch_size: int | None
-    ) -> None:
+    def _prefetch_parameter_groups(self, order: ExecutionOrder, prefetch_size: int | None) -> None:
         """Prefetch successors from ``order`` according to this module's budget.
 
         Successors are unsharded for this module's phase, which is the compute they
@@ -344,19 +342,15 @@ class FsdpModule:
         """
         if not order:
             return
-        order.advance((ref(cast(nn.Module, self)), self.phase))
+        order.advance((self, self.phase))
         if prefetch_size == 0:
             return
         prefetched_size = 0
         for index in range(order.position, len(order)):
-            module_ref, phase = order[index]
+            fsdp_module, phase = order[index]
             # Forward and backward retain their separate prefetch boundaries.
             if phase is not self.phase:
                 break
-            owner = module_ref()
-            if owner is None:
-                raise RuntimeError("A module in the FSDP execution order was destroyed.")
-            fsdp_module = cast(FsdpModule, owner)
             fsdp_module._unshard_parameter_groups(self.phase)
             prefetched_size += fsdp_module.num_parameter_elements
             if prefetch_size is None or prefetched_size >= prefetch_size:

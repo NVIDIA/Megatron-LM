@@ -16,12 +16,12 @@
 
 from collections.abc import Callable
 from contextvars import ContextVar, Token
-from weakref import WeakKeyDictionary, ref
+from weakref import WeakKeyDictionary
 
 import torch
 from torch import nn
 
-from .execution_order import ExecutionEvent, ExecutionOrder
+from .execution_order import ExecutionOrder
 from .phase import Phase
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
@@ -46,7 +46,7 @@ class FsdpContext:
     """
 
     # Phase-tagged preset forward/backward execution order.
-    execution_order: ExecutionOrder[ExecutionEvent]
+    execution_order: ExecutionOrder
     # Topology metadata must not keep modules alive after construction.
     _roots: WeakKeyDictionary[nn.Module, None]
     # Names are relative to each FSDP root and absent until finalization.
@@ -95,7 +95,7 @@ class FsdpContext:
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
         self.caller_managed_grad_sync = caller_managed_grad_sync
-        self.execution_order = ExecutionOrder[ExecutionEvent]()
+        self.execution_order = ExecutionOrder()
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
@@ -160,7 +160,7 @@ class FsdpContext:
                 if module not in registered_modules:
                     continue
                 self._module_names[module] = name
-                self.execution_order.append((ref(module), Phase.FORWARD))
+                self.execution_order.append((module, Phase.FORWARD))
 
         for root in reversed(list(self._roots)):
             _collect_backward_order(root, registered_modules, self.execution_order)
@@ -261,11 +261,11 @@ def current_fully_shard_context() -> FsdpContext | None:
 
 
 def _collect_backward_order(
-    module: nn.Module, registered_modules: set[nn.Module], order: ExecutionOrder[ExecutionEvent]
+    module: nn.Module, registered_modules: set[nn.Module], order: ExecutionOrder
 ) -> None:
     """Collect one root's preset backward prefetch order."""
     if module in registered_modules:
-        order.append((ref(module), Phase.BACKWARD))
+        order.append((module, Phase.BACKWARD))
 
     for child in reversed(list(module.children())):
         _collect_backward_order(child, registered_modules, order)
