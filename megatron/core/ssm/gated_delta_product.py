@@ -1101,7 +1101,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             precomputed_seq_start=seq_start,
         ).unsqueeze(0)
 
-    def _compute_gating(self, ba, runtime_cp: _GDPRuntimeCP | None = None):
+    def _compute_gating(
+        self, ba: torch.Tensor, runtime_cp: _GDPRuntimeCP | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute the beta and g gating tensors from the ba slice."""
         if runtime_cp is None:
             runtime_cp = self._resolve_runtime_cp(None)
@@ -1110,7 +1112,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         )
 
         b, a = b.contiguous(), a.contiguous()
-        beta = b.sigmoid()
+        # Save FP32 sigmoid values for backward, retaining the kernel's input dtype.
+        beta = b.float().sigmoid().to(b.dtype)
 
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         if runtime_cp.chunkwise:
@@ -1142,7 +1145,18 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             assert runtime_cp.helper is not None
             y = runtime_cp.helper.post_conv_ssm(y, packed_seq_params=packed_seq_params)
         if self.rmsnorm:
-            z = rearrange(z, "b l d -> l b d").contiguous()
+            z = rearrange(z, "b l d -> l b d")
+            # CP1 and chunkwise CP leave z in projection storage. At batch size one,
+            # the gated norm's flattening preserves this unit-column-stride view,
+            # so in_proj recompute can discard and restore the norm's saved gate.
+            # Headwise CP and larger batches keep their existing materialization.
+            keep_gate_view = (
+                self.recompute_in_proj
+                and (runtime_cp.chunkwise or runtime_cp.group.size() == 1)
+                and z.shape[1] == 1
+            )
+            if not keep_gate_view:
+                z = z.contiguous()
             if not runtime_cp.chunkwise:
                 assert runtime_cp.helper is not None
                 z = runtime_cp.helper.post_conv_ssm(z, packed_seq_params=packed_seq_params)
