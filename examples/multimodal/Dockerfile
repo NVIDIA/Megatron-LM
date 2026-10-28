@@ -1,13 +1,17 @@
 # Base image: NVIDIA PyTorch container with CUDA, cuDNN, NCCL, Python, and uv pre-installed
 FROM nvcr.io/nvidia/pytorch:25.12-py3
+ARG UV_VERSION=0.13.5
+ENV PATH="/root/.local/bin:$PATH"
 
 # Install JRE for pycocoevalcap
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
+        ca-certificates \
         default-jre && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 # Using --break-system-packages to allow system-wide installation in managed environment
 RUN uv pip install --system --no-cache --break-system-packages \
     einops \

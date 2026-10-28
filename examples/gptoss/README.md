@@ -26,7 +26,7 @@ export UV_PROJECT_ENVIRONMENT=/opt/venv
 export VIRTUAL_ENV=/opt/venv
 export PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
 export UV_LINK_MODE=copy
-export UV_VERSION="0.7.2"
+export UV_VERSION="0.13.5"
 
 # Install UV
 curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
