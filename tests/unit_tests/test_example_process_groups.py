@@ -261,3 +261,65 @@ def test_scripts_take_the_collection_of_the_grid_they_build(grid, monkeypatch, m
 
     assert pg_collection is grid.pg_collection
     grid.initialize.assert_called_once_with(*call[0], **call[1])
+
+
+@pytest.mark.parametrize("mode", ["collocated", "non_collocated"])
+def test_the_refit_benchmark_builds_its_source_model_on_the_registered_collection(
+    monkeypatch, mode
+):
+    """get_model() and the GPT builder both take the groups that initialize_megatron registered."""
+    script = importlib.import_module("examples.rl.benchmark_refit")
+    registered = ProcessGroupCollection()
+    monkeypatch.setattr(parallel_state, "_REGISTERED_PROCESS_GROUPS", registered)
+    monkeypatch.setattr(
+        ProcessGroupCollection, "use_mpu_process_groups", Mock(side_effect=AssertionError)
+    )
+    args = SimpleNamespace(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        expert_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_tensor_parallel_size=None,
+        num_experts=None,
+        num_benchmark_warmup=0,
+        num_benchmark_iterations=0,
+    )
+    rl = SimpleNamespace(
+        rl_inference_tensor_model_parallel_size=None,
+        rl_inference_pipeline_model_parallel_size=None,
+        rl_inference_expert_model_parallel_size=None,
+        rl_inference_expert_tensor_model_parallel_size=None,
+        refit_method="gloo",
+        refit_execution_batch_bytes=None,
+    )
+    cfg = SimpleNamespace(rl=rl, dist=SimpleNamespace(use_tp_pp_dp_mapping=False))
+    monkeypatch.setattr(script, "get_args", lambda: args)
+    monkeypatch.setattr(script, "get_run_config", lambda: cfg)
+    # Rank 0 of two holds the source model; in collocated mode it also holds the destination.
+    monkeypatch.setattr(script.torch.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(script.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(script.torch.distributed, "barrier", lambda: None)
+    for name in ("print_rank_0", "print_config_summary", "print_results"):
+        monkeypatch.setattr(script, name, lambda *args, **kwargs: None)
+    for name in ("create_refit_service", "run_benchmark"):
+        monkeypatch.setattr(script, name, Mock())
+    monkeypatch.setattr(script, "build_inference_pg_collection", Mock())
+    monkeypatch.setattr(script, "core_transformer_config_from_args", lambda args: Mock())
+    received, built_on = [], []
+    monkeypatch.setattr(
+        script, "gpt_builder", lambda **kwargs: built_on.append(kwargs["pg_collection"])
+    )
+
+    def get_model(model_provider, wrap_with_ddp, config=None, pg_collection=None):
+        received.append(pg_collection)
+        model_provider(
+            pre_process=True, post_process=True, config=config, pg_collection=pg_collection
+        )
+        return [Mock()]
+
+    monkeypatch.setattr(script, "get_training_model", get_model)
+
+    getattr(script, f"benchmark_{mode}")()
+
+    assert received[0] is registered
+    assert built_on[0] is registered
