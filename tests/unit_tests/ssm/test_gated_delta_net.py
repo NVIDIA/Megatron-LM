@@ -6,27 +6,24 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import megatron.core.ssm.gated_delta_net.gdn as gdn_module
+import megatron.core.ops.ssm.gated_delta.gdn as gdn_module
 from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import HAVE_TE_GDN
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_module_spec,
     get_transformer_block_with_experimental_attention_variant_spec,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import (
+from megatron.core.ops.ssm.gated_delta.common import (
     HAVE_FLA,
-    HAVE_TE_GDN,
-    GatedDeltaNet,
-    torch_chunk_gated_delta_rule,
-)
-from megatron.core.ssm.gated_delta_net.common import (
     _build_head_perm_for_split_sections,
     _build_thd_cp_a2a_perm,
     chunk_gated_delta_rule,
     tensor_a2a_cp2hp,
     tensor_a2a_hp2cp,
 )
+from megatron.core.ops.ssm.gated_delta.gdn import GatedDeltaNet, torch_chunk_gated_delta_rule
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.ssm.gated_delta_net_test_cases import (

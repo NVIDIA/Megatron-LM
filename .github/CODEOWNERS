@@ -26,6 +26,7 @@ megatron/core/models/audio/ @NVIDIA/mcore-audio
 
 megatron/core/models/mamba/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model
 megatron/core/ssm/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model
+megatron/core/ops/ssm/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model
 
 megatron/core/models/hybrid/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model
 
@@ -103,4 +104,4 @@ train_rl.py @NVIDIA/reinforcement-learning
 /megatron/core/transformer/custom_layers/batch_invariant_kernels.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/transformer @NVIDIA/batch-invariant
 /megatron/core/transformer/moe/batch_invariant.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mixture-of-experts-adlr @NVIDIA/mixture-of-experts-devtech @NVIDIA/batch-invariant
 /megatron/core/inference/moe/batch_invariant.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/inference @NVIDIA/batch-invariant
-/megatron/core/ssm/ops/mamba2/batch_invariant_decode.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model @NVIDIA/batch-invariant
+/megatron/core/ops/ssm/mamba2/batch_invariant_decode.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model @NVIDIA/batch-invariant

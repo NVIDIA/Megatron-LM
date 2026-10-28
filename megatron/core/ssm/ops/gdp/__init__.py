@@ -1,38 +1,21 @@
-# Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-#
-# The modules in this package are forked from the Gated Delta Product kernels
-# in flash-linear-attention v0.5.1
-# (https://github.com/fla-org/flash-linear-attention), licensed under the MIT
-# license. See the LICENSE file in the repository root.
 
-"""Inference-only fork of the Gated Delta Product kernels from
-`flash-linear-attention <https://github.com/fla-org/flash-linear-attention>`_
-(v0.5.1).
+"""Deprecated import path; use ``megatron.core.ops.ssm.gdp``.
 
-Training and the static-batching inference path call the pip
-`flash-linear-attention` kernels, which own the backward pass. Only the
-dynamic-batching decode and prefill steps route here:
-
-* `fused_recurrent_gated_delta_rule_update` -- decode (shared with GDN, whose
-  gate and beta sigmoid it can apply in-kernel).
-* `gdp_decode_prepare` -- the reshape/gating step feeding decode.
-* `chunk_gated_delta_product_varlen` -- prefill.
-* `gdp_prefill_prepare` -- the reshape/gating step feeding prefill.
-
-All entry points are forward-only.
+The historical package-level names resolve from the modules that define them.
 """
 
-from .chunk import chunk_gated_delta_product_varlen
-from .fused_recurrent import fused_recurrent_gated_delta_rule_update
-from .metadata import build_gdp_chunk_descriptors, max_gdp_chunk_counts
-from .prepare import gdp_decode_prepare, gdp_prefill_prepare
+from megatron.core.ops._compat import deprecated_module
 
-__all__ = [
-    "chunk_gated_delta_product_varlen",
-    "fused_recurrent_gated_delta_rule_update",
-    "gdp_decode_prepare",
-    "gdp_prefill_prepare",
-    "build_gdp_chunk_descriptors",
-    "max_gdp_chunk_counts",
-]
+__getattr__, __dir__ = deprecated_module(
+    __name__,
+    "megatron.core.ops.ssm.gdp",
+    exports={
+        "chunk_gated_delta_product_varlen": "megatron.core.ops.ssm.gdp.chunk",
+        "fused_recurrent_gated_delta_rule_update": "megatron.core.ops.ssm.gdp.fused_recurrent",
+        "gdp_decode_prepare": "megatron.core.ops.ssm.gdp.prepare",
+        "gdp_prefill_prepare": "megatron.core.ops.ssm.gdp.prepare",
+        "build_gdp_chunk_descriptors": "megatron.core.ops.ssm.gdp.metadata",
+        "max_gdp_chunk_counts": "megatron.core.ops.ssm.gdp.metadata",
+    },
+)

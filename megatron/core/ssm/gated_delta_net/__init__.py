@@ -1,44 +1,30 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Gated Delta Net (GDN) family of layers.
+"""Deprecated import path; use ``megatron.core.ops.ssm.gated_delta``.
 
-This package replaces the former ``megatron/core/ssm/gated_delta_net.py`` module
-at the same import path; the names below preserve that module's public surface.
+The historical package-level names resolve from the modules that define them.
 """
 
-from megatron.core.extensions.transformer_engine import HAVE_TE_GDN
-from megatron.core.ssm.gated_delta_net.common import (
-    HAVE_FLA,
-    GatedDeltaNetSubmodules,
-    causal_conv1d,
-    chunk_gated_delta_rule,
-    get_parameter_local_cp,
-    l2norm,
-    tensor_a2a_cp2hp,
-    tensor_a2a_hp2cp,
-)
-from megatron.core.ssm.gated_delta_net.gdn import GatedDeltaNet, torch_chunk_gated_delta_rule
-from megatron.core.ssm.gated_delta_net.gdn2 import (
-    HAVE_FLA_GDN2,
-    GatedDeltaNet2,
-    chunk_gdn2,
-    torch_chunk_gdn2,
-)
+from megatron.core.ops._compat import deprecated_module
 
-__all__ = [
-    "HAVE_FLA",
-    "HAVE_FLA_GDN2",
-    "HAVE_TE_GDN",
-    "GatedDeltaNet",
-    "GatedDeltaNet2",
-    "GatedDeltaNetSubmodules",
-    "causal_conv1d",
-    "chunk_gated_delta_rule",
-    "chunk_gdn2",
-    "get_parameter_local_cp",
-    "l2norm",
-    "tensor_a2a_cp2hp",
-    "tensor_a2a_hp2cp",
-    "torch_chunk_gated_delta_rule",
-    "torch_chunk_gdn2",
-]
+__getattr__, __dir__ = deprecated_module(
+    __name__,
+    "megatron.core.ops.ssm.gated_delta",
+    exports={
+        "HAVE_FLA": "megatron.core.ops.ssm.gated_delta.common",
+        "HAVE_FLA_GDN2": "megatron.core.ops.ssm.gated_delta.gdn2",
+        "HAVE_TE_GDN": "megatron.core.extensions.transformer_engine",
+        "GatedDeltaNet": "megatron.core.ops.ssm.gated_delta.gdn",
+        "GatedDeltaNet2": "megatron.core.ops.ssm.gated_delta.gdn2",
+        "GatedDeltaNetSubmodules": "megatron.core.ops.ssm.gated_delta.common",
+        "causal_conv1d": "megatron.core.ops.ssm.gated_delta.common",
+        "chunk_gated_delta_rule": "megatron.core.ops.ssm.gated_delta.common",
+        "chunk_gdn2": "megatron.core.ops.ssm.gated_delta.gdn2",
+        "get_parameter_local_cp": "megatron.core.ops.ssm.gated_delta.common",
+        "l2norm": "megatron.core.ops.ssm.gated_delta.common",
+        "tensor_a2a_cp2hp": "megatron.core.ops.ssm.gated_delta.common",
+        "tensor_a2a_hp2cp": "megatron.core.ops.ssm.gated_delta.common",
+        "torch_chunk_gated_delta_rule": "megatron.core.ops.ssm.gated_delta.gdn",
+        "torch_chunk_gdn2": "megatron.core.ops.ssm.gated_delta.gdn2",
+    },
+)

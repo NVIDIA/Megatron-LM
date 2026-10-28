@@ -35,7 +35,10 @@ from typing import Tuple
 EXEMPT_LABEL = "determinism-exempt"
 
 # Directories whose every ``.py`` file (``__init__.py`` excluded) must be registered.
-KERNEL_DIRECTORIES: Tuple[str, ...] = ("megatron/core/fusions", "megatron/core/ssm/ops")
+# ``megatron/core/ops`` is not one: its families keep operation modules (mixers, context
+# parallelism, checkpoint and inference helpers) beside their kernels. Its kernel files are
+# registered below by path, and new ones are found by ``KERNEL_CONTENT_PATTERNS``.
+KERNEL_DIRECTORIES: Tuple[str, ...] = ("megatron/core/fusions",)
 
 # Regular expressions (``re.MULTILINE``) that mark a source file as kernel-bearing wherever
 # it lives. Matched against the file's current contents by both consumers.
@@ -460,7 +463,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     # ---------------------------------------------------------------- SSM
     KernelEntry(
         name="ssm_causal_conv1d",
-        sources=("megatron/core/ssm/causal_conv1d.py",),
+        sources=("megatron/core/ops/ssm/common/causal_conv1d_cp.py",),
         tests=(C + "test_ssm_conv1d.py",),
         kind="external-lib",
         notes="Dao-AILab causal_conv1d; channel-last backward reduces dweight/dbias with "
@@ -469,12 +472,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="ssm_mamba2_varlen_kernels",
         sources=(
-            "megatron/core/ssm/ops/mamba2/ssd_combined.py",
-            "megatron/core/ssm/ops/mamba2/ssd_bmm.py",
-            "megatron/core/ssm/ops/mamba2/ssd_chunk_scan.py",
-            "megatron/core/ssm/ops/mamba2/ssd_chunk_state.py",
-            "megatron/core/ssm/ops/mamba2/ssd_state_passing.py",
-            "megatron/core/ssm/ops/mamba2/mamba_ssm.py",
+            "megatron/core/ops/ssm/mamba2/ssd_combined.py",
+            "megatron/core/ops/ssm/mamba2/ssd_bmm.py",
+            "megatron/core/ops/ssm/mamba2/ssd_chunk_scan.py",
+            "megatron/core/ops/ssm/mamba2/ssd_chunk_state.py",
+            "megatron/core/ops/ssm/mamba2/ssd_state_passing.py",
+            "megatron/core/ops/ssm/mamba2/mamba_ssm.py",
         ),
         tests=(K + "test_ssm_kernels.py",),
         kind="triton",
@@ -483,8 +486,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="ssm_mamba2_batch_invariant_decode",
         sources=(
-            "megatron/core/ssm/ops/mamba2/batch_invariant_decode.py",
-            "megatron/core/ssm/ops/mamba2/batch_invariant_decode_rows.py",
+            "megatron/core/ops/ssm/mamba2/batch_invariant_decode.py",
+            "megatron/core/ops/ssm/mamba2/batch_invariant_decode_rows.py",
         ),
         tests=("tests/unit_tests/ssm/ops/mamba2/test_batch_invariant_decode.py",),
         kind="triton",
@@ -493,10 +496,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="ssm_common_kernels",
         sources=(
-            "megatron/core/ssm/ops/common/causal_conv1d_triton.py",
-            "megatron/core/ssm/ops/common/causal_conv1d_varlen.py",
-            "megatron/core/ssm/ops/common/intermediate_extraction.py",
-            "megatron/core/ssm/ops/common/determinism.py",
+            "megatron/core/ops/ssm/common/causal_conv1d_triton.py",
+            "megatron/core/ops/ssm/common/causal_conv1d_varlen.py",
+            "megatron/core/ops/ssm/common/intermediate_extraction.py",
+            "megatron/core/ops/ssm/common/determinism.py",
         ),
         tests=(K + "test_ssm_kernels.py",),
         kind="triton",
@@ -507,18 +510,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="ssm_gdp_kernels",
         sources=(
-            "megatron/core/ssm/ops/gdp/chunk.py",
-            "megatron/core/ssm/ops/gdp/chunk_h.py",
-            "megatron/core/ssm/ops/gdp/chunk_o.py",
-            "megatron/core/ssm/ops/gdp/common.py",
-            "megatron/core/ssm/ops/gdp/cumsum.py",
-            "megatron/core/ssm/ops/gdp/fused_recurrent.py",
-            "megatron/core/ssm/ops/gdp/metadata.py",
-            "megatron/core/ssm/ops/gdp/prepare.py",
-            "megatron/core/ssm/ops/gdp/scaled_dot_kkt.py",
-            "megatron/core/ssm/ops/gdp/solve_tril.py",
-            "megatron/core/ssm/ops/gdp/wy_fast.py",
-            "megatron/core/ssm/context_parallel/gdp.py",
+            "megatron/core/ops/ssm/gdp/chunk.py",
+            "megatron/core/ops/ssm/gdp/chunk_h.py",
+            "megatron/core/ops/ssm/gdp/chunk_o.py",
+            "megatron/core/ops/ssm/gdp/common.py",
+            "megatron/core/ops/ssm/gdp/cumsum.py",
+            "megatron/core/ops/ssm/gdp/fused_recurrent.py",
+            "megatron/core/ops/ssm/gdp/metadata.py",
+            "megatron/core/ops/ssm/gdp/prepare.py",
+            "megatron/core/ops/ssm/gdp/scaled_dot_kkt.py",
+            "megatron/core/ops/ssm/gdp/solve_tril.py",
+            "megatron/core/ops/ssm/gdp/wy_fast.py",
+            "megatron/core/ops/ssm/context_parallel/gdp.py",
         ),
         tests=(K + "test_ssm_kernels.py",),
         kind="triton",
@@ -531,9 +534,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="gated_delta_net",
         sources=(
-            "megatron/core/ssm/gated_delta_net/common.py",
-            "megatron/core/ssm/gated_delta_net/gdn.py",
-            "megatron/core/ssm/gated_delta_net/gdn2.py",
+            "megatron/core/ops/ssm/gated_delta/common.py",
+            "megatron/core/ops/ssm/gated_delta/gdn.py",
+            "megatron/core/ops/ssm/gated_delta/gdn2.py",
         ),
         tests=(K + "test_ssm_kernels.py", K + "test_gated_norm.py", C + "test_hybrid_model.py"),
         kind="torch.compile",
@@ -561,7 +564,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="ssm_triton_cache_manager",
-        sources=("megatron/core/ssm/triton_cache_manager.py",),
+        sources=("megatron/core/ops/ssm/triton_cache_manager.py",),
         kind="triton",
         exempt_reason="Triton compile-cache manager; no kernel.",
     ),
@@ -723,7 +726,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     # the kernels they call (and by module-level tests where they exist); ``notes`` say which.
     KernelEntry(
         name="ssm_mamba_mixer",
-        sources=("megatron/core/ssm/mamba_mixer.py",),
+        sources=("megatron/core/ops/ssm/mamba2/mixer.py",),
         tests=(
             C + "test_ssm_conv1d.py",
             K + "test_ssm_kernels.py",
@@ -738,7 +741,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="ssm_gated_delta_product",
-        sources=("megatron/core/ssm/gated_delta_product.py",),
+        sources=("megatron/core/ops/ssm/gdp/mixer.py",),
         tests=(K + "test_ssm_kernels.py",),
         kind="dispatch",
         notes="Dispatches FLA chunk_gated_delta_product / l2_norm, the CuTeDSL gdp_attn kernel "
@@ -871,7 +874,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         name="te_thd_partitioned_indices",
         sources=(
             "megatron/core/datasets/data_schedule.py",
-            "megatron/core/ssm/mamba_context_parallel.py",
+            "megatron/core/ops/ssm/mamba2/context_parallel.py",
             "megatron/core/utils.py",
             "megatron/core/models/mimo/partition/utils.py",
             "megatron/core/models/multimodal/llava_model.py",
