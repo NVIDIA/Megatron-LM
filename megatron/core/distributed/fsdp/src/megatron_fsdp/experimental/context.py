@@ -180,12 +180,7 @@ class FsdpContext:
         return module in self._roots
 
     def reset_execution_order(self, root: nn.Module, phase: Phase) -> None:
-        """Reset the cursor to this root's entry in the construction order.
-
-        VPP chunks share a context but may run repeatedly before another chunk.
-        Reset to this root's entry rather than the beginning of the shared order.
-        Schedulers bypassing root hooks must manage their own traversal lifecycle.
-        """
+        """Reset the cursor to the root's entry for this phase."""
         self.execution_order.reset_cursor(self._root_execution_offsets[root][phase])
 
     def module_name(self, module: nn.Module) -> str:
