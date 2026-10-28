@@ -1695,7 +1695,7 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
     assert finished.finish_reason == "length"
     engine.controller.terminating_token_ids.assert_called_with(-1, stop_token_ids=None)
     assert finished.generated_log_probs == [-0.25]
-    assert finished.generated_top_n_logprobs == [{"<12>": -0.25, "<13>": -1.0}]
+    assert finished.generated_top_n_logprobs == [{"12": -0.25, "13": -1.0}]
     assert finished.tpot == [0.25]
     assert (finished.generated_tokens, finished.generated_text) == ([10, 11, 12], None)
     assert finished.finalize_text(engine.controller.tokenizer).generated_text == "<10,11,12>"
