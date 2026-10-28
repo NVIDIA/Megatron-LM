@@ -529,9 +529,299 @@
     "num_stages": 3,
     "num_warps": 4
    }
+  },
+  "megatron.core.fusions.fused_pre_gated_delta_rule._compute_g_and_beta_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_H": 16,
+     "BLOCK_S": 32
+    },
+    "num_stages": 2,
+    "num_warps": 2
+   }
+  },
+  "megatron.core.fusions.fused_pre_gated_delta_rule._conv_silu_project_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_S": 16
+    },
+    "num_stages": 2,
+    "num_warps": 2
+   }
+  },
+  "megatron.core.fusions.fused_pre_gated_delta_rule._conv_silu_project_thd_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_S": 16
+    },
+    "num_stages": 2,
+    "num_warps": 2
+   }
+  },
+  "megatron.core.fusions.fused_pre_gated_delta_rule._g_beta_backward_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_H": 16,
+     "BLOCK_S": 64
+    },
+    "num_stages": 2,
+    "num_warps": 2
+   },
+   "seq_len=16384|num_v_heads=32|torch.bfloat16|torch.float32|torch.float32|torch.float32|torch.float32|torch.bfloat16|torch.float32|torch.float32": {
+    "kwargs": {
+     "BLOCK_H": 32,
+     "BLOCK_S": 64
+    },
+    "num_stages": 2,
+    "num_warps": 4
+   },
+   "seq_len=2048|num_v_heads=32|torch.bfloat16|torch.float32|torch.float32|torch.float32|torch.float32|torch.bfloat16|torch.float32|torch.float32": {
+    "kwargs": {
+     "BLOCK_H": 16,
+     "BLOCK_S": 256
+    },
+    "num_stages": 2,
+    "num_warps": 8
+   },
+   "seq_len=32768|num_v_heads=32|torch.bfloat16|torch.float32|torch.float32|torch.float32|torch.float32|torch.bfloat16|torch.float32|torch.float32": {
+    "kwargs": {
+     "BLOCK_H": 32,
+     "BLOCK_S": 64
+    },
+    "num_stages": 2,
+    "num_warps": 4
+   }
+  },
+  "megatron.core.fusions.fused_pre_gated_delta_rule._qk_l2norm_repeat_backward_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_S": 32
+    },
+    "num_stages": 2,
+    "num_warps": 4
+   }
+  },
+  "megatron.core.ssm.ops.common.causal_conv1d_varlen._causal_conv1d_carry_states_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_C": 128
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   }
+  },
+  "megatron.core.ssm.ops.common.causal_conv1d_varlen._causal_conv1d_varlen_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_C": 256,
+     "BLOCK_T": 8
+    },
+    "num_stages": 2,
+    "num_warps": 4
+   }
+  },
+  "megatron.core.ssm.ops.gdp.chunk_h.chunk_gated_delta_product_fwd_kernel_h_blockdim64": {
+   "*": {
+    "kwargs": {
+     "BV": 32
+    },
+    "num_stages": 2,
+    "num_warps": 2
+   },
+   "H=16|K=128|V=128|BT=64|USE_G=True|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.float32|torch.bfloat16|torch.float32|torch.float32|torch.int32|torch.int64": {
+    "kwargs": {
+     "BV": 32
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "H=32|K=128|V=128|BT=64|USE_G=True|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.float32|torch.bfloat16|torch.float32|torch.float32|torch.int32|torch.int64": {
+    "kwargs": {
+     "BV": 64
+    },
+    "num_stages": 2,
+    "num_warps": 4
+   }
+  },
+  "megatron.core.ssm.ops.gdp.chunk_o.chunk_fwd_kernel_o": {
+   "*": {
+    "kwargs": {
+     "BK": 64,
+     "BV": 64
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "H=32|K=128|V=128|BT=64|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.bfloat16|torch.float32|torch.bfloat16|torch.int32|torch.int32": {
+    "kwargs": {
+     "BK": 64,
+     "BV": 64
+    },
+    "num_stages": 3,
+    "num_warps": 2
+   }
+  },
+  "megatron.core.ssm.ops.gdp.common.l2norm_fwd_kernel": {
+   "*": {
+    "kwargs": {
+     "BT": 32
+    },
+    "num_stages": 3,
+    "num_warps": 8
+   }
+  },
+  "megatron.core.ssm.ops.gdp.cumsum.chunk_local_cumsum_scalar_kernel": {
+   "*": {
+    "kwargs": {},
+    "num_stages": 3,
+    "num_warps": 2
+   }
+  },
+  "megatron.core.ssm.ops.gdp.scaled_dot_kkt.chunk_scaled_dot_kkt_fwd_kernel": {
+   "*": {
+    "kwargs": {
+     "BK": 64
+    },
+    "num_stages": 3,
+    "num_warps": 2
+   }
+  },
+  "megatron.core.ssm.ops.gdp.solve_tril.merge_16x16_to_64x64_inverse_kernel": {
+   "*": {
+    "kwargs": {
+     "DOT_PRECISION": "ieee"
+    },
+    "num_stages": 4,
+    "num_warps": 2
+   }
+  },
+  "megatron.core.ssm.ops.gdp.wy_fast.recompute_w_u_fwd_kernel": {
+   "*": {
+    "kwargs": {},
+    "num_stages": 3,
+    "num_warps": 4
+   }
+  },
+  "megatron.core.ssm.ops.mamba2.ssd_bmm._bmm_chunk_fwd_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_SIZE_K": 32,
+     "BLOCK_SIZE_M": 64,
+     "BLOCK_SIZE_N": 128
+    },
+    "num_stages": 4,
+    "num_warps": 4
+   }
+  },
+  "megatron.core.ssm.ops.mamba2.ssd_chunk_scan._chunk_scan_fwd_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_SIZE_K": 32,
+     "BLOCK_SIZE_M": 64,
+     "BLOCK_SIZE_N": 64
+    },
+    "num_stages": 4,
+    "num_warps": 2
+   }
+  },
+  "megatron.core.ssm.ops.mamba2.ssd_chunk_state._chunk_cumsum_fwd_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_SIZE_H": 8
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   }
+  },
+  "megatron.core.ssm.ops.mamba2.ssd_chunk_state._chunk_state_fwd_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_SIZE_K": 32,
+     "BLOCK_SIZE_M": 64,
+     "BLOCK_SIZE_N": 64
+    },
+    "num_stages": 4,
+    "num_warps": 2
+   }
+  },
+  "megatron.core.ssm.ops.mamba2.ssd_state_passing._state_passing_fwd_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_SIZE": 512
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   }
+  },
+  "megatron.core.transformer.experimental_attention_variant.dsa_min_memory_triton._dsa_linear_wgrad_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_I": 64,
+     "BLOCK_N": 64,
+     "BLOCK_O": 32
+    },
+    "num_stages": 4,
+    "num_warps": 8
+   }
+  },
+  "megatron.core.transformer.experimental_attention_variant.dsa_min_memory_triton._dsa_scatter_selected_grad_to_sequence_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_D": 32,
+     "BLOCK_N": 128
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   }
+  },
+  "megatron.core.transformer.experimental_attention_variant.dsa_min_memory_triton._dsa_simplified_score_block_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_M": 32,
+     "BLOCK_N": 64
+    },
+    "num_stages": 3,
+    "num_warps": 8
+   }
+  },
+  "megatron.core.transformer.experimental_attention_variant.dsa_min_memory_triton._dsa_simplified_selected_scores_backward_qk_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_K": 128
+    },
+    "num_stages": 3,
+    "num_warps": 8
+   }
+  },
+  "megatron.core.transformer.experimental_attention_variant.dsa_min_memory_triton._dsa_sparse_attention_backward_pair_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_K": 64
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   }
+  },
+  "megatron.core.transformer.experimental_attention_variant.dsa_min_memory_triton._dsa_sparse_attention_forward_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_K": 128
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   }
+  },
+  "megatron.core.transformer.experimental_attention_variant.dsa_min_memory_triton._dsa_teacher_scores_kernel": {
+   "*": {
+    "kwargs": {
+     "BLOCK_K": 64
+    },
+    "num_stages": 3,
+    "num_warps": 4
+   }
   }
  },
  "packages": {},
- "source": "mamba_ssm kernels: nemotron_3_ultra 96-GPU recording, majority vote over ranks; megatron.core MLA RoPE and mHC kernels: two sweeps timing every candidate at 2k, 8k and 32k tokens, smallest worst-case slowdown",
+ "source": "mamba_ssm kernels: nemotron_3_ultra 96-GPU recording, majority vote over ranks; megatron.core MLA RoPE and mHC kernels: two sweeps timing every candidate at 2k, 8k and 32k tokens, smallest worst-case slowdown; megatron.core GDP/GDN prefill, in-tree Mamba2 SSD, causal-conv1d varlen, fused pre-GDN and DSA min-memory kernels: a sweep timing every candidate at 2k, 8k and 32k tokens, smallest worst-case slowdown",
  "triton": ""
 }
