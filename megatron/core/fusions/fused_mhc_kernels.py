@@ -499,12 +499,18 @@ if _TRITON_AVAILABLE:
             )
 
     def _triton_h_post_bda_fwd(
-        h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
+        h_res: Tensor,
+        original_residual: Tensor,
+        h_post: Tensor,
+        x: Tensor,
+        bias: Optional[Tensor],
+        *,
+        output_dtype: torch.dtype | None = None,
     ) -> Tensor:
         s, b, n, C = original_residual.shape
         sb = s * b
         dev = h_res.device
-        out = torch.empty(sb, n, C, dtype=h_res.dtype, device=dev)
+        out = torch.empty(sb, n, C, dtype=output_dtype or h_res.dtype, device=dev)
         hr_flat = h_res.contiguous().view(sb, n, n)
         orig_flat = original_residual.contiguous().view(sb, n, C)
         hp_flat = h_post.contiguous().view(sb, n)
@@ -1241,12 +1247,18 @@ if _CUTILE_AVAILABLE:
     _hpb_bwd_g_hp_hr_best_cfg: dict = {}
 
     def _cutile_h_post_bda_fwd(
-        h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
+        h_res: Tensor,
+        original_residual: Tensor,
+        h_post: Tensor,
+        x: Tensor,
+        bias: Optional[Tensor],
+        *,
+        output_dtype: torch.dtype | None = None,
     ) -> Tensor:
         s, b, n, C = original_residual.shape
         sb = s * b
         stream = torch.cuda.current_stream()
-        out = torch.empty(sb, n, C, dtype=h_res.dtype, device=h_res.device)
+        out = torch.empty(sb, n, C, dtype=output_dtype or h_res.dtype, device=h_res.device)
         hr_flat = h_res.view(sb, n, n)
         orig_flat = original_residual.view(sb, n, C)
         hp_flat = h_post.view(sb, n)
@@ -2907,15 +2919,21 @@ class FusedHPostBDA(torch.autograd.Function):
         x: Tensor,
         bias: Optional[Tensor],
         backend: MHCBackend,
+        output_dtype: torch.dtype | None,
     ):
         """Run h_post_bda forward using the best available backend."""
         triton_fwd = _get_triton_h_post_bda_fwd(backend)
+        output_kwargs = {} if output_dtype is None else {"output_dtype": output_dtype}
         if triton_fwd is not None:
-            output = triton_fwd(h_res, original_residual, h_post, x, bias)
+            output = triton_fwd(h_res, original_residual, h_post, x, bias, **output_kwargs)
         elif _backend_uses_cutile(backend):
-            output = _cutile_h_post_bda_fwd(h_res, original_residual, h_post, x, bias)
+            output = _cutile_h_post_bda_fwd(
+                h_res, original_residual, h_post, x, bias, **output_kwargs
+            )
         else:
             output = native_h_post_bda(h_res, original_residual, h_post, x, bias)
+            if output_dtype is not None:
+                output = output.to(output_dtype)
         if bias is not None:
             ctx.save_for_backward(h_res, original_residual, h_post, x, bias)
             ctx.has_bias = True
@@ -2941,7 +2959,7 @@ class FusedHPostBDA(torch.autograd.Function):
             grads = _cutile_h_post_bda_bwd(grad_output, h_res, orig_res, h_post, x, bias)
         else:
             grads = _torch_h_post_bda_bwd(grad_output, h_res, orig_res, h_post, x, bias)
-        return (*grads, None)
+        return (*grads, None, None)
 
 
 def fused_sinkhorn(
@@ -2973,12 +2991,17 @@ def fused_h_post_bda(
     bias: Optional[Tensor],
     *,
     backend: MHCBackend = "auto",
+    output_dtype: torch.dtype | None = None,
 ) -> Tensor:
-    """Compute H_res.T @ residual + H_post * (x + bias) using the backend policy."""
+    """Mix in FP32; optional output_dtype casts on store without a full FP32 output."""
     _validate_mhc_backend(backend)
     if _backend_uses_triton(backend) or _backend_uses_cutile(backend):
-        return FusedHPostBDA.apply(h_res, original_residual, h_post, x, bias, backend)
-    return native_h_post_bda(h_res, original_residual, h_post, x, bias)
+        return FusedHPostBDA.apply(h_res, original_residual, h_post, x, bias, backend, output_dtype)
+    if output_dtype is not None:
+        original_residual, x = original_residual.to(h_res.dtype), x.to(h_res.dtype)
+        bias = None if bias is None else bias.to(h_res.dtype)
+    output = native_h_post_bda(h_res, original_residual, h_post, x, bias)
+    return output.to(output_dtype) if output_dtype is not None else output
 
 
 def fused_proj_rms_compute_h(

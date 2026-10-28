@@ -369,6 +369,11 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
 
+    dsa_indexer_precision: Literal["bf16", "mxfp8"] = "bf16"
+    """CSA2 index selection precision, independent of the model's linear FP8 recipe.
+    MXFP8 requires SM100 and cuDNN. Indexer supervision uses the original projections.
+    """
+
     dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] | None = None
     """Optional fused DSA kernel backend.
     When unset, DSv4 hybrid uses ``cudnn`` and other attention variants use ``none``.
@@ -426,6 +431,24 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # Compressed sparse attention
     ####################
+    dsv4_version: Literal["v4", "v4.1"] = "v4"
+    """Attention architecture. V4.1 uses CSA2 with explicit cross-layer sharing."""
+
+    csa2_kv_source_layers: list[int] | None = None
+    """Zero-based stack layer indices producing global KV and indexer K."""
+
+    csa2_index_source_layers: list[int] | None = None
+    """Zero-based stack layer indices computing new sparse indices."""
+
+    csa2_candidate_source_layer: int | None = None
+    """Full layer producing the hierarchical candidate pool; None disables it."""
+
+    csa2_candidate_topk_blocks: int = 0
+    """Maximum candidate blocks selected by the first decoder indexer."""
+
+    csa2_candidate_block_size: int = 0
+    """Number of global positions in a candidate block."""
+
     csa_window_size: int = 128
     """Sliding window size for compressed sparse attention."""
 
@@ -1304,6 +1327,12 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # Hyper-Connection Configuration
     ####################
+    mhc_single_pass: bool = False
+    """Use the preceding sublayer's input mix, including the final output contraction."""
+
+    mhc_epsilon: float = 1e-6
+    """Positive stabilizer for single-pass mHC input and Sinkhorn coefficients."""
+
     enable_mhc_connections: bool = False
     """Enable mHC residual connections."""
 
@@ -1673,6 +1702,12 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        if self.dsv4_version not in ("v4", "v4.1"):
+            raise ValueError(f"Unsupported dsv4_version: {self.dsv4_version}")
+        if self.dsv4_version == "v4.1" and self.experimental_attention_variant != "dsv4_hybrid":
+            raise ValueError("V4.1 requires experimental_attention_variant='dsv4_hybrid'")
+        if self.dsa_indexer_precision != "bf16" and self.dsv4_version != "v4.1":
+            raise ValueError("MXFP8 indexer selection is currently supported by CSA2 only")
         self._validate_cp_layouts()
 
         if self.attn_logit_softcapping is not None and not (
@@ -1933,6 +1968,13 @@ class TransformerConfig(ModelParallelConfig):
                     "DSA indexer loss is not supported with kpool selection; set "
                     "dsa_indexer_loss_coeff=0 or dsa_indexer_kpool=1."
                 )
+        elif self.experimental_attention_variant == "dsv4_hybrid" and self.dsv4_version == "v4.1":
+            from megatron.core.transformer.experimental_attention_variant.csa2_config import (
+                validate_csa2_config,
+            )
+
+            validate_csa2_config(self)
+            self.hetereogenous_dist_checkpoint = True
         elif self.experimental_attention_variant == "dsv4_hybrid":
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
             assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
@@ -2739,6 +2781,20 @@ class TransformerConfig(ModelParallelConfig):
                 "recompute_modules with selective recompute to reduce activation memory."
             )
 
+        if self.mhc_single_pass:
+            if self.cuda_graph_impl != "none":
+                raise NotImplementedError(
+                    "Single-pass mHC requires an explicit tensor-state graph adapter"
+                )
+            if not self.enable_mhc_connections:
+                raise ValueError("mhc_single_pass requires enable_mhc_connections=True")
+            if not math.isfinite(self.mhc_epsilon) or self.mhc_epsilon <= 0:
+                raise ValueError("mhc_epsilon must be positive and finite")
+            if self.moe_shortcut_connection or self.mtp_num_layers:
+                raise NotImplementedError("Single-pass mHC does not support shortcut MoE or MTP")
+            if self.sequence_parallel or self.tensor_model_parallel_size != 1:
+                raise NotImplementedError("Single-pass mHC currently requires TP=1 without SP")
+
         if self.use_fused_mhc and not self.enable_mhc_connections:
             raise ValueError("use_fused_mhc requires enable_mhc_connections=True.")
 
@@ -2751,7 +2807,11 @@ class TransformerConfig(ModelParallelConfig):
         if self.mhc_fused_backend != "auto" and not self.use_fused_mhc:
             raise ValueError("mhc_fused_backend requires use_fused_mhc=True when set explicitly.")
 
-        if self.enable_mhc_connections and self.recompute_granularity == "full":
+        if (
+            self.enable_mhc_connections
+            and self.recompute_granularity == "full"
+            and not (self.dsv4_version == "v4.1" and self.mhc_single_pass)
+        ):
             raise NotImplementedError(
                 "enable_mhc_connections is not yet compatible with full activation recompute. "
                 "Use selective recompute with 'mhc' in recompute_modules, or disable "

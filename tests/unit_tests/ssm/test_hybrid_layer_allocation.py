@@ -26,6 +26,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
 from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
+    CSA2LayerConfig,
     CSALayerConfig,
 )
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
@@ -38,6 +39,7 @@ _EXPECTED_LAYER_CONFIG_CLASSES = {
     Symbols.ATTENTION: AttentionLayerConfig,
     Symbols.DS_ATTENTION: DSALayerConfig,
     Symbols.CSA: CSALayerConfig,
+    Symbols.CSA2: CSA2LayerConfig,
     Symbols.HCA: CSALayerConfig,
     Symbols.MLA: MLALayerConfig,
     Symbols.WINDOW: CSALayerConfig,
@@ -452,6 +454,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("M*M*") == {
             '*': 2,
             'C': 0,
+            'V': 0,
             'D': 0,
             'G': 0,
             'H': 0,
@@ -467,6 +470,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("MG*-E") == {
             '*': 1,
             'C': 0,
+            'V': 0,
             'D': 0,
             'G': 1,
             'H': 0,
@@ -476,9 +480,10 @@ class TestGetHybridLayerCounts:
             'E': 1,
             'W': 0,
         }
-        assert get_hybrid_layer_counts("MGD-E") == {
+        assert get_hybrid_layer_counts("MGDV-E") == {
             '*': 0,
             'C': 0,
+            'V': 1,
             'D': 1,
             'G': 1,
             'H': 0,
@@ -491,6 +496,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("MG+-E") == {
             '*': 0,
             'C': 0,
+            'V': 0,
             'D': 0,
             'G': 1,
             'H': 0,
@@ -506,6 +512,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("M*|M*") == {
             '*': 2,
             'C': 0,
+            'V': 0,
             'D': 0,
             'G': 0,
             'H': 0,
@@ -518,6 +525,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("M-M-|M-M*-") == {
             '*': 1,
             'C': 0,
+            'V': 0,
             'D': 0,
             'G': 0,
             'H': 0,
@@ -533,6 +541,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("M*M*/MM/MM") == {
             '*': 2,
             'C': 0,
+            'V': 0,
             'D': 0,
             'G': 0,
             'H': 0,
@@ -549,6 +558,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("M-M-|M-M*-/MM/MM") == {
             '*': 1,
             'C': 0,
+            'V': 0,
             'D': 0,
             'G': 0,
             'H': 0,
@@ -563,6 +573,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("MEME") == {
             '*': 0,
             'C': 0,
+            'V': 0,
             'D': 0,
             'G': 0,
             'H': 0,
@@ -578,6 +589,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("MMMM/*M/*M/*M") == {
             '*': 3,
             'C': 0,
+            'V': 0,
             'D': 0,
             'G': 0,
             'H': 0,
@@ -592,6 +604,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("GMGM") == {
             '*': 0,
             'C': 0,
+            'V': 0,
             'D': 0,
             'G': 2,
             'H': 0,
@@ -607,6 +620,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("G*GM*") == {
             '*': 2,
             'C': 0,
+            'V': 0,
             'D': 0,
             'G': 2,
             'H': 0,
@@ -621,6 +635,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("DMDM") == {
             '*': 0,
             'C': 0,
+            'V': 0,
             'D': 2,
             'G': 0,
             'H': 0,
@@ -635,6 +650,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("+M+M") == {
             '*': 0,
             'C': 0,
+            'V': 0,
             'D': 0,
             'G': 0,
             'H': 0,
@@ -649,6 +665,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("") == {
             '*': 0,
             'C': 0,
+            'V': 0,
             'D': 0,
             'G': 0,
             'H': 0,
