@@ -75,12 +75,11 @@ class DataloaderConfig:
     """Shard the dataset per data-parallel rank before shuffling (cyclic sampler only)."""
 
     pin_memory: bool = True
-    """Pin host memory in the torch DataLoader. Declared only for now: the training loop keeps its
-    built-in value until the loader consumers read this config."""
+    """Pin host memory in the torch DataLoader (``--no-pin-memory`` turns it off)."""
 
     persistent_workers: bool = True
-    """Keep DataLoader workers alive between epochs. Forced to False when num_workers == 0. Declared
-    only for now: the training loop keeps its built-in value until the loader consumers read it."""
+    """Keep the DataLoader workers alive between passes (``--no-persistent-workers`` turns it off).
+    Forced to False when ``num_workers == 0``: there are no workers to keep."""
 
     drop_last: bool = True
     """Drop the last incomplete micro-batch. Declared only for now: the training loop keeps its

@@ -267,10 +267,10 @@ def on_save_checkpoint_start(async_save):
 
             
 def on_pretrain_start():
-    from megatron.training.config.compat import data_sequence_length
-
     """ Function to be called at the start of pretrain function to track E2E meta data
     """
+    from megatron.training.config.compat import data_sequence_length
+
     cfg = get_run_config()
     args = get_args()
     one_logger = get_one_logger()
