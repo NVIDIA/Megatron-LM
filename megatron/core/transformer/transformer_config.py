@@ -1448,6 +1448,11 @@ class TransformerConfig(ModelParallelConfig):
 
     ``None`` places all local layers in one block. This setting requires selective
     recomputation with ``"residual_stream"`` in ``recompute_modules``.
+
+    In HybridStack, ``1`` finalizes replay inside each execution layer's call so
+    its FSDP backward-pre hook can gather weights before replay. A Shortcut-MoE
+    pair stays in one region and must share an FSDP owner for replayed parameters.
+    Shorter regions retain more residual-stream boundary activations.
     """
 
     ####################

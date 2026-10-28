@@ -320,7 +320,11 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             hidden_states = self._apply_mixer_update(
                 mixer_out_with_bias, prepared.state, recompute_context=recompute_context
             )
-
+            if (
+                recompute_context is not None
+                and self.config.residual_stream_recompute_num_layers == 1
+            ):
+                recompute_context.finalize(hidden_states)
             return hidden_states
 
     def sharded_state_dict(
