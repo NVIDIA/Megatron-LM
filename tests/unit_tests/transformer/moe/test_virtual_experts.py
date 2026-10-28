@@ -1413,6 +1413,10 @@ def test_virtual_expert_full_iteration_lifecycle(monkeypatch, request, mxfp8, mt
     """Capture after one warmup, compare changing-input replays, then reset and recapture."""
     if mxfp8:
         request.getfixturevalue("mxfp8_grouped_mlp")
+    # GTP streams are keyed by process-group identity and outlive earlier test models.
+    # Full capture must not join their uncaptured streams at gradient finalization.
+    monkeypatch.setattr(gtp, "_AG_STREAMS", {})
+    monkeypatch.setattr(gtp, "_RS_STREAMS", {})
     monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "0")
     monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
     monkeypatch.setattr(
