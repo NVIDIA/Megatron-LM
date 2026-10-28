@@ -1,6 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import json
+import os
+import re
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -117,6 +121,74 @@ def test_error_extraction_is_opt_in_for_generated_jobs(
     else:
         assert "extract-errors" not in job["script"][0]
         assert job["artifacts"]["paths"] == ["results/"]
+
+
+@pytest.mark.parametrize("scope", ["mr", "mr-slim", "nightly"])
+def test_gb300_child_pipeline_matches_gb200_without_blocking(scope, tmp_path):
+    root = Path(__file__).resolve().parents[2]
+    pipeline = yaml.safe_load((root / ".gitlab-ci.yml").read_text())
+    functional = yaml.safe_load((root / ".gitlab/stages/04.functional-tests.yml").read_text())
+    cluster = pipeline["variables"]["CLUSTER_GB300"]["value"]
+    bridge = functional["functional:run_dev_dgx_gb300"]
+    assert bridge["allow_failure"] is True
+    assert bridge["trigger"]["strategy"] is None
+    assert cluster == "dgxgb300_oci-jhb"
+
+    inventories = {}
+    for platform in ("dgx_gb200", "dgx_gb300"):
+        workloads = recipe_parser.load_workloads(
+            container_tag="test", environment="dev", platform=platform, scope=scope
+        )
+        inventories[platform] = sorted(
+            (item.spec["model"], item.spec["test_case"], item.spec["nodes"], item.spec["gpus"])
+            for item in workloads
+            if item.type != "build"
+        )
+    assert inventories["dgx_gb300"]
+    assert inventories["dgx_gb300"] == inventories["dgx_gb200"]
+
+    # Exercise the actual configure step, including its scope guard and generator.
+    (tmp_path / "tests").symlink_to(root / "tests", target_is_directory=True)
+    steps = functional["functional:configure"]["script"]
+    arguments = next(step for step in steps if "\nARGS=(" in step)
+    generation = next(step for step in steps if "--platform dgx_gb300" in step)
+    environment = {
+        **os.environ,
+        "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}",
+        "BUILD": "yes",
+        "FUNCTIONAL_TEST": "yes",
+        "FUNCTIONAL_TEST_SCOPE": scope,
+        "FUNCTIONAL_TEST_REPEAT": "1",
+        "FUNCTIONAL_TEST_TIME_LIMIT": "2700",
+        "FUNCTIONAL_TEST_CASES": "all",
+        "UTILITY_IMAGE": "utility",
+        "CI_PIPELINE_ID": "test",
+        "RECORD_CHECKPOINTS": "false",
+        "CI_SLURM_ACCOUNT": "mcore",
+        "CLUSTER_GB300": cluster,
+    }
+    result = subprocess.run(
+        ["bash", "-e", "-u", "-o", "pipefail"],
+        input=arguments + generation,
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    # GitLab encloses regexes in slashes; bash uses the same expression without them.
+    rule = re.sub(r"/([^/]+)/", r"\1", bridge["rules"][1]["if"])
+    subprocess.run(["bash", "-c", f"[[ {rule} ]]"], env=environment, check=True)
+    generated = yaml.safe_load((tmp_path / "functional-test-job-dev-GB300.yaml").read_text())
+    jobs = {
+        name: job for name, job in generated.items() if isinstance(job, dict) and "script" in job
+    }
+    assert set(jobs) == {case for _, case, _, _ in inventories["dgx_gb300"]}
+    for job in jobs.values():
+        assert job["timeout"] == "24 hours"
+        assert f"--cluster {cluster}" in job["script"][0]
+        assert "--platform dgx_gb300" in job["script"][0]
+        assert f"--scope {scope}" in job["script"][0]
 
 
 def test_cerno_hard_cutover_contract():
