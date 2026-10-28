@@ -13,13 +13,12 @@ from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
     group_layers_into_shortcut_blocks,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualConnection
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
-from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualConnection
 
 # The shortcut-owned norms are Transformer Engine norms, which need a full TransformerConfig to
 # build and a GPU to run.
@@ -98,13 +97,28 @@ class _FakeMoE(torch.nn.Module):
             config=config, hidden_size=config.hidden_size, eps=config.layernorm_epsilon
         )
         self.mlp = _FakeMLP()
+        if config.wide_residual is not None:
+            self.residual_read_mlp = StreamwiseSigmoidWideResidualConnection(
+                config, self.layer_number, "test", operation="read"
+            )
+            self.residual_write_mlp = StreamwiseSigmoidWideResidualConnection(
+                config, layer_number, "mlp", operation="write"
+            )
 
     def _pre_mlp_layernorm_and_residual(self, hidden_states):
         """Stand-in for the layer protocol: norm output, residual, and an empty payload."""
         return hidden_states, hidden_states, ()
 
-    def _get_mlp_residual_connection(self):
-        return getattr(self, "residual_connection_mlp", None)
+    def _get_mlp_residual_connection(self, operation):
+        if self.config.wide_residual is None:
+            return None
+        match operation:
+            case "read":
+                return self.residual_read_mlp
+            case "write":
+                return self.residual_write_mlp
+            case _:
+                raise ValueError(f"Unsupported residual connection operation: {operation}.")
 
 
 @pytest.mark.parametrize(
@@ -157,21 +171,17 @@ def test_wide_shortcut_owns_independent_registered_read():
     """The routed shortcut reads wide X_l through its own ordinary-width controller."""
 
     config = _shortcut_config(wide_residual=WideResidualConfig(num_streams=3))
-    pg_collection = ProcessGroupCollection()
     compute = _FakeCompute(config)
     compute.residual_stream_hidden_size = config.wide_residual.num_streams * config.hidden_size
     moe = _FakeMoE(config)
-    moe.residual_connection_mlp = StreamwiseSigmoidWideResidualConnection(
-        config=config, layer_number=moe.layer_number, branch_name="mlp", pg_collection=pg_collection
-    )
     block = ShortcutMoEBlock(compute, moe, overlap_a2a=False).cuda()
 
     state_keys = set(block.state_dict())
     assert "shortcut_residual_read.read_map.logit" in state_keys
-    assert "moe_layer.residual_connection_mlp.read_map.logit" in state_keys
+    assert "moe_layer.residual_read_mlp.read_map.logit" in state_keys
     assert (
         block.shortcut_residual_read.read_map.logit
-        is not block.moe_layer.residual_connection_mlp.read_map.logit
+        is not block.moe_layer.residual_read_mlp.read_map.logit
     )
 
     wide_hidden = torch.randn(
@@ -230,6 +240,9 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
     expected_layer_kwargs = (
         {"residual_stream_recompute_context": attn_context} if residual_replay else {}
     )
+    input_padding_mask = torch.tensor([[False, True]])
+    moe_padding_mask = torch.tensor([[True, False]])
+    masks_by_layout = {"zigzag": moe_padding_mask}
 
     class RecordingCPLayoutState:
         def prepare_layer(self, layer_idx, hidden_states):
@@ -239,6 +252,12 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
         def finalize_layer(self, layer_idx, hidden_states):
             calls.append(("finalize", layer_idx))
             return hidden_states + layer_idx
+
+        def get_layer_padding_mask(self, layer_idx, padding_mask, padding_mask_by_layout):
+            assert layer_idx == 5
+            assert padding_mask is input_padding_mask
+            assert padding_mask_by_layout is masks_by_layout
+            return moe_padding_mask
 
     def attn_forward(hidden_states, packed_seq_params=None, **kwargs):
         observed["attn_packed"] = packed_seq_params
@@ -257,11 +276,13 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
     def route(shortcut_hidden, padding_mask=None, packed_seq_params=None, recompute_context=None):
         assert recompute_context is attn_context
         observed["route_packed"] = packed_seq_params
+        assert padding_mask is moe_padding_mask
         return shortcut_hidden, shortcut_hidden
 
     def shared(hidden_states, padding_mask=None, packed_seq_params=None, recompute_context=None):
         assert recompute_context is moe_context
         observed["shared_packed"] = packed_seq_params
+        assert padding_mask is moe_padding_mask
         return torch.zeros_like(hidden_states), None, hidden_states, ()
 
     def postprocess(
@@ -301,12 +322,13 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
         rotary_pos_emb=None,
         sequence_len_offset=None,
         packed_seq_params="packed-input",
-        padding_mask=None,
+        padding_mask=input_padding_mask,
         quant_context_factory=quant_context_factory,
         cp_layout_state=RecordingCPLayoutState(),
         packed_sequence_cp_metadata=cp_metadata,
         attn_recompute_context=attn_context,
         moe_recompute_context=moe_context,
+        padding_mask_by_layout=masks_by_layout,
     )
 
     assert calls == [("prepare", 4), ("prepare", 5), ("prepare", 5), ("finalize", 5)]
