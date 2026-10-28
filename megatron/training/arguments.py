@@ -1316,9 +1316,7 @@ def validate_args(args, defaults={}):
                 "--sequence-packing-scheduler default_dynamic_cp"
             )
         dp_cp_size = args.data_parallel_size * args.context_parallel_size
-        from megatron.core.parallel_state import (
-            get_valid_dynamic_context_parallel_group_sizes,
-        )
+        from megatron.core.parallel_state import get_valid_dynamic_context_parallel_group_sizes
 
         valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(dp_cp_size)
         if args.min_dynamic_context_parallel_size not in valid_group_sizes:
@@ -1648,6 +1646,16 @@ def validate_args(args, defaults={}):
         "Transformer Engine cross entropy loss fusion is disabled due to stability issues. "
         "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
     )
+
+    if getattr(args, "moe_aux_loss_input_token_normalization", False):
+        assert args.sft and args.calculate_per_token_loss, (
+            "--moe-aux-loss-input-token-normalization requires --sft --calculate-per-token-loss"
+        )
+        assert args.pipeline_model_parallel_size == 1, "Input-token MoE normalization requires PP=1"
+        assert args.sequence_packing_scheduler is None, (
+            "Input-token MoE normalization requires the standard SFT iterator"
+        )
+        assert args.gtp_weight_remat_size == 1, "Input-token MoE normalization does not support GTP remat"
 
     # Deterministic mode — env vars + config overrides + torch global state.
     # Implementation lives in ``megatron/training/determinism.py`` so the
@@ -3756,6 +3764,14 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
 def _add_sft_args(parser):
     group = parser.add_argument_group(title='sft')
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
+    group.add_argument(
+        '--moe-aux-loss-input-token-normalization',
+        action='store_true',
+        help='Normalize GPT SFT MoE auxiliary losses over real input tokens independently '
+             'of the scored-target count. Requires --sft --calculate-per-token-loss, PP=1, '
+             'a distinct padding token, and the standard (non-scheduler) SFT iterator. '
+             'Buffers one optimizer step of CPU batches. Disabled for backward compatibility.',
+    )
     group.add_argument(
         '--sft-loss-log-mode',
         type=str,

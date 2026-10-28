@@ -173,6 +173,10 @@ from megatron.training.logging.packed_sequence_stats import (
     consume_packed_sequence_stats_in_iteration,
     update_packed_sequence_stats,
 )
+from megatron.training.moe_loss_normalization import (
+    input_token_moe_loss_scaling,
+    prepare_moe_loss_normalization,
+)
 from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
 # Local.
@@ -197,6 +201,7 @@ from .global_vars import (
     get_telemetry,
     get_tensorboard_writer,
     get_timers,
+    get_tokenizer,
     get_train_state,
     get_wandb_writer,
 )
@@ -3428,6 +3433,35 @@ def train_step(
             scheduled_num_microbatches = get_num_microbatches()
             forward_backward_data_iterator = data_iterator
 
+        moe_normalization_context = nullcontext()
+        if getattr(args, "moe_aux_loss_input_token_normalization", False):
+            # Re-prefetch on a rerun from the rewound original RerunDataIterator.
+            # The batches here still precede TP broadcast and CP slicing.
+            if not (
+                args.sft
+                and config.calculate_per_token_loss
+                and config.pipeline_model_parallel_size == 1
+                and config.sequence_packing_scheduler is None
+                and config.gtp_weight_remat_size == 1
+                and getattr(forward_step_func, "supports_moe_input_token_normalization", False)
+            ):
+                raise ValueError(
+                    "Input-token MoE normalization requires the standard GPT SFT iterator, "
+                    "calculate_per_token_loss, PP=1, and no sequence scheduler or GTP remat."
+                )
+            tokenizer = get_tokenizer()
+            if tokenizer.pad == tokenizer.eod:
+                raise ValueError("Input-token MoE normalization requires distinct PAD and EOD IDs.")
+            normalization_groups = get_attr_wrapped_model(model[0], "pg_collection")
+            forward_backward_data_iterator, ratio = prepare_moe_loss_normalization(
+                forward_backward_data_iterator,
+                scheduled_num_microbatches,
+                pad_token_id=tokenizer.pad,
+                tp_group=normalization_groups.tp,
+                dp_group=normalization_groups.dp,
+            )
+            moe_normalization_context = input_token_moe_loss_scaling(config, ratio)
+
         # Forward pass.
         if save_activations_in_this_iteration:
             enable_activation_logging(model, args.save)
@@ -3451,7 +3485,7 @@ def train_step(
                 iteration=iteration,
                 pg_collection=metric_pg_collection,
             )
-        with grad_context, tensor_metric_context, _fb_cm:
+        with grad_context, tensor_metric_context, _fb_cm, moe_normalization_context:
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=forward_backward_data_iterator,

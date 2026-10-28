@@ -16,6 +16,7 @@
 multi_token_prediction
 multi_latent_attention
 ../../api-guide/router_replay
+../../moe-input-token-normalization
 ```
 
 ```{include} ../../../megatron/core/transformer/moe/README.md

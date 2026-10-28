@@ -59,11 +59,7 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
-from megatron.training.global_vars import (
-    get_run_config,
-    get_tokenizer,
-    set_run_config,
-)
+from megatron.training.global_vars import get_run_config, get_tokenizer, set_run_config
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from model_provider import model_provider
@@ -420,6 +416,11 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
             )
 
+    if getattr(args, "moe_aux_loss_input_token_normalization", False):
+        # Prompts are real routed tokens even though their target loss is masked.
+        # Exclude only padding from router statistics and auxiliary gradients.
+        padding_mask = tokens.eq(get_tokenizer().pad)
+
     timers('batch-generator').stop()
 
     with stimer:
@@ -450,6 +451,9 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)
+
+
+forward_step.supports_moe_input_token_normalization = True
 
 
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
