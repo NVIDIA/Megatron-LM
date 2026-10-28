@@ -1088,7 +1088,9 @@ def get_environment_rollouts(
             if bank is not None:
                 bank.retire_records(dropped)
             join_request_records(rollouts, runtime_state.request_ledger)
-            # Consumed calls belong to finished rollouts; no continuation needs their tokens.
+            # Consumed calls belong to finished rollouts, so no continuation needs their tokens;
+            # calls of rollouts that never reach the trainer stay held until the agent retires
+            # them through Gym's control route.
             _INFERENCE_INTERFACE.forget_held_prefixes(ledgered - set(runtime_state.request_ledger))
             if not cfg.rl.rl_partial_rollouts:
                 # Nothing is in flight at this boundary (asserted at collection), so every

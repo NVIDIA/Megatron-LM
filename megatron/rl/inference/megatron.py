@@ -158,9 +158,12 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
         # Gym admissions need the parent call's exact tokens on whichever engine continues it:
         # rank 0 serves them for the job, every stager publishes, every preparer fetches.
         prefix_store_server = PrefixStoreServer() if dist.get_rank() == 0 else None
-        address = [prefix_store_server.address if prefix_store_server else None]
+        address = [None if prefix_store_server is None else prefix_store_server.address]
         dist.broadcast_object_list(address, src=0)
+        assert isinstance(address[0], str), f"prefix store address not broadcast: {address[0]!r}"
         prefix_store = PrefixStoreClient(address[0])
+        prefix_store.ping()  # a store no rank can reach fails the launch, not every request
+        print_rank_0(f"Prefix store for Gym admissions at {address[0]}")
         inference_engine.payload_stager = LedgerPayloadStager(writer, prefix_store)
         inference_engine.prompt_preparer = GymPromptPreparer(prefix_store)
         dp_addr = await inference_engine.start_listening_to_data_parallel_coordinator(
@@ -237,6 +240,7 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
         writer = self._inference_engine.payload_stager.writer
         if writer is not None:
             writer.close()
+        self._prefix_store.close()
 
         if dist.get_rank() == 0:
             self._client.shutdown_coordinator()

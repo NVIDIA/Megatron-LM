@@ -418,14 +418,17 @@ class LedgerPayloadStager:
             assert uid not in self.records, f"finished-request ledger: duplicate uid {uid!r}"
             self.records[uid] = finished_metadata
         # Custody acknowledged: the reply is served without its per-token payload. A Gym
-        # worker-custody admission in offload_params gets its commit coordinates here.
+        # worker-custody admission in offload_params gets its commit coordinates here. The
+        # acknowledgement precedes the writer's flush: it is durable within this process, which
+        # is Gym's crash domain for the worker, and MRL never resumes an in-flight conversation
+        # across a restart.
         admission = (offload_params or {}).get(NG_CAPTURE_FIELD)
         if admission is None:
             return RequestPayloadStageResult()
-        if self.prefix_store is not None:
-            self.prefix_store.put(uid, payload.prompt_token_ids, payload.generated_token_ids)
         return RequestPayloadStageResult(
-            response_metadata=stage_admitted_call(uid, payload, finished_metadata, admission)
+            response_metadata=stage_admitted_call(
+                uid, payload, finished_metadata, admission, self.prefix_store
+            )
         )
 
     def drain(self) -> dict[str, FinishedRequestRecord]:
