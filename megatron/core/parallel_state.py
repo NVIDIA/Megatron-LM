@@ -3,8 +3,8 @@
 """Model and data parallel groups.
 
 .. warning::
-    **This module is being deprecated.** It holds the process groups for a single, global
-    parallel grid. Megatron-Core is migrating to explicit process-group passing via
+    **The accessors of this module are deprecated.** It holds the process groups for a single,
+    global parallel grid. Megatron-Core is migrating to explicit process-group passing via
     :class:`~megatron.core.process_groups_config.ProcessGroupCollection`.
 
     The group / rank / world-size accessors here read that global grid. A model using an
@@ -24,8 +24,10 @@
       accessor for it preserves the global dependency. Bootstrap code and explicitly commented
       migration fallbacks may still use it during the transition.
 
-    ``initialize_model_parallel`` / ``destroy_model_parallel`` / ``is_initialized`` are not
-    deprecated by this migration.
+    Bootstrap, teardown and the registry are not deprecated: ``initialize_model_parallel``,
+    ``build_process_group_collection``, ``destroy_model_parallel``, ``is_initialized``,
+    ``model_parallel_is_initialized``, ``register_process_groups`` and
+    ``get_registered_process_groups``.
 
     See ``docs/developer/parallel-state-deprecation.md``.
 """
@@ -1942,7 +1944,8 @@ def get_data_parallel_group_gloo(with_context_parallel=False, partial_data_paral
     """Get the Gloo data-parallel group the caller rank belongs to.
 
     Deprecated: reads the global parallel state. Pass an explicit Gloo data-parallel group from
-    the caller; there is no corresponding ProcessGroupCollection field. See
+    the caller, such as pg_collection.intra_dp_cp_gloo for the partial data-parallel group; the
+    other Gloo groups have no ProcessGroupCollection field. See
     docs/developer/parallel-state-deprecation.md for migration details and optional-group
     handling.
     """
@@ -2006,10 +2009,9 @@ def get_dynamic_data_context_parallel_groups(
 ) -> torch.distributed.ProcessGroup:
     """Get the dynamic CP group of ``group_size`` containing the caller rank.
 
-    Deprecated: reads the global parallel state. Pass the selected dynamic data/context group
-    from the caller; there is no corresponding ProcessGroupCollection field. See
-    docs/developer/parallel-state-deprecation.md for migration details and optional-group
-    handling.
+    Deprecated: reads the global parallel state. Use pg_collection.dynamic_cp[group_size] from
+    the caller-provided collection. See docs/developer/parallel-state-deprecation.md for
+    migration details and optional-group handling.
     """
     # Runtime DCP subdivides the replicate DPxCP domain, not the independent
     # GTP-remat data-distribution axis.
@@ -2788,7 +2790,8 @@ def get_expert_data_parallel_group_gloo(partial_expert_data_parallel=False):
     """Get expert data parallel group-gloo.
 
     Deprecated: reads the global parallel state. Pass an explicit Gloo expert-data-parallel
-    group from the caller; there is no corresponding ProcessGroupCollection field. See
+    group from the caller, such as pg_collection.intra_expt_dp_gloo for the partial expert
+    data-parallel group; the other expert Gloo group has no ProcessGroupCollection field. See
     docs/developer/parallel-state-deprecation.md for migration details and optional-group
     handling.
     """
