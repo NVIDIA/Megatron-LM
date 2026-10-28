@@ -57,6 +57,7 @@ def get_model_and_buffers(
     num_distributed_optimizer_instances: int = 1,
     grad_reduce_in_fp32: bool = True,
     param_name_patterns_for_fp32_local_accumulation: tuple = (),
+    reduce_scatter_with_fp32_accumulation: bool = False,
 ):
     ddp_config = DistributedDataParallelConfig(
         grad_reduce_in_fp32=grad_reduce_in_fp32,
@@ -66,6 +67,7 @@ def get_model_and_buffers(
         average_in_collective=average_in_collective,
         num_distributed_optimizer_instances=num_distributed_optimizer_instances,
         param_name_patterns_for_fp32_local_accumulation=param_name_patterns_for_fp32_local_accumulation,
+        reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
     )
     model = TestModel(
         input_dim=input_dim,
@@ -422,6 +424,40 @@ def test_force_all_reduce_uses_correct_collective(force_all_reduce: bool):
             ), "Expected all_reduce NOT to be called when force_all_reduce=False"
 
     Utils.destroy_model_parallel()
+
+
+def test_reduce_scatter_selection_is_per_bucket_group():
+    """Mixed DDP configurations must dispatch and wait on their own reduction implementation."""
+    Utils.initialize_model_parallel()
+    try:
+        # Build both models before reducing either so dispatch cannot depend on
+        # which model was constructed last.
+        models = [
+            get_model_and_buffers(
+                input_dim=4,
+                output_dim=4,
+                num_layers=1,
+                bias=True,
+                shared_embedding=False,
+                bucket_size=None,
+                use_distributed_optimizer=True,
+                overlap_grad_reduce=True,
+                average_in_collective=False,
+                grad_reduce_in_fp32=False,
+                reduce_scatter_with_fp32_accumulation=fp32_accumulation,
+            )
+            for fp32_accumulation in (True, False)
+        ]
+        for model, buffer, bucket_groups in models:
+            buffer.grad_data.fill_(1)
+            model.finish_grad_sync()
+            for group in bucket_groups:
+                shard = group.cached_grad_buffer_shard_list[0][
+                    group.intra_distributed_optimizer_instance_rank
+                ]
+                torch.testing.assert_close(shard, torch.ones_like(shard))
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_start_param_sync_dp_size_1():

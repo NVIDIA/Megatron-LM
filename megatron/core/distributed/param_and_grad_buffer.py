@@ -288,9 +288,7 @@ class _ParamAndGradBucketGroup:
             f"{self.ddp_config.use_distributed_optimizer=}",
         )
 
-        global dist_reduce_scatter_func
         if self.ddp_config.reduce_scatter_with_fp32_accumulation:
-            dist_reduce_scatter_func = reduce_scatter_with_fp32_accumulation
             log_single_rank(
                 logger,
                 logging.INFO,
@@ -776,7 +774,14 @@ class _ParamAndGradBucketGroup:
                     local_data_view = self.cached_grad_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
                     ]
-                    grad_reduce_handle = dist_reduce_scatter_func(
+                    # Select per bucket group: another DDP model may use a different
+                    # accumulation mode, which also determines the handle we must wait on.
+                    reduce_scatter_func = (
+                        reduce_scatter_with_fp32_accumulation
+                        if self.ddp_config.reduce_scatter_with_fp32_accumulation
+                        else dist_reduce_scatter_func
+                    )
+                    grad_reduce_handle = reduce_scatter_func(
                         local_data_view,
                         bucket.grad_data,
                         op=reduce_op,
