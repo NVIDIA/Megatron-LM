@@ -17,7 +17,7 @@ This guide for Megatron Core walks you through the following tasks:
 1. Clone the Megatron GitHub repo in it.
 
     ```bash
-    docker run --ipc=host --shm-size=512m --gpus 2 -it nvcr.io/nvidia/pytorch:24.02-py3
+    docker run --ipc=host --shm-size=512m --gpus 2 -it -e PIP_CONSTRAINT= nvcr.io/nvidia/pytorch:26.01-py3
 
     git clone https://github.com/NVIDIA/Megatron-LM.git
     cd Megatron-LM
