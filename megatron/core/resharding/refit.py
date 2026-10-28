@@ -442,6 +442,14 @@ def swap_model_weights(
     """
     Orchestrate weight swap/refit.
 
+    The destination must be quiesced for the entire call. Transfer execution is
+    not transactional: if a backend fails after writes begin, earlier batches
+    may already be visible. The exception is propagated; callers must discard
+    that partial weight generation, recover/close the backend, and retry from a
+    known-good generation rather than serving from the destination. When using
+    a backend name, call ``clear_service_cache()`` before retrying so the failed
+    cached service is closed and not reused.
+
     If *transform* is not explicitly provided, the function automatically uses
     any ``MXFP8ReshardTransform`` that was created and cached by a prior
     ``prepare_swap_model_weights`` call for the same model pair.  This makes

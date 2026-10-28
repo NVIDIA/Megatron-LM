@@ -308,6 +308,15 @@ across refits.
 Call `clear_all_caches()` before destroying distributed process groups
 to avoid stale references.  This also finalizes NVSHMEM resources.
 
+## Failure recovery
+
+Transfers are not transactional. If a backend raises after execution starts,
+completed batches may already be visible while later tensors remain unchanged;
+cache refresh and the final barrier do not run. Keep the destination quiesced,
+discard that partial weight generation, and close the failed service before a
+full retry from known-good weights. Call `clear_service_cache()` when the public
+API was given a backend name, because that service is otherwise cached.
+
 ## Process Group Requirements
 
 The source and destination models must each have a `pg_collection`
