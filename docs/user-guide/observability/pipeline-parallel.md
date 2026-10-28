@@ -62,7 +62,8 @@ All PP stages of a given step share a single `trace_id`. Each stage's `megatron.
 
 Neither part is wired into this repository yet: `megatron/training/training.py` does not call
 `broadcast_trace_context`, and `schedules.py` does not emit `megatron.pp.recv_forward.linked`.
-The snippets below show where each part goes.
+The snippets below show where each part goes. The rest of this page describes the integration as
+planned: its instrumented sites, cost and switches apply once it is wired in.
 
 ### Broadcast — `megatron/training/training.py`
 
@@ -115,8 +116,8 @@ if _recv_link_span is not None:
 
 | recv site | Instrumented? |
 |---|---|
-| Warmup `recv_forward` (lines ~2166 in `schedules.py`) | Yes |
-| Pre-1F1B `recv_forward` (line ~2196) | Yes |
+| Warmup `recv_forward` | Planned |
+| Pre-1F1B `recv_forward` | Planned |
 | Steady-state 1F1B `send_forward_recv_backward` | No — high frequency; instrumenting every hop would dominate signal |
 | Cooldown `recv_backward` | No — redundant with warmup coverage |
 
