@@ -11,14 +11,16 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
-import triton
-import triton.language as tl
 from torch import Tensor
 
+# Share the MLA helper's optional dependency/version policy and decorator stubs.
 from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+    HAVE_TRITON,
     _autotuned_mla_rope_bwd_inplace_kernel,
     _autotuned_mla_rope_fwd_inplace_kernel,
     _get_thd_token_idx,
+    tl,
+    triton,
 )
 
 
@@ -129,6 +131,8 @@ def _raw_output_rope(
     position_ids=None,
     undo=False,
 ):
+    if not HAVE_TRITON:
+        raise RuntimeError("CSA output RoPE fusion requires Triton.")
     if cu_seqlens_q is None:
         _, batch_size, nheads, head_dim = t.shape
         x = t.view(-1, nheads, head_dim)
@@ -186,6 +190,8 @@ def mla_rope_unapply_raw(
     position_ids=None,
 ):
     """Undo output RoPE, fusing non-rotary copy when rebuilding saved output."""
+    if not HAVE_TRITON:
+        raise RuntimeError("CSA output RoPE fusion requires Triton.")
     if out is None:
         return _raw_output_rope(
             t,
