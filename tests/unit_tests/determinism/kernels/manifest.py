@@ -212,6 +212,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Authoritative bool-map gather, invalid-slot padding, and probability-gradient scatter.",
     ),
     KernelEntry(
+        name="mok_runtime_dispatch",
+        sources=(
+            "megatron/core/transformer/moe/megakernel/mok/runtime.py",
+            "megatron/core/transformer/moe/megakernel/mok/backend.py",
+        ),
+        tests=(K + "test_moe_kernels.py",),
+        kind="dispatch",
+        notes="Real BF16/MXFP8 routed-only SiTU with dP/main-grad replay, native shared/latent "
+        "TP/SP, and legacy BF16 fused shared with output gate off/on; requires supported MOK/TE "
+        "on SM100/SM103 with EP4.",
+    ),
+    KernelEntry(
         name="balanced_cp_route_metadata",
         sources=(
             "megatron/core/transformer/experimental_attention_variant/cp_balanced_indexer.py",
