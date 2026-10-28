@@ -128,14 +128,20 @@ def _expected_mhc_backend_calls(fused):
 
 
 @pytest.fixture(autouse=True)
-def _keep_mhc_kernels_compiled(monkeypatch):
-    """Keep the compiled native mHC kernels compiled for every test in this file.
+def _fresh_mhc_compile_cache(monkeypatch):
+    """Compile the native mHC kernels afresh for every test in this file.
 
-    They recompile per input layout and grad mode. Across this file's model shapes they
-    would exceed dynamo's default recompile limit of 8 and fall back to eager kernels that
-    round BF16 differently, so eager and graph runs would disagree depending on test order.
+    mHC's native aggregate and post-BDA helpers use torch.compile and recompile per input
+    layout, grad mode and shape. Sharing that cache across this file's model shapes made a
+    test's eager reference and graph run round BF16 differently depending on test order, and
+    exhausted the default recompile limit, after which further variants run eagerly. As in
+    test_pp_mhc_compatibility.py, start each test from an empty cache, and allow it enough
+    recompiles to stay compiled.
     """
     monkeypatch.setattr(torch._dynamo.config, 'recompile_limit', 64)
+    torch.compiler.reset()
+    yield
+    torch.compiler.reset()
 
 
 _ATTENTION_GRAPH_SPLIT = dict(
