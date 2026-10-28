@@ -340,6 +340,9 @@ class Engram(MegatronModule):
             tp_group=pg_collection.tp,
             expt_dp_group=pg_collection.expt_dp,
         )
+        if engram_config.freeze_embedding:
+            for table in self.embedding.tables:
+                table.weight.requires_grad_(False)
         factory_kwargs = {"device": device, "dtype": config.params_dtype}
         # Official Qwen PLE layout: one fused key projection over all residual streams, one
         # shared value projection, and one group RMSNorm per role. This is mathematically

@@ -109,3 +109,61 @@ def test_official_forward_and_backward_math(tmp_path, num_streams):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-9, atol=1e-9)
     assert module.embedding.tables[0].weight.is_engram_embedding
     assert not module.embedding.tables[0].weight.allreduce
+
+
+def test_frozen_embedding_keeps_lookup_and_dense_gradients(tmp_path):
+    artifact = write_tokenizer_map(tmp_path / "map.json", vocab_size=32, layer_ids=(1,))
+    modules = []
+    for freeze in (False, True):
+        torch.manual_seed(123)
+        config = EngramConfig(
+            global_vocab_sizes=(17, 19),
+            layer_ids=(1,),
+            max_ngram_order=3,
+            num_hash_heads=2,
+            memory_dim=8,
+            kernel_size=4,
+            hash_seed=0,
+            boundary_token_id=0,
+            tokenizer_map_path=str(artifact),
+            freeze_embedding=freeze,
+        )
+        module = Engram(
+            config=make_module_config(),
+            engram_config=config,
+            layer_number=1,
+            pg_collection=make_pg_collection(),
+        )
+        with torch.no_grad():
+            module.short_conv.weight.normal_(mean=0.0, std=0.03)
+        modules.append(module)
+    trainable, frozen = modules
+
+    assert all(table.weight.requires_grad for table in trainable.embedding.tables)
+    assert not any(table.weight.requires_grad for table in frozen.embedding.tables)
+    assert all(
+        parameter.requires_grad
+        for parameter in frozen.parameters()
+        if not getattr(parameter, "is_engram_embedding", False)
+    )
+
+    input_ids = torch.tensor([[1, 4, 2, 7], [3, 5, 9, 2]], dtype=torch.int64)
+    hidden = torch.randn(4, 2, 8, dtype=torch.float64)
+    projection = torch.randn(4, 2, 8, dtype=torch.float64)
+    outputs = []
+    for module in modules:
+        output = module(hidden, input_ids)
+        (output * projection).sum().backward()
+        outputs.append(output)
+    torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)
+
+    for table in frozen.embedding.tables:
+        assert table.weight.grad is None
+    dense = [
+        (name, parameter)
+        for name, parameter in trainable.named_parameters()
+        if not getattr(parameter, "is_engram_embedding", False)
+    ]
+    frozen_parameters = dict(frozen.named_parameters())
+    for name, parameter in dense:
+        torch.testing.assert_close(frozen_parameters[name].grad, parameter.grad, rtol=0, atol=0)

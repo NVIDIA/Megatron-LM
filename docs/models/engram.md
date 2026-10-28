@@ -47,6 +47,12 @@ order, hash-head count, memory dimension per n-gram order, convolution kernel si
 raw tokenizer pad ID, tokenizer-map artifact, sparse-table LR multiplier, and sparse-table weight
 decay.
 
+`--engram-freeze-embedding` keeps the sparse tables fixed. They still serve the EP lookup, but
+take no gradient, so they get no gradient buffer and no optimizer state, and the lookup's
+backward all-to-all is skipped; the dense half (projections, norms, short convolution) still
+trains. At EP8 this drops a full-size (51.2 B) table from about 18 bytes to 2 bytes per local
+parameter. It cannot be combined with `--engram-verify-training`, which checks table gradients.
+
 Startup validates the following before model allocation:
 
 - there is one positive global vocabulary budget for every order from 2 through the configured

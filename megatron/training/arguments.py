@@ -1564,6 +1564,10 @@ def validate_args(args, defaults={}):
             "--engram-verify-training reads full gradients from main_grad and is incompatible "
             "with --use-distributed-optimizer, which reduce-scatters the gradient buffer."
         )
+        assert not getattr(args, "engram_freeze_embedding", False), (
+            "--engram-verify-training checks sparse-table gradients and updates; a frozen "
+            "table (--engram-freeze-embedding) has neither."
+        )
 
     # MoE router check
     if isinstance(args.moe_router_load_balancing_type, list) and len(args.moe_router_load_balancing_type) == 1:
@@ -3603,6 +3607,12 @@ def _add_engram_args(parser):
     )
     group.add_argument('--engram-embedding-lr-multiplier', type=float, default=5.0)
     group.add_argument('--engram-embedding-weight-decay', type=float, default=0.0)
+    group.add_argument(
+        '--engram-freeze-embedding',
+        action='store_true',
+        help='Keep the n-gram hash-embedding tables fixed (no gradient, no optimizer state); '
+        'the dense part of the n-gram memory still trains.',
+    )
     group.add_argument(
         '--engram-verify-training',
         action='store_true',
