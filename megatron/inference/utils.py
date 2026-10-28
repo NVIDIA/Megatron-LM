@@ -8,7 +8,7 @@ from typing import Literal, Optional
 
 import torch
 
-from megatron.core import dist_checkpointing
+from megatron.core import dist_checkpointing, parallel_state
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
@@ -18,7 +18,10 @@ from megatron.core.inference.quantization.utils import (
     quantize_model_to_mxfp8,
     resolve_mxfp8_backend,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    global_process_group_fallback,
+)
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_size, log_single_rank, unwrap_model
@@ -168,8 +171,12 @@ def get_model_for_inference(
     """Initialize model and load checkpoint for inference.
 
     Args:
-        pg_collection: Process groups used to build and load the model. When
-            omitted, the initialized global MPU process groups are used.
+        pg_collection: Process groups used to build and load the model, such as the groups
+            that initialize_megatron() registered,
+            ``parallel_state.get_registered_process_groups()``. Omitting it is deprecated: the
+            groups are then built from the global parallel state, with a
+            ProcessGroupFallbackWarning. With ModelOpt, only the registered groups are
+            supported.
         checkpoint_group: Ranks that collectively form this model replica's
             complete checkpoint view. Defaults to the global process group.
     """
@@ -177,7 +184,10 @@ def get_model_for_inference(
     args = get_args()
 
     if HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
-        if pg_collection is not None:
+        if (
+            pg_collection is not None
+            and pg_collection is not parallel_state.get_registered_process_groups()
+        ):
             raise ValueError(
                 "Custom inference process groups are not supported by the ModelOpt builder"
             )
@@ -185,10 +195,17 @@ def get_model_for_inference(
         # modelopt hooks (custom layer specs, calibration, etc.) have not been
         # ported to the new ``ModelBuilder`` API yet. ``_get_model`` also takes
         # care of running the modelopt-checkpoint auto-detection side effect.
-        model = _get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
+        model = _get_model(
+            modelopt_gpt_hybrid_builder, wrap_with_ddp=False, pg_collection=pg_collection
+        )
+        # Without explicit groups, load_checkpoint takes those of the model, which holds them.
+        pg_collection = None
     else:
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            with global_process_group_fallback(
+                "get_model_for_inference", deprecated_in="0.21", removed_in="0.23"
+            ):
+                pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         builder = get_model_builder(args, pg_collection=pg_collection)
         model = builder.build_distributed_models(pg_collection=pg_collection, wrap_with_ddp=False)
 
@@ -474,7 +491,10 @@ def get_dynamic_inference_engine(
     """
     args = get_args()
     if model is None:
-        model = get_model_for_inference()
+        # The groups of the grid that initialize_megatron() registered.
+        model = get_model_for_inference(
+            pg_collection=parallel_state.get_registered_process_groups()
+        )
     tokenizer = build_tokenizer(args)
 
     inference_config = get_inference_config_from_model_and_args(model, args)

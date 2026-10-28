@@ -25,8 +25,8 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.inference.text_generation_server import MegatronServer
 from megatron.core.inference.text_generation_server.run_mcore_engine import run_mcore_engine
+from megatron.core.parallel_state import get_registered_process_groups
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model
 from megatron.inference.utils import get_model_builder
@@ -154,7 +154,8 @@ def main(model_type: str = "gpt"):
             model = get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
         else:
             builder = get_model_builder(args, provider=model_type)
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            # The groups of the grid that initialize_megatron() registered.
+            pg_collection = get_registered_process_groups()
             model = builder.build_distributed_models(
                 pg_collection=pg_collection, wrap_with_ddp=False
             )

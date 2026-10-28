@@ -24,6 +24,7 @@ sys.path.append(
 from megatron.core.inference.apis import MegatronAsyncLLM, ServeConfig
 from megatron.core.inference.shards import build_inference_pg_collections_for_shards
 from megatron.core.inference.shards_spec import spec_declares_disaggregation
+from megatron.core.parallel_state import get_registered_process_groups
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import configure_nvtx_profiling
 from megatron.inference.utils import (
@@ -101,7 +102,7 @@ def _build_model_and_inference_config(args):
         inference_config.pg_collection = local_shard.pg_collection
         return model, inference_config
 
-    model = get_model_for_inference()
+    model = get_model_for_inference(pg_collection=get_registered_process_groups())
     inference_config = get_inference_config_from_model_and_args(model, args)
     return model, inference_config
 

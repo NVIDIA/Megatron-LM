@@ -53,10 +53,9 @@ def initialize_distributed(
     )
 
     # Megatron core distributed training initialization
-    parallel_state.initialize_model_parallel(
+    return parallel_state.initialize_model_parallel(
         tensor_model_parallel_size, pipeline_model_parallel_size
     )
-    return ProcessGroupCollection.use_mpu_process_groups()
 
 
 def model_provider(pg_collection: ProcessGroupCollection) -> GPTModel:

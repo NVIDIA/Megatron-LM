@@ -19,7 +19,10 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    global_process_group_fallback,
+)
 from megatron.core.transformer.spec_utils import import_module
 from megatron.inference.text_generation import generate_and_post_process
 from megatron.training import get_args, get_model, get_tokenizer, print_rank_0
@@ -30,21 +33,34 @@ from megatron.training.global_vars import set_run_config
 from megatron.training.initialize import initialize_megatron
 
 
-def model_provider(pre_process=True, post_process=True) -> GPTModel:
+def model_provider(
+    pre_process=True, post_process=True, config=None, pg_collection=None
+) -> GPTModel:
     """Builds the model.
 
     Args:
         pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
         post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
+        config (TransformerConfig, optional): Transformer configuration of the model. Defaults
+            to the one of the arguments.
+        pg_collection (ProcessGroupCollection, optional): Process groups the model is built on;
+            get_model() passes the run's. Omitting it is deprecated: the groups are then built
+            from the global parallel state, with a ProcessGroupFallbackWarning.
 
 
     Returns:
         GPTModel: The returned model
     """
     args = get_args()
+    if pg_collection is None:
+        with global_process_group_fallback(
+            "generate_samples_gpt.model_provider", deprecated_in="0.21", removed_in="0.23"
+        ):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     print_rank_0('building GPT model ...')
-    config = core_transformer_config_from_args(args)
+    if config is None:
+        config = core_transformer_config_from_args(args)
 
     if args.spec is None:
         if args.transformer_impl == 'local':
@@ -80,7 +96,7 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
         position_embedding_type=args.position_embedding_type,
         rotary_percent=args.rotary_percent,
-        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+        pg_collection=pg_collection,
     )
 
     return model

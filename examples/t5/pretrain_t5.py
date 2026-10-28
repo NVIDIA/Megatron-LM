@@ -26,6 +26,7 @@ from megatron.core.models.T5.t5_spec import (
 )
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
+    global_process_group_fallback,
     warn_global_process_group_fallback,
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
@@ -91,11 +92,19 @@ def model_provider(
             compute output logits/loss. Defaults to True.
         add_encoder (bool, optional): Defaults to True
         add_decoder (bool, optional): Defaults to True
+        config (TransformerConfig, optional): Transformer configuration of the model. Defaults
+            to the one of the arguments.
+        pg_collection (ProcessGroupCollection, optional): Process groups the model is built on;
+            get_model() passes the run's. Omitting it is deprecated: the groups are then built
+            from the global parallel state, with a ProcessGroupFallbackWarning.
     Returns:
         T5Model: The returned T5 model
     """
     if pg_collection is None:
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        with global_process_group_fallback(
+            "pretrain_t5.model_provider", deprecated_in="0.21", removed_in="0.23"
+        ):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     args = get_args()
 

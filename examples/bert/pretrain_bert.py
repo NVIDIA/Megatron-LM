@@ -22,6 +22,7 @@ from megatron.core.models.bert.bert_layer_specs import (
 from megatron.core.models.bert.bert_model import BertModel
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
+    global_process_group_fallback,
     warn_global_process_group_fallback,
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
@@ -38,9 +39,22 @@ from megatron.training.utils import average_losses_across_data_parallel_group
 
 
 def model_provider(pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None):
-    """Build the model."""
+    """Build the model.
+
+    Args:
+        pre_process: Whether the model chunk embeds its input.
+        post_process: Whether the model chunk computes the output and the losses.
+        vp_stage: Virtual pipeline stage of the model chunk.
+        config: Transformer configuration of the model. Defaults to the one of the arguments.
+        pg_collection: Process groups the model is built on; get_model() passes the run's.
+            Omitting it is deprecated: the groups are then built from the global parallel
+            state, with a ProcessGroupFallbackWarning.
+    """
     if pg_collection is None:
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        with global_process_group_fallback(
+            "pretrain_bert.model_provider", deprecated_in="0.21", removed_in="0.23"
+        ):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     print_rank_0('building BERT model ...')
 

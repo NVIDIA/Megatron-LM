@@ -180,12 +180,8 @@ def test_convert_builds_the_model_on_the_stage_of_its_groups(monkeypatch):
     monkeypatch.setattr(
         convert_model, "get_args", lambda: SimpleNamespace(init_model_with_meta_device=False)
     )
-    # The script collects the groups of the grid initialize_megatron built exactly once.
-    monkeypatch.setattr(
-        convert_model,
-        "ProcessGroupCollection",
-        SimpleNamespace(use_mpu_process_groups=lambda: pg_collection),
-    )
+    # The script takes the groups of the grid that initialize_megatron registered.
+    monkeypatch.setattr(convert_model, "get_registered_process_groups", lambda: pg_collection)
 
     with forbid_global_process_groups():
         convert_model.get_model(model_provider)
