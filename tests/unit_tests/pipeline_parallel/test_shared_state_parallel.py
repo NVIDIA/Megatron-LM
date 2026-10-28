@@ -10,12 +10,16 @@ from torch import nn
 
 from megatron.core.context_parallel.shared_state import gather_state
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
-from megatron.core.pipeline_parallel.pipeline_payload import TensorStatePayload
+from megatron.core.pipeline_parallel.pipeline_payload import (
+    PipelineDataIterator,
+    PipelinePayloadPlan,
+    PipelinePayloadSpec,
+    TensorStatePayload,
+)
 from megatron.core.pipeline_parallel.schedules import (
     forward_backward_pipelining_with_interleaving,
     forward_backward_pipelining_without_interleaving,
 )
-from megatron.core.pipeline_parallel.typed_p2p_communication import create_pipeline_control_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.state_boundary import TensorField, TensorSchema
@@ -97,22 +101,26 @@ class _Stage(nn.Module):
         )
 
 
-@pytest.fixture(scope="module")
-def control_group():
-    if Utils.world_size < 4 or Utils.world_size % 4:
-        pytest.skip("Requires a multiple of four GPU workers for PP2 x CP2")
-    Utils.initialize_model_parallel(1, 2, context_parallel_size=2)
-    pp = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["pp"]).pp
-    group = create_pipeline_control_group(pp, world_group=torch.distributed.group.WORLD)
-    yield group
-    torch.distributed.destroy_process_group(group)
-    Utils.destroy_model_parallel()
+def _plan(stage, count):
+    """Every boundary carries the hidden activation plus both shared fields."""
+
+    def boundary(index):
+        hidden = TensorField("__hidden__", (8, 2), torch.float32, "strided", True)
+        return PipelinePayloadSpec((hidden, *FIELDS), boundary_id=f"after:{index}")
+
+    first, last = stage.index == 0, stage.index == stage.total - 1
+    return PipelinePayloadPlan(
+        (None if first else boundary(stage.index - 1),) * count,
+        (None if last else boundary(stage.index),) * count,
+    )
 
 
 @pytest.mark.usefixtures("te_rng_tracker")
 @pytest.mark.parametrize("vp_size", [1, 2])
 @pytest.mark.parametrize("mode", ["eager", "recompute", "torch", "transformer_engine"])
-def test_cp_pp_state_matches_unpartitioned_layers(vp_size, mode, control_group):
+def test_cp_pp_state_matches_unpartitioned_layers(vp_size, mode):
+    if Utils.world_size < 4 or Utils.world_size % 4:
+        pytest.skip("Requires a multiple of four GPU workers for PP2 x CP2")
     Utils.initialize_model_parallel(
         1,
         2,
@@ -120,7 +128,6 @@ def test_cp_pp_state_matches_unpartitioned_layers(vp_size, mode, control_group):
         context_parallel_size=2,
     )
     groups = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["pp", "tp", "cp"])
-    control = control_group
     count, total = 4, 2 * vp_size
     config = TransformerConfig(
         num_layers=total,
@@ -139,7 +146,6 @@ def test_cp_pp_state_matches_unpartitioned_layers(vp_size, mode, control_group):
     try:
         for vp in range(vp_size):
             models.append(_Stage(config, groups.pp.rank() + 2 * vp, total, groups.cp, mode, count))
-            models[-1].pipeline_control_group = control
         reference = [_Stage(config, i, total, groups.cp, "eager", count) for i in range(total)]
         batches = [
             (
@@ -174,7 +180,11 @@ def test_cp_pp_state_matches_unpartitioned_layers(vp_size, mode, control_group):
         )
         schedule(
             forward_step_func=forward,
-            data_iterator=[iter(batches) for _ in models] if vp_size > 1 else iter(batches),
+            data_iterator=(
+                [PipelineDataIterator(batches, _plan(m, count)) for m in models]
+                if vp_size > 1
+                else PipelineDataIterator(batches, _plan(models[0], count))
+            ),
             model=models if vp_size > 1 else models[0],
             num_microbatches=count,
             seq_length=16,
