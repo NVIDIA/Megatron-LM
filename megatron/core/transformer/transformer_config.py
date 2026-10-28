@@ -913,9 +913,13 @@ class TransformerConfig(ModelParallelConfig):
     for each individual sample.
     - "global_aux_loss": Load balancing loss calculated at global batch level.
     - "sinkhorn": Balancing algorithm used in S-BASE.
-    - "quantile_balancing": Dual coordinate-descent quantile balancing (QB). Load balance is
-    handled entirely by an internal per-expert bias update; auxiliary losses must be disabled
-    (`moe_aux_loss_coeff` = 0) when QB is selected.
+    - "quantile_balancing": Quantile Balancing (QB). Load balance is handled entirely by an
+    internal per-expert bias update; auxiliary losses must be disabled (`moe_aux_loss_coeff` = 0)
+    when QB is selected. The bias is estimated either by the dual coordinate-descent estimator
+    (`moe_router_quantile_balancing_estimation_scope="micro_batch"`, with
+    `moe_router_quantile_balancing_ema`) or by Kimi K3's global-batch histogram estimator
+    (`="global_batch"`, with `moe_router_qb_num_bins`), which accumulates a per-expert histogram
+    across the global batch and converts it into the next-step per-expert routing bias.
     - "none": No load balancing.
     A list of strings can be provided to combine multiple aux-loss load balancing types.
     The default is "aux_loss".
@@ -993,9 +997,22 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_router_quantile_balancing_ema: float = 0.0
     """EMA coefficient for the quantile-balancing per-expert bias (`qb_beta`), used only when
-    `moe_router_load_balancing_type` is "quantile_balancing". At each global batch the bias is
-    updated as `qb_beta = ema * qb_beta + (1 - ema) * local_quantile`. The default 0.0 means
-    no memory: the bias is replaced by the latest global-batch quantile estimate each step."""
+    `moe_router_load_balancing_type` is "quantile_balancing" with the "micro_batch" estimator.
+    At each global batch the bias is updated as `qb_beta = ema * qb_beta + (1 - ema) * local_quantile`.
+    The default 0.0 means no memory: the bias is replaced by the latest quantile estimate each step."""
+
+    moe_router_quantile_balancing_estimation_scope: Literal['global_batch', 'micro_batch'] = (
+        "global_batch"
+    )
+    """Population used to estimate the Quantile Balancing bias. "global_batch" uses Kimi K3's
+    global-batch histogram estimator (with `moe_router_qb_num_bins`), which accumulates a persistent
+    per-expert histogram across the global batch and converts it into the next-step bias. Only
+    "global_batch" is wired here (ported from #6637); "micro_batch" (main's dual coordinate-descent
+    estimator, with `moe_router_quantile_balancing_ema`) is accepted by the type but rejected by
+    validation until its estimator is carried."""
+
+    moe_router_qb_num_bins: int = 1000
+    """Number of persistent uniform histogram bins per expert for global-batch QB."""
 
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
@@ -2498,6 +2515,16 @@ class TransformerConfig(ModelParallelConfig):
                     f"moe_shared_expert_overlap only works with alltoall or flex token dispatcher."
                 )
 
+        if self.moe_router_load_balancing_type == ["quantile_balancing"]:
+            assert (
+                isinstance(self.moe_aux_loss_coeff, list) and len(self.moe_aux_loss_coeff) == 1
+            ), (
+                "moe_aux_loss_coeff must be a list of the same length as "
+                "moe_router_load_balancing_type"
+            )
+            self.moe_router_load_balancing_type = "quantile_balancing"
+            self.moe_aux_loss_coeff = self.moe_aux_loss_coeff[0]
+
         if isinstance(self.moe_router_load_balancing_type, list):
             assert isinstance(self.moe_aux_loss_coeff, list) and len(
                 self.moe_aux_loss_coeff
@@ -2505,6 +2532,54 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_aux_loss_coeff must be a list of the same length as "
                 "moe_router_load_balancing_type"
             )
+
+        if (
+            isinstance(self.moe_router_load_balancing_type, list)
+            and "quantile_balancing" in self.moe_router_load_balancing_type
+        ):
+            raise ValueError("quantile_balancing must be the sole moe_router_load_balancing_type.")
+        if self.moe_router_load_balancing_type == "quantile_balancing":
+            aux_coeffs = (
+                self.moe_aux_loss_coeff
+                if isinstance(self.moe_aux_loss_coeff, list)
+                else [self.moe_aux_loss_coeff]
+            )
+            if any(float(coeff) != 0.0 for coeff in aux_coeffs):
+                raise ValueError(
+                    "quantile_balancing requires moe_aux_loss_coeff=0 because it replaces "
+                    "the auxiliary load-balancing loss."
+                )
+            if self.moe_router_quantile_balancing_estimation_scope != "global_batch":
+                raise ValueError(
+                    "Megatron-LM dev supports only "
+                    "moe_router_quantile_balancing_estimation_scope='global_batch'."
+                )
+            if self.moe_router_score_function != "sigmoid":
+                raise ValueError("quantile_balancing requires moe_router_score_function='sigmoid'.")
+            if self.moe_router_pre_softmax:
+                raise ValueError("quantile_balancing does not use pre-softmax routing.")
+            if self.moe_router_enable_expert_bias:
+                raise ValueError(
+                    "quantile_balancing selects the expert-bias update rule; do not also enable "
+                    "the DeepSeek-style moe_router_enable_expert_bias."
+                )
+            if self.moe_router_num_groups is not None or self.moe_router_group_topk is not None:
+                raise ValueError("quantile_balancing does not support group-limited routing.")
+            if self.moe_enable_routing_replay:
+                raise ValueError("quantile_balancing does not support routing replay.")
+            if self.moe_expert_capacity_factor is not None and self.moe_expert_capacity_factor >= 0:
+                raise ValueError("quantile_balancing does not support per-expert token dropping.")
+            if self.moe_expert_rank_capacity_factor is not None and not self.moe_paged_stash:
+                raise ValueError(
+                    "quantile_balancing with expert-rank capacity requires moe_paged_stash "
+                    "so an over-budget attempt can be retried without token dropping."
+                )
+            if self.num_moe_experts is None or not 0 < self.moe_router_topk < self.num_moe_experts:
+                raise ValueError(
+                    "quantile_balancing requires 0 < moe_router_topk < num_moe_experts."
+                )
+            if self.moe_router_qb_num_bins <= 1:
+                raise ValueError("moe_router_qb_num_bins must be greater than one.")
 
         if self.moe_expert_capacity_factor is not None:
             if self.moe_expert_capacity_factor < 0:
@@ -2526,7 +2601,10 @@ class TransformerConfig(ModelParallelConfig):
                 "seq_aux_loss",
                 "global_aux_loss",
                 "none",
-            ]:
+            ] and not (
+                self.moe_router_load_balancing_type == "quantile_balancing"
+                and self.moe_expert_capacity_factor is None
+            ):
                 raise ValueError(
                     "moe_expert_capacity_factor only works with aux_loss, "
                     "seq_aux_loss, global_aux_loss or none load balancing"

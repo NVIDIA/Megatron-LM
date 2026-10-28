@@ -223,6 +223,12 @@ class TopKRouter(Router):
         self.register_buffer('tid2eid', None)
 
         self.enable_expert_bias = self.config.moe_router_enable_expert_bias
+        # Hash-layer detection (is_hash_layer / tid2eid) is done later in __init__ on this branch;
+        # is_hash_layer is still its default False here, which is correct for every non-hash layer
+        # (hash + QB is not a supported combination).
+        self.use_quantile_balancing = (
+            self.routing_type == "quantile_balancing" and not self.is_hash_layer
+        )
         if self.enable_expert_bias:
             self.register_buffer(
                 'local_tokens_per_expert',
@@ -235,6 +241,10 @@ class TopKRouter(Router):
                 ),
                 persistent=False,
             )
+        else:
+            self.local_tokens_per_expert = None
+
+        if self.enable_expert_bias or self.use_quantile_balancing:
             self.register_buffer(
                 'expert_bias',
                 torch.zeros(
@@ -244,8 +254,26 @@ class TopKRouter(Router):
                 ),
             )
         else:
-            self.local_tokens_per_expert = None
             self.expert_bias = None
+
+        if self.use_quantile_balancing:
+            self.register_buffer(
+                'qb_histogram',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    self.config.moe_router_qb_num_bins,
+                    dtype=torch.int32,
+                    device=torch.cuda.current_device(),
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                'qb_bin_bounds',
+                torch.tensor([-1.0, 1.0], dtype=torch.float32, device=torch.cuda.current_device()),
+            )
+        else:
+            self.qb_histogram = None
+            self.qb_bin_bounds = None
 
         # Initialize global tokens per expert for global aux loss
         if self.get_aux_loss_coeff("global_aux_loss") > 0:
@@ -357,13 +385,18 @@ class TopKRouter(Router):
         if hasattr(self, 'expert_bias') and self.expert_bias is not None:
             if self.expert_bias.dtype != torch.float32:
                 self.expert_bias.data = self.expert_bias.data.to(torch.float32)
-        # Keep the QB bias in fp32 for the same reason.
+        # Keep the QB bias / histogram bin bounds in fp32 for the same reason. The micro_batch
+        # coordinate-descent buffers (qb_beta*) are not registered on the global-batch histogram
+        # path, so these hasattr guards are no-ops there.
         if hasattr(self, 'qb_beta') and self.qb_beta is not None:
             if self.qb_beta.dtype != torch.float32:
                 self.qb_beta.data = self.qb_beta.data.to(torch.float32)
         if hasattr(self, 'qb_beta_accum') and self.qb_beta_accum is not None:
             if self.qb_beta_accum.dtype != torch.float32:
                 self.qb_beta_accum.data = self.qb_beta_accum.data.to(torch.float32)
+        if hasattr(self, 'qb_bin_bounds') and self.qb_bin_bounds is not None:
+            if self.qb_bin_bounds.dtype != torch.float32:
+                self.qb_bin_bounds.data = self.qb_bin_bounds.data.to(torch.float32)
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
@@ -1085,15 +1118,38 @@ class TopKRouter(Router):
             probs, routing_map = self._hash_routing(logits, input_ids, dense_output=dense_output)
         elif self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
-        elif self.routing_type == "quantile_balancing":
+        elif (
+            self.routing_type == "quantile_balancing"
+            and self.config.moe_router_quantile_balancing_estimation_scope == "micro_batch"
+        ):
+            # micro_batch (main's dual coordinate-descent) QB. The global-batch histogram estimator
+            # falls through to the unfused topk_routing path below, which accumulates the histogram.
             assert (
                 padding_mask is None
             ), "Quantile balancing routing does not support padding masks yet."
             probs, routing_map = self.quantile_balancing(logits, dense_output=dense_output)
         else:
-            # TE capability controls the implementation, not the requested output format.
-            fused = self.config.moe_router_fusion and (
-                not dense_output or fused_topk_with_score_function_supports_topk_indices
+            # Global-batch histogram QB accumulates a per-expert histogram in this unfused path.
+            # Activation checkpointing runs the original forward under no-grad and its recompute
+            # under enable-grad, so this gate records each token exactly once.
+            accumulate_qb_histogram = (
+                self.use_quantile_balancing
+                and self.training
+                and torch.is_grad_enabled()
+                and not self.frozen_expert_bias
+            )
+            # Padded packed-sequence slots carry no real tokens, so they stay out of the
+            # K3 Quantile Balancing margin histogram (padded SBHD validation has no mask
+            # and keeps counting its padded positions, as before).
+            qb_valid_mask = (
+                ~padding_mask if accumulate_qb_histogram and padding_mask is not None else None
+            )
+            # TE capability controls the implementation, not the requested output format. The fused
+            # TE kernel does not accumulate the QB histogram, so histogram QB forces the unfused path.
+            fused = (
+                self.config.moe_router_fusion
+                and not accumulate_qb_histogram
+                and (not dense_output or fused_topk_with_score_function_supports_topk_indices)
             )
             topk_indices = (
                 torch.empty(
@@ -1115,6 +1171,9 @@ class TopKRouter(Router):
                 router_replay=self.router_replay,
                 topk_indices=topk_indices,
                 dense_output=dense_output and not fused,
+                qb_histogram=self.qb_histogram if accumulate_qb_histogram else None,
+                qb_bin_bounds=self.qb_bin_bounds if accumulate_qb_histogram else None,
+                qb_valid_mask=qb_valid_mask,
             )
             if self.config.moe_virtual_expert_load_balance and fused:
                 # TE returns compact IDs but full-width probabilities; normalize the pair.

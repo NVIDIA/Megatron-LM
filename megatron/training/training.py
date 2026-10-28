@@ -774,6 +774,32 @@ def set_seqlen_stats_in_iteration(total_real_tokens, seqlen_squared_sum):
     _seqlen_stats_are_global = True
 
 
+def update_seqlen_stats_from_padding_mask(padding_mask):
+    """Add ``sum(L_i)`` and ``sum(L_i ** 2)`` from one right-padded SBHD micro-batch.
+
+    Args:
+        padding_mask: ``[micro_batch_size, seq_length]`` boolean tensor with
+            ``True`` at padded positions (the layout emitted by
+            ``VarlenDataset`` under ``--varlen-sbhd-validation``). The real
+            length of sample ``i`` is its number of ``False`` entries.
+
+    Padded SBHD validation runs every sample through the model at full
+    ``seq_length``, but only the real tokens are useful work, so the reported
+    FLOPs would otherwise count the padding tail (about 80% of the tokens for
+    ~14K-token documents in a 64K window). Feeding the real lengths here makes
+    the SBHD reference report the same useful-work FLOPs as its packed THD
+    counterpart. Pass the CP-unsliced mask, and call this once per pipeline
+    rank and micro-batch, like the packed-sequence callers of
+    :func:`update_seqlen_stats_from_cu_seqlens`.
+    """
+    if padding_mask is None:
+        return
+    real_lens = (~padding_mask).sum(dim=1).to(torch.int32)
+    cu_seqlens = torch.zeros(real_lens.numel() + 1, dtype=torch.int32, device=real_lens.device)
+    cu_seqlens[1:] = torch.cumsum(real_lens, dim=0)
+    update_seqlen_stats_from_cu_seqlens(cu_seqlens)
+
+
 def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float]]:
     """Read, reset and globally reduce the per-iteration packed-sequence stats.
 

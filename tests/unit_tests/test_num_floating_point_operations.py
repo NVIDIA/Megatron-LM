@@ -22,6 +22,7 @@ from megatron.training.training import (
     consume_seqlen_stats_in_iteration,
     num_floating_point_operations,
     update_seqlen_stats_from_cu_seqlens,
+    update_seqlen_stats_from_padding_mask,
 )
 
 
@@ -445,6 +446,31 @@ class TestAccumulator:
         # After draining, next consume must report BSHD (no work seen) by
         # returning ``(None, None)`` so ``num_floating_point_operations`` takes
         # the closed-form defaults.
+        assert consume_seqlen_stats_in_iteration() == (None, None)
+
+    def test_update_from_padding_mask_counts_real_tokens_only(self):
+        # Two right-padded SBHD-validation samples of length 8 with 5 and 3
+        # real tokens: the padded tail must not be counted as useful work.
+        padding_mask = torch.tensor(
+            [[False] * 5 + [True] * 3, [False] * 3 + [True] * 5], dtype=torch.bool
+        )
+        update_seqlen_stats_from_padding_mask(padding_mask)
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        assert total_real_tokens == 5 + 3
+        assert seqlen_squared_sum == 5**2 + 3**2
+
+    def test_update_from_padding_mask_matches_cu_seqlens(self):
+        padding_mask = torch.zeros((3, 16), dtype=torch.bool)
+        padding_mask[0, 10:] = True
+        padding_mask[1, 16:] = True  # full-length sample, no padding
+        padding_mask[2, 1:] = True
+        update_seqlen_stats_from_padding_mask(padding_mask)
+        from_mask = consume_seqlen_stats_in_iteration()
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 10, 26, 27], dtype=torch.int32))
+        assert consume_seqlen_stats_in_iteration() == from_mask
+
+    def test_update_from_padding_mask_none_is_noop(self):
+        update_seqlen_stats_from_padding_mask(None)
         assert consume_seqlen_stats_in_iteration() == (None, None)
 
     def test_no_updates_returns_none(self):
