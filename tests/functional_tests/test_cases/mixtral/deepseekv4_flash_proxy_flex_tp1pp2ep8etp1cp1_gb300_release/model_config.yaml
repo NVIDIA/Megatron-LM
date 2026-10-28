@@ -15,6 +15,8 @@ ENV_VARS:
   NVSHMEM_IB_ENABLE_IBGDA: 0
   NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: 8
   USE_MNNVL: 1
+  NVLINK_DOMAIN_SIZE: 72
+  NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: 128
   # Preserve each eight-rank expert group within a two-node NVLink segment.
   FT_NODE_SEGMENT_SIZE: 2
 BEFORE_SCRIPT: |
@@ -224,7 +226,8 @@ MODEL_ARGS:
 
   # enable experimental
   --enable-experimental: true
-  --exit-interval: 47683
+  # Initial golden onboarding budget; retain the training LR schedule.
+  --exit-interval: 1000
 METRICS:
   - "iteration-time"
   - "lm loss"
