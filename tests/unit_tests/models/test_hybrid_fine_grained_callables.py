@@ -258,15 +258,16 @@ def test_ncclep_probabilities_do_not_reconnect_schedule_graphs(cpu_streams, zero
 
 
 def test_moe_routing_receives_the_batch_first_padding_mask():
-    """Route and preprocess get the chunk's padding mask unchanged, as in MoELayer.forward."""
+    """Route and preprocess get the chunk's padding mask and packed params, as in MoELayer.forward."""
     layer = _moe_layer(_config())
     layer._forward_pre_mlp_layernorm = lambda hidden_states: hidden_states
     layer.mlp_norm_manager = None
     layer.mlp.shared_experts_compute = lambda hidden_states: None
     received = {}
 
-    def route(hidden_states, padding_mask):
+    def route(hidden_states, padding_mask, packed_seq_params=None):
         received["route"] = padding_mask
+        received["packed_seq_params"] = packed_seq_params
         return hidden_states, None
 
     def preprocess(hidden_states, probs, routing_map, padding_mask):
@@ -283,10 +284,13 @@ def test_moe_routing_receives_the_batch_first_padding_mask():
         detach=lambda tensor: tensor.detach(),
     )
     node.chunk_state.padding_mask = padding_mask
+    # Unpacked batch: no tokens_per_sample, so nothing is unflattened.
+    node.chunk_state.packed_seq_params = PackedSeqParams()
 
     hybrid_callables._run_moe_preprocess(layer, node, torch.ones(3, 2, 1))
 
     assert received["route"] is padding_mask
+    assert received["packed_seq_params"] is node.chunk_state.packed_seq_params
     assert received["preprocess"] is padding_mask
 
 
@@ -306,7 +310,7 @@ def test_moe_slots_unflatten_packed_microbatches_like_the_eager_path(cpu_streams
         received["shared"] = hidden_states
         return None
 
-    def route(hidden_states, padding_mask):
+    def route(hidden_states, padding_mask, packed_seq_params=None):
         received["route"] = (hidden_states, padding_mask)
         return hidden_states, None
 
@@ -366,7 +370,7 @@ def test_norm_offload_uses_its_microbatch_manager_after_bda(cpu_streams, recompu
     layer.bias_dropout_add_exec_handler = nullcontext
     layer.mlp_bda = lambda *args: lambda output, residual, dropout: output[0] + residual
     layer.mlp.shared_experts_compute = lambda hidden: None
-    layer.mlp.route = lambda hidden, mask: (hidden, None)
+    layer.mlp.route = lambda hidden, mask, packed_seq_params=None: (hidden, None)
     layer.mlp.preprocess = lambda hidden, probs, routing, mask: (hidden, probs)
     layer.mlp.routed_experts_compute = lambda hidden, probs: (hidden * 3, None)
     layer.mlp.combine = lambda output: output
