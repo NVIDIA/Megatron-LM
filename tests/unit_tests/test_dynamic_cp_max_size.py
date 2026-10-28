@@ -36,13 +36,34 @@ def _scheduler(total_gpus, max_cp_size, vpp_multiple=None, min_cp_size=1):
         (12, 4, 3),
     ],
 )
-def test_explicit_cap_must_be_supported_by_actual_dpxcp(total_gpus, max_cp_size, min_cp_size):
-    with pytest.raises(ValueError, match="max_cp_size"):
+def test_explicit_cap_must_be_supported_by_actual_dpxcp(
+    monkeypatch, total_gpus, max_cp_size, min_cp_size
+):
+    with pytest.raises(ValueError, match="max_cp_size") as init_error:
         _scheduler(total_gpus, max_cp_size, min_cp_size=min_cp_size)
-    with pytest.raises(ValueError, match="max_cp_size"):
-        next_hdp_group_packing_aware(
-            [], total_gpus, 1, min_cp_size=min_cp_size, max_cp_size=max_cp_size
-        )
+
+    # The training entry point must reject the same configuration before scheduling.
+    monkeypatch.setattr(data_schedule.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        DefaultDynamicCPScheduler, "run", lambda *args: pytest.fail("Scheduling must not start")
+    )
+    config = SimpleNamespace(
+        dynamic_context_parallel=True,
+        sequence_packing_scheduler="default_dynamic_cp",
+        min_dynamic_context_parallel_size=min_cp_size,
+        max_cp_size=max_cp_size,
+        max_seqlen_per_dp_cp_rank=1,
+        virtual_pipeline_model_parallel_size=None,
+    )
+    groups = SimpleNamespace(
+        dp_cp=SimpleNamespace(size=lambda: total_gpus),
+        dp=SimpleNamespace(size=lambda: 2),
+        tp=SimpleNamespace(size=lambda: 1),
+        pp=SimpleNamespace(size=lambda: 1),
+    )
+    with pytest.raises(ValueError, match="max_cp_size") as wrapper_error:
+        wrap_data_iterator(iter(()), config, 1, pg_collection=groups)
+    assert str(wrapper_error.value) == str(init_error.value)
 
 
 @pytest.mark.parametrize("total_gpus,max_cp_size", [(8, 1), (8, 2), (8, 4), (12, 4)])

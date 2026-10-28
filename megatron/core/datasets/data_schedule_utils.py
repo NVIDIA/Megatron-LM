@@ -783,6 +783,7 @@ def next_hdp_group_packing_aware(
     it falls back to the full DPxCP group if power-of-two expansion cannot fill
     every rank. An explicit ``max_cp_size`` bounds candidate groups, but the existing
     fill and expansion paths can still produce larger groups.
+    CP size arguments are validated by ``DefaultDynamicCPScheduler.__init__``.
     """
     valid_group_sizes: List[int] = get_valid_dynamic_context_parallel_group_sizes(total_gpus)
     if cp_group_sizes is None:
@@ -802,7 +803,6 @@ def next_hdp_group_packing_aware(
         )
     enabled_cp_sizes = tuple(size for size in cp_group_sizes if size >= min_cp_size)
 
-    _validate_dynamic_cp_max_size(max_cp_size, min_cp_size, total_gpus)
     cp_limit = total_gpus if max_cp_size is None else max_cp_size
     if not sample_seqlens:
         return (
