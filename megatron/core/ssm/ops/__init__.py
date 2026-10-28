@@ -1,30 +1,31 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Triton kernels for the linear-attention / SSM mixers.
+"""Deprecated import path; use ``megatron.core.ops.ssm``.
 
-Organized by which recurrence a kernel belongs to:
-
-* `common` -- shared by every variant (causal convolution, slot-indexed state
-  gather/scatter, autotune determinism).
-* `mamba2` -- the Mamba2 state-space duality kernels, adapted from vLLM and
-  state-spaces/mamba.
-* `gdp` -- the Gated Delta Product kernels, forked from flash-linear-attention.
-
-The re-exports below are the historical top-level entry points and are kept so
-existing callers do not have to spell out the subpackage.
-
-This package is internal to Megatron Core. The kernels here are implementation
-details of the SSM mixers, not a supported kernel library.
+The historical package-level names resolve from the modules that define them.
+The optional kernel entry points keep their historical value of ``None`` when their
+kernels cannot be imported.
 """
 
-try:
-    from .mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
-except ImportError:
-    mamba_chunk_scan_combined_varlen = None
+from megatron.core.ops._compat import deprecated_module
 
-try:
-    from .common.causal_conv1d_varlen import causal_conv1d_varlen_fn
-except ImportError:
-    causal_conv1d_varlen_fn = None
+_forward, __dir__ = deprecated_module(
+    __name__,
+    "megatron.core.ops.ssm",
+    exports={
+        "mamba_chunk_scan_combined_varlen": "megatron.core.ops.ssm.mamba2.ssd_combined",
+        "causal_conv1d_varlen_fn": "megatron.core.ops.ssm.common.causal_conv1d_varlen",
+    },
+)
 
-__all__ = ["mamba_chunk_scan_combined_varlen", "causal_conv1d_varlen_fn"]
+_OPTIONAL = ("mamba_chunk_scan_combined_varlen", "causal_conv1d_varlen_fn")
+
+
+def __getattr__(name: str) -> object:
+    """Resolve ``name`` like any forwarded name, keeping the optional ``None`` fallback."""
+    try:
+        return _forward(name)
+    except ImportError:
+        if name in _OPTIONAL:
+            return None
+        raise

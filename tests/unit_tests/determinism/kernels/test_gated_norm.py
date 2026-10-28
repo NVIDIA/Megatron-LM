@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from megatron.core.fusions import fused_gated_norm
-from megatron.core.ssm.gated_delta_net.gdn import GatedDeltaNet
+from megatron.core.ops.ssm.gated_delta.gdn import GatedDeltaNet
 from tests.unit_tests.determinism.kernels.harness import assert_module_replays_bit_exact, seeded
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
