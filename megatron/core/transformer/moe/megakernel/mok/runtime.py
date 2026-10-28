@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from megatron.core.transformer.moe.megakernel.mok.backend import MoKMegakernel
 
 
-def _gate_up_weight_arguments(shared_fc1: torch.Tensor, routed_fc1, intermediate_size: int):
+def _gate_up_weight_arguments(shared_fc1: torch.Tensor | None, routed_fc1, intermediate_size: int):
     """Adapt MCore-owned combined FC1 weights to MOK's gate/up API.
 
     Shared FC1 is a dense two-dimensional parameter, so gate and up are
@@ -27,6 +27,8 @@ def _gate_up_weight_arguments(shared_fc1: torch.Tensor, routed_fc1, intermediate
     and up preserves its storage metadata, and MOK applies the existing logical
     gate/up offsets when the two arguments alias.
     """
+    if shared_fc1 is None:
+        return None, None, routed_fc1, routed_fc1
     expected_rows = 2 * intermediate_size
     if shared_fc1.ndim != 2 or shared_fc1.shape[0] != expected_rows:
         raise RuntimeError(
@@ -58,9 +60,9 @@ class _MoKWeightArguments(NamedTuple):
     This transient tuple neither copies payloads nor registers/caches parameters.
     """
 
-    shared_gate: torch.Tensor
-    shared_up: torch.Tensor
-    shared_down: torch.Tensor
+    shared_gate: torch.Tensor | None
+    shared_up: torch.Tensor | None
+    shared_down: torch.Tensor | None
     routed_gate: object
     routed_up: object
     routed_down: object
@@ -85,7 +87,7 @@ class _MoKAutograd(torch.autograd.Function):
         router_weights: torch.Tensor,
         top_experts: torch.Tensor,
         shared_output_gate_weight: torch.Tensor | None,
-        *parameters: torch.Tensor,
+        *parameters: torch.Tensor | None,
     ) -> torch.Tensor:
         """Run MOK forward and retain the state needed by backward."""
         from mok import functional
@@ -122,9 +124,11 @@ class _MoKAutograd(torch.autograd.Function):
         weight_args = _MoKWeightArguments.from_combined(
             shared_fc1, shared_fc2, fc1_forward, fc2_forward, module.intermediate_size
         )
-        gate_kwargs = {}
+        forward_kwargs = {}
         if shared_output_gate_weight is not None:
-            gate_kwargs["shared_output_gate_weight"] = shared_output_gate_weight
+            forward_kwargs["shared_output_gate_weight"] = shared_output_gate_weight
+        if module.situ_beta is not None:
+            forward_kwargs["situ_beta"] = module.situ_beta
         output, forward_context = functional.forward(
             module.mok_config,
             workspace,
@@ -133,7 +137,7 @@ class _MoKAutograd(torch.autograd.Function):
             router_weights,
             *weight_args,
             swiglu_limit=module.swiglu_limit,
-            **gate_kwargs,
+            **forward_kwargs,
         )
 
         ctx.module = module
@@ -194,8 +198,16 @@ class _MoKAutograd(torch.autograd.Function):
         )
 
         routed_parameter_grads = ctx.module.finish_routed_weight_gradients()
-        d_shared_fc1 = _finish_weight_gradient(ctx.module.shared_fc1_weight)
-        d_shared_fc2 = _finish_weight_gradient(ctx.module.shared_fc2_weight)
+        d_shared_fc1 = (
+            _finish_weight_gradient(ctx.module.shared_fc1_weight)
+            if shared_fc1 is not None
+            else None
+        )
+        d_shared_fc2 = (
+            _finish_weight_gradient(ctx.module.shared_fc2_weight)
+            if shared_fc2 is not None
+            else None
+        )
         d_output_gate = (
             _finish_weight_gradient(ctx.module.shared_output_gate_weight)
             if shared_output_gate_weight is not None

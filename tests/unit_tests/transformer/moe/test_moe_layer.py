@@ -1,11 +1,13 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
 import megatron.core.transformer.moe.moe_layer as moe_layer_module
+from megatron.core import parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_local_submodules,
@@ -23,11 +25,45 @@ from tests.unit_tests.test_utilities import Utils
 
 class TestMoELayerInit:
 
+    @pytest.mark.parametrize("already_sharded", [False, True])
+    def test_mok_route_aligns_sequence_parallel_metadata(self, already_sharded):
+        Utils.initialize_model_parallel(2, 1)
+        try:
+            layer = object.__new__(MoELayer)
+            torch.nn.Module.__init__(layer)
+            layer.config = SimpleNamespace(
+                moe_megakernel_backend="mok", sequence_parallel=True, cuda_graph_impl="none"
+            )
+            layer.tp_group = parallel_state.get_tensor_model_parallel_group()
+            layer.token_dispatcher = None
+            layer.router = torch.nn.Module()
+            layer.router.forward = Mock(return_value=(None, None))
+            hidden = torch.zeros(3, 2, 8, device="cuda")
+            token_ids = torch.arange(12, device="cuda").view(2, 6)
+            mask = token_ids % 3 == 0
+            start = layer.tp_group.rank() * 3
+            expected_ids = token_ids[:, start : start + 3]
+            expected_mask = mask[:, start : start + 3]
+            if already_sharded:
+                token_ids, mask = expected_ids, expected_mask
+
+            layer.route(hidden, mask, token_ids)
+
+            args, kwargs = layer.router.forward.call_args
+            assert args[0] is hidden
+            torch.testing.assert_close(args[1], expected_mask.T)
+            torch.testing.assert_close(kwargs["input_ids"], expected_ids)
+        finally:
+            Utils.destroy_model_parallel()
+
     @pytest.mark.skipif(
         not is_te_min_version("1.7.0.dev0"),
         reason="Expert with TE Linear is only supported in TE 1.7.0 and later.",
     )
-    def test_megakernel_skips_native_token_dispatcher_construction(self, monkeypatch):
+    @pytest.mark.parametrize("latent,shared_size", [(None, 128), (64, 256), (None, None)])
+    def test_megakernel_skips_native_token_dispatcher_construction(
+        self, monkeypatch, latent, shared_size
+    ):
         Utils.initialize_model_parallel(1, 1)
         try:
             config = TransformerConfig(
@@ -36,7 +72,8 @@ class TestMoELayerInit:
                 num_attention_heads=4,
                 num_moe_experts=1,
                 moe_ffn_hidden_size=128,
-                moe_shared_expert_intermediate_size=128,
+                moe_shared_expert_intermediate_size=shared_size,
+                moe_latent_size=latent,
                 moe_router_topk=1,
                 moe_router_pre_softmax=True,
                 moe_grouped_gemm=True,
@@ -62,33 +99,48 @@ class TestMoELayerInit:
             monkeypatch.setattr(
                 moe_layer_module, "MoEAllGatherTokenDispatcher", fail_if_constructed
             )
-            monkeypatch.setattr(
-                moe_layer_module, "build_megakernel_backend", lambda **kwargs: backend
-            )
+
+            def build_backend(**kwargs):
+                assert (kwargs["shared_experts"] is not None) == (
+                    latent is None and shared_size == 128
+                )
+                return backend
+
+            monkeypatch.setattr(moe_layer_module, "build_megakernel_backend", build_backend)
 
             layer = MoELayer(config, submodules)
 
             assert layer.token_dispatcher is None
             assert layer.megakernel_experts is backend
+            if latent is None and shared_size == 128:
+                hidden = torch.zeros((3, 2, config.hidden_size), dtype=torch.bfloat16)
+                padding_mask = torch.tensor([[0, 0, 1], [0, 1, 1]])
+                input_ids = torch.arange(6).view(2, 3)
+                probs = torch.ones((6, 1))
+                routing_map = torch.ones((6, 1), dtype=torch.bool)
+                router_forward = Mock(return_value=(probs, routing_map))
+                backend_forward = Mock(return_value=hidden)
+                monkeypatch.setattr(layer.router, "forward", router_forward)
+                monkeypatch.setattr(backend, "forward", backend_forward)
 
-            hidden = torch.zeros((3, 2, config.hidden_size), dtype=torch.bfloat16)
-            padding_mask = torch.tensor([[0, 0, 1], [0, 1, 1]])
-            input_ids = torch.arange(6).view(2, 3)
-            probs = torch.ones((6, 1))
-            routing_map = torch.ones((6, 1), dtype=torch.bool)
-            router_forward = Mock(return_value=(probs, routing_map))
-            backend_forward = Mock(return_value=hidden)
-            monkeypatch.setattr(layer.router, "forward", router_forward)
-            monkeypatch.setattr(backend, "forward", backend_forward)
+                output, bias = layer(hidden, padding_mask=padding_mask, input_ids=input_ids)
 
-            output, bias = layer(hidden, padding_mask=padding_mask, input_ids=input_ids)
+                assert output is hidden and bias is None
+                router_forward.assert_called_once()
+                assert router_forward.call_args.args[0] is hidden
+                torch.testing.assert_close(router_forward.call_args.args[1], padding_mask.T.bool())
+                assert router_forward.call_args.kwargs["input_ids"] is input_ids
+                backend_forward.assert_called_once_with(hidden, probs, routing_map)
 
-            assert output is hidden and bias is None
-            router_forward.assert_called_once()
-            assert router_forward.call_args.args[0] is hidden
-            torch.testing.assert_close(router_forward.call_args.args[1], padding_mask.T.bool())
-            assert router_forward.call_args.kwargs["input_ids"] is input_ids
-            backend_forward.assert_called_once_with(hidden, probs, routing_map)
+            if latent is None:
+                hidden = torch.zeros(2, 1, config.hidden_size)
+                monkeypatch.setattr(
+                    layer.router, "forward", lambda *args, **kwargs: (hidden, hidden)
+                )
+                probs, routing_map = layer.route(hidden)
+                prepared, _ = layer.preprocess(hidden, probs, routing_map)
+                assert prepared is hidden
+                assert layer.postprocess(hidden, None) is hidden
         finally:
             Utils.destroy_model_parallel()
 
@@ -125,6 +177,7 @@ class TestMoELayerInit:
         )
         assert isinstance(submodules, MoESubmodules)
         moe_layer = MoELayer(self.transformer_config, submodules)
+        assert moe_layer.megakernel_fuses_shared_expert is False
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("moe_token_dispatcher_type", ["allgather", "alltoall"])

@@ -16,6 +16,7 @@ from torch import nn
 from torch.distributed import ProcessGroup
 
 from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
+from megatron.core.transformer.moe.megakernel.factory import split_megakernel_backend_config
 from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
 from megatron.core.transformer.moe.megakernel.mok.runtime import _MoKAutograd
 from megatron.core.transformer.moe.megakernel.mok.weights import (
@@ -41,7 +42,7 @@ class MoKMegakernel(MegakernelBackend):
         config: TransformerConfig,
         ep_group: ProcessGroup,
         routed_experts: nn.Module,
-        shared_experts: nn.Module,
+        shared_experts: nn.Module | None,
         num_local_experts: int,
     ) -> None:
         super().__init__()
@@ -61,7 +62,7 @@ class MoKMegakernel(MegakernelBackend):
             raise ValueError("MOK currently requires gradient_accumulation_fusion=True")
         if config.moe_mlp_glu_interleave_size is not None:
             raise ValueError("MOK requires non-interleaved native MCore routed FC1 weights")
-        if config.moe_shared_expert_glu_interleave_size is not None:
+        if shared_experts is not None and config.moe_shared_expert_glu_interleave_size is not None:
             raise ValueError("MOK requires non-interleaved native shared FC1 weights")
         if config.moe_pad_expert_input_to_capacity:
             raise ValueError(
@@ -70,10 +71,10 @@ class MoKMegakernel(MegakernelBackend):
             )
         self.ep_group = ep_group
         self.num_local_experts = num_local_experts
-        self.hidden_size = config.hidden_size
+        self.hidden_size = config.moe_latent_size or config.hidden_size
         self.intermediate_size = config.moe_ffn_hidden_size
         shared_intermediate_size = config.moe_shared_expert_intermediate_size
-        if shared_intermediate_size != self.intermediate_size:
+        if shared_experts is not None and shared_intermediate_size != self.intermediate_size:
             raise ValueError(
                 "MOK requires routed and shared experts to use the same intermediate "
                 f"size, got routed={self.intermediate_size}, "
@@ -81,12 +82,21 @@ class MoKMegakernel(MegakernelBackend):
             )
         self.topk = config.moe_router_topk
         self.swiglu_limit = config.activation_func_clamp_value
+        self.situ_beta = (
+            (
+                config.activation_func_tanh_clamp_scale,
+                config.activation_func_tanh_clamp_scale_linear,
+            )
+            if config.activation_func_tanh_clamp_scale is not None
+            else None
+        )
         self.use_mxfp8_weights = bool(
             config.fp8 is not None and config.fp8_recipe == "mxfp8" and config.fp8_param
         )
         self.native_single_grouped_weights = bool(config.moe_single_grouped_weight)
+        _, backend_options = split_megakernel_backend_config(config)
         try:
-            self.mok_config = MoKConfig(**(config.moe_megakernel_backend_config or {}))
+            self.mok_config = MoKConfig(**backend_options)
         except TypeError as exc:
             raise ValueError(f"Invalid MOK option in moe_megakernel_backend_config: {exc}") from exc
 
@@ -131,7 +141,14 @@ class MoKMegakernel(MegakernelBackend):
             self._routed_fc1_parameter_names = tuple(self._routed_fc1_parameter_names)
             self._routed_fc2_parameter_names = tuple(self._routed_fc2_parameter_names)
 
-        self._register_shared_weights(shared_experts, use_output_gate=config.moe_shared_expert_gate)
+        if shared_experts is None:
+            self.register_parameter("shared_fc1_weight", None)
+            self.register_parameter("shared_fc2_weight", None)
+            self.register_parameter("shared_output_gate_weight", None)
+        else:
+            self._register_shared_weights(
+                shared_experts, use_output_gate=config.moe_shared_expert_gate
+            )
 
         # MegatronModule.set_is_first_microbatch discovers this attribute and resets it
         # once per optimizer iteration, matching TE's weight-cache lifecycle.
@@ -163,8 +180,16 @@ class MoKMegakernel(MegakernelBackend):
 
     def main_grad_arguments(self):
         """Return MOK logical main grads and optional per-expert descriptors."""
-        shared_fc1_grad = _main_grad_buffer(self.shared_fc1_weight)
-        shared_fc2_grad = _main_grad_buffer(self.shared_fc2_weight)
+        shared_fc1_grad = (
+            _main_grad_buffer(self.shared_fc1_weight)
+            if self.shared_fc1_weight is not None
+            else None
+        )
+        shared_fc2_grad = (
+            _main_grad_buffer(self.shared_fc2_weight)
+            if self.shared_fc2_weight is not None
+            else None
+        )
         fc1_main_grads = tuple(_main_grad_buffer(param) for param in self.routed_fc1_parameters)
         fc2_main_grads = tuple(_main_grad_buffer(param) for param in self.routed_fc2_parameters)
         main_grads = (shared_fc1_grad, fc1_main_grads[0], shared_fc2_grad, fc2_main_grads[0])
@@ -358,7 +383,7 @@ class MoKMegakernel(MegakernelBackend):
     def forward(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
     ) -> torch.Tensor:
-        """Run the fused MoE megakernel (dispatch, routed/shared experts, combine).
+        """Run dispatch, routed experts, optional fused shared experts, and combine.
 
         Args:
             hidden_states: Input activations of shape ``[..., hidden_size]``.

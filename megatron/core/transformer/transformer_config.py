@@ -914,9 +914,13 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     moe_megakernel_backend_config: Optional[dict] = None
-    """Backend options for moe_megakernel_backend.
+    """MCore-managed common options and backend-specific options for moe_megakernel_backend.
 
-    For example, ``fwd_num_comm_sms`` is a valid MOK backend option.
+    MCore consumes ``shared_expert_mode``: ``auto`` (default) fuses compatible shared
+    MLPs, ``fused`` requires compatibility, and ``native`` runs shared experts in
+    MCore. Activation selection is independent. Native shared experts retain the
+    model's precision policy; MOK-fused shared experts use BF16.
+    Remaining options, such as MOK's ``fwd_num_comm_sms``, are passed to the backend.
     """
 
     moe_layer_freq: Union[int, List[int]] = 1
@@ -2632,12 +2636,14 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "moe_megakernel_backend_config requires moe_megakernel_backend to be set"
             )
-
         if self.moe_megakernel_backend == "mok":
+            from megatron.core.transformer.moe.megakernel import megakernel_fuses_shared_expert
+
             if self.moe_router_dtype == "fp64":
                 raise ValueError("MOK does not support moe_router_dtype='fp64'; use 'fp32' instead")
             if self.use_transformer_engine_op_fuser:
                 raise ValueError("MOK requires use_transformer_engine_op_fuser=False")
+            fuse_shared = megakernel_fuses_shared_expert(self)
             if not self.gradient_accumulation_fusion:
                 raise ValueError("MOK currently requires gradient_accumulation_fusion=True")
             if not self.moe_grouped_gemm:
@@ -2648,8 +2654,11 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("MOK does not support moe_apply_probs_on_input")
             if self.glu_linear_offset != 0.0:
                 raise ValueError("MOK requires glu_linear_offset=0.0")
-            if self.activation_func_tanh_clamp_scale is not None:
-                raise ValueError("MOK does not support activation_func_tanh_clamp_scale")
+            if (
+                self.activation_func_tanh_clamp_scale is not None
+                and self.activation_func_tanh_clamp_scale_linear is None
+            ):
+                raise ValueError("MOK SiTU-GLU requires activation_func_tanh_clamp_scale_linear")
             mok_bf16 = (
                 self.bf16
                 and not self.fp16
@@ -2682,8 +2691,12 @@ class TransformerConfig(ModelParallelConfig):
                     "MOK does not support overlap_dispatch_backward_with_experts_wgrad; "
                     "the megakernel never runs the native dispatch path"
                 )
-            if self.tensor_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
-                raise ValueError("MOK currently requires TP=1 and expert TP=1")
+            if self.expert_tensor_parallel_size != 1:
+                raise ValueError("MOK currently requires expert TP=1")
+            # ETP=1 routed weights are unsharded; MOK consumes each rank's SP tokens.
+            # TP-sharded shared experts and duplicated latent projections stay native.
+            if self.tensor_model_parallel_size > 1 and not self.sequence_parallel:
+                raise ValueError("MOK with TP>1 requires sequence_parallel=True")
             if self.gtp_weight_remat_size != 1 or self.expert_gtp_weight_remat_size != 1:
                 raise ValueError(
                     "MOK does not support GTP weight rematerialization; the megakernel "
@@ -2691,22 +2704,20 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.expert_model_parallel_size not in (1, 4, 8, 16, 32, 64):
                 raise ValueError("MOK requires EP in {1, 4, 8, 16, 32, 64}")
-            if self.moe_shared_expert_intermediate_size is None:
-                raise ValueError("MOK requires a shared expert")
             if self.moe_shared_expert_overlap:
                 raise ValueError("MOK does not support MCore shared-expert overlap")
-            if self.moe_latent_size is not None:
-                # Native latent MoE projects only the routed branch; its shared expert
-                # stays in the original hidden space. MOK currently fuses both branches.
-                raise ValueError("MOK does not support latent MoE")
-            if self.recompute_modules and "shared_experts" in self.recompute_modules:
+            if (
+                fuse_shared
+                and self.recompute_modules
+                and "shared_experts" in self.recompute_modules
+            ):
                 raise ValueError(
                     "MOK does not support recompute_modules=['shared_experts']; shared-expert "
                     "computation is fused into the megakernel. Use whole-MoE recompute "
                     "instead."
                 )
             if not self.gated_linear_unit or self.activation_func != F.silu:
-                raise ValueError("MOK currently requires SwiGLU")
+                raise ValueError("MOK requires SwiGLU or SiTU-GLU")
 
         if self.moe_router_load_balancing_type == ["quantile_balancing"]:
             assert (
