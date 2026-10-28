@@ -14,8 +14,9 @@ import torch
 import torch.distributed as dist
 import zmq
 
-from megatron.core import dist_checkpointing
+from megatron.core import dist_checkpointing, parallel_state
 from megatron.core.inference.disaggregation.utils import transfer_peer_records
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from tests.unit_tests.inference.engines.disagg_test_utils import (
     ForwardWitness,
     _enqueue_decode_handoff,
@@ -277,6 +278,13 @@ def test_real_model_heterogeneous_handoff(tmp_path, case):
             ) as decode_engine:
                 decode_model = decode_engine.controller.inference_wrapped_model.model
                 load_canonical_model(decode_model, checkpoint_path)
+                if transformer_impl == "inference_optimized":
+                    # PyTorch counts symmetric-memory rendezvous per process. Only the chosen
+                    # pair decodes, so create its lazy TP buffer on every rank to keep later
+                    # tests' rendezvous aligned.
+                    SymmetricMemoryManager.get_buffer(
+                        "tp", process_group=parallel_state.get_tensor_model_parallel_group()
+                    )
                 groups = gather(
                     dist.get_process_group_ranks(decode_engine.pg_collection.mp), control
                 )
