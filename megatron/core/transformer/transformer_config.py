@@ -1186,6 +1186,20 @@ class TransformerConfig(ModelParallelConfig):
     """DEPRECATED: use moe_flex_dispatcher_num_sms. Number of SMs to use for HybridEP (None uses the
     default from DeepEP). If set, routed to moe_flex_dispatcher_num_sms in __post_init__."""
 
+    moe_ep_chunk_overlap: bool = field(
+        default=False, metadata={"argparse_meta": {"arg_names": ["--moe-ep-chunk-overlap"]}}
+    )
+    """[Experimental] Enable the token-chunked EP overlap path. When set,
+    the whole routed-expert region (dispatch -> FC1/activation/FC2 -> combine) is replaced by a
+    chunked two-stream schedule that overlaps the EP A2A with the expert GEMMs. Training only.
+    Its communication-SM budget is moe_flex_dispatcher_num_sms, shared with the flex
+    dispatcher rather than tuned separately."""
+
+    moe_ep_chunk_overlap_num_chunks: int = field(
+        default=4, metadata={"argparse_meta": {"arg_names": ["--moe-ep-chunk-overlap-num-chunks"]}}
+    )
+    """Number of source-token chunks the EP chunk overlap path splits each microbatch into."""
+
     moe_hybridep_num_blocks_permute: Optional[int] = None
     """Number of CUDA thread blocks for the permute part in HybridEP.
     When permute_fusion_into_hybridep is True, this sets the number
@@ -2747,6 +2761,15 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_expert_rank_capacity_factor with the 'hybridep' backend requires "
                     "use_transformer_engine_op_fuser=True or moe_use_grouped_tensor=True."
                 )
+            if self.moe_pad_expert_input_to_capacity:
+                # RAISE, not assert: the two give tokens_per_expert two answers, and picking
+                # the wrong one mis-sizes the GEMM segments silently. PYTHONOPTIMIZE strips asserts.
+                raise ValueError(
+                    "moe_expert_rank_capacity_factor and moe_pad_expert_input_to_capacity are "
+                    "two capacity mechanisms for the same dispatch and cannot be combined: the "
+                    "first drops tokens over a per-rank budget, the second pads every expert to "
+                    "moe_expert_capacity_factor. Set exactly one."
+                )
 
         if self.cpu_offloading and (
             self.cpu_offloading_num_layers < 0 or self.cpu_offloading_num_layers >= self.num_layers
@@ -2901,6 +2924,77 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_granularity = "selective"
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
+
+        # moe_ep_chunk_overlap refusals from the config alone, AFTER the recompute_modules
+        # normalization so that route in is covered. RAISE: silent failures, and -O strips asserts.
+        if self.moe_ep_chunk_overlap:
+            if self.recompute_granularity == 'full':
+                raise ValueError(
+                    "moe_ep_chunk_overlap forbids recompute_granularity='full': re-running the "
+                    "chunked forward inside the backward reorders the wgrad FIFO silently."
+                )
+            if self.recompute_granularity == 'selective' and 'moe' in (
+                self.recompute_modules or []
+            ):
+                raise ValueError(
+                    "moe_ep_chunk_overlap forbids 'moe' in recompute_modules: it wraps the whole "
+                    "chunked forward in a checkpoint, which reorders the wgrad FIFO silently. "
+                    "'moe_act' recomputes inside TE's own backward and is supported."
+                )
+            if self.moe_paged_stash:
+                raise ValueError("moe_ep_chunk_overlap does not support moe_paged_stash.")
+            # The schedule runs the experts' OWN fused forward, so the flags that path is built
+            # on are requirements here, not options; each is silent or fatal if missing.
+            for flag, why in (
+                ("use_transformer_engine_op_fuser", "the fused grouped MLP is the compute"),
+                ("moe_grouped_gemm", "it is what force-sets moe_use_grouped_tensor above"),
+            ):
+                if not getattr(self, flag):
+                    raise ValueError(f"moe_ep_chunk_overlap requires {flag}=True: {why}.")
+            # Every weight step here indexes weight0..weightN; the single-grouped layout packs
+            # them into one `weight` and leaves those slots None, so each step silently no-ops.
+            if self.moe_single_grouped_weight:
+                raise ValueError(
+                    "moe_ep_chunk_overlap does not support moe_single_grouped_weight: the "
+                    "schedule quantizes, shadows and drains one weight{i} slot per expert, and "
+                    "the single-grouped layout carries one packed weight instead."
+                )
+            # skip_routed_expert_padding() must hold, or _fused_forward re-pads rows the transport
+            # already aligned AND does a tokens_per_expert.tolist() a graph capture cannot serve.
+            if (
+                self.moe_token_dispatcher_type != "flex"
+                or self.moe_flex_dispatcher_backend not in ("hybridep", "ncclep")
+            ):
+                raise ValueError(
+                    "moe_ep_chunk_overlap requires moe_token_dispatcher_type='flex' with "
+                    "moe_flex_dispatcher_backend in ('hybridep', 'ncclep'), got "
+                    f"{self.moe_token_dispatcher_type!r}/{self.moe_flex_dispatcher_backend!r}: "
+                    "only those make skip_routed_expert_padding() true, and without it the "
+                    "experts' fused forward pads the already-aligned rows a second time and "
+                    "reads tokens_per_expert back to the host, which CUDA-graph capture cannot "
+                    "serve. Those are also the only backends that can stage one dispatch per "
+                    "chunk."
+                )
+            # The runtime takes router_topk and num_experts unscaled while the dispatch manager
+            # scales both by ETP, so the capacity would be short and the pin would hide it.
+            if self.expert_tensor_parallel_size > 1:
+                raise ValueError(
+                    "moe_ep_chunk_overlap does not support expert_tensor_parallel_size > 1, got "
+                    f"{self.expert_tensor_parallel_size}: the chunk capacity is derived from an "
+                    "unscaled moe_router_topk while the dispatch manager scales it by the "
+                    "expert-tensor-parallel size, so the dispatch would be sized short and the "
+                    "pinned permuted-token count would stop check_dispatch_capacity seeing it."
+                )
+            # expert_weight_parameters() hands the autograd node only the weight tensors, so a
+            # bias would join DDP and the optimizer yet never receive a gradient.
+            if self.add_bias_linear:
+                raise ValueError(
+                    "moe_ep_chunk_overlap does not support add_bias_linear=True: the schedule "
+                    "passes _MoEEPChunkOverlapFunction only the experts' weight tensors, so the "
+                    "expert biases never enter its autograd graph, their main_grad stays zero, "
+                    "and the optimizer updates them by zero for the whole run while the loss "
+                    "curve looks healthy."
+                )
 
         # Validation for "mhc" in recompute_modules
         if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:

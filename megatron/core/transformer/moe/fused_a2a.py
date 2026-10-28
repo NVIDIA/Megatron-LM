@@ -530,6 +530,50 @@ _hybrid_ep_buffer = None
 HYBRIDEP_TOKEN_ALIGNMENT = 64
 
 
+def make_hybrid_ep_buffer(
+    group: torch.distributed.ProcessGroup,
+    hidden_dim: int,
+    num_tokens: int,
+    num_local_experts: int,
+    num_sms_dispatch_api: Optional[int] = None,
+    num_sms_combine_api: Optional[int] = None,
+    num_blocks_permute: Optional[int] = None,
+    num_blocks_unpermute: Optional[int] = None,
+    fp8_dispatch: bool = False,
+    num_sms_preprocessing_api: Optional[int] = None,
+):
+    '''
+    Build one HybridEP buffer and return it, leaving the module-global one alone.
+
+    Returns:
+        HybridEPBuffer: a buffer built for this geometry, owned by the caller.
+    '''
+    assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
+    kwargs = {}
+    if num_sms_dispatch_api is not None:
+        kwargs['num_sms_dispatch_api'] = num_sms_dispatch_api
+    if num_sms_combine_api is not None:
+        kwargs['num_sms_combine_api'] = num_sms_combine_api
+    if num_blocks_permute is not None:
+        kwargs['num_blocks_permute'] = num_blocks_permute
+    if num_blocks_unpermute is not None:
+        kwargs['num_blocks_unpermute'] = num_blocks_unpermute
+    if num_sms_preprocessing_api is not None:
+        kwargs['num_sms_preprocessing_api'] = num_sms_preprocessing_api
+    # Mirrors `init_hybrid_ep_buffer`: HybridEP's custom allgather gives up after ~20 s if a rank
+    # is late and continues with that rank's previous routing rows, silently corrupting it.
+    if 'enable_custom_allgather' in inspect.signature(HybridEPBuffer.__init__).parameters:
+        kwargs['enable_custom_allgather'] = False
+    return HybridEPBuffer(
+        group=group,
+        hidden_dim=hidden_dim,
+        max_num_of_tokens_per_rank=num_tokens,
+        num_local_experts=num_local_experts,
+        use_fp8=fp8_dispatch,
+        **kwargs,
+    )
+
+
 def init_hybrid_ep_buffer(
     group: torch.distributed.ProcessGroup,
     hidden_dim: int,
@@ -572,30 +616,20 @@ def init_hybrid_ep_buffer(
         num_sms_preprocessing_api (Optional[int]):
             Number of SMs used by the preprocessing (metadata scan) kernel.
     '''
-    assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _hybrid_ep_buffer
-    kwargs = {}
-    if num_sms_dispatch_api is not None:
-        kwargs['num_sms_dispatch_api'] = num_sms_dispatch_api
-    if num_sms_combine_api is not None:
-        kwargs['num_sms_combine_api'] = num_sms_combine_api
-    if num_blocks_permute is not None:
-        kwargs['num_blocks_permute'] = num_blocks_permute
-    if num_blocks_unpermute is not None:
-        kwargs['num_blocks_unpermute'] = num_blocks_unpermute
-    if num_sms_preprocessing_api is not None:
-        kwargs['num_sms_preprocessing_api'] = num_sms_preprocessing_api
-    # HybridEP's custom allgather gives up after ~20 s if a rank is late and continues with that
-    # rank's routing rows from the previous dispatch, silently corrupting it. Use NCCL instead.
-    if 'enable_custom_allgather' in inspect.signature(HybridEPBuffer.__init__).parameters:
-        kwargs['enable_custom_allgather'] = False
-    _hybrid_ep_buffer = HybridEPBuffer(
-        group=group,
-        hidden_dim=hidden_dim,
-        max_num_of_tokens_per_rank=num_tokens,
-        num_local_experts=num_local_experts,
-        use_fp8=fp8_dispatch,
-        **kwargs,
+    # One constructor, so a fix to it cannot reach the module-global buffer and miss the
+    # per-caller ones; they differ only in where the result is stored.
+    _hybrid_ep_buffer = make_hybrid_ep_buffer(
+        group,
+        hidden_dim,
+        num_tokens,
+        num_local_experts,
+        num_sms_dispatch_api=num_sms_dispatch_api,
+        num_sms_combine_api=num_sms_combine_api,
+        num_blocks_permute=num_blocks_permute,
+        num_blocks_unpermute=num_blocks_unpermute,
+        fp8_dispatch=fp8_dispatch,
+        num_sms_preprocessing_api=num_sms_preprocessing_api,
     )
 
 
@@ -630,6 +664,7 @@ class HybridEPDispatch(torch.autograd.Function):
         num_sms_preprocessing_api=108,
         topk_idx=None,
         num_of_experts=None,
+        buffer=None,
     ):
         '''
         Forward pass of fused dispatch of the HybridEP backend
@@ -649,7 +684,7 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_permute = None
                 num_blocks_unpermute = None
 
-        if _hybrid_ep_buffer is None:
+        if buffer is None and _hybrid_ep_buffer is None:
             num_tokens, hidden_dim = x.shape[-2:]
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
             init_hybrid_ep_buffer(
@@ -664,6 +699,9 @@ class HybridEPDispatch(torch.autograd.Function):
                 fp8_dispatch,
                 num_sms_preprocessing_api,
             )
+        # A caller running several dispatches at once brings its own buffer; everyone else
+        # shares the module-global one, lazily built just above.
+        buffer = _hybrid_ep_buffer if buffer is None else buffer
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
         non_blocking = num_permuted_tokens is not None
@@ -683,7 +721,7 @@ class HybridEPDispatch(torch.autograd.Function):
             dispatched_scaling_factor,
             tokens_per_expert,
             handle,
-        ) = _hybrid_ep_buffer.dispatch_with_permute(
+        ) = buffer.dispatch_with_permute(
             hidden=x,
             probs=probs,
             scaling_factor=None,
@@ -698,6 +736,7 @@ class HybridEPDispatch(torch.autograd.Function):
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
         ctx.fused = fused
+        ctx.buffer = buffer
         return (
             dispatched_hidden,
             dispatched_probs,
@@ -712,7 +751,7 @@ class HybridEPDispatch(torch.autograd.Function):
         Backward pass of fused dispatch of the HybridEP backend
         '''
         handle = ctx.handle
-        combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
+        combined_hidden, combined_probs = ctx.buffer.combine_with_unpermute(
             hidden=grad_x,
             probs=grad_probs,
             handle=handle,
@@ -735,6 +774,7 @@ class HybridEPDispatch(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -745,11 +785,15 @@ class HybridEPCombine(torch.autograd.Function):
     '''
 
     @staticmethod
-    def forward(ctx, x, handle, num_permuted_tokens=None, pad_multiple=None, fused=False):
+    def forward(
+        ctx, x, handle, num_permuted_tokens=None, pad_multiple=None, fused=False, buffer=None
+    ):
         '''
         Forward pass of fused combine of the HybridEP backend
         '''
-        combined_hidden, _ = _hybrid_ep_buffer.combine_with_unpermute(
+        if buffer is None:
+            buffer = _hybrid_ep_buffer
+        combined_hidden, _ = buffer.combine_with_unpermute(
             hidden=x,
             handle=handle,
             pad_multiple=pad_multiple,
@@ -759,6 +803,7 @@ class HybridEPCombine(torch.autograd.Function):
         ctx.pad_multiple = pad_multiple
         ctx.num_permuted_tokens = num_permuted_tokens
         ctx.fused = fused
+        ctx.buffer = buffer
         return combined_hidden
 
     @staticmethod
@@ -767,15 +812,18 @@ class HybridEPCombine(torch.autograd.Function):
         Backward pass of fused combine of the HybridEP backend
         '''
         handle = ctx.handle
-        dispatched_hidden, _, _, _, _ = _hybrid_ep_buffer.dispatch_with_permute(
+        # Same rule the forward dispatch uses: a known permuted-token count is what lets
+        # HybridEP skip the pinned-memory read, which a CUDA-graph capture cannot serve.
+        dispatched_hidden, _, _, _, _ = ctx.buffer.dispatch_with_permute(
             hidden=grad_x,
             scaling_factor=None,
             handle=handle,
             pad_multiple=ctx.pad_multiple,
             num_permuted_tokens=ctx.num_permuted_tokens,
+            non_blocking=ctx.num_permuted_tokens is not None,
             **({"fuse_permute_dispatch": ctx.fused} if ctx.fused else {}),
         )
-        return dispatched_hidden, None, None, None, None
+        return dispatched_hidden, None, None, None, None, None
 
 
 if HAVE_HYBRIDEP:
@@ -797,6 +845,7 @@ if HAVE_HYBRIDEP:
         num_sms_preprocessing_api=108,
         topk_idx=None,
         num_of_experts=None,
+        buffer=None,
     ):
         '''
         Perform fused dispatch for "permute + dispatch a2a + permute" using the
@@ -834,6 +883,10 @@ if HAVE_HYBRIDEP:
                 Dense top-k expert indices with shape [num_tokens, topk].
             num_of_experts (int, optional):
                 Total number of experts. Required when topk_idx is provided.
+            buffer (HybridEPBuffer, optional):
+                Stage through this buffer instead of the module-global one. A caller with
+                several dispatches in flight at once needs one buffer per dispatch: the
+                cached replay reads buffer-resident single-slot staging from offset 0.
         '''
         return HybridEPDispatch.apply(
             x,
@@ -851,10 +904,11 @@ if HAVE_HYBRIDEP:
             num_sms_preprocessing_api,
             topk_idx,
             num_of_experts,
+            buffer,
         )
 
     @internal_api
-    def hybrid_ep_combine(x, handle, num_permuted_tokens, pad_multiple, fused=False):
+    def hybrid_ep_combine(x, handle, num_permuted_tokens, pad_multiple, fused=False, buffer=None):
         '''
         Perform fused combine operation for unpermute + combine a2a + unpermute
         using the HybridEP backend
@@ -871,7 +925,7 @@ if HAVE_HYBRIDEP:
                 The alignment multiple required for FP8 GEMM. If not provided, no padding
                 is performed.
         '''
-        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple, fused)
+        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple, fused, buffer)
 
 else:
     hybrid_ep_dispatch = None
