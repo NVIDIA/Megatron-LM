@@ -96,11 +96,14 @@ def _install_vlm(h, monkeypatch, dynamic, allow_stale):
             return result
 
         monkeypatch.setattr(module, "forward", observed)
-    build = h.engine._build_vlm_request
+    build, encode_waiting = h.engine._build_vlm_request, h.engine._encode_waiting_images
+    unencoded = {}
 
-    def build_request(**kwargs):
-        before = dict(calls)
-        request = build(**kwargs)
+    def record_encoded(request, before):
+        # Dynamic-resolution encodes may wait for prefill; record each request once encoded.
+        if request.image_embeddings is None:
+            unencoded[request.request_id] = (request, before)
+            return
         delta = tuple(calls[name] - before[name] for name in calls)
         admissions.append(
             (
@@ -112,9 +115,20 @@ def _install_vlm(h, monkeypatch, dynamic, allow_stale):
                 request.image_embeddings.detach().cpu(),
             )
         )
+
+    def build_request(**kwargs):
+        before = dict(calls)
+        request = build(**kwargs)
+        record_encoded(request, before)
         return request
 
+    def encode_waiting_images():
+        encode_waiting()
+        for request_id in list(unencoded):
+            record_encoded(*unencoded.pop(request_id))
+
     monkeypatch.setattr(h.engine, "_build_vlm_request", build_request)
+    monkeypatch.setattr(h.engine, "_encode_waiting_images", encode_waiting_images)
 
     def observe_language():
         forward = model.language_model.forward
