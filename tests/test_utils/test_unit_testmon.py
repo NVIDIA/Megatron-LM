@@ -675,3 +675,27 @@ def test_cpu_plan_execution(tmp_path, validation_status, selected_runs):
     assert len(executed) == selected_runs
     assert all("test_example.py::test_one" in event for event in executed)
     assert "unexpected GPU selection" not in result.stderr
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_baseline_records_dependencies_and_rank_coverage_in_one_pass(project, tmp_path, rank):
+    from coverage import CoverageData
+
+    pytest.importorskip("pytest_cov")
+    cache_dir = tmp_path / "recorded"
+    result = _invoke(
+        project, cache_dir, "baseline", rank=rank, pytest_args=("--cov=app", "--cov-report=")
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    data = CoverageData(basename=str(project / f".coverage.unit_tests.rank-{rank}"))
+    data.read()
+    assert {1, 2} <= set(data.lines(str(project / "app.py")))
+    assert (cache_dir / "prod/metadata.json").exists() == (rank == 0)
+    if rank == 0:
+        # The same pass must also record a usable dependency, not an empty DB.
+        (project / "app.py").write_text("def active(value):\n    return value + 2\n")
+        selected = _invoke(project, cache_dir, "select")
+        assert selected.returncode == 0, selected.stdout + selected.stderr
+        assert (cache_dir / ".testmon-work/prod/rank-0/selected-tests").read_text().strip() == (
+            "tests/test_app.py::test_active"
+        )

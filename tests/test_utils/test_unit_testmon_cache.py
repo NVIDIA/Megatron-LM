@@ -552,6 +552,24 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
         ({"SOURCE_REF": "refs/heads/pull-request/6934"}, False),
         ({"SOURCE_REPOSITORY": "fork/Megatron-LM"}, False),
         ({"SOURCE_EVENT": "pull_request"}, False),
+        ({"SOURCE_EVENT": "schedule"}, False),
+        (
+            {
+                "SOURCE_EVENT": "merge_group",
+                "SOURCE_REF": "refs/heads/gh-readonly-queue/main/pr-1",
+                "MERGE_BASE_REF": "refs/heads/main",
+            },
+            True,
+        ),
+        (
+            {
+                "SOURCE_EVENT": "merge_group",
+                "SOURCE_REF": "refs/heads/gh-readonly-queue/dev/pr-1",
+                "MERGE_BASE_REF": "refs/heads/dev",
+            },
+            False,
+        ),
+        ({"SOURCE_EVENT": "merge_group", "MERGE_BASE_REF": "refs/heads/main"}, False),
         ({"REQUESTED_SHA": "c" * 40}, False),
     ],
 )
@@ -574,7 +592,8 @@ def test_action_baseline_guard_rejects_untrusted_producers(tmp_path, override, a
             "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
             "SOURCE_REPOSITORY": "NVIDIA/Megatron-LM",
             "SOURCE_REF": "refs/heads/main",
-            "SOURCE_EVENT": "schedule",
+            "SOURCE_EVENT": "workflow_dispatch",
+            "MERGE_BASE_REF": "",
             "SOURCE_SHA": "b" * 40,
             "REQUESTED_SHA": "b" * 40,
             "TARGET_BRANCH": "main",

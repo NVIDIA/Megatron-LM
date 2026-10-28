@@ -162,7 +162,7 @@ jobs:
           container-image: ${{ inputs.container-image }}
           platform: ${{ inputs.platform }}
           sha: ${{ inputs.sha }}
-          unit_testmon_mode: ${{ matrix.mode || 'full' }}
+          unit_testmon_mode: ${{ inputs.unit_testmon_mode == 'baseline' && 'baseline' || matrix.mode || 'full' }}
           unit_testmon_target_branch: ${{ inputs.unit_testmon_target_branch }}
           unit_testmon_plan_artifact: ${{ matrix.plan_artifact }}
           unit_test_pr_files_artifact_id: ${{ inputs.unit_test_pr_files_artifact_id }}

@@ -1003,8 +1003,8 @@ jobs:
       runner: ${{ needs.configure.outputs.h100_gpu_runs_on }}
       container-image: ${{ format('{0}/megatron-lm:{1}-{2}', needs.configure.outputs.h100_registry, needs.configure.outputs.sha, needs.configure.outputs.h100_cloud) }}
       sha: ${{ needs.configure.outputs.sha }}
-      unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
-      unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
+      unit_testmon_mode: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_ref == 'refs/heads/main' && 'baseline' || needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
+      unit_testmon_target_branch: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_ref == 'refs/heads/main' && 'main' || needs.configure.outputs.target_branch }}
       unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
 
   cicd-parse-unit-tests-gb200:
@@ -1075,8 +1075,8 @@ jobs:
       container-image: ${{ needs.cicd-parse-unit-tests-gb200.outputs.container-image }}
       platform: dgx_gb200
       sha: ${{ needs.configure.outputs.sha }}
-      unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
-      unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
+      unit_testmon_mode: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_ref == 'refs/heads/main' && 'baseline' || needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
+      unit_testmon_target_branch: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_ref == 'refs/heads/main' && 'main' || needs.configure.outputs.target_branch }}
       unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
 
   # Single source of truth for "should integration tests run?".

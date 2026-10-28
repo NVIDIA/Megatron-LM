@@ -76,6 +76,9 @@ def _run(args: argparse.Namespace) -> int:
     if not pytest_args:
         raise RuntimeError("pytest arguments are required after --")
 
+    if args.mode == "baseline" and any(arg.startswith("--cov=") for arg in pytest_args):
+        os.environ["COVERAGE_FILE"] = f".coverage.unit_tests.rank-{rank}"
+
     selection_plugin = None
     if args.mode == "baseline":
         if rank == 0:
