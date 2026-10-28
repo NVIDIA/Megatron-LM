@@ -43,7 +43,7 @@ MODEL_ARGS:
   --use-varlen-dataset: true
   --varlen-mock-dataset-config-json: tests/functional_tests/test_cases/hybrid/hybrid_dynamic_cp_tp1/mock_config.json
   --tokenizer-type: NullTokenizer
-  --vocab-size: 256
+  --vocab-size: 4096
   --data-cache-path: ${DATA_CACHE_PATH}
   --split: 949,50,1
   --dataloader-type: single
