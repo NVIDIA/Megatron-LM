@@ -6,6 +6,7 @@ import torch
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
@@ -35,6 +36,9 @@ class TestParallelAttentionWithNoRope:
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
 
     def teardown_method(self, method):
@@ -181,6 +185,9 @@ class TestParallelAttentionWithNoRope:
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
         config = checkpointed_parallel_attention.config
 
