@@ -2,6 +2,7 @@
 
 import fnmatch
 import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple, Union
 
@@ -359,6 +360,26 @@ class OptimizerConfig:
     arguments layer sets this flag and resets ``use_distributed_optimizer`` to False so
     that the standard distributed-optimizer path is not triggered."""
 
+    use_layer_wise_param_layout: bool = True
+    """Layer-wise (Muon) optimizer only. When True (default, matching the training arguments),
+    LayerWise-managed buffers use the precomputed shard-aligned param layout and non-Muon
+    parameter groups are routed through a sibling DistributedOptimizer. When False
+    (``--no-use-layer-wise-param-layout``), the legacy ping-pong layout keeps every parameter,
+    non-Muon groups included, inside one LayerWise buffer."""
+
+    chunked_optimizer_state_offload: bool = False
+    """Keep selected optimizer tensor states and master weights on CPU between updates."""
+
+    optimizer_state_offload_chunk_size_mb: int = 0
+    """Target GPU staging-window size for optimizer tensor state, in MiB. Zero restores all
+    selected tensor state together."""
+
+    optimizer_state_offload_fraction: float = 1.0
+    """Fraction of optimizer parameter bundles whose state and master weights are offloaded."""
+
+    offload_optimizer_states: bool = False
+    """Deprecated alias for :attr:`chunked_optimizer_state_offload`."""
+
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute. 
         This argument is intended to have the same value as the "overlap_param_gather" argument 
@@ -427,6 +448,79 @@ class OptimizerConfig:
     def __post_init__(self):
         """Check the validity of the config."""
 
+        used_deprecated_optimizer_state_offload = self.offload_optimizer_states
+        if self.offload_optimizer_states:
+            warnings.warn(
+                "offload_optimizer_states is deprecated; use "
+                "chunked_optimizer_state_offload instead. The deprecated option now enables "
+                "the replacement with its legacy-equivalent defaults: chunk size 0 and "
+                "offload fraction 1.0 unless those settings were explicitly changed.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            self.chunked_optimizer_state_offload = True
+            self.offload_optimizer_states = False
+
+        assert (
+            self.optimizer_state_offload_chunk_size_mb >= 0
+        ), "optimizer_state_offload_chunk_size_mb must be non-negative"
+        assert (
+            0.0 <= self.optimizer_state_offload_fraction <= 1.0
+        ), "optimizer_state_offload_fraction must be in [0.0, 1.0]"
+
+        if self.chunked_optimizer_state_offload and self.optimizer_state_offload_fraction > 0.0:
+            if used_deprecated_optimizer_state_offload:
+                assert self.optimizer == 'adam', (
+                    "the deprecated --offload-optimizer-states alias currently supports only "
+                    "Adam; use --chunked-optimizer-state-offload for supported Muon offload"
+                )
+            else:
+                assert self.optimizer in (
+                    'adam',
+                    'muon',
+                ), "chunked optimizer state offload currently supports Adam and Muon"
+
+            assert (
+                not self.optimizer_cpu_offload
+            ), "chunked_optimizer_state_offload and optimizer_cpu_offload are mutually exclusive"
+            assert (
+                not self.optimizer_cuda_graph
+            ), "chunked optimizer state offload does not support optimizer CUDA graphs"
+
+            if self.use_precision_aware_optimizer:
+                assert self.main_params_dtype == torch.float32, (
+                    "chunked optimizer state offload with precision-aware optimizer requires "
+                    "main_params_dtype=torch.float32"
+                )
+                supported_state_dtypes = (torch.float32, torch.bfloat16)
+                assert self.exp_avg_dtype in supported_state_dtypes, (
+                    "chunked optimizer state offload with precision-aware optimizer requires "
+                    "exp_avg_dtype to be torch.float32 or torch.bfloat16"
+                )
+                assert self.exp_avg_sq_dtype in supported_state_dtypes, (
+                    "chunked optimizer state offload with precision-aware optimizer requires "
+                    "exp_avg_sq_dtype to be torch.float32 or torch.bfloat16"
+                )
+
+            if self.optimizer == 'muon':
+                assert (
+                    self.use_layer_wise_distributed_optimizer
+                ), "Muon optimizer state offload requires LayerWiseDistributedOptimizer"
+                assert self.bf16, "Muon optimizer state offload currently requires bf16"
+                assert self.use_layer_wise_param_layout, (
+                    "Muon optimizer state offload requires the precomputed LayerWise param layout "
+                    "(the default; do not pass --no-use-layer-wise-param-layout): the legacy "
+                    "ping-pong layout keeps non-Muon parameter groups inside the LayerWise "
+                    "optimizer, and only TensorParallelMuon children can be offloaded"
+                )
+            else:
+                assert not self.use_layer_wise_distributed_optimizer, (
+                    "Adam optimizer state offload does not support " "LayerWiseDistributedOptimizer"
+                )
+                assert (
+                    self.use_distributed_optimizer
+                ), "Adam optimizer state offload requires use_distributed_optimizer"
+
         # The following condition is used to avoid repetition in distrib_optimizer.py.
         # This is because in distrib_optimizer.py, the process to handle parameters are
         # different for different training precision settings. FP8 cases require different
@@ -444,8 +538,6 @@ class OptimizerConfig:
 
         if self.fp8_recipe == "mxfp8":
             if not self.reuse_grad_buf_for_mxfp8_param_ag:
-                import warnings
-
                 warnings.warn(
                     "mxfp8 without using reuse_grad_buf_for_mxfp8_param_ag and fp8_param_gather"
                     "will use significant amount additional GPU memory."

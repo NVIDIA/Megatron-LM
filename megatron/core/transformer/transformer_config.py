@@ -2817,6 +2817,7 @@ class TransformerConfig(ModelParallelConfig):
                     "mlp",
                     "moe",
                     "shared_experts",
+                    "gdn",
                     "gdn_norm_out",
                     "gdp_in_proj",
                     "gdp_qkv",
