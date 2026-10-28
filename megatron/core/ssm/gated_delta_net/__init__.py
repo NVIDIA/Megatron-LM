@@ -35,6 +35,8 @@ __all__ = [
     "HAVE_FLA_GDN2",
     "HAVE_FLA_KDA",
     "HAVE_TE_GDN",
+    "KimiDeltaAttention",
+    "KimiDeltaAttentionSubmodules",
     "GatedDeltaNet",
     "GatedDeltaNet2",
     "GatedDeltaNetSubmodules",

@@ -313,6 +313,19 @@ def _apply_rotary_pos_emb_thd(
     ).squeeze(1)
 
 
+def should_use_fused_mla_rope(config: TransformerConfig) -> bool:
+    """Return whether MLA's custom fused RoPE kernels support this configuration.
+
+    The custom fused MLA RoPE kernels (fused_apply_mla_rope_for_q/kv) are not yet
+    carried onto this main-based branch, so this always returns False and MLA uses
+    the (numerically equivalent) unfused RoPE path. The full fused-kernel support
+    follows in a later commit; see the based-on-main carry-over plan.
+    """
+    # TODO(to-main): carry the fused MLA RoPE kernels and restore the real gating
+    # (config.apply_rope_fusion and full-rotary check).
+    return False
+
+
 def apply_rotary_pos_emb(
     t: Tensor,
     freqs: Tensor,

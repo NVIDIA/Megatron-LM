@@ -831,6 +831,116 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     return total_real_tokens / dedup, seqlen_squared_sum / dedup
 
 
+def _dsv4_hybrid_self_attention_flops(
+    *,
+    hidden_size,
+    num_attention_heads,
+    v_head_dim,
+    q_lora_rank,
+    o_groups,
+    o_lora_rank,
+    csa_window_size,
+    seq_length,
+    n_layers_r0,
+    n_layers_r4,
+    n_layers_r128,
+    dsa_indexer_n_heads,
+    dsa_indexer_head_dim,
+    dsa_indexer_topk,
+):
+    """Per-iteration DSv4-hybrid self-attention FLOPs coefficients.
+
+    DSv4 attention layers are MLA-based but replace full ``O(L^2)`` core
+    attention with sparse attention (sliding window + compressed-KV), plus a
+    main compressor and, on ``ratio==4`` layers, a learned indexer (DSA). This
+    is the SINGLE SOURCE OF TRUTH shared by the standard-model path
+    (``transformer_flops``) and the hybrid-model path (``hybrid_flops``): the
+    two differ only in how they obtain the per-ratio attention-layer counts
+    (a ``csa_compress_ratios`` list vs. Window/CSA/HCA pattern symbols).
+
+    Layer-type ratios:
+      * ``r==0``   (Window): window-only attention; no compressor / indexer.
+      * ``r==4``   (CSA):    window + learned-topk over compressed KV
+        (compressor + indexer).
+      * ``r==128`` (HCA):    window + all compressed KV (compressor only).
+
+    Returns ``(token_linear, core)`` WITHOUT the fwd+bwd (x3) or FMA (x2)
+    expansion factors -- the caller applies those. Multiply ``token_linear`` by
+    the real (unpadded) token count and ``core`` by ``sum_i(L_i ** 2)``.
+    """
+    n_attn_layers = n_layers_r0 + n_layers_r4 + n_layers_r128
+
+    # ---- MLA projections (token-linear, per attention layer) ----
+    # DSv4 hybrid MLA: ``qk_head_dim + qk_pos_emb_head_dim == v_head_dim`` and the
+    # joint KV is a single ``hidden -> v_head_dim`` projection; the output uses a
+    # grouped low-rank ``(o_groups x o_lora_rank)`` projection (NOT the dense
+    # ``num_heads * v_head_dim -> hidden`` projection of plain MLA).
+    q_term = q_lora_rank * (hidden_size + num_attention_heads * v_head_dim + 1)
+    kv_term = hidden_size * v_head_dim + v_head_dim
+    o_term = num_attention_heads * v_head_dim * o_lora_rank + o_groups * o_lora_rank * hidden_size
+    mla_proj_term = (q_term + kv_term + o_term) * n_attn_layers
+
+    # ---- Sparse attention (replaces full core attention) ----
+    # Split into token-linear parts (window attention, constant per token) and
+    # L^2 parts (compressed-KV attention, scales with sequence length) so THD
+    # packed sequences get correct ``seqlen_squared_sum`` scaling.
+    # r=0: window-only, fixed per-token cost.
+    sparse_attn_r0 = n_layers_r0 * num_attention_heads * csa_window_size * v_head_dim * 2
+    # r=128: window (token-linear) + all compressed KV (L^2). Compressed
+    # positions per token ~= L/(128*2) (causal /2), x2 for QK^T + softmax@V ->
+    # L^2 coefficient ``num_heads * v_head_dim / 128``.
+    sparse_attn_r128_window = n_layers_r128 * num_attention_heads * csa_window_size * v_head_dim * 2
+    sparse_attn_r128_core = n_layers_r128 * num_attention_heads * v_head_dim / 128
+
+    # ---- Main compressor (ratio > 0 layers) ----
+    # Two projections per layer (wkv + wgate): ``hidden -> coff * v_head_dim``.
+    # ratio == 4: coff = 2 (overlapping windows); ratio == 128: coff = 1.
+    main_compressor_term = (
+        n_layers_r4 * hidden_size * (2 * v_head_dim) * 2
+        + n_layers_r128 * hidden_size * (1 * v_head_dim) * 2
+    )
+
+    # ---- r=4 layers: sparse attention + indexer ----
+    if n_layers_r4 > 0:
+        assert (
+            dsa_indexer_n_heads is not None
+        ), "dsa_indexer_n_heads must be set for dsv4_hybrid with ratio==4 layers."
+        assert (
+            dsa_indexer_head_dim is not None
+        ), "dsa_indexer_head_dim must be set for dsv4_hybrid with ratio==4 layers."
+        assert (
+            dsa_indexer_topk is not None
+        ), "dsa_indexer_topk must be set for dsv4_hybrid with ratio==4 layers."
+        effective_topk_4 = min(dsa_indexer_topk, seq_length // 4)
+        avg_comp_4 = effective_topk_4 * (1 - effective_topk_4 * 4 / (2 * seq_length))
+        sparse_attn_r4 = (
+            n_layers_r4 * num_attention_heads * (csa_window_size + avg_comp_4) * v_head_dim * 2
+        )
+        # Indexer token-linear: compressor (coff=2, wkv + wgate), Q proj, weights proj.
+        indexer_token_term = (
+            n_layers_r4 * hidden_size * (2 * dsa_indexer_head_dim) * 2
+            + n_layers_r4 * q_lora_rank * dsa_indexer_n_heads * dsa_indexer_head_dim
+            + n_layers_r4 * hidden_size * dsa_indexer_n_heads
+        )
+        # Indexer L^2: scoring each query against ~L/4 compressed positions.
+        indexer_scoring_core = n_layers_r4 * dsa_indexer_n_heads * dsa_indexer_head_dim / 4
+    else:
+        sparse_attn_r4 = 0
+        indexer_token_term = 0
+        indexer_scoring_core = 0
+
+    token_linear = (
+        mla_proj_term
+        + sparse_attn_r0
+        + sparse_attn_r4
+        + sparse_attn_r128_window
+        + main_compressor_term
+        + indexer_token_term
+    )
+    core = sparse_attn_r128_core + indexer_scoring_core
+    return token_linear, core
+
+
 def num_floating_point_operations(
     args,
     cfg,
@@ -899,8 +1009,15 @@ def num_floating_point_operations(
         return routed_flops + shared_flops
 
     def attn_layer_flops(
-        total_tokens, seqlen_squared_sum, hidden_size, num_heads, gqa=True,
-        gqa_groups=8, kv_channels=None,
+        total_tokens,
+        seqlen_squared_sum,
+        hidden_size,
+        num_heads,
+        gqa=True,
+        gqa_groups=8,
+        kv_channels=None,
+        attention_output_gate=False,
+        gated_attention_proj_granularity="elementwise",
     ):
         """Calculate FLOPs for an attention layer.
 
@@ -913,13 +1030,78 @@ def num_floating_point_operations(
         """
         p = (kv_channels * num_heads / hidden_size) if kv_channels else 1
         g = gqa_groups if gqa else num_heads
+        gate_projection_size = 0
+        if attention_output_gate:
+            if gated_attention_proj_granularity == "elementwise":
+                gate_projection_size = hidden_size * p
+            elif gated_attention_proj_granularity == "headwise":
+                gate_projection_size = num_heads
+            else:
+                raise ValueError(
+                    "gated_attention_proj_granularity must be either 'elementwise' or "
+                    f"'headwise', got {gated_attention_proj_granularity!r}."
+                )
         # 4 * total_tokens * h * p * (h + h*(g/n)): QKV + output projections (fwd*3, with FMA*2).
+        # The output gate contributes one additional hidden_size -> gate_size projection.
         # 2 * sum(L^2) * h * p: core attention (causal mask -> /2 cancels with FMA *2).
         return (
             4 * total_tokens * hidden_size * p
             * (hidden_size + hidden_size * (g / num_heads))
+            + 2 * total_tokens * hidden_size * gate_projection_size
             + 2 * seqlen_squared_sum * hidden_size * p
         )
+
+    def mla_attn_layer_flops(
+        total_tokens,
+        seqlen_squared_sum,
+        hidden_size,
+        num_heads,
+        q_lora_rank,
+        kv_lora_rank,
+        qk_head_dim,
+        qk_pos_emb_head_dim,
+        v_head_dim,
+        attention_output_gate=False,
+        gated_attention_proj_granularity="elementwise",
+    ):
+        """Calculate FLOPs for a Multi-Latent Attention (MLA) layer.
+
+        The generic ``attn_layer_flops`` above assumes dense MHA/GQA QKV
+        projections and badly overcounts MLA, whose Q/KV go through low-rank
+        ``lora`` ranks. Returns a forward-equivalent value (FMA factor 2 baked
+        in, no forward/backward factor): hybrid_flops applies the global factor 3.
+        """
+        fma = 2
+        if q_lora_rank is None:
+            q_term = hidden_size * num_heads * (qk_head_dim + qk_pos_emb_head_dim)
+        else:
+            q_term = q_lora_rank * (
+                hidden_size + num_heads * (qk_head_dim + qk_pos_emb_head_dim) + 1
+            )
+        gate_projection_size = 0
+        if attention_output_gate:
+            if gated_attention_proj_granularity == "elementwise":
+                gate_projection_size = num_heads * v_head_dim
+            elif gated_attention_proj_granularity == "headwise":
+                gate_projection_size = num_heads
+            else:
+                raise ValueError(
+                    "gated_attention_proj_granularity must be either 'elementwise' or "
+                    f"'headwise', got {gated_attention_proj_granularity!r}."
+                )
+        # Token-linear part (q lora+rope+norm, kv lora+rope+norm, output proj).
+        token_linear = fma * (
+            q_term
+            + kv_lora_rank * (hidden_size + num_heads * (qk_head_dim + v_head_dim) + 1)
+            + hidden_size * qk_pos_emb_head_dim
+            + (num_heads * v_head_dim) * hidden_size
+            + hidden_size * gate_projection_size
+        )
+        # Core attention (L^2) part: QK^T and (softmax(QK^T))V. /2 (causal) cancels *2 (FMA).
+        core = fma * (
+            num_heads * (qk_head_dim + qk_pos_emb_head_dim) / 2 + num_heads * v_head_dim / 2
+        )
+        return token_linear * total_tokens + core * seqlen_squared_sum
 
     def mamba_layer_flops(total_tokens, hidden_size, state_dim=16,
                           head_dim=64, num_groups=1, num_heads=128):
@@ -1000,10 +1182,55 @@ def num_floating_point_operations(
             )
         )
 
+    def kda_layer_flops(
+        total_tokens,
+        hidden_size,
+        qk_head_dim=128,
+        v_head_dim=128,
+        num_qk_heads=16,
+        num_v_heads=16,
+        conv_kernel_dim=4,
+        f_lora_rank=None,
+        gate_lora_rank=None,
+    ):
+        """Calculate projection FLOPs for a Kimi Delta Attention layer."""
+        if num_qk_heads != num_v_heads or qk_head_dim != v_head_dim:
+            raise ValueError(
+                "KDA FLOPs require the equal K/V head layout enforced by KimiDeltaAttention."
+            )
+        qk_dim = qk_head_dim * num_qk_heads
+        v_dim = v_head_dim * num_v_heads
+        f_projection_flops = hidden_size * qk_dim
+        if f_lora_rank is not None:
+            if f_lora_rank <= 0:
+                raise ValueError(
+                    f"KDA F-decay projection rank must be positive, got {f_lora_rank=}."
+                )
+            f_projection_flops = hidden_size * f_lora_rank + f_lora_rank * qk_dim
+        gate_projection_flops = hidden_size * v_dim
+        if gate_lora_rank is not None:
+            if gate_lora_rank <= 0:
+                raise ValueError(
+                    f"KDA output-gate projection rank must be positive, got {gate_lora_rank=}."
+                )
+            gate_projection_flops = hidden_size * gate_lora_rank + gate_lora_rank * v_dim
+        projection_flops = (
+            hidden_size * (2 * qk_dim + v_dim + num_qk_heads)
+            + f_projection_flops
+            + gate_projection_flops
+            + hidden_size * v_dim
+        )
+        non_core_flops = (
+            2 * total_tokens * (projection_flops + conv_kernel_dim * (2 * qk_dim + v_dim))
+        )
+        state_update_flops = num_v_heads * (qk_head_dim**2 + 3 * qk_head_dim * v_head_dim)
+        core_flops = 2 * total_tokens * state_update_flops
+        return non_core_flops + core_flops
+
     def hybrid_flops(total_tokens, seqlen_squared_sum, hidden_size,
                      num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
                      num_dsa_layers, gdp_num_householder,
-                     num_gdn_layers=0,
+                     num_gdn_layers=0, num_mla_layers=0, num_kda_layers=0,
                      mamba_state_dim=128, mamba_head_dim=64,
                      mamba_num_groups=8, mamba_num_heads=128,
                      num_attn_heads=32, gqa=True,
@@ -1015,6 +1242,9 @@ def num_floating_point_operations(
                      gdn_qk_head_dim=128, gdn_v_head_dim=128,
                      gdn_num_qk_heads=16, gdn_num_v_heads=32,
                      gdn_conv_kernel_dim=4, gdn_use_gdn2=False,
+                     kda_qk_head_dim=128, kda_v_head_dim=128,
+                     kda_num_qk_heads=16, kda_num_v_heads=16,
+                     kda_conv_kernel_dim=4, kda_f_lora_rank=None, kda_gate_lora_rank=None,
                      vocab_size=256000, mtp_num_layers=0):
         """Calculate total training FLOPs for the hybrid model, including DSA."""
         mamba_flops = (
@@ -1050,6 +1280,16 @@ def num_floating_point_operations(
                 num_attn_layers * attn_layer_flops(total_tokens, seqlen_squared_sum,
                                                    hidden_size, num_attn_heads, gqa,
                                                    gqa_groups, kv_channels) +
+                num_mla_layers * mla_attn_layer_flops(total_tokens, seqlen_squared_sum,
+                                                      hidden_size, num_attn_heads,
+                                                      args.q_lora_rank, args.kv_lora_rank,
+                                                      args.qk_head_dim, args.qk_pos_emb_head_dim,
+                                                      args.v_head_dim) +
+                num_kda_layers * kda_layer_flops(total_tokens, hidden_size,
+                                                 kda_qk_head_dim, kda_v_head_dim,
+                                                 kda_num_qk_heads, kda_num_v_heads,
+                                                 kda_conv_kernel_dim, kda_f_lora_rank,
+                                                 kda_gate_lora_rank) +
                 num_mlp_layers * mlp_layer_flops(total_tokens, hidden_size,
                                                  mlp_expansion, swiglu) +
                 num_mamba_layers * mamba_flops +
@@ -1284,7 +1524,19 @@ def num_floating_point_operations(
             )
             num_standard_attention_layers = num_layers - num_linear_attention_layers
 
-            if is_gated_delta_net_variant(args.experimental_attention_variant):
+            if args.experimental_attention_variant == "kda":
+                linear_self_attn_term = forward_backward_expansion_factor * kda_layer_flops(
+                    total_tokens=1,
+                    hidden_size=args.hidden_size,
+                    f_lora_rank=getattr(args, "kda_f_lora_rank", None),
+                    gate_lora_rank=getattr(args, "kda_gate_lora_rank", None),
+                    qk_head_dim=args.linear_key_head_dim,
+                    v_head_dim=args.linear_value_head_dim,
+                    num_qk_heads=args.linear_num_key_heads,
+                    num_v_heads=args.linear_num_value_heads,
+                    conv_kernel_dim=args.linear_conv_kernel_dim,
+                )
+            elif is_gated_delta_net_variant(args.experimental_attention_variant):
                 # Calculate the FLOPs for the gated delta net attention.
                 qk_head_dim = args.linear_key_head_dim
                 v_head_dim = args.linear_value_head_dim
@@ -1461,14 +1713,19 @@ def num_floating_point_operations(
             Symbols,
             get_hybrid_layer_counts,
         )
+        layer_counts = get_hybrid_layer_counts(args.hybrid_layer_pattern)
         num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers, num_dsa_layers = (
             itemgetter(
                 Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE,
                 Symbols.DS_ATTENTION,
             )(
-                get_hybrid_layer_counts(args.hybrid_layer_pattern)
+                layer_counts
             )
         )
+        # MLA ('+') and KDA ('K') are counted separately so hybrid_flops can use the MLA and KDA
+        # per-layer FLOPs instead of the plain-attention estimate.
+        num_mla_layers = layer_counts[Symbols.MLA]
+        num_kda_layers = layer_counts[Symbols.KDA]
 
         mtp_num_layers = args.mtp_num_layers
         if mtp_num_layers is None:
@@ -1479,6 +1736,8 @@ def num_floating_point_operations(
             seqlen_squared_sum=seqlen_squared_sum_in_batch,
             hidden_size=args.hidden_size,
             num_attn_layers=num_attn_layers,
+            num_mla_layers=num_mla_layers,
+            num_kda_layers=num_kda_layers,
             num_mamba_layers=num_mamba_layers,
             num_mlp_layers=num_mlp_layers,
             num_moe_layers=num_moe_layers,
@@ -1508,6 +1767,8 @@ def num_floating_point_operations(
             gdn_num_v_heads=args.linear_num_value_heads or 32,
             gdn_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             gdn_use_gdn2=(args.experimental_attention_variant == "gdn2"),
+            kda_f_lora_rank=getattr(args, "kda_f_lora_rank", None),
+            kda_gate_lora_rank=getattr(args, "kda_gate_lora_rank", None),
             vocab_size=cfg.tokenizer.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
         ))

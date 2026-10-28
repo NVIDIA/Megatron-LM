@@ -72,6 +72,9 @@ def _make_gpt_args(
     args.linear_num_key_heads = None
     args.linear_num_value_heads = None
     args.linear_conv_kernel_dim = None
+    args.gdp_num_householder = 3
+    args.kda_f_lora_rank = None
+    args.kda_gate_lora_rank = None
     # MLA fields (unused but referenced).
     args.q_lora_rank = None
     args.qk_head_dim = None
@@ -102,6 +105,71 @@ def _make_hybrid_args(*, num_layers=4, hidden_size=512, num_attention_heads=8, s
     args.mamba_num_heads = 128
     args.gdp_num_householder = 3
     return args, cfg
+
+
+def _make_kda_hybrid_args():
+    """Minimal KDA dimensions for hybrid FLOPs tests."""
+    args, cfg = _make_hybrid_args()
+    args.hybrid_layer_pattern = "K"
+    args.linear_key_head_dim = 32
+    args.linear_value_head_dim = 32
+    args.kda_f_lora_rank = 16
+    args.kda_gate_lora_rank = None
+    args.linear_num_key_heads = 8
+    args.linear_num_value_heads = 8
+    args.linear_conv_kernel_dim = 4
+    return args, cfg
+
+
+def _make_mla_hybrid_args():
+    """Minimal head-wise gated MLA dimensions for hybrid FLOPs tests."""
+    args, cfg = _make_hybrid_args()
+    args.hybrid_layer_pattern = "+"
+    args.q_lora_rank = 128
+    args.qk_head_dim = 48
+    args.qk_pos_emb_head_dim = 16
+    args.kv_lora_rank = 256
+    args.v_head_dim = 64
+    args.attention_output_gate = True
+    args.gated_attention_proj_granularity = "headwise"
+    return args, cfg
+
+
+def test_situ_glu_counts_the_same_ffn_gemms_as_swiglu():
+    swiglu_args, swiglu_cfg = _make_gpt_args(swiglu=True)
+    situ_glu_args, situ_glu_cfg = _make_gpt_args(swiglu=False)
+    situ_glu_args.situ_glu = True
+
+    assert num_floating_point_operations(
+        situ_glu_args, situ_glu_cfg, batch_size=8
+    ) == num_floating_point_operations(swiglu_args, swiglu_cfg, batch_size=8)
+
+
+def _enable_qwen35_vision_flops(args, validate=True):
+    """Attach a small Qwen3.5-VL vision configuration to decoder args.
+
+    Mirrors what ``examples/multimodal_dev/models/qwen35_vl/factory.py:
+    set_vision_flops_metadata`` sets on ``args``, including calling
+    ``validate_vision_flops_metadata`` (unless ``validate=False``, used by
+    tests that want to construct an invalid config and validate it
+    themselves after further mutating a field).
+    """
+    args.count_vision_model_flops = True
+    args.vision_flops_variant = "qwen35_vl"
+    args.vision_num_layers = 2
+    args.vision_hidden_size = 8
+    args.vision_ffn_hidden_size = 16
+    args.vision_num_attention_heads = 2
+    args.vision_kv_channels = 4
+    args.vision_in_channels = 3
+    args.vision_patch_size = 2
+    args.vision_temporal_patch_size = 2
+    args.vision_spatial_merge_size = 2
+    args.vision_out_hidden_size = 12
+    args.image_size = 8
+    if validate:
+        validate_vision_flops_metadata(args)
+    return args
 
 
 class TestBSHDBackwardCompat:
@@ -270,6 +338,333 @@ class TestHybridTHDScaling:
         expected_delta_per_layer_per_unit_sum = 2 * kv * n * 3  # *3 for fwd+bwd
         expected_delta = num_attn_layers * expected_delta_per_layer_per_unit_sum * bshd_sum
         assert flops_doubled - flops_bshd == expected_delta
+
+    def test_mla_attention_variants_are_counted(self):
+        """Regression: DSv4 MLA attention variants (CSA 'C', HCA 'H', Window 'W',
+        DS_ATTENTION 'D') must contribute attention FLOPs. Previously these symbols
+        were omitted, so a pattern made entirely of C/H/W layers reported zero
+        attention FLOPs -- roughly halving the throughput estimate."""
+        args, cfg = _make_hybrid_args()
+        args.multi_latent_attention = True
+        # MLA dims (DSv4-like; values only need to be self-consistent and positive).
+        args.q_lora_rank = 256
+        args.kv_lora_rank = 32
+        args.qk_head_dim = 64
+        args.qk_pos_emb_head_dim = 32
+        args.v_head_dim = 64
+        batch_size = 4
+
+        # MLA attention variants (C, H) must be counted exactly like dense MLA '+'.
+        # Both patterns are 2 MLA + 2 Mamba layers, so they yield identical FLOPs.
+        # Regular attention '*' is intentionally not the reference: hybrid grammar
+        # assigns different projection work to '*' and '+'.
+        args.hybrid_layer_pattern = "CMHM"
+        flops_mla_variants = num_floating_point_operations(args, cfg, batch_size)
+        args.hybrid_layer_pattern = "+M+M"
+        flops_dense_mla = num_floating_point_operations(args, cfg, batch_size)
+
+        assert flops_mla_variants == flops_dense_mla
+        # And attention must be a non-trivial contributor: dropping the two
+        # attention layers entirely (all Mamba) changes the estimate.
+        args.hybrid_layer_pattern = "MMMM"
+        flops_no_attn = num_floating_point_operations(args, cfg, batch_size)
+        assert flops_mla_variants != flops_no_attn
+
+
+class TestHybridMatchesStandard:
+    """The hybrid-model path (``hybrid_flops`` / ``mla_attn_layer_flops``) must
+    agree with the standard-model path (``transformer_flops``) for an equivalent
+    architecture.
+
+    A dense Transformer with ``N`` layers has ``N`` attention sub-layers and
+    ``N`` MLP sub-layers. The hybrid path models those as separate layers, so the
+    matching hybrid pattern is ``N`` attention layers interleaved with ``N`` MLP
+    layers (``"*-" * N``). With identical hidden / head / ffn / vocab dims the
+    two estimates must be bit-for-bit equal -- this pins ``mla_attn_layer_flops``
+    (and the dense ``attn_layer_flops``) against the reference MLA / MHA / GQA
+    terms in ``transformer_flops`` (see GitHub PR #5358), both for BSHD and for
+    the THD ``sum(L_i^2)`` / real-token scaling.
+    """
+
+    @staticmethod
+    def _equivalent_pair(configure, num_layers=3):
+        """Build (standard_args, standard_cfg, hybrid_args, hybrid_cfg) describing the same arch."""
+        standard, standard_cfg = _make_gpt_args(num_layers=num_layers)
+        configure(standard)
+
+        hybrid, hybrid_cfg = _make_gpt_args(num_layers=num_layers)
+        configure(hybrid)
+        # The hybrid path reads Mamba dims even when no Mamba layers are present.
+        hybrid.mamba_state_dim = 128
+        hybrid.mamba_head_dim = 64
+        hybrid.mamba_num_groups = 8
+        hybrid.mamba_num_heads = 128
+        hybrid.gdp_num_householder = 3
+        # Match the standard model's attention implementation explicitly:
+        # '*' is regular attention and '+' is dense MLA in the hybrid grammar.
+        attention_symbol = "+" if hybrid.multi_latent_attention else "*"
+        hybrid.hybrid_layer_pattern = (attention_symbol + "-") * num_layers
+        return standard, standard_cfg, hybrid, hybrid_cfg
+
+    def _assert_match(self, configure):
+        standard, standard_cfg, hybrid, hybrid_cfg = self._equivalent_pair(configure)
+        batch_size = 4
+
+        # BSHD: closed-form defaults.
+        assert num_floating_point_operations(
+            standard, standard_cfg, batch_size
+        ) == num_floating_point_operations(hybrid, hybrid_cfg, batch_size)
+
+        # THD: both paths must consume the ragged stats identically.
+        s = standard.seq_length
+        thd_sum_sq = batch_size * 4 * (s // 4) ** 2
+        thd_tokens = batch_size * s * 3 // 4
+        assert num_floating_point_operations(
+            standard,
+            standard_cfg,
+            batch_size,
+            seqlen_squared_sum_in_batch=thd_sum_sq,
+            total_real_tokens_in_batch=thd_tokens,
+        ) == num_floating_point_operations(
+            hybrid,
+            hybrid_cfg,
+            batch_size,
+            seqlen_squared_sum_in_batch=thd_sum_sq,
+            total_real_tokens_in_batch=thd_tokens,
+        )
+
+    def test_dense_mha(self):
+        self._assert_match(lambda args: None)
+
+    def test_gqa(self):
+        def configure(args):
+            args.group_query_attention = True
+            args.num_query_groups = 2
+
+        self._assert_match(configure)
+
+    def test_mla_with_q_lora(self):
+        def configure(args):
+            args.multi_latent_attention = True
+            args.group_query_attention = False
+            args.q_lora_rank = 256
+            args.qk_head_dim = 64
+            args.qk_pos_emb_head_dim = 32
+            args.kv_lora_rank = 256
+            args.v_head_dim = 64
+
+        self._assert_match(configure)
+
+    def test_mla_without_q_lora(self):
+        def configure(args):
+            args.multi_latent_attention = True
+            args.group_query_attention = False
+            args.q_lora_rank = None
+            args.qk_head_dim = 64
+            args.qk_pos_emb_head_dim = 32
+            args.kv_lora_rank = 256
+            args.v_head_dim = 64
+
+        self._assert_match(configure)
+
+    @pytest.mark.parametrize("gate_granularity", ("elementwise", "headwise"))
+    def test_mla_output_gate(self, gate_granularity):
+        def configure(args):
+            args.multi_latent_attention = True
+            args.group_query_attention = False
+            args.q_lora_rank = 256
+            args.qk_head_dim = 64
+            args.qk_pos_emb_head_dim = 32
+            args.kv_lora_rank = 256
+            args.v_head_dim = 64
+            args.attention_output_gate = True
+            args.gated_attention_proj_granularity = gate_granularity
+
+        self._assert_match(configure)
+
+
+class TestMTPLogitFlops:
+    """MTP head detachment removes draft wgrad without changing the final LM head."""
+
+    @pytest.mark.parametrize(
+        "make_args", (_make_gpt_args, _make_hybrid_args), ids=("standard", "hybrid")
+    )
+    @pytest.mark.parametrize("mtp_loss_type", ("cross_entropy", "e2e_tv"))
+    def test_detached_draft_heads_omit_only_weight_gradient(self, make_args, mtp_loss_type):
+        args = make_args()
+        args.mtp_num_layers = 3
+        args.mtp_loss_type = mtp_loss_type
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+
+        args.mtp_detach_heads = False
+        attached_flops = num_floating_point_operations(args, cfg, batch_size)
+        args.mtp_detach_heads = True
+        detached_flops = num_floating_point_operations(args, cfg, batch_size)
+
+        # One FMA-counted output-projection pass (wgrad) disappears per draft
+        # head. Forward and hidden-state dgrad remain.
+        expected_removed_wgrad = (
+            2 * total_tokens * args.hidden_size * args.padded_vocab_size * args.mtp_num_layers
+        )
+        assert attached_flops - detached_flops == expected_removed_wgrad
+
+    @pytest.mark.parametrize(
+        "make_args", (_make_gpt_args, _make_hybrid_args), ids=("standard", "hybrid")
+    )
+    def test_detached_heads_preserve_e2e_tv_target_projection(self, make_args):
+        args = make_args()
+        args.mtp_num_layers = 3
+        args.mtp_detach_heads = True
+        batch_size = 2
+
+        args.mtp_loss_type = "cross_entropy"
+        cross_entropy_flops = num_floating_point_operations(args, cfg, batch_size)
+        args.mtp_loss_type = "e2e_tv"
+        e2e_tv_flops = num_floating_point_operations(args, cfg, batch_size)
+
+        # The frozen target projection adds one forward pass, independent of
+        # the number of draft heads and their omitted weight gradients.
+        expected_target_projection = (
+            2 * batch_size * args.seq_length * args.hidden_size * args.padded_vocab_size
+        )
+        assert e2e_tv_flops - cross_entropy_flops == expected_target_projection
+
+    @pytest.mark.parametrize(
+        "make_args", (_make_gpt_args, _make_hybrid_args), ids=("standard", "hybrid")
+    )
+    def test_detach_flag_does_not_change_final_lm_head(self, make_args):
+        args = make_args()
+        args.mtp_num_layers = None
+        batch_size = 2
+
+        args.mtp_detach_heads = False
+        attached_flops = num_floating_point_operations(args, cfg, batch_size)
+        args.mtp_detach_heads = True
+        detached_flops = num_floating_point_operations(args, cfg, batch_size)
+
+        assert attached_flops == detached_flops
+
+    @pytest.mark.parametrize(
+        "make_args", (_make_gpt_args, _make_hybrid_args), ids=("standard", "hybrid")
+    )
+    def test_missing_detach_flag_keeps_legacy_three_pass_count(self, make_args):
+        args = make_args()
+        args.mtp_num_layers = 3
+        batch_size = 2
+
+        del args.mtp_detach_heads
+        legacy_flops = num_floating_point_operations(args, cfg, batch_size)
+        args.mtp_detach_heads = False
+        explicit_attached_flops = num_floating_point_operations(args, cfg, batch_size)
+
+        assert legacy_flops == explicit_attached_flops
+
+
+class TestKimiDeltaAttentionFlops:
+    """KDA layers must contribute their projection and kernel work."""
+
+    @pytest.mark.parametrize(
+        ("f_lora_rank", "gate_lora_rank"),
+        [(None, None), (16, None), (16, 24), (None, 24)],
+        ids=["legacy-fused", "kimi-k3", "both-low-rank", "low-rank-gate-only"],
+    )
+    def test_projection_formula(self, f_lora_rank, gate_lora_rank):
+        args, cfg = _make_kda_hybrid_args()
+        args.kda_f_lora_rank = f_lora_rank
+        args.kda_gate_lora_rank = gate_lora_rank
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+        qk_dim = args.linear_key_head_dim * args.linear_num_key_heads
+        v_dim = args.linear_value_head_dim * args.linear_num_value_heads
+        f_projection_flops = args.hidden_size * qk_dim
+        if f_lora_rank is not None:
+            f_projection_flops = args.hidden_size * f_lora_rank + f_lora_rank * qk_dim
+        gate_projection_flops = args.hidden_size * v_dim
+        if gate_lora_rank is not None:
+            gate_projection_flops = args.hidden_size * gate_lora_rank + gate_lora_rank * v_dim
+        projection_flops = (
+            args.hidden_size * (2 * qk_dim + v_dim + args.linear_num_key_heads)
+            + f_projection_flops
+            + gate_projection_flops
+            + args.hidden_size * v_dim
+        )
+        kda_forward = (
+            2
+            * total_tokens
+            * (projection_flops + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim))
+        )
+        kda_forward += (
+            8
+            * total_tokens
+            * args.linear_num_key_heads
+            * args.linear_key_head_dim
+            * args.linear_value_head_dim
+        )
+        logits_forward = 2 * total_tokens * args.hidden_size * args.padded_vocab_size
+
+        assert num_floating_point_operations(args, cfg, batch_size) == 3 * (kda_forward + logits_forward)
+
+
+class TestMLAHeadwiseOutputGateFlops:
+    """Head-wise gated MLA must account for gate projection and ragged attention work."""
+
+    def test_uses_ragged_attention_work(self):
+        args, cfg = _make_mla_hybrid_args()
+        batch_size = 2
+        bshd_sum = batch_size * args.seq_length**2
+        flops_full = num_floating_point_operations(
+            args, cfg, batch_size, seqlen_squared_sum_in_batch=bshd_sum
+        )
+        flops_half = num_floating_point_operations(
+            args, cfg, batch_size, seqlen_squared_sum_in_batch=bshd_sum // 2
+        )
+        expected_delta = (
+            3
+            * (bshd_sum // 2)
+            * args.num_attention_heads
+            * (args.qk_head_dim + args.qk_pos_emb_head_dim + args.v_head_dim)
+        )
+        assert flops_full - flops_half == expected_delta
+
+    def test_headwise_gate_projection_work(self):
+        args, cfg = _make_mla_hybrid_args()
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+
+        args.attention_output_gate = False
+        ungated_flops = num_floating_point_operations(args, cfg, batch_size)
+        args.attention_output_gate = True
+        gated_flops = num_floating_point_operations(args, cfg, batch_size)
+
+        expected_delta = 3 * 2 * total_tokens * args.hidden_size * args.num_attention_heads
+        assert gated_flops - ungated_flops == expected_delta
+
+
+class TestHybridAttentionOutputGateFlops:
+    """Regular attention output gating must use the regular attention projection width."""
+
+    @pytest.mark.parametrize(
+        ("gate_granularity", "gate_projection_size"), (("elementwise", 512), ("headwise", 8))
+    )
+    def test_projection_work(self, gate_granularity, gate_projection_size):
+        args, cfg = _make_hybrid_args()
+        args.hybrid_layer_pattern = "*"
+        # The model-wide MLA flag is also enabled in mixed '*' / '+' models, but '*' remains
+        # regular attention. Use a different MLA value-head width to make that distinction visible.
+        args.multi_latent_attention = True
+        args.v_head_dim = 32
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+
+        args.attention_output_gate = False
+        ungated_flops = num_floating_point_operations(args, cfg, batch_size)
+        args.attention_output_gate = True
+        args.gated_attention_proj_granularity = gate_granularity
+        gated_flops = num_floating_point_operations(args, cfg, batch_size)
+
+        expected_delta = 3 * 2 * total_tokens * args.hidden_size * gate_projection_size
+        assert gated_flops - ungated_flops == expected_delta
 
 
 class TestGatedDeltaProductFlops:

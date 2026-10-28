@@ -467,6 +467,8 @@ def core_transformer_config_from_args(args, config_class=None):
             kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
         elif variant is None and Symbols.DS_ATTENTION in pattern:
             kw_args['experimental_attention_variant'] = 'dsa'
+        elif variant is None and Symbols.KDA in pattern:
+            kw_args['experimental_attention_variant'] = 'kda'
 
         from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 
