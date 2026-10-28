@@ -1088,7 +1088,10 @@ def test_served_resume_reproduces_its_snapshot():
     assert all(
         seeded(value) for name, value in vars(snapshot.payload).items() if name != "media_tensors"
     ), vars(snapshot.payload)
-    assert all(seeded(value) for value in vars(snapshot.record).values()), vars(snapshot.record)
+    # payload is consumer-owned (Megatron RL's stager pins it); the engine never fills it.
+    assert all(
+        seeded(value) for name, value in vars(snapshot.record).items() if name != "payload"
+    ), vars(snapshot.record)
 
     wire = ResumedGeneration.from_snapshot(snapshot).to_wire()
     served = DynamicInferenceRequestRecord.from_resumed_generation(
