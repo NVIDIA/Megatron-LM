@@ -7,7 +7,6 @@ import os
 import sys
 from typing import Any, Dict, Mapping, Tuple
 
-from megatron.training.config.training_config import TokenizerConfig
 import pytest  # type: ignore[import]
 import torch
 
@@ -20,6 +19,7 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
+from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,

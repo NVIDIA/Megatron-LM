@@ -10,7 +10,6 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
-from megatron.training.config.training_config import TokenizerConfig
 import numpy as np
 import pytest
 import torch
@@ -58,6 +57,7 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.config import RLConfig
+from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from megatron.training.state import TrainState
 from megatron.training.training import _pop_samples_seen

@@ -27,7 +27,11 @@ from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint as _load_checkpoint
 from megatron.training.checkpointing import save_checkpoint as _save_checkpoint
-from megatron.training.global_vars import get_run_config, set_global_variables, unset_global_variables
+from megatron.training.global_vars import (
+    get_run_config,
+    set_global_variables,
+    unset_global_variables,
+)
 from megatron.training.training import get_model
 from model_provider import model_provider
 from tests.unit_tests.test_utilities import Utils

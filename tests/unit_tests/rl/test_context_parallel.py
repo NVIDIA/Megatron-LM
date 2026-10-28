@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from megatron.training.config.training_config import TokenizerConfig
 import pytest
 import torch
 
@@ -13,6 +12,7 @@ from megatron.rl import rl_utils
 from megatron.rl.sequence_packing_utils import SequencePacker, create_packed_seq_params_for_bin
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
+from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from tests.unit_tests.test_utilities import Utils
 

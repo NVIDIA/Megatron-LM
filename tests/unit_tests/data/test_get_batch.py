@@ -5,7 +5,6 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from megatron.training.config.training_config import TokenizerConfig
 import pytest
 import torch
 
@@ -27,6 +26,7 @@ from megatron.core.utils import (
 )
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
+from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from pretrain_hybrid import get_batch
 from tests.unit_tests.test_utilities import Utils
