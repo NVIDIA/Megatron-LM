@@ -2598,7 +2598,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         top_p = 0.95
         temperature = 2
-        expected_min_value = l[l.div_(temperature).softmax(dim=-1).cumsum(dim=-1) > top_p][0].item()
+        # Out-of-place: `l` is a view into `last_token_logits`, so dividing it
+        # in place would corrupt the fixture the sampling call below reads.
+        expected_min_value = l[l.div(temperature).softmax(dim=-1).cumsum(dim=-1) > top_p][0].item()
         sampled_logits = self.text_generation_controller.sample_from_logits(
             last_token_logits,
             SamplingParams(top_p=top_p, temperature=temperature, top_k=0),
@@ -2607,6 +2609,48 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         assert torch.all(
             sampled_logits >= expected_min_value
         ), f"The sampled logits should all be greater than {expected_min_value} but its {sampled_logits}"
+
+    def test_sample_from_logits_does_not_mutate_the_logits(self):
+        """``sample_from_logits`` must leave the caller's logits untouched.
+
+        The static batching path passes a view of the model's logits
+        (``logits[:, -1, :]``) and computes its prompt log-probs from the same
+        tensor afterwards, so an in-place temperature scale or top-k/top-p mask
+        inside the sampler would corrupt them.
+        """
+        self.setup_model(torch.float32)
+
+        for temperature in (0.0, 0.7, 2.0):
+            last_token_logits = (
+                torch.arange(0, self.vocab_size).repeat(self.batch_size, 1).float().cuda()
+            )
+            snapshot = last_token_logits.clone()
+
+            self.text_generation_controller.sample_from_logits(
+                last_token_logits, SamplingParams(temperature=temperature, top_k=0), self.vocab_size
+            )
+
+            assert torch.equal(
+                last_token_logits, snapshot
+            ), f"sample_from_logits mutated the caller's logits at temperature={temperature}"
+
+    def test_sample_from_logits_does_not_mutate_a_view_of_the_logits(self):
+        """The same contract for a *view* of the logits, which is what the
+        static batching path hands to the sampler."""
+        self.setup_model(torch.float32)
+
+        # Same [batch, seq, vocab] layout the static path produces.
+        logits = torch.arange(0, self.vocab_size).repeat(self.batch_size, 4, 1).float().cuda()
+        snapshot = logits.clone()
+        last_token_logits = logits[:, -1, :]
+
+        self.text_generation_controller.sample_from_logits(
+            last_token_logits, SamplingParams(temperature=0.7, top_k=0), self.vocab_size
+        )
+
+        assert torch.equal(
+            logits, snapshot
+        ), "sample_from_logits mutated the caller's logits through a view"
 
     @pytest.mark.parametrize("backend", ["torch", "flashinfer"])
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])

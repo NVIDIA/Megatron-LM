@@ -64,13 +64,38 @@ class TorchSampling(Sampling):
 
         Returns a new tensor (input unmodified). Shared by `sample_from_logits` and
         `log_probs_kernel` so sampling and processed log-probs apply the same filter.
+
+        The result is FP32 when `temperature != 1.0`: the divisor must not run in
+        the input's low precision, or BF16/FP16 rounding moves the top-p nucleus
+        boundary and FP16 scaling overflows to inf at low temperatures (issue
+        #7857). At `temperature == 1.0` there is no division, so the input dtype
+        is preserved.
         """
         top_p_active = not is_no_op_top_p(top_p)
         assert not (top_k > 0 and top_p_active), "Cannot have top-p and top-k both active"
-        # Clone needed: .div_() and the filters below modify in-place.
-        last_token_logits = last_token_logits.clone()
+        # Need a mutable copy of ``last_token_logits`` -- the filters below modify
+        # it in-place, and the temperature-scaled path below allocates a fresh FP32
+        # buffer to avoid BF16/FP16 rounding in the divisor (issue #7857).
         if temperature != 1.0:
+            # ``Tensor.div_(scalar)`` runs in the tensor's dtype. For BF16/FP16
+            # inputs that (a) loses precision in the scaled logit and shifts top-p
+            # nucleus membership at moderate temperatures like 0.1, and (b) can
+            # overflow FP16 at temperature=0 (floored to
+            # MIN_SAMPLING_TEMPERATURE=1e-6 -> logits * 1e6 -> inf). The downstream
+            # softmax / log_softmax already promote to FP32, so an FP32 result here
+            # is the right dtype for both sampling and log-probs.
+            #
+            # ``copy=True`` is required: ``Tensor.to(dtype)`` returns ``self`` when
+            # the dtype already matches, so without it an FP32 input would be
+            # divided in place and the caller's logits would be mutated -- the
+            # static batching path passes a view of the model's logits
+            # (``logits[:, -1, :]``) and would then compute its prompt log-probs
+            # from temperature-scaled, top-k/top-p-masked logits.
+            last_token_logits = last_token_logits.to(torch.float32, copy=True)
             last_token_logits.div_(max(temperature, MIN_SAMPLING_TEMPERATURE))
+        else:
+            # Clone needed: the filters below modify in-place.
+            last_token_logits = last_token_logits.clone()
         if not is_no_op_top_k(top_k):
             assert top_k <= last_token_logits.size(1), "top-k is larger than logit size."
             if vocab_size:
