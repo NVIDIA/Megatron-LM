@@ -111,9 +111,11 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         extra_kwargs = {}
     # Own generator: otherwise _BaseDataLoaderIter draws _base_seed from the default CPU generator
     # on ITERATOR creation, after load_checkpoint has restored it. initial_seed() reads the seed
-    # without consuming a draw.
+    # without consuming a draw. An explicit data seed also makes worker RNGs independent
+    # of the model seed; otherwise retain the legacy seed, including parallel-rank offsets.
     loader_generator = torch.Generator()
-    loader_generator.manual_seed(torch.initial_seed())
+    loader_seed = cfg.rng.data_seed
+    loader_generator.manual_seed(torch.initial_seed() if loader_seed is None else loader_seed)
     return torch.utils.data.DataLoader(
         dataset,
         batch_sampler=batch_sampler,

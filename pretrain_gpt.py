@@ -485,7 +485,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
             sequences_per_dataset = json.load(f)
 
     data_args = {
-        "random_seed": cfg.rng.seed,
+        "random_seed": cfg.rng.effective_data_seed,
         "sequence_length": args.seq_length,
         "blend": blend,
         "blend_per_split": blend_per_split,

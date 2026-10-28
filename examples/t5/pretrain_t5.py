@@ -211,7 +211,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples: int):
     tokenizer = get_tokenizer()
 
     config = T5MaskedWordPieceDatasetConfig(
-        random_seed=cfg.rng.seed,
+        random_seed=cfg.rng.effective_data_seed,
         sequence_length=args.encoder_seq_length,
         sequence_length_decoder=args.decoder_seq_length,
         blend=get_blend_from_list(args.data_path),

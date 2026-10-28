@@ -8,7 +8,11 @@ class RNGConfig:
     """Configuration settings for random number generation."""
 
     seed: int = 1234
-    """Random seed used for python, numpy, pytorch, and cuda."""
+    """Random seed for model initialization and the Python, NumPy, PyTorch, and CUDA RNGs."""
+
+    data_seed: int | None = None
+    """Optional seed for dataset construction and DataLoader workers, independent of ``seed``.
+    When omitted, preserve the existing dataset and worker seeding behavior."""
 
     te_rng_tracker: bool = False
     """Use Transformer Engine's RNG tracker. Authoritative over the model's derived copy."""
@@ -20,9 +24,16 @@ class RNGConfig:
     """Enable random initialization of params across data parallel ranks"""
 
     def validate(self) -> None:
-        """Validate the seed before training runtime initialization."""
+        """Validate model and data seeds before training runtime initialization."""
         if self.seed is None or self.seed <= 0:
             raise ValueError("Seed must be a positive integer.")
+        if self.data_seed is not None and self.data_seed <= 0:
+            raise ValueError("Data seed must be a positive integer.")
+
+    @property
+    def effective_data_seed(self) -> int:
+        """Dataset seed, falling back to the model seed when no override is supplied."""
+        return self.seed if self.data_seed is None else self.data_seed
 
     def finalize_model_config(self, model_config: object) -> None:
         """Derive Core tracker settings from this run's RNG policy."""

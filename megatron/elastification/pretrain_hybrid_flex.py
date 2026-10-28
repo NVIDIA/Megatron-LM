@@ -482,7 +482,7 @@ def core_gpt_dataset_config_from_args(args):
     blend, blend_per_split = get_blend_and_blend_per_split(args)
 
     return GPTDatasetConfig(
-        random_seed=cfg.rng.seed,
+        random_seed=cfg.rng.effective_data_seed,
         sequence_length=args.seq_length,
         blend=blend,
         blend_per_split=blend_per_split,

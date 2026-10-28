@@ -147,7 +147,8 @@ def _build_prepare_cache_args(file_prefixes, data_cache_path, **overrides):
     return parsed_args
 
 
-def test_prepare_cache_builds_blended_dataset_cache(tmp_path_dist_ckpt):
+@pytest.mark.parametrize("data_seed", [None, 5678])
+def test_prepare_cache_builds_blended_dataset_cache(tmp_path_dist_ckpt, data_seed):
     _initialize_test_environment()
 
     tokenizer = _build_null_tokenizer()
@@ -156,7 +157,7 @@ def test_prepare_cache_builds_blended_dataset_cache(tmp_path_dist_ckpt):
         tmp_path_dist_ckpt / "test_prepare_cache_builds_blended_dataset_cache", sync=True
     ) as temp_dir:
         file_prefixes = _create_shared_file_prefixes(tokenizer, os.path.join(temp_dir, "dataset"))
-        args = _build_prepare_cache_args(file_prefixes, temp_dir / "cache")
+        args = _build_prepare_cache_args(file_prefixes, temp_dir / "cache", data_seed=data_seed)
 
         summary = build_dataset_caches(args)
 
@@ -168,6 +169,63 @@ def test_prepare_cache_builds_blended_dataset_cache(tmp_path_dist_ckpt):
         assert summary["test_dataset_length"] == 16
         assert list((temp_dir / "cache").glob("*document_index.npy"))
         assert list((temp_dir / "cache").glob("*dataset_index.npy"))
+
+
+@pytest.mark.parametrize("seed", [1234, 4321])
+@pytest.mark.parametrize("data_seed", [None, 5678])
+def test_prepare_cache_seed_matches_training(seed, data_seed, tmp_path, run_config):
+    from pretrain_gpt import core_gpt_dataset_config_from_args as training_dataset_config
+
+    args = _build_prepare_cache_args(
+        ["unused"],
+        tmp_path,
+        seed=seed,
+        data_seed=data_seed,
+        dataloader_fast_cache_load=False,
+        dataloader_defer_npy_index_mmap=False,
+    )
+    run_config.rng.seed = seed
+    run_config.rng.data_seed = data_seed
+    cache_config = core_gpt_dataset_config_from_args(args)
+    training_config = training_dataset_config(args)
+    assert cache_config.random_seed == training_config.random_seed
+    assert cache_config.random_seed == (seed if data_seed is None else data_seed)
+
+
+def test_model_and_data_seeds_are_independent(tmp_path_dist_ckpt, run_config):
+    from pretrain_gpt import core_gpt_dataset_config_from_args as training_dataset_config
+
+    _initialize_test_environment()
+    tokenizer = _build_null_tokenizer()
+    with TempNamedDir(tmp_path_dist_ckpt / "independent_seeds", sync=True) as temp_dir:
+        prefixes = _create_shared_file_prefixes(tokenizer, os.path.join(temp_dir, "dataset"))
+        weights, samples, cache_hashes = [], [], []
+        for model_seed, data_seed in ((1234, 5678), (4321, 5678), (1234, 8765)):
+            run_config.rng.seed = model_seed
+            run_config.rng.data_seed = data_seed
+            torch.manual_seed(model_seed)
+            args = _build_prepare_cache_args(
+                prefixes,
+                temp_dir / "cache",
+                seed=model_seed,
+                data_seed=data_seed,
+                dataloader_fast_cache_load=False,
+                dataloader_defer_npy_index_mmap=False,
+            )
+            config = training_dataset_config(args)
+            train, _, _ = BlendedMegatronDatasetBuilder(
+                GPTDataset, [32, 8, 8], lambda: True, config
+            ).build()
+            samples.append(torch.stack([train[i]["tokens"] for i in range(8)]))
+            cache_hashes.append(train.unique_description_hash)
+            weights.append(torch.nn.Linear(8, 8).weight.detach().clone())
+
+        assert not torch.equal(weights[0], weights[1])
+        assert torch.equal(samples[0], samples[1])
+        assert cache_hashes[0] == cache_hashes[1]
+        assert torch.equal(weights[0], weights[2])
+        assert not torch.equal(samples[0], samples[2])
+        assert cache_hashes[0] != cache_hashes[2]
 
 
 def test_prepare_cache_world_size_override():

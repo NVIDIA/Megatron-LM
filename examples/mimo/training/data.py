@@ -348,7 +348,7 @@ def _build_split_loaders(
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Build split-local datasets with deterministic module/DP/split seeds."""
     cfg = get_run_config()
-    base_seed = cfg.rng.seed + module_seed_offset + get_data_lane_rank(pg_collection)
+    base_seed = cfg.rng.effective_data_seed + module_seed_offset + get_data_lane_rank(pg_collection)
     common = _mock_loader_kwargs(args, encoder_name)
     return tuple(
         _build_mock_vlm_dataloader(
