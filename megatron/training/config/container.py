@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 import copy
+import logging
 import os
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
@@ -37,21 +38,18 @@ from megatron.training.config.training_config import (
     TrainingConfig,
     ValidationConfig,
 )
-from megatron.training.config.utils import (
-    sanitize_dataclass_config,
-    serialize_dataclass,
-    serialize_value,
-)
+from megatron.training.config.utils import sanitize_dataclass_config, serialize_dataclass
 from megatron.training.config.yaml_utils import safe_yaml_representers
 from megatron.training.models import (
     BertModelConfig,
     LLaVAModelConfig,
-    MimoModelConfig,
+    MimoBuildConfig,
     T5ModelConfig,
 )
 from megatron.training.models.base import ModelConfig
 
 T = TypeVar("T", bound="ConfigContainerBase")
+logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True)
 class ConfigContainerBase:
@@ -180,28 +178,6 @@ class ConfigContainerBase:
         """
         return serialize_dataclass(self)
 
-    @classmethod
-    def _convert_value_to_dict(cls, value: Any) -> Any:
-        """
-        Recursively convert a value to a dictionary representation.
-
-        Handles:
-        - ConfigContainer instances (using to_dict)
-        - Serializable instances (using as_dict)
-        - Classes which implement a to_cfg_dict method
-        - Regular dataclasses (converting each non-private field)
-        - Lists and tuples (converting each element)
-        - Dictionaries (converting each value)
-        - Other types (kept as-is)
-
-        Args:
-            value: The value to convert
-
-        Returns:
-            The converted value
-        """
-        return serialize_value(value)
-
     def to_yaml(self, yaml_path: str) -> None:
         """
         Save the config container to a YAML file.
@@ -252,7 +228,7 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     train: TrainingConfig
     validation: ValidationConfig = field(default_factory=ValidationConfig)
-    model: ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoModelConfig
+    model: ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoBuildConfig
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
     # dataset: GPTDatasetConfig # TODO (@maanug): add support
@@ -272,7 +248,7 @@ class PretrainConfigContainer(ConfigContainerBase):
         """Return ranks in the model grid, which may be a subset of the launch."""
         launch_world_size = safe_get_world_size()
         world_size = (
-            self.model.mimo_llm_world_size if isinstance(self.model, MimoModelConfig) else None
+            self.model.mimo_llm_world_size if isinstance(self.model, MimoBuildConfig) else None
         )
         if world_size is None:
             world_size = launch_world_size
@@ -314,14 +290,19 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     def finalize_optimizer_config(self, optimizer: OptimizerConfig) -> OptimizerConfig:
         """Derive configured or legacy-built optimizer precision from the finalized model."""
+        precision = {
+            name: getattr(self.model.transformer, name)
+            for name in ("fp16", "bf16", "params_dtype", "fp8_recipe")
+        }
+        changes = {
+            name: (getattr(optimizer, name), value)
+            for name, value in precision.items()
+            if getattr(optimizer, name) != value
+        }
+        if changes:
+            logger.warning("Overriding optimizer precision from model config (old, new): %s", changes)
         # Reconstruct so optimizer-local derived precision settings are recomputed too.
-        return replace(
-            optimizer,
-            fp16=self.model.transformer.fp16,
-            bf16=self.model.transformer.bf16,
-            params_dtype=self.model.transformer.params_dtype,
-            fp8_recipe=self.model.transformer.fp8_recipe,
-        )
+        return replace(optimizer, **precision)
 
     def _resolve_batch_sizes(
         self, batch_parallel_size: int | None = None
@@ -418,20 +399,35 @@ class PretrainConfigContainer(ConfigContainerBase):
             raise ValueError("Training requires model.transformer to be configured")
         self.rl.validate_ddp_config(self.ddp)
         super().validate()
-        self._validate_gtp_config()
-        global_batch_size, _, _ = self._resolve_batch_sizes()
-        self._validate_rl_config(global_batch_size)
-
-    def _validate_gtp_config(self) -> None:
-        """Check GTP compatibility with checkpointing and distributed configuration."""
-        transformer = getattr(self.model, "transformer", None)
-        if transformer is not None and transformer.gtp_remat_num_sequence_shards > 1:
+        # Config-only topology checks also run when validating a recipe off-cluster.
+        # Launch world-size checks remain in the runtime parallel-size helpers.
+        transformer = self.model.transformer
+        tp = transformer.tensor_model_parallel_size
+        pp = transformer.pipeline_model_parallel_size
+        cp = transformer.context_parallel_size
+        weight_size = transformer.gtp_weight_remat_size
+        if min(tp, pp, cp, weight_size) < 1:
+            raise ValueError("Parallel sizes must be positive")
+        sequence_shards = transformer.gtp_remat_num_sequence_shards
+        if cp % sequence_shards:
+            raise ValueError("Runtime context-parallel size must contain the GTP sequence shards")
+        if isinstance(self.model, MimoBuildConfig) and self.model.mimo_llm_world_size is not None:
+            world_size = self.model.mimo_llm_world_size
+            if world_size <= 0:
+                raise ValueError("MIMO language-model world size must be positive")
+            if world_size % (tp * pp * (cp // sequence_shards) * weight_size):
+                raise ValueError(
+                    "MIMO language-model world size must be divisible by its model parallel size"
+                )
+        if sequence_shards > 1:
             if self.checkpoint.ckpt_format != "torch_dist":
                 raise ValueError("GTP sequence sharding requires torch_dist checkpoints")
             if self.dist.use_torch_fsdp2 or self.ddp.use_megatron_fsdp:
                 raise ValueError("GTP sequence sharding uses Megatron DDP, not FSDP")
             if self.dist.use_tp_pp_dp_mapping:
                 raise ValueError("GTP sequence sharding does not support TP-PP-DP mapping")
+        global_batch_size, _, _ = self._resolve_batch_sizes()
+        self._validate_rl_config(global_batch_size)
 
     def _validate_rl_config(self, global_batch_size: int | None) -> None:
         """Check RL policy against the supplied or resolved training batch size."""
@@ -515,7 +511,7 @@ class InferenceConfigContainer(ConfigContainerBase):
     ``DistributedDataParallelConfig``, ``RerunStateMachineConfig``, ``StragglerDetectionConfig``.
     """
 
-    model: ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoModelConfig | None
+    model: ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoBuildConfig | None
     """Model to load, or None for args-only entrypoints without model inputs."""
 
     checkpoint: CheckpointConfig

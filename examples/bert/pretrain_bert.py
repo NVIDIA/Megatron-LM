@@ -25,8 +25,7 @@ from megatron.training.global_vars import (
     get_tokenizer,
     set_run_config,
 )
-from megatron.core.transformer.spec_utils import import_module
-from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec, bert_layer_local_spec
+from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.bert_dataset import BERTMaskedWordPieceDataset, BERTMaskedWordPieceDatasetConfig
 from megatron.core.datasets.utils import get_blend_from_list
@@ -38,19 +37,14 @@ def model_provider(pre_process=True, post_process=True, vp_stage=None, config=No
 
     print_rank_0('building BERT model ...')
 
-    args = get_args()
     cfg = get_run_config()
     if config is None:
         config = cfg.model.transformer
     num_tokentypes = 2 if cfg.model.bert_binary_head else 0
 
-    if args.spec is None:
-        transformer_layer_spec = bert_layer_with_transformer_engine_spec #default spec
-    elif args.spec[0] == 'local':
-        print_rank_0('Using Local spec for transformer layers')
-        transformer_layer_spec = bert_layer_local_spec
-    else :
-        transformer_layer_spec = import_module(args.spec)
+    transformer_layer_spec = cfg.model.transformer_layer_spec
+    if transformer_layer_spec is None:
+        transformer_layer_spec = bert_layer_with_transformer_engine_spec
 
     model = BertModel(
         config=config,

@@ -99,6 +99,14 @@ def test_moe_norm_flag_reaches_transformer_config():
     assert config.moe_use_norm_before_up_proj is True
 
 
+@pytest.mark.parametrize("name", ["gtp_remat_nccl_ub", "gtp_expert_remat_nccl_ub"])
+def test_gtp_userbuffer_flags_preserve_cli_contract(name):
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    assert getattr(parser.parse_args([]), name) is False
+    assert getattr(parser.parse_args(["--" + name.replace("_", "-")]), name) is True
+
+
 def test_no_megatron_fsdp_padded_shards_flag_reaches_ddp_config():
     """--no-megatron-fsdp-padded-shards should disable padded shards in the DDP config."""
     from megatron.training.training import get_megatron_ddp_config

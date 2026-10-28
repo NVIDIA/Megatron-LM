@@ -101,7 +101,7 @@ def initialize_megatron(
     cfg.finalize()
     # Inference's args-only entrypoints keep their existing input boundary. Training
     # supplies a typed model config, including callback-based applications.
-    model_config = cfg.model.transformer if isinstance(cfg, PretrainConfigContainer) else args
+    model_config = cfg.model.transformer if training else args
     transformer_config = getattr(cfg.model, "transformer", None)
     tp_comm_overlap = (
         transformer_config.tp_comm_overlap
@@ -199,7 +199,7 @@ def initialize_megatron(
         # Setup MoE aux loss scale value.
         num_experts = (
             cfg.model.transformer.num_moe_experts
-            if isinstance(cfg, PretrainConfigContainer) else args.num_experts
+            if training else args.num_experts
         )
         if num_experts is not None:
             from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler

@@ -46,7 +46,7 @@ from megatron.training.models import (
     BertModelConfig,
     GPTModelConfig,
     LLaVAModelConfig,
-    MimoModelConfig,
+    MimoBuildConfig,
     T5ModelConfig,
 )
 from megatron.training.state import TrainState
@@ -582,7 +582,7 @@ def test_check_checkpoint_args_rejects_wide_residual_mismatch(run_config):
         check_checkpoint_args(checkpoint_args)
 
 
-@pytest.mark.parametrize("model_cls", [GPTModelConfig, BertModelConfig, MimoModelConfig])
+@pytest.mark.parametrize("model_cls", [GPTModelConfig, BertModelConfig, MimoBuildConfig])
 def test_checkpoint_model_checks_use_config_not_stale_args(run_config, model_cls):
     kwargs = {"position_embedding_type": "rope"} if model_cls is GPTModelConfig else {}
     run_config.model = model_cls(
@@ -602,6 +602,43 @@ def test_checkpoint_model_checks_use_config_not_stale_args(run_config, model_cls
         saved['model']['transformer']['hidden_size'] = 64
         with pytest.raises(AssertionError, match='hidden_size value from checkpoint'):
             check_checkpoint_args(stale, checkpoint_config=saved)
+
+
+@pytest.mark.parametrize("saved_config", [False, True])
+def test_checkpoint_padded_vocabulary_uses_tokenizer_config(run_config, saved_config):
+    run_config.tokenizer.padded_vocab_size = 512
+    run_config.model.vocab_size = 640
+    run_config.model.should_pad_vocab = False
+    args = SimpleNamespace(
+        vocab_file="vocab",
+        use_dist_ckpt=False,
+        phase_transition_iterations=None,
+        tokenizer_type="NullTokenizer",
+        padded_vocab_size=999,
+    )
+    checkpoint_args = SimpleNamespace(
+        num_layers=2,
+        hidden_size=32,
+        num_attention_heads=4,
+        max_position_embeddings=16,
+        make_vocab_size_divisible_by=128,
+        tokenizer_type="NullTokenizer",
+        padded_vocab_size=512,
+    )
+    saved = run_config.to_dict() if saved_config else None
+    if saved_config:
+        checkpoint_args.padded_vocab_size = 999
+    with (
+        mock.patch('megatron.training.checkpointing.get_args', return_value=args),
+        mock.patch('megatron.training.checkpointing.get_checkpoint_version', return_value=3.0),
+    ):
+        check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
+        run_config.tokenizer.padded_vocab_size = 768
+        with pytest.raises(AssertionError, match='padded_vocab_size value from checkpoint'):
+            check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
+        check_checkpoint_args(
+            checkpoint_args, skip_args={'padded_vocab_size'}, checkpoint_config=saved
+        )
 
 
 @pytest.mark.parametrize("restore_parallelism", [False, True])
@@ -931,7 +968,7 @@ def test_save_checkpoint(
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
 @pytest.mark.parametrize(
-    "model_cls", [GPTModelConfig, BertModelConfig, T5ModelConfig, LLaVAModelConfig, MimoModelConfig]
+    "model_cls", [GPTModelConfig, BertModelConfig, T5ModelConfig, LLaVAModelConfig, MimoBuildConfig]
 )
 @pytest.mark.parametrize("owned_rng", [False, True])
 @pytest.mark.parametrize("iteration", [0, 123])

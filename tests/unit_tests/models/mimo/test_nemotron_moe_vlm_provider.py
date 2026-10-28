@@ -320,9 +320,9 @@ def _parse_validate(argv):
         sys.argv = saved
     validate_args(args)
     cfg = get_run_config()
-    from megatron.training.models import MimoModelConfig
+    from megatron.training.models import MimoBuildConfig
 
-    cfg.model = model_config_from_args(args, model_config_cls=MimoModelConfig)
+    cfg.model = model_config_from_args(args, model_config_cls=MimoBuildConfig)
     cfg.tokenizer = tokenizer_config_from_args(args)
     build_tokenizer_and_pad_vocab_size(
         cfg.tokenizer,
@@ -684,7 +684,7 @@ def test_language_cp_comes_from_its_grid(monkeypatch, cp_size, use_groups, seque
 
     from examples.mimo.model_providers import nemotron_moe_vlm as provider
     from megatron.core.transformer import TransformerConfig
-    from megatron.training.models import MimoModelConfig
+    from megatron.training.models import MimoBuildConfig
 
     # Deliberately disagree with the grid to catch inheritance of stock CP.
     args = SimpleNamespace(
@@ -701,7 +701,7 @@ def test_language_cp_comes_from_its_grid(monkeypatch, cp_size, use_groups, seque
         rotary_seq_len_interpolation_factor=None,
         logit_dtype=None,
     )
-    get_run_config().model = MimoModelConfig(
+    get_run_config().model = MimoBuildConfig(
         transformer=TransformerConfig(
             num_layers=1,
             hidden_size=32,

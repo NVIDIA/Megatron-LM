@@ -67,7 +67,6 @@ from megatron.training.utils.checkpoint_utils import (
     get_checkpoint_train_state_filename,
     read_train_state,
 )
-from megatron.training.vocab_utils import calculate_padded_vocab_size, model_vocab_size
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration
@@ -192,18 +191,6 @@ def _checkpoint_model_arg(model_config, arg_name):
         if wide_residual is None:
             return dict(_WIDE_RESIDUAL_ARG_DEFAULTS)[arg_name]
         return wide_residual.get(arg_name.removeprefix("wide_residual_"), _MISSING_CONFIG_VALUE)
-    if arg_name == "padded_vocab_size":
-        value = model_config.get("vocab_size", _MISSING_CONFIG_VALUE)
-        if value is _MISSING_CONFIG_VALUE or value is None:
-            return value
-        if model_config.get("should_pad_vocab", False):
-            value = calculate_padded_vocab_size(
-                value,
-                model_config["make_vocab_size_divisible_by"],
-                transformer["tensor_model_parallel_size"],
-                logging_enabled=False,
-            )
-        return value
     if arg_name in model_config:
         return model_config[arg_name]
     return transformer.get(arg_name, _MISSING_CONFIG_VALUE)
@@ -308,15 +295,8 @@ def check_checkpoint_args(
     if args.vocab_file:
         _compare('max_position_embeddings', config_section='model', config_name='seq_length')
         _compare('make_vocab_size_divisible_by', config_section='model')
-        if not args.use_dist_ckpt and 'padded_vocab_size' not in skip_args:
-            saved_vocab_size = _checkpoint_model_arg(
-                (checkpoint_config or {}).get('model'), 'padded_vocab_size'
-            )
-            if saved_vocab_size is _MISSING_CONFIG_VALUE:
-                saved_vocab_size = checkpoint_args.padded_vocab_size
-            assert saved_vocab_size == model_vocab_size(cfg.model), (
-                'padded_vocab_size value from checkpoint does not match cfg.model.'
-            )
+        if not args.use_dist_ckpt:
+            _compare('padded_vocab_size', config_section='tokenizer')
         _compare('tokenizer_type')
     if cfg.rng.data_parallel_random_init:
         _compare('data_parallel_random_init', config_section='rng')

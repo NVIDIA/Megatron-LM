@@ -18,7 +18,7 @@ from megatron.training.models import (
     BertModelConfig,
     GPTModelConfig,
     LLaVAModelConfig,
-    MimoModelConfig,
+    MimoBuildConfig,
     T5ModelConfig,
 )
 from megatron.training.models.base import ModelConfig
@@ -98,6 +98,45 @@ def test_training_requires_model_transformer(monkeypatch, run_config, model, mes
     derive.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "field,value,error",
+    [
+        ("tensor_model_parallel_size", 0, "Parallel sizes must be positive"),
+        ("pipeline_model_parallel_size", 0, "Parallel sizes must be positive"),
+        ("context_parallel_size", 0, "Parallel sizes must be positive"),
+        ("gtp_weight_remat_size", 0, "Parallel sizes must be positive"),
+        ("tensor_parallel_num_sequence_shards", 0, "must be positive"),
+    ],
+)
+def test_validate_topology_without_launch_state(monkeypatch, run_config, field, value, error):
+    monkeypatch.setattr(
+        "megatron.training.config.container.safe_get_world_size",
+        Mock(side_effect=AssertionError("validate must not inspect the launch")),
+    )
+    # This recipe needs more ranks than the current test process group.
+    run_config.model.transformer.pipeline_model_parallel_size = 8
+    before = copy.deepcopy(run_config.to_dict())
+    run_config.validate()
+    run_config.validate()
+    assert run_config.to_dict() == before
+    monkeypatch.setattr(run_config.model.transformer, field, value)
+    invalid = copy.deepcopy(run_config.to_dict())
+    with pytest.raises(ValueError, match=error):
+        run_config.validate()
+    assert run_config.to_dict() == invalid
+
+
+def test_optimizer_precision_override_is_reported(run_config, caplog):
+    run_config.model.transformer.bf16 = True
+    with caplog.at_level("WARNING", logger="megatron.training.config.container"):
+        optimizer = run_config.finalize_optimizer_config(run_config.optimizer)
+    assert optimizer.bf16
+    assert "bf16" in caplog.text and "Overriding optimizer precision" in caplog.text
+    caplog.clear()
+    run_config.finalize_optimizer_config(optimizer)
+    assert not caplog.records
+
+
 @pytest.mark.parametrize("invalid_policy", ["ddp_offload", "model_pipeline"])
 def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_config, invalid_policy):
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
@@ -144,7 +183,7 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
 
 @pytest.mark.parametrize("storage", ["dict", "yaml"])
 @pytest.mark.parametrize(
-    "model_cls", [BertModelConfig, T5ModelConfig, LLaVAModelConfig, MimoModelConfig]
+    "model_cls", [BertModelConfig, T5ModelConfig, LLaVAModelConfig, MimoBuildConfig]
 )
 def test_serialization_starts_a_new_lifecycle(
     monkeypatch, run_config, model_cls, storage, tmp_path

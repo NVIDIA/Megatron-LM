@@ -307,7 +307,7 @@ def _build_tokenizer(cfg, args):
         GPTModelConfig,
         HybridModelConfig,
         LLaVAModelConfig,
-        MimoModelConfig,
+        MimoBuildConfig,
         T5ModelConfig,
     )
     from megatron.training.vocab_utils import build_tokenizer_and_pad_vocab_size
@@ -317,7 +317,7 @@ def _build_tokenizer(cfg, args):
 
     if isinstance(
         cfg.model,
-        (GPTModelConfig, HybridModelConfig, BertModelConfig, T5ModelConfig, LLaVAModelConfig, MimoModelConfig),
+        (GPTModelConfig, HybridModelConfig, BertModelConfig, T5ModelConfig, LLaVAModelConfig, MimoBuildConfig),
     ):
         make_vocab_size_divisible_by = cfg.model.make_vocab_size_divisible_by
         tp_size = cfg.model.transformer.tensor_model_parallel_size
@@ -542,11 +542,14 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     ]
     if include_training:
         resource_attrs['dl.data_parallel.size'] = cfg.get_data_parallel_size()
-        fields.extend([
+        for attr, name in (
             ('dl.batch_size', 'global_batch_size'),
             ('megatron.train_iters', 'train_iters'),
             ('megatron.micro_batch_size', 'micro_batch_size'),
-        ])
+        ):
+            value = getattr(cfg.train, name)
+            if value is not None:
+                resource_attrs[attr] = value
     else:
         fields.append(('dl.data_parallel.size', 'data_parallel_size'))
     for attr, arg_name in fields:

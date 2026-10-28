@@ -16,8 +16,7 @@ import pytest
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.arguments import _add_rl_args, parse_args, validate_args
 from megatron.training.config import RLConfig, rl_config
-from megatron.training.config.container import ConfigContainerBase
-from megatron.training.config.utils import sanitize_dataclass_config
+from megatron.training.config.utils import sanitize_dataclass_config, serialize_value
 
 INIT_FIELDS = [f for f in fields(RLConfig) if f.init]
 GRPO_4x3 = dict(grpo_prompts_per_step=4, grpo_group_size=3)  # 12 samples per iteration
@@ -146,7 +145,7 @@ class TestPostInit:
                 id="init-fields",
             ),
             pytest.param(
-                lambda cfg: _instantiate(ConfigContainerBase._convert_value_to_dict(cfg)),
+                lambda cfg: _instantiate(serialize_value(cfg)),
                 id="serialized",
                 marks=pytest.mark.skipif(
                     importlib.util.find_spec("omegaconf") is None, reason="omegaconf not installed"
@@ -350,9 +349,7 @@ def test_ddp_layout_validation_and_finalization(
     assert ddp.grad_buffer_offload == (
         explicit_layout or (perform_rl_step and offload and not cuda_graphs)
     )
-    assert ConfigContainerBase._convert_value_to_dict(ddp)["grad_buffer_offload"] == (
-        ddp.grad_buffer_offload
-    )
+    assert serialize_value(ddp)["grad_buffer_offload"] == (ddp.grad_buffer_offload)
 
 
 def test_ddp_finalization_rejects_aliasing_before_mutation():

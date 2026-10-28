@@ -33,7 +33,7 @@ from megatron.training.models import (
     BertModelConfig,
     GPTModelConfig,
     LLaVAModelConfig,
-    MimoModelConfig,
+    MimoBuildConfig,
     T5ModelConfig,
 )
 from megatron.training.vocab_utils import (
@@ -569,12 +569,14 @@ def test_training_batch_topology_uses_model_config(
     args = _runtime_args()
     args.world_size = args.mimo_llm_world_size = 999
     args.data_parallel_size = args.batch_parallel_size = 999
+    args.global_batch_size = args.micro_batch_size = args.train_iters = 999
     original_args = vars(args).copy()
     monkeypatch.setattr(
         "megatron.training.config.container.safe_get_world_size", lambda: world_size
     )
     monkeypatch.setattr(global_vars, "safe_get_world_size", lambda: world_size)
     run_config.train.micro_batch_size = 2
+    run_config.train.train_iters = 10
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
     run_config.model = MimoBuildConfig(
         transformer=TransformerConfig(
@@ -614,12 +616,60 @@ def test_training_batch_topology_uses_model_config(
     assert telemetry[0]['dl.data_parallel.size'] == expected_dp
     assert telemetry[0]['dl.tensor_parallel.size'] == 2
     assert telemetry[0]['megatron.hidden_size'] == 32
+    assert telemetry[0]['dl.batch_size'] == run_config.train.global_batch_size
+    assert telemetry[0]['megatron.micro_batch_size'] == 2
+    assert telemetry[0]['megatron.train_iters'] == 10
     assert telemetry[0] == global_vars.build_telemetry_resource_attrs(args)
+
+
+@pytest.mark.parametrize("spec", [None, ["local"], ["custom_module", "custom_spec"]])
+def test_bert_spec_is_resolved_at_config_boundary(monkeypatch, run_config, spec):
+    import megatron.training.argument_utils as adapters
+    from megatron.core.models.bert.bert_layer_specs import bert_layer_local_spec
+
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.spec = spec
+    args.max_position_embeddings = 32
+    transformer = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    monkeypatch.setattr(adapters, "core_transformer_config_from_args", lambda args: transformer)
+    imported = Mock(return_value=bert_layer_local_spec)
+    monkeypatch.setattr(adapters, "import_module", imported)
+    model = model_config_from_args(args, model_config_cls=BertModelConfig)
+    assert model.transformer_layer_spec is (None if spec is None else bert_layer_local_spec)
+    assert imported.call_count == int(spec is not None and spec[0] != "local")
+    run_config.model = model
+    restored = type(run_config).from_dict(run_config.to_dict())
+    assert restored.to_dict() == run_config.to_dict()
+
+
+@pytest.mark.parametrize("model_cls", [BertModelConfig, T5ModelConfig])
+@pytest.mark.parametrize("untie", [False, True])
+def test_callback_model_defaults_preserve_cli_policy(monkeypatch, model_cls, untie):
+    import megatron.training.argument_utils as adapters
+
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args(["--untie-embeddings-and-output-weights"] if untie else [])
+    args.max_position_embeddings = 32
+    args.encoder_num_layers = 2
+    args.rotary_seq_len_interpolation_factor = 2.0
+    transformer = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    monkeypatch.setattr(adapters, "core_transformer_config_from_args", lambda args: transformer)
+    kwargs = {"encoder_num_layers": 2} if model_cls is T5ModelConfig else {}
+    assert not model_cls(
+        transformer=transformer, seq_length=32, **kwargs
+    ).share_embeddings_and_output_weights
+    model = model_config_from_args(args, model_config_cls=model_cls)
+    assert model.share_embeddings_and_output_weights is (not untie)
+    if model_cls is T5ModelConfig:
+        assert model.seq_len_interpolation_factor == 2.0
 
 
 @pytest.mark.parametrize("known_vocab", [None, 512])
 @pytest.mark.parametrize(
-    "model_cls", [BertModelConfig, T5ModelConfig, LLaVAModelConfig, MimoModelConfig]
+    "model_cls", [BertModelConfig, T5ModelConfig, LLaVAModelConfig, MimoBuildConfig]
 )
 def test_callback_model_config_owns_shared_inputs(
     monkeypatch, isolated_globals, run_config, known_vocab, model_cls
@@ -652,7 +702,7 @@ def test_callback_model_config_owns_shared_inputs(
     assert type(cfg.model) is model_cls
     assert cfg.model.transformer is transformer
     assert cfg.model.seq_length == 2048
-    if model_cls is MimoModelConfig:
+    if model_cls is MimoBuildConfig:
         assert cfg.model.mimo_llm_world_size == 8
         assert cfg.get_model_world_size() == 8
     else:
@@ -990,7 +1040,7 @@ def test_training_topology_rejects_invalid_rank_counts(
     monkeypatch.setattr(
         "megatron.training.config.container.safe_get_world_size", lambda: world_size
     )
-    run_config.model = MimoModelConfig(
+    run_config.model = MimoBuildConfig(
         transformer=run_config.model.transformer,
         seq_length=run_config.model.seq_length,
         mimo_llm_world_size=mimo_llm_world_size,

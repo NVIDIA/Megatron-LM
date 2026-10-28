@@ -3042,6 +3042,7 @@ def setup_model_and_optimizer(
             update_train_iters(cfg.train)
     else:
         config, config_overrides = get_megatron_optimizer_config(args)
+        # Temporary until #8213 removes args-based optimizer construction.
         config = cfg.finalize_optimizer_config(config)
         config.timers = timers
         if cfg.model.transformer.use_mup:

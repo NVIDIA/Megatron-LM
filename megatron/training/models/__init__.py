@@ -9,7 +9,7 @@ from megatron.training.models.dist_utils import (
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
 from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig
 from megatron.training.models.llava import LLaVAModelConfig
-from megatron.training.models.mimo import MimoModelConfig
+from megatron.training.models.mimo import MimoBuildConfig
 from megatron.training.models.t5 import T5ModelConfig
 
 MambaModelConfig = HybridModelConfig
@@ -21,7 +21,7 @@ __all__ = [
     "BertModelConfig",
     "T5ModelConfig",
     "LLaVAModelConfig",
-    "MimoModelConfig",
+    "MimoBuildConfig",
     "Serializable",
     "compose_hooks",
     "build_virtual_pipeline_stages",

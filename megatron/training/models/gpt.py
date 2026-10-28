@@ -241,13 +241,6 @@ class GPTModelConfig(ModelConfig):
 
         # Standalone model finalization retains the same layout checks as container startup.
         self.validate()
-        if self.transformer.cuda_graph_impl != "none" and "transformer_engine" in (
-            self.transformer.transformer_impl, self.transformer.cuda_graph_impl
-        ):
-            assert self.transformer.use_te_rng_tracker, (
-                "Transformer engine's RNG tracker is required for cudagraphs, it can be "
-                "enabled with use_te_rng_tracker=True'."
-            )
 
 
 class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):

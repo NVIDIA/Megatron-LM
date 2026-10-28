@@ -12,14 +12,14 @@ if TYPE_CHECKING:
     from megatron.training.models import (
         BertModelConfig,
         LLaVAModelConfig,
-        MimoModelConfig,
+        MimoBuildConfig,
         ModelConfig,
         T5ModelConfig,
     )
 
 
 def model_vocab_size(
-    model_config: "ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoModelConfig",
+    model_config: "ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoBuildConfig",
     *,
     logging_enabled: bool = False,
 ) -> int:

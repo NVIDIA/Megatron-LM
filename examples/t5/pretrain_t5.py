@@ -133,6 +133,7 @@ def model_provider(
         share_embeddings_and_output_weights=cfg.model.share_embeddings_and_output_weights,
         position_embedding_type=cfg.model.position_embedding_type,
         rotary_percent=cfg.model.rotary_percent,
+        seq_len_interpolation_factor=cfg.model.seq_len_interpolation_factor,
         relative_attention_num_buckets=cfg.model.relative_attention_num_buckets,
         relative_attention_max_distance=cfg.model.relative_attention_max_distance,
         add_encoder=add_encoder,

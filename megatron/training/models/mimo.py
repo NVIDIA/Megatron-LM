@@ -1,19 +1,26 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 
 from megatron.core.transformer import TransformerConfig
+from megatron.training.models.base import ModelConfig
+
+if TYPE_CHECKING:
+    from examples.mimo.training.topology import HeteroTopology
 
 
 @dataclass(kw_only=True)
-class MimoModelConfig:
+class MimoBuildConfig(ModelConfig):
     """MIMO language-grid inputs for the shared training lifecycle.
 
     Tower construction and topology remain owned by the MIMO application.
     """
+
+    builder: ClassVar[str] = "examples.mimo.training.builder.MimoModelBuilder"
+    _topology: "HeteroTopology | None" = field(default=None, repr=False, compare=False)
 
     transformer: TransformerConfig
     """Language-grid architecture, precision, and parallelism."""

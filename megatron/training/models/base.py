@@ -112,7 +112,7 @@ class ModelConfig:
         """Deserialize config from dictionary.
 
         Uses _target_ to determine the correct class to instantiate.
-        The builder is restored from _builder_ or from the class's ClassVar.
+        The builder is restored from the required _builder_ entry.
 
         Args:
             data: Dictionary with _target_ and config fields
@@ -155,8 +155,7 @@ class ModelConfig:
             return value
 
         result = _from_dict(data)
-        if "_builder_" in data:
-            result.builder = data["_builder_"]
+        result.builder = data["_builder_"]
 
         return result
 
