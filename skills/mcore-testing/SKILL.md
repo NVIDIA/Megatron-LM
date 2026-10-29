@@ -171,9 +171,11 @@ uv run python -m torch.distributed.run --nproc-per-node 8 -m pytest -q \
   `megatron.core.process_groups_config` inside `warnings.catch_warnings()`.
 - Training runs opt in with `--strict-process-group-fallbacks`.
 - The deprecated `parallel_state` accessors emit a separate
-  `ParallelStateDeprecationWarning`, which `pyproject.toml` ignores for the
-  test suite because tests use the global grid on purpose. Strict mode does not
-  affect it. See `docs/api-backwards-compatibility-check.md`.
+  `ParallelStateDeprecationWarning`. `pyproject.toml` ignores it when a test
+  calls them, because tests use the global grid on purpose, and turns it into
+  an error when the caller is one of this repository's modules outside the
+  tests, such as `megatron.training.*`. Strict mode does not affect it. See
+  `docs/api-backwards-compatibility-check.md`.
 
 ### CI parity
 
