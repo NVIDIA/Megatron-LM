@@ -1391,7 +1391,7 @@ class TestDSGQADynamicInference:
             )
 
         decode_calls = []
-        from megatron.core.transformer.experimental_attention_variant.dsa_gqa_triton_decode import (
+        from megatron.core.transformer.experimental_attention_variant.dsa_gqa_inference import (
             TritonDSADecodeWorkspace,
         )
 

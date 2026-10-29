@@ -7,7 +7,7 @@ import logging
 import pytest
 import torch
 
-from megatron.core.transformer.experimental_attention_variant.dsa_gqa_triton_decode import (
+from megatron.core.transformer.experimental_attention_variant.dsa_gqa_inference import (
     TritonDSADecodeWorkspace,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
@@ -174,7 +174,7 @@ def test_cute_topk_cutoffs_ties_and_graph_replay(width, topk):
     torch.manual_seed(71)
     device = torch.device("cuda", torch.cuda.current_device())
     batch = 6
-    from megatron.core.transformer.experimental_attention_variant._dsa_cute_topk.workspace import (
+    from megatron.core.transformer.experimental_attention_variant.dsa_gqa_topk import (
         CuteTopKWorkspace,
     )
 

@@ -966,13 +966,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="dsa_triton_decode",
         sources=(
-            "megatron/core/transformer/experimental_attention_variant/dsa_gqa_triton_decode.py",
-            "megatron/core/transformer/experimental_attention_variant/_dsa_triton_decode/attention.py",
-            "megatron/core/transformer/experimental_attention_variant/_dsa_triton_decode/score.py",
-            "megatron/core/transformer/experimental_attention_variant/_dsa_cute_topk/histogram_topk.py",
-            "megatron/core/transformer/experimental_attention_variant/_dsa_cute_topk/dispatch.py",
-            "megatron/core/transformer/experimental_attention_variant/_dsa_cute_topk/workspace.py",
-            "megatron/core/transformer/experimental_attention_variant/_dsa_cute_topk/radix_fallback.py",
+            "megatron/core/transformer/experimental_attention_variant/dsa_gqa_decode_kernels.py",
+            "megatron/core/transformer/experimental_attention_variant/dsa_gqa_topk.py",
         ),
         tests=(K + "test_dsa_triton_decode.py",),
         kind="triton",
