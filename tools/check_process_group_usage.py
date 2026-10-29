@@ -30,6 +30,15 @@ remove it from the allowlist. A guarded call that replaces a removed accessor, f
 read in the same file and scope is a conversion, and ``--update`` swaps the entry. Any other new
 guarded call fails like a new read.
 
+An accessor, function or shim read that a fallback warning dominates is *warned*, and its entry
+ends with ``:warned``: in the same function, an earlier statement of its block, or of a block
+that contains it, calls ``warn_global_process_group_fallback()``, or the read sits in the block
+of ``with global_process_group_fallback(...)``. A warning in a branch does not dominate the
+statements after the branch, and a function or lambda defined after a warning runs without it.
+A read that is warned only through data flow, for example under a later ``if group is None:``,
+is *unwarned*. A read that gains its warning is a conversion; an allowlisted warned read that
+loses it fails like a new read.
+
 Usage::
 
     python tools/check_process_group_usage.py            # check
@@ -101,10 +110,16 @@ DEPRECATED_FUNCTIONS = {
     "_set_global_memory_buffer",
 }
 
-# Entry kinds in --stats order. "guarded" calls always warn before they read the globals; a call
-# of another kind may follow a warning in a fallback too, which the kind does not record.
+# Entry kinds in --stats order. "guarded" calls always warn before they read the globals.
 KINDS = ("accessor", "function", "shim", "guarded")
 GUARDED = "guarded"
+
+# A call of another kind that a fallback warning dominates ends with this suffix: an earlier
+# statement of the same block, or of a block that contains it, in the same function, calls
+# FALLBACK_WARNING, or the call sits in the block of ``with FALLBACK_BLOCK(...)``.
+WARNED = ":warned"
+FALLBACK_WARNING = "megatron.core.process_groups_config.warn_global_process_group_fallback"
+FALLBACK_BLOCK = "megatron.core.process_groups_config.global_process_group_fallback"
 
 
 def _is_deprecated_accessor(name: str) -> bool:
@@ -219,6 +234,8 @@ def _violations_in(path: pathlib.Path):
             self.hits = []
             # One (kind, names visible from enclosing scopes, own binding events) per scope.
             self.bindings = [("module", {}, _scope_bindings(tree))]
+            # Whether a fallback warning dominates the statement being visited.
+            self.warned = False
 
         def visit_FunctionDef(self, node):
             """Resolve function-local imports independently of sibling and class bindings."""
@@ -245,13 +262,61 @@ def _violations_in(path: pathlib.Path):
             }
             self.bindings.append((kind, visible, _scope_bindings(node)))
             self.scope.append(node.name)
-            for statement in node.body:
-                self.visit(statement)
+            # A function body runs when it is called, not where it is defined; a class body runs
+            # in place.
+            outer_warned = self.warned
+            if kind == "function":
+                self.warned = False
+            self._visit_block(node.body)
+            self.warned = outer_warned
             self.scope.pop()
             self.bindings.pop()
 
-        def visit_Call(self, node):
-            """Record calls resolved through an import, including import aliases."""
+        def generic_visit(self, node):
+            """Visit each list of statements, such as the branches of an ``if``, as a block."""
+            for _, value in ast.iter_fields(node):
+                if isinstance(value, list):
+                    self._visit_block(value)
+                elif isinstance(value, ast.AST):
+                    self.visit(value)
+
+        def _visit_block(self, statements):
+            """Visit ``statements`` in order; a fallback warning dominates the ones after it.
+
+            The warning stays within the block: a branch that warns does not dominate the
+            statements after the branch.
+            """
+            outer = self.warned
+            for statement in statements:
+                if isinstance(statement, ast.AST):
+                    self.visit(statement)
+                    if isinstance(statement, ast.Expr) and self._calls(
+                        statement.value, FALLBACK_WARNING
+                    ):
+                        self.warned = True
+            self.warned = outer
+
+        def visit_With(self, node):
+            """A ``with global_process_group_fallback(...)`` block has warned before its body."""
+            for item in node.items:
+                self.visit(item)
+            outer = self.warned
+            self.warned = outer or any(
+                self._calls(item.context_expr, FALLBACK_BLOCK) for item in node.items
+            )
+            self._visit_block(node.body)
+            self.warned = outer
+
+        visit_AsyncWith = visit_With
+
+        def visit_Lambda(self, node):
+            """A lambda runs when it is called, outside the block that defines it."""
+            outer, self.warned = self.warned, False
+            self.generic_visit(node)
+            self.warned = outer
+
+        def _resolve(self, node):
+            """Return the dotted path that the function called by ``node`` was imported from."""
             name = _qualified_name(node.func)
             root, separator, suffix = name.partition(".")
             _, outer, events = self.bindings[-1]
@@ -259,7 +324,15 @@ def _violations_in(path: pathlib.Path):
                 target = _binding_at(events[root], (node.lineno, node.col_offset))
             else:
                 target = outer.get(root, root)
-            name = target + separator + suffix
+            return target + separator + suffix
+
+        def _calls(self, node, function):
+            """True if ``node`` calls ``function``, given as its dotted import path."""
+            return isinstance(node, ast.Call) and self._resolve(node) == function
+
+        def visit_Call(self, node):
+            """Record calls resolved through an import, including import aliases."""
+            name = self._resolve(node)
             module, _, accessor = name.rpartition(".")
             identity = None
             if module in ("megatron.core.parallel_state", "megatron.core.mpu"):
@@ -275,6 +348,8 @@ def _violations_in(path: pathlib.Path):
                 identity = "guarded:resolve_process_groups"
             if identity:
                 scope = ".".join(self.scope) or "<module>"
+                if self.warned and not identity.startswith(GUARDED + ":"):
+                    identity += WARNED
                 self.hits.append((node.lineno, f"{scope}:{identity}"))
             self.generic_visit(node)
 
@@ -301,12 +376,24 @@ def _load_allowlist():
     return json.loads(ALLOWLIST.read_text(encoding="utf-8"))["allowed"]
 
 
+def _scope(hit):
+    """Return the enclosing scope of an entry ``scope:kind:detail``."""
+    return hit.split(":", 2)[0]
+
+
+def _kind(hit):
+    """Return the kind of an entry ``scope:kind:detail``."""
+    return hit.split(":", 2)[1]
+
+
 def _counts(found):
-    """Count calls by kind for the status output."""
+    """Count calls by kind, and the other kinds' calls as warned or unwarned, for the output."""
     c = Counter()
     for hits in found.values():
         for h in hits:
-            c[h.split(":", 2)[1]] += 1
+            c[_kind(h)] += 1
+            if _kind(h) != GUARDED:
+                c["warned" if h.endswith(WARNED) else "unwarned"] += 1
     return c
 
 
@@ -320,28 +407,48 @@ def _difference(left, right):
     return diff
 
 
-def _split_conversions(added, removed):
-    """Separate the guarded calls in ``added`` that replace a removed read of the same scope.
+def _match_replacements(added, removed):
+    """Match the calls in ``added`` with the removed reads of the same file that they replace.
 
-    Returns ``(new, converted)``. ``converted`` holds guarded calls matched one for one with
-    removed accessor, function or shim reads in the same file and scope; ``new`` holds every
-    other call.
+    Each removed accessor, function or shim read is matched at most once. Returns
+    ``(new, converted, lost)``:
+
+    * ``converted``: a read that a fallback warning now dominates, matched with the same read
+      without one, and a guarded call, matched with another read of its scope. ``--update``
+      records them.
+    * ``lost``: a read that a fallback warning no longer dominates, matched with the same read
+      with one. It fails like a new read.
+    * ``new``: every other call.
     """
-    new, converted = {}, {}
+    new, converted, lost = {}, {}, {}
     for rel, hits in added.items():
-        replaceable = Counter(
-            scope
-            for scope, kind, _ in (hit.split(":", 2) for hit in removed.get(rel, []))
-            if kind != GUARDED
-        )
-        for hit in hits:
-            scope, kind, _ = hit.split(":", 2)
-            if kind == GUARDED and replaceable[scope]:
-                replaceable[scope] -= 1
-                converted.setdefault(rel, []).append(hit)
+        replaceable = [hit for hit in removed.get(rel, []) if _kind(hit) != GUARDED]
+        # Match the reads first: a guarded call must not take the removed read that the same
+        # read with a changed classification replaces.
+        for hit in sorted(hits, key=lambda hit: _kind(hit) == GUARDED):
+            if _kind(hit) == GUARDED:
+                match = next((read for read in replaceable if _scope(read) == _scope(hit)), None)
+                target = converted
+            elif hit.endswith(WARNED):
+                match = hit[: -len(WARNED)] if hit[: -len(WARNED)] in replaceable else None
+                target = converted
             else:
-                new.setdefault(rel, []).append(hit)
-    return new, converted
+                match = hit + WARNED if hit + WARNED in replaceable else None
+                target = lost
+            if match is None:
+                target = new
+            else:
+                replaceable.remove(match)
+            target.setdefault(rel, []).append(hit)
+    return new, converted, lost
+
+
+def _print_locations(entries):
+    """Print the current source locations of the entries, which keep line numbers out."""
+    for rel, hits in sorted(entries.items()):
+        for lineno, identity in _violations_in(REPO_ROOT / rel):
+            if identity in hits:
+                print(f"  {rel}:{lineno}  {identity}")
 
 
 def main(argv=None) -> int:
@@ -356,7 +463,7 @@ def main(argv=None) -> int:
 
     found = scan()
     counts = _counts(found)
-    total = sum(counts.values())
+    total = sum(counts[kind] for kind in KINDS)
 
     if args.stats:
         print(
@@ -364,21 +471,36 @@ def main(argv=None) -> int:
         )
         for kind in KINDS:
             print(f"  {kind:10} {counts[kind]}")
+        print(
+            f"{total - counts[GUARDED]} accessor, function and shim use(s), by whether a fallback "
+            "warning precedes them"
+        )
+        for classification in ("warned", "unwarned"):
+            print(f"  {classification:10} {counts[classification]}")
         return 0
 
     allowed = _load_allowlist()
 
     removed = _difference(allowed, found)
-    added, converted = _split_conversions(_difference(found, allowed), removed)
+    added, converted, lost = _match_replacements(_difference(found, allowed), removed)
 
+    if lost:
+        n = sum(len(v) for v in lost.values())
+        print(
+            f"ERROR: {n} allowlisted use(s) of global parallel_state in megatron/core no longer "
+            "follow a fallback warning:\n"
+        )
+        _print_locations(lost)
+        print(
+            "\nA read of the global grid in megatron/core is a compatibility fallback for a "
+            "caller that omitted its groups, and warns first: call "
+            "warn_global_process_group_fallback() earlier in the same block, or in a block that "
+            "contains it, or read inside `with global_process_group_fallback(...)`.\n"
+        )
     if added:
         n = sum(len(v) for v in added.values())
         print(f"ERROR: {n} new use(s) of global parallel_state in megatron/core:\n")
-        for rel, hits in sorted(added.items()):
-            # Show current source locations while keeping line numbers out of the baseline.
-            for lineno, identity in _violations_in(REPO_ROOT / rel):
-                if identity in hits:
-                    print(f"  {rel}:{lineno}  {identity}")
+        _print_locations(added)
         print(
             "\nmegatron/core must not read process groups from parallel_state. Accept a "
             "ProcessGroupCollection or an explicit torch.distributed.ProcessGroup from the "
@@ -400,6 +522,7 @@ def main(argv=None) -> int:
             "function, for callers that do not pass their groups yet.\n"
             "See https://github.com/NVIDIA/Megatron-LM/issues/6307\n"
         )
+    if added or lost:
         return 1
 
     if args.update:
@@ -408,7 +531,8 @@ def main(argv=None) -> int:
                 {
                     "_comment": (
                         "Grandfathered uses of global parallel_state in megatron/core. "
-                        "Entries are scope:kind:detail; duplicates count separate calls. "
+                        "Entries are scope:kind:detail, with a :warned suffix for a read that "
+                        "follows a fallback warning; duplicates count separate calls. "
                         "This list must only shrink. Remove stale entries with "
                         "`python tools/check_process_group_usage.py --update`."
                     ),
@@ -438,15 +562,18 @@ def main(argv=None) -> int:
                 print(f"  {rel}  {h}")
         if converted:
             n = sum(len(v) for v in converted.values())
-            print(f"\n{n} of them became guarded fallback(s), which --update records:\n")
+            print(
+                f"\n{n} of them became guarded fallback(s) or now follow a fallback warning, "
+                "which --update records:\n"
+            )
             for rel, hits in sorted(converted.items()):
                 for h in hits:
                     print(f"  {rel}  {h}")
         return 1
 
     print(
-        f"OK: no new uses of global parallel_state ({total} grandfathered, "
-        f"{counts[GUARDED]} of them guarded)."
+        f"OK: no new uses of global parallel_state ({total} grandfathered: "
+        f"{counts[GUARDED]} guarded, {counts['warned']} warned, {counts['unwarned']} unwarned)."
     )
     return 0
 

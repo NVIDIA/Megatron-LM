@@ -30,6 +30,25 @@ SHIM_CALL = "ProcessGroupCollection.use_mpu_process_groups()"
 GUARDED_IMPORT = "from megatron.core.process_groups_config import resolve_process_groups\n"
 GUARDED_ARGS = "(None, owner='Model', required=('tp',))"
 GUARDED_CALL = "resolve_process_groups" + GUARDED_ARGS
+WARN_IMPORT = "from megatron.core.process_groups_config import warn_global_process_group_fallback\n"
+WARN = "warn_global_process_group_fallback('f')"
+WARNED_HIT = "f:accessor:parallel_state.get_tensor_model_parallel_group:warned"
+UNWARNED_HIT = "f:accessor:parallel_state.get_tensor_model_parallel_group"
+
+# Allowlisted reads that no fallback warning dominates, although each runs only after one: the
+# read sits under an ``if`` on a value that only a warned fallback leaves None, which the check
+# does not follow. Remove an entry once its read follows the warning in the same block.
+UNWARNED_READS = {
+    # if dp_group is None: after an if/else whose branches warn for the missing pg_collection
+    # or pg_collection.dp_cp_gtp_remat.
+    "megatron/core/transformer/moe/moe_logging.py": [
+        "MoEMetricsTracker._sync_metrics:accessor:parallel_state.get_data_parallel_group"
+    ],
+    # if pp_size is None: only the branch that warns for the missing pp_group sets it to None.
+    "megatron/core/transformer/multi_token_prediction.py": [
+        "mtp_on_this_rank:accessor:parallel_state.get_pipeline_model_parallel_world_size"
+    ],
+}
 
 
 class TestDetection(unittest.TestCase):
@@ -303,9 +322,9 @@ class TestDetection(unittest.TestCase):
                         self.hits(prefix + call), [f"<module>:function:parallel_state.{name}"]
                     )
 
-    def test_call_after_a_fallback_warning_is_not_guarded(self):
-        # Only resolve_process_groups() is guarded: a direct call keeps its kind even when
-        # warn_global_process_group_fallback() precedes it.
+    def test_call_after_a_fallback_warning_is_warned_not_guarded(self):
+        # Only resolve_process_groups() is guarded: a direct call keeps its kind when
+        # warn_global_process_group_fallback() precedes it, and is classified as warned.
         self.assertEqual(
             self.hits(
                 "from megatron.core import parallel_state, process_groups_config as pgc\n"
@@ -314,7 +333,88 @@ class TestDetection(unittest.TestCase):
                 "        pgc.warn_global_process_group_fallback('schedule', 'vp_size')\n"
                 "        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()\n"
             ),
-            ["schedule:function:parallel_state.get_virtual_pipeline_model_parallel_world_size"],
+            [
+                "schedule:function:parallel_state.get_virtual_pipeline_model_parallel_world_size"
+                ":warned"
+            ],
+        )
+
+    def test_reads_that_a_fallback_warning_dominates_are_warned(self):
+        cases = {
+            "later in the same block": f"def f():\n    {WARN}\n    {CALL}\n",
+            "in a block nested after the warning": (
+                f"def f(group):\n    {WARN}\n    if group is None:\n"
+                f"        for _ in range(1):\n            {CALL}\n"
+            ),
+            "in the same branch": (
+                f"def f(group):\n    if group is None:\n        {WARN}\n        {CALL}\n"
+            ),
+            "in a comprehension": f"def f():\n    {WARN}\n    return [{CALL} for _ in ()]\n",
+            "in a global_process_group_fallback block": (
+                "from megatron.core.process_groups_config import global_process_group_fallback\n"
+                f"def f():\n    with global_process_group_fallback('f'):\n        {CALL}\n"
+            ),
+            "after a warning through a module alias": (
+                "import megatron.core.process_groups_config as pgc\n"
+                f"def f():\n    pgc.{WARN}\n    {CALL}\n"
+            ),
+            "after a function-local relative import": (
+                "from other import warn_global_process_group_fallback\n"
+                "def f(group):\n    if group is None:\n"
+                "        from ..process_groups_config import warn_global_process_group_fallback\n"
+                f"        {WARN}\n        {CALL}\n"
+            ),
+        }
+        for case, body in cases.items():
+            with self.subTest(case=case):
+                self.assertEqual(self.hits(IMPORT + WARN_IMPORT + body), [WARNED_HIT])
+
+    def test_reads_that_no_fallback_warning_dominates_are_unwarned(self):
+        cases = {
+            "before the warning": f"def f():\n    {CALL}\n    {WARN}\n",
+            "after a branch that warns": (
+                f"def f(group):\n    if group is None:\n        {WARN}\n    {CALL}\n"
+            ),
+            "in the other branch": (
+                f"def f(group):\n    if group is None:\n        {WARN}\n"
+                f"    else:\n        {CALL}\n"
+            ),
+            "under a test of a value that only the warned branch sets": (
+                f"def f(group):\n    size = 1\n    if group is None:\n        {WARN}\n"
+                f"        size = None\n    if size is None:\n        {CALL}\n"
+            ),
+            "in a handler of the block that warns": (
+                f"def f():\n    try:\n        {WARN}\n    except ValueError:\n        {CALL}\n"
+            ),
+            "in a function defined after the warning": (
+                f"def f():\n    {WARN}\n    def inner():\n        {CALL}\n"
+            ),
+            "in a lambda defined after the warning": (
+                f"def f():\n    {WARN}\n    return lambda: {CALL}\n"
+            ),
+            "after a warning in another function": f"def g():\n    {WARN}\ndef f():\n    {CALL}\n",
+            "after a warning that is not a statement": (
+                f"def f(group):\n    group or {WARN}\n    {CALL}\n"
+            ),
+            "after an unrelated function of the same name": (
+                "from other import warn_global_process_group_fallback\n"
+                f"def f():\n    {WARN}\n    {CALL}\n"
+            ),
+            "in a block that warns about something else": (
+                f"def f():\n    with other_fallback('f'):\n        {CALL}\n"
+            ),
+        }
+        for case, body in cases.items():
+            with self.subTest(case=case):
+                scope = "f.inner" if "def inner" in body else "f"
+                self.assertEqual(
+                    self.hits(IMPORT + WARN_IMPORT + body), [scope + UNWARNED_HIT.removeprefix("f")]
+                )
+
+    def test_guarded_calls_take_no_warned_suffix(self):
+        self.assertEqual(
+            self.hits(WARN_IMPORT + GUARDED_IMPORT + f"def f():\n    {WARN}\n    {GUARDED_CALL}"),
+            ["f:guarded:resolve_process_groups"],
         )
 
     def test_counts_every_deprecated_parallel_state_function(self):
@@ -481,21 +581,86 @@ class TestRatchet(unittest.TestCase):
         self.assertEqual(self.run_check("--stats"), 0)
         self.assertEqual(self.run_check(), 1)
 
-    def test_stats_reports_guarded_reads_separately(self):
+    def test_stats_reports_guarded_and_warned_reads_separately(self):
         self.source.write_text(
-            IMPORT + CALL + "\n" + GUARDED_IMPORT + GUARDED_CALL, encoding="utf-8"
+            IMPORT
+            + SHIM_IMPORT
+            + GUARDED_IMPORT
+            + WARN_IMPORT
+            + f"{CALL}\n{GUARDED_CALL}\ndef f():\n    {WARN}\n    {CALL}; {SHIM_CALL}\n",
+            encoding="utf-8",
         )
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             self.assertEqual(checker.main(["--stats"]), 0)
         lines = output.getvalue().splitlines()
         self.assertEqual(
-            lines[0], "2 use(s) of global parallel_state across 1 file(s) in megatron/core"
+            lines[0], "4 use(s) of global parallel_state across 1 file(s) in megatron/core"
         )
         self.assertEqual(
-            [line.split() for line in lines[1:]],
-            [["accessor", "1"], ["function", "0"], ["shim", "0"], ["guarded", "1"]],
+            [line.split() for line in lines[1:5]],
+            [["accessor", "2"], ["function", "0"], ["shim", "1"], ["guarded", "1"]],
         )
+        self.assertEqual(
+            lines[5],
+            "3 accessor, function and shim use(s), by whether a fallback warning precedes them",
+        )
+        self.assertEqual([line.split() for line in lines[6:]], [["warned", "2"], ["unwarned", "1"]])
+
+    def test_read_that_loses_its_warning_fails(self):
+        self.write_baseline(IMPORT + WARN_IMPORT + f"def f():\n    {WARN}\n    {CALL}\n")
+        original = self.allowlist.read_bytes()
+        self.assertEqual(json.loads(original)["allowed"], {"megatron/core/sample.py": [WARNED_HIT]})
+        for case, source in {
+            "warning removed": f"def f():\n    {CALL}\n",
+            "warning moved into a branch": (
+                f"def f(group):\n    if group is None:\n        {WARN}\n    {CALL}\n"
+            ),
+        }.items():
+            with self.subTest(case=case):
+                self.source.write_text(IMPORT + WARN_IMPORT + source, encoding="utf-8")
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(checker.main([]), 1)
+                self.assertIn(
+                    "ERROR: 1 allowlisted use(s) of global parallel_state in megatron/core no "
+                    "longer follow a fallback warning",
+                    output.getvalue(),
+                )
+                self.assertIn("megatron/core/sample.py:", output.getvalue())
+                self.assertNotIn("new use(s)", output.getvalue())
+                self.assertEqual(self.run_check("--update"), 1)
+                self.assertEqual(self.allowlist.read_bytes(), original)
+
+    def test_read_that_gains_a_warning_is_recorded(self):
+        self.write_baseline(IMPORT + f"def f():\n    {CALL}\n")
+        self.source.write_text(
+            IMPORT + WARN_IMPORT + f"def f():\n    {WARN}\n    {CALL}\n", encoding="utf-8"
+        )
+        # The unwarned entry is stale until --update records the warned one instead.
+        self.assertEqual(self.run_check(), 1)
+        self.assertEqual(self.run_check("--update"), 0)
+        self.assertEqual(
+            json.loads(self.allowlist.read_text())["allowed"],
+            {"megatron/core/sample.py": [WARNED_HIT]},
+        )
+        self.assertEqual(self.run_check(), 0)
+
+    def test_a_reclassified_read_is_not_spent_by_a_guarded_call(self):
+        # The warned read replaces its own unwarned entry, so the guarded call next to it is new.
+        self.write_baseline(IMPORT + f"def f():\n    {CALL}\n")
+        self.source.write_text(
+            IMPORT
+            + WARN_IMPORT
+            + GUARDED_IMPORT
+            + f"def f():\n    {WARN}\n    {CALL}\n    {GUARDED_CALL}\n",
+            encoding="utf-8",
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(checker.main(["--update"]), 1)
+        self.assertIn("ERROR: 1 new use(s)", output.getvalue())
+        self.assertIn("f:guarded:resolve_process_groups", output.getvalue())
 
     def test_conversion_to_resolve_process_groups_swaps_the_entry(self):
         # One guarded call may replace the shim, or several accessor reads, of its scope.
@@ -549,6 +714,34 @@ class TestRatchet(unittest.TestCase):
                 self.assertEqual(self.run_check(), 1)
                 self.assertEqual(self.run_check("--update"), 1)
                 self.assertEqual(self.allowlist.read_bytes(), original)
+
+
+class TestAllowlist(unittest.TestCase):
+    """The committed allowlist grandfathers only reads that warn before they read the grid."""
+
+    def test_allowlisted_reads_are_warned_or_guarded(self):
+        path = REPO_ROOT / "tools" / "process_group_usage_allowlist.json"
+        allowed = json.loads(path.read_text(encoding="utf-8"))["allowed"]
+        unwarned = {}
+        for rel, hits in allowed.items():
+            for hit in hits:
+                if checker._kind(hit) != checker.GUARDED and not hit.endswith(checker.WARNED):
+                    unwarned.setdefault(rel, []).append(hit)
+        if unwarned == UNWARNED_READS:
+            return
+        # The locations of the allowlisted files that still exist; the checker reports the others.
+        locations = [
+            f"{rel}:{lineno}  {identity}"
+            for rel, hits in sorted(unwarned.items())
+            if (REPO_ROOT / rel).is_file()
+            for lineno, identity in checker._violations_in(REPO_ROOT / rel)
+            if identity in hits
+        ]
+        self.assertEqual(
+            unwarned,
+            UNWARNED_READS,
+            "Allowlisted reads that no fallback warning dominates:\n" + "\n".join(locations),
+        )
 
 
 if __name__ == "__main__":
