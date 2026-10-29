@@ -46,21 +46,12 @@ else:
     dot_product_attention = MagicMock()
 
 
-pg_collection = None
-
-
-@pytest.fixture(scope="module", autouse=True)
+@pytest.fixture(autouse=True)
 def model_parallel_groups():
-    """Create the TP and CP groups for this module's tests, and only when they run."""
-    global pg_collection
+    """Create the TP and CP groups for each test, and only when it runs."""
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
     model_parallel_cuda_manual_seed(123)
-    pg_collection = ProcessGroupCollection(
-        tp=parallel_state.get_tensor_model_parallel_group(),
-        cp=parallel_state.get_context_parallel_group(),
-    )
     yield
-    pg_collection = None
     Utils.destroy_model_parallel()
 
 
@@ -74,6 +65,10 @@ def get_attention_implementation(
     softmax_scale: float,
     cp_comm_type: str = "a2a",
 ) -> MegatronModule:
+    pg_collection = ProcessGroupCollection(
+        tp=parallel_state.get_tensor_model_parallel_group(),
+        cp=parallel_state.get_context_parallel_group(),
+    )
     if impl == "megatron":
         return DotProductAttention(
             config,

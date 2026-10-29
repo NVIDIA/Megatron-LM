@@ -27,15 +27,19 @@ from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
+    TeardownStage,
     get_amax_reduction_group,
     get_context_parallel_group,
     get_hierarchical_context_parallel_groups,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_world_size,
     model_parallel_is_initialized,
+    register_model_parallel_teardown,
 )
 from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
+    amax_reduction_group,
     resolve_gtp_remat_group,
     warn_global_process_group_fallback,
 )
@@ -112,6 +116,38 @@ HAVE_TE_GDN = _TE_LINEAR_ATTENTION is not None
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 _EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
+
+
+def _te_autocast_depth() -> int:
+    """Return the nesting depth of Transformer Engine autocast contexts."""
+    if is_te_min_version("2.15.0"):
+        return FP8GlobalStateManager.quantization_state.autocast_depth
+    if is_te_min_version("2.9.0"):
+        return FP8GlobalStateManager.AUTOCAST_DEPTH
+    return FP8GlobalStateManager.FP8_AUTOCAST_DEPTH
+
+
+def _check_te_autocast_exited() -> None:
+    """Refuse model-parallel teardown inside a Transformer Engine autocast context.
+
+    On exit, an open context can reduce FP8 scaling statistics over its process group,
+    which teardown destroys, and it reads the global state that teardown resets. A
+    negative depth is accepted: in-process restart with NVIDIA Resiliency Extension
+    resets TE before the interrupted main thread unwinds its autocast, whose exit then
+    decrements the reset depth below zero.
+    """
+    if _te_autocast_depth() > 0:
+        raise RuntimeError("Exit Transformer Engine autocast before destroying model parallelism.")
+
+
+def _reset_te_global_state() -> None:
+    """Drop TE's FP8 reduction groups and per-model tensor caches."""
+    FP8GlobalStateManager.reset()
+
+
+if HAVE_TE:
+    register_model_parallel_teardown(TeardownStage.VALIDATE, _check_te_autocast_exited)
+    register_model_parallel_teardown(TeardownStage.RESET_STATE, _reset_te_global_state)
 
 
 def _set_expert_parameter_attributes(
@@ -385,7 +421,18 @@ def _get_fp8_model_init_for_quant_params(qparams: TEQuantizationParams | None, t
     return _get_fp8_model_init_for_quant_recipe(qrecipe)
 
 
-def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
+def _get_fp8_autocast_for_quant_recipe(
+    qrecipe: TEQuantizationRecipe, *, pg_collection: Optional[ProcessGroupCollection] = None
+):
+    """Return the autocast context that applies a per-module quantization recipe.
+
+    Args:
+        qrecipe: Recipe of the module.
+        pg_collection: Process groups of the model that owns the module. A quantized autocast
+            reduces amaxes over ``amax_reduction_group(pg_collection, qrecipe.tp_only_amax_red)``.
+            When omitted, it uses the global amax reduction group of ``parallel_state`` if model
+            parallelism is initialized, and passes no group otherwise.
+    """
     if FP8GlobalStateManager.is_fp8_enabled():
         if not qrecipe.override_quantized_autocast:
             return nullcontext()
@@ -397,11 +444,14 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         # Force BF16 for this layer and override autocast
         return fp8_autocast(enabled=False)
     else:
-        amax_group = None
-        if model_parallel_is_initialized():
+        if pg_collection is not None:
+            amax_group = amax_reduction_group(pg_collection, qrecipe.tp_only_amax_red)
+        elif model_parallel_is_initialized():
             amax_group = get_amax_reduction_group(
                 with_context_parallel=True, tp_only_amax_red=qrecipe.tp_only_amax_red
             )
+        else:
+            amax_group = None
         if (
             qrecipe.fp8_quantization_recipe == Fp8Recipe.custom
             or qrecipe.fp4_quantization_recipe == Fp4Recipe.custom
@@ -436,13 +486,30 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         return fp8_autocast(enabled=True, fp8_recipe=quant_recipe, fp8_group=amax_group)
 
 
-def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
+def _get_fp8_autocast_for_quant_params(
+    qparams: TEQuantizationParams | None,
+    training: bool,
+    *,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+):
+    """Return the autocast context for the training or evaluation recipe in ``qparams``.
+
+    Args:
+        qparams: Per-module quantization parameters, or None if the module has none.
+        training: Whether the module is in training mode.
+        pg_collection: Process groups of the model that owns the module; see
+            ``_get_fp8_autocast_for_quant_recipe``.
+    """
     if qparams is None:
         return nullcontext()
     elif not training and qparams.evaluation_recipe is not None:
-        return _get_fp8_autocast_for_quant_recipe(qparams.evaluation_recipe)
+        return _get_fp8_autocast_for_quant_recipe(
+            qparams.evaluation_recipe, pg_collection=pg_collection
+        )
     else:
-        return _get_fp8_autocast_for_quant_recipe(qparams.training_recipe)
+        return _get_fp8_autocast_for_quant_recipe(
+            qparams.training_recipe, pg_collection=pg_collection
+        )
 
 
 def _get_should_context_be_quantized_recipe(
@@ -597,6 +664,47 @@ def _init_gtp_remat_context(
     )
     yield out_features
     _gtp_attach_post_init(module, gtp_ctx, is_grouped=is_grouped, replica_group=replica_group)
+
+
+def _gtp_replica_group(
+    pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None,
+    name: str,
+    gtp_remat_group: Optional[torch.distributed.ProcessGroup],
+    *,
+    owner: str,
+) -> Optional[torch.distributed.ProcessGroup]:
+    """Return the group ``name`` of ``pg_collection`` that replicates a layer's GTP weight shards.
+
+    Distributed checkpointing elects the writer of each GTP weight shard among its replicas, the
+    data-parallel peers outside the gtp_remat axis: ``dp_cp`` for a dense layer and ``expt_dp``
+    for an expert layer. The layer stamps this group on its shards when it is built. A layer
+    without GTP weight remat (``gtp_remat_group`` is None or has a single rank) has no GTP
+    shards, so this returns None.
+
+    A layer with GTP shards whose collection does not hold the group, or that has no collection,
+    also gets None, and ``gtp_replica_rank`` then elects the writer over the global group when
+    the checkpoint is saved. That fallback is deprecated, so this emits a
+    ``ProcessGroupFallbackWarning`` while the layer is built, where the caller can still pass the
+    group.
+
+    Args:
+        pg_collection: The layer's collection, or None.
+        name: ``dp_cp`` or ``expt_dp``.
+        gtp_remat_group: The layer's gtp_remat group, from ``resolve_gtp_remat_group``.
+        owner: Name of the layer class, used in the warning.
+    """
+    if gtp_remat_group is None or gtp_remat_group.size() <= 1:
+        return None
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        # Like resolve_gtp_remat_group: only the language model's collection has GTP axes.
+        pg_collection = pg_collection.get_language_model_collection()
+    # An unset field and an explicit None both leave the shards to the global fallback.
+    group = None if pg_collection is None else vars(pg_collection).get(name)
+    if group is None:
+        warn_global_process_group_fallback(
+            owner, f"pg_collection.{name}", deprecated_in="0.21", removed_in="0.23"
+        )
+    return group
 
 
 def split_te_layernorm_column_parallel_linear(
@@ -1268,10 +1376,14 @@ class TELinear(te.pytorch.Linear):
         name: str | None = None,
         gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
         gtp_replica_group: Optional[torch.distributed.ProcessGroup] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         """
         Args:
             name (str | None): module instance name passed top-down from its paranet module
+            pg_collection (ProcessGroupCollection | None): process groups of the model that owns
+                this layer. A per-module quantization recipe reduces amaxes over its amax
+                reduction group. Falls back to the MPU global process groups when not given.
         """
         if not HAVE_TE:
             raise ImportError(
@@ -1280,6 +1392,7 @@ class TELinear(te.pytorch.Linear):
             )
 
         self.config = config
+        self._pg_collection = pg_collection
 
         # TE returns a zero length Tensor when bias=False and
         # return_bias=True, but we prefer None.  So in that case we
@@ -1468,7 +1581,9 @@ class TELinear(te.pytorch.Linear):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward."""
         _is_first_microbatch = _resolve_is_first_microbatch(self)
-        quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+        quant_context = _get_fp8_autocast_for_quant_params(
+            self.te_quant_params, self.training, pg_collection=self._pg_collection
+        )
 
         with quant_context:
             out = super().forward(x, is_first_microbatch=_is_first_microbatch)
@@ -1540,6 +1655,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             )
 
         self.config = config
+        self._pg_collection = pg_collection
 
         if gather_output:
             raise ValueError("Transformer Engine linear layers do not support gather_output = True")
@@ -1642,7 +1758,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             extra_kwargs,
             rng_via_kwarg=False,
             out_split_size=self.tp_size,
-            replica_group=getattr(pg_collection, "dp_cp", None),
+            replica_group=_gtp_replica_group(
+                pg_collection, "dp_cp", gtp_remat_group, owner=type(self).__name__
+            ),
         )
 
         with init_quant_context, init_gtp_remat_context as gtp_output_size:
@@ -1717,7 +1835,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
     def forward(self, x):
         """Forward."""
         _is_first_microbatch = _resolve_is_first_microbatch(self)
-        quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+        quant_context = _get_fp8_autocast_for_quant_params(
+            self.te_quant_params, self.training, pg_collection=self._pg_collection
+        )
 
         # FP32 residual connections pass the FP32 residual stream into this fused module, but
         # TE LayerNormLinear requires its input dtype to match its BF16/FP16 parameters outside
@@ -1834,7 +1954,13 @@ class TEColumnParallelLinear(TELinear):
             tp_group=tp_group,
             name=name,
             gtp_remat_group=gtp_remat_group,
-            gtp_replica_group=getattr(pg_collection, "expt_dp" if is_expert else "dp_cp", None),
+            gtp_replica_group=_gtp_replica_group(
+                pg_collection,
+                "expt_dp" if is_expert else "dp_cp",
+                gtp_remat_group,
+                owner=type(self).__name__,
+            ),
+            pg_collection=pg_collection,
         )
 
         # Set proper partition_stride
@@ -2030,7 +2156,7 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
         if weight is not None and weight is not self.weight:
             raise RuntimeError("TE MXFP8 output projection does not support runtime weight.")
 
-        with get_fp8_context(self.config):
+        with get_fp8_context(self.config, pg_collection=self._pg_collection):
             torch.cuda.nvtx.range_push("mxfp8_output_proj_telinear")
             try:
                 output_parallel, output_bias = super().forward(input_)
@@ -2107,7 +2233,13 @@ class TERowParallelLinear(TELinear):
             tp_group=tp_group,
             name=name,
             gtp_remat_group=gtp_remat_group,
-            gtp_replica_group=getattr(pg_collection, "expt_dp" if is_expert else "dp_cp", None),
+            gtp_replica_group=_gtp_replica_group(
+                pg_collection,
+                "expt_dp" if is_expert else "dp_cp",
+                gtp_remat_group,
+                owner=type(self).__name__,
+            ),
+            pg_collection=pg_collection,
         )
         if config.use_cpu_initialization:
             world_size = get_pg_size(tp_group)
@@ -2795,7 +2927,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 is_expert=True,
                 is_grouped=True,
                 out_split_size=tp_size if parallel_mode == "column" else 1,
-                replica_group=getattr(pg_collection, "expt_dp", None),
+                replica_group=_gtp_replica_group(
+                    pg_collection, "expt_dp", gtp_remat_group, owner=type(self).__name__
+                ),
             )
 
             with init_quant_context, init_gtp_remat_context as output_size:
@@ -3018,7 +3152,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 _is_first_microbatch = None
             else:
                 _is_first_microbatch = _resolve_is_first_microbatch(self)
-            quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+            quant_context = _get_fp8_autocast_for_quant_params(
+                self.te_quant_params, self.training, pg_collection=self._pg_collection
+            )
 
             with quant_context:
                 out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
