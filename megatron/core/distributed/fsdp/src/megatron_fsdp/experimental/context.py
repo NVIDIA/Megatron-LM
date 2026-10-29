@@ -23,6 +23,7 @@ from torch import nn
 
 from .execution_order import ExecutionEvent, ExecutionOrder
 from .phase import Phase
+from .runtime_policy import RuntimePolicy
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
 
@@ -39,12 +40,6 @@ class FsdpContext:
     use_symmetric_memory: bool
     unify_communication_stream: bool
     caller_managed_grad_sync: bool
-    """Leave gradient synchronization to the caller instead of an autograd callback.
-
-    The caller must call ``finish_grad_sync()`` after all gradient producers,
-    including delayed weight-gradient computation, and before consuming gradients.
-    """
-
     # Phase-tagged preset forward/backward execution order.
     execution_order: ExecutionOrder
     # Topology metadata must not keep modules alive after construction.
@@ -59,30 +54,21 @@ class FsdpContext:
     def __init__(
         self,
         device: torch.device | None = None,
-        use_symmetric_memory: bool = False,
-        unify_communication_stream: bool = False,
+        runtime_policy: RuntimePolicy = RuntimePolicy(),
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
-        caller_managed_grad_sync: bool = False,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
         Args:
             device: CUDA device on which this context schedules communication. Defaults to
                 the current CUDA device.
-            use_symmetric_memory: Whether modules constructed in this context allocate
-                communication staging buffers from PyTorch's NCCL symmetric-memory pool.
-            unify_communication_stream: Whether all-gathers and reduce-scatters share one
-                communication stream to reduce peak transient memory. See
-                https://github.com/NVIDIA/Megatron-LM/issues/6471.
+            runtime_policy: Communication allocation, stream, and gradient-synchronization
+                settings shared by all modules constructed in this context.
             parameter_to_owner: Construction-time owner assignments for TensorAtomic
                 parameters, keyed by the original parameters before sharding. Owners are
                 ranks in each parameter group's 1-D data-parallel mesh and must agree across
                 that mesh. Every TensorAtomic parameter needs an entry; other entries are
                 ignored. Tensors are packed by owner without changing logical parameter order.
-            caller_managed_grad_sync: Leave gradient synchronization to the caller while
-                retaining automatic weight cleanup. The caller must
-                call ``finish_grad_sync()`` after all backward work and before reading or
-                modifying gradients.
         """
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -92,9 +78,9 @@ class FsdpContext:
             )
 
         self.is_last_microbatch = True
-        self.use_symmetric_memory = use_symmetric_memory
-        self.unify_communication_stream = unify_communication_stream
-        self.caller_managed_grad_sync = caller_managed_grad_sync
+        self.use_symmetric_memory = runtime_policy.use_symmetric_memory
+        self.unify_communication_stream = runtime_policy.unify_communication_stream
+        self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
         self.execution_order = ExecutionOrder()
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
@@ -108,7 +94,7 @@ class FsdpContext:
         self._is_finalized = False
         self._context_token: Token[FsdpContext | None] | None = None
         self.allgather_stream = torch.cuda.Stream(device)
-        if unify_communication_stream:
+        if self.unify_communication_stream:
             # A unified stream lets an all-gather reuse the storage released by a
             # preceding reduce-scatter.
             self.reduce_scatter_stream = self.allgather_stream
@@ -203,8 +189,8 @@ class FsdpContext:
             return
         raise RuntimeError(
             "Gradient reduction has no pending autograd completion callback. "
-            "Use fully_shard_context(caller_managed_grad_sync=True) and call "
-            "context.finish_grad_sync() after all backward work, including "
+            "Use fully_shard_context(runtime_policy=RuntimePolicy(caller_managed_grad_sync=True)) "
+            "and call context.finish_grad_sync() after all backward work, including "
             "delayed weight-gradient computation, before consuming gradients."
         )
 

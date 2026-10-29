@@ -40,7 +40,7 @@ from .parameter_group import (
     get_containing_parameter_group,
 )
 from .phase import Phase
-from .placement import BlockAtomic, RowAtomic
+from .placement import BlockAtomic, RowAtomic, ShardLayout
 from .schedule import SchedulePolicy
 
 
@@ -76,12 +76,15 @@ class FsdpModule:
         use_symmetric_memory: bool = False,
         register_hooks: bool = True,
         grad_accumulation_count: int | None = None,
+        shard_layout: ShardLayout = ShardLayout.PADDED,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module.
 
         Args:
             grad_accumulation_count: Total parameter-gradient callbacks per reduction
                 window. Defaults to one per owned trainable parameter.
+            shard_layout: Padded or unpadded rank segments for every parameter group.
+                See ``fully_shard``.
         """
         self._context = context
         self._phase = Phase.RESTING
@@ -109,6 +112,7 @@ class FsdpModule:
                     grad_scale=grad_scale,
                     use_symmetric_memory=use_symmetric_memory,
                     parameter_to_owner=context.parameter_to_owner,
+                    shard_layout=shard_layout,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
