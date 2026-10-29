@@ -174,6 +174,11 @@ def initialize_megatron(
                 if isinstance(cfg, PretrainConfigContainer)
                 else 1
             ),
+            expert_num_distributed_optimizer_instances=(
+                cfg.ddp.expert_num_distributed_optimizer_instances
+                if isinstance(cfg, PretrainConfigContainer)
+                else None
+            ),
         )
 
         # Single-rank log helpers write on rank 0 by default. Non-colocated MIMO puts the
@@ -363,7 +368,8 @@ def _initialize_tp_communicators(
 
 def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store,
                             skip_model_parallel_init=False, *,
-                            model_config=None, num_distributed_optimizer_instances=1):
+                            model_config=None, num_distributed_optimizer_instances=1,
+                            expert_num_distributed_optimizer_instances=None):
     """Initialize torch.distributed and core model parallel."""
     cfg = get_run_config()
     args = get_args()
@@ -493,6 +499,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 min_dynamic_context_parallel_size=model_config.min_dynamic_context_parallel_size,
                 expert_model_parallel_size=model_config.expert_model_parallel_size,
                 num_distributed_optimizer_instances=num_distributed_optimizer_instances,
+                expert_num_distributed_optimizer_instances=expert_num_distributed_optimizer_instances,
                 expert_tensor_parallel_size=model_config.expert_tensor_parallel_size,
                 distributed_timeout_minutes=cfg.dist.distributed_timeout_minutes,
                 nccl_communicator_config_path=cfg.dist.nccl_communicator_config_path,
