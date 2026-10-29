@@ -224,6 +224,213 @@ def test_hfsdp_pipeline_preserves_inner_prefetch_size_policy():
     ]
 
 
+def _hfsdp_window_pipeline(unit_ids, sizes, overlap=True, double_buffer=False):
+    """An HFSDP all-gather pipeline whose buckets are replicated on DP-Shard and sharded on
+    DP-Outer. It records the DP-Inner window and the DP-Outer gathers instead of launching
+    them."""
+    pipeline = AllGatherPipeline.__new__(AllGatherPipeline)
+    params = [object() for _ in unit_ids]
+    pipeline.buffer = SimpleNamespace(
+        num_buckets=len(unit_ids),
+        param_to_param_group={param: bucket_id for bucket_id, param in enumerate(params)},
+        parameter_groups=[
+            SimpleNamespace(
+                fsdp_unit_id=unit_id,
+                is_expert_param=False,
+                transpose_weight_buffer=None,
+                hfsdp_helper_wbuf=SimpleNamespace(is_data_distributed=False),
+                model_weight_buffer=SimpleNamespace(bucket_index=SimpleNamespace(size=size)),
+            )
+            for unit_id, size in zip(unit_ids, sizes)
+        ],
+        bucket_to_bucket_group={bucket_id: [bucket_id] for bucket_id in range(len(unit_ids))},
+        double_buf_units=set(unit_ids) if double_buffer else set(),
+        ddp_config=SimpleNamespace(
+            fsdp_double_buffer=double_buffer,
+            hfsdp_param_gather_overlap=overlap,
+            outer_dp_sharding_strategy="optim",
+        ),
+        dist_index=SimpleNamespace(
+            use_hybrid_fsdp=True,
+            get_outer_fsdp_group=lambda is_expert_parallel: SimpleNamespace(size=lambda: 2),
+        ),
+    )
+    pipeline.bucket_can_be_released = {}
+    pipeline.bucket_status = {
+        (bucket_id, False): BucketStatus.EMPTY for bucket_id in range(len(unit_ids))
+    }
+    pipeline.recorded = {}
+    pipeline._launch_outer_prefetches = lambda bucket_ids, bwd: pipeline.recorded.update(
+        outer=bucket_ids
+    )
+
+    def group_buckets(bucket_ids):
+        pipeline.recorded["inner"] = bucket_ids
+        return {}
+
+    pipeline._group_buckets = group_buckets
+    return pipeline, params
+
+
+@pytest.mark.parametrize(
+    ("order", "start_buckets", "expected_buckets"),
+    [
+        (PrefetchOrder.FORWARD_PASS_ORDER, [0, 1, 2], [0, 1, 2, 3, 4]),
+        (PrefetchOrder.FORWARD_PASS_ORDER, [0, 1], [0, 1]),
+        (PrefetchOrder.FORWARD_PASS_ORDER, [4, 5], [4, 5]),
+        (PrefetchOrder.FORWARD_PASS_ORDER, [5, 6], [5, 6, 7, 8, 9]),
+        (PrefetchOrder.FORWARD_PASS_ORDER, [7, 8], [7, 8, 9]),
+        (PrefetchOrder.BACKWARD_PASS_ORDER, [4, 5], [2, 3, 4, 5]),
+        (PrefetchOrder.BACKWARD_PASS_ORDER, [9], [6, 7, 8, 9]),
+        (PrefetchOrder.BACKWARD_PASS_ORDER, [2], [2]),
+    ],
+)
+def test_all_gather_pipeline_complete_frontier_unit(order, start_buckets, expected_buckets):
+    """Completing the frontier FSDP unit adds whole bucket groups, stops at the next unit or
+    non-unit bucket, and leaves a non-unit frontier unchanged."""
+    unit_ids = [0, 0, 1, 1, 1, None, 2, 2, 2, 2]
+    bucket_groups = [[0], [1], [2], [3, 4], [3, 4], [5], [6], [7], [8, 9], [8, 9]]
+    pipeline = AllGatherPipeline.__new__(AllGatherPipeline)
+    pipeline.buffer = SimpleNamespace(
+        parameter_groups=[SimpleNamespace(fsdp_unit_id=unit_id) for unit_id in unit_ids],
+        bucket_to_bucket_group=dict(enumerate(bucket_groups)),
+    )
+
+    actual = pipeline._complete_frontier_fsdp_unit(start_buckets, order)
+
+    assert actual == expected_buckets
+
+
+@pytest.mark.parametrize(
+    (
+        "order",
+        "requested",
+        "sizes",
+        "prefetch_size",
+        "overlap",
+        "outer_gather",
+        "double_buffer",
+        "inner",
+        "outer",
+    ),
+    [
+        # Bucket 1 exhausts the size alone; the window still covers the rest of FSDP unit 1.
+        (
+            PrefetchOrder.FORWARD_PASS_ORDER,
+            0,
+            [6, 20, 6, 6, 6, 6],
+            10,
+            True,
+            True,
+            False,
+            [0, 1, 2],
+            [0, 1, 2, 3, 4],
+        ),
+        (
+            PrefetchOrder.BACKWARD_PASS_ORDER,
+            5,
+            [6, 6, 6, 6, 20, 6],
+            10,
+            True,
+            True,
+            False,
+            [3, 4, 5],
+            [1, 2, 3, 4, 5],
+        ),
+        # The window already ends on a unit boundary or reaches past the next unit.
+        (
+            PrefetchOrder.FORWARD_PASS_ORDER,
+            0,
+            [6, 3, 20, 6, 6, 6],
+            10,
+            True,
+            True,
+            False,
+            [0, 1, 2],
+            [0, 1, 2, 3, 4],
+        ),
+        (
+            PrefetchOrder.FORWARD_PASS_ORDER,
+            0,
+            [6, 1, 1, 1, 1, 1],
+            10,
+            True,
+            True,
+            False,
+            [0, 1, 2, 3, 4, 5],
+            [0, 1, 2, 3, 4, 5],
+        ),
+        # A zero prefetch size still disables DP-Inner prefetch.
+        (
+            PrefetchOrder.FORWARD_PASS_ORDER,
+            0,
+            [6, 20, 6, 6, 6, 6],
+            0,
+            True,
+            True,
+            False,
+            [0],
+            [0, 1, 2],
+        ),
+        # Completing a unit adds no unit, so it is compatible with double buffering.
+        (
+            PrefetchOrder.FORWARD_PASS_ORDER,
+            0,
+            [6, 20, 6, 6, 6, 6],
+            10,
+            True,
+            True,
+            True,
+            [0, 1, 2],
+            [0, 1, 2, 3, 4],
+        ),
+        # Only the pipelined DP-Outer gather is affected.
+        (
+            PrefetchOrder.FORWARD_PASS_ORDER,
+            0,
+            [6, 20, 6, 6, 6, 6],
+            10,
+            False,
+            True,
+            False,
+            [0, 1],
+            None,
+        ),
+        # Without a DP-Outer gather the replicated buckets need no all-gather, so they count zero.
+        (
+            PrefetchOrder.FORWARD_PASS_ORDER,
+            0,
+            [6, 20, 6, 6, 6, 6],
+            10,
+            True,
+            False,
+            False,
+            [0, 1, 2, 3, 4, 5],
+            None,
+        ),
+    ],
+)
+def test_hfsdp_pipeline_window_ends_on_unit_boundary(
+    order, requested, sizes, prefetch_size, overlap, outer_gather, double_buffer, inner, outer
+):
+    """With pipelined DP-Outer gathers, a DP-Inner window that a DP-Outer bucket ends mid-unit
+    is extended through the rest of that FSDP unit, and no further."""
+    pipeline, params = _hfsdp_window_pipeline(
+        [0, 1, 1, 2, 2, 3], sizes, overlap=overlap, double_buffer=double_buffer
+    )
+
+    pipeline.all_gather_params(
+        [params[requested]],
+        prefetch=True,
+        prefetch_order=order,
+        suggested_AG_prefetch_size=prefetch_size,
+        outer_fsdp_group_param_gather=outer_gather,
+    )
+
+    assert pipeline.recorded.get("inner") == inner
+    assert pipeline.recorded.get("outer") == outer
+
+
 def destroy_device_mesh(device_mesh):
 
     # Teardown device mesh.

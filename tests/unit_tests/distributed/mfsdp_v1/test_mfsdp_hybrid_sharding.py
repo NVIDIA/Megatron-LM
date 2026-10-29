@@ -13,12 +13,14 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
     fully_shard_model,
     fully_shard_optimizer,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import BucketStatus
 from tests.unit_tests.distributed.mfsdp_v1.test_mfsdp_nonuniform_sharding import (
     DP_SHARD,
     LEARNING_RATE,
     OPTIM_GRADS,
     OPTIM_GRADS_PARAMS,
     TP,
+    ToyMoEModel,
     assert_loss_curve_matches_reference,
     build_replicated_models,
     destroy_device_mesh,
@@ -53,6 +55,19 @@ def build_hybrid_mesh(dp_outer: int, dp_shard: int):
     # Hybrid FSDP shards the optimizer state over the flattened DP group.
     device_mesh[(DP_OUTER, DP_SHARD)]._flatten(HSDP)
     return device_mesh
+
+
+class ToyMoEStack(torch.nn.Module):
+    """A stack of FSDP unit modules that each own a dense and an expert bucket group."""
+
+    def __init__(self, num_blocks: int = 3):
+        super().__init__()
+        self.blocks = torch.nn.ModuleList([ToyMoEModel() for _ in range(num_blocks)])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
+        return x
 
 
 def assert_reduction_schedule_matches_group_width(fsdp_model):
@@ -91,7 +106,14 @@ class TestHybridFsdpOverReplicatedWeights:
         Utils.destroy_model_parallel()
 
     @staticmethod
-    def hybrid_shard_model(model, device_mesh, dp_shard_strategy, experts_strategy=None):
+    def hybrid_shard_model(
+        model,
+        device_mesh,
+        dp_shard_strategy,
+        experts_strategy=None,
+        fsdp_unit_modules=(torch.nn.Linear,),
+        hfsdp_param_gather_overlap=False,
+    ):
         """Fully shard `model` with DP-Outer optimizer state sharding enabled."""
         hybrid_group = device_mesh[HSDP].get_group()
         return fully_shard_model(
@@ -103,10 +125,11 @@ class TestHybridFsdpOverReplicatedWeights:
             hybrid_fsdp_group=hybrid_group,
             expt_device_mesh=device_mesh,
             hybrid_fsdp_expt_group=hybrid_group,
-            fsdp_unit_modules=[torch.nn.Linear],
+            fsdp_unit_modules=list(fsdp_unit_modules),
             zero_dp_strategy=dp_shard_strategy,
             expert_zero_dp_strategy=experts_strategy,
             outer_dp_sharding_strategy=OPTIM,
+            hfsdp_param_gather_overlap=hfsdp_param_gather_overlap,
         )
 
     @pytest.mark.parametrize("mesh_shape", HYBRID_MESHES)
@@ -144,6 +167,56 @@ class TestHybridFsdpOverReplicatedWeights:
         optimizer = fully_shard_optimizer(
             torch.optim.SGD(fsdp_model.parameters(), lr=LEARNING_RATE)
         )
+
+        assert_loss_curve_matches_reference(fsdp_model, optimizer, reference_model)
+        destroy_device_mesh(device_mesh)
+
+    @pytest.mark.parametrize("mesh_shape", HYBRID_MESHES)
+    @pytest.mark.parametrize("dp_shard_strategy", [OPTIM_GRADS, OPTIM_GRADS_PARAMS])
+    def test_param_gather_overlap_prefetches_whole_units(self, dp_shard_strategy, mesh_shape):
+        """
+        With pipelined DP-Outer gathers, a DP-Inner prefetch window that the size ends inside
+        an FSDP unit covers the rest of that unit, and the loss curve is unchanged.
+        """
+        device_mesh = build_hybrid_mesh(*mesh_shape)
+        torch.manual_seed(1234)
+        reference_model = ToyMoEStack().cuda()
+        model = ToyMoEStack().cuda()
+        model.load_state_dict(reference_model.state_dict())
+
+        fsdp_model = self.hybrid_shard_model(
+            model,
+            device_mesh,
+            dp_shard_strategy,
+            experts_strategy=OPTIM_GRADS_PARAMS,
+            fsdp_unit_modules=(ToyMoEModel,),
+            hfsdp_param_gather_overlap=True,
+        )
+        optimizer = fully_shard_optimizer(
+            torch.optim.SGD(fsdp_model.parameters(), lr=LEARNING_RATE)
+        )
+
+        # Unit 0 owns buckets 0 (dense) and 1 (experts). Prefetching from bucket 0, a size just
+        # above bucket 1 ends the window after the dense bucket of unit 1.
+        parameter_groups = fsdp_model.param_and_grad_buffer.parameter_groups
+        assert [group.fsdp_unit_id for group in parameter_groups] == [0, 0, 1, 1, 2, 2]
+        assert [group.is_expert_param for group in parameter_groups] == [False, True] * 3
+        fsdp_model.suggested_AG_prefetch_size = (
+            parameter_groups[1].model_weight_buffer.bucket_index.size + 1
+        )
+        fsdp_model.synchronize_param_gather()
+        fsdp_model.start_param_sync()
+
+        # Buckets with replicated weights are PRESERVED, not EMPTY, when not being gathered.
+        gathered = {}
+        for (bucket_id, bwd), status in fsdp_model.all_gather_pipeline.bucket_status.items():
+            if not bwd:
+                gathered[bucket_id] = status in (
+                    BucketStatus.COMMUNICATING,
+                    BucketStatus.READY_TO_USE,
+                )
+        expected = [True] * 4 + [False] * 2
+        assert [gathered[bucket_id] for bucket_id in range(len(parameter_groups))] == expected
 
         assert_loss_curve_matches_reference(fsdp_model, optimizer, reference_model)
         destroy_device_mesh(device_mesh)

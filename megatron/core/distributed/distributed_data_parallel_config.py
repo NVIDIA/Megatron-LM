@@ -288,9 +288,10 @@ class DistributedDataParallelConfig:
 
     hfsdp_param_gather_overlap: bool = False
     """If true, pipeline HFSDP parameter gathers across the DP-Outer and DP-Inner
-    communication domains. DP-Inner retains its size-based prefetch policy, while
-    DP-Outer is prefetched one additional FSDP unit beyond the DP-Inner frontier.
-    Only effective with ``outer_dp_sharding_strategy='optim'``.
+    communication domains. DP-Inner keeps its size-based prefetch policy, but in the
+    microbatches that gather DP-Outer its window ends on an FSDP unit boundary. DP-Outer
+    is prefetched one additional FSDP unit beyond the DP-Inner frontier. Only effective
+    with ``outer_dp_sharding_strategy='optim'``.
     """
 
     @property
