@@ -453,9 +453,9 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             config, 'inference_disable_triton_nvls_kernels', False
         )
 
-        # Placeholder for next layer norm weights for fused
-        # reduce-scatter + add + rms-norm + all-gather
-        self.next_layer_norm_weights = None
+        # Column-parallel layer whose input rms-norm the fused
+        # reduce-scatter + add + rms-norm + all-gather applies (see _set_next_layer_norm_linear)
+        self.next_layer_norm_linear = None
         self.config = config
 
     def _matmul_reduce_scatter(self, x, residual=None):
@@ -511,7 +511,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
                     symm_mem_buffer["handle"],
                     residual,
                     self.next_layer_norm_weights,
-                    self.config.layernorm_epsilon,
+                    self.next_layer_norm_linear.eps,
                 )
                 # 1. Residual has the output of the reduce-scatter + residual add
                 #    Care must be taken in the model definition, so as to not apply the
@@ -525,15 +525,29 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             x, _ = reduce_scatter_along_first_dim(x, tp_group=self.tp_group)
         return x
 
-    def _set_next_layer_norm_weights(self, weights: torch.Tensor):
+    @property
+    def next_layer_norm_weights(self) -> Optional[torch.Tensor]:
+        """Norm weights the fused kernel applies: next_layer_norm_linear's, as they are now."""
+        if self.next_layer_norm_linear is None:
+            return None
+        return self.next_layer_norm_linear.layer_norm_weight
+
+    def _set_next_layer_norm_linear(
+        self, linear: Optional["InferenceLayerNormColumnParallelLinear"]
+    ):
         """
-        Set next layer norm weights for fused reduce-scatter + add + rms-norm + all-gather.
-        Pass the norm weight parameter itself: the kernel reads it on every forward, so it
-        sees the parameter's current storage after the model is moved, cast or wrapped.
+        Set the column-parallel layer whose input rms-norm this layer's fused
+        reduce-scatter + add + rms-norm + all-gather applies.
+
+        Its norm weights and epsilon are read on every forward, not taken here: moving or
+        casting the model, DDP's parameter buffer and meta-device materialization rebind or
+        replace parameters after the model is built. A CUDA graph replays the address read
+        at capture, as for every other weight: in-place updates such as checkpoint loads
+        reach it, and rebinding the parameters after capture requires capturing again.
         """
-        # The parameter belongs to the next layer's norm. Bypass nn.Module.__setattr__,
-        # which would also register it as a parameter of this layer.
-        object.__setattr__(self, "next_layer_norm_weights", weights)
+        # The layer belongs to another part of the model. Bypass nn.Module.__setattr__,
+        # which would also register it as a submodule of this layer.
+        object.__setattr__(self, "next_layer_norm_linear", linear)
 
     def _set_residual(self, residual: torch.Tensor):
         """

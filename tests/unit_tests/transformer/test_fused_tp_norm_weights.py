@@ -2,12 +2,14 @@
 """Fused TP communication reads the next layer's norm weights as they are at forward time.
 
 With ``inference_fuse_tp_communication``, TransformerBlock gives each
-``InferenceRowParallelLinear`` the norm weights of the column-parallel layer that takes its
-output, for the fused NVLS reduce-scatter + add + rms-norm + all-gather kernel. Moving the model
-to the GPU after CPU initialization, casting it (as Float16Module does) and DDP's parameter
-buffer all rebind the parameters to new storage after that wiring is set up.
+``InferenceRowParallelLinear`` the column-parallel layer that takes its output, whose norm the
+fused NVLS reduce-scatter + add + rms-norm + all-gather kernel applies. After that wiring is set
+up, moving the model to the GPU after CPU initialization, casting it (as Float16Module does) and
+DDP's parameter buffer rebind the parameters to new storage, and meta-device materialization
+and casts under torch.__future__'s overwrite-on-conversion replace them with new Parameters.
 """
 
+import contextlib
 from unittest import mock
 
 import pytest
@@ -23,6 +25,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_inferenc
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.utils.common_utils import to_empty_if_meta_device
 from tests.unit_tests.test_utilities import Utils
 
 requires_te = pytest.mark.skipif(
@@ -47,7 +50,22 @@ def _rebind_storage(block: TransformerBlock) -> TransformerBlock:
     return block
 
 
-# How each parameter's storage changes after construction: (config overrides, transform).
+def _materialize_meta(block: TransformerBlock) -> TransformerBlock:
+    """Materialize a block built on the meta device on the GPU, as get_model does."""
+    return to_empty_if_meta_device(block, device=torch.device("cuda", torch.cuda.current_device()))
+
+
+def _cast_overwriting_parameters(block: TransformerBlock) -> TransformerBlock:
+    """Cast to BF16 with overwrite-on-conversion, under which _apply installs new Parameters."""
+    previous = torch.__future__.get_overwrite_module_params_on_conversion()
+    torch.__future__.set_overwrite_module_params_on_conversion(True)
+    try:
+        return block.bfloat16()
+    finally:
+        torch.__future__.set_overwrite_module_params_on_conversion(previous)
+
+
+# What happens to the parameters after construction: (config overrides, transform).
 _REBINDS = {
     # Built on the CPU and moved to the GPU, as get_model does with --use-cpu-initialization.
     "cuda": (dict(use_cpu_initialization=True, params_dtype=torch.bfloat16), lambda b: b.cuda()),
@@ -55,6 +73,13 @@ _REBINDS = {
     "bfloat16": (dict(params_dtype=torch.float32), lambda b: b.bfloat16()),
     # Built in BF16 and moved into another buffer, as DDP does.
     "storage": (dict(params_dtype=torch.bfloat16), _rebind_storage),
+    # Built on the meta device and materialized, as with --init-model-with-meta-device.
+    "meta": (
+        dict(init_model_with_meta_device=True, params_dtype=torch.bfloat16),
+        _materialize_meta,
+    ),
+    # Built in FP32 and cast to BF16 with new Parameter objects.
+    "overwrite": (dict(params_dtype=torch.float32), _cast_overwriting_parameters),
 }
 
 
@@ -79,7 +104,11 @@ def _build(tp: int, rebind: str, *, fuse: bool) -> TransformerBlock:
         **overrides,
     )
     model_parallel_cuda_manual_seed(123)
-    block = TransformerBlock(config, get_gpt_layer_with_inference_spec(), post_layer_norm=False)
+    device = (
+        torch.device("meta") if config.init_model_with_meta_device else contextlib.nullcontext()
+    )
+    with device:
+        block = TransformerBlock(config, get_gpt_layer_with_inference_spec(), post_layer_norm=False)
     return transform(block).eval()
 
 
@@ -107,14 +136,17 @@ def _require_nvls():
 
 
 def _set_same_weights(unfused: TransformerBlock, fused: TransformerBlock):
-    """Copy, in place, the same weights into both blocks, with norm gains away from 1."""
+    """Load the same weights into both blocks in place, as a checkpoint load does."""
     gen = torch.Generator(device="cpu").manual_seed(4321)
     fused_params = dict(fused.named_parameters())
     with torch.no_grad():
         for name, param in unfused.named_parameters():
             if name.endswith("layer_norm_weight"):
-                param.copy_(0.5 + torch.rand(param.shape, generator=gen))
-            fused_params.pop(name).copy_(param)
+                value = 0.5 + torch.rand(param.shape, generator=gen)
+            else:
+                value = 0.03 * torch.randn(param.shape, generator=gen)
+            param.copy_(value)
+            fused_params.pop(name).copy_(value)
     assert not fused_params, f"parameters only in the fused block: {sorted(fused_params)}"
 
 
@@ -145,7 +177,7 @@ class TestFusedTPNormWeights:
 
     @pytest.mark.parametrize("rebind", list(_REBINDS))
     def test_row_parallel_layers_hold_the_norm_parameters(self, rebind):
-        """After the parameters move, each layer still points at the next norm's storage."""
+        """After the parameters change, each layer still reads the next norm's parameter."""
         Utils.initialize_model_parallel(tensor_model_parallel_size=1)
         block = _build(1, rebind, fuse=True)
         layers = block.layers
@@ -171,12 +203,13 @@ class TestFusedTPNormWeights:
                     param.shape,
                 ), f"last linear_fc2 holds {fc2_weights.dtype} on {fc2_weights.device}"
 
-        # The references add no parameters or state to the row-parallel layers.
+        # The references add no submodules, parameters or state to the row-parallel layers.
         unfused = _build(1, rebind, fuse=False)
         assert list(block.state_dict()) == list(unfused.state_dict())
-        assert [n for n, _ in block.named_parameters()] == [
-            n for n, _ in unfused.named_parameters()
-        ]
+        for names in ("named_parameters", "named_modules"):
+            assert [n for n, _ in getattr(block, names)()] == [
+                n for n, _ in getattr(unfused, names)()
+            ]
 
     @pytest.mark.parametrize("rebind", list(_REBINDS))
     def test_fused_matches_unfused(self, rebind):
