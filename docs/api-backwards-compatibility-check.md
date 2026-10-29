@@ -204,7 +204,16 @@ Bootstrap, teardown and the registry are not deprecated: `initialize_model_paral
   turns `ProcessGroupFallbackWarning` into an error. It does not affect
   `ParallelStateDeprecationWarning`.
 - **Unit tests** set up the global grid on purpose, so `pyproject.toml` ignores
-  `ParallelStateDeprecationWarning` for them. A test that checks the warning uses
+  `ParallelStateDeprecationWarning` when a test calls a deprecated function. When the caller is
+  a module of this repository outside the tests, imported under its package name, such as
+  `megatron.training.*` or `examples.*`, or a top-level script such as `pretrain_gpt`, it turns
+  the warning into an error, so the first test that reaches such a call site fails. Inside
+  `pytest.warns()` or another filter the warning is recorded or ignored instead, and the call
+  site, which warns only once per process, then stays silent for the later tests. A module that
+  a test imports under another name, through `sys.path` or a file location, such as the
+  converters of `tools/checkpoint`, and the `megatron.*` packages of other projects, such as
+  `megatron.energon`, stay ignored; `tests/unit_tests/test_parallel_state_accessor_uses.py`
+  still checks the calls of the former in their source. A test that checks the warning uses
   `pytest.warns(ParallelStateDeprecationWarning)` on a call site that has not warned yet in the
   same process.
 
