@@ -19,7 +19,6 @@ import logging
 import math
 import os
 import sys
-import warnings
 from collections import defaultdict
 from contextlib import nullcontext
 from datetime import datetime, timedelta
@@ -96,7 +95,6 @@ from megatron.core.optimizer_param_scheduler import (
     get_canonical_lr_for_logging,
 )
 from megatron.core.parallel_state import (
-    ParallelStateDeprecationWarning,
     create_all_gather_groups,
     destroy_model_parallel,
     update_pg_timeout,
@@ -162,6 +160,7 @@ from megatron.training.config import FaultInjectorConfig, TrainingConfig
 from megatron.training.config.container import PretrainConfigContainer, update_train_iters
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.initialize import (
+    _registered_pg_collection,
     initialize_megatron,
     set_jit_fusion_options,
     write_args_to_tensorboard,
@@ -1711,8 +1710,8 @@ def pretrain(
     train_state = get_train_state()
     timers = get_timers()
 
-    # initialize_megatron built the global parallel grid; from here on the model and the
-    # training loop take their process groups from this one collection.
+    # initialize_megatron built and registered the global parallel grid; from here on the model
+    # and the training loop take their process groups from this one collection.
     if pg_collection is None:
         pg_collection = _build_pg_collection_from_parallel_state(args)
 
@@ -2553,25 +2552,23 @@ def _forward_backward_grad_context(args):
     return grad_context, forward_only
 
 
-def _build_pg_collection_from_parallel_state(args):
+def _build_pg_collection_from_parallel_state(args, owner="pretrain"):
     """Return the process groups of the global parallel grid as one collection.
 
     pretrain() builds the model and its optimizer and runs the training loop on this collection.
     setup_model_and_optimizer() and get_model() build one, with a ProcessGroupFallbackWarning,
-    when they are called without a collection. The collection carries the Gloo groups the
-    distributed optimizer uses for checkpoint I/O (``intra_dp_cp_gloo`` and
-    ``intra_expt_dp_gloo``), or None for those the job did not create. With
-    ``--create-all-gather-group`` the collection also carries the separate data-parallel
+    when they are called without a collection. Its groups are those registered for the run,
+    ``parallel_state.get_registered_process_groups()``, in a new collection that sets every
+    field; a grid set up without registering a collection is read from the global parallel
+    state, with a deprecated ProcessGroupFallbackWarning that names ``owner``. The collection
+    carries the Gloo groups the distributed optimizer uses for checkpoint I/O
+    (``intra_dp_cp_gloo`` and ``intra_expt_dp_gloo``), or None for those the job did not create.
+    With ``--create-all-gather-group`` the collection also carries the separate data-parallel
     all-gather communicators (``dp_cp_ag``, and ``expt_dp_ag`` with expert parallelism), which
     Megatron-FSDP uses to overlap the parameter all-gather with the gradient reduce-scatter.
     """
     cfg = get_run_config()
-    # Bootstrap read of the registered grid, which does not warn. The registered collection is
-    # not used directly: this function adds groups to the collection it returns, and a
-    # framework may have registered one that leaves fields unset, which this sets to None.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ParallelStateDeprecationWarning)
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    pg_collection = _registered_pg_collection(owner)
 
     if args.create_all_gather_group:
         timeout = (
@@ -2637,7 +2634,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     args.model_type = model_type
     if pg_collection is None:
         warn_global_process_group_fallback("get_model", deprecated_in="0.21", removed_in="0.23")
-        pg_collection = _build_pg_collection_from_parallel_state(args)
+        pg_collection = _build_pg_collection_from_parallel_state(args, owner="get_model")
 
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
@@ -3018,7 +3015,9 @@ def setup_model_and_optimizer(
         )
         # Built once, so that the model and its optimizer run on the same groups, including
         # the all-gather communicators that --create-all-gather-group adds.
-        pg_collection = _build_pg_collection_from_parallel_state(args)
+        pg_collection = _build_pg_collection_from_parallel_state(
+            args, owner="setup_model_and_optimizer"
+        )
 
     # Typically, --skip-train is the only thing needed to disable the optimizer.
     has_normal_optimizer = not cfg.validation.skip_train

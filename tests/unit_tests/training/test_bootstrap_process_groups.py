@@ -1,0 +1,409 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+"""Training bootstrap takes its process groups from the registry, not from the global grid.
+
+pretrain() and initialize_megatron() build their collection from the one that
+initialize_model_parallel() registers, parallel_state.get_registered_process_groups(), instead of
+reading it with ProcessGroupCollection.use_mpu_process_groups(), which 0.23 removes with the
+parallel_state accessors. The collection must be the one that use_mpu_process_groups() returned,
+field by field. These tests compare the two on the standard grid, on collections that a framework
+registers, and on grids set up without the registry, where bootstrap still reads the global grid,
+now with a deprecation warning.
+"""
+
+import dataclasses
+import re
+import warnings
+from contextlib import contextmanager
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import torch
+
+from megatron.core import parallel_state, process_groups_config
+from megatron.core.parallel_state import ParallelStateDeprecationWarning
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    ProcessGroupFallbackWarning,
+    enable_strict_process_group_fallbacks,
+)
+from megatron.training import initialize, training
+from tests.unit_tests.test_utilities import Utils
+
+FIELDS = {field.name for field in dataclasses.fields(ProcessGroupCollection)}
+DATA_PARALLEL_FIELDS = ("dp", "dp_gtp_remat", "dp_cp", "dp_cp_gtp_remat", "intra_dp_cp")
+
+# (id, initialize_model_parallel() arguments, number the world size must be divisible by)
+GRIDS = [
+    ("dp", dict(), 1),
+    ("tp2_pp2", dict(tensor_model_parallel_size=2, pipeline_model_parallel_size=2), 4),
+    (
+        "tp2_pp2_tp_pp_dp_order",
+        dict(tensor_model_parallel_size=2, pipeline_model_parallel_size=2, order="tp-cp-ep-pp-dp"),
+        4,
+    ),
+    (
+        "cp2_ep2_etp1",
+        dict(context_parallel_size=2, expert_model_parallel_size=2, expert_tensor_parallel_size=1),
+        2,
+    ),
+    ("ep4", dict(expert_model_parallel_size=4), 4),
+    (
+        "hierarchical_cp",
+        dict(context_parallel_size=4, hierarchical_context_parallel_sizes=[2, 2]),
+        4,
+    ),
+    ("ep2_dist_opt2", dict(expert_model_parallel_size=2, num_distributed_optimizer_instances=2), 4),
+    ("no_gloo", dict(tensor_model_parallel_size=2, create_gloo_process_groups=False), 2),
+    ("dynamic_cp2", dict(context_parallel_size=2, dynamic_context_parallel=True), 2),
+    (
+        "tp2_dynamic_cp2",
+        dict(tensor_model_parallel_size=2, context_parallel_size=2, dynamic_context_parallel=True),
+        4,
+    ),
+]
+
+
+def _require_divisible(num_ranks):
+    if Utils.world_size % num_ranks != 0:
+        pytest.skip(f"needs a world size divisible by {num_ranks}, got {Utils.world_size}")
+
+
+def _require_no_distributed():
+    if torch.distributed.is_initialized():
+        pytest.skip("registering fake groups would replace the groups of the distributed run")
+
+
+@contextmanager
+def _recorded_warnings():
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        yield record
+
+
+def _of_category(record, category):
+    return [str(warning.message) for warning in record if issubclass(warning.category, category)]
+
+
+def _fallbacks(record):
+    """The (owner, argument) of each ProcessGroupFallbackWarning in ``record``."""
+    return [
+        re.match(r"(.+) was called without `(\w+)`", message).groups()
+        for message in _of_category(record, ProcessGroupFallbackWarning)
+    ]
+
+
+@pytest.fixture
+def fresh_fallback_record(monkeypatch):
+    """Forget which fallbacks warned, so that each test sees its own warnings."""
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+
+
+def _read_with_the_shim():
+    """The collection that bootstrap built before: use_mpu_process_groups() on the global grid."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ParallelStateDeprecationWarning)
+        return ProcessGroupCollection.use_mpu_process_groups()
+
+
+def _assert_same_collection(actual, expected):
+    """Both collections set every field, to the same groups over the same ranks; dict and list
+    fields are compared group by group."""
+    assert type(actual) is type(expected) is ProcessGroupCollection
+    assert set(vars(actual)) == set(vars(expected)) == FIELDS
+    for name in sorted(FIELDS):
+        value, reference = vars(actual)[name], vars(expected)[name]
+        if isinstance(reference, dict):
+            assert isinstance(value, dict) and sorted(value) == sorted(reference), name
+            pairs = [(value[key], group) for key, group in reference.items()]
+        elif isinstance(reference, list):
+            assert isinstance(value, list) and len(value) == len(reference), name
+            pairs = list(zip(value, reference))
+        else:
+            pairs = [(value, reference)]
+        for group, reference_group in pairs:
+            assert group is reference_group, name
+            if isinstance(reference_group, torch.distributed.ProcessGroup):
+                ranks = torch.distributed.get_process_group_ranks(group)
+                assert ranks == torch.distributed.get_process_group_ranks(reference_group), name
+
+
+def _assert_bootstrap_matches_the_shim():
+    registered = parallel_state.get_registered_process_groups()
+    expected = _read_with_the_shim()
+
+    built = initialize._registered_pg_collection("owner")
+
+    _assert_same_collection(built, expected)
+    # A new collection, with new maps: adding a group to it leaves the registered one unchanged.
+    assert built is not registered
+    assert built.dynamic_cp is not registered.dynamic_cp
+    assert built.dynamic_tp_cp is not registered.dynamic_tp_cp
+    registered_fields = dict(vars(registered))
+    built.dp_cp_ag = built.dp_cp
+    assert vars(registered) == registered_fields
+
+
+class _Group:
+    """A stand-in for a process group of a framework's grid; it has a size."""
+
+    def __init__(self, size=2):
+        self._size = size
+
+    def size(self):
+        return self._size
+
+
+def _register(**groups):
+    """Register a framework's collection of stand-in groups, without the grid's extras."""
+    extras = parallel_state.StandardGridExtras(
+        **{field.name: None for field in dataclasses.fields(parallel_state.StandardGridExtras)}
+    )
+    registered = ProcessGroupCollection(**groups)
+    parallel_state.register_process_groups(registered, extras=extras)
+    return registered
+
+
+def _data_parallel_groups():
+    return {name: _Group() for name in DATA_PARALLEL_FIELDS}
+
+
+class TestFrameworkCollection:
+    """A framework registers a collection that may leave fields unset."""
+
+    def setup_method(self, method):
+        _require_no_distributed()
+
+    def teardown_method(self, method):
+        parallel_state.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        "extra_groups",
+        [
+            pytest.param(lambda: {}, id="data_parallel_only"),
+            pytest.param(
+                lambda: dict(tp=_Group(), pp=_Group(), ep=_Group(), hcp=[_Group(), _Group()]),
+                id="model_parallel_and_hierarchical_cp",
+            ),
+            # The all-gather groups have no accessor, so the shim set them to None.
+            pytest.param(
+                lambda: dict(dp_cp_ag=_Group(), expt_dp_ag=_Group()), id="all_gather_groups"
+            ),
+            # With TP1 the runtime CP groups are the TP x runtime-CP groups.
+            pytest.param(
+                lambda: dict(tp=_Group(size=1), dynamic_cp={1: _Group(1), 2: _Group()}),
+                id="dynamic_cp_tp1",
+            ),
+            pytest.param(
+                lambda: dict(
+                    tp=_Group(),
+                    dynamic_cp={1: _Group(1), 2: _Group()},
+                    dynamic_tp_cp={1: _Group(), 2: _Group(4)},
+                ),
+                id="dynamic_cp_tp2",
+            ),
+            pytest.param(
+                lambda: dict(tp=_Group(), dynamic_cp={2: _Group()}), id="dynamic_cp_tp2_no_tp_map"
+            ),
+            pytest.param(lambda: dict(dynamic_tp_cp={2: _Group()}), id="tp_map_without_cp_map"),
+            pytest.param(lambda: dict(dynamic_cp={}, dynamic_tp_cp={}), id="empty_dynamic_maps"),
+        ],
+    )
+    def test_matches_the_shim(self, extra_groups):
+        _register(**_data_parallel_groups(), **extra_groups())
+
+        _assert_bootstrap_matches_the_shim()
+
+    @pytest.mark.parametrize(
+        "groups, missing",
+        [
+            pytest.param(
+                lambda: {**_data_parallel_groups(), "dp_cp": None}, ["dp_cp"], id="no_dp_cp"
+            ),
+            pytest.param(lambda: dict(tp=_Group()), list(DATA_PARALLEL_FIELDS), id="no_dp"),
+            pytest.param(
+                lambda: {**_data_parallel_groups(), "dynamic_cp": {2: _Group()}},
+                ["tp"],
+                id="dynamic_cp_without_tp",
+            ),
+        ],
+    )
+    def test_refuses_what_the_shim_refused(self, groups, missing):
+        """The shim asserted that these groups are set; bootstrap raises a ValueError."""
+        _register(**groups())
+
+        with pytest.raises(AssertionError):
+            _read_with_the_shim()
+        with pytest.raises(ValueError, match=re.escape(str(missing))):
+            initialize._registered_pg_collection("owner")
+
+
+@pytest.mark.usefixtures("fresh_fallback_record")
+class TestUnregisteredGrid:
+    """A grid set up without the registry is read from the global grid, with a warning."""
+
+    def setup_method(self, method):
+        _require_no_distributed()
+
+    @pytest.fixture
+    def unregistered_grid(self, monkeypatch):
+        """Set the global groups that the shim reads, as a framework could, without registering."""
+        groups = {}
+        for name, field in (
+            ("_DATA_PARALLEL_GROUP", "dp"),
+            ("_DATA_PARALLEL_GROUP_WITH_GTP_REMAT", "dp_gtp_remat"),
+            ("_DATA_PARALLEL_GROUP_WITH_CP", "dp_cp"),
+            ("_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT", "dp_cp_gtp_remat"),
+            ("_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP", "intra_dp_cp"),
+            ("_TENSOR_MODEL_PARALLEL_GROUP", "tp"),
+            ("_PIPELINE_MODEL_PARALLEL_GROUP", "pp"),
+        ):
+            groups[field] = _Group()
+            monkeypatch.setattr(parallel_state, name, groups[field])
+        assert parallel_state.get_registered_process_groups() is None
+        return groups
+
+    def test_falls_back_with_a_warning(self, unregistered_grid):
+        expected = _read_with_the_shim()
+
+        with _recorded_warnings() as record:
+            built = initialize._registered_pg_collection("pretrain")
+
+        _assert_same_collection(built, expected)
+        assert built.dp is unregistered_grid["dp"]
+        assert _fallbacks(record) == [("pretrain", "pg_collection")]
+        assert _of_category(record, ParallelStateDeprecationWarning) == []
+
+    def test_raises_under_strict_fallbacks(self, unregistered_grid):
+        with warnings.catch_warnings():
+            enable_strict_process_group_fallbacks()
+            with pytest.raises(ProcessGroupFallbackWarning, match="pretrain was called without"):
+                initialize._registered_pg_collection("pretrain")
+
+    def test_an_uninitialized_grid_fails_after_the_warning_as_before(self):
+        if parallel_state.is_initialized():
+            pytest.skip("a grid is initialized")
+        with pytest.raises(AssertionError, match="data parallel group"):
+            _read_with_the_shim()
+
+        with _recorded_warnings() as record, pytest.raises(AssertionError, match="data parallel"):
+            initialize._registered_pg_collection("pretrain")
+        assert _fallbacks(record) == [("pretrain", "pg_collection")]
+
+    @pytest.mark.parametrize("seed_from", ["grid", "model", "nothing"])
+    def test_initialization_reads_it_only_to_seed_from_it(
+        self, monkeypatch, unregistered_grid, seed_from
+    ):
+        """initialize_megatron() reads the grid only to seed from it: a caller that passes
+        seed_pg_collection, or skips seeding, gets no fallback warning."""
+        parser = ArgumentParser()
+        arguments.add_megatron_arguments(parser)
+        args = parser.parse_args([])
+        cfg = inference_cfg_container_from_args(args, build_model_config=False)
+        monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+        monkeypatch.setattr(initialize, "get_args", lambda: args)
+        for name in (
+            "initialize_runtime_services",
+            "setup_logging",
+            "initialize_rerun_state_machine",
+            "set_default_log_ranks",
+            "print_rank_0",
+        ):
+            monkeypatch.setattr(initialize, name, Mock())
+        seed = Mock()
+        monkeypatch.setattr(initialize, "_set_random_seed", seed)
+        # torch.distributed and the grid are already set up.
+        monkeypatch.setattr(initialize.torch.cuda, "device_count", lambda: 1)
+        monkeypatch.setattr(initialize.torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(initialize.torch.distributed, "get_rank", lambda: 0)
+        monkeypatch.setattr(initialize.torch.distributed, "get_world_size", lambda: 1)
+        model = ProcessGroupCollection()
+
+        with _recorded_warnings() as record:
+            initialize.initialize_megatron(
+                allow_no_cuda=True,
+                skip_dependency_compilation=True,
+                skip_random_seed=seed_from == "nothing",
+                seed_pg_collection=model if seed_from == "model" else None,
+            )
+
+        if seed_from == "nothing":
+            seed.assert_not_called()
+        else:
+            seeded_from = seed.call_args.kwargs["pg_collection"]
+            assert (seeded_from is model) == (seed_from == "model")
+        if seed_from == "grid":
+            assert seeded_from.dp is unregistered_grid["dp"]
+            assert _fallbacks(record) == [("initialize_megatron", "seed_pg_collection")]
+        else:
+            assert _fallbacks(record) == []
+
+
+@pytest.mark.usefixtures("fresh_fallback_record")
+class TestBootstrapReads:
+    """pretrain() and initialize_megatron() read the registry: no shim, no warning."""
+
+    def setup_method(self, method):
+        _require_no_distributed()
+
+    def teardown_method(self, method):
+        parallel_state.destroy_model_parallel()
+
+    @staticmethod
+    def _forbid_the_shim(monkeypatch):
+        def read_global_grid(*args, **kwargs):
+            raise AssertionError("read the global grid with use_mpu_process_groups()")
+
+        monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", read_global_grid)
+
+    @pytest.mark.usefixtures("run_config")
+    def test_pretrain_builds_its_collection_from_the_registry(self, monkeypatch):
+        registered = _register(**_data_parallel_groups(), tp=_Group(), pp=_Group())
+        self._forbid_the_shim(monkeypatch)
+        args = SimpleNamespace(create_all_gather_group=False, expert_model_parallel_size=1)
+
+        with _recorded_warnings() as record:
+            enable_strict_process_group_fallbacks()
+            pg_collection = training._build_pg_collection_from_parallel_state(args)
+
+        assert pg_collection is not registered
+        assert set(vars(pg_collection)) == FIELDS
+        assert all(vars(pg_collection)[name] is group for name, group in vars(registered).items())
+        assert record == []
+
+    @pytest.mark.usefixtures("run_config")
+    def test_initialization_seeds_from_the_registered_grid(self, monkeypatch):
+        registered = _register(**_data_parallel_groups(), tp=_Group(), pp=_Group())
+        self._forbid_the_shim(monkeypatch)
+        monkeypatch.setattr(initialize, "get_args", lambda: SimpleNamespace())
+        monkeypatch.setattr(initialize, "print_rank_0", Mock())
+        monkeypatch.setattr(initialize.torch.cuda, "device_count", lambda: 1)
+        monkeypatch.setattr(initialize.torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(initialize.torch.distributed, "get_rank", lambda: 0)
+        monkeypatch.setattr(initialize.torch.distributed, "get_world_size", lambda: 1)
+
+        with _recorded_warnings() as record:
+            enable_strict_process_group_fallbacks()
+            pg_collection = initialize._initialize_distributed(None, None, None)
+
+        assert set(vars(pg_collection)) == FIELDS
+        assert pg_collection.pp is registered.pp and pg_collection.dp is registered.dp
+        assert pg_collection.ep is None
+        assert record == []
+
+
+@pytest.mark.skipif(Utils.world_size < 2, reason="Requires a distributed run")
+class TestStandardGrid:
+    """On the grid that initialize_model_parallel() builds and registers."""
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("grid", [grid[1:] for grid in GRIDS], ids=[grid[0] for grid in GRIDS])
+    def test_bootstrap_matches_the_shim(self, grid):
+        kwargs, num_ranks = grid
+        _require_divisible(num_ranks)
+        Utils.initialize_model_parallel(**kwargs)
+
+        _assert_bootstrap_matches_the_shim()
