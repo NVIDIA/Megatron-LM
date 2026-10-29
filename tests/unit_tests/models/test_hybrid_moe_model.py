@@ -410,6 +410,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "window_attn_skip_freq": None,
     "window_size": None,
     "fine_grained_activation_offloading": False,
+    "fine_grained_offloading_graph_keep_last_group": False,
     "min_offloaded_tensor_size": 1024 * 1024,
     "offload_modules": [],
     "delay_offload_until_cuda_graph": False,

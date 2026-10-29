@@ -42,6 +42,7 @@ from megatron.core.ssm.ops.gdp import (
     fused_recurrent_gated_delta_rule_update,
 )
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
+from megatron.core.transformer.utils import precision_aware_checkpoint
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 
@@ -652,7 +653,9 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 "cu_seqlens_kv",
                 cp_size=cp_size_runtime,
             )
-            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
+            assert torch.cuda.is_current_stream_capturing() or torch.equal(
+                cu_seqlens_q, cu_seqlens_kv
+            ), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
                 f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
             )
@@ -714,21 +717,9 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                     chunkwise_cp_context,
                 )
 
-            if self.config.fp8 or self.config.fp4:
-                # Import here to avoid a circular dependency.
-                from megatron.core.extensions.transformer_engine import te_checkpoint
-
-                out, out_bias = te_checkpoint(
-                    _checkpointed_compute,
-                    False,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    self.pg_collection.tp,
-                    hidden_states,
-                )
-            else:
-                out, out_bias = tensor_parallel.checkpoint(
-                    _checkpointed_compute, False, hidden_states
-                )
+            out, out_bias = precision_aware_checkpoint(
+                _checkpointed_compute, self.config, self.pg_collection.tp, hidden_states
+            )
         else:
             out, out_bias = self._forward_compute(
                 hidden_states,
