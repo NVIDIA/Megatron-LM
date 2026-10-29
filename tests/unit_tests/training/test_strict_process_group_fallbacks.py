@@ -9,9 +9,10 @@ from unittest.mock import Mock
 
 import pytest
 
-from megatron.core import process_groups_config
+from megatron.core import parallel_state, process_groups_config
 from megatron.core.process_groups_config import (
     ProcessGroupFallbackWarning,
+    resolve_process_groups,
     warn_global_process_group_fallback,
 )
 from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
@@ -120,3 +121,34 @@ def test_fallback_during_distributed_initialization_raises_under_the_flag(
     assert len(_fallbacks(record)) == (0 if strict else 1)
     # Only without the flag does initialization go on past the fallback.
     assert initialize._set_random_seed.call_count == (0 if strict else 1)
+
+
+@pytest.mark.parametrize("strict", [False, True], ids=["default", "strict"])
+def test_fallback_without_global_grid_raises_under_the_flag(
+    monkeypatch, initialize_without_services, strict
+):
+    """Without a grid the fallback's groups are None, which torch.distributed reads as WORLD."""
+    args = _parse_args(strict)
+    args.rank = 0
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
+    monkeypatch.setattr(initialize, "setup_logging", Mock())
+    for name in (
+        "_TENSOR_MODEL_PARALLEL_GROUP",
+        "_PIPELINE_MODEL_PARALLEL_GROUP",
+        "_DATA_PARALLEL_GROUP",
+    ):
+        monkeypatch.setattr(parallel_state, name, None)
+
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("default", ProcessGroupFallbackWarning)
+        initialize.initialize_megatron(allow_no_cuda=True, skip_mpu_initialization=True)
+        assert not parallel_state.model_parallel_is_initialized()
+        if strict:
+            with pytest.raises(ProcessGroupFallbackWarning, match="groups it returns are None"):
+                resolve_process_groups(None, owner="Owner", required=("tp",))
+        else:
+            assert vars(resolve_process_groups(None, owner="Owner", required=("tp",))) == {
+                "tp": None
+            }
+
+    assert len(_fallbacks(record)) == (0 if strict else 1)

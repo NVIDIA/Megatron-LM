@@ -28,8 +28,9 @@ _FALLBACK_WARNING_SKIP_PREFIXES = (
     os.path.dirname(torch.__file__) + os.sep,
 )
 
-# (owner, argument) pairs that have already warned in this process.
-_warned_global_process_group_fallbacks: Set[Tuple[str, str]] = set()
+# Fallbacks that have already warned in this process: (owner, argument) for a fallback to the
+# global grid, and (owner, argument, "uninitialized") for one that found the grid uninitialized.
+_warned_global_process_group_fallbacks: Set[Tuple[str, ...]] = set()
 
 
 class ProcessGroupFallbackWarning(FutureWarning):
@@ -74,14 +75,28 @@ def warn_global_process_group_fallback(
         removed_in: Megatron Core release that removes this fallback. Under the N+2 policy, a
             fallback that starts to warn after 0.21 passes both versions.
     """
-    key = (owner, argument)
+    _warn_fallback_once(
+        (owner, argument),
+        f"{owner} was called without `{argument}` and falls back to the global process groups "
+        "in megatron.core.parallel_state.",
+        deprecated_in=deprecated_in,
+        removed_in=removed_in,
+    )
+
+
+def _warn_fallback_once(
+    key: Tuple[str, ...], fallback: str, *, deprecated_in: str, removed_in: str
+) -> None:
+    """Emit a ``ProcessGroupFallbackWarning`` that describes ``fallback``, once per ``key``.
+
+    A warning that a filter turns into an error is not recorded, so under an ``error`` filter
+    every fallback raises.
+    """
     if key in _warned_global_process_group_fallbacks:
         return
     warnings.warn(
-        f"{owner} was called without `{argument}` and falls back to the global process groups "
-        "in megatron.core.parallel_state. This fallback is deprecated since Megatron Core "
-        f"{deprecated_in} and will be removed in {removed_in}; pass the "
-        "owning model's process groups explicitly.",
+        f"{fallback} This fallback is deprecated since Megatron Core {deprecated_in} and will be "
+        f"removed in {removed_in}; pass the owning model's process groups explicitly.",
         ProcessGroupFallbackWarning,
         skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES,
     )
@@ -1066,6 +1081,14 @@ def resolve_process_groups(
     fields from ``megatron.core.parallel_state``. In both cases ``require_process_groups`` then
     checks that every field in ``required`` is set.
 
+    If ``parallel_state`` is not initialized, the collection holds what its accessors return
+    without a grid: None for most groups, which ``torch.distributed`` treats as the default
+    (WORLD) group. The warning then names those groups. It is recorded apart from the warning for
+    an initialized grid, so a process that reaches both hears about both. An accessor that needs
+    an initialized grid, such as the one for ``dp``, raises instead. On an initialized grid the
+    warning comes before any group is read, so strict mode
+    (``enable_strict_process_group_fallbacks``) raises without reading the grid.
+
     ``tools/check_process_group_usage.py`` counts each call in ``megatron/core`` as a guarded
     read of the global grid.
 
@@ -1079,11 +1102,54 @@ def resolve_process_groups(
 
     Returns:
         ``pg_collection`` itself, or the collection built from the global groups.
+
+    Raises:
+        ValueError: A field in ``required`` is absent (see ``require_process_groups``).
+        AssertionError: ``pg_collection`` is None, ``parallel_state`` is not initialized, and
+            the accessor of a field in ``required`` needs an initialized grid, such as the one
+            for ``dp``.
     """
     if pg_collection is None:
+        grid_initialized = parallel_state.model_parallel_is_initialized()
+        if grid_initialized:
+            # Warn before reading any group, so that strict mode raises without reading the grid.
+            warn_global_process_group_fallback(
+                owner, argument, deprecated_in=deprecated_in, removed_in=removed_in
+            )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=list(required))
+        if not grid_initialized:
+            # Without a grid the accessors return None for most groups; the warning names them.
+            _warn_fallback_to_uninitialized_grid(
+                pg_collection, owner, argument, deprecated_in=deprecated_in, removed_in=removed_in
+            )
+    require_process_groups(pg_collection, required, owner=owner)
+    return pg_collection
+
+
+def _warn_fallback_to_uninitialized_grid(
+    pg_collection: ProcessGroupCollection,
+    owner: str,
+    argument: str,
+    *,
+    deprecated_in: str,
+    removed_in: str,
+) -> None:
+    """Warn that ``owner`` fell back to an uninitialized grid, naming the groups that are None.
+
+    ``pg_collection`` is the collection built from that grid.
+    """
+    none_groups = [name for name, group in vars(pg_collection).items() if group is None]
+    if not none_groups:
         warn_global_process_group_fallback(
             owner, argument, deprecated_in=deprecated_in, removed_in=removed_in
         )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=list(required))
-    require_process_groups(pg_collection, required, owner=owner)
-    return pg_collection
+        return
+    _warn_fallback_once(
+        (owner, argument, "uninitialized"),
+        f"{owner} was called without `{argument}` and falls back to the global process groups "
+        "in megatron.core.parallel_state, which is not initialized, so the "
+        f"{', '.join(none_groups)} groups it returns are None. torch.distributed treats a None "
+        "group as the default (WORLD) group, which spans every rank.",
+        deprecated_in=deprecated_in,
+        removed_in=removed_in,
+    )

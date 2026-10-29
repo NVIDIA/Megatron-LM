@@ -205,6 +205,7 @@ def _forbid_global_collection(monkeypatch):
         raise AssertionError("resolve_process_groups read the global grid")
 
     monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", forbid)
+    monkeypatch.setattr(parallel_state, "model_parallel_is_initialized", forbid)
 
 
 def test_resolve_returns_an_explicit_collection_without_warning(monkeypatch):
@@ -225,14 +226,112 @@ def test_resolve_requires_every_field_of_an_explicit_collection(monkeypatch):
         )
 
 
-def test_resolve_in_strict_mode_raises_before_reading_the_global_grid(monkeypatch):
-    _forbid_global_collection(monkeypatch)
+def test_resolve_in_strict_mode_raises_before_reading_an_initialized_grid(monkeypatch):
+    monkeypatch.setattr(parallel_state, "model_parallel_is_initialized", lambda: True)
+
+    def forbid(*args, **kwargs):
+        raise AssertionError("resolve_process_groups read the global grid")
+
+    monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", forbid)
     with warnings.catch_warnings():
         warnings.simplefilter("error", ProcessGroupFallbackWarning)
         with pytest.raises(
             ProcessGroupFallbackWarning, match="Owner was called without `tp_group`"
         ):
             resolve_process_groups(None, owner="Owner", required=("tp",), argument="tp_group")
+
+
+@pytest.fixture
+def uninitialized_grid(monkeypatch):
+    """parallel_state without a grid, as before initialize_model_parallel."""
+    for name in (
+        "_TENSOR_MODEL_PARALLEL_GROUP",
+        "_PIPELINE_MODEL_PARALLEL_GROUP",
+        "_DATA_PARALLEL_GROUP",
+        "_CONTEXT_PARALLEL_GROUP",
+    ):
+        monkeypatch.setattr(parallel_state, name, None)
+    assert not parallel_state.model_parallel_is_initialized()
+
+
+UNINITIALIZED = "megatron.core.parallel_state, which is not initialized"
+WORLD = "torch.distributed treats a None group as the default (WORLD) group"
+
+
+def test_resolve_without_collection_or_global_grid_warns_and_returns_none_groups(
+    uninitialized_grid,
+):
+    with pytest.warns(ProcessGroupFallbackWarning) as record:
+        resolved = resolve_process_groups(
+            None,
+            owner="Owner",
+            required=("tp", "cp"),
+            argument="tp_group",
+            deprecated_in="0.22",
+            removed_in="0.24",
+        )
+    # The groups the global accessors return without a grid, which torch.distributed reads as
+    # WORLD; the warning says so.
+    assert vars(resolved) == {"tp": None, "cp": None}
+    message = str(_fallback_warning(record, "Owner", "tp_group").message)
+    assert f"{UNINITIALIZED}, so the tp, cp groups it returns are None. {WORLD}" in message
+    assert "deprecated since Megatron Core 0.22 and will be removed in 0.24" in message
+
+
+def test_resolve_without_global_grid_names_only_the_groups_that_are_none(
+    uninitialized_grid, monkeypatch
+):
+    # parallel_state has a tensor-parallel group but no pipeline- or data-parallel group.
+    tp_group = object()
+    monkeypatch.setattr(parallel_state, "_TENSOR_MODEL_PARALLEL_GROUP", tp_group)
+    with pytest.warns(ProcessGroupFallbackWarning) as record:
+        resolved = resolve_process_groups(None, owner="Owner", required=("tp", "cp"))
+        resolved_tp = resolve_process_groups(None, owner="TPOnly", required=("tp",))
+    assert vars(resolved) == {"tp": tp_group, "cp": None}
+    message = str(_fallback_warning(record, "Owner").message)
+    assert f"{UNINITIALIZED}, so the cp groups it returns are None. {WORLD}" in message
+    # No group is None, so the warning is the one for the global grid.
+    assert vars(resolved_tp) == {"tp": tp_group}
+    assert UNINITIALIZED not in str(_fallback_warning(record, "TPOnly").message)
+
+
+def test_resolve_without_global_grid_raises_where_the_accessor_needs_a_grid(uninitialized_grid):
+    # get_data_parallel_group asserts without a grid, so no None dp group reaches torch.distributed.
+    with pytest.raises(AssertionError, match="data parallel group is not initialized"):
+        resolve_process_groups(None, owner="Owner", required=("tp", "dp"))
+
+
+def test_fallbacks_with_and_without_global_grid_warn_once_each(uninitialized_grid, monkeypatch):
+    with pytest.warns(ProcessGroupFallbackWarning) as record:
+        for _ in range(2):
+            resolve_process_groups(None, owner="Owner", required=("tp",))
+    assert UNINITIALIZED in str(_fallback_warning(record, "Owner").message)
+
+    # Once the grid is initialized, the same owner warns again, about the global groups.
+    global_groups = ProcessGroupCollection(tp=object())
+    monkeypatch.setattr(parallel_state, "model_parallel_is_initialized", lambda: True)
+    monkeypatch.setattr(
+        ProcessGroupCollection, "use_mpu_process_groups", lambda required_pgs: global_groups
+    )
+    with pytest.warns(ProcessGroupFallbackWarning) as record:
+        for _ in range(2):
+            assert resolve_process_groups(None, owner="Owner", required=("tp",)) is global_groups
+    assert UNINITIALIZED not in str(_fallback_warning(record, "Owner").message)
+
+
+def test_enable_strict_mode_raises_on_fallback_without_global_grid(uninitialized_grid):
+    with warnings.catch_warnings():
+        enable_strict_process_group_fallbacks()
+        with pytest.raises(ProcessGroupFallbackWarning, match=r"groups it returns are None"):
+            resolve_process_groups(None, owner="Owner", required=("tp",), argument="tp_group")
+
+
+@pytest.mark.filterwarnings(
+    "error::megatron.core.process_groups_config.ProcessGroupFallbackWarning"
+)
+def test_pytest_error_filter_raises_on_fallback_without_global_grid(uninitialized_grid):
+    with pytest.raises(ProcessGroupFallbackWarning, match=r"groups it returns are None"):
+        resolve_process_groups(None, owner="Owner", required=("tp",), argument="tp_group")
 
 
 def test_mtp_placement_without_mtp_layers_needs_no_pp_group():
