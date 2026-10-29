@@ -284,9 +284,9 @@ class FsdpModule:
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
 
-        # Unless SchedulePolicy.unshard_all_planes_in_backward is set, recomputation gathers
-        # sharded MXFP8 rowwise planes on demand here, because backward unshards gather
-        # only their columnwise planes. Other dtype weights are already unsharded for backward.
+        # TODO: Recomputation gathers sharded MXFP8 rowwise planes on demand here, because
+        # backward prefetch gathers only columnwise planes. Recording recomputation in the
+        # backward prefetch order would let the preceding module prefetch them.
         self.unshard(Phase.FORWARD, prefetch=not is_recomputing)
 
     def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
@@ -361,9 +361,9 @@ class FsdpModule:
             raise ValueError(
                 f"Unsharding requires a FORWARD, BACKWARD, or None phase, got {phase!r}."
             )
-        # Backward recomputation reads MXFP8 rowwise planes, so gather them together with
-        # columnwise ones. This covers both this module's own pre_backward unshard and
-        # the preceding module's prefetch of it. Other dtype weights serve both phases already.
+        # Recomputation that does not re-enter this module's pre_forward reads MXFP8 rowwise
+        # planes in backward, so gather them together with columnwise ones. Other dtype
+        # weights serve both phases already.
         if phase is Phase.BACKWARD and self._schedule_policy.unshard_all_planes_in_backward:
             phase = None
         with torch.cuda.stream(self.context.allgather_stream):
@@ -374,13 +374,7 @@ class FsdpModule:
         """Return parameters to their sharded resting state after forward compute."""
         is_recomputing = self.phase is Phase.BACKWARD or _is_in_backward()
         if is_recomputing:
-            # After recomputation, backward compute reads only MXFP8 columnwise planes.
-            # - By default, release the MXFP8 rowwise planes that recomputation gathered on
-            #   demand. Other dtype weights are kept for backward.
-            # - With unshard_all_planes_in_backward, rowwise planes belong to the backward unshard
-            #   and are kept until post_backward, like columnwise planes.
-            if not self._schedule_policy.unshard_all_planes_in_backward:
-                self._release_unsharded_storage(rowwise_only=True)
+            self._release_unsharded_storage(rowwise_only=True)
         else:
             self.reshard()
         if self.phase is Phase.FORWARD:
