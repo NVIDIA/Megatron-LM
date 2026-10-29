@@ -190,9 +190,11 @@ with a `pg_collection`; without one, it falls back to the global grid with a
   (`.github/workflows/process-group-usage-check.yml`) runs on pull requests and in the merge
   queue. Its job fails when the tests of the checker,
   `tests/unit_tests/test_check_process_group_usage.py`, fail; they also check that each call in
-  the allowlist is warned or guarded, apart from two that the test lists, and that the checker
-  counts every helper of `process_groups_config.py` that reads the grid. It also fails when
-  `tests/unit_tests/test_removal_versions.py` fails (see *Removal*). The job then runs
+  the allowlist, and each read that the checker counts in Megatron Core's code, is warned or
+  guarded, apart from those the test lists (none now), and that the checker counts every helper of
+  `process_groups_config.py` that reads the grid. A new unwarned read in Megatron Core therefore
+  fails the job. It also fails when `tests/unit_tests/test_removal_versions.py` fails (see
+  *Removal*). The job then runs
   `tools/check_process_group_usage.py` and `tests/unit_tests/test_parallel_state_accessor_uses.py`
   as report-only steps (`continue-on-error`): a new call in Megatron Core, a call that lost its
   warning, or a deprecated call outside Megatron Core is listed in the step's log, and the job

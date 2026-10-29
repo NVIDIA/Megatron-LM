@@ -15,6 +15,7 @@ import pathlib
 import tempfile
 import threading
 import unittest
+from collections import Counter
 from unittest import mock
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -1304,6 +1305,68 @@ class TestAllowlist(unittest.TestCase):
             unwarned,
             UNWARNED_READS,
             "Allowlisted reads that no fallback warning dominates:\n" + "\n".join(locations),
+        )
+
+
+def _unexpected_unwarned_reads(found, expected):
+    """Compare the unwarned reads of ``found`` with ``expected``, both ``{path: [entry, ...]}``.
+
+    Returns ``(new, stale)``: the locations of the unwarned reads beyond ``expected``, and the
+    entries of ``expected`` that are no longer unwarned reads, such as those of a moved file.
+    """
+    new, stale = [], []
+    for rel in sorted(set(found) | set(expected)):
+        unwarned = [
+            hit
+            for hit in found.get(rel, [])
+            if checker._kind(hit) != checker.GUARDED and not hit.endswith(checker.WARNED)
+        ]
+        extra = Counter(unwarned) - Counter(expected.get(rel, []))
+        if extra:
+            # Only a file that the scan found has an extra read, so the file exists.
+            new.extend(
+                f"  {rel}:{lineno}  {identity}"
+                for lineno, identity in checker._violations_in(REPO_ROOT / rel)
+                if extra[identity]
+            )
+        stale.extend(
+            f"  {rel}  {hit}"
+            for hit in (Counter(expected.get(rel, [])) - Counter(unwarned)).elements()
+        )
+    return new, stale
+
+
+class TestTree(unittest.TestCase):
+    """Megatron Core reads the global grid only in a warned or guarded fallback.
+
+    The ratchet is report-only in CI until #6307 decides whether new fallbacks may be added, and
+    calls from Megatron Core do not emit ParallelStateDeprecationWarning. This test classifies the
+    reads in the tree itself, allowlisted or not: one that no fallback warning dominates fails,
+    apart from UNWARNED_READS. It leaves the number of warned and guarded reads to the ratchet.
+    """
+
+    def test_an_entry_of_a_moved_file_is_stale(self):
+        hit = "f:accessor:parallel_state.get_tensor_model_parallel_group"
+        self.assertEqual(
+            _unexpected_unwarned_reads({}, {"megatron/core/moved.py": [hit]}),
+            ([], [f"  megatron/core/moved.py  {hit}"]),
+        )
+
+    def test_reads_in_megatron_core_are_warned_or_guarded(self):
+        new, stale = _unexpected_unwarned_reads(checker.scan(), UNWARNED_READS)
+        self.assertFalse(
+            new,
+            "Reads of the global grid in megatron/core that no fallback warning precedes:\n"
+            + "\n".join(new)
+            + "\nTake the group from the caller. A compatibility fallback for a caller that "
+            "omits it calls warn_global_process_group_fallback() first, in the same block or one "
+            "that contains it, or reads in a `with global_process_group_fallback(...)` block; "
+            "private parallel_state state is never read.",
+        )
+        self.assertFalse(
+            stale,
+            "UNWARNED_READS lists reads that are now warned or gone; remove them:\n"
+            + "\n".join(stale),
         )
 
 
