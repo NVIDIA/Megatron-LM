@@ -46,6 +46,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     micro_batch_size = (
         cfg.validation.eval_micro_batch_size if is_eval else cfg.train.micro_batch_size
     )
+
     if split == Split.valid and cfg.validation.full_validation:
         batch_sampler = MegatronFullValidationSampler(
             total_samples=len(dataset),
@@ -95,11 +96,11 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             DistributedSignalHandler(cfg.train.exit_signal).__enter__()
 
     maybe_worker_init_fn = worker_init_fn if args.num_workers > 0 else None
-    # Identity collate for VarlenDataset and packing-scheduler paths;
-    # they emit one variable-length dict per sample, not stack-able by
-    # the default collate. --varlen-sbhd-validation is excluded: it bypasses
-    # packing and emits fixed-length [seq_length] samples that the default
-    # collate stacks normally.
+    # Identity collate for VarlenDataset and packing-scheduler paths; they emit
+    # one variable-length dict per sample, not stack-able by the default
+    # collate. --varlen-sbhd-validation is excluded: it bypasses packing and
+    # emits fixed-length [seq_length] samples that the default collate stacks
+    # normally.
     if (
         (args.use_varlen_dataset and not args.varlen_sbhd_validation)
         or args.dynamic_context_parallel

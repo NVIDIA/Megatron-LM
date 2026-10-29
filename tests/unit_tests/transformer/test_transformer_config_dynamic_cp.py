@@ -29,6 +29,20 @@ def _make_config(**overrides):
         )
     if variant == "dsa":
         kwargs.update(add_bias_linear=False, dsa_kernel_backend="none")
+    if overrides.get("dynamic_context_parallel"):
+        # NOTE(nightly-sync 26_10_2026): main's DCP V2 (ea99fdfce) added a new invariant to
+        # TransformerConfig.__post_init__ -- `assert self.calculate_per_token_loss,
+        # "Dynamic context parallelism must be used with calculate_per_token_loss"` -- because
+        # a loss normalized by a static token count is wrong once the CP group size varies per
+        # microbatch. It is a genuine main correctness guard (main-only, pinned by main's own
+        # test_transformer_config.py::test_dynamic_cp_rejects_unsupported_config[overrides2]),
+        # not main lacking a dev feature, so adopt it and satisfy it in dev's configs. The
+        # fixture above already sets this flag explicitly; tests that call _make_config
+        # directly with dynamic CP (test_head_divisibility_uses_configured_cp) did not, and
+        # tripped the new assertion before reaching the behaviour they pin. Set as a default
+        # rather than forced, so an explicit override still wins and main's guard stays
+        # testable.
+        kwargs.setdefault("calculate_per_token_loss", True)
     kwargs.update(overrides)
     config_type = (
         MLATransformerConfig
@@ -44,7 +58,16 @@ def _make_config(**overrides):
             dict(context_parallel_size=2, sequence_packing_scheduler="dp_balanced"), id="static-cp2"
         ),
         pytest.param(
-            dict(context_parallel_size=1, dynamic_context_parallel=True), id="dynamic-cp1"
+            dict(
+                context_parallel_size=1,
+                dynamic_context_parallel=True,
+                # Required by TransformerConfig whenever dynamic_context_parallel is set:
+                # loss scaling cannot use the static TP x CP group once CP groups are
+                # picked per microbatch. These tests only assert CP-layout compatibility,
+                # so the flag is incidental to what they cover.
+                calculate_per_token_loss=True,
+            ),
+            id="dynamic-cp1",
         ),
     ]
 )
