@@ -53,6 +53,7 @@ def save_training_checkpoint(
     if path is None:
         raise ValueError("checkpoint path is required")
     step = int(step)
+    sync_params_before_read(model)
     if use_dcp is None:
         use_dcp = True
     if not use_dcp:
@@ -180,6 +181,15 @@ def _resolve_step_checkpoint_path(path: str) -> str:
     if step_dirs:
         return os.path.join(path, step_dirs[-1])
     return path
+
+
+def sync_params_before_read(model: nn.Module | Iterable[nn.Module]) -> None:
+    """Finish the DDP param all-gather that overlap_param_gather defers to the next forward."""
+    chunks = list(model) if isinstance(model, nn.ModuleList) else _model_chunks(model)
+    for chunk in chunks:
+        ddp_config = getattr(chunk, "ddp_config", None)
+        if getattr(ddp_config, "overlap_param_gather", False):
+            chunk.start_param_sync(force_sync=True)
 
 
 def _supports_dist_opt_distckpt(model: nn.Module | Iterable[nn.Module], optimizer) -> bool:

@@ -74,9 +74,10 @@ storage, credentials, or a particular scheduler.
 | 4 homogeneous SM100 GPUs (GB200 reference) | Runs only tests whose minimum architecture is Blackwell |
 | Anything else, including mixed capabilities | Reports unsupported hardware and exits 2 |
 
-No Blackwell-only tests are registered yet, so the default GB200 run reports
-NOT_RUN and exits 3. When an explicit subset is requested on Blackwell, Hopper
-tests are allowed because Blackwell satisfies their minimum architecture.
+The only Blackwell-only tests are the optional MiniMax-M3 Magi suites, so the
+default GB200 run reports NOT_RUN and exits 3. When an explicit subset is
+requested on Blackwell, Hopper tests are allowed because Blackwell satisfies
+their minimum architecture.
 
 ## Discovery and Layout
 
@@ -163,3 +164,10 @@ The operator-level numerical test
 (`smoke/model/test_magi_attention_e2e.py`) require a real MagiAttention
 build; they are marked `optional` and run through their dedicated venv-based
 runner. See `../docs/magi_attention.md` and `run_magi_attention_e2e.sh`.
+
+The MiniMax-M3 Magi suites (`unit/primitive/modules/attention/test_msa_magi_unit.py`,
+`smoke/model/minimax_m3/lite/test_minimax_m3_magi_parallel_smoke.py`,
+`smoke/model/minimax_m3/lite/test_minimax_m3_train_curve_smoke.py`) additionally
+need the MagiAttention MSA extension and `msa_v1` on Blackwell. The MiniMax-M3
+Hugging Face parity tests need a `transformers` release that ships
+`minimax_m3_vl`. Both groups are marked `optional` for that reason.

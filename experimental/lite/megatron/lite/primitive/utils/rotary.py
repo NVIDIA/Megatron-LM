@@ -96,6 +96,24 @@ class RotaryEmbedding(nn.Module):
             )
         return emb[:, None, None, :]
 
+    def get_emb_for_positions(self, position_ids: Tensor) -> Tensor:
+        """``[T, 1, 1, rot]`` rotary table for arbitrary per-token positions (no CP zigzag slicing).
+
+        Used by the ``magi`` MSA backend whose token layout is a load-balanced dispatch rather than a
+        zigzag shard; ``position_ids`` are the (doc-local) positions of this rank's tokens.
+        """
+        if self.inv_freq.device.type == "cpu" and torch.cuda.is_available():
+            self.inv_freq = self.inv_freq.to(device=torch.cuda.current_device())
+        seq = position_ids.to(device=self.inv_freq.device, dtype=self.inv_freq.dtype).reshape(-1)
+        if self.seq_len_interpolation_factor is not None:
+            seq = seq * (1 / self.seq_len_interpolation_factor)
+        freqs = torch.outer(seq, self.inv_freq)
+        if not self.rotary_interleaved:
+            emb = torch.cat((freqs, freqs), dim=-1)
+        else:
+            emb = torch.stack((freqs.view(-1, 1), freqs.view(-1, 1)), dim=-1).view(freqs.shape[0], -1)
+        return emb[:, None, None, :]
+
     @lru_cache(maxsize=32)
     def forward(
         self,
