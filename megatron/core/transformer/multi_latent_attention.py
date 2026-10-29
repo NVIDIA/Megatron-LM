@@ -1117,13 +1117,17 @@ class MLASelfAttention(MultiLatentAttention):
                 # q: [num_tokens, n, q_head_dim]
                 q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
 
-            # With cached latents, prepare_for_absorption has replaced linear_kv_up_proj by its
-            # linear part; kv_layernorm above applied the norm.
-            kv_up_proj = (
-                self.linear_kv_up_proj_linear if self.cache_mla_latents else self.linear_kv_up_proj
-            )
-            # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
-            kv, _ = kv_up_proj(_up_proj_input(kv_up_proj, kv_compressed))
+            if self.cache_mla_latents:
+                # Cached-latent mode keeps kv_compressed whole on every TP rank, and
+                # prepare_for_absorption has replaced linear_kv_up_proj (a fused KV norm is now
+                # kv_layernorm above).
+                # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
+                kv = self.up_project_whole_latents(kv_compressed)
+            else:
+                # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
+                kv, _ = self.linear_kv_up_proj(
+                    _up_proj_input(self.linear_kv_up_proj, kv_compressed)
+                )
 
             # kv: [num_tokens, n, (qk_head_dim + v_head_dim)]
             kv = kv.view(

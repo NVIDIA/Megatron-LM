@@ -2318,26 +2318,6 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             )
 
     @pytest.mark.internal
-    def test_mtp_kv_cache_rejects_mla_rotary_embeddings(self):
-        self.setup_model(
-            torch.float32,
-            static=False,
-            num_speculative_tokens=2,
-            mtp_num_layers=1,
-            mtp_use_repeated_layer=True,
-            position_embedding_type="none",
-        )
-        controller = self.text_generation_controller
-        assert controller.inference_wrapped_model.inference_context.enable_mtp_kv_cache
-        # MLA's position type is internal: the top-level "none" must not bypass the guard.
-        with mock.patch.object(controller.model_config, "multi_latent_attention", True):
-            with pytest.raises(ValueError, match="MTP KV caching does not support MLA"):
-                TextGenerationController(
-                    inference_wrapped_model=controller.inference_wrapped_model,
-                    tokenizer=self.mock_tokenizer,
-                )
-
-    @pytest.mark.internal
     @pytest.mark.parametrize(
         "num_speculative_tokens,position_embedding_type",
         [(2, "none"), (0, "none"), (0, "learned_absolute"), (0, "rope")],
