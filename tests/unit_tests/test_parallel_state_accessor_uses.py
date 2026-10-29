@@ -16,9 +16,9 @@ module-level code). A warning inside an earlier branch, loop or ``with``, or ins
 block runs later, outside it, and is not allowed. A read, write or deletion of a private
 (``_``-prefixed) attribute of parallel_state is never allowed; the deprecated
 ``_set_global_memory_buffer()`` counts as a deprecated function instead. Megatron Core is exempt
-at run time and is checked by tools/check_process_group_usage.py instead; tests use the global
-grid on purpose. Files listed in UNIMPORTABLE_FILES, which import a module that does not exist
-and so cannot run, are skipped.
+at run time and is checked by tools/check_process_group_usage.py instead; unit tests use the
+global grid on purpose. Files listed in UNIMPORTABLE_FILES, which import a module that does not
+exist and so cannot run, are skipped.
 
 Stdlib only. Run directly with ``python tests/unit_tests/test_parallel_state_accessor_uses.py`` to
 avoid the GPU fixtures used when pytest collects the enclosing unit-test package.
