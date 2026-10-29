@@ -59,8 +59,12 @@ their communicators, such as `create_group()`, `create_all_gather_groups()` and
 - Calls in the block of `global_process_group_fallback()` do not warn: that block has already
   emitted a `ProcessGroupFallbackWarning` for the fallback they belong to.
 - Calls that `torch.compile` traces do not warn, so they do not break the graph.
-- The test suite ignores the warning through `filterwarnings` in `pyproject.toml`, because tests
-  set up and read the global grid on purpose.
+- The test suite ignores the warning through `filterwarnings` in `pyproject.toml` when a test
+  calls a deprecated function, because tests set up and read the global grid on purpose. When the
+  caller is a module of this repository outside the tests, such as `megatron.training.*` or
+  `pretrain_gpt`, the warning is an error instead, so the first test that reaches such a call
+  fails. [API backward compatibility checking](../api-backwards-compatibility-check.md)
+  describes the modules that the filter matches.
 
 ## Select the matching group
 
@@ -438,14 +442,23 @@ Two checks report new reads of the global grid. CI runs both.
   `accessor`), and the stage predicates, virtual-pipeline state, rank and size overrides,
   dynamic context-parallel group maps, `get_all_ranks()` and memory-buffer aliases (kind
   `function`);
-- `ProcessGroupCollection.use_mpu_process_groups()` (kind `shim`);
-- `resolve_process_groups()`, the warned fallback (kind `guarded`).
+- `ProcessGroupCollection.use_mpu_process_groups()`, and
+  `parallel_state.get_registered_process_groups()`, which is not deprecated but returns the same
+  global groups (kind `shim`);
+- the helpers of `process_groups_config.py` that read the grid when the caller omits its groups
+  and warn for that fallback: `resolve_process_groups()`, `resolve_gtp_remat_group()`,
+  `ProcessGroupCollection.setup_process_groups_for_ddp()` and
+  `setup_process_groups_for_optimizer()` (kind `guarded`).
 
 `tools/process_group_usage_allowlist.json` records the existing calls. An entry records the
 file, the enclosing function or class, and the function called, but not the line number, so code
 can move within its function without changing the allowlist. Each call has its own entry: a second
-identical call in the same function is a new read. The checker exits with an error when it finds
-a call that the allowlist does not hold, or an entry whose call is gone.
+identical call in the same function is a new read. An accessor, function or shim entry ends
+with `:warned` when a fallback warning precedes the call: a `warn_global_process_group_fallback()`
+call earlier in the same function, in its block or in a block that contains it, or a
+`with global_process_group_fallback(...)` block around it. The checker exits with an error when it
+finds a call that the allowlist does not hold, a warned call that lost its warning, or an entry
+whose call is gone.
 
 The check is syntactic. It follows calls made through `parallel_state`, `mpu`, an
 `import ... as` alias, or a direct `from megatron.core.parallel_state import ...`, but not
@@ -453,10 +466,17 @@ through an assigned alias (`grid = parallel_state`) or a dynamic lookup
 (`getattr(parallel_state, name)`). Reviewers still look for reads it cannot see.
 
 `tests/unit_tests/test_parallel_state_accessor_uses.py` guards the code outside Megatron Core:
-the non-test code under `megatron/`, `examples/`, `tools/` and `tasks/`. It allows a call of a
-deprecated function or of `use_mpu_process_groups()` only in a
-`global_process_group_fallback()` block or in a bootstrap block that ignores
-`ParallelStateDeprecationWarning`.
+the non-test code under `megatron/`, `examples/`, `tools/`, `tasks/`, `scripts/` and `docs/`, and
+the top-level scripts. It allows a call of a deprecated function or of `use_mpu_process_groups()`
+only in a `global_process_group_fallback()` block or in a bootstrap block that ignores
+`ParallelStateDeprecationWarning`. It also follows the module through assigned aliases,
+`getattr()` with a constant name, `importlib.import_module()` and `sys.modules`.
+
+In CI, the *Process group usage check* workflow runs the checker and the guard as report-only
+steps: what they find is listed in the step's log, and the job still passes. The job fails when
+the checker's own tests fail, or when `tests/unit_tests/test_removal_versions.py` finds code that
+announces a removal the package version has reached (see [Removal schedule](#removal-schedule)).
+[API backward compatibility checking](../api-backwards-compatibility-check.md) describes the job.
 
 ### When the check reports a new read
 
@@ -465,8 +485,8 @@ function, for example
 `megatron/core/foo.py:12  my_func:accessor:parallel_state.get_tensor_model_parallel_group`.
 
 - **New code:** take the group from the caller and pass it through. Switching to
-  `use_mpu_process_groups()` or `resolve_process_groups()` does not help; the checker counts
-  both.
+  `use_mpu_process_groups()`, `get_registered_process_groups()` or a guarded helper such as
+  `resolve_process_groups()` does not help; the checker counts them all.
 - **Moved code:** a read that moves to another function or file, or whose function is renamed,
   is reported as new. If the read cannot be removed in the same PR, edit the allowlist by hand:
   replace the old entry with the new one. Point it out in the PR description so that a reviewer
@@ -481,18 +501,19 @@ it with your change:
 python tools/check_process_group_usage.py --update
 ```
 
-`--update` removes stale entries. When a `resolve_process_groups()` call replaces a removed
-direct read in the same file and scope, it swaps the entry. It never adds any other entry.
+`--update` removes stale entries. When a guarded call replaces a removed read in the same file
+and scope, or a read gains a fallback warning, it swaps the entry. It never adds any other entry.
 
 ### Run it locally
 
-The checker and both tests need only the Python standard library:
+The checker and the three tests need only the Python standard library:
 
 ```bash
 python tools/check_process_group_usage.py           # the ratchet
-python tools/check_process_group_usage.py --stats   # count reads by kind
+python tools/check_process_group_usage.py --stats   # count reads by kind and warning
 python tests/unit_tests/test_check_process_group_usage.py   # the checker's own tests
 python tests/unit_tests/test_parallel_state_accessor_uses.py   # the guard outside megatron/core
+python tests/unit_tests/test_removal_versions.py   # removals that the version has reached
 ```
 
 ## Removal schedule
@@ -502,6 +523,10 @@ python tests/unit_tests/test_parallel_state_accessor_uses.py   # the guard outsi
 | 0.21 | The deprecated functions and `use_mpu_process_groups()` warn when called from outside Megatron Core. The fallbacks of Megatron Core components warn with `ProcessGroupFallbackWarning`. Both warnings name 0.23. |
 | 0.22 | Both warnings stay, the second release in which callers can migrate. |
 | 0.23 | The deprecated functions and `use_mpu_process_groups()` are removed, and so are the fallbacks: the process-group arguments that warned become required. |
+
+When `megatron/core/package_info.py` reaches 0.23, `tests/unit_tests/test_removal_versions.py`
+fails and lists the code that still announces that removal: the `removed_in` arguments and
+defaults, and the `*_REMOVED_IN` constants.
 
 After 0.23, `parallel_state` keeps bootstrap (`initialize_model_parallel()` and
 `build_process_group_collection()`), teardown (`destroy_model_parallel()`), the
