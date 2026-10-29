@@ -87,14 +87,20 @@ def inference(monkeypatch):
 
 @pytest.fixture
 def modelopt(inference, monkeypatch):
-    """The ModelOpt path, with a stand-in for get_model; returns the groups it receives."""
+    """The ModelOpt path, with a stand-in for get_model that calls the provider as it does.
+
+    Returns the groups get_model receives.
+    """
     inference.args.modelopt_enabled = True
     monkeypatch.setattr(utils, "HAS_NVIDIA_MODELOPT", True)
-    monkeypatch.setattr(utils, "modelopt_gpt_hybrid_builder", object(), raising=False)
+    monkeypatch.setattr(utils, "modelopt_gpt_hybrid_builder", Mock(), raising=False)
     received = []
 
     def get_model(model_provider, wrap_with_ddp, pg_collection=None):
         received.append(pg_collection)
+        model_provider(
+            pre_process=True, post_process=True, config=None, pg_collection=pg_collection
+        )
         return [_Model()]
 
     monkeypatch.setattr(utils, "_get_model", get_model)
@@ -140,6 +146,9 @@ def test_modelopt_builds_on_the_registered_collection(inference, modelopt, monke
         utils.get_model_for_inference(pg_collection=registered)
 
     assert modelopt == [registered]
+    utils.modelopt_gpt_hybrid_builder.assert_called_once_with(
+        inference.args, pre_process=True, post_process=True, config=None, pg_collection=registered
+    )
     assert all(inference.loaded[0][argument] is None for argument in CHECKPOINT_GROUPS)
 
 
