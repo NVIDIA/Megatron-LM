@@ -976,6 +976,13 @@ def log_on_each_pipeline_stage(
 
         args (Tuple[Any]): Message format arguments.
 
+        tp_group (torch.distributed.ProcessGroup, optional): Tensor-parallel group of the model
+            that logs. Pass it together with ``dp_cp_group``. Omitting both is deprecated: the
+            groups of the global parallel state are used, with a ``ProcessGroupFallbackWarning``.
+
+        dp_cp_group (torch.distributed.ProcessGroup, optional): Data-parallel group, including
+            the context-parallel ranks, of the model that logs.
+
         kwargs (Dict[str, Any]): All logging.Logger.log keyword arguments
     """
     assert torch.distributed.is_initialized()
@@ -986,13 +993,24 @@ def log_on_each_pipeline_stage(
     if not logger.isEnabledFor(level):
         return
 
-    if tp_group is None and dp_cp_group is None:
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        dp_cp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-    else:
-        assert tp_group is not None and dp_cp_group is not None
-        tp_rank = tp_group.rank()
-        dp_cp_rank = dp_cp_group.rank()
+    if tp_group is None:
+        # Import here to avoid a circular import: process_groups_config imports parallel_state,
+        # which imports this module.
+        from megatron.core.process_groups_config import resolve_process_groups
+
+        # Deprecated fallback: the groups behind get_tensor_model_parallel_rank() and
+        # get_data_parallel_rank(with_context_parallel=True) of the global parallel state.
+        pg_collection = resolve_process_groups(
+            None,
+            owner="log_on_each_pipeline_stage",
+            required=("tp", "dp_cp_gtp_remat"),
+            argument="tp_group/dp_cp_group",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        tp_group, dp_cp_group = pg_collection.tp, pg_collection.dp_cp_gtp_remat
+    tp_rank = tp_group.rank()
+    dp_cp_rank = dp_cp_group.rank()
 
     if tp_rank == 0 and dp_cp_rank == 0:
         logger.log(level, msg, *args, **kwargs)
@@ -1013,7 +1031,8 @@ def check_param_hashes_across_dp_replicas(
     very frequently in the main training loop.
 
     The DP replicas are given by the model's data-parallel groups. If neither group is passed,
-    the data-parallel groups of the global parallel state are used.
+    the replicate data-parallel groups of the global parallel state are used; this fallback is
+    deprecated and emits a ``ProcessGroupFallbackWarning``.
 
     Args:
         model (List[torch.nn.Module]): List of model chunks whose parameter hashes need to
@@ -1036,10 +1055,22 @@ def check_param_hashes_across_dp_replicas(
             ``dp_group`` is None, or expert parameters and ``expt_dp_group`` is None.
     """
     if dp_group is None and expt_dp_group is None:
-        # Migration fallback for callers that do not pass the model's groups: the replicate
-        # data-parallel groups of the global parallel state.
-        dp_group = parallel_state.get_data_parallel_group(with_gtp_remat=False)
-        expt_dp_group = parallel_state.get_expert_data_parallel_group(with_gtp_remat=False)
+        # Import here to avoid a circular import: process_groups_config imports parallel_state,
+        # which imports this module.
+        from megatron.core.process_groups_config import resolve_process_groups
+
+        # Deprecated fallback for callers that do not pass the model's groups: the replicate
+        # data-parallel groups of the global parallel state. A missing expert group is
+        # rejected below if this rank holds expert parameters.
+        pg_collection = resolve_process_groups(
+            None,
+            owner="check_param_hashes_across_dp_replicas",
+            required=("dp", "expt_dp"),
+            argument="dp_group/expt_dp_group",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        dp_group, expt_dp_group = pg_collection.dp, pg_collection.expt_dp
 
     # Compute per-parameter hashes on this rank.
     # Keep track of expert and non-expert parameters separately since they need to be

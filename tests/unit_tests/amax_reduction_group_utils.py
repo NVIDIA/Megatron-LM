@@ -2,7 +2,7 @@
 
 """Helpers for tests that check which group FP8/FP4 contexts reduce amaxes over."""
 
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from unittest.mock import patch
 
 import torch
@@ -11,12 +11,30 @@ from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
 from megatron.core.process_groups_config import ProcessGroupCollection
 
+# The parallel_state accessors that return a global amax reduction group: the getter itself,
+# and the TP x CP and TP x DP x CP groups behind the collection fields tp_cp and tp_dp_cp.
+_GLOBAL_AMAX_GROUP_ACCESSORS = (
+    "get_amax_reduction_group",
+    "get_tensor_and_context_parallel_group",
+    "get_tensor_and_data_parallel_group",
+)
+
 
 def global_amax_group(tp_only_amax_red):
     """Return the amax reduction group of the global parallel state."""
     return parallel_state.get_amax_reduction_group(
         with_context_parallel=True, tp_only_amax_red=tp_only_amax_red
     )
+
+
+def global_amax_groups():
+    """Return a collection with the global grid's amax reduction groups, tp_cp and tp_dp_cp.
+
+    For tests that run modules on the global grid outside a model that holds a collection.
+    FP8/FP4 contexts given this collection reduce over the same groups as their deprecated
+    fallback, without its warning.
+    """
+    return ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp_cp", "tp_dp_cp"])
 
 
 def copy_of(group):
@@ -44,13 +62,10 @@ def with_copied_amax_groups(pg_collection=None):
 @contextmanager
 def forbid_global_amax_group():
     """Fail on any read of the global amax reduction group."""
-    from megatron.core.extensions import transformer_engine as te_extension
-
     error = AssertionError("the global amax reduction group was read")
-    with (
-        patch.object(parallel_state, "get_amax_reduction_group", side_effect=error),
-        patch.object(te_extension, "get_amax_reduction_group", side_effect=error),
-    ):
+    with ExitStack() as stack:
+        for name in _GLOBAL_AMAX_GROUP_ACCESSORS:
+            stack.enter_context(patch.object(parallel_state, name, side_effect=error))
         yield
 
 

@@ -7,10 +7,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from megatron.core import fp4_utils, fp8_utils
+from megatron.core import fp4_utils, fp8_utils, parallel_state, process_groups_config
 from megatron.core.enums import Fp8Recipe
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.amax_reduction_group_utils import (
     forbid_global_amax_group,
@@ -24,8 +24,30 @@ from tests.unit_tests.test_utilities import Utils
 pytestmark = pytest.mark.skipif(not fp8_utils.HAVE_TE, reason="requires Transformer Engine")
 
 
+# The Transformer Engine module that the per-module recipe contexts below stand in for.
+TE_MODULE = "TELinear"
+
+# The owners whose fallbacks the contexts below reach when the caller omits the collection.
+FALLBACK_OWNERS = ("get_fp8_context", "get_fp4_context", TE_MODULE)
+
+
 def _config(**kwargs):
     return TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4, **kwargs)
+
+
+def _assert_fallback_warnings(record):
+    """Check that each owner warned once that it falls back to the global groups."""
+    for owner in FALLBACK_OWNERS:
+        matches = [
+            w
+            for w in record
+            if issubclass(w.category, ProcessGroupFallbackWarning)
+            and f"{owner} was called without `pg_collection`" in str(w.message)
+        ]
+        assert len(matches) == 1, owner
+        assert "deprecated since Megatron Core 0.21 and will be removed in 0.23" in str(
+            matches[0].message
+        )
 
 
 class TestAmaxReductionGroupHelper:
@@ -118,10 +140,10 @@ class TestAmaxReductionGroupOnGrids:
 
         with forbid_global_amax_group(), record_amax_groups() as groups:
             te_extension._get_fp8_autocast_for_quant_params(
-                qparams, True, pg_collection=pg_collection
+                qparams, True, owner=TE_MODULE, pg_collection=pg_collection
             )
             te_extension._get_fp8_autocast_for_quant_params(
-                qparams, False, pg_collection=pg_collection
+                qparams, False, owner=TE_MODULE, pg_collection=pg_collection
             )
 
         assert len(groups) == 2
@@ -170,7 +192,7 @@ class TestAmaxReductionGroupOnGrids:
             fp8_utils.get_fp8_context(config, pg_collection=pg_collection)
         with pytest.raises(ValueError, match=field_name):
             te_extension._get_fp8_autocast_for_quant_params(
-                qparams, True, pg_collection=pg_collection
+                qparams, True, owner=TE_MODULE, pg_collection=pg_collection
             )
 
     def test_init_context_does_not_need_an_amax_group(self):
@@ -190,10 +212,13 @@ class TestAmaxReductionGroupOnGrids:
         fp8_model_init.assert_called_once()
 
     @pytest.mark.parametrize("tp_only_amax_red", [False, True])
-    def test_omitted_collection_uses_the_global_group(self, tp_only_amax_red):
-        """Callers that pass no collection keep the global amax reduction group."""
+    def test_omitted_collection_warns_and_uses_the_global_group(
+        self, tp_only_amax_red, monkeypatch
+    ):
+        """Callers that pass no collection warn and keep the global amax reduction group."""
         from megatron.core.extensions import transformer_engine as te_extension
 
+        monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
         Utils.initialize_model_parallel(tensor_model_parallel_size=min(2, Utils.world_size))
         expected = global_amax_group(tp_only_amax_red)
         fp8_config = _config(
@@ -202,10 +227,31 @@ class TestAmaxReductionGroupOnGrids:
         fp4_config = _config(fp4="e2m1", tp_only_amax_red=tp_only_amax_red)
         qparams = te_quantization_params(tp_only_amax_red, tp_only_amax_red)
 
-        with record_amax_groups() as groups:
+        with pytest.warns(ProcessGroupFallbackWarning) as record, record_amax_groups() as groups:
             fp8_utils.get_fp8_context(fp8_config)
             fp4_utils.get_fp4_context(fp4_config)
-            te_extension._get_fp8_autocast_for_quant_params(qparams, True)
+            te_extension._get_fp8_autocast_for_quant_params(qparams, True, owner=TE_MODULE)
 
+        _assert_fallback_warnings(record)
         assert len(groups) == 3
         assert all(group is expected for group in groups)
+
+    def test_omitted_collection_without_a_global_grid_passes_no_group(self, monkeypatch):
+        """Without a global grid the fallback still warns, and leaves the group to TE."""
+        from megatron.core.extensions import transformer_engine as te_extension
+
+        monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+        Utils.initialize_distributed()
+        if parallel_state.model_parallel_is_initialized():
+            pytest.skip("an earlier test left the global grid initialized")
+        fp8_config = _config(fp8="e4m3", fp8_recipe=Fp8Recipe.tensorwise)
+        fp4_config = _config(fp4="e2m1")
+        qparams = te_quantization_params(False, False)
+
+        with pytest.warns(ProcessGroupFallbackWarning) as record, record_amax_groups() as groups:
+            fp8_utils.get_fp8_context(fp8_config)
+            fp4_utils.get_fp4_context(fp4_config)
+            te_extension._get_fp8_autocast_for_quant_params(qparams, True, owner=TE_MODULE)
+
+        _assert_fallback_warnings(record)
+        assert groups == [None, None, None]

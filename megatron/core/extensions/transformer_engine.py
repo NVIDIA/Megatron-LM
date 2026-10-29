@@ -28,12 +28,10 @@ from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
     TeardownStage,
-    get_amax_reduction_group,
     get_context_parallel_group,
     get_hierarchical_context_parallel_groups,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_world_size,
-    model_parallel_is_initialized,
     register_model_parallel_teardown,
 )
 from megatron.core.process_groups_config import (
@@ -41,6 +39,7 @@ from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     amax_reduction_group,
     resolve_gtp_remat_group,
+    resolve_process_groups,
     warn_global_process_group_fallback,
 )
 from megatron.core.quantization.quant_config import QuantizationConfig
@@ -422,16 +421,21 @@ def _get_fp8_model_init_for_quant_params(qparams: TEQuantizationParams | None, t
 
 
 def _get_fp8_autocast_for_quant_recipe(
-    qrecipe: TEQuantizationRecipe, *, pg_collection: Optional[ProcessGroupCollection] = None
+    qrecipe: TEQuantizationRecipe,
+    *,
+    owner: str,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """Return the autocast context that applies a per-module quantization recipe.
 
     Args:
         qrecipe: Recipe of the module.
+        owner: Name of the module class, used in the warning when ``pg_collection`` is omitted.
         pg_collection: Process groups of the model that owns the module. A quantized autocast
             reduces amaxes over ``amax_reduction_group(pg_collection, qrecipe.tp_only_amax_red)``.
-            When omitted, it uses the global amax reduction group of ``parallel_state`` if model
-            parallelism is initialized, and passes no group otherwise.
+            Omitting it is deprecated and emits a ``ProcessGroupFallbackWarning``: the autocast
+            then uses the global amax reduction group of ``parallel_state``, or passes no group,
+            which Transformer Engine reads as its default group, when ``parallel_state`` has none.
     """
     if FP8GlobalStateManager.is_fp8_enabled():
         if not qrecipe.override_quantized_autocast:
@@ -446,12 +450,16 @@ def _get_fp8_autocast_for_quant_recipe(
     else:
         if pg_collection is not None:
             amax_group = amax_reduction_group(pg_collection, qrecipe.tp_only_amax_red)
-        elif model_parallel_is_initialized():
-            amax_group = get_amax_reduction_group(
-                with_context_parallel=True, tp_only_amax_red=qrecipe.tp_only_amax_red
-            )
         else:
-            amax_group = None
+            # Deprecated fallback for modules built without the model's groups.
+            global_groups = resolve_process_groups(
+                None,
+                owner=owner,
+                required=("tp_cp", "tp_dp_cp"),
+                deprecated_in="0.21",
+                removed_in="0.23",
+            )
+            amax_group = global_groups.tp_cp if qrecipe.tp_only_amax_red else global_groups.tp_dp_cp
         if (
             qrecipe.fp8_quantization_recipe == Fp8Recipe.custom
             or qrecipe.fp4_quantization_recipe == Fp4Recipe.custom
@@ -490,6 +498,7 @@ def _get_fp8_autocast_for_quant_params(
     qparams: TEQuantizationParams | None,
     training: bool,
     *,
+    owner: str,
     pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """Return the autocast context for the training or evaluation recipe in ``qparams``.
@@ -497,6 +506,7 @@ def _get_fp8_autocast_for_quant_params(
     Args:
         qparams: Per-module quantization parameters, or None if the module has none.
         training: Whether the module is in training mode.
+        owner: Name of the module class; see ``_get_fp8_autocast_for_quant_recipe``.
         pg_collection: Process groups of the model that owns the module; see
             ``_get_fp8_autocast_for_quant_recipe``.
     """
@@ -504,11 +514,11 @@ def _get_fp8_autocast_for_quant_params(
         return nullcontext()
     elif not training and qparams.evaluation_recipe is not None:
         return _get_fp8_autocast_for_quant_recipe(
-            qparams.evaluation_recipe, pg_collection=pg_collection
+            qparams.evaluation_recipe, owner=owner, pg_collection=pg_collection
         )
     else:
         return _get_fp8_autocast_for_quant_recipe(
-            qparams.training_recipe, pg_collection=pg_collection
+            qparams.training_recipe, owner=owner, pg_collection=pg_collection
         )
 
 
@@ -1582,7 +1592,10 @@ class TELinear(te.pytorch.Linear):
         """Forward."""
         _is_first_microbatch = _resolve_is_first_microbatch(self)
         quant_context = _get_fp8_autocast_for_quant_params(
-            self.te_quant_params, self.training, pg_collection=self._pg_collection
+            self.te_quant_params,
+            self.training,
+            owner=type(self).__name__,
+            pg_collection=self._pg_collection,
         )
 
         with quant_context:
@@ -1836,7 +1849,10 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         """Forward."""
         _is_first_microbatch = _resolve_is_first_microbatch(self)
         quant_context = _get_fp8_autocast_for_quant_params(
-            self.te_quant_params, self.training, pg_collection=self._pg_collection
+            self.te_quant_params,
+            self.training,
+            owner=type(self).__name__,
+            pg_collection=self._pg_collection,
         )
 
         # FP32 residual connections pass the FP32 residual stream into this fused module, but
@@ -3153,7 +3169,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             else:
                 _is_first_microbatch = _resolve_is_first_microbatch(self)
             quant_context = _get_fp8_autocast_for_quant_params(
-                self.te_quant_params, self.training, pg_collection=self._pg_collection
+                self.te_quant_params,
+                self.training,
+                owner=type(self).__name__,
+                pg_collection=self._pg_collection,
             )
 
             with quant_context:
