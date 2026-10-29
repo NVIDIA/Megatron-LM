@@ -158,7 +158,7 @@ def test_delayed_wgrad_hooks_belong_to_the_slot_that_computes_them(cpu_streams, 
 
 
 @pytest.mark.parametrize(
-    "symbol", [Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MLA, Symbols.GDN]
+    "symbol", [Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MLA, Symbols.GDN, Symbols.KDA]
 )
 def test_attention_half_layer_forward_and_wgrad_are_scheduled(symbol):
     """All attention symbols, including MLA '+', preserve their forward and backward work."""

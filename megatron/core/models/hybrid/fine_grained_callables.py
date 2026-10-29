@@ -300,6 +300,7 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
                     LayerSymbols.DS_ATTENTION,
                     LayerSymbols.MLA,
                     LayerSymbols.GDN,
+                    LayerSymbols.KDA,
                 ):
                     # Use _forward_attention rather than __call__: an attention half-layer has
                     # mlp=IdentityOp / mlp_bda=IdentityFuncOp by default, and TransformerLayer's
@@ -397,6 +398,7 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
             LayerSymbols.DS_ATTENTION,
             LayerSymbols.MLA,
             LayerSymbols.GDN,
+            LayerSymbols.KDA,
         ):
             # TransformerLayer-backed pre-layers go through the standard
             # _BackwardDWWrapper which coordinates attn / shared-expert wgrad

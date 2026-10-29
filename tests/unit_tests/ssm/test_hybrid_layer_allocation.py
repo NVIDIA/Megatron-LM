@@ -639,6 +639,7 @@ class TestGetHybridLayerCounts:
             'D': 0,
             'G': 0,
             'H': 0,
+            'K': 0,
             'M': 2,
             '+': 0,
             '-': 0,
