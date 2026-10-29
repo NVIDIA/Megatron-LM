@@ -248,6 +248,10 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         hyperparameters (including the group-level ``step``) and re-bind the FQN-keyed state
         to the current parameters, mirroring the Megatron-FSDP branch of
         :meth:`DistributedOptimizer.load_state_dict`.
+
+        Compute weights are refreshed last. Not every checkpoint load goes through
+        ``FullyShardedDataParallelV2.load_state_dict``: the GPT->Hybrid ``fsdp_dtensor`` load
+        writes the main weights in place and only then reaches the optimizer.
         """
         param_groups = self._param_groups_from_group_meta(state_dict["param_to_group_meta"])
         state = state_dict["state"]
@@ -256,6 +260,28 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             owned_fqns = {fqn for group in param_groups for fqn in group["params"]}
             state = {fqn: param_state for fqn, param_state in state.items() if fqn in owned_fqns}
         self.optimizer.load_state_dict({"state": state, "param_groups": param_groups})
+        self._sync_all_model_weights_from_main_weights()
+
+    @override
+    def reload_model_params(self, state_dict=None) -> None:
+        """Refresh compute weights after model weights were loaded without optimizer state.
+
+        Called for ``--no-load-optim``, ``--finetune`` and release checkpoints. MFSDP v2
+        parameters are views of the main weights, so the model load already wrote those, and
+        ``state_dict`` has nothing to add. What is left is the other direction: the compute
+        weights the next forward reads are separate buffers, otherwise refreshed only after an
+        optimizer step.
+        """
+        self._sync_all_model_weights_from_main_weights()
+
+    def _sync_all_model_weights_from_main_weights(self) -> None:
+        """Refresh the compute weights of every parameter group, frozen ones included.
+
+        ``get_parameters()`` holds only the trainable parameters, but a frozen parameter group
+        also keeps its compute weights apart from its main weights, and a load writes both.
+        """
+        for model_chunk in self.model_chunks:
+            sync_model_weights_from_main_weights(model_chunk.parameters())
 
     @override
     def sharded_state_dict(
