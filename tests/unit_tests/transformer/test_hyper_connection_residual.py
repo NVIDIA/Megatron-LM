@@ -104,8 +104,13 @@ def test_adapter_preserves_owner_selected_state_across_interleaved_reads():
         for _ in range(2)
     ]
     prepared = [
-        model.read(value, fp32_residual_connection=True, execution_context=execution)
-        for value in values
+        model.read(
+            value,
+            fp32_residual_connection=True,
+            branch_input_dtype=dtype,
+            execution_context=execution,
+        )
+        for value, dtype in zip(values, (None, torch.bfloat16))
     ]
     for value, (branch, state), chosen in zip(values, prepared, selected):
         assert branch is chosen[0]
@@ -127,6 +132,14 @@ def test_adapter_preserves_owner_selected_state_across_interleaved_reads():
         for call, (_, state) in zip(write.call_args_list, reversed(prepared)):
             assert all(a is b for a, b in zip(call.args[:3], (state[1], state[0], state[2])))
     assert calls == ["read", "read", "write", "write"]
+    for context in (None, ResidualStreamRecomputeContext(CheckpointWithoutOutputManager(), False)):
+        with pytest.raises(TypeError, match="returned branch dtype.*expected"):
+            model.read(
+                values[0],
+                branch_input_dtype=torch.float32,
+                execution_context=execution,
+                recompute_context=context,
+            )
 
 
 @pytest.mark.parametrize("has_bias", [False, True])
