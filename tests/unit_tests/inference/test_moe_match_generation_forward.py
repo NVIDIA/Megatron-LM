@@ -226,8 +226,8 @@ def _layer_pair(recipe, gen_config, train_config, max_tokens=LOCAL_TOKENS):
 
     Generation converts as production does: MXFP8 replaces TE's MXFP8 parameters
     with MCore ``MXFP8Tensor``s at load, NVFP4 quantizes the BF16 stacks on the
-    first forward. Training keeps its parameters and the value pass re-derives the
-    kernel weights from them on every forward.
+    first forward. Training keeps its parameters and the value pass derives the
+    kernel weights from them once per forward-backward call.
     """
     from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
 
@@ -545,9 +545,10 @@ class TestTrainGenParity:
     def test_value_pass_follows_a_weight_update(self, recipe):
         """After the parameters move, the value pass matches a refreshed generation.
 
-        A value pass that cached its kernel weights would keep matching the old
-        generation and miss this. The update is applied to both layers' BF16
-        parameters, and generation requantizes as a refit would.
+        The update is applied to both layers' BF16 parameters, and generation
+        requantizes as a refit would. The value pass keeps its kernel weights within
+        a forward-backward call and rebuilds them when the next one starts, which
+        the pipeline schedules mark with ``set_is_first_microbatch``.
         """
         _skip_unless_supported(recipe)
         gen_config, train_config = _generation_and_training_configs(recipe)
@@ -556,7 +557,7 @@ class TestTrainGenParity:
         with torch.no_grad(), InferenceMode.active():
             stale_gen_out, _ = gen_layer(hidden)
         with torch.no_grad():
-            train_layer(hidden)
+            stale_train_out, _ = train_layer(hidden)
 
         with torch.no_grad():
             for layer in (gen_layer, train_layer):
@@ -569,9 +570,14 @@ class TestTrainGenParity:
         with torch.no_grad(), InferenceMode.active():
             gen_out, _ = gen_layer(hidden)
         with torch.no_grad():
+            same_call_out, _ = train_layer(hidden)
+            train_layer.set_is_first_microbatch()
             train_out, _ = train_layer(hidden)
 
         assert _elements_that_differ(gen_out, stale_gen_out) > 0, "the update moved nothing"
+        assert (
+            _elements_that_differ(same_call_out, stale_train_out) == 0
+        ), "the value pass rebuilt its kernel weights within one forward-backward call"
         differing = _elements_that_differ(train_out, gen_out)
         assert differing == 0, (
             f"{recipe}: after a weight update, {differing}/{train_out.numel()} elements "
@@ -667,12 +673,45 @@ class TestSymmetricHeapSizing:
             wide, _ = layer(hidden)
         assert _elements_that_differ(wide, chunked) == 0
 
-    def _heap_sized_layer(self):
-        _skip_unless_supported(self.RECIPE)
+    def _heap_sized_layer(self, recipe=RECIPE, max_tokens=SMALL):
+        _skip_unless_supported(recipe)
         if _dispatcher() != "nvls":
             pytest.skip("the symmetric heap is only used by the NVLS dispatcher (EP > 1)")
-        config = _config(self.RECIPE, moe_match_generation_forward=True)
-        return config, _build_layer(config, for_inference=True, max_tokens=self.SMALL).eval()
+        config = _config(recipe, moe_match_generation_forward=True)
+        with _fp8_context(config, is_init=True):
+            layer = _build_layer(config, for_inference=True, max_tokens=max_tokens).eval()
+        return config, layer
+
+    def test_each_launch_covers_only_rows_that_hold_tokens(self):
+        """The kernel's cost follows the microbatch, not the generation-sized heap."""
+        config, layer = self._heap_sized_layer()
+        seen = _spy_on_value_pass(layer.experts)
+        group_size = torch.distributed.get_world_size(layer._inference_token_dispatcher.tp_ep_group)
+        with torch.no_grad():
+            layer(_hidden(config, seed=3, tokens=self.SMALL + self.SMALL // 2))
+        assert [routing_map.shape[0] for routing_map in seen] == [
+            group_size * self.SMALL,
+            group_size * (self.SMALL // 2),
+        ]
+
+    def test_mxfp8_launches_keep_the_largest_kernel_tile(self):
+        """MXFP8 launches follow the microbatch down to the kernel's largest-tile floor.
+
+        The routed MXFP8 kernel has no tile config for a launch of a few tokens per
+        rank at these shapes, so a small microbatch launches on the floor's rows.
+        """
+        config, layer = self._heap_sized_layer("mxfp8", max_tokens=HEAP_TOKENS)
+        seen = _spy_on_value_pass(layer.experts)
+        group_size = torch.distributed.get_world_size(layer._inference_token_dispatcher.tp_ep_group)
+        floor = 128 * layer.num_local_experts // config.moe_router_topk + 1
+        assert group_size * LOCAL_TOKENS < floor < group_size * (HEAP_TOKENS // 2)
+        with torch.no_grad(), _fp8_context(config):
+            layer(_hidden(config, seed=3, tokens=LOCAL_TOKENS))
+            layer(_hidden(config, seed=3, tokens=HEAP_TOKENS // 2))
+        assert [routing_map.shape[0] for routing_map in seen] == [
+            floor,
+            group_size * (HEAP_TOKENS // 2),
+        ]
 
     def test_a_layer_that_skips_the_metadata_sync_matches_one_that_runs_it(self):
         """Generation refreshes dispatch metadata on its first MoE layer only.
