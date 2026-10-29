@@ -2,13 +2,16 @@
 
 """Dynamic-batching inference for DSA over GQA with the simplified indexer."""
 
+import gc
+import weakref
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.config import InferenceConfig, KVCacheManagementMode
 from megatron.core.inference.contexts import DynamicInferenceContext
+from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 from megatron.core.transformer.experimental_attention_variant import dsa_gqa_inference as dsa_gqa
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa_inference import (
     _sparse_attention_rows,
@@ -47,6 +50,43 @@ def initialize_decode_test_distributed():
     Utils.initialize_model_parallel(1, 1)
     yield
     Utils.destroy_model_parallel()
+
+
+@pytest.fixture
+def native_context_factory():
+    def make_context(*, max_sequence_length, max_requests, max_tokens, **kwargs):
+        return DynamicInferenceContext(
+            model_config=TransformerConfig(
+                num_layers=1,
+                add_bias_linear=False,
+                hidden_size=HIDDEN_SIZE,
+                num_attention_heads=NUM_HEADS,
+                num_query_groups=1,
+                kv_channels=HEAD_DIM,
+                params_dtype=torch.bfloat16,
+                bf16=True,
+                experimental_attention_variant="dsa",
+                dsa_indexer_mode="simplified",
+                dsa_kernel_backend="reference",
+                dsa_indexer_n_heads=1,
+                dsa_indexer_head_dim=INDEX_DIM,
+                dsa_indexer_topk=TOPK,
+                dsa_indexer_loss_coeff=0.1,
+            ),
+            inference_config=InferenceConfig(
+                max_sequence_length=max_sequence_length,
+                max_requests=max_requests,
+                max_tokens=max_tokens,
+                block_size_tokens=256,
+                buffer_size_gb=0.1,
+                unified_memory_level=0,
+                num_cuda_graphs=None,
+                use_flashinfer_fused_rope=False,
+                **kwargs,
+            ),
+        )
+
+    return make_context
 
 
 def test_speculative_decode_steps_are_rejected():
@@ -363,8 +403,139 @@ def test_score_windows_match_one_window(monkeypatch):
     torch.testing.assert_close(attend(), one_window, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize(
+    "cache_mode,static_pointers",
+    [
+        (KVCacheManagementMode.PERSIST, True),
+        (KVCacheManagementMode.OFFLOAD, False),
+        (KVCacheManagementMode.RECOMPUTE, False),
+        (KVCacheManagementMode.OFFLOAD, True),
+        (KVCacheManagementMode.RECOMPUTE, True),
+    ],
+    ids=["persist", "offload", "recompute", "offload-static", "recompute-static"],
+)
+def test_native_decode_workspace_suspend_resume(
+    native_context_factory, cache_mode, static_pointers
+):
+    """Repeated context suspension releases obsolete storage and preserves decode results."""
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Native DSA decode requires Blackwell")
+    pytest.importorskip("cutlass.cute")
+    if static_pointers and cache_mode != KVCacheManagementMode.PERSIST:
+        if not HAVE_TORCH_MEMORY_SAVER:
+            pytest.skip("Static offload/recompute requires torch_memory_saver")
+
+    torch.manual_seed(73)
+    rows, bound, page_size = 4, 4096, 256
+    context = native_context_factory(
+        max_sequence_length=bound,
+        max_requests=rows,
+        max_tokens=rows,
+        kv_cache_management_mode=cache_mode,
+        static_kv_memory_pointers=static_pointers,
+    )
+    context.memory_buffer.normal_()
+    context.dsa_memory_buffer.normal_()
+    saved_kv = context.memory_buffer.cpu()
+    saved_index_keys = context.dsa_memory_buffer.cpu()
+    cache_bytes = sum(t.numel() * t.element_size() for t in (saved_kv, saved_index_keys))
+    table = torch.arange(rows * bound // page_size, device="cuda", dtype=torch.int32).view(rows, -1)
+    query = torch.randn(rows, NUM_HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    index_query = torch.randn(rows, INDEX_DIM, device="cuda", dtype=torch.bfloat16)
+
+    def fill_metadata():
+        context.padded_active_token_count = context.padded_active_request_count = rows
+        context.num_prefill_requests = 0
+        context._fill_dsa_row_metadata(
+            3, rows, torch.tensor([1, 1, 1]), torch.tensor([bound, 2048, 33])
+        )
+        context._gpu_dsa_row_buf.copy_(context._cpu_dsa_row_buf)
+
+    def attend():
+        return dsa_gqa._native_sparse_attention(
+            query=query,
+            key_cache=context.memory_buffer[0, 0],
+            value_cache=context.memory_buffer[1, 0],
+            index_query=index_query,
+            index_key_cache=context.dsa_memory_buffer[0],
+            block_table=table,
+            inference_context=context,
+            row_metadata=context.dsa_row_metadata(),
+            max_context_length=bound,
+            index_topk=TOPK,
+            softmax_scale=HEAD_DIM**-0.5,
+        )
+
+    def capture():
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            attend()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = attend()
+        return graph, output
+
+    fill_metadata()
+    expected = _sparse_attention_rows(
+        query=query,
+        key_cache=context.memory_buffer[0, 0],
+        value_cache=context.memory_buffer[1, 0],
+        index_query=index_query,
+        index_key_cache=context.dsa_memory_buffer[0],
+        block_table=table,
+        row_metadata=context.dsa_row_metadata(),
+        max_context_length=bound,
+        index_topk=TOPK,
+        softmax_scale=HEAD_DIM**-0.5,
+    )
+    graph, output = capture()
+    releases_storage = cache_mode != KVCacheManagementMode.PERSIST and not static_pointers
+    suspended_allocations = []
+    for _ in range(3):
+        # Engine graph warmup resets bookkeeping without invalidating graph-owned buffers.
+        context.reset()
+        fill_metadata()
+        graph.replay()
+        torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
+        assert len(context._dsa_decode_workspaces) == 1
+        workspace_ref = weakref.ref(next(iter(context._dsa_decode_workspaces.values()))[0])
+        descriptor_base_ref = weakref.ref(workspace_ref()._key_descriptor.base)
+        torch.cuda.synchronize()
+        allocated_before = torch.cuda.memory_allocated()
+
+        # Match engine order: release context storage, then discard graphs with moving pointers.
+        context.deallocate_inference_state_buffers()
+        if releases_storage:
+            del output
+            graph.reset()
+        gc.collect()
+        torch.cuda.synchronize()
+        if releases_storage:
+            assert workspace_ref() is None
+            assert descriptor_base_ref() is None
+            allocated_after = torch.cuda.memory_allocated()
+            assert allocated_before - allocated_after >= cache_bytes
+            suspended_allocations.append(allocated_after)
+            assert allocated_after <= suspended_allocations[0] + 1024**2
+        else:
+            assert workspace_ref() is next(iter(context._dsa_decode_workspaces.values()))[0]
+
+        context.reinitialize_inference_state_buffers()
+        if cache_mode == KVCacheManagementMode.RECOMPUTE:
+            context.memory_buffer.copy_(saved_kv)
+            context.dsa_memory_buffer.copy_(saved_index_keys)
+        fill_metadata()
+        if releases_storage:
+            graph, output = capture()
+        graph.replay()
+        torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
+        assert len(context._dsa_decode_workspaces) == 1
+
+
 @pytest.mark.parametrize("decode_only", [True, False])
-def test_native_decode_and_mixed_batches_replay_in_cuda_graph(decode_only):
+def test_native_decode_and_mixed_batches_replay_in_cuda_graph(decode_only, native_context_factory):
     """Refreshed requests, caches and padding in a captured native layer match eager rows."""
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("Native DSA decode requires Blackwell")
@@ -386,34 +557,8 @@ def test_native_decode_and_mixed_batches_replay_in_cuda_graph(decode_only):
     table = torch.zeros(padded_requests, max_pages, device=device, dtype=torch.int32)
     query = torch.zeros(padded_rows, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
     index_query = torch.zeros(padded_rows, INDEX_DIM, device=device, dtype=torch.bfloat16)
-    native_context = DynamicInferenceContext(
-        model_config=TransformerConfig(
-            num_layers=1,
-            add_bias_linear=False,
-            hidden_size=1024,
-            num_attention_heads=NUM_HEADS,
-            num_query_groups=1,
-            kv_channels=HEAD_DIM,
-            params_dtype=torch.bfloat16,
-            bf16=True,
-            experimental_attention_variant="dsa",
-            dsa_indexer_mode="simplified",
-            dsa_kernel_backend="reference",
-            dsa_indexer_n_heads=1,
-            dsa_indexer_head_dim=INDEX_DIM,
-            dsa_indexer_topk=TOPK,
-            dsa_indexer_loss_coeff=0.1,
-        ),
-        inference_config=InferenceConfig(
-            max_sequence_length=bound,
-            max_requests=padded_requests,
-            max_tokens=padded_rows,
-            block_size_tokens=page_size,
-            buffer_size_gb=0.1,
-            unified_memory_level=0,
-            num_cuda_graphs=None,
-            use_flashinfer_fused_rope=False,
-        ),
+    native_context = native_context_factory(
+        max_sequence_length=bound, max_requests=padded_requests, max_tokens=padded_rows
     )
     native_context.padded_active_token_count = padded_rows
     native_context.padded_active_request_count = padded_requests
