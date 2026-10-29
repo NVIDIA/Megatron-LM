@@ -537,6 +537,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         # Batch-first shape of the padding_mask input reserved by the TE CUDA graph of this layer;
         # set in get_layer_static_inputs at capture, None when the graph has no such input.
         self._cuda_graph_padding_mask_shape: Optional[tuple[int, ...]] = None
+        # (shape, dtype) of the rotary_pos_emb this layer received in eager training (the
+        # cuda_graph_warmup_steps), recorded in _forward_attention.
+        self._rotary_pos_emb_seen: Optional[tuple[tuple[int, ...], torch.dtype]] = None
+        # Whether the TE CUDA graph of this layer takes rotary_pos_emb as an input; set when the
+        # graph is captured with the self-attention inside it, None otherwise.
+        self._cuda_graph_has_rotary_pos_emb: Optional[bool] = None
         if self.config.recompute_granularity == 'selective':
             assert self.config.recompute_modules is not None
             if "layernorm" in self.config.recompute_modules:
@@ -857,6 +863,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             # residual to the n-stream tensor, before its read gate.
             hidden_states = self._maybe_apply_engram(hidden_states, input_ids, packed_seq_params)
 
+        if (
+            self.training
+            and isinstance(rotary_pos_emb, Tensor)
+            and self._rotary_pos_emb_seen is None
+        ):
+            # TE CUDA graph capture reserves a rotary_pos_emb input of this layout and dtype.
+            self._rotary_pos_emb_seen = (tuple(rotary_pos_emb.shape), rotary_pos_emb.dtype)
         if residual_stream_recompute_context is None:
             input_layernorm_output, residual, attn_state = self._run_input_layernorm(hidden_states)
         else:
@@ -1874,6 +1887,37 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 .reshape(1, 1, slen_per_cp, seq_length)
                 .tile(micro_batch_size, 1, 1, 1)
             )
+        # TE copies only the captured inputs into the graph at replay and ignores any other
+        # keyword argument, so a rotary embedding that is not a graph input never reaches the
+        # graphed attention. Reserve one with the layout and dtype that the eager warmup steps
+        # passed to this layer, sized to the graph's sequence: its own buffer per (layer,
+        # microbatch), since e.g. multimodal RoPE ('mrope') or a vision encoder's 2D RoPE
+        # changes with every batch. TECudaGraphHelper replaces it with a shared buffer for
+        # 'rope'.
+        if attn_in_graph and self._rotary_pos_emb_seen is not None:
+            # Rows per graph: the CP-local packed capacity under static THD, else the CP-local
+            # sequence length.
+            if self._is_thd_cuda_graph():
+                slen_per_cp = self.config.max_seqlen_per_dp_cp_rank
+            else:
+                slen_per_cp = seq_length // self.config.context_parallel_size
+            rotary_shape, rotary_dtype = self._rotary_pos_emb_seen
+            rotary_shape = list(rotary_shape)
+            mrope_section = getattr(self.config, "mrope_section", None)
+            if (
+                mrope_section is not None
+                and len(rotary_shape) == 4
+                and rotary_shape[0] == 3
+                and rotary_shape[-1] == sum(mrope_section)
+            ):
+                # Raw per-axis mRoPE frequencies [3, b, s, d / 2] (fused mRoPE path):
+                # the sequence is axis 2.
+                rotary_shape[2] = slen_per_cp
+            else:
+                rotary_shape[0] = slen_per_cp
+            static_inputs["rotary_pos_emb"] = torch.zeros(
+                rotary_shape, dtype=rotary_dtype, device=torch.cuda.current_device()
+            )
         if self.is_moe_layer and getattr(self.mlp.router, 'is_hash_layer', False):
             # [batch, seq] of the static hidden states; THD graphs use a single packed row.
             static_inputs["input_ids"] = torch.zeros(
@@ -2075,6 +2119,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             not self.config.cuda_graph_modules
             or CudaGraphModule.attn in self.config.cuda_graph_modules
         ):
+            if not isinstance(self.self_attention, IdentityOp):
+                # Replays must pass a rotary embedding exactly when the graph takes one.
+                self._cuda_graph_has_rotary_pos_emb = kwargs.get("rotary_pos_emb") is not None
             hidden_states, context = self._forward_attention(*args, **kwargs)
         else:
             if len(args) > 0:
@@ -2141,6 +2188,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             "inference_context and packed_seq_params are excluded from input list. "
             "For inference cuda graph, please use cuda_graph_impl=local instead."
         )
+        # TE ignores keyword arguments that a graph was not captured with, so a rotary embedding
+        # passed to a graph without that input would silently not be applied.
+        passes_rotary_pos_emb = kwargs.get("rotary_pos_emb") is not None
+        if self._cuda_graph_has_rotary_pos_emb not in (None, passes_rotary_pos_emb):
+            raise RuntimeError(
+                f"TransformerLayer {self.layer_number}: rotary_pos_emb was passed to a TE CUDA "
+                "graph that was captured without a rotary_pos_emb input and would ignore it. The "
+                "input is reserved only when the eager steps before the capture "
+                "(cuda_graph_warmup_steps) pass a rotary embedding to the layer."
+                if passes_rotary_pos_emb
+                else f"TransformerLayer {self.layer_number}: the TE CUDA graph was captured with a "
+                "rotary_pos_emb input, but the replay passes none."
+            )
 
         kwargs["packed_seq_params"] = packed
         if self.config.delay_offload_until_cuda_graph:

@@ -2582,6 +2582,8 @@ class TECudaGraphHelper:
                 hidden_states = static_inputs.pop("hidden_states")
                 _sample_args = (hidden_states,)
                 if contains_self_attn:
+                    # 'rope' is the same for every microbatch, so all samples share one buffer.
+                    # Other rotary embeddings keep the input from get_layer_static_inputs.
                     # The THD static inputs (cu_seqlens) decide the table's contract.
                     rotary_pos_emb = get_rotary_pos_emb(
                         chunk_of_the_layer, hidden_states, "cu_seqlens_q" in static_inputs
@@ -3301,8 +3303,10 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
     * num_model_chunks is always 1 (vision has no virtual pipeline stages).
     * Batch dimension is always 1 (images are concatenated along the sequence
       dimension).
-    * Sample argument generation uses a simple loop (no rotary embeddings or
-      buffer-reuse optimization).
+    * Sample argument generation uses a simple loop (no buffer-reuse
+      optimization). A layer that received a rotary embedding in the eager
+      steps before the capture gets a rotary_pos_emb graph input
+      (TransformerLayer.get_layer_static_inputs).
     * _finish_capturing wraps captured graphs to filter None values that arise
       from vision encoder layers returning (output, None), and skips cleanup
       that is handled by the LM decoder helper.
@@ -3419,10 +3423,10 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
         """Generate sample arguments for vision encoder CUDA Graph capturing.
 
         Vision uses a simple per-layer-per-microbatch loop with batch_dim=1
-        and no rotary embeddings (unlike the parent's buffer-reuse
-        optimization). The order and chunk_id_list arguments are
-        unused because vision has num_model_chunks=1 and does not need
-        the pipeline-schedule-aware buffer lifecycle tracking.
+        (unlike the parent's buffer-reuse optimization). The order and
+        chunk_id_list arguments are unused because vision has
+        num_model_chunks=1 and does not need the pipeline-schedule-aware
+        buffer lifecycle tracking.
 
         Returns:
             Tuple of (sample_args, sample_kwargs) lists for each
