@@ -156,6 +156,8 @@ class RouterReplay:
         """
         self.is_mtp_layer = is_mtp_layer
         self.target_topk_idx: Optional[torch.Tensor] = None  # Target topk indices for replay
+        self.target_replay_mask: Optional[torch.Tensor] = None
+        self.replay_backward_mask_list: List[Optional[torch.Tensor]] = []
         self.recorded_topk_idx: Optional[torch.Tensor] = None  # Recorded topk indices for replay
         self.router_replay_action: Optional[RouterReplayAction] = (
             None  # Router replay action for this layer
@@ -169,10 +171,22 @@ class RouterReplay:
         self.layer_number: Optional[int] = None
         RouterReplay.global_router_replay_instances.append(self)
 
-    def set_target_indices(self, topk_indices: torch.Tensor):
-        """Sets the target topk indices for replay."""
+    def set_target_indices(
+        self, topk_indices: torch.Tensor, replay_mask: Optional[torch.Tensor] = None
+    ):
+        """Set expert indices and an optional per-token replay mask.
+
+        Args:
+            topk_indices: Expert IDs shaped ``[num_tokens, topk]``.
+            replay_mask: Optional token mask. True rows use ``topk_indices``;
+                false rows use the caller's native top-k function. Omitting the
+                mask preserves full replay. Resolved forward routes are retained
+                for backward recomputation, including rows selected natively.
+        """
         self.target_topk_idx = topk_indices
+        self.target_replay_mask = replay_mask
         self.replay_backward_list.append(topk_indices)
+        self.replay_backward_mask_list.append(replay_mask)
 
     def get_recorded_indices(self) -> Optional[torch.Tensor]:
         """Returns the recorded topk indices."""
@@ -182,7 +196,9 @@ class RouterReplay:
         """Clears the recorded and target topk indices."""
         self.recorded_topk_idx = None
         self.target_topk_idx = None
+        self.target_replay_mask = None
         self.replay_backward_list = []
+        self.replay_backward_mask_list = []
 
     def set_router_replay_action(self, router_replay_action: RouterReplayAction):
         """Sets the router replay action for this layer."""
@@ -222,20 +238,39 @@ class RouterReplay:
             )
             self.record_indices(top_indices)
             return probs, top_indices
-        elif self.router_replay_action == RouterReplayAction.REPLAY_FORWARD:
-            top_indices = self.target_topk_idx
-            # Ensure indices are on the correct device
-            top_indices = top_indices.to(scores.device)
-            # Gather the scores for the replayed indices to get the probabilities
-            probs = scores.gather(1, top_indices)
-            return probs, top_indices
-        elif self.router_replay_action == RouterReplayAction.REPLAY_BACKWARD:
-            top_indices = self.replay_backward_list.pop(0)
-            # Ensure indices are on the correct device
-            top_indices = top_indices.to(scores.device)
-            # Gather the scores for the replayed indices to get the probabilities
-            probs = scores.gather(1, top_indices)
-            return probs, top_indices
+        elif self.router_replay_action in (
+            RouterReplayAction.REPLAY_FORWARD,
+            RouterReplayAction.REPLAY_BACKWARD,
+        ):
+            if self.router_replay_action == RouterReplayAction.REPLAY_FORWARD:
+                top_indices, mask = self.target_topk_idx, self.target_replay_mask
+            else:
+                if not self.replay_backward_list:
+                    raise RuntimeError("Router replay backward has no recorded microbatch.")
+                top_indices = self.replay_backward_list.pop(0)
+                mask = self.replay_backward_mask_list.pop(0)
+            if top_indices is None:
+                raise RuntimeError("Router replay requires target expert indices.")
+            top_indices = top_indices.to(device=scores.device, dtype=torch.long)
+            if top_indices.shape != (scores.shape[0], topk):
+                raise ValueError("Replay indices must have shape [num_tokens, topk].")
+            if mask is not None:
+                if mask.numel() != scores.shape[0]:
+                    raise ValueError("Replay mask must have one entry per token.")
+                _, native_indices = default_compute_topk(
+                    scores, topk, num_groups=num_groups, group_topk=group_topk
+                )
+                top_indices = torch.where(
+                    mask.to(device=scores.device, dtype=torch.bool).reshape(-1, 1),
+                    top_indices,
+                    native_indices,
+                )
+            if self.router_replay_action == RouterReplayAction.REPLAY_FORWARD:
+                # Snapshot the actual choices, including unmasked native rows.
+                # Recompute must not make a second routing decision for them.
+                self.replay_backward_list[-1] = top_indices.detach().clone()
+                self.replay_backward_mask_list[-1] = None
+            return scores.gather(1, top_indices), top_indices
         else:
             return default_compute_topk(scores, topk, num_groups, group_topk)
 
