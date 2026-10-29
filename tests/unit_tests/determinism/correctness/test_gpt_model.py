@@ -18,6 +18,7 @@ import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.determinism.bit_exact_runner import BitExactRunner
 from tests.unit_tests.determinism.configs import GPT_CONFIGS, PARALLELISM_CONFIGS, gpt_base
@@ -41,6 +42,7 @@ def build_gpt(overrides, pre_process=True, post_process=True, vp_stage=None, **_
         post_process=post_process,
         vp_stage=vp_stage,
         position_embedding_type="rope",
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     ).cuda()
 
 
