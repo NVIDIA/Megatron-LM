@@ -1,9 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""The inference entry points build their model on the groups that initialize_megatron registered.
+"""In-tree scripts build their model on the groups that initialize_megatron registered.
 
 get_model_for_inference(), get_dynamic_inference_engine() and get_model() build the model on the
-collection they are given. The entry points in this repository pass the registered one,
+collection they are given. The inference entry points, and every other script in this repository
+that calls megatron.training's get_model(), pass the registered one,
 parallel_state.get_registered_process_groups(); a caller that omits it falls back to the global
 grid with a ProcessGroupFallbackWarning. The tests run without torch.distributed, with stand-ins
 for the model builder and the checkpoint loader.
@@ -23,16 +24,10 @@ from megatron.core.process_groups_config import ProcessGroupCollection, ProcessG
 from megatron.inference import utils
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
-# The folders whose code runs inference; tests are not scanned.
+# The folders whose code builds models; tests are not scanned.
 SCANNED_FOLDERS = ("megatron", "examples", "tools", "tasks")
-# The inference entry points, which build their model with get_model() after
-# initialize_megatron() registered the groups of its grid.
-INFERENCE_ENTRY_POINTS = (
-    "examples/inference/**/*.py",
-    "megatron/inference/**/*.py",
-    "tools/run_*.py",
-    "examples/multimodal/run_text_generation.py",
-)
+# The modules that scripts import megatron.training's get_model() from.
+GET_MODEL_MODULES = ("megatron.training", "megatron.training.training")
 # The groups that get_model_for_inference passes to load_checkpoint.
 CHECKPOINT_GROUPS = {
     "tp_group": "tp",
@@ -260,7 +255,12 @@ def _sources():
 
 
 def _passes(call, *arguments):
-    return any(keyword.arg in arguments for keyword in call.keywords)
+    """Whether ``call`` passes one of ``arguments`` by keyword, as something other than None."""
+    return any(
+        keyword.arg in arguments
+        and not (isinstance(keyword.value, ast.Constant) and keyword.value.value is None)
+        for keyword in call.keywords
+    )
 
 
 def test_in_tree_callers_pass_their_collection():
@@ -281,10 +281,133 @@ def test_in_tree_callers_of_the_dynamic_engine_pass_a_model_or_its_groups():
     ] == []
 
 
-def test_the_inference_entry_points_pass_their_collection_to_get_model():
-    """Every get_model() call in the inference entry points passes pg_collection."""
-    paths = [path for pattern in INFERENCE_ENTRY_POINTS for path in REPO_ROOT.glob(pattern)]
-    calls = _calls({"get_model", "_get_model"}, paths)
+def _dotted_name(node):
+    """Return the dotted name of a name or attribute chain, such as ``megatron.training``."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _dotted_name(node.value)
+        return prefix and f"{prefix}.{node.attr}"
+    return None
+
+
+def _imported_module(node, package):
+    """Return the absolute name of the module that the ImportFrom ``node`` imports from.
+
+    A relative import resolves against ``package``, the name parts of the importing file's package.
+    """
+    if not node.level:
+        return node.module
+    parts = package[: max(len(package) - node.level + 1, 0)]
+    return ".".join(parts + ((node.module,) if node.module else ()))
+
+
+def _get_model_calls(path, root=REPO_ROOT):
+    """Return every call of megatron.training's get_model() in ``path``, in line order.
+
+    A call matches under any name that ``path`` imports get_model() or its module as, such as
+    ``get_training_model(...)`` or ``training.get_model(...)``, by an absolute import or by a
+    relative one, which resolves against the package of ``path`` under ``root``; a function of
+    another module that is also named get_model does not.
+    """
+    package = path.relative_to(root).parent.parts
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    functions, modules = set(), set(GET_MODEL_MODULES)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = _imported_module(node, package)
+            for alias in node.names:
+                if module in GET_MODEL_MODULES and alias.name == "get_model":
+                    functions.add(alias.asname or alias.name)
+                elif f"{module}.{alias.name}" in GET_MODEL_MODULES:
+                    modules.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            modules.update(
+                alias.asname
+                for alias in node.names
+                if alias.asname and alias.name in GET_MODEL_MODULES
+            )
+    if ".".join(package + (path.stem,)) == "megatron.training.training":
+        functions.add("get_model")
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (
+            (isinstance(node.func, ast.Name) and node.func.id in functions)
+            or (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get_model"
+                and _dotted_name(node.func.value) in modules
+            )
+        )
+    ]
+    return sorted(calls, key=lambda call: call.lineno)
+
+
+def test_the_get_model_check_sees_every_form_of_the_call(tmp_path):
+    """Aliases and module attributes match, and passing None does not count as a collection."""
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import megatron.training\n"
+        "import megatron.training.training as mtt\n"
+        "from megatron import training\n"
+        "from megatron.training import get_model as build\n"
+        "from examples.post_training.modelopt.convert_model import get_model\n"
+        "build(provider, pg_collection=groups)\n"
+        "build(provider, pg_collection=None)\n"
+        "megatron.training.get_model(provider)\n"
+        "mtt.get_model(provider)\n"
+        "training.get_model(provider)\n"
+        "get_model(provider)\n",
+        encoding="utf-8",
+    )
+
+    calls = _get_model_calls(probe, root=tmp_path)
+
+    assert [(call.lineno, _passes(call, "pg_collection")) for call in calls] == [
+        (6, True),
+        (7, False),
+        (8, False),
+        (9, False),
+        (10, False),
+    ]
+
+
+def test_the_get_model_check_resolves_relative_imports(tmp_path):
+    """A module of the megatron.training package may import get_model() relatively."""
+    package = tmp_path / "megatron" / "training"
+    package.mkdir(parents=True)
+    probe = package / "probe.py"
+    probe.write_text(
+        "from .training import get_model\n"
+        "from . import training\n"
+        "from .. import training as parent\n"
+        "from .checkpointing import get_model as other\n"
+        "get_model(provider)\n"
+        "training.get_model(provider)\n"
+        "parent.get_model(provider)\n"
+        "other(provider)\n",
+        encoding="utf-8",
+    )
+    defining = package / "training.py"
+    defining.write_text("get_model(provider)\n", encoding="utf-8")
+
+    assert [call.lineno for call in _get_model_calls(probe, root=tmp_path)] == [5, 6, 7]
+    assert [call.lineno for call in _get_model_calls(defining, root=tmp_path)] == [1]
+
+
+def test_in_tree_callers_pass_their_collection_to_get_model():
+    """Every call of megatron.training's get_model() outside the tests passes pg_collection.
+
+    The scripts that build their model after initialize_megatron() pass the collection it
+    registered, so none of them falls back to the global grid.
+    """
+    calls = [
+        (f"{path.relative_to(REPO_ROOT)}:{call.lineno}", call)
+        for path in sorted(set(_sources()))
+        for call in _get_model_calls(path)
+    ]
 
     assert calls, "found no call of get_model"
     assert [site for site, call in calls if not _passes(call, "pg_collection")] == []

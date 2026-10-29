@@ -36,6 +36,7 @@ except ImportError:
     _HAS_SHARED_CALIB = False
 from utils import get_hf_tokenizer
 
+from megatron.core.parallel_state import get_registered_process_groups
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -187,9 +188,11 @@ if __name__ == "__main__":
     prune_builder = functools.partial(
         modelopt_gpt_hybrid_builder, disable_moe_grouped_gemm=True
     )
+    # Build the model on the groups that initialize_megatron() registered.
     model = get_model(
         functools.partial(model_provider, prune_builder),
         wrap_with_ddp=False,
+        pg_collection=get_registered_process_groups(),
     )
     unwrapped_model = unwrap_model(model)[0]
     print_rank_0(f"Original Model: {unwrapped_model}")

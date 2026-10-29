@@ -55,6 +55,7 @@ except ImportError:
 
 from utils import build_lm_batch_from_input_ids, get_hf_tokenizer
 
+from megatron.core.parallel_state import get_registered_process_groups
 from megatron.core.utils import get_batch_on_this_cp_rank, unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -498,8 +499,11 @@ if __name__ == "__main__":
 
     tokenizer = get_hf_tokenizer()
 
+    # Build the model on the groups that initialize_megatron() registered.
     model = get_model(
-        functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False
+        functools.partial(model_provider, modelopt_gpt_hybrid_builder),
+        wrap_with_ddp=False,
+        pg_collection=get_registered_process_groups(),
     )
     # The calibration batches are split over the context-parallel group of the model.
     pg_collection = unwrap_model(model)[0].pg_collection
