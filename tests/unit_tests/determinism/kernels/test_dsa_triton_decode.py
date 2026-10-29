@@ -147,8 +147,8 @@ def test_native_decode_matches_training_kernels_and_graph_refresh(head_dim, seed
             max_score_error = max(
                 max_score_error, (scaled_scores - training_scores).abs().max().item()
             )
-        # Online softmax rounds unnormalized BF16 weights before the final scale;
-        # training rounds normalized weights. Keep this budget uniform across shapes.
+        # Blackwell training retains FP32 probabilities; decode rounds BF16 weights
+        # before PV. Keep this budget uniform across shapes.
         torch.testing.assert_close(actual, same_support, atol=3e-3, rtol=2e-2)
         torch.testing.assert_close(actual, expected, atol=3e-3, rtol=2e-2)
         max_output_error = max(
