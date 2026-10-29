@@ -2590,29 +2590,6 @@ class ParamAndGradBuffer:
         for group in self.parameter_groups:
             group.grad_dtype = self._resolve_group_grad_dtype(group, meta_device_init_fp8_params)
 
-        if self.ddp_config.gradient_reduce_div_fusion:
-            # PyTorch uses the first bucket's ReduceOp for the entire coalesced call.
-            # Mixing BF16 (pre-scaled SUM) with other dtypes (PREMUL_SUM) is unsafe.
-            requires_grad_only = (
-                self.only_create_grad_buffer_and_main_weight_buffer_for_param_requires_grad
-            )
-            for bucket_id, bucket_group in self.bucket_to_bucket_group.items():
-                if bucket_id != bucket_group[0]:
-                    continue
-                grad_comm_dtypes = {
-                    self.mp_policy.grad_comm_dtype or self.parameter_groups[i].grad_dtype
-                    for i in bucket_group
-                    if self.parameter_groups[i].requires_grad or not requires_grad_only
-                }
-                if len(grad_comm_dtypes) > 1:
-                    raise ValueError(
-                        "[Megatron-FSDP] gradient_reduce_div_fusion=True is not supported with "
-                        "mixed gradient communication dtypes in a coalesced bucket group "
-                        f"({', '.join(sorted(str(dtype) for dtype in grad_comm_dtypes))}). "
-                        "Set gradient_reduce_div_fusion=False "
-                        "(--no-gradient-reduce-div-fusion) or use a single grad_comm_dtype."
-                    )
-
         if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
             # Double Buffering
             UB_BUFFER_NUM = 2
@@ -4268,6 +4245,9 @@ class GradReducePipeline:
         # many empty bucket requests.
         ddp_config = self.buffer.ddp_config
         mp_policy = self.buffer.mp_policy
+        # Decide before scaling any bucket: PyTorch reuses the first ReduceOp for the
+        # entire coalesced call. Recompute for each launch to honor dtype policy changes.
+        force_sum = self._group_requires_sum(bucket_group)
         if ddp_config.fsdp_double_buffer:
             self._enforce_double_buffer_limit(bucket_group)
 
@@ -4280,7 +4260,8 @@ class GradReducePipeline:
         # DP-Shard Gradient Reduction
         dp_group = self.get_fsdp_buffer(bucket_group[0]).data_parallel_group
         with torch.cuda.stream(reduce_scatter_stream):
-            with _coalescing_manager(dp_group):
+            with ExitStack() as coalescing_stack:
+                coalesced_dtype = None
                 # List of gradient accumulation closure tasks.
                 # (grad_buffer, reduced_grad)
                 grad_accum_closure = []
@@ -4312,6 +4293,17 @@ class GradReducePipeline:
                         )
                     unreduced_grad = unreduced_grad_bucket.data
 
+                    # allreduce_coalesced requires identical tensor dtypes on supported
+                    # PyTorch backends. Keep the group-wide scaling decision, but flush
+                    # all-reduce calls at dtype boundaries. Reduce-scatter supports mixed
+                    # dtypes and can keep the entire group in one coalesced call.
+                    if coalesced_dtype is None or (
+                        bucket_strategy == "no_shard" and unreduced_grad.dtype != coalesced_dtype
+                    ):
+                        coalescing_stack.close()
+                        coalescing_stack.enter_context(_coalescing_manager(dp_group))
+                        coalesced_dtype = unreduced_grad.dtype
+
                     # Pre-scale unsharded bucket gradient and prepare the ReduceOp.
                     scaling_factor = gbuf.gradient_scaling_factor
                     reduce_op = gradient_reduce_preprocessing(
@@ -4319,6 +4311,7 @@ class GradReducePipeline:
                         scaling_factor,
                         ddp_config,
                         group_size=gbuf.data_parallel_group.size(),
+                        force_sum=force_sum,
                     )
 
                     # Gradients are copied into an unsharded buffer under 'no_shard' and
@@ -4394,7 +4387,8 @@ class GradReducePipeline:
                 is_expert_parallel=self.buffer.parameter_groups[bucket_group[0]].is_expert_param
             )
             with torch.cuda.stream(self.outer_fsdp_group_grad_reduce_stream):
-                with _coalescing_manager(outer_fsdp_group):
+                with ExitStack() as coalescing_stack:
+                    coalesced_dtype = None
                     # List of gradient accumulation closure tasks.
                     # (grad_buffer, reduced_grad)
                     grad_accum_closure = []
@@ -4435,6 +4429,15 @@ class GradReducePipeline:
                                 device=unreduced_grad.device,
                                 init_values=unreduced_grad,
                             ).data
+
+                        # The DP-Outer all-reduce has the same dtype restriction as DP-Shard.
+                        if coalesced_dtype is None or (
+                            ddp_config.outer_dp_sharding_strategy == "no_shard"
+                            and unreduced_grad.dtype != coalesced_dtype
+                        ):
+                            coalescing_stack.close()
+                            coalescing_stack.enter_context(_coalescing_manager(outer_fsdp_group))
+                            coalesced_dtype = unreduced_grad.dtype
 
                         # All-reduce or reduce-scatter the DP-Shard gradients across DP-Outer.
                         if ddp_config.outer_dp_sharding_strategy != "no_shard":
@@ -4517,6 +4520,27 @@ class GradReducePipeline:
         for free_up_grad_bucket in free_up_grad_bucket_func.values():
             free_up_grad_bucket()
         return True
+
+    def _group_requires_sum(self, bucket_group: List[int]) -> bool:
+        """Compare reduction metadata within an existing coalescing group."""
+        # Parameter grouping already fixes the process group and collective type.
+        dp_group = self.get_fsdp_buffer(bucket_group[0]).data_parallel_group
+        group_size = dp_group.size()
+        first_metadata = None
+        force_sum = False
+        for bucket_id in bucket_group:
+            gbuf = self.get_fsdp_buffer(bucket_id)
+            metadata = _get_gradient_reduce_metadata(
+                self.buffer.mp_policy.grad_comm_dtype or gbuf.dtype,
+                gbuf.gradient_scaling_factor,
+                self.buffer.ddp_config,
+                group_size,
+            )
+            if first_metadata is None:
+                first_metadata = metadata
+            elif metadata != first_metadata:
+                force_sum = True
+        return force_sum
 
 
 class PrefetchOrder(Enum):
@@ -5104,38 +5128,61 @@ class AllGatherPipeline:
         )
 
 
+class _GradientReduceMetadata(NamedTuple):
+    """Fields that must match when a coalesced call shares one reduction operator."""
+
+    op: torch.distributed.ReduceOp
+    premul_dtype: Optional[torch.dtype] = None
+    premul_factor: Optional[float] = None
+
+
+def _get_gradient_reduce_metadata(dtype, scaling_factor, ddp_config, group_size=None):
+    """Select a reduction without modifying gradients or constructing a custom NCCL op."""
+    if scaling_factor is None:
+        return _GradientReduceMetadata(torch.distributed.ReduceOp.SUM)
+    if ddp_config.average_in_collective:
+        return _GradientReduceMetadata(torch.distributed.ReduceOp.AVG)
+    if group_size != 1 and ddp_config.gradient_reduce_div_fusion and dtype != torch.bfloat16:
+        # Keep BF16 on explicit scaling + SUM, including on older PyTorch backends
+        # whose PREMUL_SUM scalar conversion does not support BF16 correctly.
+        return _GradientReduceMetadata(torch.distributed.ReduceOp.PREMUL_SUM, dtype, scaling_factor)
+    return _GradientReduceMetadata(torch.distributed.ReduceOp.SUM)
+
+
 @torch.no_grad()
-def gradient_reduce_preprocessing(grad_data, scaling_factor, ddp_config, group_size=None):
+def gradient_reduce_preprocessing(
+    grad_data, scaling_factor, ddp_config, group_size=None, *, force_sum=False
+):
     """
     Gradient reduce preprocessing for gradient averaging and gradient scaling.
 
     ``group_size`` is the reduction group's rank count; None skips the one-rank case below.
+    ``force_sum`` explicitly scales this bucket once when its coalesced group cannot
+    share an operator. AVG is represented by scaling by ``1 / group_size``; a None
+    factor still means no scaling, including with per-token loss normalization.
     """
 
     # TODO(@cspades): Clean up this logic in conjunction with
     # gradient reduction arguments: calculate_per_token_loss,
     # and average_in_collective.
-    if scaling_factor is None:
-        # No scaling - use SUM reduction.
+    reduce_op = _get_gradient_reduce_metadata(
+        grad_data.dtype, scaling_factor, ddp_config, group_size
+    ).op
+    if force_sum:
+        if reduce_op == torch.distributed.ReduceOp.AVG:
+            if group_size is None:
+                raise ValueError(
+                    "group_size is required to replace AVG with explicit scaling + SUM"
+                )
+            scaling_factor = 1.0 / group_size
         reduce_op = torch.distributed.ReduceOp.SUM
-    elif ddp_config.average_in_collective:
-        # Scaling overridden by AVG reduction.
-        reduce_op = torch.distributed.ReduceOp.AVG
-    elif group_size == 1:
-        # A reduction over a single rank degenerates into a copy, which does not necessarily
-        # carry the pre-multiplier of a premul-sum reduction, so scale the gradient directly.
-        # The scale is 1/dp_cp_size while the reduction runs over a narrower group, so a
-        # one-rank group arises whenever expert parallelism spans the data parallel domain,
-        # and again under HFSDP when DP-Shard holds a single rank.
-        grad_data.mul_(scaling_factor)
-        reduce_op = torch.distributed.ReduceOp.SUM
-    elif ddp_config.gradient_reduce_div_fusion and grad_data.dtype != torch.bfloat16:
-        # Fused SUM reduction.
+
+    if reduce_op == torch.distributed.ReduceOp.PREMUL_SUM:
         reduce_op = torch.distributed._make_nccl_premul_sum(scaling_factor)
-    else:
-        # Scale gradients with SUM reduction.
+    elif reduce_op == torch.distributed.ReduceOp.SUM and scaling_factor is not None:
+        # Single-rank reductions may degenerate into a copy that ignores PREMUL_SUM.
+        # Explicit scaling also handles BF16 and groups with incompatible operators/factors.
         grad_data.mul_(scaling_factor)
-        reduce_op = torch.distributed.ReduceOp.SUM
 
     return reduce_op
 
