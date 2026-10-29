@@ -191,10 +191,11 @@ def test_finetune_reuses_registered_config(monkeypatch, run_config):
     global_vars._set_timers(args)
     model, optimizer, scheduler = Mock(), Mock(), Mock()
 
-    def setup(*unused):
+    def setup(*unused, pg_collection):
         assert global_vars.get_run_config() is run_config
         return model, optimizer, scheduler
 
+    monkeypatch.setattr(finetune_utils, '_build_pg_collection_from_parallel_state', Mock())
     monkeypatch.setattr(finetune_utils, 'setup_model_and_optimizer', setup)
     callback = Mock()
     finetune_utils.finetune(Mock(), Mock(), end_of_epoch_callback_provider=lambda: callback)
