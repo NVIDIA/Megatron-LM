@@ -22,7 +22,11 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    resolve_gtp_remat_group,
+    warn_global_process_group_fallback,
+)
 from megatron.core.utils import (
     divide,
     get_global_memory_buffer,
@@ -93,21 +97,44 @@ except:
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
 
-def param_is_not_tensor_parallel_duplicate(param, tp_group=None, expert_tp_group=None):
+def param_is_not_tensor_parallel_duplicate(
+    param, tp_group=None, expert_tp_group=None, *, use_global_fallback=True
+):
     """Return whether a parameter contributes to a unique model-parallel shard.
 
     Parameters reduced over expert data parallel groups use the expert tensor-parallel
     group for duplicate filtering. Other parameters use the regular tensor-parallel group.
+
+    Args:
+        param: The parameter to check.
+        tp_group: Tensor-parallel group of the dense parameters.
+        expert_tp_group: Tensor-parallel group of the expert parameters.
+        use_global_fallback: What a ``None`` group means. With ``True``, an expert parameter
+            without ``expert_tp_group`` uses ``tp_group``, and a parameter left without a group
+            reads the global tensor-parallel rank. Callers that took both groups from the
+            owner's ``ProcessGroupCollection`` pass ``False``: ``None`` then marks an axis that
+            is off, so the parameter has no replica along it and is kept. The read of the
+            global rank is deprecated and emits a ``ProcessGroupFallbackWarning``.
     """
     if hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel:
         return True
+    is_expert = not getattr(param, "allreduce", True)
+    if not use_global_fallback:
+        group = expert_tp_group if is_expert else tp_group
+        return group is None or group.rank() == 0
     # allreduce=False marks parameters using the expert topology, so filter duplicates over ETP.
-    if not getattr(param, "allreduce", True) and expert_tp_group is not None:
+    if is_expert and expert_tp_group is not None:
         tp_group = expert_tp_group
     # Prefer provided tp_group when available (new explicit path).
     if tp_group is not None:
         return tp_group.rank() == 0
     # Fallback to legacy global state (back-compat).
+    warn_global_process_group_fallback(
+        "param_is_not_tensor_parallel_duplicate",
+        "expert_tp_group" if is_expert else "tp_group",
+        deprecated_in="0.21",
+        removed_in="0.23",
+    )
     return get_tensor_model_parallel_rank() == 0
 
 
@@ -121,7 +148,9 @@ def copy_gtp_attributes(destination, source):
             setattr(destination, attr, getattr(source, attr))
 
 
-def param_is_not_gtp_duplicate(param, gtp_group=None, expert_gtp_group=None):
+def param_is_not_gtp_duplicate(
+    param, gtp_group=None, expert_gtp_group=None, *, use_global_fallback=True
+):
     """True if the param's grad is counted once across the GTP_remat/EGTP_remat axis.
 
     GTP_remat/EGTP_remat shards are unique per peer (kept); replicated params counted only on
@@ -132,6 +161,12 @@ def param_is_not_gtp_duplicate(param, gtp_group=None, expert_gtp_group=None):
     callers whose axis is the global one: a module carrying its own grid (MIMO builds every
     module's ``gtp_remat`` group in its HyperCommGrid and never initializes the MPU globals)
     reads rank 0 on every rank there, which keeps every replicated param on every peer.
+
+    Callers that took both groups from the owner's ``ProcessGroupCollection`` pass
+    ``use_global_fallback=False``: a ``None`` group then marks a GTP axis that is off, so the
+    param is kept instead of being filtered by the global GTP rank. With
+    ``use_global_fallback=True``, the MPU fallback is deprecated and emits a
+    ``ProcessGroupFallbackWarning``.
     """
     if getattr(param, "is_gtp_weight_remat", False):
         return True
@@ -140,7 +175,15 @@ def param_is_not_gtp_duplicate(param, gtp_group=None, expert_gtp_group=None):
     # Prefer provided group when available (new explicit path).
     if group is not None:
         return group.rank() == 0
+    if not use_global_fallback:
+        return True
     # Fallback to legacy global state (back-compat).
+    warn_global_process_group_fallback(
+        "param_is_not_gtp_duplicate",
+        "expert_gtp_group" if is_expert else "gtp_group",
+        deprecated_in="0.21",
+        removed_in="0.23",
+    )
     if is_expert:
         return get_expert_gtp_weight_remat_rank() == 0
     return get_gtp_weight_remat_rank() == 0

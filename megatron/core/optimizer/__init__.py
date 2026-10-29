@@ -3,7 +3,7 @@ import copy
 import logging
 import warnings
 from collections import defaultdict
-from dataclasses import astuple
+from dataclasses import astuple, fields
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -53,7 +53,7 @@ from megatron.core.optimizer_param_scheduler import (
     combine_param_group_overrides,
     param_group_override_to_tuple,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_process_groups
 from megatron.core.transformer.fsdp_dtensor_checkpoint import (
     get_ep_rank_and_size,
     get_global_unique_param_name,
@@ -79,6 +79,7 @@ from .optimizer import (
     FP32Optimizer,
     MegatronOptimizer,
     param_group_identifier_keys,
+    set_duplicate_filter_groups,
 )
 
 # Subclass aliases kept for backward compatibility; all are OptimizerConfig.
@@ -693,7 +694,9 @@ def _get_megatron_optimizer_based_on_param_groups(
         # factor, so summing it over every rank is correct by construction.
         setattr(optimizer, 'grad_stats_parallel_group', torch.distributed.group.WORLD)
     elif config.fp16 or config.bf16:
-        optimizer = Float16OptimizerWithFloat16Params(optimizer, config, grad_scaler, init_state_fn)
+        optimizer = Float16OptimizerWithFloat16Params(
+            optimizer, config, grad_scaler, init_state_fn, pg_collection=pg_collection
+        )
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
     else:
         # FP32 optimizer.
@@ -703,16 +706,8 @@ def _get_megatron_optimizer_based_on_param_groups(
 
     if pg_collection is None:
         raise ValueError("pg_collection must be resolved by get_megatron_optimizer")
-    tp_group = pg_collection.tp
-    expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
     # TODO(M4): plumb TP groups through optimizer constructors so these setattrs disappear.
-    setattr(optimizer, 'tp_group', tp_group)
-    setattr(optimizer, 'expert_tp_group', expert_tp_group)
-    # The GTP axes this optimizer's params are sharded over. Taken from the collection rather
-    # than MPU because a MIMO module owns its axes through its own grid and leaves the MPU
-    # globals unset, where the duplicate filter would read rank 0 everywhere.
-    setattr(optimizer, 'gtp_group', getattr(pg_collection, 'gtp_remat', None))
-    setattr(optimizer, 'expert_gtp_group', getattr(pg_collection, 'expt_gtp_remat', None))
+    set_duplicate_filter_groups(optimizer, pg_collection)
 
     return optimizer
 
@@ -934,17 +929,12 @@ def _get_megatron_emerging_optimizer(
                 continue
             if config.bf16:
                 optimizer = Float16OptimizerWithFloat16Params(
-                    optimizer, config, None, init_state_fn
+                    optimizer, config, None, init_state_fn, pg_collection=pg_collection
                 )
             else:
                 optimizer = FP32Optimizer(optimizer, config, init_state_fn)
             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
-            tp_group = pg_collection.tp
-            expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
-            setattr(optimizer, 'tp_group', tp_group)
-            setattr(optimizer, 'expert_tp_group', expert_tp_group)
-            setattr(optimizer, 'gtp_group', getattr(pg_collection, 'gtp_remat', None))
-            setattr(optimizer, 'expert_gtp_group', getattr(pg_collection, 'expt_gtp_remat', None))
+            set_duplicate_filter_groups(optimizer, pg_collection)
             results.append(optimizer)
             continue
         else:
@@ -1066,7 +1056,9 @@ def get_megatron_optimizer(
             subsets of parameters (identified by ParamKey).
         use_gloo_process_groups (bool): if false, disable use of Gloo process groups
             in underlying Megatron optimizers.
-        pg_collection: Optional unified process group for distributed training.
+        pg_collection (Optional[ProcessGroupCollection]): process groups of the model that
+            ``model_chunks`` belong to. Omitting it is deprecated: get_megatron_optimizer then
+            warns and builds every group from the global parallel state.
         dump_param_to_param_group_map (Optional[str]): path to dump parameter to param group map.
         param_group_process_group (Optional[torch.distributed.ProcessGroup]): group whose ranks
             must construct aligned optimizer parameter groups. ``None`` preserves WORLD alignment.
@@ -1097,7 +1089,16 @@ def get_megatron_optimizer(
     # construction, so the global-state fallback lives here and nowhere deeper: every helper below
     # receives an explicit collection. See docs/developer/parallel-state-deprecation.md.
     if pg_collection is None:
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        # Build every field, as use_mpu_process_groups() does by default. The optimizers built
+        # below read most of them, and several of their readers treat an unset field
+        # differently from one set to None.
+        pg_collection = resolve_process_groups(
+            None,
+            owner="get_megatron_optimizer",
+            required=[field.name for field in fields(ProcessGroupCollection)],
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
 
     is_mfsdp_v2 = isinstance(model_chunks[0], FullyShardedDataParallelV2)
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
