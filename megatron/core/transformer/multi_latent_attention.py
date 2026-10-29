@@ -932,6 +932,10 @@ class MLASelfAttention(MultiLatentAttention):
         # QKV down projection and layernorm
         # =========================================
         q_compressed, kv_combined = self._qkv_down_projection(hidden_states)
+        # With sequence parallelism, kv_compressed can stay split along the sequence, since the
+        # column-parallel linear_kv_up_proj gathers it. The latent KV cache instead stores every
+        # token's latent on each TP rank (latents are shared by all heads), so when caching
+        # latents, kv_compressed keeps the full sequence, as k_pos_emb does.
         if kv_combined.size(-1) != self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim:
             # kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim)]
             kv_combined = gather_from_tensor_model_parallel_region(kv_combined)
@@ -939,15 +943,20 @@ class MLASelfAttention(MultiLatentAttention):
             kv_compressed, k_pos_emb = torch.split(
                 kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
             )
-            if self.config.sequence_parallel:
+            if self.config.sequence_parallel and not self.cache_mla_latents:
                 # kv_compressed:[s / TP, b, kv_lora_rank]
                 kv_compressed = scatter_to_sequence_parallel_region(kv_compressed)
         else:
+            sequence_parallel = get_pg_size(self.tp_group) > 1 and self.config.sequence_parallel
+            if sequence_parallel and self.cache_mla_latents:
+                # kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim)]
+                kv_combined = gather_from_sequence_parallel_region(kv_combined, group=self.tp_group)
             # kv_compressed:[s / TP, b, kv_lora_rank], k_pos_emb: [s / TP, b, qk_pos_emb_head_dim]
+            # (both [s, ...] if gathered above)
             kv_compressed, k_pos_emb = torch.split(
                 kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
             )
-            if get_pg_size(self.tp_group) > 1 and self.config.sequence_parallel:
+            if sequence_parallel and not self.cache_mla_latents:
                 # k_pos_emb: [s, b, qk_pos_emb_head_dim]
                 k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=self.tp_group)
 
@@ -1345,6 +1354,9 @@ class MLASelfAttention(MultiLatentAttention):
                 # This is used in absorption when we are
                 # uncompressing the KV cache in prefill/mixed stages
                 self.linear_kv_up_proj_linear = linear_kv_up_proj_linear
+                # The cache holds every token's latent on each TP rank, so its up-projection is
+                # local: it must not all-gather its input as a sequence-parallel layer would.
+                self.linear_kv_up_proj_linear.sequence_parallel = False
 
                 kv_up_weight = (
                     self.linear_kv_up_proj.weight
