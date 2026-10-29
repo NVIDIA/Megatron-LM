@@ -97,6 +97,7 @@ def test_block_graph_rotary_survives_train_generation_switch(
         config.inference_cuda_graph_scope = InferenceCudaGraphScope.block
         context = types.SimpleNamespace(
             max_sequence_length=128,
+            max_sequence_length_for_model=128,
             is_static_batching=lambda: False,
             is_dynamic_batching=lambda: True,
             use_flashinfer_fused_rope=False,
@@ -126,6 +127,7 @@ def test_block_graph_rotary_survives_train_generation_switch(
             graphs = []
             for seq_len in (64, 128, 64):
                 context.max_sequence_length = seq_len
+                context.max_sequence_length_for_model = seq_len
                 # Capture must retain the same constant used by warmup.
                 ref = weakref.ref(forward(context))
                 expected = forward(context) + 1
@@ -165,6 +167,7 @@ def test_block_graph_rotary_survives_train_generation_switch(
         with torch.inference_mode():
             for seq_len, ref, graph, output, expected in graphs:
                 context.max_sequence_length = seq_len
+                context.max_sequence_length_for_model = seq_len
                 torch.testing.assert_close(forward(context), ref(), rtol=0, atol=0)
                 graph.replay()
                 torch.testing.assert_close(output, expected, rtol=0, atol=0)
