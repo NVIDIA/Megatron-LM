@@ -25,7 +25,7 @@ from megatron.core.extensions.transformer_engine import (
     TERowParallelLinear,
 )
 from megatron.core.parallel_state import get_tensor_model_parallel_group
-from megatron.core.process_groups_config import warn_global_process_group_fallback
+from megatron.core.process_groups_config import global_process_group_fallback
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import DotProductAttention
@@ -99,13 +99,13 @@ class InternViTRMSNorm(MegatronModule):
     def _resolve_tp_group(self):
         """Return the tensor-parallel group, falling back to the global one if none was given."""
         if self.tp_group is None:
-            warn_global_process_group_fallback(
+            with global_process_group_fallback(
                 "examples.multimodal.nvlm.internvit.InternViTRMSNorm",
                 "tp_group",
                 deprecated_in="0.21",
                 removed_in="0.23",
-            )
-            self.tp_group = get_tensor_model_parallel_group()
+            ):
+                self.tp_group = get_tensor_model_parallel_group()
         return self.tp_group
 
     def _norm(self, x, var):

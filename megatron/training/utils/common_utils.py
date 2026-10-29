@@ -42,7 +42,7 @@ from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_
 from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
-    warn_global_process_group_fallback,
+    global_process_group_fallback,
 )
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.core.transformer.module import param_is_not_shared
@@ -142,20 +142,20 @@ def calc_params_l2_norm(
     moe_gtp_sharded_params_data = []  # MoE-GTP_remat sharded → expert_dp
 
     if pg_collection is None:
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "calc_params_l2_norm", deprecated_in="0.21", removed_in="0.23"
-        )
-        gtp_rank = mpu.get_gtp_weight_remat_rank()
-        egtp_rank = mpu.get_expert_gtp_weight_remat_rank()
-        tp_group = mpu.get_tensor_model_parallel_group()
-        expert_tp_group = mpu.get_expert_tensor_parallel_group()
-        dp_cp_group = mpu.get_data_parallel_group(
-            with_context_parallel=True, with_gtp_remat=False
-        )
-        expert_dp_group = mpu.get_expert_data_parallel_group(with_gtp_remat=False)
-        expert_gtp_group = mpu.get_expert_gtp_weight_remat_group()
-        dense_reduce_group = mpu.get_model_parallel_group()
-        expert_reduce_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
+        ):
+            gtp_rank = mpu.get_gtp_weight_remat_rank()
+            egtp_rank = mpu.get_expert_gtp_weight_remat_rank()
+            tp_group = mpu.get_tensor_model_parallel_group()
+            expert_tp_group = mpu.get_expert_tensor_parallel_group()
+            dp_cp_group = mpu.get_data_parallel_group(
+                with_context_parallel=True, with_gtp_remat=False
+            )
+            expert_dp_group = mpu.get_expert_data_parallel_group(with_gtp_remat=False)
+            expert_gtp_group = mpu.get_expert_gtp_weight_remat_group()
+            dense_reduce_group = mpu.get_model_parallel_group()
+            expert_reduce_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
     else:
         gtp_rank = get_pg_rank(pg_collection.gtp_remat)
         egtp_rank = get_pg_rank(pg_collection.expt_gtp_remat)
@@ -362,13 +362,13 @@ def average_losses_across_data_parallel_group(
         mpu.get_data_parallel_group() is used instead, with a ProcessGroupFallbackWarning.
     """
     if group is None:
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "average_losses_across_data_parallel_group",
             "group",
             deprecated_in="0.21",
             removed_in="0.23",
-        )
-        group = mpu.get_data_parallel_group()
+        ):
+            group = mpu.get_data_parallel_group()
     averaged_losses = torch.cat([loss.clone().detach().view(1) for loss in losses])
     torch.distributed.all_reduce(averaged_losses, group=group)
     averaged_losses = averaged_losses / group.size()
@@ -390,13 +390,13 @@ def reduce_max_stat_across_model_parallel_group(
         mpu.get_model_parallel_group() is used instead, with a ProcessGroupFallbackWarning.
     """
     if group is None:
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "reduce_max_stat_across_model_parallel_group",
             "group",
             deprecated_in="0.21",
             removed_in="0.23",
-        )
-        group = mpu.get_model_parallel_group()
+        ):
+            group = mpu.get_model_parallel_group()
     if stat is None:
         stat = -1.0
     stat = torch.tensor([stat], dtype=torch.float32, device=torch.cuda.current_device())
@@ -418,13 +418,13 @@ def logical_and_across_model_parallel_group(
         mpu.get_model_parallel_group() is used instead, with a ProcessGroupFallbackWarning.
     """
     if group is None:
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "logical_and_across_model_parallel_group",
             "group",
             deprecated_in="0.21",
             removed_in="0.23",
-        )
-        group = mpu.get_model_parallel_group()
+        ):
+            group = mpu.get_model_parallel_group()
     if input is True:
         input = 1
     else:
@@ -451,10 +451,10 @@ def report_memory(name, process_group=None):
     if cfg.logger.log_device_memory_used:
         string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
     if process_group is None:
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "report_memory", "process_group", deprecated_in="0.21", removed_in="0.23"
-        )
-        is_dp_rank_0 = mpu.get_data_parallel_rank() == 0
+        ):
+            is_dp_rank_0 = mpu.get_data_parallel_rank() == 0
     else:
         is_dp_rank_0 = get_pg_rank(process_group) == 0
     if is_dp_rank_0:
@@ -658,16 +658,14 @@ def is_first_or_last_pipeline_stage(vp_stage, pp_group=None, vp_size=None):
             is_first_stage = is_first_stage and vp_stage == 0
             is_last_stage = is_last_stage and vp_stage == vp_size - 1
         return is_first_stage or is_last_stage
-    warn_global_process_group_fallback(
-        "is_first_or_last_pipeline_stage", "pp_group", deprecated_in="0.21", removed_in="0.23"
-    )
     ignore_virtual = True
     if vp_stage is not None:
         ignore_virtual = False
-    return (
-        mpu.is_pipeline_first_stage(ignore_virtual=ignore_virtual, vp_stage=vp_stage)
-        or mpu.is_pipeline_last_stage(ignore_virtual=ignore_virtual, vp_stage=vp_stage)
-    )
+    with global_process_group_fallback(
+        "is_first_or_last_pipeline_stage", "pp_group", deprecated_in="0.21", removed_in="0.23"
+    ):
+        first = mpu.is_pipeline_first_stage(ignore_virtual=ignore_virtual, vp_stage=vp_stage)
+        return first or mpu.is_pipeline_last_stage(ignore_virtual=ignore_virtual, vp_stage=vp_stage)
 
 
 def get_device_arch_version():

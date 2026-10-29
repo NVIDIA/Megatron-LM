@@ -17,11 +17,11 @@ from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_trai
 from megatron.core.fusions.fused_bias_geglu import bias_geglu
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
-from megatron.core.parallel_state import create_group
+from megatron.core.parallel_state import ParallelStateDeprecationWarning, create_group
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     enable_strict_process_group_fallbacks,
-    warn_global_process_group_fallback,
+    global_process_group_fallback,
 )
 from megatron.core.rerun_state_machine import (
     RerunDiagnostic,
@@ -218,11 +218,15 @@ def initialize_megatron(
         # TODO is this still a necessary option?
         args.use_cpu_initialization = True
         # delayed initialization of DDP-related stuff
-        # We only set basic DDP globals
-        mpu.set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
+        # We only set basic DDP globals. Until the external DDP manager builds the grid, these
+        # overrides are the only source of the tensor-parallel size and rank; setting them is
+        # part of bootstrap, so the deprecation of the setters does not warn here.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ParallelStateDeprecationWarning)
+            mpu.set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
+            mpu.set_tensor_model_parallel_rank(args.rank)
         # and return function for external DDP manager
         # to call when it has DDP initialized
-        mpu.set_tensor_model_parallel_rank(args.rank)
         return finish_mpu_init
     else:
         # Megatron's MPU is the master. Complete initialization right away.
@@ -568,16 +572,23 @@ def _set_random_seed(
                     "pg_collection must set pp, and dp_gtp_remat when "
                     "data_parallel_random_init is set, to seed the random number generators"
                 )
-        elif pp_group is None or (data_parallel_random_init and dp_group is None):
-            warn_global_process_group_fallback(
+        # Ensure that different pipeline MP stages get different seeds, and with
+        # data_parallel_random_init different data parallel ranks too.
+        pp_rank = get_pg_rank(pp_group) if pp_group is not None else None
+        dp_rank = None
+        if data_parallel_random_init and dp_group is not None:
+            dp_rank = get_pg_rank(dp_group)
+        if pp_rank is None or (data_parallel_random_init and dp_rank is None):
+            # The ranks that no group gives come from the global parallel grid.
+            with global_process_group_fallback(
                 "_set_random_seed", deprecated_in="0.21", removed_in="0.23"
-            )
-        # Ensure that different pipeline MP stages get different seeds.
-        pp_rank = get_pg_rank(pp_group) if pp_group is not None else mpu.get_pipeline_model_parallel_rank()
+            ):
+                if pp_rank is None:
+                    pp_rank = mpu.get_pipeline_model_parallel_rank()
+                if data_parallel_random_init and dp_rank is None:
+                    dp_rank = mpu.get_data_parallel_rank()
         seed = seed_ + (100 * pp_rank)
-        # Ensure different data parallel ranks get different seeds
         if data_parallel_random_init:
-            dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
             seed = seed + (10 * dp_rank)
         random.seed(seed)
         np.random.seed(seed)
@@ -744,10 +755,10 @@ def _warmup_jit_function(tp_size=None):
     # relative to the historical behavior encoded in the golden values.
     if args.sequence_parallel:
         if tp_size is None:
-            warn_global_process_group_fallback(
+            with global_process_group_fallback(
                 "set_jit_fusion_options", "tp_size", deprecated_in="0.21", removed_in="0.23"
-            )
-            tp_size = mpu.get_tensor_model_parallel_world_size()
+            ):
+                tp_size = mpu.get_tensor_model_parallel_world_size()
         seq_length = args.seq_length // tp_size
     else:
         seq_length = args.seq_length

@@ -49,6 +49,7 @@ from megatron.core import parallel_state as mpu
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
+    global_process_group_fallback,
     warn_global_process_group_fallback,
 )
 from megatron.training import get_args, get_train_state
@@ -241,10 +242,10 @@ def _broadcast_without_pp(
     if not (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1):
         return factory()
     if tp_dp_cp_group is None:
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "_broadcast_without_pp", "tp_dp_cp_group", deprecated_in="0.21", removed_in="0.23"
-        )
-        tp_dp_cp_group = mpu.get_tensor_and_data_parallel_group(with_context_parallel=True)
+        ):
+            tp_dp_cp_group = mpu.get_tensor_and_data_parallel_group(with_context_parallel=True)
     src = dist.get_process_group_ranks(tp_dp_cp_group)[0]
     payload = [factory() if dist.get_rank() == src else None]
     dist.broadcast_object_list(payload, src=src, group=tp_dp_cp_group)

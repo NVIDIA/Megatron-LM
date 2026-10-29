@@ -6,8 +6,9 @@ Every group, rank and size accessor, pipeline-stage predicate, virtual-pipeline 
 setter, rank and size override, and memory-buffer alias emits a ParallelStateDeprecationWarning
 once per call site. The warning names its replacement and the releases that deprecate and remove
 the function. Bootstrap, teardown and the registry do not warn, and neither do Megatron Core's
-own compatibility fallbacks, which report a single ProcessGroupFallbackWarning instead. Strict
-process-group fallbacks leave the accessor warning a warning.
+own compatibility fallbacks, which report a single ProcessGroupFallbackWarning instead; the
+fallbacks of training read the grid in a global_process_group_fallback() block to the same
+effect. Strict process-group fallbacks leave the accessor warning a warning.
 
 The CPU tests run without torch.distributed. The tests on the standard grid need GPUs; they use
 a TP2 x PP2 grid on 4 or more ranks, and smaller grids otherwise.
@@ -15,9 +16,11 @@ a TP2 x PP2 grid on 4 or more ranks, and smaller grids otherwise.
 
 import contextlib
 import inspect
+import os
 import re
 import threading
 import warnings
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -32,6 +35,12 @@ from megatron.core.process_groups_config import (
     resolve_process_groups,
 )
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
+from megatron.training import checkpointing
+from megatron.training.utils.common_utils import (
+    average_losses_across_data_parallel_group,
+    is_first_or_last_pipeline_stage,
+)
+from tasks import finetune_utils
 from tests.unit_tests.test_utilities import Utils
 
 VERSIONS = "is deprecated since Megatron Core 0.21 and will be removed in 0.23."
@@ -515,6 +524,51 @@ def test_strict_fallbacks_raise_but_leave_the_accessor_warning_a_warning():
     ]
 
 
+def test_training_fallbacks_read_the_overrides_without_accessor_warnings(monkeypatch):
+    """Training's fallbacks keep the accessors' semantics, including the rank and size
+    overrides, and report the fallback once instead of each accessor they call."""
+    for name, value in (
+        ("_MPU_TENSOR_MODEL_PARALLEL_RANK", 1),
+        ("_MPU_PIPELINE_MODEL_PARALLEL_RANK", 2),
+        ("_MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE", 4),
+        ("_MPU_EXPERT_MODEL_PARALLEL_RANK", 3),
+        ("_MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE", 4),
+    ):
+        monkeypatch.setattr(parallel_state, name, value)
+
+    with _recorded_warnings() as record:
+        name = checkpointing.get_checkpoint_name("ckpt", 5)
+        on_first_or_last_stage = is_first_or_last_pipeline_stage(None)
+
+    assert name == os.path.join("ckpt", "iter_0000005", "mp_rank_01_002_003", "model_optim_rng.pt")
+    assert not on_first_or_last_stage
+    assert _fallbacks(record) == [
+        ("get_checkpoint_name", "pg_collection"),
+        ("is_first_or_last_pipeline_stage", "pp_group"),
+    ]
+    assert _deprecated_calls(record) == []
+
+
+@pytest.mark.parametrize("fields", [("dp_gtp_remat", "dp"), ("dp",)])
+def test_finetuning_samples_over_the_registered_grid(monkeypatch, fields):
+    """The finetuning data loader splits the data over the data-parallel group of the grid that
+    initialize_megatron() registered, and reads no deprecated function. As in pretraining, a
+    collection without dp_gtp_remat, which predates that field, splits it over dp."""
+    sampled, *others = fields
+    pg_collection = ProcessGroupCollection(
+        **{sampled: Mock(**{"size.return_value": 4, "rank.return_value": 3})},
+        **{field: Mock(**{"size.return_value": 2, "rank.return_value": 1}) for field in others},
+    )
+    monkeypatch.setattr(parallel_state, "_REGISTERED_PROCESS_GROUPS", pg_collection)
+
+    with _recorded_warnings() as record:
+        data_loader = finetune_utils.build_data_loader(range(8), 2, 0, drop_last=False)
+
+    assert (data_loader.sampler.num_replicas, data_loader.sampler.rank) == (4, 3)
+    assert _deprecated_calls(record) == []
+    assert _fallbacks(record) == []
+
+
 @requires_grid
 class TestStandardGrid:
     """On the standard grid, bootstrap and fallbacks report no accessor warning."""
@@ -574,3 +628,28 @@ class TestStandardGrid:
         assert _deprecated_calls(record) == []
         global_tp_group = parallel_state.get_tensor_model_parallel_group()
         assert pg_collection.tp is tp_group is shim.tp is global_tp_group
+
+    def test_training_fallbacks_match_the_model_groups(self):
+        """Without groups, training helpers read the same grid, with one warning each."""
+        self._initialize()
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        loss = torch.full((1,), float(torch.distributed.get_rank()), device="cuda")
+        with _recorded_warnings() as record:
+            name = checkpointing.get_checkpoint_name("ckpt", 1)
+            on_first_or_last_stage = is_first_or_last_pipeline_stage(None)
+            averaged = average_losses_across_data_parallel_group([loss])
+
+        assert _fallbacks(record) == [
+            ("get_checkpoint_name", "pg_collection"),
+            ("is_first_or_last_pipeline_stage", "pp_group"),
+            ("average_losses_across_data_parallel_group", "group"),
+        ]
+        assert _deprecated_calls(record) == []
+        assert name == checkpointing.get_checkpoint_name("ckpt", 1, pg_collection=pg_collection)
+        assert on_first_or_last_stage == is_first_or_last_pipeline_stage(
+            None, pp_group=pg_collection.pp
+        )
+        torch.testing.assert_close(
+            averaged,
+            average_losses_across_data_parallel_group([loss], group=pg_collection.dp_gtp_remat),
+        )

@@ -10,7 +10,7 @@ from megatron.core import mpu
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
-    warn_global_process_group_fallback,
+    global_process_group_fallback,
 )
 
 # Optional per-iteration packed SFT statistics. Individual sample lengths are
@@ -50,14 +50,15 @@ def update_packed_sequence_stats(
         ):
             return
     elif torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "update_packed_sequence_stats", deprecated_in="0.21", removed_in="0.23"
-        )
-        if (
-            not mpu.is_pipeline_last_stage(ignore_virtual=True)
-            or mpu.get_tensor_model_parallel_rank() != 0
-            or mpu.get_context_parallel_rank() != 0
         ):
+            contributes = (
+                mpu.is_pipeline_last_stage(ignore_virtual=True)
+                and mpu.get_tensor_model_parallel_rank() == 0
+                and mpu.get_context_parallel_rank() == 0
+            )
+        if not contributes:
             return
 
     device = (

@@ -111,6 +111,7 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
+    global_process_group_fallback,
     warn_global_process_group_fallback,
 )
 from megatron.core.rerun_state_machine import (
@@ -818,13 +819,13 @@ def consume_seqlen_stats_in_iteration(
         torch.distributed.all_reduce(t)
         dedup = pg_collection.tp.size() * pg_collection.cp.size() * pg_collection.pp.size()
     elif torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "consume_seqlen_stats_in_iteration", deprecated_in="0.21", removed_in="0.23"
-        )
+        ):
+            tp_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
+            cp_size = max(mpu.get_context_parallel_world_size(), 1)
+            pp_size = max(mpu.get_pipeline_model_parallel_world_size(), 1)
         torch.distributed.all_reduce(t)
-        tp_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
-        cp_size = max(mpu.get_context_parallel_world_size(), 1)
-        pp_size = max(mpu.get_pipeline_model_parallel_world_size(), 1)
         dedup = tp_size * cp_size * pp_size
     else:
         # No model-parallel state -> treat as a single rank, no reduction.
@@ -2870,8 +2871,8 @@ def _get_data_parallel_group(pg_collection, *, with_context_parallel, owner):
             ranks that read distinct data, or does not set the replicate group either.
     """
     if pg_collection is None:
-        warn_global_process_group_fallback(owner, deprecated_in="0.21", removed_in="0.23")
-        return mpu.get_data_parallel_group(with_context_parallel=with_context_parallel)
+        with global_process_group_fallback(owner, deprecated_in="0.21", removed_in="0.23"):
+            return mpu.get_data_parallel_group(with_context_parallel=with_context_parallel)
     if with_context_parallel:
         name, replicate_name = "dp_cp_gtp_remat", "dp_cp"
     else:
@@ -4833,8 +4834,8 @@ def _get_data_parallel_world_size(pg_collection, args):
             raise ValueError("The training process groups must include dp_gtp_remat")
         return sample_group.size()
     if mpu.model_parallel_is_initialized():
-        warn_global_process_group_fallback("train", deprecated_in="0.21", removed_in="0.23")
-        return mpu.get_data_parallel_world_size()
+        with global_process_group_fallback("train", deprecated_in="0.21", removed_in="0.23"):
+            return mpu.get_data_parallel_world_size()
     # Bootstrap fallback before process groups are initialized.
     return get_batch_parallel_size(args)
 
@@ -6361,10 +6362,10 @@ def build_train_valid_test_data_loaders(
     if is_distributed:
         build_data_pipeline = True
     elif pg_collection is None:
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "build_train_valid_test_data_loaders", deprecated_in="0.21", removed_in="0.23"
-        )
-        build_data_pipeline = mpu.get_tensor_model_parallel_rank() == 0
+        ):
+            build_data_pipeline = mpu.get_tensor_model_parallel_rank() == 0
     else:
         build_data_pipeline = get_pg_rank(pg_collection.tp) == 0
     if build_data_pipeline:

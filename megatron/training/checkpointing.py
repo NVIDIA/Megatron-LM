@@ -52,6 +52,7 @@ from megatron.core.post_training.modelopt.checkpointing import (
 from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
+    global_process_group_fallback,
     require_process_groups,
     warn_global_process_group_fallback,
 )
@@ -297,6 +298,15 @@ def _warn_global_grid_fallback(owner, argument):
     warn_global_process_group_fallback(owner, argument, deprecated_in='0.21', removed_in='0.23')
 
 
+def _global_grid_fallback(owner, argument):
+    """Warn as ``_warn_global_grid_fallback`` does, and return a block that reads the grid.
+
+    The accessors of ``mpu`` called in the block belong to this fallback, so they do not warn
+    again.
+    """
+    return global_process_group_fallback(owner, argument, deprecated_in='0.21', removed_in='0.23')
+
+
 def _dp_cp_group_or_global(dp_cp_group, owner):
     """Return ``dp_cp_group``, or warn and return the global data- and context-parallel group.
 
@@ -305,8 +315,8 @@ def _dp_cp_group_or_global(dp_cp_group, owner):
     """
     if dp_cp_group is not None:
         return dp_cp_group
-    _warn_global_grid_fallback(owner, 'dp_cp_group')
-    return mpu.get_data_parallel_group(with_context_parallel=True)
+    with _global_grid_fallback(owner, 'dp_cp_group'):
+        return mpu.get_data_parallel_group(with_context_parallel=True)
 
 
 def _checkpoint_pg_collection(model, pg_collection, owner):
@@ -397,17 +407,17 @@ def get_checkpoint_name(
         value is None
         for value in (pipeline_parallel, tensor_rank, pipeline_rank, expert_parallel, expert_rank)
     ):
-        _warn_global_grid_fallback('get_checkpoint_name', 'pg_collection')
-    if pipeline_parallel is None:
-        pipeline_parallel = mpu.get_pipeline_model_parallel_world_size() > 1
-    if tensor_rank is None:
-        tensor_rank = mpu.get_tensor_model_parallel_rank()
-    if pipeline_rank is None:
-        pipeline_rank = mpu.get_pipeline_model_parallel_rank()
-    if expert_parallel is None:
-        expert_parallel = mpu.get_expert_model_parallel_world_size() > 1
-    if expert_rank is None:
-        expert_rank = mpu.get_expert_model_parallel_rank()
+        with _global_grid_fallback('get_checkpoint_name', 'pg_collection'):
+            if pipeline_parallel is None:
+                pipeline_parallel = mpu.get_pipeline_model_parallel_world_size() > 1
+            if tensor_rank is None:
+                tensor_rank = mpu.get_tensor_model_parallel_rank()
+            if pipeline_rank is None:
+                pipeline_rank = mpu.get_pipeline_model_parallel_rank()
+            if expert_parallel is None:
+                expert_parallel = mpu.get_expert_model_parallel_world_size() > 1
+            if expert_rank is None:
+                expert_rank = mpu.get_expert_model_parallel_rank()
 
     # Use both the tensor and pipeline MP rank. If using the distributed
     # optimizer, then the optimizer's path must additionally include the
@@ -624,18 +634,17 @@ def get_rng_state(
     }
 
     if dp_group is None:
-        _warn_global_grid_fallback('get_rng_state', 'dp_group')
-    dp_world_size = (
-        get_pg_size(dp_group) if dp_group is not None else mpu.get_data_parallel_world_size()
-    )
+        with _global_grid_fallback('get_rng_state', 'dp_group'):
+            dp_world_size = mpu.get_data_parallel_world_size()
+    else:
+        dp_world_size = get_pg_size(dp_group)
     rng_state_list = None
     if cfg.rng.data_parallel_random_init and torch.distributed.is_initialized() and dp_world_size > 1:
+        if dp_group is None:
+            with _global_grid_fallback('get_rng_state', 'dp_group'):
+                dp_group = mpu.get_data_parallel_group()
         rng_state_list = [None for i in range(dp_world_size)]
-        torch.distributed.all_gather_object(
-            rng_state_list,
-            rng_state,
-            group=dp_group if dp_group is not None else mpu.get_data_parallel_group(),
-        )
+        torch.distributed.all_gather_object(rng_state_list, rng_state, group=dp_group)
     else:
         rng_state_list = [rng_state]
 
@@ -751,13 +760,13 @@ def save_grads(
     )
 
     if pg_collection is None:
-        _warn_global_grid_fallback('save_grads', 'pg_collection')
-        expt_dp_rank = mpu.get_expert_data_parallel_rank()
-        tp_rank = mpu.get_tensor_model_parallel_rank()
-        pp_rank = mpu.get_pipeline_model_parallel_rank()
-        ep_rank = mpu.get_expert_model_parallel_rank()
-        pipeline_parallel = mpu.get_pipeline_model_parallel_world_size() > 1
-        expert_parallel = mpu.get_expert_model_parallel_world_size() > 1
+        with _global_grid_fallback('save_grads', 'pg_collection'):
+            expt_dp_rank = mpu.get_expert_data_parallel_rank()
+            tp_rank = mpu.get_tensor_model_parallel_rank()
+            pp_rank = mpu.get_pipeline_model_parallel_rank()
+            ep_rank = mpu.get_expert_model_parallel_rank()
+            pipeline_parallel = mpu.get_pipeline_model_parallel_world_size() > 1
+            expert_parallel = mpu.get_expert_model_parallel_world_size() > 1
     else:
         tp_group, pp_group, ep_group, expt_dp_group = require_process_groups(
             pg_collection, ('tp', 'pp', 'ep', 'expt_dp'), owner='save_grads'
@@ -1745,37 +1754,39 @@ def maybe_save_dataloader_state(
             f'Could not find a save_state for the train_iterator of type {type(train_iterator)}'
         )
 
-    # Compatibility fallbacks for callers that omit a group: it comes from the global parallel
-    # grid. Every rank warns before any rank-dependent branch.
-    for argument, group in (
-        ('tp_group', tp_group),
-        ('pp_group', pp_group),
-        ('dp_group', dp_group),
-        ('cp_group', cp_group),
-    ):
-        if group is None:
-            _warn_global_grid_fallback('maybe_save_dataloader_state', argument)
-
-    # An omitted CP group does not require an initialized global grid: without one, the TP0/PP0
-    # ranks write.
+    # Compatibility fallbacks for callers that omit a group: what the group decides comes from
+    # the global parallel grid. Every rank reads it, and so warns, before any rank-dependent
+    # branch.
+    owner = 'maybe_save_dataloader_state'
+    if tp_group is None:
+        with _global_grid_fallback(owner, 'tp_group'):
+            is_first_tp_rank = mpu.get_tensor_model_parallel_rank() == 0
+    else:
+        is_first_tp_rank = get_pg_rank(tp_group) == 0
+    if pp_group is None:
+        with _global_grid_fallback(owner, 'pp_group'):
+            is_first_pp_rank = mpu.is_pipeline_first_stage(ignore_virtual=True)
+            pipeline_parallel = mpu.get_pipeline_model_parallel_world_size() > 1
+    else:
+        is_first_pp_rank = get_pg_rank(pp_group) == 0
+        pipeline_parallel = get_pg_size(pp_group) > 1
+    if dp_group is None:
+        with _global_grid_fallback(owner, 'dp_group'):
+            dp_rank = mpu.get_data_parallel_rank()
+            dp_group = mpu.get_data_parallel_group()
+    else:
+        dp_rank = get_pg_rank(dp_group)
     if cp_group is None:
-        cp_group = mpu.get_context_parallel_group(check_initialized=False)
+        # An omitted CP group does not require an initialized global grid: without one, the
+        # TP0/PP0 ranks write.
+        with _global_grid_fallback(owner, 'cp_group'):
+            cp_group = mpu.get_context_parallel_group(check_initialized=False)
     is_first_cp_rank = cp_group is None or get_pg_rank(cp_group) == 0
 
     # Save dataloader state for each data parallel rank only once.
-    first_rank = (
-        get_pg_rank(pp_group) == 0
-        if pp_group is not None
-        else mpu.is_pipeline_first_stage(ignore_virtual=True)
-    ) and (
-        get_pg_rank(tp_group) == 0
-        if tp_group is not None
-        else mpu.get_tensor_model_parallel_rank() == 0
-    ) and is_first_cp_rank
-    if not first_rank:
+    if not (is_first_pp_rank and is_first_tp_rank and is_first_cp_rank):
         return
 
-    dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
     # A loader that advances a global cursor and slices it by rank returns the same state on
     # every data-parallel rank. It can say so to collapse the per-rank files into a single
     # dprank000 file that every rank restores from.
@@ -1793,11 +1804,7 @@ def maybe_save_dataloader_state(
     data_state_save_path = get_checkpoint_name(
         dataloader_save_path,
         iteration,
-        pipeline_parallel=(
-            get_pg_size(pp_group) > 1
-            if pp_group is not None
-            else mpu.get_pipeline_model_parallel_world_size() > 1
-        ),
+        pipeline_parallel=pipeline_parallel,
         # Dataloader state is sharded only by DP rank. Keep it in the canonical TP0/PP0 directory.
         tensor_rank=0,
         pipeline_rank=0,
@@ -1806,13 +1813,12 @@ def maybe_save_dataloader_state(
         basename=f'train_dataloader_dprank{state_file_rank:03d}.pt',
     )
 
-    data_parallel_group = dp_group if dp_group is not None else mpu.get_data_parallel_group()
-    torch.distributed.barrier(group=data_parallel_group)
+    torch.distributed.barrier(group=dp_group)
 
     if dp_rank == 0:
         ensure_directory_exists(data_state_save_path)
 
-    torch.distributed.barrier(group=data_parallel_group)
+    torch.distributed.barrier(group=dp_group)
 
     if train_dataloader_state_dict is None:
         return
@@ -2250,8 +2256,8 @@ def _load_global_dist_base_checkpoint(
             process_group = _dp_cp_group_or_global(dp_cp_group, '_load_global_dist_base_checkpoint')
         elif args.ckpt_fully_parallel_load_process_group == 'ep_dp':
             if expt_dp_group is None:
-                _warn_global_grid_fallback('_load_global_dist_base_checkpoint', 'expt_dp_group')
-                expt_dp_group = mpu.get_expert_data_parallel_group()
+                with _global_grid_fallback('_load_global_dist_base_checkpoint', 'expt_dp_group'):
+                    expt_dp_group = mpu.get_expert_data_parallel_group()
             process_group = expt_dp_group
         else:
             raise ValueError(
