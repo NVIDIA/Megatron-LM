@@ -594,19 +594,16 @@ def _check_legacy_checkpoint_expert_placement(state_dict, ckpt_type, args):
         return
 
     requested_path = getattr(args, 'moe_expert_placement_path', None)
-    if requested_path is None:
-        return
-
     checkpoint_args = state_dict.get('args', None)
     saved_path = getattr(checkpoint_args, 'moe_expert_placement_path', None)
     saved_placement = getattr(checkpoint_args, 'moe_expert_placement', None)
     requested_placement = getattr(args, 'moe_expert_placement', None)
 
-    if requested_placement is not None and saved_placement == requested_placement:
-        return
     if saved_placement is None and saved_path is not None:
-        if os.path.abspath(saved_path) == os.path.abspath(requested_path):
+        if requested_path and os.path.abspath(saved_path) == os.path.abspath(requested_path):
             return
+    elif saved_placement == requested_placement:
+        return
 
     saved_desc = saved_path if saved_path is not None else '<none>'
     raise RuntimeError(

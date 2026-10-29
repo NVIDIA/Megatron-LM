@@ -168,3 +168,56 @@ class TestExpertPlacementDispatch:
         )
         assert container.moe_layer.token_dispatcher.expert_order_is_identity is True
         container.dispatcher_dropless_test()
+
+    @pytest.mark.internal
+    @pytest.mark.timeout(120)
+    @pytest.mark.parametrize("ep_size", [2, 8])
+    @pytest.mark.parametrize("dedup", [False, True])
+    def test_placed_layer_matches_default_layer(self, ep_size, dedup):
+        """Experts keyed by global id must compute the same layer under any placement."""
+        if Utils.world_size % ep_size != 0:
+            pytest.skip(f"needs a world size divisible by EP={ep_size}")
+        container = MoEModelTestContainer(
+            tp_size=1, ep_size=ep_size, pp_size=1, num_moe_experts=16, moe_router_topk=4
+        )
+        # The fp32 router gate runs through TE's general GEMM, whose rounding can move the
+        # router weight gradient by ~1e-3 when a last-bit difference in the probability
+        # gradient (e.g. the dedup combine's summation order) flips it. An fp64 router
+        # takes the plain torch path and compares at fp32 rounding level.
+        default = container.new_moe_layer(moe_router_dtype="fp64")
+        perm = torch.randperm(16, generator=torch.Generator().manual_seed(0)).tolist()
+        placed = container.new_moe_layer(
+            moe_router_dtype="fp64",
+            moe_expert_placement={"default": None, "layers": {0: perm}},
+            moe_token_dedup=dedup,
+        )
+        layers = (default, placed)
+        assert placed.token_dispatcher.expert_order == perm
+        placed.router.load_state_dict(default.router.state_dict())
+        for layer in layers:
+            for expert, gid in zip(layer.experts.local_experts, layer.local_expert_indices):
+                gen = torch.Generator().manual_seed(gid)
+                for p in expert.parameters():
+                    p.data.copy_(torch.randn(p.shape, generator=gen) * 0.1)
+        gen = torch.Generator(device="cuda").manual_seed(torch.distributed.get_rank())
+        x = torch.randn(32, 2, container.config.hidden_size, device="cuda", generator=gen)
+        grad = torch.randn(x.shape, device="cuda", generator=gen)
+        # Placement (and dedup) only change the order of expert rows and of a token's expert
+        # outputs, so compare at fp32 rounding level with TF32 matmuls off: their
+        # reduced-precision accumulation is order-sensitive at the 1e-3 level.
+        prev_tf32 = torch.backends.cuda.matmul.allow_tf32
+        prev_precision = torch.get_float32_matmul_precision()
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
+        try:
+            results = []
+            for layer in layers:
+                inp = x.clone().requires_grad_()
+                out, _ = layer(inp)
+                out.backward(grad)
+                results.append((out, inp.grad, layer.router.weight.grad))
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = prev_tf32
+            torch.set_float32_matmul_precision(prev_precision)
+        for ref, got in zip(*results):
+            torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-4)
