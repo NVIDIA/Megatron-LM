@@ -1361,9 +1361,14 @@ def _warn_fallback_to_uninitialized_grid(
 ) -> None:
     """Warn that ``owner`` fell back to an uninitialized grid, naming the groups that are None.
 
-    ``pg_collection`` is the collection built from that grid.
+    ``pg_collection`` is the collection built from that grid. A None GTP weight-remat group
+    means that the axis is off, not the WORLD group, so the warning leaves those groups out.
     """
-    none_groups = [name for name, group in vars(pg_collection).items() if group is None]
+    none_groups = [
+        name
+        for name, group in vars(pg_collection).items()
+        if group is None and name not in ("gtp_remat", "expt_gtp_remat")
+    ]
     if not none_groups:
         warn_global_process_group_fallback(
             owner, argument, deprecated_in=deprecated_in, removed_in=removed_in
