@@ -1381,6 +1381,9 @@ class DynamicEngineTestConfig:
     # HybridModel, and only the layer pattern and stack spec (and so the
     # mixer) differ.
     ssm_mixer: str = "mamba"
+    # Main decoder pattern of a hybrid model, with '|' between pipeline stages. None keeps the
+    # default one recurrent, one attention and one MLP layer per stage.
+    hybrid_layer_pattern: Optional[str] = None
     return_log_probs: bool = False
     top_n_logprobs: int = 0
     logprobs_mode: str = "raw_logprobs"
@@ -1756,13 +1759,17 @@ class DynamicInferenceEngineTestBase:
         elif test_config.model_provider == "hybrid":
             is_gdn = test_config.ssm_mixer == "gdn"
             pp_size = test_config.pipeline_model_parallel_size
+            recurrent_symbol = "G" if is_gdn else "M"
+            if test_config.hybrid_layer_pattern is not None:
+                main_pattern = test_config.hybrid_layer_pattern
+            else:
+                # 1 recurrent layer, 1 attention layer, 1 MLP layer per stage.
+                main_pattern = "|".join([recurrent_symbol + "*-"] * min(pp_size, 2))
             # Transformer config.
             transformer_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
                 flash_attention_version=test_config.flash_attention_version,
-                num_layers=(
-                    3 if pp_size == 1 else 6
-                ),  # 1 Mamba layer, 1 attention layer, 1 MLP layer
+                num_layers=len(main_pattern.replace("|", "")),
                 mtp_num_layers=test_config.num_speculative_tokens,
                 mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
                 moe_pad_experts_for_cuda_graph_inference=(
@@ -1821,11 +1828,7 @@ class DynamicInferenceEngineTestBase:
             # When speculative tokens are configured, append MTP depth sections
             # to the hybrid layer pattern so the model creates MTP blocks.
             mtp_suffix = ("/" + test_config.mtp_layer_pattern) * test_config.num_speculative_tokens
-            recurrent_symbol = "G" if is_gdn else "M"
-            if pp_size == 1:
-                mamba_pattern = recurrent_symbol + "*-" + mtp_suffix
-            else:
-                mamba_pattern = recurrent_symbol + "*-|" + recurrent_symbol + "*-" + mtp_suffix
+            mamba_pattern = main_pattern + mtp_suffix
             model = HybridModel(
                 config=transformer_config,
                 hybrid_stack_spec=hybrid_stack_spec_for(test_config.ssm_mixer),
