@@ -2,27 +2,10 @@
   "_comment": "Grandfathered reads of global process-group state in megatron/core. Entries are scope:kind:detail; duplicates count separate calls. This list must only shrink. Remove stale entries with `python tools/check_process_group_usage.py --update`.",
   "allowed": {
     "megatron/core/distributed/finalize_model_grads.py": [
-      "_allreduce_conditional_embedding_grads:accessor:parallel_state.get_pipeline_model_parallel_group",
-      "_allreduce_router_grads:accessor:parallel_state.get_pipeline_model_parallel_group",
-      "_allreduce_router_grads:accessor:parallel_state.get_pipeline_model_parallel_world_size",
-      "_allreduce_word_embedding_grads:accessor:parallel_state.get_embedding_group",
-      "_allreduce_word_embedding_grads:accessor:parallel_state.get_pipeline_model_parallel_group",
-      "finalize_model_grads:accessor:parallel_state.get_data_parallel_group",
-      "finalize_model_grads:accessor:parallel_state.get_embedding_group",
-      "finalize_model_grads:accessor:parallel_state.get_expert_gtp_weight_remat_group",
-      "finalize_model_grads:accessor:parallel_state.get_gtp_weight_remat_group",
-      "finalize_model_grads:accessor:parallel_state.get_pipeline_model_parallel_group",
-      "finalize_model_grads:accessor:parallel_state.get_position_embedding_group",
-      "finalize_model_grads:accessor:parallel_state.get_tensor_and_data_parallel_group",
-      "finalize_model_grads:accessor:parallel_state.get_tensor_and_data_parallel_group",
-      "finalize_model_grads:accessor:parallel_state.get_tensor_model_parallel_group"
+      "finalize_model_grads:guarded:resolve_process_groups"
     ],
     "megatron/core/distributed/fsdp/mcore_fsdp_adapter.py": [
       "FullyShardedDataParallelV1._init_dist_index:guarded:resolve_process_groups"
-    ],
-    "megatron/core/distributed/param_and_grad_buffer.py": [
-      "_ParamAndGradBuffer.__init__:accessor:parallel_state.get_data_and_context_parallel_group",
-      "_ParamAndGradBuffer.__init__:accessor:parallel_state.get_tensor_model_parallel_group"
     ],
     "megatron/core/distributed/torch_fully_sharded_data_parallel.py": [
       "TorchFullyShardedDataParallel.__init__:guarded:resolve_process_groups"
@@ -138,7 +121,7 @@
       "DSAttention.__init__:shim:use_mpu_process_groups"
     ],
     "megatron/core/transformer/experimental_attention_variant/dsa_gqa.py": [
-      "SimplifiedDSGQAIndexer.__init__:shim:use_mpu_process_groups"
+      "SimplifiedDSGQAIndexer.__init__:guarded:resolve_process_groups"
     ],
     "megatron/core/transformer/fsdp_dtensor_checkpoint.py": [
       "get_ep_layer_offset:guarded:resolve_process_groups"
@@ -197,5 +180,5 @@
       "make_tp_sharded_tensor_for_checkpoint:guarded:resolve_process_groups"
     ]
   },
-  "total": 101
+  "total": 86
 }
