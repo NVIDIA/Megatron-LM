@@ -2875,6 +2875,12 @@ def _add_regularization_args(parser):
                        'The default of 1 keeps the bit-exact per-matrix path; raise '
                        '(e.g. to 32) to cut kernel launches on MoE expert homes at '
                        'the cost of bitwise parity (baddbmm vs addmm rounding).')
+    group.add_argument('--muon-store-param-remainders', action='store_true',
+                       help='Keep each Muon-managed param as its BF16 model param plus an int16 '
+                       'remainder instead of an FP32 main copy (2 bytes per param less; the '
+                       'FP32 main value is rebuilt exactly for each update). Requires '
+                       '--muon-tp-mode layer_sharded, --bf16 and --use-precision-aware-optimizer, '
+                       'which also gives the scalar Adam params BF16-capable states.')
     group.add_argument('--muon-use-syrk', action='store_true',
                        help='Use the Triton SYRK kernel for the symmetric-output '
                        'Newton-Schulz GEMMs in Muon (~1/3 off '

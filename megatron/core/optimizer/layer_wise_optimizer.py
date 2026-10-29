@@ -33,6 +33,7 @@ from .param_layout import (
     pad_param_start,
     pad_to_divisor,
 )
+from .param_remainders import Float16OptimizerWithParamRemainders
 
 logger = logging.getLogger(__name__)
 
@@ -686,7 +687,17 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         f'got {type(opt).__name__}. Do not pre-wrap with Megatron optimizers.'
                     )
                 wrapper = Float16OptimizerWithFloat16Params
-                if (
+                if config.muon_store_param_remainders:
+                    # Muon steps the BF16 params with int16 remainders; no FP32 main params
+                    # and so no grad copy to graph. Param sync must run from the DDP param
+                    # buffer the BF16 params live in.
+                    if not self.use_buffer_param_sync:
+                        raise ValueError(
+                            "muon_store_param_remainders requires the layer-wise param layout "
+                            "(--use-distributed-optimizer with a full param layout)."
+                        )
+                    wrapper = Float16OptimizerWithParamRemainders
+                elif (
                     model_chunks
                     and getattr(get_model_config(model_chunks[0]), "cuda_graph_impl", "none")
                     == "full_iteration"

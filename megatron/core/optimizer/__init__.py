@@ -911,7 +911,9 @@ def _get_megatron_emerging_optimizer(
         )
     # The precision-aware flag reaches the scalar (Adam) DistributedOptimizer below. The emerging
     # optimizer keeps FP32 main params and reads ``.grad``, so it and its LayerWise / Float16
-    # wrappers get a config with the flag off.
+    # wrappers get a config with the flag off -- unless Muon stores param remainders: then it
+    # steps the BF16 params and reads their FP32 grads from ``.decoupled_grad``, whatever the
+    # FP8 recipe, so grad-norm, clipping and zero counting must read them there too.
     emerging_config = config
     if config.use_precision_aware_optimizer:
         if not use_separate_distributed_optimizer:
@@ -920,7 +922,11 @@ def _get_megatron_emerging_optimizer(
                 "layer-wise path with a separate DistributedOptimizer for the scalar params "
                 "(--optimizer muon --use-distributed-optimizer)."
             )
-        emerging_config = config.without_precision_aware_optimizer()
+        if config.muon_store_param_remainders:
+            emerging_config = copy.copy(config)
+            emerging_config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 = True
+        else:
+            emerging_config = config.without_precision_aware_optimizer()
 
     if use_separate_distributed_optimizer and any(
         # A separate DistributedOptimizer with byte-level sharding handles any group

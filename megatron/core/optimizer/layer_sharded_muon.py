@@ -28,6 +28,7 @@ from megatron.core.optimizer.layer_sharded_a2a import (
     route_from_ns_home,
     route_to_ns_home,
 )
+from megatron.core.optimizer.param_remainders import apply_update_with_remainder, merge_main_param
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import (
     get_emerging_optimizers_version,
@@ -389,6 +390,7 @@ class LayerShardedMuon(TensorParallelMuon):
         qkv_split_shapes: list[int] | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
+        store_param_remainders: bool = False,
     ) -> None:
         if not HAVE_EMERGING_OPTIMIZERS:
             raise ImportError(
@@ -462,6 +464,22 @@ class LayerShardedMuon(TensorParallelMuon):
         # param_group index -> (gtp_remat_group, tp_group), overriding the constructor
         # defaults. Set via set_group_process_groups().
         self._group_process_groups: dict[int, tuple] = {}
+        # Step BF16 params whose FP32 main value is the param plus an int16 remainder
+        # (param_remainders.py) instead of FP32 main params: grads are read from
+        # ``param.decoupled_grad`` and every update rebuilds, updates and re-splits the main
+        # value in one fused pass. id(param) -> remainder, set via set_param_remainders().
+        self.store_param_remainders = store_param_remainders
+        self._param_remainders: dict[int, torch.Tensor] = {}
+        if store_param_remainders and (
+            type(self).pre_weight_update_fn_inplace
+            is not TensorParallelMuon.pre_weight_update_fn_inplace
+            or type(self).post_weight_update_fn_inplace
+            is not TensorParallelMuon.post_weight_update_fn_inplace
+        ):
+            raise ValueError(
+                f"{type(self).__name__} overrides the weight-update hooks, which the fused "
+                "store_param_remainders update does not run."
+            )
         # Per-group exchange plan (param specs, homes, a2a routing metadata): a pure
         # function of the group's params, their sharding attributes and the domain sizes,
         # all static across steps; only the tensor packing is per-step. Keyed by the
@@ -486,6 +504,37 @@ class LayerShardedMuon(TensorParallelMuon):
         self._warned_missing_homes = False
         self._plans.clear()
 
+    def set_param_remainders(self, param_remainders: dict[int, torch.Tensor]) -> None:
+        """Set the int16 remainder of each BF16 param (by id) under store_param_remainders.
+        FP32 params have none: they are their own main params."""
+        if not self.store_param_remainders:
+            raise RuntimeError("set_param_remainders() needs store_param_remainders=True.")
+        self._param_remainders = param_remainders
+
+    def _grad(self, p: torch.Tensor) -> torch.Tensor | None:
+        """FP32 gradient of ``p``: ``decoupled_grad`` next to a BF16 param with remainders."""
+        if self.store_param_remainders:
+            return getattr(p, "decoupled_grad", None)
+        return p.grad
+
+    def _defers_weight_decay(self) -> bool:
+        """Under store_param_remainders, weight decay that only rescales the param is applied
+        in the fused update instead (bitwise the same: nothing reads the param in between).
+        L2 decay adds the param to the gradient, so it stays before the momentum update."""
+        return self.store_param_remainders and getattr(self, "weight_decay_method", "l2") != "l2"
+
+    @torch.no_grad()
+    def _init_group(self, group: dict, skip_non_grad_params: bool = True) -> None:
+        if not self.store_param_remainders:
+            return super()._init_group(group, skip_non_grad_params)
+        for p in group["params"]:
+            if skip_non_grad_params and self._grad(p) is None:
+                continue
+            state = self.state[p]
+            if len(state) == 0:
+                # FP32 momentum next to the BF16 param.
+                state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32)
+
     def set_group_process_groups(self, group_process_groups: dict[int, tuple]) -> None:
         """Override the (GTP, TP) process groups per param group.
 
@@ -503,7 +552,9 @@ class LayerShardedMuon(TensorParallelMuon):
         self._warned_shared_domain = False
         self._plans.clear()
 
-    def _apply_update(self, p: torch.Tensor, update: torch.Tensor, lr: float) -> None:
+    def _apply_update(
+        self, p: torch.Tensor, update: torch.Tensor, lr: float, weight_decay: float
+    ) -> None:
         """Apply one weight update through the base-class hook points.
 
         ``OrthogonalizedOptimizer.step()`` brackets every ``p.add_`` with
@@ -518,7 +569,30 @@ class LayerShardedMuon(TensorParallelMuon):
         fallback and than TensorParallelMuon's duplicated mode. TODO: forward
         the ``weight_update_hook`` constructor parameter once the
         emerging-optimizers pin moves past EO #224.
+
+        Under store_param_remainders the FP32 main value of ``p`` is rebuilt from its
+        remainder, takes the deferred weight decay and the update (the same FP32 ops as
+        below, in one fused pass) and is split back; the update hooks must be no-ops then.
         """
+        if self.store_param_remainders:
+            weight_decay_alpha = None
+            if self._defers_weight_decay() and weight_decay != 0.0:
+                weight_decay_alpha = {
+                    "decoupled": -weight_decay * lr,
+                    "independent": -weight_decay,
+                    "palm": -(weight_decay * lr * lr),
+                }[self.weight_decay_method]
+            remainder = self._param_remainders.get(id(p))
+            if remainder is None:
+                # An FP32 param is its own main param: the same two ops, unfused.
+                if weight_decay_alpha is not None:
+                    p.add_(p, alpha=weight_decay_alpha)
+                p.add_(update, alpha=-lr)
+                return
+            apply_update_with_remainder(
+                p, remainder, update, update_alpha=-lr, weight_decay_alpha=weight_decay_alpha
+            )
+            return
         self.pre_weight_update_fn_inplace(p, update)
         p.add_(update, alpha=-lr)
         self.post_weight_update_fn_inplace(p)
@@ -618,6 +692,11 @@ class LayerShardedMuon(TensorParallelMuon):
         # full-matrix Newton-Schulz per param (with the groups from pg_collection).
         # Mathematically correct, just redundant: every rank recomputes every matrix.
         if not self._homes_set:
+            if self.store_param_remainders:
+                raise RuntimeError(
+                    "LayerShardedMuon with store_param_remainders needs set_param_ns_homes() "
+                    "before step(): the TensorParallelMuon fallback updates FP32 params."
+                )
             if not self._warned_no_homes:
                 self._warned_no_homes = True
                 log_single_rank(
@@ -742,7 +821,7 @@ class LayerShardedMuon(TensorParallelMuon):
             lr = group["lr"]
             beta = group["momentum"]
 
-            params = [p for p in group["params"] if p.grad is not None]
+            params = [p for p in group["params"] if self._grad(p) is not None]
             if not params:
                 continue
             plan = self._plan_for(group_index, params, gtp_remat_group, tp_group)
@@ -750,16 +829,24 @@ class LayerShardedMuon(TensorParallelMuon):
             # 1. Momentum update on the local shard.
             with _phase("momentum"):
                 for p in params:
-                    grad = p.grad
+                    grad = self._grad(p)
                     state = self.state[p]
-                    self._apply_weight_decay_inplace(p, grad, lr, group["weight_decay"])
+                    if self.store_param_remainders:
+                        if not self._defers_weight_decay() and group["weight_decay"] != 0.0:
+                            remainder = self._param_remainders.get(id(p))
+                            main_param = p if remainder is None else merge_main_param(p, remainder)
+                            self._apply_weight_decay_inplace(
+                                main_param, grad, lr, group["weight_decay"]
+                            )
+                    else:
+                        self._apply_weight_decay_inplace(p, grad, lr, group["weight_decay"])
                     state["momentum_buffer"].lerp_(grad, 1 - beta)
 
             def ns_input(p):
                 """NS input of ``p``. With nesterov=False it aliases the momentum buffer
                 (``.float()`` is a no-op on fp32); everything below treats it as read-only."""
                 buf = self.state[p]["momentum_buffer"]
-                return (p.grad.lerp(buf, beta) if self.nesterov else buf).float()
+                return (self._grad(p).lerp(buf, beta) if self.nesterov else buf).float()
 
             # 2. Replicated params (whole on every rank of the domain, which is every param
             #    of a single-rank domain): local Newton-Schulz on each rank's own copy,
@@ -770,7 +857,7 @@ class LayerShardedMuon(TensorParallelMuon):
                 with _phase("ns_replicated"), fp32_matmul_precision(self.fp32_matmul_prec):
                     replicated = {i: params[i] for i in plan.replicated}
                     for i, ns_output in self._iter_ns(replicated, load=ns_input):
-                        self._apply_update(params[i], ns_output, lr)
+                        self._apply_update(params[i], ns_output, lr, group["weight_decay"])
                         del ns_output
             if not plan.routed:
                 continue
@@ -911,4 +998,4 @@ class LayerShardedMuon(TensorParallelMuon):
             with _phase("update"):
                 for p, shard in zip(local_param_shards, update_shards):
                     if shard is not None:
-                        self._apply_update(p, shard, lr)
+                        self._apply_update(p, shard, lr, group["weight_decay"])
