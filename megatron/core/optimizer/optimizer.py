@@ -865,31 +865,33 @@ class MegatronOptimizer(ABC):
         # ``test_filter_reorder_distinguishes_groups_by_max_lr``.
         loaded_groups_map = {_identifier_for(group): group for group in state_dict_groups}
 
-        # The zip below pairs current groups with saved ones positionally, so a checkpoint
-        # with FEWER groups than the optimizer silently drops the surplus and returns a short
-        # list -- which torch then rejects, several frames away, with "loaded state dict has a
-        # different number of parameter groups" and no clue as to which group or why. A
-        # checkpoint with MORE groups is fine and intended: this filters down to the ones the
-        # current optimizer has.
-        if len(state_dict_groups) < len(current_groups):
-            # Fewer groups than the optimizer is the pre-split case: one group where there
-            # are now two. Rebuild the missing side rather than pairing positionally, which
-            # would drop the surplus and let torch reject the result several frames away with
-            # "loaded state dict has a different number of parameter groups". A checkpoint
-            # with MORE groups is fine and handled by the loop below, which filters down.
+        # A pre-split checkpoint is missing one specific thing: the indexer group. Both of
+        # today's groups were carved out of a single group written before ``is_dsa_indexer``
+        # existed, so that saved group reads as False for the key and the indexer half of the
+        # split matches nothing. Ask for that group rather than comparing group counts: a
+        # count says only that something is absent, not what, and would send an unrelated
+        # mismatch down the reconstruction path.
+        if any(
+            _is_dsa_indexer_identifier(key) and key not in loaded_groups_map
+            for key in needed_groups
+        ):
             return _expand_pre_split_param_groups(
                 current_groups, needed_groups, loaded_groups_map
             )
 
+        # Every current group has to be in the checkpoint, and that is checked here rather
+        # than inside the loop below because the loop zips against the saved groups: a group
+        # missing from the checkpoint but positioned after the ones it does have would never
+        # be visited, and the short result would be rejected by torch several frames away
+        # with "loaded state dict has a different number of parameter groups" and no clue as
+        # to which group or why. A checkpoint with MORE groups is fine and intended -- the
+        # loop filters down to the ones the current optimizer has.
+        for key in needed_groups:
+            if key not in loaded_groups_map:
+                raise ValueError(_missing_param_group_message(key, loaded_groups_map))
+
         final_groups = []
         for key, params in zip(needed_groups, params_in_state_dict_order):
-            if key not in loaded_groups_map:
-                message = _missing_param_group_message(key, loaded_groups_map)
-                if _is_dsa_indexer_identifier(key):
-                    # The distributed optimizer grandfathers this case; this path cannot.
-                    message += _PRE_SPLIT_CHECKPOINT_HINT
-                raise ValueError(message)
-
             # Update group's parameters to preserve state dict ordering
             group = loaded_groups_map[key]
             group['params'] = params
