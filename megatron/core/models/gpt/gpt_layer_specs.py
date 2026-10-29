@@ -719,10 +719,11 @@ def get_gpt_mtp_block_spec(
     pp_rank: Optional[int] = None,
 ) -> MultiTokenPredictionBlockSubmodules:
     """GPT Multi-Token Prediction (MTP) block spec."""
-    # MTP has only ever used the Transformer Engine or the local backend, never the
-    # inference one, so it does not go through _base_backend_name().
+    # The MTP norms and projection come from the same backend as the decoder layers, as the
+    # final norm does: the local backend's torch norm cannot run under sequence parallelism,
+    # which the inference-optimized layers require at TP > 1.
     backend: BackendSpecProvider = get_backend_from_config(
-        config, transformer_impl="transformer_engine" if use_transformer_engine else "local"
+        config, transformer_impl=_base_backend_name(config, use_transformer_engine)
     )
     return get_gpt_mtp_block_spec_for_backend(
         config=config, spec=spec, backend=backend, vp_stage=vp_stage, pp_rank=pp_rank

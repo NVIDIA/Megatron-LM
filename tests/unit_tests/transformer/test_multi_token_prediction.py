@@ -14,6 +14,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE, _resolve_is_fir
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
+    get_gpt_layer_with_inference_spec,
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
 )
@@ -30,6 +31,7 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
+from megatron.core.tensor_parallel.inference_layers import InferenceColumnParallelLinear
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_checkpoint
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -736,6 +738,38 @@ class TestMultiTokenPredictionLayer:
             assert num_weights == 29664 * config.mtp_num_layers
         elif tp == 4:
             assert num_weights == 15216 * config.mtp_num_layers
+
+    @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
+    @pytest.mark.parametrize('tp', [1, 2])
+    def test_constructor_inference_optimized(self, tp):
+        """The MTP head comes from the inference backend, like the layers it wraps.
+
+        Inference-optimized layers require sequence parallelism at TP > 1, which the local
+        backend's torch norm rejects.
+        """
+        if Utils.world_size < tp:
+            pytest.skip(f"TP={tp} requires at least {tp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+        config = TransformerConfig(
+            mtp_num_layers=2,
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=8,
+            use_cpu_initialization=True,
+            tensor_model_parallel_size=tp,
+            sequence_parallel=tp > 1,
+            transformer_impl="inference_optimized",
+            normalization="RMSNorm",
+            add_bias_linear=False,
+        )
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config=config, spec=get_gpt_layer_with_inference_spec(), use_transformer_engine=False
+        )
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+
+        assert len(mtp.layers) == config.mtp_num_layers
+        for layer in mtp.layers:
+            assert isinstance(layer.eh_proj, InferenceColumnParallelLinear)
 
     @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
     @pytest.mark.parametrize('repeated', [False, True])
