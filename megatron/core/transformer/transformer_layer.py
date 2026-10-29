@@ -1685,7 +1685,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             fc2_next_layer_norm_weights (Optional[Tensor]): Next layer's QKV norm weights
                 for current layer's MLP FC2.
         """
-        self.self_attention.linear_qkv.skip_norm_and_all_gather = skip_qkv_norm_and_all_gather
+        # Only a linear_qkv that applies the input norm can take it over from the previous
+        # layer's FC2. Otherwise (e.g. MLA) get_qkv_layer_norm_weights gives that FC2 no
+        # weights and this layer applies its own input norm.
+        linear_qkv = self._get_layer_norm_linear_qkv()
+        if linear_qkv is not None:
+            linear_qkv.skip_norm_and_all_gather = skip_qkv_norm_and_all_gather
 
         # Use current layer's own MLP FC1 norm weights for attention's/mixer's out_proj
         mlp_fc1_weights = self.get_mlp_layer_norm_weights()
@@ -1702,7 +1707,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
     def _set_fc2_next_layer_norm_weights(self, weights: Optional[Tensor]):
         """Set next layer norm weights for MLP FC2."""
         if weights is None:
-            # Create dummy tensor for last layer (same shape as fc1 norm weights)
+            # Create dummy tensor for the last layer, or when the next layer applies its own
+            # input norm (same shape as fc1 norm weights)
             weights = torch.empty_like(self.get_mlp_layer_norm_weights())
         self.mlp.linear_fc2._set_next_layer_norm_weights(weights)
 
@@ -1723,14 +1729,30 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         """
         return self.mlp.linear_fc1.layer_norm_weight.data
 
-    def get_qkv_layer_norm_weights(self) -> Tensor:
+    def get_qkv_layer_norm_weights(self) -> Optional[Tensor]:
         """
         Get the QKV layer norm weights.
 
         Returns:
-            Tensor: The layer norm weight data.
+            Optional[Tensor]: The layer norm weight data, or None if the attention input
+                norm is not applied by linear_qkv (see _get_layer_norm_linear_qkv).
         """
-        return self.self_attention.linear_qkv.layer_norm_weight.data
+        linear_qkv = self._get_layer_norm_linear_qkv()
+        return linear_qkv.layer_norm_weight.data if linear_qkv is not None else None
+
+    def _get_layer_norm_linear_qkv(self) -> Optional[torch.nn.Module]:
+        """
+        Get the attention's linear_qkv if it applies the input norm itself. Only that norm,
+        with the all-gather after it, can be fused into the previous layer's FC2.
+
+        MLA has no linear_qkv: its input_layernorm is a separate module, and its down
+        projections take the normalized sequence-parallel shard, not the all-gathered input.
+
+        Returns:
+            Optional[torch.nn.Module]: linear_qkv, or None.
+        """
+        linear_qkv = getattr(self.self_attention, "linear_qkv", None)
+        return linear_qkv if hasattr(linear_qkv, "layer_norm_weight") else None
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
