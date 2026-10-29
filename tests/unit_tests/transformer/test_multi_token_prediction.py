@@ -2557,6 +2557,7 @@ class TestMultiTokenPrediction:
         args.mtp_hsm = mtp_hsm
         args.freeze_base_model_for_mtp = freeze_base_model_for_mtp
         args.mtp_loss_scaling_factor = 0.1
+        args.padded_vocab_size = 128800
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.max_position_embeddings = 256
@@ -2601,7 +2602,6 @@ class TestMultiTokenPrediction:
         # Temporary args/config duplication during the training-loop refactor:
         # migrated settings use config; remaining settings still use legacy args.
         cfg = pretrain_cfg_container_from_args(args)
-        cfg.tokenizer.padded_vocab_size = 128800
         cfg.finalize()
         set_run_config(cfg)
         initialize_runtime_services(args, build_tokenizer=False, training=True)
@@ -4285,6 +4285,7 @@ class TestMultiTokenPredictionHybrid:
         args = parse_args()
         args.mtp_num_layers = 2
         args.mtp_loss_scaling_factor = 0.1
+        args.padded_vocab_size = 128800
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.num_query_groups = 8
@@ -4326,7 +4327,6 @@ class TestMultiTokenPredictionHybrid:
         # Temporary args/config duplication during the training-loop refactor:
         # migrated settings use config; remaining settings still use legacy args.
         cfg = pretrain_cfg_container_from_args(args)
-        cfg.tokenizer.padded_vocab_size = 128800
         cfg.finalize()
         set_run_config(cfg)
         initialize_runtime_services(args, build_tokenizer=False, training=True)

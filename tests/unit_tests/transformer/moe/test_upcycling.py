@@ -98,6 +98,7 @@ def create_test_args(tp, grouped_gemm, swiglu, squared_relu, use_te):
     sys.argv = ['test_upcycling.py']
     args = parse_args()
     args.num_layers = 2
+    args.padded_vocab_size = 256
     args.hidden_size = 128
     args.num_attention_heads = 8
     args.max_position_embeddings = 256
@@ -139,7 +140,6 @@ def create_test_args(tp, grouped_gemm, swiglu, squared_relu, use_te):
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     cfg = pretrain_cfg_container_from_args(args)
-    cfg.tokenizer.padded_vocab_size = 256
     cfg.finalize()
     set_run_config(cfg)
     initialize_runtime_services(args, build_tokenizer=False, training=True)
