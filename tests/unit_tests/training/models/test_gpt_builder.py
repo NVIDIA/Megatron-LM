@@ -221,6 +221,8 @@ class TestDefaultLayerSpecDispatch:
             config.transformer.qk_layernorm,
             config.transformer.multi_latent_attention,
             qk_l2_norm=config.transformer.qk_l2_norm,
+            num_experts=None,
+            moe_grouped_gemm=config.transformer.moe_grouped_gemm,
         )
         assert result is spec
 
@@ -860,23 +862,54 @@ class TestMtpBlockSpec:
         assert mock_get_mtp.call_args.args[1] is layer_specs[-1]
         assert result is mock_get_mtp.return_value
 
-    @patch("megatron.training.models.gpt._te_or_local_layer_spec")
+    @patch("megatron.training.models.gpt._backend_layer_spec")
     @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
-    def test_uses_te_or_local_layer_spec_for_empty_layer_specs(
-        self, mock_get_mtp, mock_te_or_local
-    ):
+    def test_uses_backend_layer_spec_for_empty_layer_specs(self, mock_get_mtp, mock_backend_spec):
         config = self._make_config(mtp_num_layers=1)
         spec = TransformerBlockSubmodules(layer_specs=[])
         fallback_spec = Mock(spec=ModuleSpec)
-        mock_te_or_local.return_value = fallback_spec
+        mock_backend_spec.return_value = fallback_spec
         mock_get_mtp.return_value = Mock(spec=ModuleSpec)
 
         mtp_block_spec(config, spec, vp_stage=4, pp_rank=7)
 
-        mock_te_or_local.assert_called_once_with(config, 4)
+        mock_backend_spec.assert_called_once_with(config, 4)
         passed_spec = mock_get_mtp.call_args.args[1]
         assert passed_spec is fallback_spec
         assert mock_get_mtp.call_args.kwargs["pp_rank"] == 7
+
+    @pytest.mark.parametrize(
+        ("transformer_impl", "layer_spec_fn"),
+        [
+            ("transformer_engine", "get_gpt_layer_with_transformer_engine_spec"),
+            ("inference_optimized", "get_gpt_layer_with_inference_spec"),
+            ("local", "get_gpt_layer_local_spec"),
+        ],
+    )
+    @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
+    def test_empty_layer_specs_use_the_decoder_backend(
+        self, mock_get_mtp, transformer_impl, layer_spec_fn
+    ):
+        """An MTP-only pipeline stage builds its MTP layer from the decoder's backend.
+
+        Its MoE block spec has no layer to reuse. An inference-optimized model must still get an
+        inference layer there: a local layer's torch norm rejects the sequence parallelism that
+        inference-optimized layers require at TP > 1.
+        """
+        config = _make_dispatch_config(transformer_impl=transformer_impl, num_moe_experts=4)
+        config.transformer.mtp_num_layers = 1
+
+        with patch(
+            f"megatron.training.models.gpt.{layer_spec_fn}", autospec=True
+        ) as mock_layer_spec_fn:
+            mtp_block_spec(config, TransformerBlockSubmodules(layer_specs=[]), pp_rank=1)
+
+        assert mock_get_mtp.call_args.args[1] is mock_layer_spec_fn.return_value
+        layer_spec_call = mock_layer_spec_fn.call_args
+        layer_spec_args = inspect.signature(mock_layer_spec_fn).bind(
+            *layer_spec_call.args, **layer_spec_call.kwargs
+        )
+        assert layer_spec_args.arguments["num_experts"] == 4
 
     @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
     def test_passes_vp_stage_and_use_te_to_get_gpt_mtp_block_spec(self, mock_get_mtp):

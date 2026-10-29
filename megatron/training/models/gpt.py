@@ -61,11 +61,7 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
     ):
         # MoE models fall through to the shared num_moe_experts branch below;
         # get_gpt_decoder_block_spec already handles the inference_optimized impl.
-        return get_gpt_layer_with_inference_spec(
-            transformer_cfg.qk_layernorm,
-            transformer_cfg.multi_latent_attention,
-            qk_l2_norm=transformer_cfg.qk_l2_norm,
-        )
+        return _backend_layer_spec(config, vp_stage)
     elif config.restore_modelopt_state:
         ## Layer specification for quantization with ModelOpt. ##
 
@@ -98,10 +94,13 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
     elif isinstance(transformer_cfg, HeterogeneousTransformerConfig):
         return get_gpt_heterogeneous_layer_spec(transformer_cfg, use_te)
     else:
-        return _te_or_local_layer_spec(config, vp_stage)
+        return _backend_layer_spec(config, vp_stage)
 
-def _te_or_local_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
-    """Need to be able to call just these branches for mtp transformer layer spec."""
+def _backend_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
+    """A layer spec from the backend that transformer_impl selects, as the decoder block uses.
+
+    Also the MTP layer spec on a pipeline stage that has no decoder layers to take it from.
+    """
 
     transformer_cfg = config.transformer
     use_te = transformer_cfg.transformer_impl == "transformer_engine"
@@ -124,6 +123,14 @@ def _te_or_local_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSp
             mla_down_proj_fusion=getattr(config.transformer, "mla_down_proj_fusion", False),
             use_grouped_gemm_for_dense_mlp=config.transformer.use_grouped_gemm_for_dense_mlp,
             **kwargs,
+        )
+    elif transformer_cfg.transformer_impl == "inference_optimized":
+        return get_gpt_layer_with_inference_spec(
+            transformer_cfg.qk_layernorm,
+            transformer_cfg.multi_latent_attention,
+            qk_l2_norm=transformer_cfg.qk_l2_norm,
+            num_experts=transformer_cfg.num_moe_experts,
+            moe_grouped_gemm=transformer_cfg.moe_grouped_gemm,
         )
     else:
         return get_gpt_layer_local_spec(
@@ -436,7 +443,7 @@ def mtp_block_spec(
                 spec = transformer_layer_spec.layer_specs[-1]
             else:
                 # A pipeline stage with no decoder layers still needs a decoder spec for MTP.
-                spec = _te_or_local_layer_spec(config, vp_stage)
+                spec = _backend_layer_spec(config, vp_stage)
         else:
             spec = transformer_layer_spec
 

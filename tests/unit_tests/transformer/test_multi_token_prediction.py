@@ -172,8 +172,20 @@ class TestMultiTokenPredictionLayer:
         destroy_global_vars()
         destroy_num_microbatches_calculator()
 
-    def _create_config_and_mtp_block_spec(self, tp, cp, use_te=False, use_repeated_layer=False):
+    def _create_config_and_mtp_block_spec(
+        self, tp, cp, use_te=False, use_repeated_layer=False, inference_optimized=False
+    ):
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+        # Inference-optimized layers require RMSNorm and no linear biases.
+        inference_kwargs = (
+            dict(
+                transformer_impl="inference_optimized",
+                normalization="RMSNorm",
+                add_bias_linear=False,
+            )
+            if inference_optimized
+            else {}
+        )
         config = TransformerConfig(
             mtp_num_layers=2,
             num_layers=4,
@@ -184,8 +196,11 @@ class TestMultiTokenPredictionLayer:
             sequence_parallel=True if tp > 1 else False,
             context_parallel_size=cp,  # Enable CP for MTP testing
             mtp_use_repeated_layer=use_repeated_layer,
+            **inference_kwargs,
         )
-        if use_te:
+        if inference_optimized:
+            transformer_layer_spec = get_gpt_layer_with_inference_spec()
+        elif use_te:
             transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec()
         else:
             transformer_layer_spec = get_gpt_layer_local_spec()
@@ -749,27 +764,16 @@ class TestMultiTokenPredictionLayer:
         """
         if Utils.world_size < tp:
             pytest.skip(f"TP={tp} requires at least {tp} ranks")
-        Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
-        config = TransformerConfig(
-            mtp_num_layers=2,
-            num_layers=4,
-            hidden_size=64,
-            num_attention_heads=8,
-            use_cpu_initialization=True,
-            tensor_model_parallel_size=tp,
-            sequence_parallel=tp > 1,
-            transformer_impl="inference_optimized",
-            normalization="RMSNorm",
-            add_bias_linear=False,
-        )
-        mtp_block_spec = get_gpt_mtp_block_spec(
-            config=config, spec=get_gpt_layer_with_inference_spec(), use_transformer_engine=False
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(
+            tp, cp=1, inference_optimized=True
         )
         mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
 
         assert len(mtp.layers) == config.mtp_num_layers
         for layer in mtp.layers:
             assert isinstance(layer.eh_proj, InferenceColumnParallelLinear)
+            # Its input all-gather follows another all-gather on the shared symmetric buffer.
+            assert layer.eh_proj.barrier_before_all_gather
 
     @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
     @pytest.mark.parametrize('repeated', [False, True])
