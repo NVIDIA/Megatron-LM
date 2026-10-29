@@ -50,9 +50,9 @@ class ExecutionOrder:
         for index in range(len(self)):
             yield self[index]
 
-    def reset_cursor(self, position: int = 0) -> None:
+    def reset_cursor(self) -> None:
         """Reset traversal without changing the recorded sequence."""
-        self._position = position
+        self._position = 0
 
     def __len__(self) -> int:
         return len(self._items)

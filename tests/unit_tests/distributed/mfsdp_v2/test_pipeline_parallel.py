@@ -48,18 +48,13 @@ def _mfsdp_v2_ddp_config() -> DistributedDataParallelConfig:
     )
 
 
-def _compute_config() -> TransformerConfig:
-    """A minimal TransformerConfig accepted by MFSDP v2 validation."""
-    return TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=1)
-
-
 class TestMfsdpV2PipelineSharedContext:
     """MFSDP v2 virtual-pipeline chunks share a single FSDP context."""
 
     def setup_method(self):
-        """Initialize the single-stage process groups the wrapping call needs."""
+        """Initialize two pipeline stages for the wrapping call."""
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=2
         )
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
@@ -68,19 +63,30 @@ class TestMfsdpV2PipelineSharedContext:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 CUDA devices.")
-    def test_shared_context_across_virtual_pipeline_chunks(self, distributed_setup):
-        """Multiple virtual-pipeline chunks wrapped in one call share one FsdpContext."""
+    @pytest.mark.parametrize("num_chunks", [1, 2], ids=["pp", "vpp"])
+    def test_pipeline_chunks_gather_on_demand(self, distributed_setup, num_chunks):
+        """PP and VPP chunks share a context and support consecutive backward calls."""
         device = distributed_setup.device
 
-        # virtual_pipeline_model_parallel_size > 1 yields multiple chunks on this
-        # rank; model two virtual-pipeline sub-stages here. The ambient
-        # fully_shard_context is opened for every MFSDP v2 wrap, regardless of the
-        # chunk count.
-        chunks = [_VirtualPipelineChunk().to(device=device, dtype=torch.bfloat16) for _ in range(2)]
+        # The ambient context is shared for both ordinary PP and VPP wrapping.
+        chunks = [
+            _VirtualPipelineChunk().to(device=device, dtype=torch.bfloat16)
+            for _ in range(num_chunks)
+        ]
+        config = TransformerConfig(
+            num_layers=4,
+            hidden_size=16,
+            num_attention_heads=1,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
+            pipeline_model_parallel_size=2,
+            virtual_pipeline_model_parallel_size=2 if num_chunks == 2 else None,
+        )
 
         wrapped_chunks = wrap_model_chunks_with_ddp(
             chunks,
-            _compute_config(),
+            config,
             _mfsdp_v2_ddp_config(),
             DP=FullyShardedDataParallel,
             pg_collection=self.pg_collection,
@@ -106,3 +112,14 @@ class TestMfsdpV2PipelineSharedContext:
         # The helper left no ambient context behind: the chunks joined its scope and
         # that scope, which owned the only finalize call, has since exited.
         assert current_fully_shard_context() is None
+
+        assert not first_context.execution_order
+        for chunk in wrapped_chunks:
+            assert chunk.module._schedule_policy.forward_prefetch_size == 0
+            assert chunk.module._schedule_policy.backward_prefetch_size == 0
+        # Warmup/cooldown can issue F, F, B, B even with only one local chunk.
+        inputs = torch.ones(2, 16, device=device, dtype=torch.bfloat16)
+        outputs = [chunk(inputs) for chunk in wrapped_chunks for _ in range(2)]
+        for output in reversed(outputs):
+            output.float().sum().backward()
+        first_context.finish_grad_sync()
