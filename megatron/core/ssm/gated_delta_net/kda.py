@@ -263,7 +263,7 @@ class KimiDeltaAttention(_GDNBase):
         x = self.out_norm(x)
         return (x * torch.sigmoid(gate.float())).to(x_dtype)
 
-    def _proj(self, proj, x):
+    def _proj(self, proj, x, **kwargs):
         """Apply a projection GEMM, forcing BF16 when kda_disable_fp8 is set.
 
         vLLM rollout keeps every KDA projection in BF16 (the checkpoint stores them
@@ -271,8 +271,35 @@ class KimiDeltaAttention(_GDNBase):
         pearson sharp under FP8 hybrid training."""
         if self.config.kda_disable_fp8:
             with get_fp8_disabled_context(self.config):
-                return proj(x)
-        return proj(x)
+                return proj(x, **kwargs)
+        return proj(x, **kwargs)
+
+    def _input_projections(self, hidden_states):
+        """Project the layer input: qkvfg and beta, and with two-stage gates raw_g and gate.
+
+        Beta intentionally remains a separate matrix. In inference, in_proj and beta_proj
+        all-gather their common input once.
+
+        Returns:
+            (qkvfg, beta, raw_g, gate); raw_g and gate are None without two-stage gates.
+        """
+        nvtx_range_push(suffix="in_proj")
+        if self._beta_proj_shares_in_proj_input and not self.training:
+            gathered = self.in_proj.all_gather_input(hidden_states)
+            qkvfg, _ = self._proj(self.in_proj, gathered, input_is_gathered=True)
+            beta, _ = self._proj(self.beta_proj, gathered, input_is_gathered=True)
+        else:
+            qkvfg, _ = self._proj(self.in_proj, hidden_states)
+            beta, _ = self._proj(self.beta_proj, hidden_states)
+        nvtx_range_pop(suffix="in_proj")
+
+        raw_g = gate = None
+        if self.two_stage_gates:
+            f_a, _ = self._proj(self.f_a_proj, hidden_states)
+            raw_g, _ = self._proj(self.f_b_proj, f_a)
+            g_a, _ = self._proj(self.g_a_proj, hidden_states)
+            gate, _ = self._proj(self.g_b_proj, g_a)
+        return qkvfg, beta, raw_g, gate
 
     def supports_two_stage_attention(self) -> bool:
         """KDA currently implements only the atomic forward path."""
@@ -460,17 +487,7 @@ class KimiDeltaAttention(_GDNBase):
     ):
         """Core KDA computation (in_proj -> conv1d -> gated_delta_rule -> norm -> out_proj)."""
 
-        # Input projections. Beta intentionally remains a separate matrix.
-        nvtx_range_push(suffix="in_proj")
-        if self._beta_proj_shares_in_proj_input:
-            (qkvfg, _), (beta, _) = self._proj(
-                partial(self.in_proj.forward_with_shared_input, others=(self.beta_proj,)),
-                hidden_states,
-            )
-        else:
-            qkvfg, _ = self._proj(self.in_proj, hidden_states)
-            beta, _ = self._proj(self.beta_proj, hidden_states)
-        nvtx_range_pop(suffix="in_proj")
+        qkvfg, beta, raw_g, gate = self._input_projections(hidden_states)
 
         qkvfg, thd_cp_a2a_inv = a2a_cp_to_hp(
             qkvfg,
@@ -491,12 +508,7 @@ class KimiDeltaAttention(_GDNBase):
             packed_seq_params,
         )
 
-        raw_g = gate = None
         if self.two_stage_gates:
-            f_a, _ = self._proj(self.f_a_proj, hidden_states)
-            raw_g, _ = self._proj(self.f_b_proj, f_a)
-            g_a, _ = self._proj(self.g_a_proj, hidden_states)
-            gate, _ = self._proj(self.g_b_proj, g_a)
             raw_g, _ = a2a_cp_to_hp(
                 raw_g,
                 (self.qk_dim_local_tp,),

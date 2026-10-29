@@ -1,5 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-from typing import Callable, Optional, Sequence, Tuple, Union
+from typing import Callable, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -183,8 +183,8 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         self.triton_nvls_kernels_allowed = not config.inference_disable_triton_nvls_kernels
 
         # Barrier before the input all-gather overwrites the shared "tp" symmetric buffer.
-        # Cleared only by code that proves it redundant (see chain_tp_buffer_collectives in
-        # megatron.core.inference.symmetric_memory).
+        # Cleared only by code that proves it redundant (see
+        # megatron.core.inference.tp_buffer_order).
         self.barrier_before_all_gather = True
 
         # Boolean to be toggled externally for skipping norm and all-gather.
@@ -322,8 +322,8 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
         self.triton_nvls_kernels_allowed = not config.inference_disable_triton_nvls_kernels
 
         # Barrier before the input all-gather overwrites the shared "tp" symmetric buffer.
-        # Cleared only by code that proves it redundant (see chain_tp_buffer_collectives in
-        # megatron.core.inference.symmetric_memory).
+        # Cleared only by code that proves it redundant (see
+        # megatron.core.inference.tp_buffer_order).
         self.barrier_before_all_gather = True
 
     def _maybe_allocate_symmetric_buffer(self, x: torch.Tensor):
@@ -361,35 +361,39 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
             x, _ = gather_along_first_dim(x, process_group=self.tp_group)
             return x
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
+    def all_gather_input(self, x: torch.Tensor) -> torch.Tensor:
+        """All-gather this layer's sequence-parallel input across its TP group, as forward does.
+
+        Linears on the same TP group that read the same input can gather it once with this, then
+        each take the result with ``forward(..., input_is_gathered=True)``. With NVLS the result
+        lives in the shared symmetric buffer, so their forwards must run before the buffer's
+        next operation. Eval mode only: in training mode Transformer Engine gathers in forward.
+        """
+        assert not self.training, "all_gather_input runs only in eval mode"
+        if self.tp_size == 1:
+            return x
+        return self._all_gather(x, self._maybe_allocate_symmetric_buffer(x))
+
+    def forward(
+        self, x: torch.Tensor, input_is_gathered: bool = False
+    ) -> Tuple[torch.Tensor, None]:
         """
         Forward pass.
+
+        Args:
+            x: The input, sequence-parallel unless ``input_is_gathered``.
+            input_is_gathered: ``x`` is already all-gathered (see ``all_gather_input``), so
+                this skips the all-gather. Eval mode only.
         """
         if self.training:
+            assert not input_is_gathered, "input_is_gathered applies only in eval mode"
             return super().forward(x)
 
-        (output,) = self.forward_with_shared_input(x)
-        return output
+        if not input_is_gathered:
+            x = self.all_gather_input(x)
+        x = _apply_linear(x, self.weight, self.config)
 
-    def forward_with_shared_input(
-        self, x: torch.Tensor, others: Sequence["InferenceColumnParallelLinear"] = ()
-    ) -> Tuple[Tuple[torch.Tensor, Optional[torch.Tensor]], ...]:
-        """Apply this layer and ``others`` to the same input, all-gathering it once.
-
-        ``others`` are inference column-parallel linears on this layer's TP group. In eval mode
-        their GEMMs read the input this layer gathered, with no all-gather of their own; in
-        training mode each runs its own forward.
-
-        Returns:
-            The forward outputs of this layer and of ``others``, in that order.
-        """
-        linears = (self, *others)
-        if self.training:
-            return tuple(linear(x) for linear in linears)
-
-        if self.tp_size > 1:
-            x = self._all_gather(x, self._maybe_allocate_symmetric_buffer(x))
-        return tuple((_apply_linear(x, linear.weight, linear.config), None) for linear in linears)
+        return x, None
 
 
 class InferenceRowParallelLinear(TERowParallelLinear):

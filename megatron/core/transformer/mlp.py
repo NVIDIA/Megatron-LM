@@ -25,7 +25,7 @@ from megatron.core.fusions.fused_bias_geglu import (
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
-from megatron.core.inference.symmetric_memory import skip_all_gather_barrier_after_reduce_scatter
+from megatron.core.inference.tp_buffer_order import skip_all_gather_barrier_after_reduce_scatter
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -257,8 +257,8 @@ class MLP(MegatronModule):
             name=(name + ".linear_fc2") if name is not None else None,
         )
 
-    def chain_tp_buffer_collectives(self, preceding_reduce_scatter):
-        """See chain_tp_buffer_collectives in megatron.core.inference.symmetric_memory.
+    def declare_tp_buffer_order(self, preceding_reduce_scatter):
+        """See megatron.core.inference.tp_buffer_order.
 
         linear_fc1's all-gather of the input comes first; linear_fc2's reduce-scatter comes last.
         """

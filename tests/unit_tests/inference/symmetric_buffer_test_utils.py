@@ -6,8 +6,9 @@ Inference-optimized linears all-gather into and reduce-scatter out of shared sym
 with the multimem kernels of megatron.core.inference.communication.torch_symm_triton. A kernel
 may write a buffer only once no peer can still read the bytes it writes (see
 multimem_all_gather and multimem_reduce_scatter). record_symmetric_buffer_ops records those
-kernels, and the collectives that synchronize a process group, in launch order;
-find_symmetric_buffer_races checks the recording against that rule.
+kernels, and the collectives that synchronize a process group, in launch order, with the ranks
+of each buffer's and each collective's group; find_symmetric_buffer_races checks the recording
+against that rule.
 """
 
 import contextlib
@@ -23,6 +24,8 @@ import torch
 from megatron.core.inference.communication.torch_symm_triton import collectives, fused_collectives
 from megatron.core.inference.communication.torch_symm_triton.utils import is_device_nvls_capable
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+
+Ranks = frozenset[int]
 
 ALL_GATHER = "all_gather"
 REDUCE_SCATTER = "reduce_scatter"
@@ -41,30 +44,39 @@ class BufferOp:
         barrier_before: Whether an all-gather barriered before writing; None otherwise.
         segment: (byte offset, bytes per rank) of the segments a kernel writes or reduces, or
             None for SYNC and for the fused three-tensor all-gather.
+        ranks: Global ranks of the buffer's process group, or of the collective's for SYNC.
+            None if unknown, which counts as every rank.
     """
 
     kind: str
     buffer: Optional[int] = None
     barrier_before: Optional[bool] = None
     segment: Optional[tuple[int, int]] = None
+    ranks: Optional[Ranks] = None
 
 
 def _nbytes(tensor: torch.Tensor) -> int:
     return tensor.numel() * tensor.element_size()
 
 
-def _describe_multimem_op(name: str, arguments: dict) -> BufferOp:
-    handle = arguments["symm_mem_hdl"]
+def _group_ranks(group: Optional[torch.distributed.ProcessGroup]) -> Ranks:
+    group = group if group is not None else torch.distributed.group.WORLD
+    return frozenset(torch.distributed.get_process_group_ranks(group))
+
+
+def _describe_multimem_op(name: str, arguments: dict, buffer_ranks: dict) -> BufferOp:
+    buffer = arguments["symm_mem_hdl"].multicast_ptr
+    ranks = buffer_ranks.get(buffer)
     if name == "multimem_all_gather":
         segment = (arguments["byte_offset"], _nbytes(arguments["input_tensor"]))
-        return BufferOp(ALL_GATHER, handle.multicast_ptr, arguments["barrier_before"], segment)
+        return BufferOp(ALL_GATHER, buffer, arguments["barrier_before"], segment, ranks)
     if name == "multimem_all_gather_fused":
-        return BufferOp(ALL_GATHER, handle.multicast_ptr, arguments["barrier_before"])
+        return BufferOp(ALL_GATHER, buffer, arguments["barrier_before"], ranks=ranks)
     if name == "multimem_reduce_scatter":
         segment = (0, _nbytes(arguments["output_tensor"]))
-        return BufferOp(REDUCE_SCATTER, handle.multicast_ptr, segment=segment)
+        return BufferOp(REDUCE_SCATTER, buffer, segment=segment, ranks=ranks)
     segment = (0, _nbytes(arguments["residual_output_tensor"]))
-    return BufferOp(FUSED_REDUCE_SCATTER_ALL_GATHER, handle.multicast_ptr, segment=segment)
+    return BufferOp(FUSED_REDUCE_SCATTER_ALL_GATHER, buffer, segment=segment, ranks=ranks)
 
 
 def _describe_collective(arguments: dict) -> Optional[BufferOp]:
@@ -73,7 +85,7 @@ def _describe_collective(arguments: dict) -> Optional[BufferOp]:
         return None
     if torch.distributed.get_world_size(arguments.get("group")) < 2:
         return None
-    return BufferOp(SYNC)
+    return BufferOp(SYNC, ranks=_group_ranks(arguments.get("group")))
 
 
 _MULTIMEM_OPS = (
@@ -125,39 +137,73 @@ def _recorder(original: Callable, describe: Callable, ops: list) -> Callable:
     return record
 
 
+def _buffer_group_recorder(buffer_ranks: dict) -> Callable:
+    """Wrap SymmetricMemoryManager.get_buffer to note the ranks of each buffer's group."""
+    original = SymmetricMemoryManager.get_buffer
+
+    def get_buffer(key, process_group=None, size_mb=None):
+        buffer = original(key, process_group=process_group, size_mb=size_mb)
+        if process_group is not None and buffer.symm_mem_hdl is not None:
+            buffer_ranks[buffer.symm_mem_hdl.multicast_ptr] = _group_ranks(process_group)
+        return buffer
+
+    return get_buffer
+
+
 @contextlib.contextmanager
 def record_symmetric_buffer_ops() -> Iterator[list[BufferOp]]:
     """Record the multimem kernels and synchronizing collectives launched inside the block.
 
     Every module's reference to the kernel wrappers and to the torch.distributed collectives is
     patched, so the recording does not depend on how callers import them. The real operations
-    still run.
+    still run. A buffer's group is taken from the callers that fetch it from
+    SymmetricMemoryManager with their process group, as the inference layers do before each
+    operation.
 
     Yields:
         The list the BufferOps are appended to, in launch order.
     """
     ops: list[BufferOp] = []
+    buffer_ranks: dict = {}
     replacements = {}
     for module, name in _MULTIMEM_OPS:
         original = getattr(module, name)
-        describe = lambda arguments, name=name: _describe_multimem_op(name, arguments)
+        describe = lambda arguments, name=name: _describe_multimem_op(name, arguments, buffer_ranks)
         replacements[id(original)] = _recorder(original, describe, ops)
     for name in _SYNCHRONIZING_COLLECTIVES:
         original = getattr(torch.distributed, name)
         replacements[id(original)] = _recorder(original, _describe_collective, ops)
     with contextlib.ExitStack() as stack:
         _patch_every_reference(stack, replacements)
+        stack.enter_context(
+            mock.patch.object(
+                SymmetricMemoryManager,
+                "get_buffer",
+                staticmethod(_buffer_group_recorder(buffer_ranks)),
+            )
+        )
         yield ops
+
+
+def _covers(sync: BufferOp, buffer: BufferOp) -> bool:
+    """Whether sync's group contains every rank of buffer's group."""
+    if sync.ranks is None:
+        return True
+    if buffer.ranks is None:
+        return len(sync.ranks) == torch.distributed.get_world_size()
+    return buffer.ranks <= sync.ranks
 
 
 def find_symmetric_buffer_races(ops: list[BufferOp]) -> list[str]:
     """Describe each recorded write of a symmetric buffer that a peer may still be reading.
 
-    Per buffer, the state after each operation is "synced" (a synchronizing collective ran
-    since the buffer's last operation), "gathered" (peers may read the whole buffer after an
-    all-gather), or the segment of the last reduce-scatter (peers may still reduce their own
-    segments of every rank's buffer: it has no exit barrier). Before the first operation the
-    state is unknown, which is treated as "gathered". Then:
+    Per buffer, the state after each operation is "synced" (a collective that synchronizes
+    every rank of the buffer's group ran since the buffer's last operation), "gathered" (peers
+    may read the whole buffer after an all-gather), or the segment of the last reduce-scatter
+    (peers may still reduce their own segments of every rank's buffer: it has no exit barrier).
+    Before the first operation the state is unknown, which is treated as "gathered". A
+    collective over a group that leaves out a rank of the buffer's group does not synchronize
+    the buffer. Then:
 
     - an all-gather without its barrier must find the buffer synced, or follow a reduce-scatter
       with the same segment;
@@ -166,13 +212,15 @@ def find_symmetric_buffer_races(ops: list[BufferOp]) -> list[str]:
     """
     races = []
     state: dict = {}
-    default_state = "gathered"
+    last_index: dict = {}
     for index, op in enumerate(ops):
         if op.kind == SYNC:
-            default_state = "synced"
-            state = {}
             continue
-        previous = state.get(op.buffer, default_state)
+        previous = state.get(op.buffer, "gathered")
+        since = last_index.get(op.buffer, -1) + 1
+        if any(other.kind == SYNC and _covers(other, op) for other in ops[since:index]):
+            previous = "synced"
+        last_index[op.buffer] = index
         if op.kind == ALL_GATHER:
             safe = (
                 op.barrier_before

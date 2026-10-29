@@ -20,6 +20,10 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.inference.tp_buffer_order import (
+    skip_all_gather_barrier_after_reduce_scatter,
+    skip_all_gather_barrier_after_synchronizing_collective,
+)
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, get_backend
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -1455,6 +1459,10 @@ class MultiTokenPredictionLayer(MegatronModule):
                 name=(name + ".h_proj") if name is not None else None,
                 **projection_kwargs,
             )
+            # _concat_embeddings runs h_proj's input all-gather right after the NCCL gather of
+            # e_proj's output, which synchronizes the TP group (see
+            # megatron.core.inference.tp_buffer_order).
+            skip_all_gather_barrier_after_synchronizing_collective(self.h_proj)
             self.eh_proj = None
         else:
             # Combine each hidden state with the corresponding future-token embedding.
@@ -1533,6 +1541,19 @@ class MultiTokenPredictionLayer(MegatronModule):
                     setattr(self.hc_head_base, "sequence_parallel", True)
                     setattr(self.hc_head_scale, "sequence_parallel", True)
         self.offload_context = nullcontext()
+
+    def declare_tp_buffer_order_after_embedding(self, embedding) -> None:
+        """Declare that each forward embeds its tokens with embedding right before e_proj.
+
+        See megatron.core.inference.tp_buffer_order. The model that owns this layer passes the
+        embedding it also passes to every forward. With hyper connections, e_proj's input
+        all-gather is then the first operation on the "tp" buffer after the embedding's
+        reduce-scatter, on the same tokens, normalized: _get_embeddings and
+        forward_single_position look the tokens up right before _concat_embeddings. Given
+        precomputed embeddings instead, MultiTokenPredictionBlock rolls them with an NCCL
+        all-gather over the TP group before each layer, which synchronizes the group.
+        """
+        skip_all_gather_barrier_after_reduce_scatter(embedding.word_embeddings, self.e_proj)
 
     def get_inner_quantization_context(self) -> AbstractContextManager:
         """Return the quantization context for fine-grained MTP execution."""

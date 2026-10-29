@@ -13,7 +13,7 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.inference.symmetric_memory import skip_all_gather_barrier_after_reduce_scatter
+from megatron.core.inference.tp_buffer_order import skip_all_gather_barrier_after_reduce_scatter
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings.rope_utils import (
@@ -1911,8 +1911,8 @@ class SelfAttention(Attention):
             else None
         )
 
-    def chain_tp_buffer_collectives(self, preceding_reduce_scatter):
-        """See chain_tp_buffer_collectives in megatron.core.inference.symmetric_memory.
+    def declare_tp_buffer_order(self, preceding_reduce_scatter):
+        """See megatron.core.inference.tp_buffer_order.
 
         linear_qkv's all-gather of the layer input comes first; linear_proj's reduce-scatter
         comes last.

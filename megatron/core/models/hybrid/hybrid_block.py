@@ -21,7 +21,7 @@ from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.inference.symmetric_memory import chain_tp_buffer_collectives
+from megatron.core.inference.tp_buffer_order import chain_tp_buffer_order
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_layer_type_list_from_layer_config_list,
@@ -439,7 +439,7 @@ class HybridStack(MegatronModule):
         # stack cannot know, so it keeps its barrier.
         reduce_scatter = None
         for layer in self.layers:
-            reduce_scatter = chain_tp_buffer_collectives(layer, reduce_scatter)
+            reduce_scatter = chain_tp_buffer_order(layer, reduce_scatter)
 
     def _shortcut_layer_pairs(self) -> tuple[tuple[int, int], ...]:
         """Return physical layer indices that must share one residual replay block."""

@@ -5,30 +5,29 @@
 Inference-optimized column-parallel linears all-gather their sequence-parallel input into one
 shared "tp" symmetric buffer, and their GEMMs read it there. Each all-gather barriers before it
 writes unless the module that knows the order of operations on the buffer proves the barrier
-redundant (chain_tp_buffer_collectives in megatron.core.inference.symmetric_memory): the
-all-gather directly follows a reduce-scatter with the same per-rank segments, or a collective
-that synchronizes the TP group. The declarations are static, so CUDA graph capture and replay
-agree.
+redundant (megatron.core.inference.tp_buffer_order): the all-gather directly follows a
+reduce-scatter with the same per-rank segments, or a collective that synchronizes the TP group.
+The declarations are static, so CUDA graph capture and replay agree.
 
 The GPU tests run an eval forward of each inference layer type at TP=2 with sequence
 parallelism and NVLS, record the operations on the buffer and the synchronizing collectives,
 check that none writes a buffer a peer may still read, and pin which all-gathers barrier. The
-CPU tests check the declaration rules and that every inference layer spec has a case.
+dynamic-batching decode path is checked in test_text_generation_controller.py. The CPU tests
+check that every inference layer spec has a case, and the race check itself.
 """
 
 import ast
 import dataclasses
 import pathlib
-from types import SimpleNamespace
-from unittest import mock
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-import megatron.core.inference.symmetric_memory as symmetric_memory
 import megatron.core.tensor_parallel.inference_layers as inference_layers
+from megatron.core.activations import squared_relu
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
@@ -36,6 +35,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     gated_delta_product_inference_stack_spec,
     hybrid_inference_stack_spec,
 )
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import HAVE_FLA, HAVE_FLA_GDN2, HAVE_FLA_KDA
 from megatron.core.ssm.gated_delta_product import HAVE_FLA as HAVE_GDP_FLA
@@ -50,6 +50,8 @@ from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.inference.symmetric_buffer_test_utils import (
     ALL_GATHER,
     REDUCE_SCATTER,
+    SYNC,
+    BufferOp,
     barrier_trace,
     find_symmetric_buffer_races,
     record_symmetric_buffer_ops,
@@ -85,6 +87,9 @@ _MOE_CONFIG = dict(
     moe_ffn_hidden_size=128,
     moe_shared_expert_intermediate_size=256,
     moe_grouped_gemm=True,
+    moe_router_dtype="fp32",
+    # An activation the inference-optimized grouped experts implement.
+    activation_func=squared_relu,
 )
 _GDN_CONFIG = dict(
     linear_conv_kernel_dim=4,
@@ -317,9 +322,7 @@ class TestInferenceAllGatherBarriers:
             config,
             stack_spec.submodules,
             layer_config_list=validate_segment_layers(pattern, config),
-            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=["tp", "pp", "cp"]
-            ),
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def _check(self, module, expected_trace):
@@ -380,10 +383,61 @@ class TestInferenceAllGatherBarriers:
             inference_layers.InferenceLayerNormColumnParallelLinear,
         )
         assert not any(isinstance(module, all_gathering) for module in dsa_layer.modules())
-        linear_proj = dsa_layer.self_attention.linear_proj
-        assert isinstance(linear_proj, inference_layers.InferenceRowParallelLinear)
-        assert symmetric_memory.chain_tp_buffer_collectives(dsa_layer, None) is linear_proj
+        assert isinstance(
+            dsa_layer.self_attention.linear_proj, inference_layers.InferenceRowParallelLinear
+        )
         assert mlp_layer.mlp.linear_fc1.barrier_before_all_gather is False
+
+    def test_hybrid_mhc_mtp_projections(self):
+        """mHC MTP's e_proj follows the embedding's reduce-scatter, and h_proj an NCCL gather.
+
+        Run in InferenceMode, where the embedding reduce-scatters through the buffer.
+        """
+        streams = 2
+        config = self._config(
+            num_layers=2,
+            mtp_num_layers=1,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=streams,
+            mhc_sinkhorn_iterations=3,
+        )
+        vocab_size = 128
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_inference_stack_spec,
+            vocab_size=vocab_size,
+            max_sequence_length=self.sequence_length,
+            hybrid_layer_pattern="*-/*",
+        )
+        model = model.cuda().eval()
+        mtp_layer = model.mtp.layers[0]
+        generator = torch.Generator(device="cuda").manual_seed(1234)
+        input_ids = torch.randint(
+            vocab_size,
+            (self.micro_batch_size, self.sequence_length),
+            device="cuda",
+            generator=generator,
+        )
+        position_ids = torch.arange(self.sequence_length, device="cuda").expand_as(input_ids)
+        hidden_streams = torch.randn(
+            self.sequence_length // self.tensor_parallel_size,
+            self.micro_batch_size,
+            self.hidden_size * streams,
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        InferenceMode.set_active()
+        try:
+            with record_symmetric_buffer_ops() as ops, torch.no_grad():
+                skip_unless_nvls(mtp_layer.tp_group)
+                decoder_input = model.embedding(input_ids=input_ids, position_ids=position_ids)
+                mtp_layer._concat_embeddings(hidden_streams, decoder_input)
+        finally:
+            InferenceMode.unset_active()
+        races = find_symmetric_buffer_races(ops)
+        assert not races, f"{races}\nrecorded: {ops}"
+        assert barrier_trace(ops) == [RS, AG, AG]
 
 
 def test_every_inference_hybrid_layer_spec_has_a_case():
@@ -415,102 +469,20 @@ def test_other_tests_exist(node_id):
     assert function_name in functions, f"{node_id} does not exist"
 
 
-class _StandIn:
-    """An inference linear reduced to the attributes the declaration rules read."""
-
-    def __init__(self, **attributes):
-        self.__dict__.update(attributes)
-
-
-class _ColumnParallel(_StandIn):
-    pass
-
-
-class _LayerNormColumnParallel(_StandIn):
-    pass
-
-
-class _RowParallel(_StandIn):
-    pass
-
-
-class TestDeclarationRules:
-    """The declaration rules of megatron.core.inference.symmetric_memory, on stand-ins (CPU)."""
-
-    tp_group = object()
-
-    @pytest.fixture(autouse=True)
-    def stand_in_linears(self, monkeypatch):
-        monkeypatch.setattr(inference_layers, "HAVE_TE", True)
-        monkeypatch.setattr(inference_layers, "InferenceColumnParallelLinear", _ColumnParallel)
-        monkeypatch.setattr(
-            inference_layers, "InferenceLayerNormColumnParallelLinear", _LayerNormColumnParallel
-        )
-        monkeypatch.setattr(inference_layers, "InferenceRowParallelLinear", _RowParallel)
-
-    def _all_gather(self, cls=_LayerNormColumnParallel, in_features=256, fp32_residual=False):
-        return cls(
-            tp_group=self.tp_group,
-            in_features=in_features,
-            config=SimpleNamespace(fp32_residual_connection=fp32_residual),
-            barrier_before_all_gather=True,
-        )
-
-    def _reduce_scatter(self, out_features=256, tp_group=None):
-        return _RowParallel(tp_group=tp_group or self.tp_group, out_features=out_features)
-
-    @pytest.mark.parametrize(
-        "all_gather_kwargs, reduce_scatter_kwargs, barrier",
-        [
-            ({}, {}, False),
-            ({"cls": _ColumnParallel}, {}, False),
-            # A different width writes into the segments that peers may still reduce.
-            ({"in_features": 128}, {}, True),
-            ({}, {"tp_group": object()}, True),
-            # An FP32 residual stream doubles the bytes each rank all-gathers.
-            ({"fp32_residual": True}, {}, True),
-        ],
-    )
-    def test_after_reduce_scatter(self, all_gather_kwargs, reduce_scatter_kwargs, barrier):
-        all_gather = self._all_gather(**all_gather_kwargs)
-        symmetric_memory.skip_all_gather_barrier_after_reduce_scatter(
-            self._reduce_scatter(**reduce_scatter_kwargs), all_gather
-        )
-        assert all_gather.barrier_before_all_gather is barrier
-
-    def test_after_unknown_or_other_reduce_scatter(self):
-        all_gather = self._all_gather()
-        symmetric_memory.skip_all_gather_barrier_after_reduce_scatter(None, all_gather)
-        symmetric_memory.skip_all_gather_barrier_after_reduce_scatter(
-            _StandIn(out_features=256), all_gather
-        )
-        assert all_gather.barrier_before_all_gather is True
-        other = _StandIn(barrier_before_all_gather=True)
-        symmetric_memory.skip_all_gather_barrier_after_reduce_scatter(self._reduce_scatter(), other)
-        assert other.barrier_before_all_gather is True
-
-    def test_after_synchronizing_collective(self):
-        all_gather = self._all_gather(_ColumnParallel)
-        symmetric_memory.skip_all_gather_barrier_after_synchronizing_collective(all_gather)
-        assert all_gather.barrier_before_all_gather is False
-        other = _StandIn(barrier_before_all_gather=True)
-        symmetric_memory.skip_all_gather_barrier_after_synchronizing_collective(other)
-        assert other.barrier_before_all_gather is True
-
-    def test_chain(self):
-        reduce_scatter = self._reduce_scatter()
-        # Modules that do nothing on the buffer pass the preceding reduce-scatter on.
-        assert symmetric_memory.chain_tp_buffer_collectives(None, reduce_scatter) is reduce_scatter
-        assert (
-            symmetric_memory.chain_tp_buffer_collectives(IdentityOp(), reduce_scatter)
-            is reduce_scatter
-        )
-        # A module that does not declare its order may do anything there.
-        assert (
-            symmetric_memory.chain_tp_buffer_collectives(torch.nn.Linear(2, 2), reduce_scatter)
-            is None
-        )
-        declaring = mock.Mock(spec=["chain_tp_buffer_collectives"])
-        declaring.chain_tp_buffer_collectives.return_value = "last"
-        assert symmetric_memory.chain_tp_buffer_collectives(declaring, reduce_scatter) == "last"
-        declaring.chain_tp_buffer_collectives.assert_called_once_with(reduce_scatter)
+def test_race_check_counts_only_collectives_that_cover_the_buffer():
+    """A collective synchronizes a buffer only if its group holds every rank of the buffer's."""
+    tp_ranks = frozenset({0, 1})
+    reduce_scatter = BufferOp(REDUCE_SCATTER, 1, segment=(0, 512), ranks=tp_ranks)
+    # A wider all-gather writes into segments that peers may still reduce.
+    all_gather = BufferOp(ALL_GATHER, 1, barrier_before=False, segment=(0, 1024), ranks=tp_ranks)
+    assert find_symmetric_buffer_races([reduce_scatter, all_gather])
+    for sync_ranks, synced in [
+        (tp_ranks, True),
+        (frozenset(range(8)), True),
+        # A data- or expert-parallel group of the same size leaves out the TP peer.
+        (frozenset({0, 2}), False),
+        (frozenset({0, 2, 4, 6}), False),
+    ]:
+        sync = BufferOp(SYNC, ranks=sync_ranks)
+        races = find_symmetric_buffer_races([reduce_scatter, sync, all_gather])
+        assert not races if synced else races, sync_ranks

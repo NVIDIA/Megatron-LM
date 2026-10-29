@@ -1213,8 +1213,9 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize("num_cuda_graphs", [None, 4], ids=["eager", "cuda_graphs"])
     @torch.inference_mode()
-    def test_mtp_kv_cache_inference_optimized_sequence_parallel(self):
+    def test_mtp_kv_cache_inference_optimized_sequence_parallel(self, num_cuda_graphs):
         """Same, with TP=2 + SP: the commit pass pads to a TP multiple and scatters."""
         Utils.initialize_distributed()
         if torch.distributed.get_world_size() < 2:
@@ -1237,6 +1238,8 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             max_prompt_length=16,
             num_tokens_to_generate=6,
             num_gap_steps=1,
+            num_cuda_graphs=num_cuda_graphs,
+            force_build_cuda_graphs=num_cuda_graphs is not None,
             context_max_requests=8,
             materialize_only_last_token_logits=False,
         )

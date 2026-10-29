@@ -20,7 +20,7 @@ from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_row_copy import contiguous_rows
-from megatron.core.inference.symmetric_memory import (
+from megatron.core.inference.tp_buffer_order import (
     skip_all_gather_barrier_after_synchronizing_collective,
 )
 from megatron.core.models.common.embeddings import (
@@ -827,8 +827,8 @@ class MLASelfAttention(MultiLatentAttention):
         """Resolve which Q/KV norm and up-projection implementations to build."""
         return QKNormConfigResolver(self.config, submodules).resolve()
 
-    def chain_tp_buffer_collectives(self, preceding_reduce_scatter):
-        """See chain_tp_buffer_collectives in megatron.core.inference.symmetric_memory.
+    def declare_tp_buffer_order(self, preceding_reduce_scatter):
+        """See megatron.core.inference.tp_buffer_order.
 
         The query projection's all-gather (linear_q_up_proj, or linear_q_proj without
         q_lora_rank) comes first. get_query_key_value_tensors runs it after gathering the RoPE

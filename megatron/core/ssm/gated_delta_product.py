@@ -22,7 +22,7 @@ from megatron.core.inference.contexts import BaseInferenceContext, DynamicInfere
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
 )
-from megatron.core.inference.symmetric_memory import skip_all_gather_barrier_after_reduce_scatter
+from megatron.core.inference.tp_buffer_order import skip_all_gather_barrier_after_reduce_scatter
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -511,8 +511,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             self.nheads_local_cp = self.nheads_local_tp
             self.ngroups_local_cp = self.ngroups_local_tp
 
-    def chain_tp_buffer_collectives(self, preceding_reduce_scatter):
-        """See chain_tp_buffer_collectives in megatron.core.inference.symmetric_memory.
+    def declare_tp_buffer_order(self, preceding_reduce_scatter):
+        """See megatron.core.inference.tp_buffer_order.
 
         in_proj's all-gather of the layer input comes first; out_proj's reduce-scatter comes last.
         """

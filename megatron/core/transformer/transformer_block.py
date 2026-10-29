@@ -17,7 +17,7 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.inference.symmetric_memory import chain_tp_buffer_collectives
+from megatron.core.inference.tp_buffer_order import chain_tp_buffer_order
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
@@ -427,7 +427,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # block cannot know, so it keeps its barrier.
         reduce_scatter = None
         for layer in self.layers:
-            reduce_scatter = chain_tp_buffer_collectives(layer, reduce_scatter)
+            reduce_scatter = chain_tp_buffer_order(layer, reduce_scatter)
 
     def has_final_layernorm_in_this_stage(self):
         """

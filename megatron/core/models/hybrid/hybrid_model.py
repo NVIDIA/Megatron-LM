@@ -428,6 +428,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 hash_moe_layer_threshold=hash_moe_layer_threshold or None,
                 name="mtp",
             )
+            # Every MTP forward looks its tokens up with self.embedding.
+            for layer in self.mtp.layers:
+                layer.declare_tp_buffer_order_after_embedding(self.embedding)
             self._setup_mtp_cuda_graphs()
 
         # Output

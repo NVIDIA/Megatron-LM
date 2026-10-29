@@ -16,7 +16,7 @@ from megatron.core.inference.moe.flashinfer_mxfp8 import (
     require_flashinfer_routed_mxfp8,
 )
 from megatron.core.inference.moe.flashinfer_nvfp4 import require_flashinfer_routed_nvfp4
-from megatron.core.inference.symmetric_memory import chain_tp_buffer_collectives
+from megatron.core.inference.tp_buffer_order import chain_tp_buffer_order
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
@@ -487,8 +487,8 @@ class MoELayer(BaseMoELayer):
         # Setup events and streams for delayed wgrad computation.
         self.setup_delayed_wgrad_for_dispatch_backward_overlap()
 
-    def chain_tp_buffer_collectives(self, preceding_reduce_scatter):
-        """See chain_tp_buffer_collectives in megatron.core.inference.symmetric_memory.
+    def declare_tp_buffer_order(self, preceding_reduce_scatter):
+        """See megatron.core.inference.tp_buffer_order.
 
         Routed tokens never touch the "tp" buffer: the router is replicated, and the token
         dispatchers and grouped experts communicate through their own buffers or NCCL. Only the
@@ -496,7 +496,7 @@ class MoELayer(BaseMoELayer):
         """
         if self.megakernel_experts is not None:
             return None
-        return chain_tp_buffer_collectives(self.shared_experts, preceding_reduce_scatter)
+        return chain_tp_buffer_order(self.shared_experts, preceding_reduce_scatter)
 
     def _setup_inference_mode(self, pg_collection):
         """Set up inference-optimized token dispatcher.
