@@ -170,6 +170,10 @@ uv run python -m torch.distributed.run --nproc-per-node 8 -m pytest -q \
   catch it calls `enable_strict_process_group_fallbacks()` from
   `megatron.core.process_groups_config` inside `warnings.catch_warnings()`.
 - Training runs opt in with `--strict-process-group-fallbacks`.
+- The deprecated `parallel_state` accessors emit a separate
+  `ParallelStateDeprecationWarning`, which `pyproject.toml` ignores for the
+  test suite because tests use the global grid on purpose. Strict mode does not
+  affect it. See `docs/api-backwards-compatibility-check.md`.
 
 ### CI parity
 
