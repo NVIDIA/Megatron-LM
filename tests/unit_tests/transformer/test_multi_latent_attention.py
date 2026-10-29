@@ -7,18 +7,23 @@ from unittest import mock
 import pytest
 import torch
 
+import megatron.core.tensor_parallel.inference_layers as inference_layers
 import megatron.core.transformer.multi_latent_attention as mla_module
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.inference.communication.torch_symm_triton.utils import is_device_nvls_capable
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_inference_submodules,
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -30,6 +35,7 @@ from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttentionSubmodules,
     MultiLatentAttention,
 )
+from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.typed_torch import apply_module
@@ -639,6 +645,118 @@ class TestTensorParallelMLAAttention:
             assert output.shape[1] == micro_batch_size
             assert output.shape[2] == config.hidden_size
             assert bias.shape[0] == config.hidden_size
+
+
+@pytest.mark.skipif(
+    not inference_layers.HAVE_TE, reason="inference_optimized requires Transformer Engine"
+)
+@pytest.mark.parametrize("variant", ["q_up_proj", "q_proj", "fused_down_proj"])
+class TestMLAUpProjectionAllGatherBarrier:
+    """Inference-optimized MLA at TP=2 with sequence parallelism, without latent caching (static
+    batching, or a forward without an inference context).
+
+    The query projection (linear_q_up_proj, or linear_q_proj without q_lora_rank) and
+    linear_kv_up_proj all-gather their inputs into the shared "tp" symmetric buffer back to
+    back. multimem_all_gather requires an all-gather that directly follows another one on the
+    buffer to barrier before overwriting it; after a reduce-scatter, no barrier is needed.
+    """
+
+    tensor_parallel_size = 2
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self, variant):
+        Utils.initialize_model_parallel(self.tensor_parallel_size, 1)
+        SymmetricMemoryManager.destroy()
+        model_parallel_cuda_manual_seed(123)
+        q_lora_rank, qk_layernorm = (None, False) if variant == "q_proj" else (64, True)
+        config = MLATransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=64,
+            qk_head_dim=64,
+            qk_pos_emb_head_dim=64,
+            v_head_dim=128,
+            qk_layernorm=qk_layernorm,
+            rope_type="rope",
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            transformer_impl="inference_optimized",
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            tensor_model_parallel_size=self.tensor_parallel_size,
+            sequence_parallel=True,
+        )
+        if variant == "fused_down_proj":
+            layer_spec = hybrid_inference_stack_spec.submodules.mla_fused_down_proj_layer
+            spec = layer_spec.submodules.self_attention
+        else:
+            spec = get_gpt_layer_with_inference_submodules(
+                qk_layernorm=qk_layernorm, multi_latent_attention=True
+            ).self_attention
+        self.attention = build_module(spec, config=config, layer_number=1).cuda().eval()
+        yield
+        torch.cuda.synchronize()
+        SymmetricMemoryManager.destroy()  # its buffer is registered on this TP group
+        Utils.destroy_model_parallel()
+
+    def _symmetric_collectives(self, hidden_states):
+        """Run the attention and return its symmetric-memory collectives in order: all-gathers
+        with their barrier_before flag, and reduce-scatters."""
+        events = []
+        all_gather = inference_layers.multimem_all_gather
+        reduce_scatter = inference_layers.multimem_reduce_scatter
+
+        def record_all_gather(*args, barrier_before=False, **kwargs):
+            events.append(("all_gather", barrier_before))
+            return all_gather(*args, barrier_before=barrier_before, **kwargs)
+
+        def record_reduce_scatter(*args, **kwargs):
+            events.append(("reduce_scatter", None))
+            return reduce_scatter(*args, **kwargs)
+
+        with (
+            mock.patch.object(inference_layers, "multimem_all_gather", record_all_gather),
+            mock.patch.object(inference_layers, "multimem_reduce_scatter", record_reduce_scatter),
+            torch.no_grad(),
+        ):
+            self.attention(hidden_states, attention_mask=None)
+        return events
+
+    def test_kv_up_proj_all_gather_barriers_after_query_all_gather(self):
+        tp_group = self.attention.pg_collection.tp
+        # Collective: create the buffer on every rank, then skip on all ranks or none.
+        handle = SymmetricMemoryManager.get_buffer("tp", process_group=tp_group).symm_mem_hdl
+        nvls = is_device_nvls_capable(torch.device("cuda", torch.cuda.current_device()))
+        nvls = torch.tensor(
+            [float(nvls and handle is not None and bool(handle.multicast_ptr))], device="cuda"
+        )
+        torch.distributed.all_reduce(nvls, op=torch.distributed.ReduceOp.MIN, group=tp_group)
+        if nvls.item() != 1.0:
+            pytest.skip("NVLS multicast unavailable")
+
+        sequence_length, micro_batch_size = 64, 2
+        generator = torch.Generator(device="cuda").manual_seed(1234)
+        hidden_states = torch.randn(
+            sequence_length // self.tensor_parallel_size,
+            micro_batch_size,
+            self.attention.config.hidden_size,
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+
+        # The query projection's all-gather comes first; in a model it follows the previous
+        # layer's reduce-scatter and needs no barrier. linear_kv_up_proj's all-gather follows
+        # it directly and must barrier. linear_proj then reduce-scatters.
+        assert self._symmetric_collectives(hidden_states) == [
+            ("all_gather", False),
+            ("all_gather", True),
+            ("reduce_scatter", None),
+        ]
 
 
 @pytest.mark.experimental
