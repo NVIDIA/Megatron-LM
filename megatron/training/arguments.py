@@ -3188,7 +3188,7 @@ def _add_distributed_args(parser):
                        choices=['no_shard', 'optim'],
                        help='Sharding strategy for the outer expert data-parallel group in MFSDP v2. '
                             'Valid values are "no_shard" (HSDP) and "optim" (HFSDP). '
-                            'Defaults to --outer-dp-sharding-strategy when omitted.')
+                            'Defaults to --outer-dp-sharding-strategy, or "no_shard" without an expert outer axis.')
     group.add_argument('--hfsdp-param-gather-overlap', action='store_true',
                        help='Pipeline HFSDP parameter all-gathers across DP-Outer and DP-Inner. '
                             'DP-Outer is prefetched one FSDP unit beyond the existing '
@@ -3212,6 +3212,9 @@ def _add_distributed_args(parser):
                        help='If set, enable full sharding in megatron-fsdp Hybrid Sharded Data Parallel (HSDP) mode.')
     group.add_argument('--num-distributed-optimizer-instances', type=int, default=1,
                        help='Number of Distributed Optimizer copies across Data Parallel domain.')
+    group.add_argument('--expert-num-distributed-optimizer-instances', type=int, default=None,
+                       help='Number of Distributed Optimizer copies across the expert Data Parallel domain. '
+                            'Defaults to --num-distributed-optimizer-instances; only MFSDP v2 supports a different value.')
     group.add_argument('--torch-fsdp2-no-reshard-after-forward', action='store_false', dest='torch_fsdp2_reshard_after_forward',
                        help='Whether to reshard weights after forward pass when using PyTorch FSDP2. '
                        'Set to enable FSDP ZeRO-2.')
