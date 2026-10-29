@@ -277,8 +277,10 @@ class FsdpModule:
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
 
         if self.is_root():
-            if not is_recomputing:
-                context.reset_execution_order(cast(nn.Module, self), Phase.FORWARD)
+            order = context.execution_order
+            # Later roots continue the shared order rather than starting a new pass.
+            if not is_recomputing and order and order[0].module is self:
+                order.reset_cursor()
             context.allgather_stream.wait_stream(context.current_stream())
 
         # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
@@ -445,7 +447,6 @@ class FsdpModule:
             context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.BACKWARD))
         current_stream = context.current_stream()
         if self.is_root():
-            context.reset_execution_order(cast(nn.Module, self), Phase.BACKWARD)
             context.register_post_backward_hook()
             # Fork the reduce-scatter stream from the current stream once, at the
             # start of backward, so every module's post-backward reduce-scatter is

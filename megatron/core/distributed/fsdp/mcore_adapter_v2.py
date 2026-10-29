@@ -244,9 +244,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:
         # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
+        prefetch_size = ddp_config.suggested_communication_unit_size
+        if config.pipeline_model_parallel_size > 1 or config.overlap_moe_expert_parallel_comm:
+            prefetch_size = 0
         schedule_policy = SchedulePolicy(
-            forward_prefetch_size=ddp_config.suggested_communication_unit_size,
-            backward_prefetch_size=ddp_config.suggested_communication_unit_size,
+            forward_prefetch_size=prefetch_size,
+            backward_prefetch_size=prefetch_size,
             register_hooks=not config.overlap_moe_expert_parallel_comm,
         )
         common_fully_shard_kwargs = dict(

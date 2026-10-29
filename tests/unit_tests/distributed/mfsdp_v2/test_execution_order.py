@@ -85,7 +85,8 @@ def test_explicit_reset_and_exhaustion():
         assert list(order)[order.position :] == []
         with pytest.raises(RuntimeError, match='exceeded'):
             order.advance()
-    order.reset_cursor(1)
+    order.reset_cursor()
+    assert order.advance() == a
     assert order.advance() == b
     empty = ExecutionOrder()
     assert list(empty) == []

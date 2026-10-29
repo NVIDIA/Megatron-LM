@@ -50,8 +50,6 @@ class FsdpContext:
     execution_order: ExecutionOrder
     # Topology metadata must not keep modules alive after construction.
     _roots: WeakKeyDictionary[nn.Module, None]
-    # Forward/backward entry offsets for each root in the construction order.
-    _root_execution_offsets: WeakKeyDictionary[nn.Module, dict[Phase, int]]
     # Names are relative to each FSDP root and absent until finalization.
     _module_names: WeakKeyDictionary[nn.Module, str]
     # The optimizer runs on the current stream and must wait for reductions on
@@ -104,7 +102,6 @@ class FsdpContext:
         # Construction-only; empty after finalization.
         self._registered_modules: list[nn.Module] = []
         self._roots = WeakKeyDictionary()
-        self._root_execution_offsets = WeakKeyDictionary()
         self._module_names = WeakKeyDictionary()
         self.parameter_to_owner = parameter_to_owner
         self._is_finalized = False
@@ -162,7 +159,6 @@ class FsdpContext:
             if root in children:
                 continue
             self._roots[root] = None
-            self._root_execution_offsets[root] = {Phase.FORWARD: len(self.execution_order)}
             for name, module in root.named_modules():
                 if module not in registered_modules:
                     continue
@@ -172,8 +168,14 @@ class FsdpContext:
 
         if not self._recording_execution_order:
             for root in reversed(list(self._roots)):
-                self._root_execution_offsets[root][Phase.BACKWARD] = len(self.execution_order)
                 _collect_backward_order(root, registered_modules, self.execution_order)
+
+        if all(
+            module._schedule_policy.forward_prefetch_size == 0
+            and module._schedule_policy.backward_prefetch_size == 0
+            for module in registered_modules
+        ):
+            self.execution_order = ExecutionOrder()
 
         self._registered_modules.clear()
         self.parameter_to_owner = None
@@ -183,10 +185,6 @@ class FsdpContext:
         """Return whether ``module`` is an outermost FSDP module in this context."""
         self.ensure_finalized()
         return module in self._roots
-
-    def reset_execution_order(self, root: nn.Module, phase: Phase) -> None:
-        """Reset the cursor to the root's entry for this phase."""
-        self.execution_order.reset_cursor(self._root_execution_offsets[root][phase])
 
     def module_name(self, module: nn.Module) -> str:
         """Return ``module``'s name relative to its FSDP root."""
