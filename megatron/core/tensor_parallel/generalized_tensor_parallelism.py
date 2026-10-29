@@ -508,6 +508,9 @@ def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     # race peers' main_grad.add_ still queued on rs_stream.
     if not torch.cuda.is_current_stream_capturing():
         _close_wgrad_accumulation_windows()
+        # Every GTP buffer of the step has been issued and the optimizer step follows: the
+        # slab plans or verifies here, and no gather issued before this fence is reused after.
+        get_global_GTP_cache().step_boundary()
     # The per-layer CG runner replay streams exist only in the eager / per-layer-CG path; under
     # whole-step capture there are no runners, so stop here while capturing.
     if torch.cuda.is_current_stream_capturing():

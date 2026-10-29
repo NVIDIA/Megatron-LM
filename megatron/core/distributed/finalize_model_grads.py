@@ -727,12 +727,6 @@ def finalize_model_grads(
         )
 
         wait_for_gtp_grad_reduction_on_current_stream()
-        from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
-            get_global_GTP_cache,
-        )
-
-        # Step boundary for the GTP weight slab: every GTP buffer of this step has been issued.
-        get_global_GTP_cache().step_boundary()
 
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
