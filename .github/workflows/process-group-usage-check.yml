@@ -48,20 +48,25 @@ jobs:
           python-version: "3.12"
 
       # Run the test file directly to avoid the unit-test package's GPU fixtures. It also
-      # classifies the reads in megatron/core: one that no fallback warning precedes, apart from
-      # those its UNWARNED_READS lists, fails this step, whether or not the allowlist holds it.
+      # classifies the reads in megatron/core: one that is neither warned nor guarded fails this
+      # step, apart from those its UNWARNED_READS lists, whether or not the allowlist holds it. A
+      # use of a private parallel_state attribute is never warned or guarded, even in a fallback;
+      # the deprecated _set_global_memory_buffer() counts as a deprecated function.
       - name: Test the process-group usage checker
         run: python tests/unit_tests/test_check_process_group_usage.py
 
       # Fails once the version in megatron/core/package_info.py reaches a removal version that the
-      # code still announces. The unit-test bucket runs it too, but a selective (Testmon) run of
-      # the pull request that bumps the version can skip it. Stdlib-only, run by path as well.
+      # code still announces. The H100 unit-test bucket runs it too: testmon_mandatory_tests.yaml
+      # adds it to the selective run of a pull request that changes a file it scans, such as
+      # package_info.py, and a new top-level script needs its own entry in that YAML file. This
+      # step reports it without waiting for a GPU runner. Stdlib-only, run by path as well.
       - name: Check that no announced removal is due
         run: python tests/unit_tests/test_removal_versions.py
 
       # No third-party dependencies: the checker and its tests are stdlib-only.
-      # Report-only: new reads are listed in the log but do not fail the job. Whether new code may
-      # fall back to parallel_state is still to be decided, see
+      # Report-only: this step lists every new read in the log, warned and guarded ones included,
+      # without failing the job; the checker's tests above fail it on an unwarned one. Whether new
+      # code may fall back to parallel_state is still to be decided, see
       # https://github.com/NVIDIA/Megatron-LM/issues/6307.
       - name: Check for new global process-group reads in megatron/core
         continue-on-error: true
