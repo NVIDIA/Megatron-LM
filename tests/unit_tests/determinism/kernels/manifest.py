@@ -159,7 +159,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="attention_kernels_and_dispatch",
         sources=("megatron/core/transformer/attention.py",),
-        tests=(K + "test_fused_activations.py", K + "test_runtime_cp_attention.py"),
+        tests=(
+            K + "test_fused_activations.py",
+            K + "test_runtime_cp_attention.py",
+            "tests/unit_tests/models/test_inference_residual_norm.py",
+        ),
         kind="dispatch",
         notes="Attention._apply_output_gate is replayed in test_fused_activations.py. "
         "Packed SelfAttention dispatch through RoPE and TE attention is replayed with runtime "
@@ -202,6 +206,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "construction and optional latent norms around the registered TE / RoPE / CSA kernels.",
     ),
     # ---------------------------------------------------------------- Megatron Triton fusions
+    KernelEntry(
+        name="fused_bf16_add_rmsnorm",
+        sources=("megatron/core/ops/normalization/bf16_add_rmsnorm.py",),
+        tests=(K + "test_bf16_add_rmsnorm.py",),
+        kind="triton",
+        notes="Inference-only BF16 rounding before RMSNorm, TE native general/tuned reduction order; "
+        "both normalized output and residual replay under side-stream contention.",
+    ),
     KernelEntry(
         name="fused_pad_routing_map",
         sources=("megatron/core/fusions/fused_pad_routing_map.py",),
@@ -729,6 +741,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             C + "test_ssm_conv1d.py",
             K + "test_ssm_kernels.py",
             "tests/unit_tests/inference/engines/test_batch_invariant_mamba_prefix_caching.py",
+            "tests/unit_tests/models/test_inference_residual_norm.py",
         ),
         kind="dispatch",
         notes="Selects the pip causal_conv1d / mamba_ssm kernels (causal_conv1d_fn, "

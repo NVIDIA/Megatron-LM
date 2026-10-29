@@ -1405,6 +1405,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_sequence_cp_metadata=None,
+        inference_input_is_normalized: bool = False,
     ) -> Tensor:
         """
         Run the QKV input projection and core attention, stopping before linear_proj.
@@ -1504,11 +1505,15 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
 
         qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
         with qkv_linear_manager as hidden_states:
+            normalized_kwargs = (
+                {"inference_input_is_normalized": True} if inference_input_is_normalized else {}
+            )
             qkv_output = self.get_query_key_value_tensors(
                 hidden_states,
                 key_value_states,
                 split_qkv=split_qkv,
                 output_gate=self.config.attention_output_gate,
+                **normalized_kwargs,
             )
         # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
         qkv_output = qkv_linear_manager.group_offload(qkv_output, forced_released_tensors=[])
@@ -1987,6 +1992,7 @@ class SelfAttention(Attention):
         key_value_states: Tensor | None = None,
         output_gate: bool = False,
         split_qkv: bool = True,
+        inference_input_is_normalized: bool = False,
     ) -> (
         tuple[Tensor, Tensor, Tensor, Tensor]
         | tuple[Tensor, Tensor, Tensor]
@@ -1999,7 +2005,13 @@ class SelfAttention(Attention):
         """
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
-        mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
+        if inference_input_is_normalized:
+            project_normalized = getattr(self.linear_qkv, "forward_normalized", None)
+            if project_normalized is None:
+                raise RuntimeError("Normalized QKV input requires an inference projection")
+            mixed_qkv, _ = project_normalized(hidden_states)
+        else:
+            mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
         num_query_heads_per_group = (
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition
         )

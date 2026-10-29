@@ -2150,6 +2150,20 @@ class CudaGraphManager(torch.nn.Module):
                             # Replace the hidden states from previous layer's output buffer
                             local_kwargs = dict(kwargs)
                             local_kwargs['hidden_states'] = previous_runner[0].fwd_graph_outputs[0]
+                            # Fused residual normalization exposes its second
+                            # tensor explicitly. Link it alongside the rounded
+                            # residual; host-side layer attributes are not replayed.
+                            if kwargs.get(
+                                "inference_fuse_residual_norm", False
+                            ) and previous_runner[3].get("inference_fuse_residual_norm", False):
+                                output_map = runner.base_module.inference_cudagraph_io_map
+                                previous_outputs = previous_runner[0].fwd_graph_outputs
+                                for key, output_index in output_map.items():
+                                    value = kwargs.get(key)
+                                    if torch.is_tensor(value):
+                                        previous_output = previous_outputs[output_index]
+                                        if ArgMetadata(previous_output) == ArgMetadata(value):
+                                            local_kwargs[key] = previous_output
                         except StopIteration:
                             # No match found for previous layer, continue with no buffer reuse
                             pass

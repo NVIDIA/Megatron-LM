@@ -1131,6 +1131,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
+        if kwargs.pop("inference_fuse_residual_norm", False):
+            return self._inference_residual_norm.forward(self, *args, **kwargs)
         with _otel_managed_span(
             'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
         ):
