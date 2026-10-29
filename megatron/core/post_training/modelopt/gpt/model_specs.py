@@ -1,5 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+from typing import Optional
+
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
@@ -39,6 +41,8 @@ def get_gpt_modelopt_spec(
     real_quant_cfg: str = "None",
     qk_l2_norm: bool = False,
     use_arbitrary_attention_mask: bool = False,
+    vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
 ):
     """Mix the native spec with TENorm.
 
@@ -53,8 +57,11 @@ def get_gpt_modelopt_spec(
         real_quant_cfg: Model Optimizer real quantization config
         qk_l2_norm: whether to use Llama4 L2 norm for Q and K
         use_arbitrary_attention_mask: whether to use arbitrary attention mask instead of causal
+        vp_stage: virtual pipeline stage of the block; required with a virtual pipeline
+        pp_rank: rank in the model's pipeline-parallel group. The block keeps only the layers
+            of this pipeline stage; if None, the global pipeline rank is used.
     """
-    num_layers_to_build = get_num_layers_to_build(config)
+    num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
 
     # Llama4 Scout-16E support for NeMo. NeMo's GPTConfig is using attribute .qk_l2_norm directly.
     qk_l2_norm = getattr(config, "qk_l2_norm", qk_l2_norm)
@@ -197,7 +204,7 @@ def get_gpt_modelopt_spec(
 
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     # Note: MCore layer_number starts at 1
-    offset = get_transformer_layer_offset(config)
+    offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
     layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
     # Block spec.
