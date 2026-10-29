@@ -3,6 +3,7 @@
 """Utility functions related to FP4 that are used throughout Megatron core"""
 
 from contextlib import nullcontext
+from typing import Optional
 
 import torch
 
@@ -12,6 +13,7 @@ from megatron.core.fp8_utils import (
     _get_grouped_quantized_recipe,
     _unwrap_parameter_data,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection, amax_reduction_group
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 
@@ -238,14 +240,30 @@ if HAVE_TE:
                     "Please make sure you are using a compatible TE version >= 2.7.0.dev0."
                 )
         else:
-            raise ValueError(
-                """FP4 support requires TransformerEngine version >= 2.7.0.dev0 
-                for NVFP4BlockScaling."""
-            )
+            raise ValueError("""FP4 support requires TransformerEngine version >= 2.7.0.dev0 
+                for NVFP4BlockScaling.""")
         return fp4_recipe
 
-    def get_fp4_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
-        """Return fp4 context manager."""
+    def get_fp4_context(
+        config: TransformerConfig,
+        layer_no: int = -1,
+        is_init: bool = False,
+        *,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
+        """Return fp4 context manager.
+
+        Args:
+            config: Configuration object.
+            layer_no: *Global* layer index (including layers on other pipeline-parallel ranks).
+            is_init: Whether the context is fp8_model_init (True) or fp8_autocast (False).
+            pg_collection: Process groups of the model that owns the layer. The autocast
+                context reduces amaxes over
+                ``amax_reduction_group(pg_collection, config.tp_only_amax_red)``. When omitted,
+                it uses the global amax reduction group of ``parallel_state`` if model
+                parallelism is initialized, and passes no group otherwise. Unused by
+                fp8_model_init, which does not reduce amaxes.
+        """
         num_bf16_layers_at_start = (
             config.num_layers_at_start_in_bf16 if config.first_last_layers_bf16 else 0
         )
@@ -263,13 +281,16 @@ if HAVE_TE:
             fp4_context = nullcontext()
         else:
             fp4_recipe = get_fp4_recipe(config)
-            fp4_group = None
-            if parallel_state.model_parallel_is_initialized():
-                fp4_group = parallel_state.get_amax_reduction_group(
-                    with_context_parallel=True, tp_only_amax_red=config.tp_only_amax_red
-                )
 
             if not is_init:
+                if pg_collection is not None:
+                    fp4_group = amax_reduction_group(pg_collection, config.tp_only_amax_red)
+                elif parallel_state.model_parallel_is_initialized():
+                    fp4_group = parallel_state.get_amax_reduction_group(
+                        with_context_parallel=True, tp_only_amax_red=config.tp_only_amax_red
+                    )
+                else:
+                    fp4_group = None
                 # TE currently uses fp8_autocast for fp8 and fp4 quantization.
                 fp4_context = transformer_engine.pytorch.fp8_autocast(
                     enabled=True, fp8_recipe=fp4_recipe, fp8_group=fp4_group
@@ -297,6 +318,12 @@ else:
         """Return None when Transformer Engine is not available."""
         return None
 
-    def get_fp4_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
+    def get_fp4_context(
+        config: TransformerConfig,
+        layer_no: int = -1,
+        is_init: bool = False,
+        *,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
         """Return nullcontext when Transformer Engine is not available."""
         return nullcontext()
