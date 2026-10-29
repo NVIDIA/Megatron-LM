@@ -145,6 +145,9 @@ class ModelConfig:
 
         def _as_dict(config):
             if isinstance(config, (list, tuple)):
+                # Recurse into layer-config sequences so run-config YAML preserves their fields.
+                # Otherwise, the YAML object fallback records only each config's class,
+                # silently losing heterogeneous settings such as MoE expert widths.
                 return [_as_dict(value) for value in config]
             if not is_dataclass(config) or isinstance(config, type):
                 if callable(config):
