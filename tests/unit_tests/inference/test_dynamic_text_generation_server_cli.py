@@ -15,6 +15,7 @@ from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.transformer import TransformerConfig
 from megatron.training import argument_utils, arguments, global_vars
 from megatron.training.models import GPTModelConfig, HybridModelConfig, LLaVAModelConfig
+from megatron.training.vocab_utils import model_vocab_size
 from tools.run_dynamic_text_generation_server import add_text_generation_server_args
 
 
@@ -50,8 +51,14 @@ def test_deferred_bootstrap_resolves_detected_model(monkeypatch, family, padded_
         assert not build_tokenizer
         global_vars.initialize_runtime_services(args, build_tokenizer=False)
         if padded_vocab_size is None:
+            cfg = global_vars.get_run_config()
             with pytest.raises(ValueError, match="Model vocabulary must be resolved"):
-                _ = global_vars.get_run_config().model.effective_vocab_size
+                model_vocab_size(
+                    cfg.model.vocab_size,
+                    should_pad_vocab=cfg.model.should_pad_vocab,
+                    make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by,
+                    tensor_model_parallel_size=cfg.model.transformer.tensor_model_parallel_size,
+                )
 
     def detect(args, **kwargs):
         assert global_vars._GLOBAL_TOKENIZER is None
@@ -77,7 +84,12 @@ def test_deferred_bootstrap_resolves_detected_model(monkeypatch, family, padded_
     assert is_vlm == (family in ("llava", "mimo"))
     assert global_vars.get_tokenizer().vocab_size == 261
     assert (
-        cfg.model.effective_vocab_size
+        model_vocab_size(
+            cfg.model.vocab_size,
+            should_pad_vocab=cfg.model.should_pad_vocab,
+            make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by,
+            tensor_model_parallel_size=cfg.model.transformer.tensor_model_parallel_size,
+        )
         == cfg.tokenizer.padded_vocab_size
         == (384 if padded_vocab_size is None else padded_vocab_size)
     )

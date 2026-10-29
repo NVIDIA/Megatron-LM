@@ -6,14 +6,14 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 
 from megatron.core.transformer import TransformerConfig
-from megatron.training.models.base import ModelConfig, VocabSizeMixin
+from megatron.training.models.base import ModelConfig
 
 if TYPE_CHECKING:
     from examples.mimo.training.topology import HeteroTopology
 
 
 @dataclass(kw_only=True)
-class MimoBuildConfig(ModelConfig, VocabSizeMixin):
+class MimoBuildConfig(ModelConfig):
     """MIMO language-grid inputs for the shared training lifecycle.
 
     Tower construction and topology remain owned by the MIMO application.

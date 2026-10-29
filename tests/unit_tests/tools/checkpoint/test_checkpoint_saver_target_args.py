@@ -11,6 +11,7 @@ import torch
 from megatron.core import mpu
 from megatron.core.transformer import TransformerConfig
 from megatron.training.models import BertModelConfig
+from megatron.training.vocab_utils import model_vocab_size
 
 _REPO_ROOT = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..')
 sys.path.insert(0, os.path.join(_REPO_ROOT, 'tools', 'checkpoint'))
@@ -100,7 +101,14 @@ def test_receive_lm_updates_vocab_before_model_construction(
             assert run_config.model.vocab_size == expected_vocab
             assert not run_config.model.should_pad_vocab
             saver.models[pp_rank][ep_rank][tp_rank] = torch.empty(
-                run_config.model.effective_vocab_size // target_tp, 1
+                model_vocab_size(
+                    run_config.model.vocab_size,
+                    should_pad_vocab=run_config.model.should_pad_vocab,
+                    make_vocab_size_divisible_by=run_config.model.make_vocab_size_divisible_by,
+                    tensor_model_parallel_size=run_config.model.transformer.tensor_model_parallel_size,
+                )
+                // target_tp,
+                1,
             )
         return saver.models[pp_rank][ep_rank][tp_rank]
 

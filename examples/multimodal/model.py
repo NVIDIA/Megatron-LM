@@ -25,6 +25,7 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.utils import log_single_rank
 from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron.training.global_vars import get_run_config
+from megatron.training.vocab_utils import model_vocab_size
 
 
 def model_provider(
@@ -266,7 +267,12 @@ def model_provider(
     model = LLaVAModel(
         language_transformer_config=language_config,
         language_transformer_layer_spec=language_transformer_layer_spec,
-        language_vocab_size=cfg.model.effective_vocab_size,
+        language_vocab_size=model_vocab_size(
+            cfg.model.vocab_size,
+            should_pad_vocab=cfg.model.should_pad_vocab,
+            make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by,
+            tensor_model_parallel_size=cfg.model.transformer.tensor_model_parallel_size,
+        ),
         language_max_sequence_length=args.decoder_seq_length,
         vision_transformer_config=vision_config,
         vision_transformer_layer_spec=vision_transformer_layer_spec,

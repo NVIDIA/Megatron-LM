@@ -27,6 +27,7 @@ from megatron.core.models.T5.t5_spec import (
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.vocab_utils import model_vocab_size
 from megatron.training.global_vars import (
     get_run_config,
     get_tokenizer,
@@ -123,7 +124,12 @@ def model_provider(
         encoder_config=encoder_config,
         transformer_encoder_layer_spec=en_block_spec,
         transformer_decoder_layer_spec=de_block_spec,
-        vocab_size=cfg.model.effective_vocab_size,
+        vocab_size=model_vocab_size(
+            cfg.model.vocab_size,
+            should_pad_vocab=cfg.model.should_pad_vocab,
+            make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by,
+            tensor_model_parallel_size=cfg.model.transformer.tensor_model_parallel_size,
+        ),
         max_sequence_length=cfg.model.seq_length,
         pre_process=pre_process,
         post_process=post_process,

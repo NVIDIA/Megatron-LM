@@ -39,6 +39,7 @@ from megatron.training.models import (
 from megatron.training.vocab_utils import (
     build_tokenizer_and_pad_vocab_size,
     calculate_padded_vocab_size,
+    model_vocab_size,
 )
 
 
@@ -96,6 +97,32 @@ def test_batch_finalization_uses_core_world_size(
         run_config.finalize()
     assert run_config.train.global_batch_size == 2 * expected_world_size
     assert run_config.validation.eval_global_batch_size == 2 * expected_world_size
+
+
+@pytest.mark.parametrize(
+    "vocab_size,pad,expected",
+    [
+        (None, True, None),
+        (None, False, None),
+        (261, False, 261),
+        (261, True, 512),
+        (512, True, 512),
+        (768, False, 768),
+    ],
+)
+def test_model_vocab_size(vocab_size, pad, expected):
+    kwargs = dict(
+        vocab_size=vocab_size,
+        should_pad_vocab=pad,
+        make_vocab_size_divisible_by=128,
+        tensor_model_parallel_size=2,
+    )
+    if expected is None:
+        with pytest.raises(ValueError, match="Model vocabulary must be resolved"):
+            model_vocab_size(**kwargs)
+    else:
+        assert model_vocab_size(**kwargs) == expected
+        assert model_vocab_size(**kwargs) == expected
 
 
 @pytest.mark.parametrize("adapter", [gpt_config_from_args, hybrid_config_from_args])

@@ -42,6 +42,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_pg_rank, get_pg_size
 from megatron.training.global_vars import get_run_config
+from megatron.training.vocab_utils import model_vocab_size
 
 try:
     from megatron.core.extensions.transformer_engine import TERowParallelLinear
@@ -271,7 +272,12 @@ def language_model_spec(
         params={
             "config": config,
             "mamba_stack_spec": stack_spec,
-            "vocab_size": cfg.model.effective_vocab_size,
+            "vocab_size": model_vocab_size(
+                cfg.model.vocab_size,
+                should_pad_vocab=cfg.model.should_pad_vocab,
+                make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by,
+                tensor_model_parallel_size=cfg.model.transformer.tensor_model_parallel_size,
+            ),
             "max_sequence_length": args.seq_length,
             "pre_process": pp_rank == 0,
             "post_process": pp_rank == pp_size - 1,

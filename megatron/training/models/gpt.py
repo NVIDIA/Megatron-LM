@@ -34,7 +34,7 @@ from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.training.models.base import ModelBuilder, ModelConfig, VocabSizeMixin, compose_hooks
+from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 from megatron.training.models.dist_utils import unimodal_build_distributed_models
 from megatron.training.vocab_utils import calculate_padded_vocab_size
 
@@ -141,7 +141,7 @@ def _te_or_local_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSp
 
 
 @dataclass(kw_only=True)
-class GPTModelConfig(ModelConfig, VocabSizeMixin):
+class GPTModelConfig(ModelConfig):
     """Configuration for a Megatron Core GPT model.
 
     This is purely a configuration object. All model construction

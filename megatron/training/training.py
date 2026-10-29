@@ -864,11 +864,18 @@ def num_floating_point_operations(
             CP-alignment padding or end-of-sequence padding, so neither kind of
             padding shows up in the reported FLOPs.
     """
+    from megatron.training.vocab_utils import model_vocab_size
+
     transformer = model_config.transformer
     llm_seq_length = sequence_length
     group_query_attention = transformer.num_query_groups != transformer.num_attention_heads
     swiglu = transformer.gated_linear_unit and transformer.activation_func is torch.nn.functional.silu
-    vocab_size = model_config.effective_vocab_size
+    vocab_size = model_vocab_size(
+        model_config.vocab_size,
+        should_pad_vocab=model_config.should_pad_vocab,
+        make_vocab_size_divisible_by=model_config.make_vocab_size_divisible_by,
+        tensor_model_parallel_size=transformer.tensor_model_parallel_size,
+    )
 
     # Defaults: BSHD layout assumption (full causal mask, every sample length =
     # llm_seq_length, no padding). For BSHD ``total_real_tokens = batch * s`` and
