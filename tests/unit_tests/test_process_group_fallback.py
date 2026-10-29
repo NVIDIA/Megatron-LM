@@ -82,10 +82,10 @@ def test_fallback_warning_is_a_future_warning():
 def test_fallback_warning_carries_the_versions_of_the_call():
     with pytest.warns(ProcessGroupFallbackWarning) as record:
         warn_global_process_group_fallback(
-            "Owner", "tp_group", deprecated_in="0.21", removed_in="0.23"
+            "Owner", "tp_group", deprecated_in="0.22", removed_in="0.24"
         )
     message = str(_fallback_warning(record, "Owner", "tp_group").message)
-    assert "deprecated since Megatron Core 0.21 and will be removed in 0.23" in message
+    assert "deprecated since Megatron Core 0.22 and will be removed in 0.24" in message
 
 
 def test_each_omitted_argument_of_an_owner_warns_once():
@@ -280,11 +280,11 @@ class TestGlobalProcessGroupFallbacks:
                 None,
                 owner="Owner",
                 required=("pp", "embd"),
-                deprecated_in="0.21",
-                removed_in="0.23",
+                deprecated_in="0.22",
+                removed_in="0.24",
             )
         message = str(_fallback_warning(record, "Owner").message)
-        assert "since Megatron Core 0.21 and will be removed in 0.23" in message
+        assert "since Megatron Core 0.22 and will be removed in 0.24" in message
         # Only the required fields are built, and a non-member's embd is an explicit None.
         assert set(vars(pg_collection)) == {"pp", "embd"}
         assert pg_collection.pp is parallel_state.get_pipeline_model_parallel_group()

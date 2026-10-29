@@ -71,7 +71,7 @@ def warn_global_process_group_fallback(
         argument: Name of the omitted process-group argument.
         deprecated_in: Megatron Core release in which this fallback started to warn.
         removed_in: Megatron Core release that removes this fallback. Under the N+2 policy, a
-            fallback that starts to warn after 0.20 passes both versions.
+            fallback that starts to warn after 0.21 passes both versions.
     """
     key = (owner, argument)
     if key in _warned_global_process_group_fallbacks:
