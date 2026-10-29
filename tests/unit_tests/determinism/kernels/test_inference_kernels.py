@@ -785,6 +785,27 @@ def test_vllm_moe_align_block_size_replays():
     )
 
 
+@pytest.mark.parametrize(
+    "num_experts,topk,scaling_factor",
+    [(128, 6, 2.5), (512, 6, 5.0), (512, 22, 5.0)],
+    ids=["nano", "512-experts", "super-ultra"],
+)
+@pytest.mark.parametrize("num_tokens", [2, 2048])
+def test_sigmoid_topk_routing_replay(num_experts, topk, scaling_factor, num_tokens):
+    from megatron.core.inference.moe.sigmoid_topk import sigmoid_topk_routing
+
+    seeded()
+    logits = torch.randn(num_tokens, num_experts, device="cuda")
+    expert_bias = torch.randn(num_experts, device="cuda") * 0.05
+    assert_replays_bit_exact(
+        lambda lg, b: sigmoid_topk_routing(lg, b, topk, scaling_factor),
+        (logits, expert_bias),
+        replays=4,
+        backward=False,
+        what=f"sigmoid_topk_routing[tokens={num_tokens}, experts={num_experts}, topk={topk}]",
+    )
+
+
 # --- batch-invariant kernels -----------------------------------------------------------------
 
 
