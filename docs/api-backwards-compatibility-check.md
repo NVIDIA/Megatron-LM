@@ -183,7 +183,9 @@ with a `pg_collection`; without one, it falls back to the global grid with a
   fallback, and the accessors and `use_mpu_process_groups()` it calls do not warn again.
   `tests/unit_tests/test_parallel_state_accessor_uses.py` checks that the code of this
   repository outside Megatron Core and its tests calls them only in such a block or in
-  bootstrap code that ignores `ParallelStateDeprecationWarning`.
+  bootstrap code that ignores `ParallelStateDeprecationWarning` after warning with that category
+  itself, earlier in the same function, and never touches a private attribute of
+  `parallel_state`.
 - **In CI**, the *Process group usage check* workflow
   (`.github/workflows/process-group-usage-check.yml`) runs on pull requests and in the merge
   queue. Its job fails when the tests of the checker,

@@ -1,16 +1,21 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """In-tree code outside Megatron Core calls the deprecated parallel_state functions, and
-ProcessGroupCollection.use_mpu_process_groups(), only in a warned fallback or in bootstrap, so it
-emits no ParallelStateDeprecationWarning.
+ProcessGroupCollection.use_mpu_process_groups(), only in a warned fallback, so a stock run emits
+no ParallelStateDeprecationWarning, and it never touches the private state of parallel_state.
 
 A call is allowed inside ``with global_process_group_fallback(...)`` (or a helper of the same
 module that returns one), whose ProcessGroupFallbackWarning reports the fallback, and inside a
-``with warnings.catch_warnings()`` block that ignores ParallelStateDeprecationWarning, which marks
-bootstrap code. A reference in a function or lambda defined in such a block runs later, outside
-it, and is not allowed. Megatron Core is exempt at run time and is checked by
-tools/check_process_group_usage.py instead; tests use the global grid on purpose. Files listed
-in UNIMPORTABLE_FILES, which import a module that does not exist and so cannot run, are skipped.
+``with warnings.catch_warnings()`` block that ignores ParallelStateDeprecationWarning after the
+code has warned on its own: an earlier statement of the same function, in the block of the
+``with`` or in a block that contains it, calls ``warnings.warn()`` with that category or
+``warn_global_process_group_fallback()``. A reference in a function or lambda defined in such a
+block runs later, outside it, and is not allowed. A read, write or deletion of a private
+(``_``-prefixed) attribute of parallel_state is never allowed; the deprecated
+``_set_global_memory_buffer()`` counts as a deprecated function instead. Megatron Core is exempt
+at run time and is checked by tools/check_process_group_usage.py instead; tests use the global
+grid on purpose. Files listed in UNIMPORTABLE_FILES, which import a module that does not exist
+and so cannot run, are skipped.
 
 Stdlib only. Run directly with ``python tests/unit_tests/test_parallel_state_accessor_uses.py`` to
 avoid the GPU fixtures used when pytest collects the enclosing unit-test package.
@@ -28,6 +33,8 @@ CORE = "megatron.core"
 # megatron.core exports parallel_state under its legacy name as well.
 PARALLEL_STATE_NAMES = {"parallel_state", "mpu"}
 FALLBACK = "global_process_group_fallback"
+# The fallback warning that a call made before a block that ignores WARNING can report instead.
+FALLBACK_WARNING = "warn_global_process_group_fallback"
 WARNING = "ParallelStateDeprecationWarning"
 # ProcessGroupCollection.use_mpu_process_groups(), deprecated with the parallel_state accessors.
 # The name is unique to it, so every attribute of that name counts, whatever its owner.
@@ -62,15 +69,18 @@ def deprecated_functions(source):
     return names
 
 
+def _last_name(node):
+    """Return ``name`` for the expression ``name`` or ``owner.name``, or None."""
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
+
+
 def _called_name(node):
     """Return the name of the function that ``node`` calls, or None if it is not a call."""
-    if not isinstance(node, ast.Call):
-        return None
-    if isinstance(node.func, ast.Attribute):
-        return node.func.attr
-    if isinstance(node.func, ast.Name):
-        return node.func.id
-    return None
+    return _last_name(node.func) if isinstance(node, ast.Call) else None
 
 
 def _fallback_helpers(tree):
@@ -212,6 +222,30 @@ def _module_references(tree, package):
     return refers_to
 
 
+def _is_private(name):
+    """True for a private attribute such as ``_DATA_PARALLEL_GROUP``, but not a dunder."""
+    return name.startswith("_") and not (name.startswith("__") and name.endswith("__"))
+
+
+def _warns(statement, warn_functions):
+    """True for ``warnings.warn(..., ParallelStateDeprecationWarning, ...)``, with the category
+    given by position or keyword, and for ``warn_global_process_group_fallback(...)``.
+
+    ``warn_functions`` holds the spellings of ``warnings.warn`` that the file's imports bind, such
+    as ``warnings.warn`` or ``warn``; another function named ``warn``, such as a logger's, does
+    not emit the warning.
+    """
+    if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
+        return False
+    call = statement.value
+    if _called_name(call) == FALLBACK_WARNING:
+        return True
+    if ast.unparse(call.func) not in warn_functions:
+        return False
+    categories = call.args[1:2] + [k.value for k in call.keywords if k.arg == "category"]
+    return any(_last_name(category) == WARNING for category in categories)
+
+
 def _ignores_the_warning(statement):
     """True for ``warnings.simplefilter("ignore", ParallelStateDeprecationWarning)`` and the
     equivalent ``filterwarnings`` call."""
@@ -231,7 +265,8 @@ def _ignores_the_warning(statement):
 
 def uncovered_uses(source, package, deprecated):
     """Return the lines that use a deprecated parallel_state function, or the
-    ProcessGroupCollection.use_mpu_process_groups() shim, outside an allowed block.
+    ProcessGroupCollection.use_mpu_process_groups() shim, outside an allowed block, and those that
+    read, write or delete a private attribute of parallel_state anywhere.
 
     ``package`` is the dotted package of the scanned file, used to resolve relative imports. A
     name bound to the parallel_state module, by an import or an assignment, or to one of its
@@ -242,48 +277,87 @@ def uncovered_uses(source, package, deprecated):
     tree = ast.parse(source)
     refers_to = _module_references(tree, package)
     functions = set()
+    # Names bound to a private attribute of parallel_state.
+    private = set()
+    # The spellings of warnings.warn that the imports bind.
+    warn_functions = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "warnings":
+                    warn_functions.add(f"{alias.asname or alias.name}.warn")
+        elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
             if node.level:
                 module = importlib.util.resolve_name("." * node.level + module, package)
             for alias in node.names:
-                if module == PARALLEL_STATE and alias.name == "*":
+                if module == "warnings" and alias.name == "warn":
+                    warn_functions.add(alias.asname or alias.name)
+                elif module == PARALLEL_STATE and alias.name == "*":
                     functions.update(deprecated)
                 elif module == PARALLEL_STATE and alias.name in deprecated:
+                    # A deprecated function is one even if private: _set_global_memory_buffer.
                     functions.add(alias.asname or alias.name)
+                elif module == PARALLEL_STATE and _is_private(alias.name):
+                    private.add(alias.asname or alias.name)
     covering = {FALLBACK} | _fallback_helpers(tree)
     lines = []
 
     class Visitor(ast.NodeVisitor):
         def __init__(self):
             self.covered = False
+            # Whether an earlier statement of the function, in the current block or in a block
+            # that contains it, has warned (_warns).
+            self.warned = False
+
+        def generic_visit(self, node):
+            # Visit each list of statements, such as the branches of an ``if``, as a block.
+            for _, value in ast.iter_fields(node):
+                if isinstance(value, list):
+                    self._visit_block(value)
+                elif isinstance(value, ast.AST):
+                    self.visit(value)
+
+        def _visit_block(self, statements):
+            # A warning covers the statements after it in its block, not those after the block.
+            outer = self.warned
+            for statement in statements:
+                if isinstance(statement, ast.AST):
+                    self.visit(statement)
+                    self.warned = self.warned or _warns(statement, warn_functions)
+            self.warned = outer
 
         def visit_With(self, node):
             for item in node.items:
                 self.visit(item)
             covers = any(_called_name(item.context_expr) in covering for item in node.items)
+            # Ignoring the warning hides the read unless the code has warned before the block.
             covers = covers or (
-                any(_called_name(item.context_expr) == "catch_warnings" for item in node.items)
+                self.warned
+                and any(_called_name(item.context_expr) == "catch_warnings" for item in node.items)
                 and any(_ignores_the_warning(statement) for statement in node.body)
             )
             outer, self.covered = self.covered, self.covered or covers
-            for statement in node.body:
-                self.visit(statement)
+            self._visit_block(node.body)
             self.covered = outer
 
         def _visit_deferred(self, node):
             # A function or lambda runs when it is called, which can be after the block ends.
-            outer, self.covered = self.covered, False
+            outer = self.covered, self.warned
+            self.covered = self.warned = False
             self.generic_visit(node)
-            self.covered = outer
+            self.covered, self.warned = outer
 
         visit_FunctionDef = visit_AsyncFunctionDef = visit_Lambda = _visit_deferred
 
         def _visit_attribute(self, node):
             owner, name = _attribute(node)
-            if not self.covered and (
-                name == SHIM or (name in deprecated and refers_to(owner) == PARALLEL_STATE)
+            module = refers_to(owner)
+            if module == PARALLEL_STATE and _is_private(name) and name not in deprecated:
+                # The private state of parallel_state is not an interface, even in a fallback.
+                lines.append(node.lineno)
+            elif not self.covered and (
+                name == SHIM or (name in deprecated and module == PARALLEL_STATE)
             ):
                 lines.append(node.lineno)
             self.generic_visit(node)
@@ -297,7 +371,7 @@ def uncovered_uses(source, package, deprecated):
                 self.generic_visit(node)
 
         def visit_Name(self, node):
-            if not self.covered and node.id in functions:
+            if node.id in private or (not self.covered and node.id in functions):
                 lines.append(node.lineno)
 
     Visitor().visit(tree)
@@ -506,6 +580,7 @@ class TestUncoveredUses(unittest.TestCase):
             "        return mpu.get_tensor_model_parallel_rank()\n",
             "import warnings\nfrom megatron.core import mpu\n"
             "from megatron.core.parallel_state import ParallelStateDeprecationWarning\n"
+            "warnings.warn('lazy init is deprecated', ParallelStateDeprecationWarning)\n"
             "with warnings.catch_warnings():\n"
             "    warnings.simplefilter('ignore', ParallelStateDeprecationWarning)\n"
             "    mpu.set_tensor_model_parallel_rank(0)\n",
@@ -514,6 +589,7 @@ class TestUncoveredUses(unittest.TestCase):
             "with global_process_group_fallback('f', deprecated_in='0.21'):\n"
             "    pg_collection = ProcessGroupCollection.use_mpu_process_groups(['tp'])\n",
             "import warnings\n"
+            "warn_global_process_group_fallback('f', deprecated_in='0.21', removed_in='0.23')\n"
             "with warnings.catch_warnings():\n"
             "    warnings.simplefilter('ignore', ParallelStateDeprecationWarning)\n"
             "    pg_collection = ProcessGroupCollection.use_mpu_process_groups()\n",
@@ -524,6 +600,140 @@ class TestUncoveredUses(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(self.uses(source), [])
 
+    def test_bootstrap_block_follows_an_explicit_warning(self):
+        # Ignoring ParallelStateDeprecationWarning is allowed only after the code has reported the
+        # read itself, earlier in the function, as megatron/training/initialize.py does.
+        imports = "import warnings\nfrom megatron.core import mpu\n"
+        block = (
+            "with warnings.catch_warnings():\n"
+            "    warnings.simplefilter('ignore', ParallelStateDeprecationWarning)\n"
+            "    mpu.set_tensor_model_parallel_rank(0)\n"
+        )
+        warn = "warnings.warn('deprecated', ParallelStateDeprecationWarning)\n"
+
+        def body(*statements, depth=1):
+            return "".join(
+                "    " * depth + line + "\n"
+                for statement in statements
+                for line in statement.splitlines()
+            )
+
+        allowed = {
+            "a warning by position": warn.replace(")", ", stacklevel=2)"),
+            "a warning by keyword": warn.replace("Parallel", "category=Parallel"),
+            "a qualified category": warn.replace("Parallel", "parallel_state.Parallel"),
+            "a fallback warning": "warn_global_process_group_fallback('f')\n",
+            "warnings imported under another name": (
+                "import warnings as w\n" + warn.replace("warnings.", "w.")
+            ),
+            "warn imported from warnings": (
+                "from warnings import warn\n" + warn.replace("warnings.", "")
+            ),
+        }
+        for case, warning in allowed.items():
+            with self.subTest(case=case):
+                self.assertEqual(self.uses(imports + "def f():\n" + body(warning, block)), [])
+        with self.subTest(case="a warning in a block that contains the bootstrap block"):
+            self.assertEqual(
+                self.uses(
+                    imports + "def f(lazy):\n" + body(warn, "if lazy:") + body(block, depth=2)
+                ),
+                [],
+            )
+        flagged = {
+            "no warning": body(block),
+            "a warning after the block": body(block, warn),
+            "a warning in a branch before the block": (
+                body("if lazy:") + body(warn, depth=2) + body(block)
+            ),
+            "a warning of another category": body(
+                warn.replace("ParallelStateDeprecationWarning", "DeprecationWarning"), block
+            ),
+            "a category whose name only contains the warning's": body(
+                warn.replace("Parallel", "NotParallel"), block
+            ),
+            "a logger's warn": body(warn.replace("warnings.", "logger."), block),
+            "a warn function of another module": body(
+                "from other import warn", warn.replace("warnings.", ""), block
+            ),
+            "a warning that is not a statement": body("lazy or " + warn, block),
+            "a warning the block itself silences": body(
+                block.replace("    mpu.", "    " + warn + "    mpu.")
+            ),
+        }
+        for case, function_body in flagged.items():
+            with self.subTest(case=case):
+                source = imports + "def f(lazy):\n" + function_body
+                self.assertEqual(len(self.uses(source)), 1, source)
+        with self.subTest(case="a warning in another function"):
+            self.assertEqual(
+                self.uses(imports + "def g():\n" + body(warn) + "def f():\n" + body(block)), [8]
+            )
+        with self.subTest(case="a function defined after the warning"):
+            self.assertEqual(self.uses(imports + warn + "def f():\n" + body(block)), [7])
+
+    def test_finds_private_attributes_anywhere(self):
+        # A private attribute of parallel_state is not an interface: no block allows it.
+        cases = [
+            ("from megatron.core import mpu\nmpu._DATA_PARALLEL_GROUP\n", [2]),
+            ("from megatron.core import parallel_state\nparallel_state._MPU_X = 0\n", [2]),
+            ("from megatron.core import mpu\ndel mpu._DATA_PARALLEL_GROUP\n", [2]),
+            ("from megatron.core import mpu\ngetattr(mpu, '_DATA_PARALLEL_GROUP', None)\n", [2]),
+            (
+                "import megatron.core\ngrid = megatron.core.parallel_state\n"
+                "grid._DATA_PARALLEL_GROUP = None\n",
+                [3],
+            ),
+            (
+                "from megatron.core.parallel_state import _DATA_PARALLEL_GROUP as group\n"
+                "def f():\n    return group\n",
+                [3],
+            ),
+            (
+                "from megatron.core import mpu\n"
+                "with global_process_group_fallback('f'):\n"
+                "    mpu._MPU_TENSOR_MODEL_PARALLEL_RANK = 0\n",
+                [3],
+            ),
+            (
+                "import warnings\nfrom megatron.core import mpu\n"
+                "warnings.warn('deprecated', ParallelStateDeprecationWarning)\n"
+                "with warnings.catch_warnings():\n"
+                "    warnings.simplefilter('ignore', ParallelStateDeprecationWarning)\n"
+                "    mpu._MPU_TENSOR_MODEL_PARALLEL_RANK = 0\n",
+                [6],
+            ),
+        ]
+        for source, lines in cases:
+            with self.subTest(source=source):
+                self.assertEqual(self.uses(source), lines)
+        for source in (
+            "from megatron.core import mpu\nmpu.__name__\n",
+            "from megatron.core import utils\nutils._GLOBAL_MEMORY_BUFFER\n",
+            "from other import parallel_state\nparallel_state._DATA_PARALLEL_GROUP\n",
+            "self._DATA_PARALLEL_GROUP = None\n",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.uses(source), [])
+
+    def test_a_deprecated_private_function_counts_as_deprecated(self):
+        # parallel_state deprecates _set_global_memory_buffer() like its public functions, so a
+        # fallback block allows it, as tools/check_process_group_usage.py does.
+        deprecated = self.DEPRECATED | {"_set_global_memory_buffer"}
+        fallback = "with global_process_group_fallback('f'):\n    "
+        for imports, call in (
+            ("from megatron.core import mpu\n", "mpu._set_global_memory_buffer()\n"),
+            (
+                "from megatron.core.parallel_state import _set_global_memory_buffer\n",
+                "_set_global_memory_buffer()\n",
+            ),
+        ):
+            with self.subTest(call=call):
+                self.assertEqual(uncovered_uses(imports + call, self.PACKAGE, deprecated), [2])
+                self.assertEqual(
+                    uncovered_uses(imports + fallback + call, self.PACKAGE, deprecated), []
+                )
+
 
 class TestInTreeUses(unittest.TestCase):
     """The code in SCANNED_FOLDERS and at the top level, outside Megatron Core, does not warn."""
@@ -532,6 +742,7 @@ class TestInTreeUses(unittest.TestCase):
         names = deprecated_functions(PARALLEL_STATE_FILE.read_text(encoding="utf-8"))
         self.assertIn("get_tensor_model_parallel_group", names)
         self.assertIn("set_tensor_model_parallel_rank", names)
+        self.assertIn("_set_global_memory_buffer", names)
         self.assertNotIn("initialize_model_parallel", names)
 
     def test_in_tree_code_outside_core_does_not_warn(self):
