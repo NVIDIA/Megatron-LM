@@ -7,6 +7,7 @@ import contextlib
 import importlib
 import importlib.util
 import logging
+import warnings
 from collections import namedtuple
 from collections.abc import Callable
 from functools import lru_cache
@@ -1686,8 +1687,14 @@ _TE_NATIVE_WORKSPACE_BYTES = 1024
 # Originals saved by _enable_te_native_workspace_starvation for restoration.
 _TE_WORKSPACE_SIZE_FN_ORIG = None
 _TE_GROUPED_WORKSPACE_FN_ORIG = None
-_TE_NATIVE_ENV_ORIG: dict = {}
-_TE_NATIVE_BLAS_ORIG = None
+
+# Originals saved by _enable_aten_gemm_workspace_starvation for restoration.
+_ATEN_GEMM_ENV_ORIG: dict = {}
+_ATEN_GEMM_CUBLASLT_WORKSPACE_ORIG = None
+_ATEN_GEMM_BLAS_ORIG = None
+_ATEN_GEMM_FALLBACK_FILTER = None
+# How PyTorch's warning starts when cuBLASLt fails a GEMM and PyTorch reruns it on cuBLAS.
+_CUBLASLT_FALLBACK_WARNING = "bgemm_internal_cublaslt error"
 
 
 def te_supports_batch_invariant_grouped_gemm(device: int | None = None) -> bool:
@@ -1716,59 +1723,111 @@ def _get_te_native_grouped_workspace(device: int, layout: str) -> torch.Tensor:
     return torch.empty(_TE_WORKSPACE_SIZE_FN_ORIG(), dtype=torch.uint8, device=device)
 
 
-def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WORKSPACE_BYTES):
-    """Make the NATIVE cuBLASLt GEMM kernels batch-invariant via workspace starvation.
+def _enable_aten_gemm_workspace_starvation():
+    """Keep the aten GEMMs that a backend leaves native from splitting K.
 
-    cuBLASLt selects split-K reduction variants per M (the co-batch token count),
+    cuBLAS(Lt) selects split-K reduction variants per M (the co-batch token count),
     which changes the fp32 accumulation order across batch compositions. Split-K
-    variants require workspace; starving the workspace to ~1KB disqualifies them,
-    pinning every M to the same serial-K reduction recipe — batch-invariant at
-    native kernel speed, with no kernel substitution. (Tile shape selection may
-    still vary with M, but M/N tiling does not affect bits: bf16 products are
-    exact in fp32, so only the K-reduction order matters.)
+    variants require workspace; starving the workspace disqualifies them, pinning
+    every M to the same serial-K reduction recipe with the native kernels. (Tile shape
+    selection may still vary with M, but M/N tiling does not affect bits: bf16
+    products are exact in fp32, so only the K-reduction order matters.)
 
+    te_native leaves every aten GEMM native; deepgemm and triton replace aten::mm and
+    aten::addmm but leave aten::bmm and aten::baddbmm, which einsum lowers to.
     Three knobs must all land:
-    - cuBLASLt env pins for kernels that honor them (set before first use).
+    - A zero cuBLASLt workspace. PyTorch >= 2.14 looks the size up at every GEMM, so
+      setting it with torch.backends.cuda.cublaslt_workspace_size holds however late
+      the mode is enabled. Earlier versions read CUBLASLT_WORKSPACE_SIZE once, at
+      cuBLASLt's first GEMM, so there the mode must be enabled before the first GEMM.
+      The env var is pinned on every version, which also covers child processes.
     - PyTorch's preferred BLAS library: on CUDA it defaults to cuBLAS, whose workspace
-      the env pin does not starve, so aten GEMMs without an epilogue (a bias-free
-      torch.matmul, such as the GPT output layer) would still pick split-K per M.
-      Prefer cuBLASLt, so every aten GEMM runs under the pinned workspace.
-    - Transformer Engine's own workspace: TE (<= 2.15 verified) hardcodes 32MiB in
-      get_cublas_workspace_size_bytes() and ignores CUBLASLT_WORKSPACE_SIZE, so the
-      env pin alone never engages for TE-launched GEMMs — patch the size fn and
-      clear its lru_cache.
+      the env pin does not starve. Prefer cuBLASLt. This relies on
+      torch.backends.cuda.preferred_blas_library, which PyTorch marks experimental.
+    - When cuBLASLt fails a GEMM, PyTorch warns and reruns it on cuBLAS with its full
+      workspace. Raise that warning as an error while the mode is on, so a GEMM cannot
+      lose invariance silently.
+
+    Not covered: fp32 and fp64 matrix-vector and dot products (torch.mv, a matmul
+    with a 1-D operand), which PyTorch always runs on cuBLAS.
     """
     import logging
     import os
 
-    global _TE_GROUPED_WORKSPACE_FN_ORIG, _TE_WORKSPACE_SIZE_FN_ORIG, _TE_NATIVE_BLAS_ORIG
+    global _ATEN_GEMM_CUBLASLT_WORKSPACE_ORIG, _ATEN_GEMM_BLAS_ORIG, _ATEN_GEMM_FALLBACK_FILTER
     logger = logging.getLogger(__name__)
 
+    cublaslt_workspace_size = getattr(torch.backends.cuda, "cublaslt_workspace_size", None)
+    if not torch.cuda.is_available():
+        cublaslt_workspace_size = None
+    if cublaslt_workspace_size is not None and _ATEN_GEMM_CUBLASLT_WORKSPACE_ORIG is None:
+        # Read the size before the env pin below, so disabling the mode restores what
+        # cuBLASLt used before it. The explicit size takes precedence over the env var.
+        _ATEN_GEMM_CUBLASLT_WORKSPACE_ORIG = cublaslt_workspace_size()
+        cublaslt_workspace_size(0)
     # CUBLASLT_WORKSPACE_SIZE must be pinned (not setdefault): a preset value
     # (e.g. from a determinism launcher) large enough for split-K would make
-    # te_native silently non-invariant on the aten GEMM path.
+    # the mode silently non-invariant on the aten GEMM path.
     for var, pinned in (("CUBLASLT_WORKSPACE_SIZE", "0"),):
         prev = os.environ.get(var)
         if prev is not None and prev != pinned:
             logger.warning(
-                "te_native batch-invariant backend overriding %s=%s with %s "
+                "Batch-invariant mode overriding %s=%s with %s "
                 "(split-K disqualification requires a starved workspace).",
                 var,
                 prev,
                 pinned,
             )
-        _TE_NATIVE_ENV_ORIG[var] = prev
+        _ATEN_GEMM_ENV_ORIG[var] = prev
         os.environ[var] = pinned
-    if torch.cuda.is_initialized():
+    if cublaslt_workspace_size is None and torch.cuda.is_initialized():
         logger.warning(
-            "te_native backend enabled after CUDA initialization; cuBLASLt "
-            "handles created earlier may retain their original workspace and "
-            "remain batch-variant. Enable batch-invariant mode before the "
-            "first GEMM."
+            "Batch-invariant mode enabled after CUDA initialization on a PyTorch "
+            "without torch.backends.cuda.cublaslt_workspace_size: if cuBLASLt already "
+            "ran a GEMM, it keeps its workspace, and aten GEMMs may split K and remain "
+            "batch-variant. Enable batch-invariant mode before the first GEMM."
         )
-    if _TE_NATIVE_BLAS_ORIG is None and torch.cuda.is_available():
-        _TE_NATIVE_BLAS_ORIG = torch.backends.cuda.preferred_blas_library()
+    if _ATEN_GEMM_BLAS_ORIG is None and torch.cuda.is_available():
+        _ATEN_GEMM_BLAS_ORIG = torch.backends.cuda.preferred_blas_library()
         torch.backends.cuda.preferred_blas_library("cublaslt")
+    if _ATEN_GEMM_FALLBACK_FILTER is None:
+        warnings.filterwarnings("error", message=_CUBLASLT_FALLBACK_WARNING, category=UserWarning)
+        _ATEN_GEMM_FALLBACK_FILTER = warnings.filters[0]
+
+
+def _disable_aten_gemm_workspace_starvation():
+    """Restore the warning filters, BLAS library, workspace and env set for native aten GEMMs."""
+    import os
+
+    global _ATEN_GEMM_CUBLASLT_WORKSPACE_ORIG, _ATEN_GEMM_BLAS_ORIG, _ATEN_GEMM_FALLBACK_FILTER
+    if _ATEN_GEMM_FALLBACK_FILTER is not None:
+        if _ATEN_GEMM_FALLBACK_FILTER in warnings.filters:
+            warnings.filters.remove(_ATEN_GEMM_FALLBACK_FILTER)
+        _ATEN_GEMM_FALLBACK_FILTER = None
+    if _ATEN_GEMM_BLAS_ORIG is not None:
+        torch.backends.cuda.preferred_blas_library(_ATEN_GEMM_BLAS_ORIG)
+        _ATEN_GEMM_BLAS_ORIG = None
+    if _ATEN_GEMM_CUBLASLT_WORKSPACE_ORIG is not None:
+        torch.backends.cuda.cublaslt_workspace_size(_ATEN_GEMM_CUBLASLT_WORKSPACE_ORIG)
+        _ATEN_GEMM_CUBLASLT_WORKSPACE_ORIG = None
+    for var, prev in _ATEN_GEMM_ENV_ORIG.items():
+        if prev is None:
+            os.environ.pop(var, None)
+        else:
+            os.environ[var] = prev
+    _ATEN_GEMM_ENV_ORIG.clear()
+
+
+def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WORKSPACE_BYTES):
+    """Make Transformer Engine's NATIVE cuBLASLt GEMMs batch-invariant via workspace starvation.
+
+    The mechanism of _enable_aten_gemm_workspace_starvation (a starved workspace
+    disqualifies split-K), applied to TE's own workspace: TE (<= 2.15 verified)
+    hardcodes 32MiB in get_cublas_workspace_size_bytes() and ignores
+    CUBLASLT_WORKSPACE_SIZE, so the env pin alone never engages for TE-launched
+    GEMMs — patch the size fn and clear its lru_cache.
+    """
+    global _TE_GROUPED_WORKSPACE_FN_ORIG, _TE_WORKSPACE_SIZE_FN_ORIG
     try:
         import transformer_engine.pytorch.cpp_extensions.gemm as _te_gemm_mod
 
@@ -1795,13 +1854,8 @@ def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WOR
 
 
 def _disable_te_native_workspace_starvation():
-    """Restore the TE workspace function, BLAS library and env pinned by the te_native backend."""
-    import os
-
-    global _TE_GROUPED_WORKSPACE_FN_ORIG, _TE_WORKSPACE_SIZE_FN_ORIG, _TE_NATIVE_BLAS_ORIG
-    if _TE_NATIVE_BLAS_ORIG is not None:
-        torch.backends.cuda.preferred_blas_library(_TE_NATIVE_BLAS_ORIG)
-        _TE_NATIVE_BLAS_ORIG = None
+    """Restore the TE workspace functions patched by the te_native backend."""
+    global _TE_GROUPED_WORKSPACE_FN_ORIG, _TE_WORKSPACE_SIZE_FN_ORIG
     if _TE_GROUPED_WORKSPACE_FN_ORIG is not None:
         _get_te_native_grouped_workspace.cache_clear()
         try:
@@ -1823,12 +1877,6 @@ def _disable_te_native_workspace_starvation():
         except ImportError:
             pass
         _TE_WORKSPACE_SIZE_FN_ORIG = None
-    for var, prev in _TE_NATIVE_ENV_ORIG.items():
-        if prev is None:
-            os.environ.pop(var, None)
-        else:
-            os.environ[var] = prev
-    _TE_NATIVE_ENV_ORIG.clear()
 
 
 _BATCH_INVARIANT_COLLECTIVE = "ordered"
@@ -1857,6 +1905,9 @@ def enable_batch_invariant_mode(backend: str = "te_native", collective: str = "o
             kernels (aten and TE) and obtains invariance via workspace
             starvation instead of kernel substitution. Grouped GEMM uses
             DeepGEMM for "deepgemm"/"triton"; "te_native" leaves it native.
+            The aten GEMMs a backend leaves native (all of them for "te_native";
+            `aten::bmm`/`aten::baddbmm`, which einsum lowers to, for
+            "deepgemm"/"triton") run on cuBLASLt with a starved workspace.
     """
     global _batch_invariant_MODE, _batch_invariant_LIB, _BATCH_INVARIANT_BACKEND
     global _BATCH_INVARIANT_COLLECTIVE
@@ -1878,6 +1929,9 @@ def enable_batch_invariant_mode(backend: str = "te_native", collective: str = "o
     dispatch_key = getattr(torch.accelerator.current_accelerator(), "type", "cpu").upper()
     _batch_invariant_MODE = True
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
+    # Every backend leaves aten GEMMs native: te_native all of them, deepgemm and
+    # triton aten::bmm and aten::baddbmm. Keep those from splitting K.
+    _enable_aten_gemm_workspace_starvation()
     if backend == "te_native":
         # Keep the NATIVE cuBLASLt kernels for every dense GEMM (aten and TE);
         # batch invariance comes from workspace starvation (split-K
@@ -1920,6 +1974,7 @@ def disable_batch_invariant_mode():
     # Restore Transformer Engine kernels if previously patched
     _te_unpatch_for_batch_invariant()
     _disable_te_native_workspace_starvation()
+    _disable_aten_gemm_workspace_starvation()
     _unpin_mamba_autotuners()
 
 
