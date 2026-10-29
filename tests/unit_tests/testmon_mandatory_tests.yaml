@@ -30,6 +30,7 @@ mappings:
       - tasks
       - scripts
       - docs
+      - tests/functional_tests
       - gpt_builders.py
       - hybrid_builders.py
       - mamba_builders.py
