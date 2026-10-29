@@ -164,6 +164,13 @@ workload rather than generalizing from any single comparison.
 > must be validated numerically rather than inferred from alignment.
 > Keep `use_transformer_engine_op_fuser=False`. Forward batch invariance does
 > not promise bitwise-identical gradients across different minibatches.
+>
+> MLA models with `cache_mla_latents` (required for dynamic batching) are
+> supported, with `flash_attention_version` 3 or 4 as above. Their decode-only
+> steps then skip FlashMLA, whose split-KV schedule depends on the whole batch.
+> Like mixed steps and training, they run unabsorbed attention: each layer
+> up-projects the latent cache to keys and values and runs FlashAttention with
+> one KV split. A decode step therefore costs about as much as a mixed step.
 
 > **Selective MXFP8 parameter storage.** Use the same Transformer Engine per-module
 > precision recipe for training and inference through `TransformerConfig.quant_recipe`
@@ -1059,7 +1066,10 @@ is the opposite of the `MegatronLLM` constructor default.
   raise), and in-core static-tiling preprocessing was removed — clients needing
   static tiling must submit a preprocessed tensor payload.
 - **MLA requires a specific configuration.** `cache_mla_latents=True`, a KV block
-  size of exactly 64, and the `flash_mla` package. RoPE fusion, sliding-window
+  size of exactly 64, and the `flash_mla` package. Batch-invariant mode works with
+  the latent cache, but its decode-only steps skip FlashMLA: each layer
+  up-projects the latent cache and runs FlashAttention 3 or 4, as in mixed steps,
+  which makes decoding slower. RoPE fusion, sliding-window
   attention, Flash Decoding, and the Triton KV-append fast path are all
   incompatible with the latent cache.
 - **GDN2 is not supported.** `experimental_attention_variant='gdn2'` raises
