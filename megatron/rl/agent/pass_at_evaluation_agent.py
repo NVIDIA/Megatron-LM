@@ -61,7 +61,11 @@ class PassAtEvaluationAgent(EvaluationAgent, ABC):
     ) -> PassAtEvaluationResponse:
 
         evaluations = [self._evaluation(prompt, golden, request) for _ in range(self.max_k)]
-        responses = await asyncio.gather(*evaluations)
+        # Every sample finishes before a failure is raised: none is left running unawaited.
+        responses = await asyncio.gather(*evaluations, return_exceptions=True)
+        for response in responses:
+            if isinstance(response, BaseException):
+                raise response
 
         results = sum([response.results for response in responses], [])
         rewards = [result.reward for result in results]
