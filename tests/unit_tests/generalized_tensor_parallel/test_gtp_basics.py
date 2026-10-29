@@ -2248,7 +2248,9 @@ def _worker_count_zeros_excludes_gtp_padding(rank, world_size, port):
             exp_avg_sq_dtype=torch.float32,
             log_num_zeros_in_grad=True,
         )
-        optim = get_megatron_optimizer(opt_config, [ddp_model])
+        optim = get_megatron_optimizer(
+            opt_config, [ddp_model], pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        )
 
         optim.zero_grad()
         ddp_model.zero_grad_buffer()

@@ -1963,7 +1963,11 @@ class TestRLUtils:
         optimizer_config = OptimizerConfig(
             optimizer='adam', bf16=True, use_distributed_optimizer=True
         )
-        optimizer = get_megatron_optimizer(optimizer_config, [ddp_model])
+        optimizer = get_megatron_optimizer(
+            optimizer_config,
+            [ddp_model],
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+        )
 
         # Manually initialize optimizer state (simulating what happens after first step)
         # This avoids needing to run a full forward/backward/step cycle
