@@ -9,10 +9,12 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 from megatron.core import tuning
 from megatron.core.transformer import TransformerConfig
 from megatron.core.tuning import AutotunePolicy
+from megatron.core.tuning import policy as tuning_policy
 from megatron.training import global_vars
 from megatron.training import initialize as initialization
 from megatron.training.argument_utils import _triton_autotune_config_from_args
@@ -208,3 +210,95 @@ def test_cli_config_invariant_list(parser):
     assert _triton_autotune_config_from_args(empty).config_invariant == ()
     named = parser.parse_args(['--triton-autotune-config-invariant', 'pkg.mod.kernel'])
     assert _triton_autotune_config_from_args(named).config_invariant == ('pkg.mod.kernel',)
+
+
+def _train_with(*flags):
+    """Install the policy as initialize_megatron does for these training arguments."""
+
+    def install(parser, monkeypatch):
+        args = parser.parse_args(list(flags))
+        tuning.install(
+            _triton_autotune_config_from_args(args), deterministic=args.deterministic_mode
+        )
+
+    return install
+
+
+def _deterministic_after_install(parser, monkeypatch):
+    tuning.install()
+    monkeypatch.setattr(torch, 'are_deterministic_algorithms_enabled', lambda: True)
+
+
+def _mamba_deterministic_env(parser, monkeypatch):
+    monkeypatch.setenv('MAMBA_DETERMINISTIC', '1')
+    _train_with()(parser, monkeypatch)
+
+
+@pytest.fixture
+def unpinned_process(isolated_policy, monkeypatch):
+    """No policy installed and nothing deterministic requested, as when a process starts."""
+    monkeypatch.setattr(tuning_policy, '_deterministic_override', None)
+    monkeypatch.setattr(torch, 'are_deterministic_algorithms_enabled', lambda: False)
+
+
+@pytest.mark.parametrize(
+    ('advertised', 'remedy'),
+    [
+        pytest.param('--deterministic-mode', _train_with('--deterministic-mode'), id='cli-det'),
+        pytest.param(
+            '--triton-autotune-mode pinned',
+            _train_with('--triton-autotune-mode', 'pinned'),
+            id='cli-pinned',
+        ),
+        pytest.param(
+            'install(..., deterministic=True)',
+            # The recipe in megatron/core/tuning/README.md.
+            lambda parser, monkeypatch: tuning.install(
+                AutotunePolicy(table_path=('/path/to/tables',), on_miss='error', verify_every=10),
+                deterministic=True,
+            ),
+            id='readme',
+        ),
+        pytest.param(
+            "install(AutotunePolicy(mode='pinned'))",
+            lambda parser, monkeypatch: tuning.install(AutotunePolicy(mode='pinned')),
+            id='python-pinned',
+        ),
+    ],
+)
+def test_ssm_pinning_check_accepts_each_remedy_it_names(
+    unpinned_process, parser, monkeypatch, advertised, remedy
+):
+    from megatron.core.ssm.ops.common.determinism import assert_ssm_kernels_pinned
+
+    with pytest.raises(AssertionError, match='installed policy: none') as rejected:
+        assert_ssm_kernels_pinned()
+    assert advertised in str(rejected.value)
+    remedy(parser, monkeypatch)
+    assert_ssm_kernels_pinned()
+
+
+@pytest.mark.parametrize(
+    'setup',
+    [
+        pytest.param(_train_with(), id='cli-default'),
+        pytest.param(_deterministic_after_install, id='torch-flag-after-install'),
+        pytest.param(_mamba_deterministic_env, id='mamba-env'),
+        pytest.param(
+            _train_with('--deterministic-mode', '--triton-autotune-mode', 'auto'),
+            id='cli-det-explicit-auto',
+        ),
+        pytest.param(
+            _train_with('--deterministic-mode', '--triton-autotune-modules', 'transformer_engine'),
+            id='cli-det-ssm-out-of-scope',
+        ),
+    ],
+)
+def test_ssm_pinning_check_rejects_policies_that_leave_ssm_kernels_timed(
+    unpinned_process, parser, monkeypatch, setup
+):
+    from megatron.core.ssm.ops.common.determinism import assert_ssm_kernels_pinned
+
+    setup(parser, monkeypatch)
+    with pytest.raises(AssertionError, match='installed policy: mode='):
+        assert_ssm_kernels_pinned()

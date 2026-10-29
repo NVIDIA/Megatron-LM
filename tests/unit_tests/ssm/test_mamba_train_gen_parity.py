@@ -1,11 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Bitwise parity between the Mamba training forward and the generation kernels.
 
-The scan comparison spans two implementations, so both have to pick the same Triton
-tiling: export MAMBA_DETERMINISTIC=1 before pytest, or that test skips.
+The scan comparisons span two implementations, so both have to pick the same Triton
+tiling. They run under a pinned autotune policy, as batch-invariant mode requires: it
+pins mamba_ssm's kernels and the in-tree ones alike, when they launch.
 """
-
-import os
 
 import pytest
 import torch
@@ -34,13 +33,6 @@ pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
     pytest.mark.skipif(not HAVE_MAMBA, reason="mamba_ssm required"),
 ]
-
-# Reading the environment is the whole check: the autotune config lists are fixed at
-# import, long before any test code runs, so only the launcher can pin them.
-requires_pinned_autotune = pytest.mark.skipif(
-    not os.environ.get("MAMBA_DETERMINISTIC", "").startswith("1"),
-    reason="needs MAMBA_DETERMINISTIC=1 so both implementations pick the same tiling",
-)
 
 NHEADS = 8
 HEADDIM = 32
@@ -88,7 +80,7 @@ def _inputs():
 class TestScanParity:
     """Training's chunk scan against the varlen scan dynamic prefill runs."""
 
-    @requires_pinned_autotune
+    @pytest.mark.usefixtures("pinned_autotune")
     def test_training_scan_matches_varlen_prefill(self, inputs):
         """Bitwise, since the prefill state seeds every token decoded after it."""
         x, z, dt, B, C = (inputs[k] for k in ("x", "z", "dt", "B", "C"))
@@ -189,7 +181,7 @@ class TestFusedTrainingParity:
     conv followed by the scan, which is what ``ssm_prefill`` runs.
     """
 
-    @requires_pinned_autotune
+    @pytest.mark.usefixtures("pinned_autotune")
     def test_fused_training_kernel_matches_varlen_prefill(self, inputs):
         from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
 

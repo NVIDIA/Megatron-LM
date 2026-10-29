@@ -12,6 +12,8 @@ from megatron.core.ssm.mamba_layer import MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.tuning import AutotunePolicy, active_policy, install
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -126,6 +128,44 @@ class TestMambaMixer:
 
 
 class TestMambaMixerErrorChecks:
+
+    def test_batch_invariant_mode_requires_pinned_ssm_kernels(self):
+        """Checked when the mixer is built, under the policy its kernels will launch with."""
+        Utils.initialize_model_parallel(1)
+        model_parallel_cuda_manual_seed(123)
+        transformer_config = TransformerConfig(
+            hidden_size=256,
+            num_layers=1,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+            batch_invariant_mode=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+
+        def build():
+            return MambaMixer(
+                transformer_config,
+                hybrid_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
+                transformer_config.hidden_size,
+                pg_collection=pg_collection,
+            )
+
+        previous = active_policy()
+        try:
+            # What training installs without --deterministic-mode.
+            install(AutotunePolicy(mode="auto"))
+            with pytest.raises(AssertionError, match="installed policy: mode='auto'"):
+                build()
+            install(AutotunePolicy(mode="pinned"))
+            assert build().config.batch_invariant_mode
+        finally:
+            install(previous or AutotunePolicy(mode="auto"))
+            Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(
         "hidden_size, ngroups, tp_size, expected_error_message",

@@ -23,7 +23,7 @@ import torch
 
 from megatron.core.ssm import mamba_mixer as mamba_mixer_module
 from megatron.core.ssm.ops.common import determinism as ssm_determinism
-from megatron.core.tuning import autotune_configs, choice_log
+from megatron.core.tuning import autotune_configs, choice_log, pins
 from megatron.core.tuning import policy as tuning_policy
 from tests.unit_tests.determinism.correctness.test_ssm_conv1d import (
     _build_mixer,
@@ -83,6 +83,8 @@ def _assert_pinned(*tuners):
         name = tuner.base_fn.__name__
         choices = [value for key, value in choice_log().items() if f".{name}|" in key]
         assert choices and all(value.endswith(";pinned") for value in choices), choices
+        # The query batch-invariant SSM layers check must agree with what the adapter did.
+        assert pins(tuner.base_fn.__module__)
 
 
 # --- Mamba2 --------------------------------------------------------------------------------

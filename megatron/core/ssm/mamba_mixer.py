@@ -26,6 +26,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
 from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_carry_states
+from megatron.core.ssm.ops.common.determinism import assert_ssm_kernels_pinned
 from megatron.core.ssm.ops.common.intermediate_extraction import (
     scatter_intermediate_conv,
     scatter_intermediate_ssm,
@@ -375,6 +376,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
 
         # Both of this mixer's conv layouts need it; see assert_causal_conv1d_deterministic.
         assert_causal_conv1d_deterministic(config.deterministic_mode)
+        if config.batch_invariant_mode:
+            assert_ssm_kernels_pinned()
 
         self.activation = "silu"
         self.act = nn.SiLU()

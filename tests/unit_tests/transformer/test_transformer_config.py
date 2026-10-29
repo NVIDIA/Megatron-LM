@@ -147,6 +147,30 @@ def test_batch_invariant_backend_rejects_unknown_value_at_construction():
         )
 
 
+def test_batch_invariant_hybrid_config_precedes_the_autotune_policy(monkeypatch):
+    # Training builds the model config before it installs the autotune policy, so the Mamba
+    # mixer, built afterwards, checks that the policy pins the SSM kernels; the config cannot.
+    from megatron.core.transformer.enums import AttnBackend
+    from megatron.core.tuning import interception
+    from megatron.core.tuning import policy as tuning_policy
+
+    monkeypatch.setattr(interception, "_policy", None)
+    monkeypatch.setattr(tuning_policy, "_deterministic_override", False)
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        is_hybrid_model=True,
+        batch_invariant_mode=True,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        attention_backend=AttnBackend.flash,
+        flash_attention_version=4,
+        attention_dropout=0.0,
+    )
+    assert config.batch_invariant_mode
+
+
 def test_mhc_fused_backend_defaults_to_auto():
     config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
 
