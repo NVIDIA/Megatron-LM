@@ -1988,46 +1988,28 @@ class TestDynamicContext:
         assert torch.all(conv_state_layer3 == 30.0)
         assert torch.all(ssm_state_layer3 == 40.0)
 
-    @pytest.mark.internal
-    @rounder_override(64)
-    def test_hybrid_mla_layers_get_their_own_latent_kv_planes(self):
-        """Each MLA layer of a hybrid model maps to its own plane of the latent KV cache.
-
-        KV planes are numbered in layer order, apart from the Mamba state slots, so each MLA
-        layer's latents land in, and are read back from, that layer's plane.
-        """
-        kv_lora_rank, qk_pos_emb_head_dim = 32, 16
-        latent_dim = kv_lora_rank + qk_pos_emb_head_dim
-        layer_type_list = [Symbols.MAMBA, Symbols.MLA, Symbols.MLP] * 2
-        dynamic_context = DynamicInferenceContext(
-            model_config=MLATransformerConfig(
-                params_dtype=torch.float32,
-                num_layers=len(layer_type_list),
-                hidden_size=64,
-                num_attention_heads=4,
-                kv_lora_rank=kv_lora_rank,
-                qk_pos_emb_head_dim=qk_pos_emb_head_dim,
-                cache_mla_latents=True,
-            ),
-            inference_config=InferenceConfig(
-                max_sequence_length=512,
-                buffer_size_gb=0.03,
-                block_size_tokens=64,  # FlashMLA's block size, required with cached latents
-                mamba_inference_state_config=MambaInferenceStateConfig(
-                    layer_type_list, (544, 4), (8, 64, 16), torch.float32, torch.float32
-                ),
-                unified_memory_level=0,
-            ),
+    @staticmethod
+    def _latent_mla_model_config(num_layers):
+        """An MLA model config that caches latents of width 32 + 16."""
+        return MLATransformerConfig(
+            params_dtype=torch.float32,
+            num_layers=num_layers,
+            hidden_size=64,
+            num_attention_heads=4,
+            kv_lora_rank=32,
+            qk_pos_emb_head_dim=16,
+            cache_mla_latents=True,
         )
 
-        assert dynamic_context.layer_map == {0: 0, 1: 0, 3: 1, 4: 1}
-        assert dynamic_context.num_attention_layers == 2
-        assert dynamic_context.num_mamba_layers == 2
+    @staticmethod
+    def _assert_latents_use_one_plane_per_layer(dynamic_context, kv_layer_numbers):
+        """The latent KV buffer has one plane per KV-cache layer, in layer order, and each
+        layer's latents land in, and are read back from, that layer's plane."""
         assert dynamic_context.memory_buffer.shape == (
-            2,
+            len(kv_layer_numbers),
             dynamic_context.kv_block_allocator.pool_size,
             64,
-            latent_dim,
+            32 + 16,
         )
 
         context_length = 10
@@ -2042,19 +2024,81 @@ class TestDynamicContext:
         block_idx = dynamic_context.gpu_view.token_to_block_idx[:context_length]
         position = dynamic_context.gpu_view.token_to_local_position_within_kv_block[:context_length]
 
-        # Layer numbers are 1-based: the MLA layers are layers 2 and 5.
-        mla_layer_numbers = (2, 5)
-        for fill, layer_number in enumerate(mla_layer_numbers, start=1):
+        for fill, layer_number in enumerate(kv_layer_numbers, start=1):
             latents = torch.full(
-                (dynamic_context.padded_active_token_count, 1, latent_dim),
-                float(fill),
-                device="cuda",
+                (dynamic_context.padded_active_token_count, 1, 32 + 16), float(fill), device="cuda"
             )
             dynamic_context.append_key_value_cache(layer_number, latents, None)
-        for fill, layer_number in enumerate(mla_layer_numbers, start=1):
+        for fill, layer_number in enumerate(kv_layer_numbers, start=1):
             kv_cache, value_cache, _ = dynamic_context.key_value_cache(layer_number)
             assert value_cache is None
             assert torch.all(kv_cache[block_idx, position] == fill)
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize(
+        "layer_type_list, layer_map, kv_layer_numbers",
+        [
+            ([Symbols.MAMBA, Symbols.MLA, Symbols.MLP] * 2, {0: 0, 1: 0, 3: 1, 4: 1}, (2, 5)),
+            # Per-symbol maps would give the DSA and MLA layers the same plane.
+            (
+                [Symbols.MAMBA, Symbols.DS_ATTENTION, Symbols.MLA, Symbols.MLP],
+                {0: 0, 1: 0, 2: 1},
+                (2, 3),
+            ),
+        ],
+        ids=["mamba-mla", "mamba-dsa-mla"],
+    )
+    def test_hybrid_mla_layers_get_their_own_latent_kv_planes(
+        self, layer_type_list, layer_map, kv_layer_numbers
+    ):
+        """Each KV-cache layer of a Mamba hybrid maps to its own plane of the latent KV cache.
+
+        Attention, DSA and MLA layers share one KV plane numbering in layer order, apart from the
+        Mamba state slots. `kv_layer_numbers` are the 1-based numbers of the KV-cache layers.
+        """
+        dynamic_context = DynamicInferenceContext(
+            model_config=self._latent_mla_model_config(len(layer_type_list)),
+            inference_config=InferenceConfig(
+                max_sequence_length=512,
+                buffer_size_gb=0.03,
+                block_size_tokens=64,  # FlashMLA's block size, required with cached latents
+                mamba_inference_state_config=MambaInferenceStateConfig(
+                    layer_type_list, (544, 4), (8, 64, 16), torch.float32, torch.float32
+                ),
+                unified_memory_level=0,
+            ),
+        )
+
+        assert dynamic_context.layer_map == layer_map
+        assert dynamic_context.num_attention_layers == len(kv_layer_numbers)
+        assert dynamic_context.num_mamba_layers == layer_type_list.count(Symbols.MAMBA)
+        self._assert_latents_use_one_plane_per_layer(dynamic_context, kv_layer_numbers)
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_hybrid_without_recurrent_layers_gets_kv_planes_for_attention_layers_only(self):
+        """A hybrid model without Mamba or GDN layers sizes its KV cache by its attention layers.
+
+        It has no Mamba state config, so its layer types come from `InferenceConfig`. A KV plane
+        for every layer would leave half of this buffer to the MoE layers.
+        """
+        layer_type_list = [Symbols.MLA, Symbols.MOE] * 2
+        dynamic_context = DynamicInferenceContext(
+            model_config=self._latent_mla_model_config(len(layer_type_list)),
+            inference_config=InferenceConfig(
+                max_sequence_length=512,
+                buffer_size_gb=0.03,
+                block_size_tokens=64,  # FlashMLA's block size, required with cached latents
+                layer_type_list=layer_type_list,
+                unified_memory_level=0,
+            ),
+        )
+
+        assert dynamic_context.layer_map == {0: 0, 2: 1}
+        assert dynamic_context.num_attention_layers == 2
+        assert dynamic_context.num_mamba_layers == 0
+        self._assert_latents_use_one_plane_per_layer(dynamic_context, kv_layer_numbers=(1, 3))
 
     @pytest.mark.internal
     @rounder_override(64)

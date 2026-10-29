@@ -513,21 +513,26 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     "batch_invariant_mode requires FP32 Mamba SSM states so state-passing "
                     "boundaries are not rounded between decode chunks."
                 )
+        else:
+            self.mamba_conv_states_shape, self.mamba_ssm_states_shape = (None, None)
 
-            # Attention, DSA and MLA layers share the paged KV cache, and Mamba and GDN layers
-            # share the slot-indexed recurrent-state cache. Build one map per cache in global
-            # layer order; independently generated per-symbol maps all start at zero and would
-            # alias if they were simply unioned. Hybrid patterns reject standard attention
-            # alongside the MLA family, so all KV-cache layers take one buffer layout (MLA
-            # latents or per-head keys and values).
+        layer_type_list = inference_config.layer_type_list
+        if layer_type_list is None and self.is_hybrid_model:
+            layer_type_list = mamba_inference_state_config.layer_type_list
+        if layer_type_list is not None:
+            # A hybrid model gives cache space only to the layers that use it. Attention, DSA
+            # and MLA layers share the paged KV cache, and Mamba and GDN layers share the
+            # slot-indexed recurrent-state cache. Build one map per cache in global layer order;
+            # independently generated per-symbol maps all start at zero and would alias if they
+            # were simply unioned. Hybrid patterns reject standard attention alongside the MLA
+            # family, so all KV-cache layers take one buffer layout (MLA latents or per-head
+            # keys and values).
             kv_layer_map = {}
             recurrent_layer_map = {}
-            for global_layer_idx, layer_type in enumerate(
-                mamba_inference_state_config.layer_type_list
-            ):
-                if layer_type in (Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MLA):
+            for global_layer_idx, layer_type in enumerate(layer_type_list):
+                if layer_type in Symbols.KV_CACHE_LAYERS:
                     kv_layer_map[global_layer_idx] = len(kv_layer_map)
-                elif layer_type in (Symbols.MAMBA, Symbols.GDN):
+                elif layer_type in Symbols.RECURRENT_STATE_LAYERS:
                     recurrent_layer_map[global_layer_idx] = len(recurrent_layer_map)
 
             self.num_attention_layers = len(kv_layer_map)
@@ -555,7 +560,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 model_config, vp_stage=None, pp_rank=pp_rank
             )
             self.num_mamba_layers = 0
-            self.mamba_conv_states_shape, self.mamba_ssm_states_shape = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
 
         self._mtp_initialize_kv_cache(model_config, inference_config.mtp_layer_type_list)
