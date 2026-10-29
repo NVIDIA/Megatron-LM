@@ -14,12 +14,12 @@ import pytest
 import torch
 
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
-from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-    get_qsa_module_spec_for_backend,
-)
 from megatron.core.packed_seq_params import PackedSeqParams, pad_sequence_for_thd
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.experimental_attention_variant import qsa as qsa_module
+from megatron.core.transformer.experimental_attention_variant.qsa_module_specs import (
+    get_qsa_module_spec_for_backend,
+)
 from megatron.core.transformer.spec_utils import build_module
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.test_attention_variant_qsa import (
