@@ -182,16 +182,24 @@ Bootstrap, teardown and the registry are not deprecated: `initialize_model_paral
   (`.github/workflows/process-group-usage-check.yml`) runs on pull requests and in the merge
   queue. Its job fails when the tests of the checker,
   `tests/unit_tests/test_check_process_group_usage.py`, fail; they also check that each call in
-  the allowlist is warned or guarded, apart from two that the test lists. The job then runs
+  the allowlist is warned or guarded, apart from two that the test lists, and that the checker
+  counts every helper of `process_groups_config.py` that reads the grid. It also fails when
+  `tests/unit_tests/test_removal_versions.py` fails (see *Removal*). The job then runs
   `tools/check_process_group_usage.py` and `tests/unit_tests/test_parallel_state_accessor_uses.py`
   as report-only steps (`continue-on-error`): a new call in Megatron Core, a call that lost its
   warning, or a deprecated call outside Megatron Core is listed in the step's log, and the job
   still passes. Whether that should block a pull request is still to be decided, see
-  [#6307](https://github.com/NVIDIA/Megatron-LM/issues/6307). The unit-test jobs run both test
-  files in the `tests/unit_tests/**/*.py` bucket, where a failure of either fails the job;
-  nothing there runs the checker on the repository's code. A pull request that runs selective
-  (Testmon) unit tests may skip both files, because Testmon selects tests by the code they
-  execute and they read the files they check as text; the merge queue runs every test.
+  [#6307](https://github.com/NVIDIA/Megatron-LM/issues/6307). The unit-test jobs run these
+  three test files in the `tests/unit_tests/**/*.py` bucket, where a failure of any of them
+  fails the job; nothing there runs the checker on the repository's code. A pull request that
+  runs selective (Testmon) unit tests may skip them, because Testmon selects tests by the code
+  they execute and they read the files they check as text; the merge queue runs every test.
+- **Removal** is due when the version in `megatron/core/package_info.py` reaches the
+  `removed_in` version of a fallback, the default of that argument, or a `*_REMOVED_IN`
+  constant such as `_ACCESSOR_REMOVED_IN` in `parallel_state.py`.
+  `tests/unit_tests/test_removal_versions.py` then fails and lists that code. It fails the
+  *Process group usage check* job, which runs it on every pull request that changes code,
+  including the one that bumps the version, and the unit-test jobs.
 - **Strict mode** (`--strict-process-group-fallbacks`, `enable_strict_process_group_fallbacks()`)
   turns `ProcessGroupFallbackWarning` into an error. It does not affect
   `ParallelStateDeprecationWarning`.

@@ -51,6 +51,12 @@ jobs:
       - name: Test the process-group usage checker
         run: python tests/unit_tests/test_check_process_group_usage.py
 
+      # Fails once the version in megatron/core/package_info.py reaches a removal version that the
+      # code still announces. The unit-test bucket runs it too, but a selective (Testmon) run of
+      # the pull request that bumps the version can skip it. Stdlib-only, run by path as well.
+      - name: Check that no announced removal is due
+        run: python tests/unit_tests/test_removal_versions.py
+
       # No third-party dependencies: the checker and its tests are stdlib-only.
       # Report-only: new reads are listed in the log but do not fail the job. Whether new code may
       # fall back to parallel_state is still to be decided, see
