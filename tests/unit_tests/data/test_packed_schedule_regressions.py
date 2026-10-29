@@ -12,6 +12,7 @@ from megatron.core.datasets import data_schedule
 from megatron.core.datasets.data_schedule import DefaultDynamicCPScheduler, DpBalancedScheduler
 from megatron.core.datasets.data_schedule_utils import (
     align_sample_id_groups,
+    get_global_real_seqlen_stats,
     get_packed_sequence_length,
     pad_packed_batch_before_cp_slice,
 )
@@ -525,3 +526,45 @@ def test_dynamic_cp_schedule_preserves_samples_groups_and_capacity(world_size, p
                 seen.extend(ids)
                 rank += size
         assert sorted(seen) == list(range(len(lengths)))
+
+
+def _unpacked_samples(real_lengths, alignment=8):
+    samples = []
+    for real in real_lengths:
+        padded = -(-real // alignment) * alignment
+        tokens = torch.arange(padded, dtype=torch.int64)
+        samples.append(
+            {
+                "tokens": tokens,
+                "labels": tokens + 1,
+                "loss_mask": (tokens < real).float(),
+                "position_ids": tokens.clone(),
+                "original_seq_len": torch.tensor([real], dtype=torch.int32),
+                "padded_seq_len": torch.tensor([padded], dtype=torch.int32),
+            }
+        )
+    return samples
+
+
+def test_real_seqlen_stats_cover_every_dp_rank(monkeypatch):
+    """Each DP rank holds different sub-samples, and the statistics count all of them once."""
+    local_lengths, peer_lengths = [5, 13, 8], [30, 2]
+    dp_group = _group(2)
+    reduced_groups = []
+
+    def all_reduce(tensor, op=torch.distributed.ReduceOp.SUM, group=None):
+        # Add the real lengths of the other DP rank.
+        reduced_groups.append(group)
+        tensor += torch.tensor(
+            [sum(peer_lengths), sum(length * length for length in peer_lengths)], dtype=tensor.dtype
+        )
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    real_tokens, real_token_squares = get_global_real_seqlen_stats(
+        _unpacked_samples(local_lengths), dp_group, torch.device("cpu")
+    )
+
+    lengths = local_lengths + peer_lengths
+    assert real_tokens == sum(lengths)
+    assert real_token_squares == sum(length * length for length in lengths)
+    assert len(reduced_groups) == 1 and reduced_groups[0] is dp_group
