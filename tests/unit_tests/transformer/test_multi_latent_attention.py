@@ -596,20 +596,39 @@ class _AttentionKernelReached(Exception):
     """Raised by a stubbed attention kernel to end the forward once its inputs are captured."""
 
 
+@pytest.mark.parametrize(
+    "kv_norm",
+    [
+        "fused",
+        pytest.param(
+            "disabled",
+            marks=pytest.mark.skip(
+                reason="Needs NVIDIA/Megatron-LM#8570: without it, prepare_for_absorption "
+                "fails on a linear_kv_up_proj without a fused KV norm, since it tries to split "
+                "off a norm that is not there."
+            ),
+        ),
+    ],
+)
 @pytest.mark.parametrize("linear_qkv_down_proj", linear_qkv_down_proj_options)
 class TestSequenceParallelMLALatentCache:
     """Dynamic batching with cached latents at TP=2 with sequence parallelism, which the
     inference-optimized layers require for TP > 1. The dynamic context is real; the attention
     kernel (flash_decode_and_prefill) is stubbed, so FlashAttention and FlashMLA are not needed.
+
+    The KV norm is either fused into linear_kv_up_proj, which prepare_for_absorption splits into
+    a norm and a column-parallel linear, or disabled, so that linear_kv_up_proj is an
+    InferenceColumnParallelLinear, which all-gathers its input at TP > 1.
     """
 
     tensor_parallel_size = 2
     prompt_len = 100
 
     @pytest.fixture(scope='function', autouse=True)
-    def setup_and_teardown(self, linear_qkv_down_proj):
+    def setup_and_teardown(self, linear_qkv_down_proj, kv_norm):
         Utils.initialize_model_parallel(self.tensor_parallel_size, 1)
         model_parallel_cuda_manual_seed(123)
+        qk_layernorm = kv_norm == "fused"
         config = MLATransformerConfig(
             num_layers=1,
             hidden_size=512,
@@ -619,7 +638,7 @@ class TestSequenceParallelMLALatentCache:
             qk_head_dim=64,
             qk_pos_emb_head_dim=64,
             v_head_dim=128,
-            qk_layernorm=True,
+            qk_layernorm=qk_layernorm,
             normalization="RMSNorm",
             add_bias_linear=False,
             transformer_impl="inference_optimized",
@@ -633,7 +652,7 @@ class TestSequenceParallelMLALatentCache:
             sequence_parallel=True,
         )
         spec = get_gpt_layer_with_inference_submodules(
-            qk_layernorm=True, multi_latent_attention=True
+            qk_layernorm=qk_layernorm, multi_latent_attention=True
         ).self_attention
         spec.submodules.linear_q_down_proj = linear_qkv_down_proj
         spec.submodules.linear_kv_down_proj = linear_qkv_down_proj
