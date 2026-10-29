@@ -1156,8 +1156,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             state_dict_state = {s[0]: s[1] for s in state_dict_state}
 
         else:
-            # Retrieve existing optimizer state.
-            state_dict_state = inner_state_dict["state"]
+            # Optimizer state is already allocated. ``dist_checkpointing.load``
+            # populated the live state tensors in place via sharded-state-dict
+            # wrappers — the ``self.optimizer.state`` tensors already hold the
+            # checkpoint data — so the saved state does not need to be applied
+            # again. Set ``state_dict_state`` to a sentinel so the call to
+            # ``self.optimizer.load_state_dict`` below is replaced with a
+            # param-group-only update. That avoids both (a) clearing
+            # ``self.optimizer.state`` (``Optimizer.load_state_dict`` does
+            # ``self.state = defaultdict(dict)`` unconditionally) and (b)
+            # casting every state tensor to the param dtype (and, for TE
+            # ``FusedAdam``, allocating fresh FP32 state copies), which
+            # roughly doubles peak GPU memory during checkpoint restore and
+            # OOMs large MoE runs (issue #8046).
+            state_dict_state = None
 
         # Extract 'step', for non-Apex/TE support.
         if not HAVE_APEX_OR_TE:
@@ -1165,7 +1177,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert len(steps) == 1
             step = torch.tensor(steps[0], dtype=torch.float)
 
-            for s in state_dict_state.values():
+            # Empty-state branch: set on the dummy tensors that are about to
+            # be loaded. Populated branch (issue #8046): set on the LIVE
+            # state in place, since the state tensors are preserved there.
+            step_targets = (
+                state_dict_state.values()
+                if state_dict_state is not None
+                else self.optimizer.state.values()
+            )
+            for s in step_targets:
                 # Native PyTorch state dict requires step (i.e., iteration).
                 s["step"] = step
         elif isinstance(self.optimizer, HybridDeviceOptimizer):
@@ -1181,9 +1201,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     v["step"] = step.detach().clone()
 
         # Optimizer.
-        self.optimizer.load_state_dict(
-            {"state": state_dict_state, "param_groups": state_dict_param_groups}
-        )
+        if state_dict_state is None:
+            # State was already populated in place by ``dist_checkpointing.load``;
+            # update only the param-group hyperparameters. ``state_dict_param_groups``
+            # carries integer ``params`` indices (per ``Optimizer.state_dict``);
+            # ``self.optimizer.param_groups[i]['params']`` carries the live list of
+            # main-param tensors / ids, which we carry forward.
+            self.optimizer.param_groups = [
+                {**old_group, **{k: v for k, v in saved.items() if k != "params"}}
+                for old_group, saved in zip(self.optimizer.param_groups, state_dict_param_groups)
+            ]
+        else:
+            self.optimizer.load_state_dict(
+                {"state": state_dict_state, "param_groups": state_dict_param_groups}
+            )
 
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
