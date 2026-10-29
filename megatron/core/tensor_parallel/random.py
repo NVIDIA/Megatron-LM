@@ -19,16 +19,12 @@ from torch.utils.checkpoint import detach_variable
 from torch.utils.cpp_extension import load_inline
 from typing_extensions import TypeVarTuple, Unpack
 
-from megatron.core.parallel_state import (
-    get_expert_gtp_weight_remat_rank,
-    get_expert_gtp_weight_remat_world_size,
-    get_expert_model_parallel_rank,
-    get_expert_tensor_parallel_rank,
-    get_gtp_weight_remat_rank,
-    get_gtp_weight_remat_world_size,
-    get_tensor_model_parallel_rank,
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    resolve_gtp_remat_group,
+    resolve_process_groups,
+    warn_global_process_group_fallback,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_observation import suspend_tensor_observations
 from megatron.core.utils import (
     get_pg_rank,
@@ -566,9 +562,14 @@ def model_parallel_cuda_manual_seed(
     process groups of the model being seeded, when it is given: ``tp``, ``ep``, ``expt_tp``
     (the expert tensor-parallel group, which can differ from ``tp``), ``gtp_remat`` and
     ``expt_gtp_remat``. The collection must set all five; a group set to None means that
-    axis is off (rank 0, world size 1). Without ``pg_collection`` they come from the global
-    parallel state. The tracker is shared by the whole process, so its states can follow the
-    layout of only one model per process.
+    axis is off (rank 0, world size 1). The tracker is shared by the whole process, so its
+    states can follow the layout of only one model per process.
+
+    Without ``pg_collection``, the ranks and world sizes that are not passed come from the
+    global parallel state. This fallback is deprecated and emits a
+    ``ProcessGroupFallbackWarning``. It resolves the GTP_remat groups as the layers do without
+    a collection (``resolve_gtp_remat_group``), so those axes are off when the global parallel
+    state has no GTP_remat groups.
     """
     if pg_collection is not None:
         seed_groups = ("tp", "ep", "expt_tp", "gtp_remat", "expt_gtp_remat")
@@ -578,35 +579,46 @@ def model_parallel_cuda_manual_seed(
                 f"model_parallel_cuda_manual_seed: pg_collection must set {missing}; "
                 "set a group to None when its axis is off"
             )
-        if tp_rank is None:
-            tp_rank = get_pg_rank(pg_collection.tp)
-        if ep_rank is None:
-            ep_rank = get_pg_rank(pg_collection.ep)
-        if etp_rank is None:
-            etp_rank = get_pg_rank(pg_collection.expt_tp)
-        if gtp_remat_rank is None:
-            gtp_remat_rank = get_pg_rank(pg_collection.gtp_remat)
-        if egtp_remat_rank is None:
-            egtp_remat_rank = get_pg_rank(pg_collection.expt_gtp_remat)
-        if gtp_remat_world_size is None:
-            gtp_remat_world_size = get_pg_size(pg_collection.gtp_remat)
-        if egtp_remat_world_size is None:
-            egtp_remat_world_size = get_pg_size(pg_collection.expt_gtp_remat)
-    # Without a collection, ranks and world sizes not passed come from the global parallel state.
+        tp_group, ep_group, etp_group = pg_collection.tp, pg_collection.ep, pg_collection.expt_tp
+        gtp_remat_group = pg_collection.gtp_remat
+        egtp_remat_group = pg_collection.expt_gtp_remat
+    else:
+        # The ranks and world sizes that are not passed come from the global grid. A group left
+        # None here belongs to a rank or world size that was passed, and is not read below.
+        tp_group = ep_group = etp_group = gtp_remat_group = egtp_remat_group = None
+        if None in (tp_rank, ep_rank, etp_rank):
+            global_groups = resolve_process_groups(
+                None,
+                owner="model_parallel_cuda_manual_seed",
+                required=("tp", "ep", "expt_tp"),
+                deprecated_in="0.21",
+                removed_in="0.23",
+            )
+            tp_group, ep_group, etp_group = (
+                global_groups.tp,
+                global_groups.ep,
+                global_groups.expt_tp,
+            )
+        if None in (gtp_remat_rank, egtp_remat_rank, gtp_remat_world_size, egtp_remat_world_size):
+            warn_global_process_group_fallback(
+                "model_parallel_cuda_manual_seed", deprecated_in="0.21", removed_in="0.23"
+            )
+            gtp_remat_group = resolve_gtp_remat_group(None, is_expert=False)
+            egtp_remat_group = resolve_gtp_remat_group(None, is_expert=True)
     if tp_rank is None:
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_rank = get_pg_rank(tp_group)
     if ep_rank is None:
-        ep_rank = get_expert_model_parallel_rank()
+        ep_rank = get_pg_rank(ep_group)
     if etp_rank is None:
-        etp_rank = get_expert_tensor_parallel_rank()
+        etp_rank = get_pg_rank(etp_group)
     if gtp_remat_rank is None:
-        gtp_remat_rank = get_gtp_weight_remat_rank()
+        gtp_remat_rank = get_pg_rank(gtp_remat_group)
     if egtp_remat_rank is None:
-        egtp_remat_rank = get_expert_gtp_weight_remat_rank()
+        egtp_remat_rank = get_pg_rank(egtp_remat_group)
     if gtp_remat_world_size is None:
-        gtp_remat_world_size = get_gtp_weight_remat_world_size()
+        gtp_remat_world_size = get_pg_size(gtp_remat_group)
     if egtp_remat_world_size is None:
-        egtp_remat_world_size = get_expert_gtp_weight_remat_world_size()
+        egtp_remat_world_size = get_pg_size(egtp_remat_group)
     # 2718 is just for fun and any POSITIVE value will work.
     offset = seed + 2718
     tensor_model_parallel_seed = offset + tp_rank
@@ -721,6 +733,7 @@ class CheckpointFunction(torch.autograd.Function):
         ctx: Any,
         run_function: Callable[[Unpack[_Ts]], _R],
         distribute_saved_activations: bool,
+        tp_group: Optional[torch.distributed.ProcessGroup],
         *args: Unpack[_Ts],
     ) -> _R:
         """Forward pass."""
@@ -728,6 +741,7 @@ class CheckpointFunction(torch.autograd.Function):
 
         ctx.run_function = run_function
         ctx.distribute_saved_activations = distribute_saved_activations
+        ctx.tp_group = tp_group
 
         # Copy the rng states.
         ctx.rng_states = _get_all_rng_states()
@@ -740,7 +754,8 @@ class CheckpointFunction(torch.autograd.Function):
         if distribute_saved_activations:
             ctx.input_0_shape = args[0].data.shape
             safely_set_viewless_tensor_data(
-                args[0], split_tensor_into_1d_equal_chunks(args[0].data, new_buffer=True)
+                args[0],
+                split_tensor_into_1d_equal_chunks(args[0].data, new_buffer=True, tp_group=tp_group),
             )
 
         # Store everything.
@@ -765,7 +780,10 @@ class CheckpointFunction(torch.autograd.Function):
         inputs = ctx.saved_tensors
         if ctx.distribute_saved_activations:
             safely_set_viewless_tensor_data(
-                inputs[0], gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape)
+                inputs[0],
+                gather_split_1d_tensor(inputs[0].data, tp_group=ctx.tp_group).view(
+                    ctx.input_0_shape
+                ),
             )
 
         with _fork_rng():
@@ -788,14 +806,21 @@ class CheckpointFunction(torch.autograd.Function):
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
 
         _unset_checkpointing()
-        return (None, None) + grads
+        return (None, None, None) + grads
 
 
 def checkpoint(
-    function: Callable[[Unpack[_Ts]], _R], distribute_saved_activations: bool, *args: Unpack[_Ts]
+    function: Callable[[Unpack[_Ts]], _R],
+    distribute_saved_activations: bool,
+    *args: Unpack[_Ts],
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> _R:
     """Checkpoint a model or part of the model.
-    This has been directly copied from torch.utils.checkpoint."""
+    This has been directly copied from torch.utils.checkpoint.
+
+    With ``distribute_saved_activations``, the first input is saved split across ``tp_group``,
+    the tensor-parallel group of the checkpointed module.
+    """
     from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
 
     # Skip checkpointing during CUDA graph warmup and capture, matching the behavior of
@@ -803,7 +828,7 @@ def checkpoint(
     # run inside a captured graph.
     if is_graph_warmup() or is_graph_capturing():
         return function(*args)
-    return CheckpointFunction.apply(function, distribute_saved_activations, *args)
+    return CheckpointFunction.apply(function, distribute_saved_activations, tp_group, *args)
 
 
 class _RegionState(enum.Enum):
