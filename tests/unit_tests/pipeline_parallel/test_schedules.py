@@ -20,7 +20,6 @@ from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
 )
-from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import (
     convert_schedule_table_to_order,
     get_overlap_moe_expert_parallel_comm_order,
@@ -139,11 +138,6 @@ def test_dynamic_context_parallel_forward_batch_has_tp_schema(monkeypatch):
     monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: [0])
     monkeypatch.setattr(torch.distributed, "broadcast", lambda *args, **kwargs: None)
     group = _packing_test_group()
-    monkeypatch.setattr(
-        schedule.parallel_state,
-        "get_dynamic_data_context_parallel_groups",
-        lambda group_size: group,
-    )
     sample = {
         "tokens": torch.arange(4, dtype=torch.int64),
         "labels": torch.arange(1, 5, dtype=torch.int64),
@@ -159,6 +153,9 @@ def test_dynamic_context_parallel_forward_batch_has_tp_schema(monkeypatch):
             iter([sample]),
             dynamic_cp=True,
             pg_collection=SimpleNamespace(tp=group, pp=group, cp=group),
+            dynamic_cp_group_func=lambda group_size: group,
+            dynamic_tp_cp_group_func=lambda group_size: group,
+            tp_cp_group=group,
         )
     )
     for value in (tokens, labels, loss_mask, position_ids, padding_mask):
@@ -169,8 +166,10 @@ def test_dynamic_context_parallel_forward_batch_has_tp_schema(monkeypatch):
     assert params.cu_seqlens_q.tolist() == [0, 4]
     assert params.cu_seqlens_q.dtype == torch.int32
     assert params.max_seqlen_q == 4
-    assert params.local_cp_size == 1 and params.cp_group is None
-    assert params.cp_singleton_group is group
+    # The producer now emits the runtime group directly; finalize_packed_seq_params()
+    # is what moves a CP1 group into cp_singleton_group (main ea99fdfce).
+    assert params.local_cp_size == 1 and params.cp_group is group
+    assert params.cp_singleton_group is None
 
 
 def test_dynamic_context_parallel_non_source_tp_receives_batch_metadata(monkeypatch):
@@ -182,11 +181,11 @@ def test_dynamic_context_parallel_non_source_tp_receives_batch_metadata(monkeypa
     tp_group = _packing_test_group(rank=1, size=2)
     cp_group = _packing_test_group(size=2)
     pp_group = _packing_test_group()
-    monkeypatch.setattr(
-        schedule.parallel_state,
-        "get_dynamic_data_context_parallel_groups",
-        lambda group_size: cp_group if group_size == 2 else pytest.fail("wrong CP width"),
-    )
+
+    def dynamic_cp_group_func(group_size):
+        assert group_size == 2, "wrong CP width"
+        return cp_group
+
     payloads = [
         torch.tensor([2, 4], dtype=torch.int32),
         torch.arange(4, dtype=torch.int64).view(1, 4),
@@ -208,7 +207,12 @@ def test_dynamic_context_parallel_non_source_tp_receives_batch_metadata(monkeypa
 
     monkeypatch.setattr(torch.distributed, "broadcast", receive)
     result = get_batch_on_this_rank_for_sequence_packing(
-        None, dynamic_cp=True, pg_collection=SimpleNamespace(tp=tp_group, pp=pp_group, cp=cp_group)
+        None,
+        dynamic_cp=True,
+        pg_collection=SimpleNamespace(tp=tp_group, pp=pp_group, cp=cp_group),
+        dynamic_cp_group_func=dynamic_cp_group_func,
+        dynamic_tp_cp_group_func=dynamic_cp_group_func,
+        tp_cp_group=tp_group,
     )
     assert not payloads
     tokens, labels, loss_mask, attention_mask, position_ids, params, padding_mask = result

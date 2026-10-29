@@ -488,15 +488,23 @@ class ShortcutMoEBlock(MegatronModule):
             )
         moe_hidden_states = hidden_states
         moe_packed_seq_params = packed_seq_params
+        moe_padding_mask = padding_mask
         if cp_layout_state is not None:
             moe_hidden_states, moe_packed_seq_params = cp_layout_state.prepare_layer(
                 self.moe_local_idx, moe_hidden_states
             )
+            moe_padding_mask = cp_layout_state.get_layer_padding_mask(
+                self.moe_local_idx, padding_mask, padding_mask_by_layout
+            )
 
-        if padding_mask_by_layout is not None:
-            padding_mask = padding_mask_by_layout[
-                cp_layout_state.manager.layer_layouts[self.moe_local_idx]
-            ]
+        # NOTE(nightly-sync 26_10_2026): main hoisted dev's inline per-layout
+        # padding-mask lookup into ContextParallelLayoutState.get_layer_padding_mask()
+        # (called just above) and renamed the result to moe_padding_mask so the
+        # attention path keeps the unmapped mask. The merge kept both copies, and
+        # dev's leftover block re-clobbered `padding_mask` -- which main's rename
+        # deliberately leaves alone for the attention call site below -- so it is
+        # dropped here. input_ids_by_layout has no main equivalent (dev-only), so
+        # its remap stays inline.
         if input_ids_by_layout is not None:
             input_ids = input_ids_by_layout[
                 cp_layout_state.manager.layer_layouts[self.moe_local_idx]
@@ -509,13 +517,17 @@ class ShortcutMoEBlock(MegatronModule):
             )
             route_input, route_probs = self._moe_router_preprocess(
                 shortcut_hidden=moe_hidden_states,
-                padding_mask=padding_mask,
+                padding_mask=moe_padding_mask,
                 packed_seq_params=moe_packed_seq_params,
                 input_ids=input_ids,
                 recompute_context=attn_recompute_context,
             )
             if overlap:
                 self.route_ready_event.record(torch.cuda.current_stream())
+
+        # Only the non-inference paths below produce a paired state; the inference path
+        # returns its output directly and never reaches the post-core-attn call.
+        paired_state = None
 
         # Launch the input and attn of the attention layer
         with quant_context_factory(attn_config, self.attn_layer_idx):
@@ -589,7 +601,7 @@ class ShortcutMoEBlock(MegatronModule):
             shared_expert_output, moe_unflatten_mbs, mlp_residual, mlp_state = (
                 self._moe_shared_experts(
                     hidden_states=attn_layer_output,
-                    padding_mask=padding_mask,
+                    padding_mask=moe_padding_mask,
                     packed_seq_params=moe_packed_seq_params,
                     recompute_context=moe_recompute_context,
                 )

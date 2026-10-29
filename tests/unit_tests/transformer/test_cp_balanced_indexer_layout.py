@@ -1673,6 +1673,11 @@ def test_balanced_config_accepts_dynamic_context_parallelism(monkeypatch):
         context_parallel_size=1,
         dynamic_context_parallel=True,
         sequence_packing_scheduler="default_dynamic_cp",
+        # Required by TransformerConfig once dynamic_context_parallel is set: loss
+        # scaling cannot use the static TP x CP group when CP groups are chosen per
+        # microbatch. This test only asserts that the balanced indexer accepts
+        # dynamic CP, so the flag is incidental to what it covers.
+        calculate_per_token_loss=True,
     )
     assert config.dynamic_context_parallel
 

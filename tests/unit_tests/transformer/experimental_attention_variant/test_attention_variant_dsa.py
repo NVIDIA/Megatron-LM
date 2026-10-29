@@ -403,6 +403,11 @@ def test_absorbed_mla_qkv_rope_uses_microbatch_cp_group(
             cp_comm_type="all_gather",
             apply_rope_fusion=False,
             use_cpu_initialization=True,
+            # Required by TransformerConfig when dynamic_context_parallel is set: loss
+            # scaling cannot use the static TP x CP group under per-microbatch CP groups.
+            # Irrelevant to the QKV/RoPE paths under test, so set it on both configs to
+            # keep them differing only in their CP sizes.
+            calculate_per_token_loss=True,
         )
 
     k_up_weight = torch.randn(2, 4, 8, device="cuda")
@@ -4736,6 +4741,12 @@ class TestDSAModuleSpecDispatch:
             "cp_comm_type": "allgather",
             "cuda_graph_impl": "local",
             "cuda_graph_modules": [CudaGraphModule.attn],
+            # Required by TransformerConfig for the dynamic_context_parallel cases
+            # below: loss scaling cannot use the static TP x CP group once CP groups
+            # are picked per microbatch. These cases only assert on CUDA-graph
+            # warnings and spec dispatch, so the value is irrelevant to them, and
+            # **overrides still lets a caller set it back to False.
+            "calculate_per_token_loss": True,
         }
         kwargs.update(overrides)
         return self._make_dsa_config(**kwargs)
