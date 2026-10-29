@@ -974,7 +974,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         kind="triton",
         training_path=False,
-        notes="TMA/tcgen05 score, CuTe DSL exact top-k with a Triton radix fallback, and Triton sparse attention "
+        notes="TMA/tcgen05 score, CuTe DSL exact top-k with a PyTorch fallback, and Triton sparse attention "
         "replay bit-exactly; compares simplified training/decode forward kernels and covers "
         "empty/ragged requests, causal masks, and graph page-table refresh.",
     ),

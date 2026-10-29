@@ -788,9 +788,11 @@ def test_native_decode_matches_training_kernels_and_graph_refresh(head_dim, seed
     )
 
 
-@pytest.mark.parametrize("width,topk", [(516, 512), (4096, 1024), (32772, 2048), (65536, 2048)])
+@pytest.mark.parametrize(
+    "width,topk", [(516, 512), (4096, 1024), (32772, 2048), (65536, 2048), (131072, 2048)]
+)
 def test_cute_topk_cutoffs_ties_and_graph_replay(width, topk):
-    """Short/empty rows, ties, infinities, and unaligned lengths select exact values."""
+    """Replay switches between CuTe and torch top-k with ragged rows and infinities."""
     pytest.importorskip("cutlass.cute")
     torch.manual_seed(71)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -804,11 +806,6 @@ def test_cute_topk_cutoffs_ties_and_graph_replay(width, topk):
     scores = torch.randn(batch, stride, device=device)
     lengths = torch.tensor([width - 3, 1, 0, width, width, width], device=device, dtype=torch.int32)
     scores[3].zero_()
-    scores[4, :width].copy_(torch.arange(width, device=device).float() / width)
-    scores[4, 0] = -1e20
-    scores[4, 1] = 1e20
-    scores[5, ::3] = float("inf")
-    scores[5, 1::3] = -float("inf")
     indices = torch.empty(batch, topk, device=device, dtype=torch.int32)
 
     selector = CuteTopKWorkspace(scores, lengths, indices)
@@ -817,23 +814,42 @@ def test_cute_topk_cutoffs_ties_and_graph_replay(width, topk):
         selector()
 
     run()
-    expected = indices.clone()
-    for row, length in enumerate(lengths.tolist()):
-        count = min(topk, length)
-        valid = indices[row][indices[row] >= 0].long()
-        assert valid.numel() == count
-        assert valid.unique().numel() == count
-        assert bool((valid < length).all())
-        assert bool((indices[row, count:] == -1).all())
-        if count:
-            torch.testing.assert_close(
-                scores[row, valid].sort().values,
-                scores[row, :length].topk(count).values.sort().values,
-                atol=0,
-                rtol=0,
-            )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
-    graph.replay()
-    torch.testing.assert_close(indices, expected, atol=0, rtol=0)
+
+    for adversarial in (False, True, False):
+        scores.normal_()
+        scores[3].zero_()
+        if adversarial:
+            # Valid -inf values must outrank padding, even if padding contains +inf.
+            scores[0, : width - 3] = -float("inf")
+            scores[0, width - 3 :] = float("inf")
+            scores[4, :width].copy_(torch.arange(width, device=device).float() / width)
+            scores[4, 0] = -1e20
+            scores[4, 1] = 1e20
+            scores[5, ::3] = float("inf")
+            scores[5, 1::3] = -float("inf")
+        graph.replay()
+        assert bool(selector.flags.any()) == adversarial
+        if selector.chunks > 1:
+            assert bool(selector.merge_flags.any()) == adversarial
+        for row, length in enumerate(lengths.tolist()):
+            count = min(topk, length)
+            valid = indices[row][indices[row] >= 0].long()
+            assert valid.numel() == count
+            assert valid.unique().numel() == count
+            assert bool((valid < length).all())
+            assert bool((indices[row, count:] == -1).all())
+            if count:
+                torch.testing.assert_close(
+                    scores[row, valid].sort().values,
+                    scores[row, :length].topk(count).values.sort().values,
+                    atol=0,
+                    rtol=0,
+                )
+        expected = indices.clone()
+        graph.replay()
+        torch.testing.assert_close(indices, expected, atol=0, rtol=0)
+        run()
+        torch.testing.assert_close(indices, expected, atol=0, rtol=0)

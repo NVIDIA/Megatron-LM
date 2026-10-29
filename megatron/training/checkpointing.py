@@ -2407,12 +2407,7 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
             print_rank_0(f'Checkpoint did not provide arguments {arg_name}')
 
     # Model args.
-    # Hybrid depth is derived from its layer pattern during argument validation.
-    if (
-        getattr(args, 'hybrid_layer_pattern', None) is None
-        and getattr(checkpoint_args, 'hybrid_layer_pattern', None) is None
-    ):
-        _set_arg('num_layers')
+    _set_arg('num_layers')
     _set_arg('hidden_size')
     _set_arg('ffn_hidden_size')
     _set_arg('seq_length')
@@ -2438,18 +2433,6 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('apply_query_key_layer_scaling', force=True)
     _set_arg('attention_dropout', force=True)
     _set_arg('hidden_dropout', force=True)
-
-    # Restore the routing geometry when loading a DSA checkpoint for inference.
-    # Dense checkpoints must not override an explicitly requested DSA conversion.
-    if getattr(checkpoint_args, 'experimental_attention_variant', None) == 'dsa':
-        for arg_name in (
-            'experimental_attention_variant',
-            'dsa_indexer_mode',
-            'dsa_indexer_n_heads',
-            'dsa_indexer_head_dim',
-            'dsa_indexer_topk',
-        ):
-            _set_arg(arg_name, force=True)
 
     # Restore wide-residual architecture settings. The enabling argument has a None
     # default and remains command-line overridable; concrete-default controls follow
