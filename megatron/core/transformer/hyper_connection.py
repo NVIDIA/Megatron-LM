@@ -930,6 +930,7 @@ class HyperConnectionResidualConnection(ResidualConnection):
 
     Reads carry the residual and predicted maps to the write. Set use_input_residual
     to preserve callers that carry the input instead of the owner's residual view.
+    Owner dtypes are preserved; incompatible branch dtype requests are rejected.
     Output-discard replay covers aggregation and nonterminal writes only.
     """
 
@@ -965,12 +966,10 @@ class HyperConnectionResidualConnection(ResidualConnection):
     ) -> tuple[Tensor, ResidualConnectionState]:
         """Read eagerly, without registering output-discard replay."""
 
-        del fp32_residual_connection  # The owner chooses compatible residual/map dtypes.
+        # The owner chooses dtypes; the base validates any requested branch dtype.
+        del fp32_residual_connection, branch_input_dtype
         return self._read_from_owner(
-            hidden_states,
-            self._execution_context(execution_context),
-            branch_input_dtype=branch_input_dtype,
-            checkpoint_fn=None,
+            hidden_states, self._execution_context(execution_context), checkpoint_fn=None
         )
 
     def _read_from_owner(
@@ -978,7 +977,6 @@ class HyperConnectionResidualConnection(ResidualConnection):
         hidden_states: Tensor,
         execution_context: HyperConnectionExecutionContext,
         *,
-        branch_input_dtype: torch.dtype | None,
         checkpoint_fn: Callable[..., Tensor] | None,
     ) -> tuple[Tensor, ResidualConnectionState]:
         """Share owner invocation and state packing without choosing a replay policy."""
@@ -993,11 +991,6 @@ class HyperConnectionResidualConnection(ResidualConnection):
             branch_input, h_res, h_post, residual = apply_module(execution_context.owner)(
                 hidden_states, return_residual=True, checkpoint_fn=checkpoint_fn
             )
-        # Retain the owner's activation dtype and selected autograd path. Promoting only
-        # the residual would mismatch its live maps; TransformerConfig rejects mixed
-        # FP32-residual mHC. The generic read flag must not cast this selected alias.
-        if branch_input_dtype is not None and branch_input.dtype != branch_input_dtype:
-            branch_input = branch_input.to(dtype=branch_input_dtype)
         return branch_input, (residual, h_res, h_post)
 
     def _eager_write(
@@ -1030,13 +1023,13 @@ class HyperConnectionResidualConnection(ResidualConnection):
         training: bool,
         checkpoint_fn: Callable[..., Tensor] | None,
     ) -> Tensor:
-        """Share owner write arithmetic and dtype handling for both entry points."""
+        """Invoke the owner's write without changing its output dtype."""
 
         if len(state) != 3:
             raise ValueError("mHC residual write requires the selected residual and both maps.")
         residual, h_res, h_post = state
         value = branch_output if isinstance(branch_output, tuple) else (branch_output, None)
-        hidden_states = execution_context.owner.fused_h_res_h_post_bda(
+        return execution_context.owner.fused_h_res_h_post_bda(
             h_res,
             residual,
             h_post,
@@ -1046,14 +1039,6 @@ class HyperConnectionResidualConnection(ResidualConnection):
             fused=execution_context.bias_dropout_fusion,
             checkpoint_fn=checkpoint_fn,
         )
-        config = execution_context.owner.config
-        if (
-            config.fp32_residual_connection
-            and config.params_dtype is not None
-            and hidden_states.dtype != config.params_dtype
-        ):
-            hidden_states = hidden_states.to(config.params_dtype)
-        return hidden_states
 
     def _checkpoint_read(
         self,
@@ -1066,11 +1051,10 @@ class HyperConnectionResidualConnection(ResidualConnection):
     ) -> tuple[Tensor, ResidualConnectionState]:
         # Let the existing mHC owner checkpoint aggregation rather than replaying prediction
         # and rebuilding the selected residual alias through the generic whole-read path.
-        del fp32_residual_connection  # Match the eager owner's residual/map dtype policy.
+        del fp32_residual_connection, branch_input_dtype
         return self._read_from_owner(
             hidden_states,
             self._execution_context(execution_context),
-            branch_input_dtype=branch_input_dtype,
             checkpoint_fn=context.checkpoint,
         )
 
