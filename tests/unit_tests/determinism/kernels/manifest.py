@@ -118,6 +118,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="torch.compile",
     ),
     KernelEntry(
+        name="paged_stash_marker_propagation",
+        sources=("megatron/core/extensions/transformer_engine.py",),
+        tests=(K + "test_fused_activations.py",),
+        kind="dispatch",
+        notes="Propagates TE's grouped-tensor marker across fused-activation views and casts; "
+        "the marked SwiGLU and QuickGeGLU replay test covers values and gradients.",
+    ),
+    KernelEntry(
         name="fused_bias_gelu",
         sources=("megatron/core/fusions/fused_bias_gelu.py",),
         tests=(K + "test_fused_activations.py",),
@@ -352,6 +360,26 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "histogram accumulation and bias updates.",
     ),
     KernelEntry(
+        name="mok_route_adapter",
+        sources=("megatron/core/transformer/moe/megakernel/mok/route_adapter.py",),
+        tests=(K + "test_mok_kernels.py",),
+        kind="triton",
+        notes="Dense routing-map compaction and router-gradient scatter use one CTA per token "
+        "and unique expert indices; replayed with missing routes and side-stream contention.",
+    ),
+    KernelEntry(
+        name="mok_runtime",
+        sources=(
+            "megatron/core/transformer/moe/megakernel/mok/backend.py",
+            "megatron/core/transformer/moe/megakernel/mok/runtime.py",
+            "megatron/core/transformer/moe/megakernel/mok/weights.py",
+        ),
+        kind="dispatch",
+        exempt_reason="MOK forward/backward, schedule, and weight-descriptor kernels require "
+        "Blackwell GPUs and the optional qizhang/mcore-integration MOK build, which are not "
+        "available in the H100 determinism bucket. Routing conversion is replayed separately.",
+    ),
+    KernelEntry(
         name="moe_router",
         sources=("megatron/core/transformer/moe/router.py",),
         tests=(
@@ -506,6 +534,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/gated_delta_net/common.py",
             "megatron/core/ssm/gated_delta_net/gdn.py",
             "megatron/core/ssm/gated_delta_net/gdn2.py",
+            "megatron/core/ssm/gated_delta_net/kda.py",
         ),
         tests=(K + "test_ssm_kernels.py", K + "test_gated_norm.py", C + "test_hybrid_model.py"),
         kind="torch.compile",
@@ -570,12 +599,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             C + "test_gpt_model.py",
             "tests/unit_tests/distributed/test_param_storage_copyback.py",
+            "tests/unit_tests/distributed/test_gradient_scaling.py",
             "tests/unit_tests/rl/test_rl_utils.py",
         ),
         kind="external-lib",
         notes="NCCL reduce-scatter / all-gather; covered by the FSDP/DP cells of the model-level suite. "
         "Relocated parameter storage is checked exactly after all-gather and CUDA graph replay; "
-        "the RL test checks exact classic-DDP reduce-scatter after gradient-buffer restoration.",
+        "the RL test checks exact classic-DDP reduce-scatter after gradient-buffer restoration. "
+        "Token scaling is compared exactly with FP32 multiplication in eager and CUDA graph "
+        "replay, including changing factors and low-precision gradient buffers.",
     ),
     KernelEntry(
         name="nccl_allocator",
@@ -776,7 +808,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         training_path=False,
         notes="MXFP8Tensor dispatches the Megatron quantize kernel (replayed: "
         "test_mxfp8_quantize_replays) or FlashInfer mxfp8_quantize / mm_mxfp8 / fused MoE, which need "
-        "flashinfer on Blackwell and are not replayed in CI.",
+        "flashinfer on Blackwell. The clamped CUTLASS BF16/MXFP8 adapters are replayed "
+        "by test_flashinfer_clamped_relu2_replays with top-k=1, including CUDA graphs; "
+        "the default atomic top-k finalize and routed backend are not covered by that test.",
     ),
     KernelEntry(
         name="inference_flashinfer_nvfp4_moe",
@@ -919,6 +953,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "replay covers the selected GEMM, deterministic torch fallback, and chunked KPool top-k.",
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
+    KernelEntry(
+        name="dsa_tilelang_absorbed_shape_dispatch",
+        sources=("megatron/core/transformer/experimental_attention_variant/ops/tilelang_dsa.py",),
+        tests=(K + "test_dsa_tilelang_shapes.py",),
+        kind="dispatch",
+        notes="SparseMLA forward replay with NoPE channel padding and invalid top-k slot padding. "
+        "Backward atomic accumulation remains covered by the DSA family exemption below; "
+        "output and gradient parity are checked in test_dsa_tilelang_shapes under transformer/.",
+    ),
     KernelEntry(
         name="dsa_tilelang_kernels",
         sources=(

@@ -996,11 +996,10 @@ class GTPShardHandle:
     and prune the param from _inflight_comm_params when the collective completes.
     """
 
-    def __init__(self, handle, gtp_shards, reduce_scatter=False, *, completion_recorded=False):
+    def __init__(self, handle, gtp_shards, reduce_scatter=False):
         self.handle = handle
         self.gtp_shards = gtp_shards
         self.reduce_scatter = reduce_scatter
-        self.completion_recorded = completion_recorded
         _inflight_comm_params.add(gtp_shards[0])
         param = gtp_shards[0]
         stream = (
@@ -1103,7 +1102,6 @@ def _init_gtp_runtime_attrs(obj):
     obj._debug_name = ""
     # Hot-path caches (populated lazily on first use).  chain_id/group are
     # set after init, so we can't resolve streams eagerly here.
-    obj._cached_ag_stream = None
     obj._cached_rs_stream = None
     obj._cached_dtypes = None
     obj._cached_gtp_remat_group = None
@@ -1610,12 +1608,10 @@ class GTPShardedParam(torch.nn.Parameter):
                 nvtx_range_pop(f"{nvtx_label}.gtp_ag")
                 results = [weight_total]
 
-            # Grouped FC1/FC2 share this stream but have independent consumers. Record
-            # this gather's completion before a different chain appends its prefetch.
-            # NCCL Work.wait() enqueues a stream dependency; it does not synchronize
-            # the host in the normal asynchronous NCCL configuration.
-            completion_recorded = async_op and _chain_is_grouped(self.chain_id)
-            if completion_recorded:
+            # Record each asynchronous gather's completion at issue time, before later
+            # prefetches append unrelated work to the AG stream. Work.wait() establishes
+            # the NCCL-to-AG-stream dependency before recording the consumer's event.
+            if async_op:
                 # TE synchronous fallbacks can return no Work even with async_op=True.
                 if handle is not None:
                     handle.wait()
@@ -1627,7 +1623,7 @@ class GTPShardedParam(torch.nn.Parameter):
 
         # 6. Wrap handle.
         if async_op:
-            handle = GTPShardHandle(handle, weights, completion_recorded=completion_recorded)
+            handle = GTPShardHandle(handle, weights)
         else:
             handle = None
 
@@ -1635,20 +1631,12 @@ class GTPShardedParam(torch.nn.Parameter):
         return result, handle
 
     def _wait_param_gather(self):
-        # Grouped chains record completion at issue time: recording at consumption
-        # would also wait for unrelated prefetches appended to the shared AG stream.
-        # Other chains retain their wait-site completion event.
-        ag_stream = self._cached_ag_stream
-        if ag_stream is None:
-            ag_stream = get_ag_stream(self.chain_id, self.group)
-            self._cached_ag_stream = ag_stream
-        with torch.cuda.stream(ag_stream):
-            if self._prefetch_handle is not None:
-                handle = self._prefetch_handle
-                handle.wait()
-                self._prefetch_handle = None
-                if not getattr(handle, "completion_recorded", False):
-                    self.ag_event.record()
+        # The underlying Work wait and event record were issued on the AG stream
+        # with the gather. Retire host tracking here; the consumer still waits on
+        # ag_event. Never re-record it after unrelated prefetches have been queued.
+        if self._prefetch_handle is not None:
+            self._prefetch_handle.wait()
+            self._prefetch_handle = None
 
     def _all_gather_weight_on_demand(self, fwd, recompute=False, recompute_prev=None):
         # Only pass the recompute kwargs when they apply, so the fwd/bwd path keeps calling
@@ -1733,9 +1721,9 @@ class GTPShardedParam(torch.nn.Parameter):
 
         * already ready (a previous peek or external drain finished this AG): retain its event
           wait, so the returned data is usable on the caller's stream without another gather;
-        * a prefetch is in flight (a chain neighbour issued this weight's AG): drain it on
-          ag_stream as ``_wait_param_gather`` does and leave the ``_already_ag_drained`` hand-off
-          marker, so the consume skips the drain but keeps its ``ag_event`` wait;
+        * a prefetch is in flight (a chain neighbour issued this weight's AG): retire its
+          host tracking and leave the ``_already_ag_drained`` hand-off marker. Both peek and
+          consume wait on the completion event recorded when the AG was issued;
         * no prefetch (chain head, first iteration, MTP's second consume of a repeated layer):
           issue this weight's AG asynchronously, as a predecessor would have, then drain and mark
           it the same way; the consume reads it through the marker instead of gathering again;
@@ -1767,18 +1755,10 @@ class GTPShardedParam(torch.nn.Parameter):
         return result if self.is_routed_expert else result[0]
 
     def _wait_recompute_param_gather(self):
-        # Recompute-chain analogue of _wait_param_gather, on the _recompute_* slot.
-        ag_stream = self._cached_ag_stream
-        if ag_stream is None:
-            ag_stream = get_ag_stream(self.chain_id, self.group)
-            self._cached_ag_stream = ag_stream
-        with torch.cuda.stream(ag_stream):
-            if self._recompute_prefetch_handle is not None:
-                handle = self._recompute_prefetch_handle
-                handle.wait()
-                self._recompute_prefetch_handle = None
-                if not getattr(handle, "completion_recorded", False):
-                    self._recompute_ag_event.record()
+        # Recompute gathers record their own completion event at issue time too.
+        if self._recompute_prefetch_handle is not None:
+            self._recompute_prefetch_handle.wait()
+            self._recompute_prefetch_handle = None
 
     def _recompute_prefetch_next(self, target, nvtx_label=None):
         # Issue target's rowwise (fwd) AG into its recompute slot. _all_gather_weight skips the
@@ -2348,9 +2328,10 @@ class GTPShardedParam(torch.nn.Parameter):
 
             outputs = []
             nvtx_range_push(f"{nvtx_label}.batched_gtp_rs")
-            with torch.distributed._coalescing_manager(
-                group=self.group, device=wgrads[0].device, async_ops=async_op
-            ) as cm:
+            # reduce_scatter_tensor uses fast-path coalescing. Adding device coalescing
+            # can replace its Work handle with an outer Work, retaining input tensors
+            # after the returned handle is waited on.
+            with torch.distributed._coalescing_manager(group=self.group, async_ops=async_op) as cm:
                 for out_buffer, tensor in zip(out_buffers, wgrads):
                     out, _ = reduce_scatter_along_first_dim(tensor, self.group, output=out_buffer)
                     outputs.append(out)
@@ -2825,8 +2806,9 @@ def wait_async_comms(
     """Drain in-flight GTP asynchronous communication.
 
     This drains AG and recompute-AG handles and, unless ``skip_rs`` is set, wgrad RS handles.
-    During CUDA graph capture, draining a handle materializes its wait in the producer graph and
-    records the corresponding event. Partial graphs use ``external=True`` to emit
+    AG and recompute-AG issue their underlying Work wait and completion event at the gather
+    site; draining them here only retires host tracking. During CUDA graph capture, these
+    operations belong to the producer graph. Partial graphs use ``external=True`` to emit
     event-record and event-wait nodes that preserve the dependency
     between separately captured graphs at replay. The host must launch the producer graph before
     the consumer graph so its record is the one observed by the wait. An AG handoff marker prevents
