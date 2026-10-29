@@ -1,6 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import importlib
 import os
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -801,6 +803,43 @@ def test_te_native_device_metadata_workspace(monkeypatch, supported):
 
     assert te_gemm._get_grouped_cublas_workspace is original_grouped_workspace
     assert te_gemm.get_cublas_workspace_size_bytes() == unrestricted_bytes
+
+
+def test_te_native_prefers_cublaslt_and_restores_it():
+    """The pinned cuBLASLt workspace reaches aten GEMMs only if they run on cuBLASLt."""
+    before = torch.backends.cuda.preferred_blas_library()
+    with set_batch_invariant_mode(True, backend="te_native"):
+        assert torch.backends.cuda.preferred_blas_library() == torch._C._BlasBackend.Cublaslt
+    assert torch.backends.cuda.preferred_blas_library() == before
+
+
+# A fresh process enables the mode before its first GEMM, as initialize_megatron does:
+# cuBLASLt reads CUBLASLT_WORKSPACE_SIZE when it is first used.
+_TE_NATIVE_ATEN_MATMUL = """
+import os
+import torch
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
+
+torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+with set_batch_invariant_mode(True, backend="te_native"):
+    torch.manual_seed(0)
+    for k, n in ((512, 50), (512, 8), (1024, 50), (1024, 100)):
+        weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(512, 1, k, device="cuda", dtype=torch.bfloat16)
+        full = torch.matmul(x, weight.t())
+        for m in (16, 64, 128, 192, 256, 384):
+            assert torch.equal(torch.matmul(x[:m], weight.t()), full[:m]), (k, n, m)
+"""
+
+
+def test_te_native_aten_matmul_batch_invariant():
+    """A bias-free torch.matmul, the GEMM of the GPT output layer (ColumnParallelLinear), gives
+    each row the same bits whatever the row count. Hidden size 512 with 50 output columns (a
+    100-token vocabulary at TP=2) is a shape where cuBLAS picks split-K by row count."""
+    result = subprocess.run(
+        [sys.executable, "-c", _TE_NATIVE_ATEN_MATMUL], capture_output=True, text=True, timeout=600
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
 
 
 # ============================================================================

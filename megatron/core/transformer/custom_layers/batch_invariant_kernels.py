@@ -1687,6 +1687,7 @@ _TE_NATIVE_WORKSPACE_BYTES = 1024
 _TE_WORKSPACE_SIZE_FN_ORIG = None
 _TE_GROUPED_WORKSPACE_FN_ORIG = None
 _TE_NATIVE_ENV_ORIG: dict = {}
+_TE_NATIVE_BLAS_ORIG = None
 
 
 def te_supports_batch_invariant_grouped_gemm(device: int | None = None) -> bool:
@@ -1726,8 +1727,12 @@ def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WOR
     still vary with M, but M/N tiling does not affect bits: bf16 products are
     exact in fp32, so only the K-reduction order matters.)
 
-    Two knobs must both land:
+    Three knobs must all land:
     - cuBLASLt env pins for kernels that honor them (set before first use).
+    - PyTorch's preferred BLAS library: on CUDA it defaults to cuBLAS, whose workspace
+      the env pin does not starve, so aten GEMMs without an epilogue (a bias-free
+      torch.matmul, such as the GPT output layer) would still pick split-K per M.
+      Prefer cuBLASLt, so every aten GEMM runs under the pinned workspace.
     - Transformer Engine's own workspace: TE (<= 2.15 verified) hardcodes 32MiB in
       get_cublas_workspace_size_bytes() and ignores CUBLASLT_WORKSPACE_SIZE, so the
       env pin alone never engages for TE-launched GEMMs — patch the size fn and
@@ -1736,7 +1741,7 @@ def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WOR
     import logging
     import os
 
-    global _TE_GROUPED_WORKSPACE_FN_ORIG, _TE_WORKSPACE_SIZE_FN_ORIG
+    global _TE_GROUPED_WORKSPACE_FN_ORIG, _TE_WORKSPACE_SIZE_FN_ORIG, _TE_NATIVE_BLAS_ORIG
     logger = logging.getLogger(__name__)
 
     # CUBLASLT_WORKSPACE_SIZE must be pinned (not setdefault): a preset value
@@ -1761,6 +1766,9 @@ def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WOR
             "remain batch-variant. Enable batch-invariant mode before the "
             "first GEMM."
         )
+    if _TE_NATIVE_BLAS_ORIG is None and torch.cuda.is_available():
+        _TE_NATIVE_BLAS_ORIG = torch.backends.cuda.preferred_blas_library()
+        torch.backends.cuda.preferred_blas_library("cublaslt")
     try:
         import transformer_engine.pytorch.cpp_extensions.gemm as _te_gemm_mod
 
@@ -1787,10 +1795,13 @@ def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WOR
 
 
 def _disable_te_native_workspace_starvation():
-    """Restore the TE workspace function and env pinned by the te_native backend."""
+    """Restore the TE workspace function, BLAS library and env pinned by the te_native backend."""
     import os
 
-    global _TE_GROUPED_WORKSPACE_FN_ORIG, _TE_WORKSPACE_SIZE_FN_ORIG
+    global _TE_GROUPED_WORKSPACE_FN_ORIG, _TE_WORKSPACE_SIZE_FN_ORIG, _TE_NATIVE_BLAS_ORIG
+    if _TE_NATIVE_BLAS_ORIG is not None:
+        torch.backends.cuda.preferred_blas_library(_TE_NATIVE_BLAS_ORIG)
+        _TE_NATIVE_BLAS_ORIG = None
     if _TE_GROUPED_WORKSPACE_FN_ORIG is not None:
         _get_te_native_grouped_workspace.cache_clear()
         try:
