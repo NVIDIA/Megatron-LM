@@ -6,6 +6,7 @@ import os
 import random
 import time
 import warnings
+from dataclasses import fields
 from datetime import timedelta
 from typing import Optional
 
@@ -56,6 +57,10 @@ from megatron.training.global_vars import get_run_config, get_train_state, initi
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
 logger = logging.getLogger(__name__)
+
+# The data-parallel groups that a collection of the parallel grid must set: the parallel_state
+# accessors that ProcessGroupCollection.use_mpu_process_groups() reads them with assert it.
+_REQUIRED_GRID_GROUPS = ("dp", "dp_gtp_remat", "dp_cp", "dp_cp_gtp_remat", "intra_dp_cp")
 
 
 def initialize_megatron(
@@ -174,6 +179,8 @@ def initialize_megatron(
             get_position_embedding_ranks,
             store,
             skip_model_parallel_init=skip_model_parallel_init,
+            # Only seeding from the grid reads the groups of a grid set up before this call.
+            read_initialized_grid=not skip_random_seed and seed_pg_collection is None,
         )
 
         # Single-rank log helpers write on rank 0 by default. Non-colocated MIMO puts the
@@ -364,13 +371,65 @@ def _initialize_tp_communicators(
         )
 
 
+def _registered_pg_collection(owner, argument="pg_collection"):
+    """Return a new collection of the process groups registered for this run.
+
+    The groups are those of ``parallel_state.get_registered_process_groups()``: the collection
+    that initialize_model_parallel() builds and registers, or that a framework registers with
+    register_process_groups(). The registered collection is not returned itself, so the caller
+    can add groups, such as ``dp_cp_ag``, to the one it gets. Every field is set, as
+    ProcessGroupCollection.use_mpu_process_groups() sets them from the registered groups: a
+    field that the registered collection leaves unset is None, ``dynamic_cp`` and
+    ``dynamic_tp_cp`` are new dictionaries, ``dynamic_tp_cp`` holds the ``dynamic_cp`` groups
+    when the tensor-parallel size is 1, and ``dp_cp_ag`` and ``expt_dp_ag`` are None.
+
+    A grid that was set up without registering a collection is read from the global parallel
+    state, with a ProcessGroupFallbackWarning that names ``owner`` and ``argument``. This
+    fallback is deprecated in Megatron Core 0.21 and removed in 0.23.
+
+    Args:
+        owner: The function whose caller omitted ``argument``, named by the fallback warning.
+        argument: The argument that would have supplied the process groups.
+
+    Raises:
+        ValueError: The registered collection does not set a data-parallel group (``dp``,
+            ``dp_gtp_remat``, ``dp_cp``, ``dp_cp_gtp_remat`` or ``intra_dp_cp``), or, with
+            dynamic context parallelism, the tensor-parallel group.
+    """
+    registered = mpu.get_registered_process_groups()
+    if registered is None:
+        with global_process_group_fallback(
+            owner, argument, deprecated_in="0.21", removed_in="0.23"
+        ):
+            return ProcessGroupCollection.use_mpu_process_groups()
+    dynamic_cp = dict(registered.dynamic_cp or {})
+    required = _REQUIRED_GRID_GROUPS + (("tp",) if dynamic_cp else ())
+    missing = [name for name in required if getattr(registered, name) is None]
+    if missing:
+        raise ValueError(f"The registered process groups must set {missing}")
+    groups = {
+        field.name: getattr(registered, field.name) for field in fields(ProcessGroupCollection)
+    }
+    groups.update(dp_cp_ag=None, expt_dp_ag=None, dynamic_cp=dynamic_cp)
+    if not dynamic_cp:
+        groups["dynamic_tp_cp"] = {}
+    elif registered.tp.size() == 1:
+        # The runtime context-parallel groups are already the TP x runtime-CP groups.
+        groups["dynamic_tp_cp"] = dict(dynamic_cp)
+    else:
+        groups["dynamic_tp_cp"] = dict(registered.dynamic_tp_cp or {})
+    return ProcessGroupCollection(**groups)
+
+
 def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store,
-                            skip_model_parallel_init=False):
+                            skip_model_parallel_init=False, read_initialized_grid=True):
     """Initialize torch.distributed and core model parallel.
 
     Returns the ProcessGroupCollection of the parallel grid that this call
     builds, or of the grid that the caller already initialized. Returns None
-    when model-parallel setup is skipped or no CUDA device is present.
+    when model-parallel setup is skipped or no CUDA device is present, and,
+    when `read_initialized_grid` is False, for a grid that the caller already
+    initialized.
     """
     cfg = get_run_config()
     args = get_args()
@@ -471,12 +530,12 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
     if device_count > 0 and not skip_model_parallel_init:
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
-            # Bootstrap read of the grid that the caller set up, which does not warn. A
-            # framework may have registered a collection that leaves fields unset; seeding
-            # requires each group it reads to be set, to None when its axis is off.
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", ParallelStateDeprecationWarning)
-                pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            # The groups that the caller registered. Seeding requires each group it reads to be
+            # set, to None when its axis is off, which a framework's collection may leave unset.
+            if read_initialized_grid:
+                pg_collection = _registered_pg_collection(
+                    "initialize_megatron", "seed_pg_collection"
+                )
         else:
             if args.gtp_weight_remat_size > 1 or args.expert_gtp_weight_remat_size > 1:
                 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
