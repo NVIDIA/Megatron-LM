@@ -1202,8 +1202,10 @@ def drop_padding_routes(
     """Remove every route of the padding tokens from a dense routing result.
 
     The router keeps padding tokens in its routes and excludes them only from its statistics.
-    Expert backends that consume the routes directly call this so padding tokens are neither
-    dispatched nor computed; their routed output is then zero.
+    This helper defines reference semantics for backends consuming dense routes: padding tokens
+    have no routed contribution. Production MoK applies the mask during route compaction without
+    materializing these masked copies. The routed output of padding tokens is zero; the shared
+    expert is separate and not masked here.
 
     Args:
         routing_probs (torch.Tensor): Tensor of shape [num_tokens, num_experts] containing the
