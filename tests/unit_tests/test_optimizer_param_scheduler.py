@@ -411,7 +411,9 @@ def test_step_lr_rescale_restores_zero_transition_warmup_from_checkpoint(
 
 
 def test_step_lr_rescale_rejects_mismatched_zero_transition_warmup(zero_warmup_checkpoint_state):
-    restored_scheduler = _make_constant_rescale_scheduler({"lr": -1.0, "weight_decay": -1.0}, 40)
+    restored_scheduler = _make_constant_rescale_scheduler(
+        {"lr": -1.0, "weight_decay": -1.0}, 40, use_checkpoint_opt_param_scheduler=False
+    )
     with pytest.raises(AssertionError, match="step LR rescale warmup samples"):
         restored_scheduler.load_state_dict(zero_warmup_checkpoint_state)
 
@@ -419,7 +421,10 @@ def test_step_lr_rescale_rejects_mismatched_zero_transition_warmup(zero_warmup_c
 def test_step_lr_rescale_override_keeps_runtime_transition_warmup(zero_warmup_checkpoint_state):
     restored_group = {"lr": -1.0, "weight_decay": -1.0}
     restored_scheduler = _make_constant_rescale_scheduler(
-        restored_group, 40, override_opt_param_scheduler=True
+        restored_group,
+        40,
+        override_opt_param_scheduler=True,
+        use_checkpoint_opt_param_scheduler=False,
     )
     restored_scheduler.load_state_dict(zero_warmup_checkpoint_state)
 
