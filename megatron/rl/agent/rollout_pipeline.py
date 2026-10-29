@@ -13,13 +13,19 @@ import numpy as np
 from megatron.core.inference.utils import asyncio_Queue, asyncio_QueueShutDown
 from megatron.core.utils import trace_async_exceptions
 
-from ..inference import ReturnsRaw
+from ..inference import ReturnsRaw, ReturnsTokens
 from ..rollout_granularity import GRANULARITY_RANK, ConsumptionGranularity, SubmissionGranularity
-from .api import EpisodeResult, GroupedRolloutRequest, GroupRolloutParams, RolloutGroup
+from .api import (
+    EpisodeResult,
+    GroupedRolloutRequest,
+    GroupRolloutParams,
+    RolloutGroup,
+    TokenRollout,
+)
 
 if TYPE_CHECKING:
     from ..rollout_bank import RolloutBank
-    from .api import GroupedRolloutGenerator, Rollout, TokenRollout
+    from .api import GroupedRolloutGenerator, Rollout
 
 logger = logging.getLogger(__name__)
 
@@ -216,8 +222,8 @@ class RolloutPipeline:
             initial_batch_id: Batch ID assigned to the first batch in this pipeline.
         """
         assert isinstance(
-            request.inference_interface, ReturnsRaw
-        ), "InferenceInterface must support raw_text return to provide rollouts."
+            request.inference_interface, (ReturnsRaw, ReturnsTokens)
+        ), "InferenceInterface must return raw text or tokens to provide rollouts."
         self.agent = agent
         self.request = request
         self.bank = bank
@@ -270,6 +276,8 @@ class RolloutPipeline:
         self.assembled_count = 0
         # All drops, any reason; the two counters below attribute them for metrics.
         self.dropped_count = 0
+        # Dropped groups never reach the trainer; handle their finished-request ledger records.
+        self._dropped_completion_ids: list[str] = []
         self.filtered_count = 0
         self.refilled_placeholder_groups = 0
         self.restored_count = 0
@@ -487,6 +495,12 @@ class RolloutPipeline:
                 )
                 if self._decide_drop(group):
                     self.dropped_count += 1
+                    self._dropped_completion_ids.extend(
+                        completion_id
+                        for rollout in group.rollouts
+                        if isinstance(rollout, TokenRollout)
+                        for completion_id in rollout.completion_ids
+                    )
                     task = asyncio.create_task(
                         self._regenerate_group(group.batch_id, group.index_in_batch)
                     )
@@ -503,6 +517,11 @@ class RolloutPipeline:
                 self._maybe_close_intake()
         finally:
             self.output_queue.shutdown()
+
+    def take_dropped_completion_ids(self) -> list[str]:
+        """Completion ids of the groups dropped since the last call."""
+        dropped, self._dropped_completion_ids = self._dropped_completion_ids, []
+        return dropped
 
     @staticmethod
     def _is_refillable_placeholder(rollout: "Rollout | TokenRollout") -> bool:

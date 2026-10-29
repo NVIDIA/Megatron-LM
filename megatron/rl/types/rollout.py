@@ -36,21 +36,24 @@ class Rollout(AgentBaseModel):
 class TokenRollout(AgentBaseModel):
     """Tokenized representation of a language-based Rollout."""
 
-    trajectory: list[list[int]]
+    trajectory: list[list[int]] | None
     reward: list[float] | float
     generation_mask: list[list[bool]] | None = None
     logprobs: list[list[float]] | None = None
     env_id: str = ''
     problem_id: str | None = None
     completion_ids: list[str] = []
+    policy_epochs: list[list[tuple[int, int]]] | None = None
+    kv_cache_epochs: list[list[tuple[int, int]]] | None = None
+    num_evictions: list[int] | None = None
     generation_cap: int | None = None
     rollout_status: str = 'ok'
     failure_reason: str | None = None
 
     @property
     def is_placeholder(self) -> bool:
-        """An empty trajectory is the placeholder left by a failed episode."""
-        return not self.trajectory
+        """An empty episode: no turns, and no requests to rebuild them from."""
+        return not self.trajectory and not self.completion_ids
 
 
 Rollouts = list[TokenRollout | Rollout]
