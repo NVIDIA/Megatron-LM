@@ -16,7 +16,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, process_groups_config
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import OptimizerConfig
@@ -26,7 +26,7 @@ from megatron.core.pipeline_parallel.schedules import (
     forward_backward_pipelining_with_interleaving,
     forward_backward_pipelining_without_interleaving,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.training import global_vars, training
@@ -293,7 +293,7 @@ class TestTrainingPgCollection:
         assert wrapped[0].process_group is dp_cp_group
         assert built[0].process_group is dp_cp_group
 
-    def test_schedule_follows_the_collection_pipeline_group(self):
+    def test_schedule_follows_the_collection_pipeline_group(self, monkeypatch):
         # The global grid has no pipeline parallelism; the collection has two stages.
         Utils.initialize_model_parallel()
         pp_group, _ = torch.distributed.new_subgroups_by_enumeration(
@@ -307,5 +307,7 @@ class TestTrainingPgCollection:
 
         assert schedule(None) is forward_backward_pipelining_without_interleaving
         assert schedule(2) is forward_backward_pipelining_with_interleaving
-        # Without a collection the global grid decides.
-        assert training._get_forward_backward_func(None, None) is forward_backward_no_pipelining
+        # Without a collection the global grid decides, through the deprecated fallback.
+        monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+        with pytest.warns(ProcessGroupFallbackWarning, match="get_forward_backward_func"):
+            assert training._get_forward_backward_func(None, None) is forward_backward_no_pipelining
