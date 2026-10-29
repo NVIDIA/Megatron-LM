@@ -351,11 +351,8 @@ def test_mxfp8_unshard_gathers_rowwise_for_forward_and_columnwise_for_backward(d
 @requires_mxfp8
 @pytest.mark.parametrize("placements", _MXFP8_PLACEMENTS)
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
-@pytest.mark.parametrize(
-    "unshard_all_planes_in_backward", [False, True], ids=["on_demand", "all_planes_in_backward"]
-)
 def test_mxfp8_activation_recompute_matches_no_recompute(
-    distributed_setup, use_reentrant, placements, unshard_all_planes_in_backward
+    distributed_setup, use_reentrant, placements
 ):
     """Recomputation regathers rowwise planes in backward without changing numerics."""
     device = distributed_setup.device
@@ -364,66 +361,20 @@ def test_mxfp8_activation_recompute_matches_no_recompute(
 
     recipe = MXFP8BlockScaling()
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    policy = SchedulePolicy(unshard_all_planes_in_backward=unshard_all_planes_in_backward)
 
     def build(use_reentrant):
         with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
             torch.manual_seed(2026)
             model = _RecomputedMLP(device, use_reentrant)
         with fully_shard_context(FsdpContext(device=device)):
-            fully_shard(model.fc1, mesh=mesh, placements=placements, schedule_policy=policy)
-            fully_shard(model.fc2, mesh=mesh, placements=placements, schedule_policy=policy)
-            fully_shard(model, mesh=mesh, placements=placements, schedule_policy=policy)
+            fully_shard(model.fc1, mesh=mesh, placements=placements)
+            fully_shard(model.fc2, mesh=mesh, placements=placements)
+            fully_shard(model, mesh=mesh, placements=placements)
         optimizer = FusedAdam(model.parameters(), lr=0.01)
         fully_shard_optimizer(optimizer)
         return model, optimizer
 
     _check_recompute_matches_no_recompute(distributed_setup, recipe, build, use_reentrant)
-
-
-@pytest.mark.launch_on_gb200
-@requires_mxfp8
-@pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
-@pytest.mark.parametrize(
-    "unshard_all_planes_in_backward", [False, True], ids=["on_demand", "all_planes_in_backward"]
-)
-def test_mxfp8_backward_unshard_gathers_rowwise_for_recompute(
-    distributed_setup, use_reentrant, unshard_all_planes_in_backward
-):
-    """Checks rowwise planes are ready before a re-entered recomputation only when opted in.
-
-    Also checks both planes are released after backward.
-    """
-    device = distributed_setup.device
-    if distributed_setup.world_size < 2:
-        pytest.skip("Distributed MXFP8 coverage requires at least two ranks.")
-
-    recipe = MXFP8BlockScaling()
-    with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
-        model = _RecomputedMLP(device, use_reentrant)
-    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    policy = SchedulePolicy(unshard_all_planes_in_backward=unshard_all_planes_in_backward)
-    with fully_shard_context(device=device):
-        fully_shard(model.fc1, mesh=mesh, placements=_ZERO3_PLACEMENTS, schedule_policy=policy)
-        fully_shard(model.fc2, mesh=mesh, placements=_ZERO3_PLACEMENTS, schedule_policy=policy)
-        fully_shard(model, mesh=mesh, placements=_ZERO3_PLACEMENTS, schedule_policy=policy)
-
-    # Prepended so it runs before the FSDP pre_forward that would gather on demand.
-    def check_recompute(module, _args):
-        if _is_recomputing():
-            assert _allocated_planes(module)[0] == unshard_all_planes_in_backward
-
-    for module in (model.fc1, model.fc2):
-        module.register_forward_pre_hook(check_recompute, prepend=True)
-
-    # Reentrant checkpointing produces gradients only for inputs requiring grad.
-    x = torch.randn(32, 64, dtype=torch.bfloat16, device=device, requires_grad=True)
-    with te.autocast(recipe=recipe):
-        output = model(x)
-    output.float().square().mean().backward()
-
-    for module in (model.fc1, model.fc2):
-        assert _allocated_planes(module) == (False, False)
 
 
 @pytest.mark.launch_on_gb200

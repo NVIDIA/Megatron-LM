@@ -28,14 +28,11 @@ class SchedulePolicy:
         backward_prefetch_size: The same as ``forward_prefetch_size``, for backward
             order.
         unshard_all_planes_in_backward: Whether backward unshards and prefetches of this
-            module gather MXFP8 rowwise planes along with columnwise ones, keeping them
-            until post_backward. Enable it when activations recomputed in backward use
-            this module's MXFP8 weights. Otherwise, backward unshards gather only
-            columnwise planes, so either:
-            1) a recomputation that does not re-enter this module's forward hooks finds
-               no rowwise planes and fails in Transformer Engine; or
-            2) a recomputation that does re-enter them gathers the rowwise planes
-               separately on demand, without overlap, degrading performance.
+            module gather MXFP8 rowwise planes along with columnwise ones. Enable it when
+            activations recomputed in backward use this module's MXFP8 weights without
+            re-entering this module's forward hooks, e.g. a checkpointed submodule.
+            Otherwise, backward unshards gather only columnwise planes, and the
+            recomputation fails in Transformer Engine.
     """
 
     forward_prefetch_size: int | None = None
