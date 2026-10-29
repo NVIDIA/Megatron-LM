@@ -1,5 +1,4 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# Source license: BSD-3-Clause (NVIDIA terms reproduced in LICENSE).
 """Temperature-scaled teacher-to-student KL over tensor-parallel vocabulary shards."""
 
 import math

@@ -160,6 +160,13 @@ def test_weighted_mtp_gradients(ce_weight, kl_weight, early_backward, per_token,
             )
         if kd_enabled:
             loss = loss + kl_weight * reference_kl(student, teacher[depth:], 2.0).t()
+        if training and enabled:
+            torch.testing.assert_close(
+                MTPLossLoggingHelper.tracker["loss_values"][depth - 1],
+                (loss * depth_mask).sum() / depth_mask.sum().clamp(min=1),
+                rtol=1e-4,
+                atol=4e-6,
+            )
         factor = mask.sum() if per_token else 1
         expected = expected + config.mtp_loss_scaling_factor / 2 * factor * (
             loss * depth_mask
@@ -172,7 +179,7 @@ def test_weighted_mtp_gradients(ce_weight, kl_weight, early_backward, per_token,
     else:
         assert hidden.grad is None and weight.grad is None
     assert torch.count_nonzero(main.grad) == 0
-    assert ("loss_values" in MTPLossLoggingHelper.tracker) == (training and ce_weight > 0)
+    assert ("loss_values" in MTPLossLoggingHelper.tracker) == (training and enabled)
     assert ("kd_loss_values" in MTPLossLoggingHelper.tracker) == kd_enabled
 
 
@@ -206,7 +213,7 @@ def test_kd_logging_without_ce_and_after_cleanup():
                 group,
             )
         MTPLossLoggingHelper.save_metrics_to_tracker(
-            None,
+            torch.tensor(2.0, device="cuda"),
             torch.tensor(3.0, device="cuda"),
             torch.tensor(4.0, device="cuda"),
             0,
@@ -215,7 +222,8 @@ def test_kd_logging_without_ce_and_after_cleanup():
         )
         metrics = {}
         MTPLossLoggingHelper.track_mtp_metrics(0.125, iteration, None, total_loss_dict=metrics)
-        assert set(metrics) == {"mtp_1 kd_logit_loss"}
+        assert set(metrics) == {"mtp_1 loss", "mtp_1 kd_logit_loss"}
+        assert metrics["mtp_1 loss"].item() == 0.25
         assert metrics["mtp_1 kd_logit_loss"].item() == 2.0
         assert MTPLossLoggingHelper.tracker["kd_avg_group"] is group
         assert MTPLossLoggingHelper.tracker["kd_loss_counts"].sum() == 0
@@ -400,3 +408,61 @@ def test_sequence_parallel_projection():
     torch.testing.assert_close(
         head.weight.grad, rw.grad.chunk(2)[group.rank()], rtol=1e-4, atol=4e-6
     )
+
+
+@pytest.mark.parametrize("ce_weight,kd_weight", [(1.0, 0.0), (0.0, 1.0), (0.3, 0.7)])
+def test_combined_and_component_logging(ce_weight, kd_weight):
+    class Writer:
+        def __init__(self):
+            self.values = {}
+
+        def add_scalar(self, name, value, iteration):
+            self.values[name] = value.item()
+
+        def log(self, values, iteration):
+            self.values.update({name: value.item() for name, value in values.items()})
+
+    writer, wandb_writer = Writer(), Writer()
+    scalar = lambda value: torch.tensor(value, device="cuda")
+    for iteration, multiplier in enumerate((1.0, 2.0), start=1):
+        # Unequal token counts exercise the distinct aggregation rules:
+        # combined/CE average microbatch means; KD divides total sums by counts.
+        for ce, kd, count in ((2.0, 4.0, 2.0), (6.0, 2.0, 4.0)):
+            MTPLossLoggingHelper.save_metrics_to_tracker(
+                scalar(multiplier * (ce_weight * ce + kd_weight * kd)),
+                scalar(1.0),
+                scalar(2.0),
+                0,
+                1,
+                ce_loss=scalar(multiplier * ce) if ce_weight else None,
+            )
+            if kd_weight:
+                MTPLossLoggingHelper.save_kd_loss_to_tracker(
+                    scalar(multiplier * kd * count), scalar(count), 0, 1, None
+                )
+        metrics = {}
+        MTPLossLoggingHelper.track_mtp_metrics(
+            0.5, iteration, writer, wandb_writer, total_loss_dict=metrics
+        )
+        expected = {"mtp_1 loss": multiplier * (ce_weight * 4.0 + kd_weight * 3.0)}
+        if ce_weight:
+            expected["mtp_1 ce_loss"] = multiplier * 4.0
+        if kd_weight:
+            expected["mtp_1 kd_logit_loss"] = multiplier * 16.0 / 6.0
+        assert set(metrics) == set(expected)
+        for name, value in expected.items():
+            assert metrics[name].item() == pytest.approx(value)
+            assert writer.values[name] == pytest.approx(value)
+            assert wandb_writer.values[name] == pytest.approx(value)
+        assert writer.values["mtp_1_acceptance_rate"] == 50.0
+        assert writer.values["mtp_1_cumulative_acceptance_rate"] == 50.0
+        for key in ("loss_values", "ce_loss_values", "kd_loss_values", "kd_loss_counts"):
+            if key in MTPLossLoggingHelper.tracker:
+                assert MTPLossLoggingHelper.tracker[key].count_nonzero() == 0
+
+
+def test_combined_logging_without_acceptance_counters():
+    MTPLossLoggingHelper.tracker = {"loss_values": torch.tensor([3.0], device="cuda")}
+    metrics = {}
+    MTPLossLoggingHelper.track_mtp_metrics(0.5, 1, None, total_loss_dict=metrics)
+    assert metrics["mtp_1 loss"].item() == 1.5

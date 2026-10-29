@@ -97,8 +97,13 @@ backpropagates through the teacher. Student output-head gradients follow the
 existing `mtp_detach_heads` setting. Early backward remains available; it still
 retains teacher logits in addition to the current student's logits.
 
-`mtp_N loss` reports the unweighted CE component when enabled, and
-`mtp_N kd_logit_loss` reports the unweighted temperature-scaled KL when enabled.
+`mtp_N loss` reports the weighted CE + KL objective before overall MTP scaling,
+including in KD-only training. `mtp_N ce_loss` reports unweighted CE when enabled;
+`mtp_N kd_logit_loss` reports unweighted temperature-scaled KL when enabled.
+The combined loss and CE metric retain upstream microbatch/rank mean averaging;
+KL retains its token-count-weighted aggregation. With uneven token counts these
+aggregations differ, so the logged combined loss need not equal a weighted sum
+of the two logged component metrics.
 Acceptance metrics remain available for KD-only training. KL logging divides
 accumulated loss sums by accumulated counts; an empty microbatch contributes a
 zero sum and a count of one, matching the source branch. The KL metric is not

@@ -1,5 +1,4 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
-# Source license: BSD-3-Clause (NVIDIA terms reproduced in LICENSE).
 from __future__ import annotations
 
 import inspect
@@ -557,39 +556,44 @@ class MTPLossLoggingHelper:
 
     @staticmethod
     def save_metrics_to_tracker(
-        loss: Optional[torch.Tensor],
+        loss: torch.Tensor,
         correct: torch.Tensor,
         total: torch.Tensor,
         layer_number: int,
         num_layers: int,
         reduce_group: torch.distributed.ProcessGroup = None,
         avg_group: torch.distributed.ProcessGroup = None,
+        ce_loss: Optional[torch.Tensor] = None,
     ):
         """Save the mtp metrics (loss, correct, total) for logging.
 
         Args:
-            loss (Optional[torch.Tensor]): Unweighted CE mean, or None when CE is disabled.
+            loss (torch.Tensor): Mean weighted CE + KL objective, before overall MTP scaling.
             correct (torch.Tensor): Number of correct predictions.
             total (torch.Tensor): Total number of predictions.
             layer_number (int): Layer index of the loss.
             num_layers (int): The number of total layers.
             reduce_group (torch.distributed.ProcessGroup): The group for reducing the loss.
             avg_group (torch.distributed.ProcessGroup): The group for averaging the loss.
+            ce_loss (Optional[torch.Tensor]): Unweighted CE mean, when CE is enabled.
         """
         # Skip mtp loss logging if layer_number is None.
         if layer_number is None:
             return
 
         tracker = MTPLossLoggingHelper.tracker
-        if loss is not None and "loss_values" not in tracker:
+        if "loss_values" not in tracker:
             tracker["loss_values"] = loss.new_zeros(num_layers, dtype=torch.float32)
         if "correct_values" not in tracker:
             tracker["correct_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
         if "total_values" not in tracker:
             tracker["total_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
 
-        if loss is not None:
-            tracker["loss_values"][layer_number] += loss.detach()
+        tracker["loss_values"][layer_number] += loss.detach()
+        if ce_loss is not None:
+            if "ce_loss_values" not in tracker:
+                tracker["ce_loss_values"] = ce_loss.new_zeros(num_layers, dtype=torch.float32)
+            tracker["ce_loss_values"][layer_number] += ce_loss.detach()
         tracker["correct_values"][layer_number] += correct.detach()
         tracker["total_values"][layer_number] += total.detach()
         tracker["reduce_group"] = reduce_group
@@ -597,7 +601,7 @@ class MTPLossLoggingHelper:
 
     @staticmethod
     def save_kd_loss_to_tracker(loss_sum, count, layer_number, num_layers, avg_group):
-        """Accumulate unweighted KL sums/counts, independently of the CE tracker."""
+        """Accumulate unweighted KL sums/counts, independently of the combined objective tracker."""
         tracker = MTPLossLoggingHelper.tracker
         if "kd_loss_values" not in tracker:
             tracker["kd_loss_values"] = loss_sum.new_zeros(num_layers, dtype=torch.float32)
@@ -611,7 +615,7 @@ class MTPLossLoggingHelper:
     def clean_metrics_in_tracker():
         """Clear the mtp metrics."""
         tracker = MTPLossLoggingHelper.tracker
-        for key in ("kd_loss_values", "kd_loss_counts"):
+        for key in ("ce_loss_values", "kd_loss_values", "kd_loss_counts"):
             if key in tracker:
                 tracker[key].zero_()
         if "loss_values" in tracker:
@@ -628,8 +632,10 @@ class MTPLossLoggingHelper:
     def reduce_metrics_in_tracker():
         """Collect and reduce the mtp metrics across ranks."""
         tracker = MTPLossLoggingHelper.tracker
-        if "loss_values" in tracker:
-            loss_values = tracker["loss_values"]
+        for key in ("loss_values", "ce_loss_values"):
+            if key not in tracker:
+                continue
+            loss_values = tracker[key]
             if tracker.get('reduce_group') is not None:
                 torch.distributed.all_reduce(loss_values, group=tracker['reduce_group'])
             if tracker.get('avg_group') is not None:
@@ -666,15 +672,13 @@ class MTPLossLoggingHelper:
                     writer.add_scalar(name, loss, iteration)
                 if wandb_writer is not None:
                     wandb_writer.log({name: loss}, iteration)
-        if "correct_values" not in tracker:
+        if "loss_values" not in tracker:
             MTPLossLoggingHelper.clean_metrics_in_tracker()
             return
 
-        mtp_losses = tracker.get("loss_values")
-        if mtp_losses is not None:
-            mtp_losses = mtp_losses * loss_scale
-        mtp_corrects = tracker["correct_values"]
-        mtp_totals = tracker["total_values"]
+        mtp_losses = tracker["loss_values"] * loss_scale
+        mtp_corrects = tracker.get("correct_values", torch.zeros_like(mtp_losses))
+        mtp_totals = tracker.get("total_values", torch.ones_like(mtp_losses))
 
         # Process-local logging state; cumulative rates intentionally reset after restart/resume.
         if (
@@ -699,26 +703,33 @@ class MTPLossLoggingHelper:
             step_acc_name = f"mtp_{i+1}_acceptance_rate"
             cum_acc_name = f"mtp_{i+1}_cumulative_acceptance_rate"
 
-            loss = mtp_losses[i] if mtp_losses is not None else None
+            loss = mtp_losses[i]
+            if "ce_loss_values" in tracker:
+                ce_name = f"mtp_{i+1} ce_loss"
+                ce_loss = tracker["ce_loss_values"][i] * loss_scale
+                if total_loss_dict is not None:
+                    total_loss_dict[ce_name] = total_loss_dict.get(ce_name, 0) + ce_loss
+                if writer is not None:
+                    writer.add_scalar(ce_name, ce_loss, iteration)
+                if wandb_writer is not None:
+                    wandb_writer.log({ce_name: ce_loss}, iteration)
             # Empty masks can leave no valid MTP positions, so clamp denominators to avoid NaNs.
             step_rate = (mtp_corrects[i] / torch.clamp(mtp_totals[i], min=1)) * 100.0
             cum_rate = (
                 mtp_cumulative_corrects[i] / torch.clamp(mtp_cumulative_totals[i], min=1)
             ) * 100.0
 
-            if total_loss_dict is not None and loss is not None:
+            if total_loss_dict is not None:
                 total_loss_dict[loss_name] = (
                     total_loss_dict.get(loss_name, torch.zeros_like(loss)) + loss
                 )
 
             if writer is not None:
-                if loss is not None:
-                    writer.add_scalar(loss_name, loss, iteration)
+                writer.add_scalar(loss_name, loss, iteration)
                 writer.add_scalar(step_acc_name, step_rate, iteration)
                 writer.add_scalar(cum_acc_name, cum_rate, iteration)
             if wandb_writer is not None:
-                if loss is not None:
-                    wandb_writer.log({f"{loss_name}": loss}, iteration)
+                wandb_writer.log({f"{loss_name}": loss}, iteration)
                 wandb_writer.log({f"{step_acc_name}": step_rate}, iteration)
                 wandb_writer.log({f"{cum_acc_name}": cum_rate}, iteration)
 
@@ -1364,7 +1375,11 @@ def process_mtp_loss(
 
         if is_training:
             # Logging only: detach so nothing here keeps this head's graph alive.
-            mtp_loss_for_log = ce_sum / num_tokens.clamp(min=1) if ce_enabled else None
+            combined_sum = config.mtp_ce_loss_weight * ce_sum if ce_enabled else 0
+            if kd_enabled:
+                combined_sum = combined_sum + config.mtp_kl_loss_weight * kd_sum
+            mtp_loss_for_log = combined_sum / num_tokens.clamp(min=1)
+            ce_loss_for_log = ce_sum / num_tokens.clamp(min=1) if ce_enabled else None
 
             if metric_avg_group is None:
                 # Compatibility fallback for callers that have not migrated to explicit groups.
@@ -1378,6 +1393,7 @@ def process_mtp_loss(
                 mtp_layer_number,
                 config.mtp_num_layers,
                 avg_group=metric_avg_group,
+                ce_loss=ce_loss_for_log,
             )
             if kd_enabled:
                 MTPLossLoggingHelper.save_kd_loss_to_tracker(
