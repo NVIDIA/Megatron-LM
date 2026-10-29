@@ -126,7 +126,7 @@ def aligned_hca_backward(
     *,
     cp_rank: int,
     softmax_scale: float,
-    cp_size: int = 16,
+    cp_size: int,
 ):
     """Normalize strides after output RoPE and invoke the optional cuDNN API."""
     _, backward = _get_aligned_hca_backward()

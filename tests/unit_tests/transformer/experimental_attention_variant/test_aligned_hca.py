@@ -5,13 +5,14 @@
 import sys
 from argparse import ArgumentParser
 from dataclasses import fields
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer.experimental_attention_variant import csa
 from megatron.core.transformer.experimental_attention_variant.csa_utils import aligned_hca as hca
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
     fused_sparse_attention as sparse,
@@ -54,7 +55,8 @@ def test_optional_api_import_and_cache(missing_api):
 
 @pytest.mark.parametrize("cp_rank,cp_size", [(None, 16), (0, 4), (7, 8), (15, 16)])
 @pytest.mark.parametrize("deterministic", [False, True])
-def test_backward_dispatch_and_strides(cp_rank, cp_size, deterministic):
+@pytest.mark.parametrize("reconstruct", [False, True])
+def test_backward_dispatch_and_strides(cp_rank, cp_size, deterministic, reconstruct):
     """Autograd routes gradients and passes contiguous inputs to aligned HCA."""
     q = torch.randn(3, 2, 8, device="cpu")[..., ::2].requires_grad_()
     kv = torch.randn(5, 8, device="cpu")[:, ::2].requires_grad_()
@@ -62,6 +64,8 @@ def test_backward_dispatch_and_strides(cp_rank, cp_size, deterministic):
     out = torch.randn(3, 2, 8, device="cpu")[..., ::2]
     lse = torch.randn(2, 6, device="cpu")[:, ::2]
     topk = torch.zeros(3, 2, device="cpu", dtype=torch.int32)
+    lengths = torch.full((3,), 2, device="cpu", dtype=torch.int32)
+    parts = tuple(part.detach() for part in kv.split((1, 3, 1))) if reconstruct else None
     dout = torch.randn(3, 2, 8, device="cpu")[..., ::2]
     grads = dict(
         dq=torch.full_like(q, 1), dkv=torch.full_like(kv, 2), d_sink=torch.full_like(sink, 3)
@@ -70,7 +74,7 @@ def test_backward_dispatch_and_strides(cp_rank, cp_size, deterministic):
     stock = Mock()
     stock.sparse_attention_backward_wrapper.return_value = grads
     with (
-        patch.object(sparse, "_csa_fwd_flash_mla", return_value=(out, lse, None)),
+        patch.object(sparse, "_csa_fwd_flash_mla", return_value=(out, lse, None)) as forward,
         patch.object(sparse, "get_flash_mla_topk_alignment", return_value=64),
         patch.object(sparse, "_DSA", stock),
         patch.object(
@@ -86,13 +90,22 @@ def test_backward_dispatch_and_strides(cp_rank, cp_size, deterministic):
             sink,
             topk,
             0.125,
+            topk_length=lengths,
             is_thd=True,
+            kv_reconstruction_parts=parts,
             deterministic=deterministic,
             cuda_graph=deterministic,
             hca_cp_rank=cp_rank,
             hca_cp_size=cp_size,
         )
         torch.testing.assert_close(result, out.reshape(3, -1))
+        context = result.grad_fn.next_functions[0][0]
+        if cp_rank is None:
+            assert context.saved_tensors[-3] is forward.call_args.args[2]
+            assert context.topk_length is lengths
+        else:
+            assert context.saved_tensors[-3] is None
+            assert context.topk_length is None
         result.backward(dout.reshape_as(result))
     for actual, expected in zip((q.grad, kv.grad, sink.grad), grads.values()):
         torch.testing.assert_close(actual, expected)
@@ -107,6 +120,7 @@ def test_backward_dispatch_and_strides(cp_rank, cp_size, deterministic):
         assert deterministic_kwargs.call_args.kwargs == dict(
             requested=deterministic, cuda_graph=deterministic
         )
+        assert stock.sparse_attention_backward_wrapper.call_args.kwargs["topk_length"] is lengths
     else:
         deterministic_kwargs.assert_not_called()
         stock.sparse_attention_backward_wrapper.assert_not_called()
@@ -119,6 +133,78 @@ def test_backward_dispatch_and_strides(cp_rank, cp_size, deterministic):
         ):
             assert actual.is_contiguous()
             torch.testing.assert_close(actual, expected)
+
+
+def test_aligned_dispatch_requires_explicit_cp_size():
+    """Missing CP size must fail before invoking either attention backend."""
+    with patch.object(sparse.CSASparseAttnFunc, "apply") as apply:
+        with pytest.raises(ValueError, match="hca_cp_size is required"):
+            sparse.csa_sparse_attn(None, None, None, None, 0.125, hca_cp_rank=0)
+        apply.assert_not_called()
+    with pytest.raises(TypeError, match="cp_size"):
+        hca.aligned_hca_backward(None, None, None, None, None, None, cp_rank=0, softmax_scale=0.125)
+
+
+@pytest.mark.parametrize("training", [False, True])
+@pytest.mark.parametrize("grad_enabled", [False, True])
+def test_thd_cp_forward_selects_hca_only_with_grad(training, grad_enabled):
+    """Eval and checkpoint no-grad forwards skip backward-only eligibility checks."""
+    module = csa.CompressedSparseAttention.__new__(csa.CompressedSparseAttention)
+    torch.nn.Module.__init__(module)
+    module.use_fused_kernels = True
+    module.compress_ratio = module.window_size = 128
+    module.softmax_scale = 512**-0.5
+    module.attn_sink = torch.nn.Parameter(torch.zeros(128, device="cpu"))
+    group = Mock()
+    group.size.return_value, group.rank.return_value = 8, 7
+    module.pg_collection = SimpleNamespace(cp=group)
+    module.config = SimpleNamespace(
+        hca_aligned_backward=True,
+        dsa_indexer_loss_coeff=0.0,
+        dsa_indexer_use_sparse_loss=True,
+        recompute_granularity=None,
+        deterministic_mode=False,
+        cuda_graph_impl="transformer_engine",
+    )
+    module.indexer = None
+    module.compressor = Mock()
+    module.compressor._cp_requires_single_projection.return_value = False
+    scalar = torch.zeros(1, device="cpu", dtype=torch.bfloat16)
+    query = scalar.expand(4096, 128, 512)
+    key = scalar.expand(4096, 1, 1, 512)
+    x = scalar.expand(4096, 1, 512)
+    boundary = scalar.expand(128, 1, 512)
+    module.compressor._forward_thd_cp.return_value = (scalar.expand(33, 1, 512), None)
+    cu = torch.tensor([0, 32768], device="cpu", dtype=torch.int32)
+    params = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, max_seqlen_q=32768)
+    params.cp_partition_mode = "contiguous"
+    expected = query.reshape(4096, -1)
+    module.train(training)
+    with (
+        torch.set_grad_enabled(grad_enabled),
+        patch.object(
+            csa, "_OutputInverseRope", return_value=SimpleNamespace(fused_params=object())
+        ),
+        patch.object(csa, "nvtx_range_push"),
+        patch.object(csa, "nvtx_range_pop"),
+        patch.object(csa, "get_flash_mla_topk_alignment", return_value=64),
+        patch.object(layout, "build_cp_compressor_layout", return_value=Mock()),
+        patch.object(layout, "build_attention_indices", return_value=(None,) * 4),
+        patch.object(
+            csa, "gather_from_sequence_parallel_region", return_value=scalar.expand(264, 512)
+        ),
+        patch.object(csa, "aligned_hca_cp_rank", return_value=7) as select,
+        patch.object(csa, "csa_sparse_attn", return_value=expected) as attention,
+    ):
+        actual = module._forward_thd_cp(query, key, x, x, boundary, boundary.unsqueeze(2), params)
+    assert actual.shape == (4096, 1, 128 * 512)
+    assert actual.data_ptr() == expected.data_ptr()
+    assert attention.call_args.kwargs["hca_cp_rank"] == (7 if grad_enabled else None)
+    assert attention.call_args.kwargs["hca_cp_size"] == 8
+    if grad_enabled:
+        select.assert_called_once()
+    else:
+        select.assert_not_called()
 
 
 def _metadata(cp_rank=0, sequence_length=65536, cp_size=16):

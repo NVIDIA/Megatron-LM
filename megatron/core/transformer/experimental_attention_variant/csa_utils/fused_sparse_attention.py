@@ -1917,7 +1917,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
         deterministic: bool = False,
         cuda_graph: bool = False,
         hca_cp_rank: Optional[int] = None,
-        hca_cp_size: int = 16,
+        hca_cp_size: Optional[int] = None,
     ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
         """Run FlashMLA sparse-attention forward and save tensors for backward."""
         # cuDNN backward keys its compile cache on the saved top-k width. Align
@@ -1939,14 +1939,15 @@ class CSASparseAttnFunc(torch.autograd.Function):
         if out_rope is not None:
             out_rope.apply_(out)
 
+        saved_topk_idxs = None if hca_cp_rank is not None else topk_idxs
         ctx.reconstruct_kv_for_backward = kv_reconstruction_parts is not None
         if ctx.reconstruct_kv_for_backward:
             _validate_kv_reconstruction_parts(kv, kv_reconstruction_parts)
-            ctx.save_for_backward(q, *kv_reconstruction_parts, attn_sink, topk_idxs, out, lse)
+            ctx.save_for_backward(q, *kv_reconstruction_parts, attn_sink, saved_topk_idxs, out, lse)
         else:
-            ctx.save_for_backward(q, kv, attn_sink, topk_idxs, out, lse)
+            ctx.save_for_backward(q, kv, attn_sink, saved_topk_idxs, out, lse)
         ctx.softmax_scale = softmax_scale
-        ctx.topk_length = topk_length
+        ctx.topk_length = None if hca_cp_rank is not None else topk_length
         ctx.out_rope = out_rope
         ctx.deterministic = deterministic
         ctx.cuda_graph = cuda_graph
@@ -2023,7 +2024,7 @@ def csa_sparse_attn(
     deterministic: bool = False,
     cuda_graph: bool = False,
     hca_cp_rank: Optional[int] = None,
-    hca_cp_size: int = 16,
+    hca_cp_size: Optional[int] = None,
 ) -> Tensor:
     """Sparse attention (Path A / Path C step 2).
 
@@ -2062,11 +2063,15 @@ def csa_sparse_attn(
             undone there before the cuDNN backward. Saves one full O buffer
             per layer against rotating the returned tensor out of place.
         hca_cp_rank: CP rank for an aligned HCA layout validated by the caller.
+        hca_cp_size: Required CP size when ``hca_cp_rank`` is set.
 
     Returns:
         SBHD ``(sq, b, np * d_v)`` or THD ``(total_sq, np * d_v)`` bf16,
         inverse-RoPE'd when ``out_rope`` is given.
     """
+    if hca_cp_rank is not None and hca_cp_size is None:
+        raise ValueError("hca_cp_size is required when hca_cp_rank is set")
+
     # Layout-specific input pre-reshape — the kernel always consumes a
     # flat ``(rows, np, d)`` query and ``(n_kv, d)`` KV; only the rows
     # axis interpretation differs (rows = ``total_sq`` for THD, rows =

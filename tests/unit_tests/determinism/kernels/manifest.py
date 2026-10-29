@@ -132,7 +132,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(K + "test_dsv4_dev_replay.py",),
         kind="dispatch",
-        notes="Real aligned HCA autograd replay with prepared packing and side-stream contention.",
+        notes="FlashMLA forward plus cudnn.aligned_hca_backward_wrapper "
+        "(NVIDIA/cudnn-frontend#1198), with prepared packing and side-stream contention. "
+        "Bypasses stock deterministic backward selection; uses grouped GEMMs and fixed-order "
+        "FP32 partial reductions without atomic accumulation. Requires GB300/Rubin and the "
+        "frontend API; skips on H100 CI.",
     ),
     KernelEntry(
         name="dev_csa_fused_compressor_dispatch",

@@ -3990,7 +3990,7 @@ class CompressedSparseAttention(MegatronModule):
         # ---- Step 7b: sparse attention path ----------------------------------
         if self.use_fused_kernels:
             hca_cp_rank = None
-            if self.config.hca_aligned_backward and indexer is None:
+            if self.config.hca_aligned_backward and indexer is None and torch.is_grad_enabled():
                 hca_cp_rank = aligned_hca_cp_rank(
                     query,
                     kv_full_thd,

@@ -80,7 +80,8 @@ def test_dev_flat_sparse_indices_replay():
 
 
 @pytest.mark.parametrize("sequence_length,cp_size", [(16384, 4), (32768, 8), (65536, 16)])
-def test_dev_aligned_hca_backward_replays(sequence_length, cp_size):
+@pytest.mark.parametrize("reconstruct", [False, True])
+def test_dev_aligned_hca_backward_replays(sequence_length, cp_size, reconstruct):
     """Replay HCA autograd with prepared packing and scheduling contention."""
     from megatron.core.transformer.experimental_attention_variant.csa_utils import (
         aligned_hca,
@@ -128,7 +129,12 @@ def test_dev_aligned_hca_backward_replays(sequence_length, cp_size):
     def run(q, kv, sink):
         selected = _select(q, kv, params, group)
         assert selected == rank
-        return fused_sparse_attention.csa_sparse_attn(
+        parts = (
+            tuple(part.detach() for part in kv.split((128, tokens, compressed)))
+            if reconstruct
+            else None
+        )
+        output = fused_sparse_attention.csa_sparse_attn(
             q,
             kv,
             sink,
@@ -136,10 +142,15 @@ def test_dev_aligned_hca_backward_replays(sequence_length, cp_size):
             512**-0.5,
             topk_length=lengths,
             is_thd=True,
+            kv_reconstruction_parts=parts,
             deterministic=True,
             hca_cp_rank=selected,
             hca_cp_size=cp_size,
         )
+        context = output.grad_fn.next_functions[0][0]
+        assert context.saved_tensors[-3] is None
+        assert context.topk_length is None
+        return output
 
     _, grads = assert_replays_bit_exact(
         run, (q, kv, sink), contention=True, what="aligned HCA backward"
