@@ -2145,8 +2145,9 @@ class TransformerConfig(ModelParallelConfig):
 
             # gdn2 may also be enabled for GDN layers built via the hybrid layer pattern
             # symbol 'G', where linear_attention_freq is unused; the GPT experimental
-            # attention route raises a clear error downstream if it is missing.
-            if self.experimental_attention_variant == "gdn":
+            # attention route raises a clear error downstream if it is missing. The same
+            # holds for plain gdn in a hybrid model: the pattern places the GDN layers.
+            if self.experimental_attention_variant == "gdn" and not self.is_hybrid_model:
                 assert (
                     self.linear_attention_freq is not None
                 ), "linear_attention_freq must be set for linear gdn."
