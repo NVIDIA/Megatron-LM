@@ -42,6 +42,12 @@ install(
 )
 ```
 
+Batch-invariant mode on a model with Mamba layers requires a policy that pins
+the SSM kernels: the Mamba mixer checks `pins("mamba_ssm",
+"megatron.core.ssm.ops")` when it is built, so install the policy before
+building the model. The `deterministic_mode` model-config field does not install
+one.
+
 `install` replaces the previous policy, and `install()` restores the default. A
 mapping is converted to `AutotunePolicy` and any other type is rejected first.
 `install` raises if the policy cannot be carried out, such as when its recording

@@ -211,6 +211,11 @@ class AutotunePolicy:
             mode = "auto"
         return replace(self, mode=mode)
 
+    def covers(self, module: str) -> bool:
+        """Whether kernels defined in ``module`` are in scope, matching ``modules`` at
+        package boundaries."""
+        return any(module == prefix or module.startswith(prefix + ".") for prefix in self.modules)
+
     @property
     def intercepts(self) -> bool:
         """Whether this policy needs the autotuner patched at all.

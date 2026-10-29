@@ -4697,19 +4697,9 @@ class TransformerConfig(ModelParallelConfig):
                 "training and inference attention paths run the same batch-invariant "
                 f"FlashAttention kernel (got {self.flash_attention_version})."
             )
-            if self.is_hybrid_model:
-                from megatron.core.ssm.ops.common.determinism import use_deterministic_mode
-
-                # Checked rather than set: the autotune config lists are fixed at
-                # import, so setting the flag here would change nothing.
-                assert use_deterministic_mode(), (
-                    "Batch invariant mode on a hybrid model requires deterministic mode, so "
-                    "the SSM Triton kernels pin their autotune configs instead of choosing "
-                    "per call shape. Run with --deterministic-mode; applications that build "
-                    "models without Megatron's training initializer enable it as "
-                    "megatron/core/tuning/README.md describes. MAMBA_DETERMINISTIC=1 does not "
-                    "enable it: it only configures the external mamba_ssm package."
-                )
+            # SSM layers also need their Triton kernels pinned. That is up to the installed
+            # autotune policy, which training installs after building this config, so the
+            # Mamba mixer checks it when built (assert_ssm_kernels_pinned).
 
             # Context parallelism routes through TE's FA2 fwd/bwd kernels directly, which
             # cannot be pinned to another version; dropout is not batch-invariant.

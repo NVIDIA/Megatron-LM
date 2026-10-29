@@ -277,6 +277,7 @@ class TestDynamicInferenceNVLS(_TestDynamicInferenceBase):
 
     @pytest.mark.flaky_in_dev  # Issue #7958: batch-invariant prefill/full-forward parity.
     @requires_te_batch_invariant_attention
+    @pytest.mark.usefixtures("pinned_autotune")  # batch-invariant Mamba layers require it
     @torch.inference_mode()
     def test_batch_invariant_prefill_matches_full_forward(self):
         """Dynamic prefill should exactly match the full-sequence forward."""

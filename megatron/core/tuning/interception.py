@@ -52,15 +52,27 @@ def active_policy() -> AutotunePolicy | None:
     return _policy
 
 
+def pins(*modules: str) -> bool:
+    """Whether the installed policy pins the Triton kernels defined in each of ``modules``.
+
+    Pinning acts when a kernel launches, so it also covers kernels imported before the
+    policy was installed. Kernels listed in ``config_invariant`` keep their timed choice,
+    which by definition cannot change their outputs.
+    """
+    return (
+        _policy is not None
+        and _policy.mode == "pinned"
+        and all(_policy.covers(module) for module in modules)
+    )
+
+
 def _scope(autotuner, policy: AutotunePolicy):
     scope = _scopes.get(autotuner)
     if scope is None:
         module = selection.kernel_module(autotuner)
         name = selection.kernel_name(autotuner)
         qualified = f"{module}.{name}"
-        in_scope = any(
-            module == prefix or module.startswith(prefix + ".") for prefix in policy.modules
-        )
+        in_scope = policy.covers(module)
         scope = (module, name, qualified, in_scope, qualified in policy.config_invariant)
         _scopes[autotuner] = scope
     return scope
@@ -383,5 +395,6 @@ __all__ = [
     "choice_log",
     "install",
     "maybe_verify_choices",
+    "pins",
     "verify_choices",
 ]

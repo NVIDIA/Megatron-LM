@@ -91,6 +91,18 @@ def run_config(monkeypatch):
     return container
 
 
+@pytest.fixture
+def pinned_autotune():
+    """Pin every in-scope Triton kernel for one test, as --deterministic-mode does."""
+    from megatron.core.tuning import AutotunePolicy, active_policy, install
+
+    previous = active_policy()
+    install(AutotunePolicy(mode="pinned"))
+    yield
+    # With nothing installed, Triton chose freely, which the auto policy leaves it to do.
+    install(previous or AutotunePolicy(mode="auto"))
+
+
 def pytest_sessionfinish(session, exitstatus):
     if exitstatus == 5:
         session.exitstatus = 0
