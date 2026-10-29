@@ -291,3 +291,48 @@ cover end-to-end SFT or GRPO training.
     `actor_rollout_ref.actor.engine.ep=8`,
     `algorithm.adv_estimator=grpo`, `actor_rollout_ref.actor.policy_loss.loss_mode=vanilla`,
     and `critic.enable=False`.
+
+### DS4.1 speculative rollout and sleep
+
+`run_deepseek_v41_dapo.sh` enables frozen-drafter DSpark (`k=5`, exact block
+rejection sampling, adaptive verification disabled) and sleep level 2. The native
+vLLM sleep lifecycle retains `*.bias_vl` and `draft.*`; the target is updated
+through layerwise checkpoint reload. Level 2 requires every preserve pattern to
+match a tensor and every selected CUDA parameter and buffer to have a native
+backup. Waking weights verifies the saved tensor set, dtype, shape, and full-byte
+fingerprints before returning; missing or changed state raises an error. These
+checks run by default. Level 1 remains available for diagnosis. Use a vLLM build with native sleep parameter
+preservation and host-resident reload permutations (00474aeec6 or newer).
+
+The paired actor/rollout contract is configurable:
+
+```bash
+DSV41_ATTENTION_CORE=flashmla DSV41_HEAD_DTYPE=float32 \
+  ROLLOUT_SPEC=True ROLLOUT_SLEEP_LEVEL=2 \
+  bash scripts/run_deepseek_v41_dapo.sh
+```
+
+`DSV41_ATTENTION_CORE` accepts `flashmla` or `mega`; `DSV41_HEAD_DTYPE` accepts
+`float32` or `bfloat16`. Both settings reach the actor's `impl_cfg` and vLLM.
+The current actor implements `flashmla`/`float32`; unsupported choices fail before
+build until the corresponding model implementation is available.
+`INDEXER_KV_DTYPE` and `INDEXER_SPARSE_LOGITS` configure vLLM's indexer contract;
+select values supported by the actor implementation and validate the pair.
+CP remains configurable with `ACTOR_CP` (default 1). `GRAD_OFFLOAD=True` releases
+DDP gradient storage between training phases without copying gradients to host;
+it remains opt-in. `ROLLOUT_SPEC=False ROLLOUT_SLEEP_LEVEL=1` selects the resident
+gradient, non-speculative lifecycle when `GRAD_OFFLOAD=False`.
+
+Checkpoints use Core's existing writers. Per-tensor streaming D2H staging is not
+included, and the recipe sets `MCORE_DIST_CKPT_STREAM_D2H=0`.
+Distributed optimizer saves default to `dp_reshardable`: resume may change DP,
+while TP/PP/EP must match. `MLITE_DISTOPT_SHARDING_TYPE=fully_reshardable` selects
+the more memory-intensive portable layout. Loads use the saved layout metadata.
+Frozen Engram tables are restored from the original release at initialization,
+so that release must remain available at resume.
+
+Sleep diagnostics are opt-in: `VERL_MLITE_SLEEP_FP_DIR` records state fingerprints;
+`VERL_MLITE_L2_RETENTION=1|unnamed|attrs[:pattern]|ownerless` enables retention
+bisection. The default is `0`, using vLLM's named preservation. Fingerprints are
+diagnostics: large host tables use head/tail samples, so they do not replace
+full token-logprob bit comparisons.
