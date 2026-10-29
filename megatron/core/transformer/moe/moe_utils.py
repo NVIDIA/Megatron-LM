@@ -1715,9 +1715,11 @@ def get_default_pg_collection(
     the fields in ``MOE_LAYER_PROCESS_GROUPS``, the experts' data-parallel groups ``expt_dp``
     and ``expt_dp_gtp_remat``, and the GTP weight-rematerialization groups ``gtp_remat`` and
     ``expt_gtp_remat``, so the linear layers built on the collection do not fall back and warn
-    again for those groups; every other field stays unset. With GTP weight remat on, the
-    Transformer Engine linears of the shared experts still fall back for their ``dp_cp`` replica
-    group, with a warning of their own.
+    again for those groups; every other field stays unset, ``dp_cp`` included. With dense GTP
+    weight remat on (``gtp_remat`` has more than one rank), the shared experts and any latent
+    projections that GTP covers therefore get no ``dp_cp`` replica group for their shards: the
+    Transformer Engine linears of the shared experts warn for it when they are built, and
+    checkpoint saving elects the shard writers over the global group, with a warning.
 
     Args:
         owner: Name of the class or function whose caller omitted ``pg_collection``.
