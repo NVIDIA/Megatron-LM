@@ -272,6 +272,27 @@ class _VirtualExpertFC2WgradStore:
         self._load_balancer.start_fc2_grad_reduce()
 
 
+class _FusedImplBackwardPreHooks(torch.autograd.Function):
+    """Identity whose backward runs the fused implementation's submodule backward pre-hooks.
+
+    The fused TE ops bypass ``linear_fc1``/``linear_fc2`` in backward, so their full
+    backward pre-hooks never fire. FSDP registers parameter unshard hooks there (e.g.
+    MFSDP v2 under combined 1F1B); without them the fused backward can read MXFP8
+    columnwise weights whose storage was released after forward. Applied to the fused
+    output, this node runs before the fused backward reads any weight.
+    """
+
+    @staticmethod
+    def forward(ctx, output: torch.Tensor, replay_hooks: Callable) -> torch.Tensor:
+        ctx.replay_hooks = replay_hooks
+        return output.view_as(output)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        ctx.replay_hooks(grad_output)
+        return grad_output, None
+
+
 class TEGroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using TE's GroupedLinear.
 
@@ -932,6 +953,38 @@ class TEGroupedMLP(MegatronModule):
 
         return forward_pre_hook
 
+    def _fused_impl_backward_pre_hook_modules(self) -> list[torch.nn.Module]:
+        """Submodules whose backward pre-hooks the fused backward must emulate."""
+        return [
+            submodule
+            for submodule in chain(self.linear_fc1.modules(), self.linear_fc2.modules())
+            if submodule._backward_pre_hooks
+        ]
+
+    def _replay_fused_impl_backward_pre_hooks(self, grad_output: torch.Tensor) -> None:
+        """Call submodule backward pre-hooks before the fused backward runs.
+
+        Like the forward emulation, this supports hooks that trigger parameter
+        all-gathers (e.g. FSDP unshard before dgrad reads columnwise weights), not
+        hooks that rewrite gradients the fused implementation never exposes.
+        """
+        for submodule in self._fused_impl_backward_pre_hook_modules():
+            for hook in list(submodule._backward_pre_hooks.values()):
+                if hook(submodule, (grad_output,)) is not None:
+                    raise RuntimeError(
+                        f"Applying a fused implementation for {self.__class__.__name__}, "
+                        f"but a {submodule.__class__.__name__} submodule "
+                        "has a backward pre-hook that modifies the output gradient."
+                    )
+
+    def _attach_fused_impl_backward_pre_hooks(self, output: torch.Tensor) -> torch.Tensor:
+        """Make the fused output's backward replay submodule backward pre-hooks first."""
+        if not output.requires_grad or not self._fused_impl_backward_pre_hook_modules():
+            return output
+        return _FusedImplBackwardPreHooks.apply(
+            output, self._replay_fused_impl_backward_pre_hooks
+        )
+
     @staticmethod
     def _ensure_main_grad(linear_module: torch.nn.Module) -> None:
         """Expose FSDP main_grad buffers required by TE fused wgrad accumulation."""
@@ -1079,7 +1132,9 @@ class TEGroupedMLP(MegatronModule):
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
         if self.config.moe_paged_stash:
             output = paged_stash_group_commit(output, name="grouped_mlp")
-        return output
+        # Last forward op, so its backward runs first: unshard before any fused backward
+        # step (stash reload, unpadding, offload reload, dgrad) touches the weights.
+        return self._attach_fused_impl_backward_pre_hooks(output)
 
     @staticmethod
     def _remove_glu_interleaving(x: torch.Tensor, interleave_size: int) -> torch.Tensor:

@@ -711,6 +711,75 @@ def test_rebind_fused_ops_params_skips_unchanged_params(monkeypatch):
     assert fc1_op.weight0 is module.linear_fc1.weight0
 
 
+def _module_with_plain_linears():
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.linear_fc1 = torch.nn.Linear(2, 2)
+    module.linear_fc2 = torch.nn.Linear(2, 2)
+    return module
+
+
+class _RecordFusedBackward(torch.autograd.Function):
+    """Stands in for the fused TE ops: its backward is where weights would be read."""
+
+    @staticmethod
+    def forward(ctx, x, events):
+        ctx.events = events
+        return x * 2
+
+    @staticmethod
+    def backward(ctx, grad):
+        ctx.events.append("fused_backward")
+        return grad * 2, None
+
+
+def test_fused_impl_backward_pre_hooks_run_before_fused_backward():
+    # Fused ops bypass linear_fc1/fc2 in backward, so FSDP's unshard backward pre-hooks
+    # (MFSDP v2 under combined 1F1B) must be replayed before the fused backward reads
+    # MXFP8 columnwise weights whose storage may have been released after forward.
+    module = _module_with_plain_linears()
+    events = []
+    module.linear_fc1.register_full_backward_pre_hook(
+        lambda submodule, grad_output: events.append(("fc1", submodule, grad_output))
+    )
+    module.linear_fc2.register_full_backward_pre_hook(
+        lambda submodule, grad_output: events.append(("fc2", submodule, grad_output))
+    )
+    x = torch.ones(3, 2, requires_grad=True)
+
+    output = module._attach_fused_impl_backward_pre_hooks(_RecordFusedBackward.apply(x, events))
+    output.backward(torch.full((3, 2), 3.0))
+
+    assert [event if isinstance(event, str) else event[0] for event in events] == [
+        "fc1",
+        "fc2",
+        "fused_backward",
+    ]
+    assert events[0][1] is module.linear_fc1 and events[1][1] is module.linear_fc2
+    torch.testing.assert_close(events[0][2][0], torch.full((3, 2), 3.0))
+    torch.testing.assert_close(x.grad, torch.full((3, 2), 6.0))
+
+
+def test_fused_impl_output_unchanged_without_backward_pre_hooks():
+    module = _module_with_plain_linears()
+    output = torch.ones(3, 2, requires_grad=True) * 2
+
+    assert module._attach_fused_impl_backward_pre_hooks(output) is output
+
+
+def test_fused_impl_rejects_gradient_modifying_backward_pre_hook():
+    module = _module_with_plain_linears()
+    module.linear_fc1.register_full_backward_pre_hook(
+        lambda submodule, grad_output: (grad_output[0] * 2,)
+    )
+    output = module._attach_fused_impl_backward_pre_hooks(
+        torch.ones(3, 2, requires_grad=True) * 2
+    )
+
+    with pytest.raises(RuntimeError, match="modifies the output gradient"):
+        output.sum().backward()
+
+
 def test_make_fused_impl_pre_forward_hook_rejects_input_modifying_hook():
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
