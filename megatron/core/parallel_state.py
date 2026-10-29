@@ -2371,10 +2371,11 @@ def create_all_gather_groups(
         pg_collection (ProcessGroupCollection): The process groups that the all-gather groups
             mirror: each all-gather group has the ranks of a ``dp_cp`` group, or, for expert
             parameters with expert parallelism (``ep`` larger than one rank), of an ``expt_dp``
-            group, so any rank order is supported. Omitting it is deprecated: the groups then
-            come from the global parallel state, with a ProcessGroupFallbackWarning, and the
-            expert groups support only the default tp-cp-ep-dp-pp rank order without a rank
-            offset.
+            group, so any rank order is supported. Those groups of all ranks' collections must
+            partition the ranks that have one, as a parallel grid's do. Omitting it is
+            deprecated: the groups then come from the global parallel state, with a
+            ProcessGroupFallbackWarning, and the expert groups support only the default
+            tp-cp-ep-dp-pp rank order without a rank offset.
 
     Returns:
         tuple: (dp_cp_ag_group, expt_dp_ag_group) where expt_dp_ag_group is None
@@ -2458,10 +2459,14 @@ def create_all_gather_groups(
 def _create_all_gather_groups_from_collection(
     pg_collection, for_expert_parallelism, timeout, nccl_comm_cfgs
 ):
-    """Create the all-gather groups of create_all_gather_groups() from pg_collection's groups."""
+    """Create the all-gather groups of create_all_gather_groups() from pg_collection's groups.
+
+    The ``dp_cp`` groups of the ranks' collections, and their ``expt_dp`` groups, must each
+    partition the ranks that have one, as the groups of a parallel grid do.
+    """
 
     def global_ranks(group):
-        return None if group is None else tuple(torch.distributed.get_process_group_ranks(group))
+        return None if group is None else torch.distributed.get_process_group_ranks(group)
 
     with_experts = (
         for_expert_parallelism and pg_collection.ep is not None and pg_collection.ep.size() > 1
@@ -2470,25 +2475,35 @@ def _create_all_gather_groups_from_collection(
         global_ranks(pg_collection.dp_cp),
         global_ranks(pg_collection.expt_dp) if with_experts else None,
     )
+    own_leaders = tuple(None if ranks is None else min(ranks) for ranks in own_ranks)
     # Each rank knows only its own groups, but every rank creates every group, in the same
-    # order: gather the groups of all ranks and create each distinct one in sorted order.
-    all_ranks = [None] * torch.distributed.get_world_size()
-    torch.distributed.all_gather_object(all_ranks, own_ranks)
+    # order. The groups partition the ranks, so a group is the ranks that share its lowest
+    # rank: gather that rank of each rank's groups, a constant amount of data per rank.
+    all_leaders = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(all_leaders, own_leaders)
 
     all_gather_groups = []
     for index, pg_name, group_desc in (
         (0, "dp_cp", "DATA_PARALLEL_GROUP_WITH_CP_AG"),
         (1, "ep_dp", "EXPERT_DATA_PARALLEL_GROUP_AG"),
     ):
+        members = {}
+        for rank, leaders in enumerate(all_leaders):
+            if leaders[index] is not None:
+                members.setdefault(leaders[index], []).append(rank)
         all_gather_group = None
-        for ranks in sorted({entry[index] for entry in all_ranks if entry[index] is not None}):
+        for leader in sorted(members):
+            # A rank's own group takes the ranks of the group it mirrors. They equal
+            # members[leader], except with the fake backend, whose all-gather returns the
+            # rank's own entry from every rank.
+            own = leader == own_leaders[index]
             group = create_group(
-                list(ranks),
+                own_ranks[index] if own else members[leader],
                 timeout=timeout,
                 pg_options=get_nccl_options(pg_name, nccl_comm_cfgs or {}),
                 group_desc=group_desc,
             )
-            if ranks == own_ranks[index]:
+            if own:
                 all_gather_group = group
         all_gather_groups.append(all_gather_group)
     return tuple(all_gather_groups)
