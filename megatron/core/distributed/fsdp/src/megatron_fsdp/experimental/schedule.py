@@ -27,7 +27,7 @@ class SchedulePolicy:
             disables prefetching, and positive values are parameter-element budgets.
         backward_prefetch_size: The same as ``forward_prefetch_size``, for backward
             order.
-        unshard_rowwise_in_backward: Whether backward unshards and prefetches of this
+        unshard_all_planes_in_backward: Whether backward unshards and prefetches of this
             module gather MXFP8 rowwise planes along with columnwise ones, keeping them
             until post_backward. Enable it when activations recomputed in backward use
             this module's MXFP8 weights. Otherwise, backward unshards gather only
@@ -40,7 +40,7 @@ class SchedulePolicy:
 
     forward_prefetch_size: int | None = None
     backward_prefetch_size: int | None = None
-    unshard_rowwise_in_backward: bool = False
+    unshard_all_planes_in_backward: bool = False
 
     def __post_init__(self) -> None:
         """Validate non-negative prefetch budgets."""
