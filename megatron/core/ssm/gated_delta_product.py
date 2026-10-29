@@ -27,7 +27,12 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic, causal_conv1d_cp
+from megatron.core.ssm.causal_conv1d import (
+    CHANNEL_LAST_ALIGNMENT,
+    assert_causal_conv1d_deterministic,
+    causal_conv1d_cp,
+    ensure_channel_last_alignment,
+)
 from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.ssm.context_parallel.gdp_common import gdp_chunkwise_context_parallel
 from megatron.core.ssm.gdp_context_parallel import GDPContextParallel
@@ -43,7 +48,11 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import deprecate_inference_params, make_tp_sharded_tensor_for_checkpoint
+from megatron.core.utils import (
+    deprecate_inference_params,
+    make_tp_sharded_tensor_for_checkpoint,
+    round_up_to_nearest_multiple,
+)
 
 if HAVE_GTP:
     from megatron.core.tensor_parallel.gtp_api import is_gtp_param
@@ -843,13 +852,26 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             assert self.cp is not None
             zVKQba = self.cp.pre_conv_ssm(zVKQba, packed_seq_params=packed_seq_params)
 
-        return self._preprocess(zVKQba)
+        z, VKQ, ba = self._preprocess(zVKQba)
+        # The causal conv reads VKQ in place where its layout allows. A copy it needs is made
+        # here, inside the in_proj recompute checkpoint, so that recompute discards it too.
+        return z, ensure_channel_last_alignment(VKQ), ba
 
     def _preprocess(self, zVKQba):
         """Switch the (l, b, proj_dim) input projection to the batch-first layout the
         causal conv and the kernels expect, and split it into the z, VKQ, and ba groups.
+
+        When the switch needs a copy (batch size > 1), the copy's rows are padded to the
+        causal conv's channel-last alignment, so that the conv can read VKQ in place from it
+        whatever the projection width.
         """
-        zVKQba = rearrange(zVKQba, "l b d -> b l d").contiguous()
+        zVKQba = rearrange(zVKQba, "l b d -> b l d")
+        if not zVKQba.is_contiguous():
+            batch, length, width = zVKQba.shape
+            pitch = round_up_to_nearest_multiple(width, CHANNEL_LAST_ALIGNMENT)
+            zVKQba = zVKQba.new_empty_strided(
+                (batch, length, width), (length * pitch, pitch, 1)
+            ).copy_(zVKQba)
 
         return torch.split(
             zVKQba,
@@ -879,16 +901,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         every caller whose kernel normalizes internally must set, such as the CuTeDSL
         path (``use_qk_l2norm_in_kernel``).
         """
-        # Both conv paths below read ``x`` through its channels-last [B, D, L] transpose.
-        # causal_conv1d loads 8-element vectors along the channels, so the slice's offset
-        # and its batch and token strides must all be multiples of 8 elements. ``x`` is a
-        # view into ``zVKQba``, whose token stride is the full local projection width; that
-        # width is not a multiple of 8 when ``nheads_local_cp * (num_householder + 1)`` is
-        # not, so copy VKQ out in that case. ``clone`` rather than ``contiguous``: the
-        # latter keeps the stride of a size-1 batch or token dimension.
-        if x.storage_offset() % 8 or x.stride(0) % 8 or x.stride(1) % 8:
-            x = x.clone(memory_format=torch.contiguous_format)
-
         if self.chunkwise_context_parallel:
             assert (
                 conv_state is None
@@ -905,8 +917,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             assert self.cp is not None
             # ``causal_conv1d_fn`` expects a ``[B, D, L]`` tensor in channels-last memory,
             # which is also what it requires when ``seq_idx`` is set. ``x`` is channels-last
-            # (a view into ``zVKQba`` or the copy above), so the transpose alone already
-            # gives stride(1) == 1 and no further copy is needed on either path.
+            # (a view into ``zVKQba``, or the aligned copy ``_in_proj_preprocess`` made of
+            # it), so the transpose alone already gives stride(1) == 1 and no copy is needed
+            # on either path.
             x = rearrange(x, "b l d -> b d l")
             if conv_state is not None:
                 # Static-batching prefill: seed the conv state from the prompt's tail.
