@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import itertools
 import os
@@ -1691,7 +1691,7 @@ class TestMTPHiddenStateRollUnderParallelism:
                 None if cu_seqlens_padded is None else cu_seqlens_padded.view(1, -1)
             ),
         }
-        batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=cp_group)
+        batch = get_batch_on_this_cp_rank(batch, dynamic_cp=False, cp_group=cp_group)
         positions = batch["tokens"][0]
         if sequence_parallel:
             positions = positions.chunk(get_pg_size(tp_group))[get_pg_rank(tp_group)]
@@ -2786,7 +2786,7 @@ class TestMultiTokenPrediction:
             batch["output_ref"] = output_ref
             # Get batch for current CP rank (handles CP tensor splitting)
             batch = get_batch_on_this_cp_rank(
-                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                batch, dynamic_cp=False, cp_group=get_context_parallel_group()
             )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = gpt_model[0].forward(
@@ -2910,7 +2910,7 @@ class TestMultiTokenPrediction:
 
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         batch = get_batch_on_this_cp_rank(
-            batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+            batch, dynamic_cp=False, cp_group=get_context_parallel_group()
         )
         gpt_model, _, _ = setup_model_and_optimizer(
             ModelType.encoder_or_decoder, self.model_provider
@@ -4079,7 +4079,7 @@ class TestMultiTokenPredictionHybrid:
         cp_batch = get_batches_on_this_cp_rank(
             batch,
             boundary_layout="contiguous",
-            is_hybrid_cp=False,
+            dynamic_cp=False,
             cp_group=cp_group,
             additional_layouts=("zigzag",),
             sequence_parallel=tp > 1,
@@ -4536,21 +4536,22 @@ class TestMultiTokenPredictionHybrid:
         )
 
         def convert_cp_layout_spy(
-            layer_hidden_states,
+            *,
+            input_,
             source_layout,
             target_layout,
-            passed_cp_group,
+            cp_group,
             sequence_parallel,
-            passed_tp_group,
-            passed_tp_cp_group,
+            tp_group,
+            tp_cp_group,
             thd_plan,
         ):
             assert source_layout == "contiguous"
             assert target_layout == "zigzag"
-            assert passed_cp_group is cp_group
+            assert cp_group is model.mtp.cp_group
             assert sequence_parallel
-            assert passed_tp_group is tp_group
-            assert passed_tp_cp_group is tp_cp_group
+            assert tp_group is model.mtp.tp_group
+            assert tp_cp_group is model.mtp.tp_cp_group
             assert thd_plan is cp_layout_plan
             if layer_hidden_states.dtype == torch.bool:
                 torch.testing.assert_close(layer_hidden_states, (~padding_mask).transpose(0, 1))
@@ -4644,6 +4645,58 @@ class TestMultiTokenPredictionHybrid:
         assert captured["mtp_loss"]["input_ids"] is zigzag_input_ids
         assert captured["mtp_loss"]["main_hidden_states"] is hidden_states
         torch.testing.assert_close(output, labels.to(dtype=hidden_states.dtype) + 1000.0)
+
+    def test_mtp_scheduler_keeps_boundary_layout_for_module_local_conversion(self, monkeypatch):
+        cp_group = types.SimpleNamespace(size=lambda: 2)
+        mtp = types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                cp_partition_mode="contiguous",
+                attention_cp_layout="zigzag",
+                sequence_packing_scheduler="dp_balanced",
+            ),
+            cp_group=cp_group,
+            tp_group=object(),
+            tp_cp_group=object(),
+            sequence_parallel=True,
+        )
+        mtp.prepare_cp_layout = types.MethodType(MultiTokenPredictionBlock.prepare_cp_layout, mtp)
+        hidden_states = torch.randn(2, 1, 8)
+        input_ids = torch.tensor([[1, 2]])
+        position_ids = torch.tensor([[0, 1]])
+        labels = torch.tensor([[2, 3]])
+        loss_mask = torch.ones(1, 2)
+        packed_seq_params = PackedSeqParams(qkv_format="thd", cp_partition_mode="contiguous")
+        cp_batch = ContextParallelBatch.from_single_layout(
+            layout="contiguous",
+            batch={
+                "tokens": input_ids,
+                "position_ids": position_ids,
+                "labels": labels,
+                "loss_mask": loss_mask,
+            },
+            packed_seq_params=packed_seq_params,
+        )
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.multi_token_prediction.convert_cp_layout",
+            lambda **_kwargs: pytest.fail("scheduler layout conversion must stay module-local"),
+        )
+        prepared = mtp.prepare_cp_layout(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            decoder_input=None,
+            mhc_multistream=None,
+            labels=labels,
+            loss_mask=loss_mask,
+            mtp_input_mask=None,
+            packed_seq_params=packed_seq_params,
+            cp_batch=cp_batch,
+        )
+
+        assert prepared.hidden_states is hidden_states
+        assert prepared.packed_seq_params is packed_seq_params
+        assert prepared.cp_partition_mode == "contiguous"
 
     @pytest.mark.parametrize("compute_mtp_loss", [True, False])
     def test_compute_mtp_loss_does_not_control_speculative_decoding(
@@ -4793,7 +4846,7 @@ class TestMultiTokenPredictionHybrid:
 
             batch["output_ref"] = output_ref
             batch = get_batch_on_this_cp_rank(
-                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                batch, dynamic_cp=False, cp_group=get_context_parallel_group()
             )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = mamba_model[0].forward(

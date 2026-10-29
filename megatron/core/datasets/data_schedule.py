@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import enum
 from functools import partial
@@ -26,16 +26,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_pipeline_rank,
 )
-
-try:
-    # Register the TE CUDA kernels
-    import transformer_engine  # pylint: disable=unused-import
-
-    # Alias the PyTorch wrapper so we can call tex.* APIs
-    import transformer_engine_torch as tex
-except ImportError:
-    # TE isn't installed or the torch wrapper is missing
-    tex = None
 
 
 def _build_thd_padding_mask(
@@ -703,6 +693,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         _sanitize_thd_padding_values(batch, batch['padding_mask'])
         pad_packed_batch_before_cp_slice(batch, config, cp_group.size(), tp_group.size())
 
+    cp_partition_mode = getattr(config, "cp_partition_mode", "zigzag")
     # Partition padding_mask for context parallel on every PP stage. Partition
     # token-like tensors only on stages that own them.
     if is_tp_rank_0 and not return_context_parallel_batch:
