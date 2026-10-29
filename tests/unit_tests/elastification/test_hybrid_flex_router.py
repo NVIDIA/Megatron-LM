@@ -17,6 +17,7 @@ import torch
 
 import megatron.elastification.router.hybrid_flex_router as _router_module
 import megatron.training as _megatron_training
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.elastification.router.hybrid_flex_router import FlextronRouter
 from tests.unit_tests.test_utilities import Utils
@@ -74,6 +75,11 @@ def _router_config(
     return config
 
 
+def _router(config):
+    """Build a router on the groups of a model that lives on the global grid."""
+    return FlextronRouter(config, pg_collection=ProcessGroupCollection.use_mpu_process_groups())
+
+
 @pytest.mark.internal
 class TestFlextronRouter:
     def setup_method(self, method):
@@ -118,7 +124,7 @@ class TestFlextronRouter:
 
     def test_construction(self):
         config = _router_config()
-        router = FlextronRouter(config).cuda()
+        router = _router(config).cuda()
         # Each gate is a Sequential of two linear layers + activation.
         assert hasattr(router, "gate_mlp")
         assert hasattr(router, "gate_emb")
@@ -131,7 +137,7 @@ class TestFlextronRouter:
 
     def test_router_params_marked_for_pp_sync(self):
         config = _router_config()
-        router = FlextronRouter(config).cuda()
+        router = _router(config).cuda()
         for p in router.parameters():
             # _mark_router_params_for_pp_sync adds this attribute to every
             # trainable parameter so the PP gradient sync picks them up.
@@ -139,7 +145,7 @@ class TestFlextronRouter:
 
     def test_forward_returns_five_axis_outputs(self):
         config = _router_config()
-        router = FlextronRouter(config).cuda()
+        router = _router(config).cuda()
         out = router(1.0)
         assert len(out) == 5
         # Order (per hybrid_flex_router.forward):
@@ -153,7 +159,7 @@ class TestFlextronRouter:
 
     def test_emb_output_shape_matches_choice_count(self):
         config = _router_config()
-        router = FlextronRouter(config).cuda()
+        router = _router(config).cuda()
         _, _, emb, _, _ = router(1.0)
         logits, choice = emb
         # Logits have one entry per emb_int_list choice.
@@ -174,8 +180,8 @@ class TestFlextronRouter:
         config = _router_config()
         config.curr_iteration = 0
 
-        router_a = FlextronRouter(config).cuda()
-        router_b = FlextronRouter(config).cuda()
+        router_a = _router(config).cuda()
+        router_b = _router(config).cuda()
         # Copy weights so both routers are in the same parameter state; the
         # determinism check is about the Gumbel RNG, not init noise.
         router_b.load_state_dict(router_a.state_dict())
@@ -193,7 +199,7 @@ class TestFlextronRouter:
 
     def test_fwd_pass_count_increments(self):
         config = _router_config()
-        router = FlextronRouter(config).cuda()
+        router = _router(config).cuda()
         assert router.fwd_pass_count == 0
         router(1.0)
         assert router.fwd_pass_count == 1
@@ -203,7 +209,7 @@ class TestFlextronRouter:
     def test_different_iterations_give_different_samples(self):
         """Bumping curr_iteration changes the Gumbel seed; logits should differ."""
         config = _router_config()
-        router = FlextronRouter(config).cuda()
+        router = _router(config).cuda()
 
         # Iteration 0 via the default setup-method stub.
         out_iter_0 = router(1.0)
