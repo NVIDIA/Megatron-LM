@@ -224,7 +224,7 @@ def test_nccl_ub_enables_symmetric_memory(process_group_collection, monkeypatch)
     original_fully_shard_context = mcore_fsdp_adapter.fully_shard_context
 
     def record_fully_shard_context(*args, **kwargs):
-        fully_shard_context_calls.append(kwargs["use_symmetric_memory"])
+        fully_shard_context_calls.append(kwargs["runtime_policy"].use_symmetric_memory)
         return original_fully_shard_context(*args, **kwargs)
 
     monkeypatch.setattr(mcore_fsdp_adapter, "fully_shard_context", record_fully_shard_context)
