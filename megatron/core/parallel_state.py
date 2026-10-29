@@ -72,6 +72,8 @@ _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP = None
 # Expert data parallel group
 _EXPERT_DATA_PARALLEL_GROUP = None
 _EXPERT_DATA_PARALLEL_GROUP_GLOO = None
+# All expert replica rank lists, also used to construct a separate optimizer AG communicator.
+_EXPERT_WEIGHT_REPLICA_RANK_SETS = None
 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = None
 _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
@@ -974,6 +976,7 @@ def initialize_model_parallel(
         rank_offset=rank_offset,
         gtp_remat=expert_gtp_remat_size,
     )
+    expert_weight_replica_rank_sets = expert_decoder_rank_generator.get_ranks("dp")
 
     assert (
         order.endswith("pp")
@@ -1588,6 +1591,8 @@ def initialize_model_parallel(
     assert _EXPERT_DATA_PARALLEL_GROUP is None, "Expert data group is already initialized"
     global _EXPERT_DATA_PARALLEL_GROUP_GLOO
     assert _EXPERT_DATA_PARALLEL_GROUP_GLOO is None, "Expert data group-gloo is already initialized"
+    global _EXPERT_WEIGHT_REPLICA_RANK_SETS
+    _EXPERT_WEIGHT_REPLICA_RANK_SETS = expert_weight_replica_rank_sets
     global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     assert (
         _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is None
@@ -1611,7 +1616,7 @@ def initialize_model_parallel(
     # Gloo only on the non-EGTP path (EGTP + Gloo out of scope; the EGTP optimizer uses DCP).
     if expert_gtp_remat_size > 1:
         create_gloo_process_groups = False
-    for ranks in expert_decoder_rank_generator.get_ranks("dp"):
+    for ranks in expert_weight_replica_rank_sets:
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1774,7 +1779,6 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
         )
 
     rank = torch.distributed.get_rank()
-    pp_size = get_pipeline_model_parallel_world_size()
     ep_size = get_expert_model_parallel_world_size()
     # Reuse the resolved weight layout, including rank offsets and CP overlap.
     # Reconstructing it from CP and GTP sizes would count shared ranks twice.
@@ -1793,22 +1797,10 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
     # Create expert DP all-gather group if requested
     expt_dp_ag_group = None
     if for_expert_parallelism and ep_size > 1:
-        expert_tp_size = get_expert_tensor_parallel_world_size()
-        expert_dp_size = get_expert_data_parallel_world_size()
-        egtp_remat_size = get_expert_gtp_weight_remat_world_size() or 1
-
-        expert_rank_gen = RankGenerator(
-            tp=expert_tp_size,
-            ep=ep_size,
-            dp=expert_dp_size,
-            pp=pp_size,
-            cp=1,
-            gtp_remat=egtp_remat_size,
-            order=_inject_gtp_remat_axis('tp-cp-ep-dp-pp', after='ep'),
-            rank_offset=0,
-        )
-
-        for expert_dp_ranks in expert_rank_gen.get_ranks('dp'):
+        # Reuse the exact expert weight layout resolved during initialization. Reconstructing it
+        # here would lose custom axis ordering, rank offsets, and future layout extensions.
+        assert _EXPERT_WEIGHT_REPLICA_RANK_SETS is not None
+        for expert_dp_ranks in _EXPERT_WEIGHT_REPLICA_RANK_SETS:
             expert_dp_ag = create_group(
                 expert_dp_ranks,
                 timeout=timeout,
@@ -2867,6 +2859,9 @@ def destroy_model_parallel():
 
     global _EXPERT_DATA_PARALLEL_GROUP
     _EXPERT_DATA_PARALLEL_GROUP = None
+
+    global _EXPERT_WEIGHT_REPLICA_RANK_SETS
+    _EXPERT_WEIGHT_REPLICA_RANK_SETS = None
 
     global _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT
     _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = None

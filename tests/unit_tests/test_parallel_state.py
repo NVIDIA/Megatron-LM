@@ -666,44 +666,31 @@ def test_separate_all_gather_group():
     Utils.destroy_model_parallel()
 
 
-def test_expert_all_gather_group():
+@pytest.mark.parametrize('order', ['tp-cp-ep-dp-pp', 'tp-cp-dp-ep-pp'])
+def test_expert_all_gather_group(order):
     """Test expert AG groups for MoE models with AG/RS overlap."""
-    # Initialize model parallel with expert parallelism
+    if world_size < 8 or world_size % 8 != 0:
+        pytest.skip(f"Test requires world_size divisible by 8, but got {world_size}")
+
     Utils.initialize_model_parallel(
-        expert_model_parallel_size=min(2, world_size),
-        context_parallel_size=max(1, world_size // 2) if world_size > 1 else 1,
+        pipeline_model_parallel_size=2,
+        expert_model_parallel_size=2,
+        order=order,
     )
 
-    # Get ranks for both regular and expert AG groups
-    dp_cp_group = ps.get_data_parallel_group(with_context_parallel=True)
-    dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
     expt_dp_group = ps.get_expert_data_parallel_group()
     expt_dp_ranks = torch.distributed.get_process_group_ranks(expt_dp_group)
 
-    # Create AG groups for both regular and expert parameters
-    dp_cp_ag_group = torch.distributed.new_group(ranks=dp_cp_ranks, backend='nccl')
-    expt_dp_ag_group = torch.distributed.new_group(ranks=expt_dp_ranks, backend='nccl')
+    _dp_cp_ag_group, expt_dp_ag_group = ps.create_all_gather_groups(for_expert_parallelism=True)
+    assert expt_dp_ag_group is not None
 
-    # Create ProcessGroupCollection with AG groups
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-    pg_collection.dp_cp_ag = dp_cp_ag_group
     pg_collection.expt_dp_ag = expt_dp_ag_group
 
-    # Verify both AG groups are set
-    assert pg_collection.dp_cp_ag is not None
     assert pg_collection.expt_dp_ag is not None
-
-    # Verify expert AG group has same ranks as expert dp group
-    expt_dp_group = pg_collection.expt_dp
-    if expt_dp_group is not None:
-        expt_ag_ranks = torch.distributed.get_process_group_ranks(expt_dp_ag_group)
-        expt_dp_ranks_actual = torch.distributed.get_process_group_ranks(expt_dp_group)
-        assert (
-            expt_ag_ranks == expt_dp_ranks_actual
-        ), "Expert AG group should have same ranks as expert dp group"
-        assert (
-            expt_dp_ag_group != expt_dp_group
-        ), "Expert AG group should be a different communicator"
+    expt_ag_ranks = torch.distributed.get_process_group_ranks(expt_dp_ag_group)
+    assert expt_ag_ranks == expt_dp_ranks, "Expert AG group should match expert DP ranks"
+    assert expt_dp_ag_group != expt_dp_group, "Expert AG group should be a different communicator"
 
     Utils.destroy_model_parallel()
 
