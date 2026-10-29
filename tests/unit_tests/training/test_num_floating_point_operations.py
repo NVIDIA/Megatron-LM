@@ -42,7 +42,8 @@ def _make_args(**overrides):
     )
     for name, value in overrides.items():
         setattr(args, name, value)
-    return args
+    cfg = SimpleNamespace(tokenizer=SimpleNamespace(padded_vocab_size=args.padded_vocab_size))
+    return args, cfg
 
 
 def _expected_flops(tokens, squared_lengths, layer_counts, mtp_depth):
@@ -104,7 +105,7 @@ def test_mtp_repeats_final_decoder_attention_type(
 ):
     pattern = [1, 1, 1, 0] * 10 if num_layers == 40 else [1, 1, 1]
     original_pattern = pattern.copy()
-    args = _make_args(
+    args, cfg = _make_args(
         num_layers=num_layers,
         mtp_num_layers=mtp_depth,
         linear_attention_freq=4 if pattern_form == "int" else pattern,
@@ -112,12 +113,16 @@ def test_mtp_repeats_final_decoder_attention_type(
     )
     stats, tokens, squared_lengths = _batch_stats(layout)
 
-    actual = num_floating_point_operations(args, batch_size=3, **stats)
+    actual = num_floating_point_operations(args, cfg, batch_size=3, **stats)
 
     assert actual == _expected_flops(tokens, squared_lengths, expected_counts, mtp_depth or 0)
     # Keep T fixed and change only Q to isolate the number of full-attention layers.
     merged = num_floating_point_operations(
-        args, batch_size=3, total_real_tokens_in_batch=tokens, seqlen_squared_sum_in_batch=tokens**2
+        args,
+        cfg,
+        batch_size=3,
+        total_real_tokens_in_batch=tokens,
+        seqlen_squared_sum_in_batch=tokens**2,
     )
     assert merged - actual == 48 * expected_counts[1] * (tokens**2 - squared_lengths)
     # A list describes decoder layers only; counting MTP must not append to it.
@@ -127,7 +132,7 @@ def test_mtp_repeats_final_decoder_attention_type(
 @pytest.mark.parametrize("layout", ["bshd", "thd"])
 @pytest.mark.parametrize("mtp_depth", [None, 0, 1, 2])
 def test_plain_attention_and_dense_mlp_flops_are_unchanged(layout, mtp_depth):
-    args = _make_args(
+    args, cfg = _make_args(
         experimental_attention_variant=None,
         linear_attention_freq=None,
         num_layers=3,
@@ -137,14 +142,14 @@ def test_plain_attention_and_dense_mlp_flops_are_unchanged(layout, mtp_depth):
     stats, tokens, squared_lengths = _batch_stats(layout)
     depth = mtp_depth or 0
 
-    actual = num_floating_point_operations(args, batch_size=3, **stats)
+    actual = num_floating_point_operations(args, cfg, batch_size=3, **stats)
 
     assert actual == _expected_flops(tokens, squared_lengths, (0, 3 + depth, 3 + depth, 0), depth)
 
 
 def _make_dsv4_args(pattern, **overrides):
     """A small HybridModel whose FLOPs have independently calculated coefficients."""
-    args = _make_args(
+    args, cfg = _make_args(
         hybrid_layer_pattern=pattern,
         experimental_attention_variant=None,
         num_layers=len(pattern.split('/')[0].replace('|', '')),
@@ -171,13 +176,13 @@ def _make_dsv4_args(pattern, **overrides):
     )
     for name, value in overrides.items():
         setattr(args, name, value)
-    return args
+    return args, cfg
 
 
 @pytest.mark.parametrize('symbol', ['W', 'C', 'H'])
 @pytest.mark.parametrize('packed', [False, True])
 def test_dsv4_attention_flops_use_pattern_and_real_token_statistics(symbol, packed):
-    args = _make_dsv4_args(symbol)
+    args, cfg = _make_dsv4_args(symbol)
     # BSHD: two L=256 sequences. Packed: L=128 and L=384 in a padded allocation.
     tokens = 512
     squared_lengths = 128**2 + 384**2 if packed else 2 * 256**2
@@ -197,25 +202,25 @@ def test_dsv4_attention_flops_use_pattern_and_real_token_statistics(symbol, pack
     if symbol == 'C':
         expected -= 1536 * tokens**2 / squared_lengths
     before = vars(args).copy()
-    assert num_floating_point_operations(args, batch_size=2, **stats) == int(expected)
+    assert num_floating_point_operations(args, cfg, batch_size=2, **stats) == int(expected)
     assert vars(args) == before
     if packed:
         args.seq_length = 2048
-        assert num_floating_point_operations(args, batch_size=32, **stats) == int(expected)
+        assert num_floating_point_operations(args, cfg, batch_size=32, **stats) == int(expected)
 
 
 def test_dsv4_flops_count_repeated_mtp_attention_and_projection():
-    args = _make_dsv4_args('W-E/C-/C-', mtp_num_layers=None)
+    args, cfg = _make_dsv4_args('W-E/C-/C-', mtp_num_layers=None)
     tokens, squared_lengths = 512, 2 * 256**2
     # Pattern: W + 2*C + 3*dense MLP + 1*MoE; two MTP norms/projections,
     # three logits projections. The actual repeated pattern owns MTP depth.
     expected = 27636 * tokens + 24 * squared_lengths - 3072 * tokens**2 / squared_lengths
-    assert num_floating_point_operations(args, batch_size=2) == int(expected)
+    assert num_floating_point_operations(args, cfg, batch_size=2) == int(expected)
     assert args.mtp_num_layers is None
 
 
 def test_dsv4_dense_csa_flops_do_not_require_an_indexer():
-    args = _make_dsv4_args(
+    args, cfg = _make_dsv4_args(
         'C',
         csa_dense_mode=True,
         dsa_indexer_n_heads=None,
@@ -225,4 +230,4 @@ def test_dsv4_dense_csa_flops_do_not_require_an_indexer():
     # Dense ratio-4 CSA: projections/window/compressor=538 MACs per token,
     # plus the full compressed attention core; logits add1536 FLOPs per token.
     expected = (6 * 538 + 1536) * 512 + 24 * (2 * 256**2)
-    assert num_floating_point_operations(args, batch_size=2) == expected
+    assert num_floating_point_operations(args, cfg, batch_size=2) == expected

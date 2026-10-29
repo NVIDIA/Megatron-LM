@@ -1013,14 +1013,15 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             precomputed_seq_start=seq_start,
         ).unsqueeze(0)
 
-    def _compute_gating(self, ba):
+    def _compute_gating(self, ba: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute the beta and g gating tensors from the ba slice."""
         b, a = torch.split(
             ba, [self.nheads_local_cp * self.num_householder, self.nheads_local_cp], dim=-1
         )
 
         b, a = b.contiguous(), a.contiguous()
-        beta = b.sigmoid()
+        # Save FP32 sigmoid values for backward, retaining the kernel's input dtype.
+        beta = b.float().sigmoid().to(b.dtype)
 
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         if self.chunkwise_context_parallel:
@@ -1048,7 +1049,18 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             assert self.cp is not None
             y = self.cp.post_conv_ssm(y, packed_seq_params=packed_seq_params)
         if self.rmsnorm:
-            z = rearrange(z, "b l d -> l b d").contiguous()
+            z = rearrange(z, "b l d -> l b d")
+            # CP1 and chunkwise CP leave z in projection storage. At batch size one,
+            # the gated norm's flattening preserves this unit-column-stride view,
+            # so in_proj recompute can discard and restore the norm's saved gate.
+            # Headwise CP and larger batches keep their existing materialization.
+            keep_gate_view = (
+                self.recompute_in_proj
+                and (self.pg_collection.cp.size() == 1 or self.chunkwise_context_parallel)
+                and z.shape[1] == 1
+            )
+            if not keep_gate_view:
+                z = z.contiguous()
             if not self.chunkwise_context_parallel:
                 z = self.cp.post_conv_ssm(z, packed_seq_params=packed_seq_params)
             y = self.norm(y, z)
@@ -1192,20 +1204,21 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             use_qk_l2norm_in_kernel=True,
             intermediate_states=intermediate_ssm_state,
             steps_per_token=self.num_householder,
+            compact_output=True,
         )
-        core_attn_out = rearrange(
-            core_attn_out, "n (t m) h d -> n t m h d", m=self.num_householder
-        )[
-            ..., -1, :, :
-        ].contiguous()  # [n, 1, h, d]
+        # The recurrent kernel stores just the final Householder result per token,
+        # directly in the contiguous [request, token, head, dim] decode layout.
 
         # No scatter: the kernel above already wrote each request's final state into
         # its cache slot in place.
         #
-        # ``_postprocess`` returns the sequence-first layout, so transpose back to the
-        # batch-first [n, seq_len, d_inner] this method contracts to return; the
-        # transpose is free at l == 1. post_conv_ssm inside it is a no-op here: decode
-        # only runs at cp_size == 1.
+        # Decode has no CP exchange. Keep speculative output batch-first so the
+        # shared dynamic path can flatten it without copying a transposed result.
+        if zVKQba.shape[1] > 1:
+            y = rearrange(core_attn_out, "n t h d -> n t (h d)")
+            return self.norm(y, z.contiguous()) if self.rmsnorm else y
+
+        # ``_postprocess`` returns sequence-first; the transpose is free at l == 1.
         return self._postprocess(core_attn_out, z).transpose(0, 1)
 
     def ssm_prefill(
