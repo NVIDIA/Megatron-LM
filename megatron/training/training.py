@@ -5343,7 +5343,12 @@ def train(
             # e.g. timeout for normal iterations vs timeout for iterations with checkpoint
             # this timeout is triggered when there's no collective communication
             # for the duration of timeout
-            update_pg_timeout(timedelta(seconds=cfg.dist.distributed_timeout_seconds_after_init))
+            # The run's collection adds the groups that parallel_state did not create, such as
+            # those of a multi-module run.
+            update_pg_timeout(
+                timedelta(seconds=cfg.dist.distributed_timeout_seconds_after_init),
+                pg_collection=pg_collection,
+            )
         # Update number of microbatches first without consistency check to decide if a
         # checkpoint should be saved. If the number of microbatches is different
         # from the previous iteration, save a checkpoint. Then run consistency check
