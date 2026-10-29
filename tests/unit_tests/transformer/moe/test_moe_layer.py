@@ -28,7 +28,7 @@ from tests.unit_tests.test_utilities import Utils
 class _RecordingMegakernel(torch.nn.Module):
     """Megakernel backend stand-in that records the routes it computes: padding tokens dropped."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.routes = []
 
@@ -71,7 +71,7 @@ class _CapacityCheckingMegakernel(_RecordingMegakernel):
     """Megakernel stand-in with a static per-expert capacity, like MOK's schedule capacity: running
     (not capturing) more routes on one expert than it holds fails, where MOK traps on the GPU."""
 
-    def __init__(self, capacity):
+    def __init__(self, capacity) -> None:
         super().__init__()
         self.capacity = capacity
         self.routing_maps = []
