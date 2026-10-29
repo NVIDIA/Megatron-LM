@@ -2993,6 +2993,18 @@ def load_checkpoint(
             for model_key in ('model', *(f'model{i}' for i in range(len(model)))):
                 if model_key in load_kwargs['sharded_state_dict']:
                     model_sharded_state_dict_modifier(load_kwargs['sharded_state_dict'][model_key])
+
+        if getattr(args, 'wide_residual', None) and ckpt_type == CheckpointType.GLOBAL:
+            from megatron.core.transformer.wide_residual import retarget_legacy_residual_keys
+
+            # Checkpoints saved before the residual read/write split store the wide-residual
+            # parameters (and their optimizer state) under residual_connection* keys.
+            retargeted = retarget_legacy_residual_keys(
+                load_kwargs['sharded_state_dict'],
+                dist_checkpointing.load_tensors_metadata(checkpoint_name).keys(),
+            )
+            if retargeted:
+                print_rank_0(f'Loading {retargeted} wide-residual tensors from legacy keys')
     elif args.ckpt_format == 'torch_dcp':
         model_sd = model[0].state_dict()
         if tp_group is None and pp_group is None:
