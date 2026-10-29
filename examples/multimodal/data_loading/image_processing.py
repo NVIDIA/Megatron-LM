@@ -676,6 +676,10 @@ class DynamicResolutionImageTilingStrategy(ImageTilingStrategy):
         video_target_num_patches: int | None = None,
         video_maintain_aspect_ratio: bool = False,
         video_temporal_patch_size: int = 1,
+        spatial_merge_size: int = 1,
+        image_bounds: tuple[int, int] | None = None,
+        pixel_mean: tuple[float, ...] | None = None,
+        pixel_std: tuple[float, ...] | None = None,
     ):
         """
         Args:
@@ -701,7 +705,23 @@ class DynamicResolutionImageTilingStrategy(ImageTilingStrategy):
                 patch budget. Default False.
             video_temporal_patch_size: Temporal patch size for video frame compression. Default 1, no temporal compression.
         """
-        assert "radio" in vision_model_type, "Dynamic resolution is only supported for radio models"
+        assert "radio" in vision_model_type or vision_model_type in (
+            "pixtral-vit",
+            "pixtral-vit-large",
+        ), "Unsupported dynamic-resolution vision encoder"
+        if type(spatial_merge_size) is not int or spatial_merge_size < 1:
+            raise ValueError("spatial_merge_size must be a positive integer")
+        if pixel_shuffle and spatial_merge_size != 1:
+            raise ValueError("native merging and external pixel shuffle cannot be combined")
+        self._spatial_merge_size = spatial_merge_size
+        self.spatial_reduction = 2 if pixel_shuffle else spatial_merge_size
+        self._image_bounds = image_bounds
+        if image_bounds is not None:
+            divisor = patch_size * self.spatial_reduction
+            if any(type(side) is not int or side <= 0 or side % divisor for side in image_bounds):
+                raise ValueError("image bounds must be positive patch/reduction-aligned dimensions")
+            if (image_bounds[0] // patch_size) * (image_bounds[1] // patch_size) < min_num_patches:
+                raise ValueError("image bounds cannot satisfy min_num_patches")
 
         if apply_data_augment:
             warnings.warn(
@@ -735,7 +755,10 @@ class DynamicResolutionImageTilingStrategy(ImageTilingStrategy):
         self._video_maintain_aspect_ratio = video_maintain_aspect_ratio
         self._video_temporal_patch_size = video_temporal_patch_size
 
-        pixel_mean, pixel_std = pixel_statistics[self._vision_model_type]
+        if pixel_mean is None and pixel_std is None:
+            pixel_mean, pixel_std = pixel_statistics[self._vision_model_type]
+        elif pixel_mean is None or pixel_std is None:
+            raise ValueError("pixel_mean and pixel_std must be supplied together")
         self._transform = T.Compose(
             [
                 T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
@@ -796,6 +819,9 @@ class DynamicResolutionImageTilingStrategy(ImageTilingStrategy):
         # NOTE: With python this rounds down if even, e.g. 512/16 = 32 + 0.5 = 32.5 -> 32
         closest_patch_height = round(orig_height / self._patch_size + 0.5)
         closest_patch_width = round(orig_width / self._patch_size + 0.5)
+        if self._image_bounds is not None:
+            closest_patch_height = max(1, closest_patch_height)
+            closest_patch_width = max(1, closest_patch_width)
         patches = closest_patch_height * closest_patch_width
 
         # Calculate the max scaling factor that we could apply to stay within budget
@@ -806,6 +832,9 @@ class DynamicResolutionImageTilingStrategy(ImageTilingStrategy):
         factor = min(math.sqrt(current_num_tokens_available / patches), self._factor_max)
         target_patch_height = math.floor(factor * closest_patch_height)
         target_patch_width = math.floor(factor * closest_patch_width)
+        if self._image_bounds is not None:
+            target_patch_height = max(1, target_patch_height)
+            target_patch_width = max(1, target_patch_width)
 
         # Scale up (possibly > factor_max) if we're less than min_num_patches and this is > num tokens avail
         if (
@@ -864,7 +893,7 @@ class DynamicResolutionImageTilingStrategy(ImageTilingStrategy):
                 target_patch_width, target_patch_height = long, short
 
         # Pixel shuffle groups 2x2 patches, so both grid dimensions must be even.
-        required_divisor = 2 if self._pixel_shuffle else 1
+        required_divisor = self.spatial_reduction
 
         # Augment before handling required divisors
         if data_augment and random.random() < tiling_augment_prob:
@@ -963,6 +992,68 @@ class DynamicResolutionImageTilingStrategy(ImageTilingStrategy):
                     target_patch_height = target_patch_height_down
                     target_patch_width = target_patch_width_down
 
+        if self._image_bounds is not None:
+            # Apply per-axis limits after rounding. Area alone does not bound
+            # extreme aspect ratios; preserve the old RADIO policy when unset.
+            max_height, max_width = (side // self._patch_size for side in self._image_bounds)
+            target_patch_height = max(required_divisor, min(target_patch_height, max_height))
+            target_patch_width = max(required_divisor, min(target_patch_width, max_width))
+            target_patch_width = max(
+                required_divisor,
+                min(
+                    target_patch_width,
+                    current_num_tokens_available
+                    // target_patch_height
+                    // required_divisor
+                    * required_divisor,
+                ),
+            )
+            target_patch_height = max(
+                required_divisor,
+                min(
+                    target_patch_height,
+                    current_num_tokens_available
+                    // target_patch_width
+                    // required_divisor
+                    * required_divisor,
+                ),
+            )
+            if (
+                not self._min_num_patches
+                <= target_patch_height * target_patch_width
+                <= current_num_tokens_available
+            ):
+                # A one-axis greedy expansion can miss a feasible rectangular
+                # grid. Search aligned rows and their feasible column interval;
+                # the configured side bound makes this a small metadata-only loop.
+                candidates = []
+                for rows in range(required_divisor, max_height + 1, required_divisor):
+                    low = (
+                        math.ceil(self._min_num_patches / rows / required_divisor)
+                        * required_divisor
+                    )
+                    high = min(
+                        max_width,
+                        current_num_tokens_available // rows // required_divisor * required_divisor,
+                    )
+                    if low > high:
+                        continue
+                    cols = max(
+                        low,
+                        min(
+                            high,
+                            round(rows * orig_width / orig_height / required_divisor)
+                            * required_divisor,
+                        ),
+                    )
+                    score = abs(math.log((cols / rows) / (orig_width / orig_height)))
+                    candidates.append((score, -rows * cols, rows, cols))
+                if not candidates:
+                    raise ValueError(
+                        "no aligned image grid satisfies the minimum, budget and side bounds"
+                    )
+                _, _, target_patch_height, target_patch_width = min(candidates)
+
         # Calculate spatial embeddings for this frame/tile (E)
         # Note: Temporal compression is handled externally in task_encoder.py
         # via _group_video_frame_params_into_tubelets, which groups T frames
@@ -1059,7 +1150,7 @@ class DynamicResolutionImageTilingStrategy(ImageTilingStrategy):
             List of ImageTilingParams for each media item
         """
         # Expand token budget by reduction factors (tokens available before reduction)
-        num_tokens_available = num_tokens_available * (4 if self._pixel_shuffle else 1)
+        num_tokens_available = num_tokens_available * self.spatial_reduction**2
         num_images = sum(1 for m in media_list if isinstance(m, ImageMedia))
         num_video_frames = sum(1 for m in media_list if isinstance(m, VideoFrameMedia))
         assert num_images + num_video_frames == len(
