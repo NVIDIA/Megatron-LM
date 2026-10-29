@@ -359,7 +359,10 @@ def owner_pg_collection(monkeypatch):
         # Rotary embeddings and the CSA compressor allocate on the current device.
         monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
         group = torch.distributed.new_group([0])
-        yield ProcessGroupCollection(tp=group, cp=group, pp=group)
+        # GTP is off, as in build_test_pg_collection, so no linear falls back for its axes.
+        yield ProcessGroupCollection(
+            tp=group, cp=group, pp=group, gtp_remat=None, expt_gtp_remat=None
+        )
         torch.distributed.destroy_process_group(group)
         if created_default_group:
             # Later tests in the session must not find this one-rank default group.
