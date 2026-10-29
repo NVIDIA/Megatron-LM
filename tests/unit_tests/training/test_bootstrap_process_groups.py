@@ -478,6 +478,40 @@ class TestLazyMpuInit:
         assert parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK == 3
 
 
+@pytest.mark.skipif(Utils.world_size > 1, reason="A distributed run initializes the real world")
+class TestFakeBackend:
+    """With --fake-process-group, each process stands for one rank and communicates nothing."""
+
+    def test_all_gather_groups_mirror_the_collection(self, monkeypatch):
+        """The fake all-gather returns this rank's own entry from every rank."""
+        _require_no_distributed()
+        from torch.testing._internal.distributed.fake_pg import FakeStore
+
+        monkeypatch.setattr(parallel_state, "_global_process_group_list", None)
+        torch.distributed.init_process_group("fake", store=FakeStore(), rank=5, world_size=8)
+        try:
+            grid = HyperCommGrid([2, 2, 2], ["tp", "ep", "dp"])
+            pg_collection = ProcessGroupCollection(
+                dp_cp=grid.create_pg(["ep", "dp"]),
+                ep=grid.create_pg("ep"),
+                expt_dp=grid.create_pg("dp"),
+            )
+
+            all_gather_groups = parallel_state.create_all_gather_groups(
+                for_expert_parallelism=True, pg_collection=pg_collection
+            )
+
+            for all_gather_group, group in zip(
+                all_gather_groups, (pg_collection.dp_cp, pg_collection.expt_dp)
+            ):
+                assert all_gather_group is not group
+                assert torch.distributed.get_process_group_ranks(
+                    all_gather_group
+                ) == torch.distributed.get_process_group_ranks(group)
+        finally:
+            torch.distributed.destroy_process_group()
+
+
 @pytest.mark.skipif(Utils.world_size < 2, reason="Requires a distributed run")
 class TestStandardGrid:
     """On the grid that initialize_model_parallel() builds and registers."""
@@ -519,6 +553,37 @@ class TestStandardGrid:
             assert torch.distributed.get_process_group_ranks(
                 all_gather_group
             ) == torch.distributed.get_process_group_ranks(group)
+
+    @pytest.mark.parametrize(
+        "grid", [grid[1:] for grid in EXPERT_GRIDS], ids=[grid[0] for grid in EXPERT_GRIDS]
+    )
+    def test_all_gather_groups_exchange_one_rank_per_group(self, monkeypatch, grid):
+        """Each rank sends the lowest rank of each of its groups, not all their ranks, which
+        every rank would receive from every rank: with groups that span the world, that is
+        the square of the world size."""
+        kwargs, num_ranks = grid
+        _require_divisible(num_ranks)
+        Utils.initialize_model_parallel(**kwargs)
+        pg_collection = parallel_state.get_registered_process_groups()
+        sent = []
+        all_gather_object = torch.distributed.all_gather_object
+
+        def record_all_gather_object(object_list, obj, *args, **kwargs):
+            sent.append(obj)
+            return all_gather_object(object_list, obj, *args, **kwargs)
+
+        monkeypatch.setattr(torch.distributed, "all_gather_object", record_all_gather_object)
+
+        parallel_state.create_all_gather_groups(
+            for_expert_parallelism=True, pg_collection=pg_collection
+        )
+
+        assert sent == [
+            tuple(
+                min(torch.distributed.get_process_group_ranks(group))
+                for group in (pg_collection.dp_cp, pg_collection.expt_dp)
+            )
+        ]
 
     @pytest.mark.usefixtures("run_config", "fresh_fallback_record")
     @pytest.mark.parametrize(
