@@ -424,9 +424,15 @@ plumbing changes in their own PR so the fix can be reviewed and reverted indepen
 caller or the registered collection. A fallback reads the grid in a
 `global_process_group_fallback()` block. Code that still calls a deprecated function on purpose
 reports it first with its own `warnings.warn(..., ParallelStateDeprecationWarning)`, and only
-then ignores that warning in a `warnings.catch_warnings()` block around the calls, as the lazy
-initialization in `megatron/training/initialize.py` does. No code reads or writes the private
-attributes of `parallel_state`. A stock run emits no `ParallelStateDeprecationWarning`.
+then ignores that warning with `warnings.simplefilter("ignore", ParallelStateDeprecationWarning)`
+in a `warnings.catch_warnings()` block around the calls, as the lazy initialization in
+`megatron/training/initialize.py` does. No code reads, writes or deletes a private attribute of
+`parallel_state`, even in a fallback, and no code takes the memory buffer from `parallel_state`:
+`megatron.core.utils` has it, and `tests/unit_tests/test_global_memory_buffer_imports.py`
+rejects `get_global_memory_buffer()`, `destroy_global_memory_buffer()` and
+`_set_global_memory_buffer()` from `parallel_state` under `megatron/`, `examples/` and `tools/`
+and in the top-level scripts, even in a fallback. A stock run emits no
+`ParallelStateDeprecationWarning`.
 
 **Reviewing?** Flag new calls of the deprecated functions and of `use_mpu_process_groups()` in
 `megatron/core`. Allowed exceptions: `parallel_state.py` itself, `process_groups_config.py`,
@@ -487,12 +493,17 @@ that inherit it included. Reviewers still look for reads it cannot see.
 `tests/unit_tests/test_parallel_state_accessor_uses.py` guards the code outside Megatron Core:
 the non-test code under `megatron/`, `examples/`, `tools/`, `tasks/`, `scripts/` and `docs/`, and
 the top-level scripts. It allows a call of a deprecated function or of `use_mpu_process_groups()`
-only in a `global_process_group_fallback()` block, or in a `warnings.catch_warnings()` block that
-ignores `ParallelStateDeprecationWarning` after the code has reported the call itself: an earlier
-statement of the same function, in the block of the `with` or in a block that contains it,
-calls `warnings.warn()` with that category or `warn_global_process_group_fallback()`;
-another function named `warn`, such as a logger's, does not count. It never allows a read, write
-or deletion of a private attribute of `parallel_state`, apart from the deprecated
+only in a `global_process_group_fallback()` block, or in a `warnings.catch_warnings()` block
+whose body calls `warnings.simplefilter("ignore", ParallelStateDeprecationWarning)` (or the
+matching `warnings.filterwarnings()`) after the code has reported the call itself: a statement
+that is only a call of `warnings.warn(..., ParallelStateDeprecationWarning)`, with the category as
+its second argument or as `category=`, or of `warn_global_process_group_fallback()` comes before
+the `with`, in the block that holds it or in a block that contains that block, of the same
+function (of the module for module-level code). A warning inside an earlier branch, loop or
+`with`, or inside the `catch_warnings()` block, does not count, and neither does another function
+named `warn`, such as a logger's. A reference in a function or lambda defined inside either block
+runs later, outside it, and is not allowed. It never allows a
+read, write or deletion of a private attribute of `parallel_state`, apart from the deprecated
 `_set_global_memory_buffer()`, which it treats like the other deprecated functions. It also
 follows the module through assigned aliases, `getattr()`, `setattr()` and `delattr()` with a
 constant name, `importlib.import_module()` and `sys.modules`, and does not follow the forms the

@@ -1341,8 +1341,9 @@ class TestTree(unittest.TestCase):
 
     The ratchet is report-only in CI until #6307 decides whether new fallbacks may be added, and
     calls from Megatron Core do not emit ParallelStateDeprecationWarning. This test classifies the
-    reads in the tree itself, allowlisted or not: one that no fallback warning dominates fails,
-    apart from UNWARNED_READS. It leaves the number of warned and guarded reads to the ratchet.
+    reads in the tree itself, allowlisted or not: one that is neither warned nor guarded fails, a
+    private use included, apart from UNWARNED_READS. It leaves the number of warned and guarded
+    reads to the ratchet.
     """
 
     def test_an_entry_of_a_moved_file_is_stale(self):
@@ -1356,7 +1357,8 @@ class TestTree(unittest.TestCase):
         new, stale = _unexpected_unwarned_reads(checker.scan(), UNWARNED_READS)
         self.assertFalse(
             new,
-            "Reads of the global grid in megatron/core that no fallback warning precedes:\n"
+            "Reads of the global grid in megatron/core that are neither warned nor guarded (a "
+            "private parallel_state use is neither, even after a fallback warning):\n"
             + "\n".join(new)
             + "\nTake the group from the caller. A compatibility fallback for a caller that "
             "omits it calls warn_global_process_group_fallback() first, in the same block or one "

@@ -169,8 +169,10 @@ with a `pg_collection`; without one, it falls back to the global grid with a
   from its caller. It counts the calls of the fallbacks of `process_groups_config.py`, which
   read the grid when the caller omits its groups, as guarded: `resolve_process_groups()`,
   `resolve_gtp_remat_group()`, and `ProcessGroupCollection.setup_process_groups_for_ddp()` and
-  `setup_process_groups_for_optimizer()`, and any read, write or deletion of a private attribute
-  of `parallel_state`. It counts a reference whether or not the code calls it, through imports,
+  `setup_process_groups_for_optimizer()`. It also counts any other read, write or deletion of a
+  private attribute of `parallel_state`, which no fallback warning makes acceptable (the
+  deprecated `_set_global_memory_buffer()` counts as a deprecated function). It counts a
+  reference whether or not the code calls it, through imports,
   assigned aliases, `getattr()`, `setattr()` or `delattr()` with a constant name,
   `importlib.import_module()` and `sys.modules`. A new call of any of them makes the check exit
   with an error. Its allowlist of the existing calls records which ones are warned: preceded, in
@@ -182,10 +184,19 @@ with a `pg_collection`; without one, it falls back to the global grid with a
   from `megatron.core.process_groups_config`. It emits one `ProcessGroupFallbackWarning` for the
   fallback, and the accessors and `use_mpu_process_groups()` it calls do not warn again.
   `tests/unit_tests/test_parallel_state_accessor_uses.py` checks that the code of this
-  repository outside Megatron Core and its tests calls them only in such a block or in
-  bootstrap code that ignores `ParallelStateDeprecationWarning` after warning with that category
-  itself, earlier in the same function, and never touches a private attribute of
-  `parallel_state`.
+  repository outside Megatron Core and its tests calls them only in such a block or in a
+  `with warnings.catch_warnings()` block whose body calls
+  `warnings.simplefilter("ignore", ParallelStateDeprecationWarning)` (or the matching
+  `warnings.filterwarnings()`) after a statement that is only a call of
+  `warnings.warn(..., ParallelStateDeprecationWarning)` or of
+  `warn_global_process_group_fallback()`, before the `with` in the block that holds it or in a
+  block that contains that block, of the same function (of the module for module-level code); see
+  [the guide](developer/parallel-state-deprecation.md#the-ci-check) for the details.
+  It also checks that the code never touches any other private attribute of `parallel_state`; it
+  treats the deprecated `_set_global_memory_buffer()` like the other deprecated functions, but
+  `tests/unit_tests/test_global_memory_buffer_imports.py` rejects the memory-buffer aliases from
+  `parallel_state` under `megatron/`, `examples/` and `tools/` and in the top-level scripts, even
+  in a fallback.
 - **In CI**, the *Process group usage check* workflow
   (`.github/workflows/process-group-usage-check.yml`) runs on pull requests and in the merge
   queue. Its job fails when the tests of the checker,
@@ -196,9 +207,11 @@ with a `pg_collection`; without one, it falls back to the global grid with a
   fails the job. It also fails when `tests/unit_tests/test_removal_versions.py` fails (see
   *Removal*). The job then runs
   `tools/check_process_group_usage.py` and `tests/unit_tests/test_parallel_state_accessor_uses.py`
-  as report-only steps (`continue-on-error`): a new call in Megatron Core, a call that lost its
-  warning, or a deprecated call outside Megatron Core is listed in the step's log, and the job
-  still passes. Whether that should block a pull request is still to be decided, see
+  as report-only steps (`continue-on-error`): they list every new call in Megatron Core, warned
+  and guarded ones included, every call that lost its warning, and every deprecated call outside
+  Megatron Core, without failing the job; the checker's tests have already failed it on an
+  unwarned call in Megatron Core, one that lost its warning included. Whether a new warned
+  fallback should block a pull request is still to be decided, see
   [#6307](https://github.com/NVIDIA/Megatron-LM/issues/6307). The unit-test jobs run these
   three test files in the `tests/unit_tests/**/*.py` bucket, where a failure of any of them
   fails the job. Testmon selects tests by the code they execute, and these read the files they

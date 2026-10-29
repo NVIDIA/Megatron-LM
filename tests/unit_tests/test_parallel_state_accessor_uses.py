@@ -7,9 +7,12 @@ no ParallelStateDeprecationWarning, and it never touches the private state of pa
 A call is allowed inside ``with global_process_group_fallback(...)`` (or a helper of the same
 module that returns one), whose ProcessGroupFallbackWarning reports the fallback, and inside a
 ``with warnings.catch_warnings()`` block that ignores ParallelStateDeprecationWarning after the
-code has warned on its own: an earlier statement of the same function, in the block of the
-``with`` or in a block that contains it, calls ``warnings.warn()`` with that category or
-``warn_global_process_group_fallback()``. A reference in a function or lambda defined in such a
+code has warned on its own: a statement that is only a call of
+``warnings.warn(..., ParallelStateDeprecationWarning)`` (the category by position or keyword) or of
+``warn_global_process_group_fallback()`` comes before the ``with``, in the block
+that holds it or in a block that contains that block, of the same function (of the module for
+module-level code). A warning inside an earlier branch, loop or ``with``, or inside the
+``catch_warnings()`` block, does not count. A reference in a function or lambda defined in such a
 block runs later, outside it, and is not allowed. A read, write or deletion of a private
 (``_``-prefixed) attribute of parallel_state is never allowed; the deprecated
 ``_set_global_memory_buffer()`` counts as a deprecated function instead. Megatron Core is exempt
