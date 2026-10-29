@@ -394,7 +394,8 @@ class TestHybridModel:
         placement.assert_called_once()
         placement_args = placement.call_args.kwargs
         assert placement_args["pp_group"] is model.pg_collection.pp
-        assert placement_args["vp_size"] == model_config.virtual_pipeline_model_parallel_size
+        # Without a virtual pipeline the model passes a size of 1, not None.
+        assert placement_args["vp_size"] == 1
 
     def test_forward_propagates_mtp_input_mask(self, mocker):
         class CaptureMTP(torch.nn.Module):
