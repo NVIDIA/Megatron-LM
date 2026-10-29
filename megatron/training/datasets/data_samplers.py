@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 
 from megatron.core import mpu
 from megatron.core.datasets.utils import Split
-from megatron.core.process_groups_config import warn_global_process_group_fallback
+from megatron.core.process_groups_config import global_process_group_fallback
 from megatron.core.utils import get_pg_rank, get_pg_size
 
 from megatron.training import get_args
@@ -55,11 +55,11 @@ def build_pretraining_data_loader(dataset, consumed_samples, pg_collection=None)
         return dataset
 
     if pg_collection is None:
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "build_pretraining_data_loader", deprecated_in="0.21", removed_in="0.23"
-        )
-        data_parallel_rank = mpu.get_data_parallel_rank()
-        data_parallel_size = mpu.get_data_parallel_world_size()
+        ):
+            data_parallel_rank = mpu.get_data_parallel_rank()
+            data_parallel_size = mpu.get_data_parallel_world_size()
     else:
         # Collections that predate the GTP weight-remat fields carry only the replicate group.
         data_parallel_group = pg_collection.dp_gtp_remat or pg_collection.dp
