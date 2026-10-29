@@ -38,9 +38,10 @@ Each entry has one of five kinds:
   ``setup_process_groups_for_optimizer()``. ``resolve_gtp_remat_group()`` does not warn when
   its caller passes ``owner=None`` because that caller has warned already. Their own reads are
   in an exempt file, so each call counts, whether or not the argument it forwards can be None;
-* ``private``: a read or write of a private (``_``-prefixed) attribute of ``parallel_state``,
-  such as ``_DATA_PARALLEL_GROUP`` or an ``_MPU_*`` override. That state is not an interface,
-  so a fallback warning does not make it acceptable: a private entry is never warned.
+* ``private``: a read, write or deletion of a private (``_``-prefixed) attribute of
+  ``parallel_state``, such as ``_DATA_PARALLEL_GROUP`` or an ``_MPU_*`` override; the deprecated
+  ``_set_global_memory_buffer()`` is a ``function``. That state is not an interface, so a
+  fallback warning does not make it acceptable: a private entry is never warned.
 
 A guarded call is still a read, so wrapping a fallback in ``resolve_process_groups()`` does not
 remove it from the allowlist. A guarded call that replaces a removed read of another kind in the

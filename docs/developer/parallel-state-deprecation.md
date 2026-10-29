@@ -422,9 +422,11 @@ plumbing changes in their own PR so the fix can be reviewed and reverted indepen
 
 **Changing code outside Megatron Core in this repository?** Take the groups from the model, the
 caller or the registered collection. A fallback reads the grid in a
-`global_process_group_fallback()` block, and bootstrap code that reads the grid on purpose
-ignores `ParallelStateDeprecationWarning` in a `warnings.catch_warnings()` block, so a stock run
-emits no `ParallelStateDeprecationWarning`.
+`global_process_group_fallback()` block. Code that still calls a deprecated function on purpose
+reports it first with its own `warnings.warn(..., ParallelStateDeprecationWarning)`, and only
+then ignores that warning in a `warnings.catch_warnings()` block around the calls, as the lazy
+initialization in `megatron/training/initialize.py` does. No code reads or writes the private
+attributes of `parallel_state`. A stock run emits no `ParallelStateDeprecationWarning`.
 
 **Reviewing?** Flag new calls of the deprecated functions and of `use_mpu_process_groups()` in
 `megatron/core`. Allowed exceptions: `parallel_state.py` itself, `process_groups_config.py`,
@@ -453,9 +455,10 @@ Two checks report new reads of the global grid. CI runs both.
   and warn for that fallback: `resolve_process_groups()`, `resolve_gtp_remat_group()`,
   `ProcessGroupCollection.setup_process_groups_for_ddp()` and
   `setup_process_groups_for_optimizer()` (kind `guarded`);
-- reads and writes of the private attributes of `parallel_state`, such as
-  `_DATA_PARALLEL_GROUP` or an `_MPU_*` override (kind `private`). That state is not an
-  interface, so a fallback warning does not make such an entry warned.
+- reads, writes and deletions of the private attributes of `parallel_state`, such as
+  `_DATA_PARALLEL_GROUP` or an `_MPU_*` override (kind `private`); the deprecated
+  `_set_global_memory_buffer()` counts as a function. That state is not an interface, so a
+  fallback warning does not make such an entry warned.
 
 `tools/process_group_usage_allowlist.json` records the existing calls. An entry records the
 file, the enclosing function or class, and the function called, but not the line number, so code
@@ -479,9 +482,15 @@ still look for reads it cannot see.
 `tests/unit_tests/test_parallel_state_accessor_uses.py` guards the code outside Megatron Core:
 the non-test code under `megatron/`, `examples/`, `tools/`, `tasks/`, `scripts/` and `docs/`, and
 the top-level scripts. It allows a call of a deprecated function or of `use_mpu_process_groups()`
-only in a `global_process_group_fallback()` block or in a bootstrap block that ignores
-`ParallelStateDeprecationWarning`. It also follows the module through assigned aliases,
-`getattr()` with a constant name, `importlib.import_module()` and `sys.modules`.
+only in a `global_process_group_fallback()` block, or in a `warnings.catch_warnings()` block that
+ignores `ParallelStateDeprecationWarning` after the code has reported the call itself: an earlier
+statement of the same function, in the block of the `with` or in a block that contains it,
+calls `warnings.warn()` with that category or `warn_global_process_group_fallback()`;
+another function named `warn`, such as a logger's, does not count. It never allows a read, write
+or deletion of a private attribute of `parallel_state`, apart from the deprecated
+`_set_global_memory_buffer()`, which it treats like the other deprecated functions. It also
+follows the module through assigned aliases, `getattr()` with a constant name,
+`importlib.import_module()` and `sys.modules`.
 
 In CI, the *Process group usage check* workflow runs the checker and the guard as report-only
 steps: what they find is listed in the step's log, and the job still passes. The job fails when
