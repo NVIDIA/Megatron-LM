@@ -1,18 +1,19 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""validate_args must reject CUDA graphs with hybrid (dynamic) context parallelism.
+"""The config built from args must reject CUDA graphs with dynamic context parallelism.
 
 A captured graph bakes in static communicators, so it cannot follow the per-microbatch
-context-parallel group that hybrid context parallelism selects at runtime.
+context-parallel group that dynamic context parallelism selects at runtime.
 """
 
 import sys
 
 import pytest
 
-from megatron.training.arguments import parse_args, validate_args
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 
-_GUARD = "Hybrid context parallelism not supported with CUDA Graph"
+_GUARD = "Dynamic context parallelism not supported with CUDA Graph"
 
 
 def _hybrid_cp_args(monkeypatch, **overrides):
@@ -32,7 +33,7 @@ def _hybrid_cp_args(monkeypatch, **overrides):
     args.lr = 1e-4
     args.tokenizer_type = "NullTokenizer"
     args.vocab_size = 1024
-    args.hybrid_context_parallel = True
+    args.dynamic_context_parallel = True
     args.max_seqlen_per_dp_cp_rank = 1024
     args.calculate_per_token_loss = True
     args.dataloader_type = "single"
@@ -54,20 +55,41 @@ def test_hybrid_context_parallel_rejects_cuda_graph_impl(
     monkeypatch, cuda_graph_impl, prerequisites
 ):
     args = _hybrid_cp_args(monkeypatch, cuda_graph_impl=cuda_graph_impl, **prerequisites)
+    validate_args(args)
     with pytest.raises(AssertionError, match=_GUARD):
-        validate_args(args)
+        core_transformer_config_from_args(args, TransformerConfig)
 
 
 @pytest.mark.parametrize("deprecated_flag", ["enable_cuda_graph", "external_cuda_graph"])
 def test_hybrid_context_parallel_rejects_deprecated_cuda_graph_flags(monkeypatch, deprecated_flag):
     # validate_args translates these into cuda_graph_impl and deletes them before the
-    # hybrid-CP checks run, so the guard must read cuda_graph_impl.
+    # config is built, so the guard must read cuda_graph_impl.
     args = _hybrid_cp_args(monkeypatch, **{deprecated_flag: True})
+    validate_args(args)
     with pytest.raises(AssertionError, match=_GUARD):
-        validate_args(args)
+        core_transformer_config_from_args(args, TransformerConfig)
 
 
 def test_hybrid_context_parallel_without_cuda_graphs_validates(monkeypatch):
     args = _hybrid_cp_args(monkeypatch)
     validate_args(args)
     assert args.cuda_graph_impl == "none"
+    assert core_transformer_config_from_args(args, TransformerConfig).dynamic_context_parallel
+
+
+def test_hybrid_builder_rejects_dynamic_context_parallel(monkeypatch):
+    from hybrid_builders import hybrid_builder
+
+    args = _hybrid_cp_args(monkeypatch)
+    with pytest.raises(NotImplementedError, match="not yet supported for HybridModel"):
+        hybrid_builder(args, pre_process=True, post_process=True)
+
+
+def test_deprecated_hybrid_context_parallel_flag_warns_and_maps(monkeypatch):
+    args = _hybrid_cp_args(
+        monkeypatch, rank=0, dynamic_context_parallel=False, hybrid_context_parallel=True
+    )
+    with pytest.warns(UserWarning, match="--hybrid-context-parallel is deprecated"):
+        validate_args(args)
+    assert args.dynamic_context_parallel
+    assert not args.hybrid_context_parallel

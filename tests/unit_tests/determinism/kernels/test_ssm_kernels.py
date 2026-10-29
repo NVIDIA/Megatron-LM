@@ -138,6 +138,61 @@ def test_mamba_chunk_scan_combined_varlen_replays():
     )
 
 
+def test_batch_invariant_decode_step_replays():
+    """One buffered batch-invariant decode step (chunk scan in target-rows mode, gated by the
+    current token's z) replays bit-exact, including a slot that crosses a chunk boundary."""
+    from megatron.core.ssm.ops.mamba2.batch_invariant_decode import (
+        BatchInvariantDecodeBuffers,
+        batch_invariant_decode_buffered_scan,
+    )
+
+    seeded()
+    slots, nheads, headdim, ngroups, dstate, chunk = 8, 16, 64, 2, 128, 128
+    bufs = BatchInvariantDecodeBuffers.allocate(
+        slots, chunk, nheads, headdim, ngroups, dstate, torch.device("cuda"), torch.float32
+    )
+    rows = (bufs.x, bufs.dt, bufs.B, bufs.C)
+    for t in rows:
+        t.normal_()
+    num_buffered = torch.randint(0, chunk, (slots,), dtype=torch.int32, device="cuda")
+    num_buffered[0] = chunk - 1  # this step fills slot 0's chunk
+    batch_indices = torch.arange(slots, dtype=torch.int32, device="cuda")
+    step = [
+        torch.randn(slots, 1, *shape, device="cuda")
+        for shape in ((nheads, headdim), (nheads, headdim), (nheads,), (ngroups, dstate))
+    ]
+    C = torch.randn(slots, 1, ngroups, dstate, device="cuda")
+    A = -torch.rand(nheads, device="cuda") - 0.5
+    D = torch.randn(nheads, device="cuda")
+    dt_bias = torch.rand(nheads, device="cuda")
+    ssm_state = torch.randn(slots, nheads, headdim, dstate, device="cuda")
+
+    def fn(x_buf, dt_buf, B_buf, C_buf, num_buffered, x, z, dt, B, C, ssm_state):
+        buffers = BatchInvariantDecodeBuffers(
+            x=x_buf,
+            dt=dt_buf,
+            B=B_buf,
+            C=C_buf,
+            num_buffered=num_buffered,
+            out=torch.empty(slots, nheads, headdim, device="cuda"),
+            target_rows=torch.empty(slots, dtype=torch.int32, device="cuda"),
+            chunk_flags=torch.empty(slots, dtype=torch.int32, device="cuda"),
+            chunk_starts=torch.empty(slots, dtype=torch.int32, device="cuda"),
+        )
+        y = batch_invariant_decode_buffered_scan(
+            buffers, x, z, dt, B, C, A, D, dt_bias, batch_indices, ssm_state
+        )
+        return y, ssm_state, num_buffered
+
+    assert_replays_bit_exact(
+        fn,
+        (*rows, num_buffered, *step, C, ssm_state),
+        replays=4,
+        backward=False,
+        what="batch_invariant_decode_buffered_scan",
+    )
+
+
 def test_selective_state_update_replays():
     from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
 
@@ -394,7 +449,9 @@ def test_fused_recurrent_gated_delta_rule_update_replays(gate_in_kernel):
     )
 
 
-def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays():
+@pytest.mark.parametrize("M", [2, 3])
+@pytest.mark.parametrize("compact_output", [False, True])
+def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays(M, compact_output):
     """Speculative decode: ``S`` draft tokens of ``M`` Householder steps each.
 
     Exercises the slot-indexed state cache and ``intermediate_states``, which the
@@ -405,7 +462,7 @@ def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays():
     from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
 
     seeded()
-    B, S, M, H, K, V = 64, 4, 2, 8, 128, 128
+    B, S, H, K, V = 64, 4, 8, 128, 128
     T = S * M
     slots = B + 8
     q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
@@ -432,6 +489,7 @@ def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays():
             state_indices=state_indices,
             intermediate_states=intermediate,
             steps_per_token=M,
+            compact_output=compact_output,
         )
         return o, final_state, intermediate
 
@@ -441,7 +499,7 @@ def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays():
         replays=4,
         backward=False,
         contention=True,
-        what="fused_recurrent_gated_delta_rule_update (speculative decode)",
+        what=f"fused_recurrent_gated_delta_rule_update (speculative decode, compact={compact_output})",
     )
 
 
@@ -494,12 +552,13 @@ def test_fused_recurrent_gated_delta_rule_update_padding_replays():
 
 
 @pytest.mark.parametrize("S", [1, 4])
-def test_gdp_decode_prepare_replays(S):
-    """``S`` is one plus the speculative draft length; ``S == 1`` is plain decode."""
-    from megatron.core.ssm.ops.gdp.decode_prepare import gdp_decode_prepare
+@pytest.mark.parametrize("M", [1, 2, 3])
+def test_gdp_decode_prepare_replays(S, M):
+    """Replay all copy-index paths in plain and speculative decode."""
+    from megatron.core.ssm.ops.gdp.prepare import gdp_decode_prepare
 
     seeded()
-    n, M, H, G, P, N = 256, 2, 16, 4, 128, 128
+    n, H, G, P, N = 256, 16, 4, 128, 128
     x = torch.randn(n, S, M * H * P + M * G * N + G * N, device="cuda", dtype=torch.bfloat16)
     # `ba` reaches the kernel as a slice of the input projection, so only its last
     # dimension is contiguous and the token stride comes from the view, not the width.
@@ -511,7 +570,29 @@ def test_gdp_decode_prepare_replays(S):
         (x, ba, A_log, dt_bias),
         replays=4,
         backward=False,
-        what=f"gdp_decode_prepare (S={S})",
+        what=f"gdp_decode_prepare (S={S}, M={M})",
+    )
+
+
+@pytest.mark.parametrize("T", [1, 4096])
+def test_gdp_prefill_prepare_replays(T):
+    """``T`` is the packed token count of a prefill step."""
+    from megatron.core.ssm.ops.gdp.prepare import gdp_prefill_prepare
+
+    seeded()
+    M, H, G, P, N = 3, 12, 12, 64, 128
+    x = torch.randn(1, T, M * H * P + M * G * N + G * N, device="cuda", dtype=torch.bfloat16)
+    # `ba` reaches the kernel as a slice of the input projection, so only its last
+    # dimension is contiguous and the token stride comes from the view, not the width.
+    ba = torch.randn(1, T, 2 * (M * H + H), device="cuda", dtype=torch.bfloat16)[..., : M * H + H]
+    A_log = torch.randn(H, device="cuda")
+    dt_bias = torch.randn(H, device="cuda")
+    assert_replays_bit_exact(
+        lambda x, ba, A_log, dt_bias: gdp_prefill_prepare(x, ba, A_log, dt_bias, M, H, G, P, N),
+        (x, ba, A_log, dt_bias),
+        replays=4,
+        backward=False,
+        what=f"gdp_prefill_prepare (T={T})",
     )
 
 
@@ -661,6 +742,46 @@ def test_torch_chunk_gated_delta_rule_replays_fwd_bwd():
         return o, state
 
     assert_replays_bit_exact(fn, (q, k, v, g, beta), replays=3, what="torch_chunk_gated_delta_rule")
+
+
+def test_kda_gate_jit_path_replays_fwd_bwd():
+    """KDA's jit-fused gate reshaping and beta activation replay bit-exactly."""
+    from types import SimpleNamespace
+
+    from megatron.core.ssm.gated_delta_net.kda import KimiDeltaAttention
+
+    seeded()
+    batch, seq_len, heads, head_dim = 2, 256, 4, 32
+    dummy = SimpleNamespace(key_head_dim=head_dim)
+    A_log = torch.randn(heads, device="cuda")
+    dt_bias = torch.randn(heads, device="cuda")
+    raw_g = torch.randn(
+        batch * seq_len * heads * head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    beta = torch.randn(
+        batch * seq_len * heads, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+
+    def fn(raw_g, beta):
+        raw_g, gates = KimiDeltaAttention._compute_gates(
+            dummy, A_log, dt_bias, batch, seq_len, raw_g, beta
+        )
+        return raw_g, gates["beta"]
+
+    assert_replays_bit_exact(fn, (raw_g, beta), replays=3, what="KDA gate JIT path")
+
+
+def test_kda_fp8_opt_out_scope_is_replay_safe():
+    """KDA-only FP8 initialization selection remains stable across the dispatch path."""
+    from megatron.core.ssm.gated_delta_net.common import _kda_fp8_disabled
+    from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
+    from megatron.core.ssm.kda_layer_config import KDALayerConfig
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+    config.kda_disable_fp8 = True
+    assert _kda_fp8_disabled(KDALayerConfig.from_config(config))
+    assert not _kda_fp8_disabled(GDNLayerConfig.from_config(config))
 
 
 @pytest.mark.xfail(
