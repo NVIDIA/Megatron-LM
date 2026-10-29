@@ -1,6 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Nemotron MoE VLM model provider for heterogeneous MIMO examples."""
+"""Nemotron6-MoE VLM model provider for heterogeneous MIMO examples.
+
+Vision projection recipes include affine (the default), squared-ReLU MLP with
+intermediate width 4x the encoder output width, and FastGELU MLP with intermediate
+width equal to decoder hidden width. The mlp/mlp2 spellings are accepted as aliases;
+changing a spelling preserves the architecture and checkpoint parameter names.
+"""
 
 from __future__ import annotations
 
@@ -22,7 +28,7 @@ from examples.mimo.model_providers.radio_encoder import (
     radio_vision_encoder_spec,
 )
 from examples.mimo.utils.hetero import get_grid_dim_size
-from megatron.core.activations import squared_relu
+from megatron.core.activations import squared_relu, unfused_fast_gelu
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
 from megatron.core.models.hybrid.hybrid_layer_specs import (
@@ -44,8 +50,12 @@ from megatron.core.utils import get_pg_rank, get_pg_size
 from megatron.training.global_vars import get_run_config
 
 try:
-    from megatron.core.extensions.transformer_engine import TERowParallelLinear
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelLinear,
+        TERowParallelLinear,
+    )
 except ImportError:  # pragma: no cover - TE always present in the CI container
+    TEColumnParallelLinear = None
     TERowParallelLinear = None
 
 if TYPE_CHECKING:
@@ -53,9 +63,27 @@ if TYPE_CHECKING:
 
 NEMOTRON_MODEL_PROVIDER = "nemotron-moe-vlm"
 
+_VISION_PROJECTION_TYPES = (
+    "affine",
+    "mlp_squared_relu_4x_encoder_output_width",
+    "mlp_fast_gelu_1x_decoder_hidden_width",
+)
+_VISION_PROJECTION_ALIASES = {
+    "mlp": "mlp_squared_relu_4x_encoder_output_width",
+    "mlp2": "mlp_fast_gelu_1x_decoder_hidden_width",
+}
+
+
+def _resolve_vision_projection_type(projector_type: str) -> str:
+    """Resolve recipe aliases without rewriting parsed or restored checkpoint arguments."""
+    resolved = _VISION_PROJECTION_ALIASES.get(projector_type, projector_type)
+    if resolved not in _VISION_PROJECTION_TYPES:
+        raise ValueError(f"unsupported vision projection type {projector_type!r}")
+    return resolved
+
 
 def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """Register the model-provider args for hetero MIMO examples.
+    """Register the model-provider args for heterogeneous MIMO examples.
 
     Only the provider/vision knobs this PR consumes are declared here; stock
     ``arguments.py`` owns the ``TransformerConfig`` field flags and
@@ -97,9 +125,18 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
     provider.add_argument(
         "--vision-projection-type",
         type=str,
-        choices=["mlp", "affine"],
+        choices=(*_VISION_PROJECTION_TYPES, *_VISION_PROJECTION_ALIASES),
         default="affine",
-        help="Projection module from frozen vision features to language hidden size.",
+        metavar="PROJECTOR",
+        help=(
+            "Vision-to-language projection (default: %(default)s). affine uses one linear "
+            "layer. mlp_squared_relu_4x_encoder_output_width uses two bias-free linear layers "
+            "with squared ReLU and intermediate width 4 times the emitted encoder feature "
+            "width (including pixel shuffle). mlp_fast_gelu_1x_decoder_hidden_width uses two "
+            "bias-free linear layers with unfused FastGELU and intermediate width equal to "
+            "decoder hidden size. Aliases: mlp = the squared-ReLU recipe, mlp2 = the "
+            "FastGELU recipe. Alias names preserve checkpoint shapes and parameter names."
+        ),
     )
     return parser
 
@@ -114,15 +151,25 @@ def _vocab_size() -> int:
     raise ValueError("vocab size unresolved: set --vocab-size / a tokenizer, or padded_vocab_size")
 
 
-def nemotron_projection_layer_spec() -> ModuleSpec:
-    """Return the Nemotron VLM RADIO-to-language projector layer spec."""
+def nemotron_projection_layer_spec(projector_type: str = "affine") -> ModuleSpec:
+    """Return projector linears, preserving the affine-compatible default."""
+    projector_type = _resolve_vision_projection_type(projector_type)
     if TERowParallelLinear is None:
         raise RuntimeError("TERowParallelLinear is required")
+    if projector_type == "mlp_fast_gelu_1x_decoder_hidden_width" and TEColumnParallelLinear is None:
+        raise RuntimeError("TEColumnParallelLinear is required for the FastGELU projector")
     # MultimodalProjector's affine path builds fc1 with gather_output=True, which
     # TE column-parallel linears reject; use core ColumnParallelLinear for fc1.
     return ModuleSpec(
         module=MLP,
-        submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=TERowParallelLinear),
+        submodules=MLPSubmodules(
+            linear_fc1=(
+                TEColumnParallelLinear
+                if projector_type == "mlp_fast_gelu_1x_decoder_hidden_width"
+                else ColumnParallelLinear
+            ),
+            linear_fc2=TERowParallelLinear,
+        ),
     )
 
 
@@ -134,7 +181,7 @@ def nemotron_language_config(
     expt_tp_size: int,
     cp_size: int = 1,
 ) -> TransformerConfig:
-    """Nemotron MoE language config: stock from-args base + model-specific overrides."""
+    """Nemotron6-MoE language config: stock from-args base + model-specific overrides."""
     config = deepcopy(_base_config(args))
     gtp_remat_num_sequence_shards = config.gtp_remat_num_sequence_shards
     # Code-only fields + hetero parallelism pins.
@@ -189,6 +236,9 @@ def nemotron_projection_config(
     base_config: TransformerConfig | None = None,
 ) -> TransformerConfig:
     """Vision-to-Nemotron projection config: stock from-args base + overrides."""
+    projector_type = _resolve_vision_projection_type(
+        getattr(args, "vision_projection_type", "affine")
+    )
     config = deepcopy(base_config if base_config is not None else _base_config(args))
     config.num_layers = 1
     config.hidden_size = int(args.hidden_size)
@@ -199,6 +249,9 @@ def nemotron_projection_config(
     config.bias_dropout_fusion = False
     config.add_bias_linear = False
     config.activation_func = squared_relu
+    if projector_type == "mlp_fast_gelu_1x_decoder_hidden_width":
+        config.ffn_hidden_size = config.hidden_size
+        config.activation_func = unfused_fast_gelu
     config.normalization = "RMSNorm"
     _make_dense_non_hybrid(config)  # Projection inherits no MoE/Mamba/hybrid settings.
     config.tensor_model_parallel_size = tp_size
@@ -218,12 +271,13 @@ def _nemotron_projection_spec(
     base_config: TransformerConfig | None = None,
 ) -> ModuleSpec:
     """Build the RADIO-to-language projection for its owning grid."""
+    projector_type = _resolve_vision_projection_type(args.vision_projection_type)
     return ModuleSpec(
         module=MultimodalProjector,
         params={
             "config": nemotron_projection_config(args, tp_size, input_size, base_config),
-            "submodules": nemotron_projection_layer_spec().submodules,
-            "projector_type": args.vision_projection_type,
+            "submodules": nemotron_projection_layer_spec(projector_type).submodules,
+            "projector_type": "affine" if projector_type == "affine" else "mlp",
             "input_size": input_size,
             "pg_collection": pg_collection,
         },
@@ -416,7 +470,7 @@ def build_nemotron_communicator(
 
 
 def nemotron_provider() -> MimoProvider:
-    """Provider descriptor for the Nemotron MoE + RADIO VLM."""
+    """Provider descriptor for the Nemotron6-MoE + RADIO VLM."""
     return MimoProvider(
         encoder_module_names=(RADIO_ENCODER_MODULE_NAME,),
         language_spec=language_model_spec,
