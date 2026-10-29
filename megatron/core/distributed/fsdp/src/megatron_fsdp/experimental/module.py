@@ -339,22 +339,29 @@ class FsdpModule:
         """Prefetch successors from ``order`` according to this module's budget.
 
         Successors are unsharded for this module's phase, which is the compute they
-        run next in ``order``.
+        run next in ``order``. Backward skips successors whose backward already
+        finished in this pass, which ``order`` predicts when execution differs from it.
+        Their post_backward() has already run, so their gathered weights would outlive
+        optimizer.step() and feed the next forward.
         """
         module = cast(nn.Module, self)
         order.advance(module)
+        finished_modules = (
+            self.context.finished_backward_modules if self.phase is Phase.BACKWARD else ()
+        )
         next_module = order.next_item()
         if prefetch_size is None:
-            if next_module is not None:
+            if next_module is not None and next_module not in finished_modules:
                 cast(FsdpModule, next_module)._unshard_parameter_groups(self.phase)
             return
 
         prefetched_size = 0
         offset = 1
         while next_module is not None and prefetched_size < prefetch_size:
-            fsdp_module = cast(FsdpModule, next_module)
-            fsdp_module._unshard_parameter_groups(self.phase)
-            prefetched_size += fsdp_module.num_parameter_elements
+            if next_module not in finished_modules:
+                fsdp_module = cast(FsdpModule, next_module)
+                fsdp_module._unshard_parameter_groups(self.phase)
+                prefetched_size += fsdp_module.num_parameter_elements
             offset += 1
             next_module = order.next_item(offset)
 
@@ -450,6 +457,7 @@ class FsdpModule:
         self.reshard()
         self.context.validate_grad_sync()
         self._reduce_gradient_groups()
+        self.context.finished_backward_modules.add(cast(nn.Module, self))
         self.phase = Phase.RESTING
         torch.cuda.nvtx.range_pop()
 

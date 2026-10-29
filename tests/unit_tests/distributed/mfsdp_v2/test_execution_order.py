@@ -2,17 +2,42 @@
 
 """Coverage for occurrence-based FSDP prefetch and weak module ownership."""
 
+import copy
 import gc
 from unittest.mock import Mock
 from weakref import ref
 
 import pytest
+import torch
+import torch.distributed as dist
 from torch import nn
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor, Shard
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    Placements,
+    SchedulePolicy,
+    fully_shard,
+    fully_shard_context,
+    fully_shard_optimizer,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
     ExecutionOrder,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+
+
+class ReverseRegisteredModel(nn.Module):
+    """Registers ``second`` before ``first`` but runs ``first`` before ``second``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.second = nn.Linear(8, 8, bias=False)
+        self.first = nn.Linear(8, 8, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run ``first`` and then ``second``."""
+        return self.second(torch.relu(self.first(x)))
 
 
 @pytest.mark.parametrize(
@@ -94,3 +119,50 @@ def test_iteration_and_weak_references():
     # Traversal skips dead references, but the demand cursor must not skip a call.
     with pytest.raises(RuntimeError, match='diverged'):
         order.advance(first)
+
+
+@pytest.mark.parametrize(
+    "schedule_policy",
+    [SchedulePolicy(), SchedulePolicy(forward_prefetch_size=1024, backward_prefetch_size=1024)],
+    ids=["next_module", "element_budget"],
+)
+def test_backward_prefetch_skips_finished_modules(distributed_setup, schedule_policy):
+    """A mispredicted backward prefetch must not carry pre-step weights into the next forward.
+
+    Registration order predicts backward ``first`` -> ``second``, but ``second`` finishes
+    first. Prefetching ``second`` from ``first`` gathers weights that no post_backward()
+    releases, so they survive optimizer.step().
+    """
+    rank = distributed_setup.rank
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    placements = Placements(
+        dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+    )
+    torch.manual_seed(1234)
+    baseline = ReverseRegisteredModel().to(device)
+    model = copy.deepcopy(baseline)
+    with fully_shard_context(device=device):
+        for module in (model.second, model.first, model):
+            fully_shard(module, mesh=mesh, placements=placements, schedule_policy=schedule_policy)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    fully_shard_optimizer(optimizer)
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.1)
+
+    torch.manual_seed(5678 + rank)
+    for _ in range(3):
+        x = torch.randn(4, 8, device=device)
+        baseline_optimizer.zero_grad()
+        baseline_loss = baseline(x).square().mean()
+        baseline_loss.backward()
+        for parameter in baseline.parameters():
+            dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
+        baseline_optimizer.step()
+
+        optimizer.zero_grad()
+        loss = model(x).square().mean()
+        loss.backward()
+        for name, parameter in model.named_parameters():
+            assert isinstance(parameter, DTensor), f"{name} is still unsharded after backward."
+        optimizer.step()
+        torch.testing.assert_close(loss, baseline_loss)
