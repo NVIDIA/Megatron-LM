@@ -25,6 +25,9 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils import (
     cp_utils,
     thd_layout_kernels,
 )
+from megatron.core.transformer.experimental_attention_variant.csa_utils.aligned_hca import (
+    aligned_hca_cp_rank,
+)
 from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_compressor import (
     maybe_compress_thd_fused,
 )
@@ -3986,6 +3989,17 @@ class CompressedSparseAttention(MegatronModule):
 
         # ---- Step 7b: sparse attention path ----------------------------------
         if self.use_fused_kernels:
+            hca_cp_rank = None
+            if self.config.hca_aligned_backward and indexer is None and torch.is_grad_enabled():
+                hca_cp_rank = aligned_hca_cp_rank(
+                    query,
+                    kv_full_thd,
+                    packed_seq_params,
+                    cp_group,
+                    window_size=self.window_size,
+                    compress_ratio=ratio,
+                    boundary_rows=d_window,
+                )
             output = csa_sparse_attn(
                 query,
                 kv_full_thd,
@@ -3998,6 +4012,8 @@ class CompressedSparseAttention(MegatronModule):
                 out_rope=fused_out_rope,
                 deterministic=self.config.deterministic_mode,
                 cuda_graph=self.config.cuda_graph_impl != "none",
+                hca_cp_rank=hca_cp_rank,
+                hca_cp_size=cp_size,
             )
         else:
             output = unfused_compressed_sparse_attn(

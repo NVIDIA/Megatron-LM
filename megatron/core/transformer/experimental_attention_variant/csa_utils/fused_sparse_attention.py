@@ -64,6 +64,7 @@ from ..dsa_cudnn_kernels import (
     _pad_sparse_backward_topk,
 )
 from . import csa_indexer_loss_kernels, thd_indexer_kernels, thd_layout_kernels
+from .aligned_hca import aligned_hca_backward
 from .csa_teacher_lse import csa_teacher_lse_unsupported_reason, fused_csa_teacher_lse
 
 # ---------------------------------------------------------------------------
@@ -1915,6 +1916,8 @@ class CSASparseAttnFunc(torch.autograd.Function):
         out_rope: Optional[OutputRopeParams] = None,
         deterministic: bool = False,
         cuda_graph: bool = False,
+        hca_cp_rank: Optional[int] = None,
+        hca_cp_size: Optional[int] = None,
     ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
         """Run FlashMLA sparse-attention forward and save tensors for backward."""
         # cuDNN backward keys its compile cache on the saved top-k width. Align
@@ -1936,17 +1939,20 @@ class CSASparseAttnFunc(torch.autograd.Function):
         if out_rope is not None:
             out_rope.apply_(out)
 
+        saved_topk_idxs = None if hca_cp_rank is not None else topk_idxs
         ctx.reconstruct_kv_for_backward = kv_reconstruction_parts is not None
         if ctx.reconstruct_kv_for_backward:
             _validate_kv_reconstruction_parts(kv, kv_reconstruction_parts)
-            ctx.save_for_backward(q, *kv_reconstruction_parts, attn_sink, topk_idxs, out, lse)
+            ctx.save_for_backward(q, *kv_reconstruction_parts, attn_sink, saved_topk_idxs, out, lse)
         else:
-            ctx.save_for_backward(q, kv, attn_sink, topk_idxs, out, lse)
+            ctx.save_for_backward(q, kv, attn_sink, saved_topk_idxs, out, lse)
         ctx.softmax_scale = softmax_scale
-        ctx.topk_length = topk_length
+        ctx.topk_length = None if hca_cp_rank is not None else topk_length
         ctx.out_rope = out_rope
         ctx.deterministic = deterministic
         ctx.cuda_graph = cuda_graph
+        ctx.hca_cp_rank = hca_cp_rank
+        ctx.hca_cp_size = hca_cp_size
         return out, lse, lse_indexer
 
     @staticmethod
@@ -1964,30 +1970,44 @@ class CSASparseAttnFunc(torch.autograd.Function):
 
         out, dO = _undo_output_rope_for_backward(ctx.out_rope, out, dO)
 
-        dq, dkv, d_sink = _csa_sparse_attention_backward(
-            q,
-            kv,
-            out,
-            dO,
-            lse,
-            attn_sink,
-            topk_idxs,
-            softmax_scale=ctx.softmax_scale,
-            topk_length=ctx.topk_length,
-            **_deterministic_sparse_bwd_kwargs(
+        if ctx.hca_cp_rank is not None:
+            result = aligned_hca_backward(
                 q,
                 kv,
                 out,
+                dO,
+                lse,
+                attn_sink,
+                cp_rank=ctx.hca_cp_rank,
+                cp_size=ctx.hca_cp_size,
+                softmax_scale=ctx.softmax_scale,
+            )
+            dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
+        else:
+            dq, dkv, d_sink = _csa_sparse_attention_backward(
+                q,
+                kv,
+                out,
+                dO,
                 lse,
                 attn_sink,
                 topk_idxs,
-                ctx.topk_length,
-                ctx.softmax_scale,
-                requested=getattr(ctx, "deterministic", False),
-                cuda_graph=getattr(ctx, "cuda_graph", False),
-            ),
-        )
-        return dq, dkv, d_sink, None, None, None, None, None, None, None, None
+                softmax_scale=ctx.softmax_scale,
+                topk_length=ctx.topk_length,
+                **_deterministic_sparse_bwd_kwargs(
+                    q,
+                    kv,
+                    out,
+                    lse,
+                    attn_sink,
+                    topk_idxs,
+                    ctx.topk_length,
+                    ctx.softmax_scale,
+                    requested=getattr(ctx, "deterministic", False),
+                    cuda_graph=getattr(ctx, "cuda_graph", False),
+                ),
+            )
+        return dq, dkv, d_sink, None, None, None, None, None, None, None, None, None, None
 
 
 def csa_sparse_attn(
@@ -2003,6 +2023,8 @@ def csa_sparse_attn(
     out_rope: Optional[OutputRopeParams] = None,
     deterministic: bool = False,
     cuda_graph: bool = False,
+    hca_cp_rank: Optional[int] = None,
+    hca_cp_size: Optional[int] = None,
 ) -> Tensor:
     """Sparse attention (Path A / Path C step 2).
 
@@ -2040,11 +2062,16 @@ def csa_sparse_attn(
             the Function, in place on the tensor it saves for backward, and
             undone there before the cuDNN backward. Saves one full O buffer
             per layer against rotating the returned tensor out of place.
+        hca_cp_rank: CP rank for an aligned HCA layout validated by the caller.
+        hca_cp_size: Required CP size when ``hca_cp_rank`` is set.
 
     Returns:
         SBHD ``(sq, b, np * d_v)`` or THD ``(total_sq, np * d_v)`` bf16,
         inverse-RoPE'd when ``out_rope`` is given.
     """
+    if hca_cp_rank is not None and hca_cp_size is None:
+        raise ValueError("hca_cp_size is required when hca_cp_rank is set")
+
     # Layout-specific input pre-reshape — the kernel always consumes a
     # flat ``(rows, np, d)`` query and ``(n_kv, d)`` KV; only the rows
     # axis interpretation differs (rows = ``total_sq`` for THD, rows =
@@ -2081,6 +2108,8 @@ def csa_sparse_attn(
         out_rope,
         deterministic,
         cuda_graph,
+        hca_cp_rank,
+        hca_cp_size,
     )  # (rows, np, d_v)
 
     # Layout-specific output reshape: collapse (np, d_v) → (np * d_v),
