@@ -1247,8 +1247,10 @@ _unique_buffer_counts = {}
 
 class TestTECudaGraphHelper:
     @pytest.mark.launch_on_gb200
-    @pytest.mark.parametrize("chunks", [1, 2])
-    def test_scheduler_thd_replay_preserves_pipeline_inputs(self, monkeypatch, chunks):
+    @pytest.mark.parametrize("pp_size,cp_size,chunks", [(1, 1, 1), (2, 1, 1), (2, 2, 1), (2, 2, 2)])
+    def test_scheduler_thd_replay_preserves_pipeline_inputs(
+        self, monkeypatch, pp_size, cp_size, chunks
+    ):
         """Changing packed microbatch counts must preserve outputs and every gradient."""
         from megatron.core.pipeline_parallel.schedules import (
             get_pp_rank_microbatches,
@@ -1258,8 +1260,8 @@ class TestTECudaGraphHelper:
         from megatron.core.transformer.cuda_graphs import convert_schedule_table_to_order
 
         Utils.initialize_model_parallel(
-            pipeline_model_parallel_size=2,
-            context_parallel_size=2,
+            pipeline_model_parallel_size=pp_size,
+            context_parallel_size=cp_size,
             virtual_pipeline_model_parallel_size=chunks if chunks > 1 else None,
         )
         # Match training initialization: DDP keeps AccumulateGrad nodes alive,
@@ -1280,7 +1282,7 @@ class TestTECudaGraphHelper:
                 decrease_batch_size_if_needed=False,
             )
             config = TransformerConfig(
-                num_layers=2 * chunks,
+                num_layers=pp_size * chunks,
                 hidden_size=64,
                 num_attention_heads=4,
                 use_cpu_initialization=True,
@@ -1288,15 +1290,15 @@ class TestTECudaGraphHelper:
                 thd_max_packed_sequences=4,
                 cuda_graph_modules=[CudaGraphModule.attn],
                 sequence_packing_scheduler="dp_balanced",
-                max_seqlen_per_dp_cp_rank=16,
+                max_seqlen_per_dp_cp_rank=32 // cp_size,
                 pad_packed_seq_alignment="max",
                 cuda_graph_warmup_steps=1,
                 use_te_rng_tracker=True,
                 bf16=True,
                 params_dtype=torch.bfloat16,
                 pipeline_dtype=torch.bfloat16,
-                pipeline_model_parallel_size=2,
-                context_parallel_size=2,
+                pipeline_model_parallel_size=pp_size,
+                context_parallel_size=cp_size,
                 virtual_pipeline_model_parallel_size=chunks if chunks > 1 else None,
                 microbatch_group_size_per_vp_stage=2,
                 attention_backend=AttnBackend.fused,
@@ -1348,7 +1350,12 @@ class TestTECudaGraphHelper:
                 layer = callables[0]
                 for mb in range(4):
                     hidden = torch.randn(
-                        16, 1, 64, dtype=torch.bfloat16, device="cuda", requires_grad=True
+                        32 // cp_size,
+                        1,
+                        64,
+                        dtype=torch.bfloat16,
+                        device="cuda",
+                        requires_grad=True,
                     )
                     inputs[chunk, mb] = hidden.detach().clone()
                     output, _ = layer(
@@ -1358,7 +1365,8 @@ class TestTECudaGraphHelper:
                         packed_seq_params=packed[mb % 2],
                     )
                     value = output.detach().clone()
-                    output[: 12 if mb % 2 else 16].float().sum().backward()
+                    valid_tokens = (24 if mb % 2 else 32) // cp_size
+                    output[:valid_tokens].float().sum().backward()
                     expected[chunk, mb] = value, hidden.grad.detach().clone()
                     if mb in (1, 3):
                         expected_params[chunk, mb + 1] = {
@@ -1371,6 +1379,7 @@ class TestTECudaGraphHelper:
             try:
                 helper.create_cudagraphs()
                 assert helper.graphs_created()
+                assert helper.num_microbatches == (1 if pp_size == 1 else 4)
                 for count in (4, 2, 4):
                     _, _, warmup, _ = get_pp_rank_microbatches(
                         count, chunks, 2, p2p_communicator=helper.p2p_communicator
@@ -1393,9 +1402,10 @@ class TestTECudaGraphHelper:
                                 rotary_pos_emb=rotary,
                                 packed_seq_params=packed[mb % 2],
                             )
+                            valid_tokens = (24 if mb % 2 else 32) // cp_size
                             torch.testing.assert_close(
-                                output[: 12 if mb % 2 else 16],
-                                expected[chunk, mb][0][: 12 if mb % 2 else 16],
+                                output[:valid_tokens],
+                                expected[chunk, mb][0][:valid_tokens],
                                 msg=f"output count={count} chunk={chunk} mb={mb}",
                             )
                             pending[chunk, mb] = hidden, output
@@ -1403,7 +1413,8 @@ class TestTECudaGraphHelper:
                             mb = backwards[chunk]
                             backwards[chunk] += 1
                             hidden, output = pending.pop((chunk, mb))
-                            output[: 12 if mb % 2 else 16].float().sum().backward()
+                            valid_tokens = (24 if mb % 2 else 32) // cp_size
+                            output[:valid_tokens].float().sum().backward()
                             torch.testing.assert_close(
                                 hidden.grad,
                                 expected[chunk, mb][1],
