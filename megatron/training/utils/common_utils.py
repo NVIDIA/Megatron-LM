@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """General utilities."""
 import json
@@ -50,7 +50,7 @@ from megatron.core.utils import (
     to_local_if_dtensor,
     unwrap_model,
 )
-from megatron.training import get_adlr_autoresume, get_args, get_timers
+from megatron.training import get_adlr_autoresume, get_args, get_timers, get_train_state
 from megatron.training.global_vars import get_run_config
 
 
@@ -456,8 +456,14 @@ def check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_sch
     # Add barrier to ensure consistnecy.
     torch.distributed.barrier()
     if autoresume.termination_requested():
-        if args.save:
-            save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
+        if get_run_config().checkpoint.save:
+            save_checkpoint(
+                iteration,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                get_train_state().num_floating_point_operations_so_far,
+            )
         print_rank_0(">>> autoresume termination request found!")
         if torch.distributed.get_rank() == 0:
             autoresume.request_resume()

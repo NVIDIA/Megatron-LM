@@ -1,5 +1,6 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import dataclasses
 import logging
 import os
 from pathlib import Path
@@ -27,23 +28,27 @@ from megatron.training.checkpointing import (
     load_checkpoint,
     read_metadata,
 )
+from megatron.training.config import CheckpointConfig
+from megatron.training.global_vars import get_run_config
 from megatron.training.utils import print_rank_0
 
 logger = logging.getLogger(__name__)
 
 
-def has_modelopt_state(checkpoint_path: str) -> bool:
+def has_modelopt_state(checkpoint_path: str, *, checkpoint: CheckpointConfig) -> bool:
     """Check if modelopt_state folder exists inside the checkpoint and contains nontrivial state.
 
     NOTE: Ignores distillation (KD) state, which is deprecated and unused.
 
     Args:
         checkpoint_path: Path to the checkpoint directory
+        checkpoint: The checkpoint policy to inspect with (its format selects the reader): the
+            registered section at run time, or, at startup before any run config exists, the
+            section built from the arguments.
 
     Returns:
         True if modelopt_state exists and contains nontrivial state, False otherwise
     """
-    args = get_args()
 
     def _has_nontrivial_modelopt_state(modelopt_state: dict) -> bool:
         """Check whether modelopt_state contains state beyond the (deprecated, unused) KD mode."""
@@ -54,9 +59,11 @@ def has_modelopt_state(checkpoint_path: str) -> bool:
         return len(modes) > 0
 
     try:
-        if args.ckpt_format == "torch":
-            # Non-sharded
-            state_dict, _, _ = _load_base_checkpoint(checkpoint_path, rank0=False)
+        if checkpoint.ckpt_format == "torch":
+            # Non-sharded; the legacy reader is the one path that needs the arguments.
+            state_dict, _, _, _ = _load_base_checkpoint(
+                checkpoint_path, get_args(), rank0=False, checkpoint=checkpoint
+            )
             if state_dict is None:
                 return False
             modelopt_state = state_dict.get("modelopt_state")
@@ -104,14 +111,14 @@ def load_modelopt_state(model: nn.Module, load_dir: Optional[str] = None) -> Non
         model: the model to load the modelopt_state into
         load_dir: optionally provide a different loading path
     """
-    args = get_args()
-    load_dir = load_dir or args.load
+    checkpoint = get_run_config().checkpoint
+    load_dir = load_dir or checkpoint.load
 
-    if args.ckpt_format == "torch":
+    if checkpoint.ckpt_format == "torch":
         # Non-sharded
         print_rank_0(f"Loading ModelOpt state from base checkpoint ({load_dir})")
         try:
-            state_dict, _, _ = _load_base_checkpoint(args.load, rank0=False)
+            state_dict, _, _, _ = _load_base_checkpoint(load_dir, rank0=False)
         except Exception:
             print_rank_0("Failed to load base checkpoint via megatron _load_base_checkpoint!")
             return
@@ -138,14 +145,18 @@ def load_kd_teacher_checkpoint(model) -> None:
 
     teacher = unwrap_model(model[0]).teacher_model
     print_rank_0(f"Loading teacher as {type(teacher).__name__} from {args.export_kd_teacher_load} ...")
-    # [WAR]: To avoid error out on loading teacher's checkpoint, we temporarily
-    # set args.finetune to True while loading the teacher checkpoint.
-    original_args_finetune, original_ckpt_format = args.finetune, args.ckpt_format
-    args.finetune = True
-    if args.export_kd_teacher_ckpt_format is not None:
-        args.ckpt_format = args.export_kd_teacher_ckpt_format
-    try:
-        load_checkpoint([teacher], None, None, load_arg='export_kd_teacher_load')
-    finally:
-        args.finetune, args.ckpt_format = original_args_finetune, original_ckpt_format
+    # The teacher is loaded weights-only (finetune-style) from its own directory and, when given,
+    # its own format: an override of this load, not a change of the run's checkpoint policy.
+    checkpoint = get_run_config().checkpoint
+    load_checkpoint(
+        [teacher],
+        None,
+        None,
+        checkpoint=dataclasses.replace(
+            checkpoint,
+            load=args.export_kd_teacher_load,
+            finetune=True,
+            ckpt_format=args.export_kd_teacher_ckpt_format or checkpoint.ckpt_format,
+        ),
+    )
     print_rank_0("... teacher loaded successfully.")

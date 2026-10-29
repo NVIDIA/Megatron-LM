@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
 import os
@@ -31,7 +31,7 @@ from megatron.training.global_vars import (
 from megatron.training.training import force_param_sync, get_model, setup_model_and_optimizer
 from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 cuda_graph_supported = False
 reason_for_no_cuda_graph = ""
@@ -530,6 +530,7 @@ class TestFP4Param:
             # and gathered before the state dict is taken.
             force_param_sync(model, optimizer=optimizer)
             saved_state = self.quantized_param_state(model[0])
+            sync_checkpoint_config(get_args())
             save_checkpoint(3, model, optimizer, opt_param_scheduler, 0)
             torch.distributed.barrier()
 
@@ -538,6 +539,7 @@ class TestFP4Param:
             args, model, optimizer, opt_param_scheduler = self.setup_checkpoint_case(
                 tp_size, str(ckpt_dir), **kwargs
             )
+            sync_checkpoint_config(get_args())
             iteration, _ = load_checkpoint(
                 model, optimizer, opt_param_scheduler, strict=True, restore_training_state=True
             )
@@ -590,6 +592,7 @@ class TestFP4Param:
             )
             self.run_train_steps(args, model, optimizer, num_steps=2)
             force_param_sync(model, optimizer=optimizer)
+            sync_checkpoint_config(get_args())
             save_checkpoint(2, model, optimizer, opt_param_scheduler, 0)
             torch.distributed.barrier()
 
@@ -622,6 +625,7 @@ class TestFP4Param:
                 )
                 args.load = str(ckpt_dir)
                 try:
+                    sync_checkpoint_config(args)
                     iteration, _ = load_checkpoint(model, None, None, strict=True)
                 except Exception as e:
                     # A failure on one rank only leaves the other rank waiting in a collective

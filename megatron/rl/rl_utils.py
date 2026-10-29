@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
 import gc
@@ -720,7 +720,9 @@ def maybe_get_rollout_bank(args):
     if _ROLLOUT_BANK is None:
         from megatron.rl.rollout_bank import RolloutBank
 
-        bank_dir = cfg.rl.rl_rollout_bank_dir or os.path.join(args.save or ".", "rollout_bank")
+        bank_dir = cfg.rl.rl_rollout_bank_dir or os.path.join(
+            cfg.checkpoint.save or ".", "rollout_bank"
+        )
         _ROLLOUT_BANK = RolloutBank(bank_dir, max_bytes=cfg.rl.rl_rollout_bank_max_bytes)
         get_rl_runtime_state().rollout_bank = _ROLLOUT_BANK
         log_single_rank(logger, logging.INFO, f"Durable rollout bank enabled at {bank_dir}")

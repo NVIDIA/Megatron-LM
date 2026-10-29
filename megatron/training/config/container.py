@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 import os
 from dataclasses import dataclass, field
@@ -38,7 +38,7 @@ from megatron.training.config.training_config import (
 )
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.models import GPTModelConfig, Serializable, HybridModelConfig
+from megatron.training.models import GPTModelConfig, HybridModelConfig, Serializable
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
@@ -386,6 +386,13 @@ class PretrainConfigContainer(ConfigContainerBase):
         """Validate each section, then the RL section against the rest of the run."""
         self.rl.validate_ddp_config(self.ddp)
         super().validate()
+        self.checkpoint.validate_run(
+            use_distributed_optimizer=self.optimizer.use_distributed_optimizer,
+            use_torch_fsdp2=self.dist.use_torch_fsdp2,
+            use_megatron_fsdp=self.ddp.use_megatron_fsdp,
+            use_gloo_process_groups=self.dist.use_gloo_process_groups,
+            overlap_param_gather=self.ddp.overlap_param_gather,
+        )
         global_batch_size, _, _ = self._resolve_batch_sizes()
         self._validate_rl_config(global_batch_size)
 
@@ -413,6 +420,10 @@ class PretrainConfigContainer(ConfigContainerBase):
         from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
         from megatron.training import get_args
 
+        # Checkpoint derivations first: the RL check below reads the derived load_optim.
+        self.checkpoint.finalize_checkpoint_config(
+            skip_train=self.validation.skip_train, perform_rl_step=self.rl.perform_rl_step
+        )
         # TODO: Use get_batch_parallel_size(self) once topology inputs are config-owned.
         # Keep this temporary args dependency in framework finalization, not validation.
         batch_sizes = self._resolve_batch_sizes(get_batch_parallel_size(get_args()))
@@ -486,3 +497,12 @@ class InferenceConfigContainer(ConfigContainerBase):
     tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
     logger: LoggerConfig = field(default_factory=LoggerConfig)
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
+
+    def validate(self) -> None:
+        """Validate each section, then the checkpoint format against the sections inference owns."""
+        super().validate()
+        self.checkpoint.validate_run(use_torch_fsdp2=self.dist.use_torch_fsdp2)
+
+    def _finalize(self) -> None:
+        super()._finalize()
+        self.checkpoint.finalize_checkpoint_config()

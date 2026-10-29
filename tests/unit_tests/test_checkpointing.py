@@ -1,7 +1,8 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
+import contextlib
 import os
-from dataclasses import fields
+from dataclasses import fields, replace
 from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
@@ -24,6 +25,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
+from megatron.training import checkpointing
 from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
@@ -39,11 +41,12 @@ from megatron.training.checkpointing import (
     save_checkpoint,
     set_checkpoint_version,
 )
-from megatron.training.config import ProfilingConfig
-from megatron.training.global_vars import set_args
+from megatron.training.config import CheckpointConfig, ProfilingConfig
+from megatron.training.global_vars import get_args, set_args
 from megatron.training.state import TrainState
+from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 pytestmark = pytest.mark.usefixtures("run_config")
 
@@ -53,7 +56,9 @@ def test_model_only_checkpoint_does_not_trigger_gpt_hybrid_interop(ckpt_args):
     """Missing checkpoint args do not identify a model-only checkpoint as GPT."""
 
     args = SimpleNamespace(hybrid_layer_pattern="M*E")
-    assert _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, [object()]) == (None, False)
+    assert _maybe_setup_gpt_to_hybrid_load(
+        args, ckpt_args, [object()], checkpoint=CheckpointConfig(), saved_save_optim=True
+    ) == (None, False)
 
 
 @pytest.mark.parametrize("auto_detect", [False, True])
@@ -72,6 +77,7 @@ def test_inference_shards_reject_legacy_checkpoint(create_ckpt_load_args, monkey
         mock.Mock(return_value=({}, "unused", False, CheckpointType.LEGACY)),
     )
     with pytest.raises(ValueError, match="incompatible with legacy torch checkpoints"):
+        sync_checkpoint_config(args)
         load_checkpoint([], None, None)
 
 
@@ -719,6 +725,7 @@ def test_load_base_checkpoint(
         args = create_ckpt_load_args
         args.ckpt_format = ckpt_format
 
+        sync_checkpoint_config(args)
         state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
             load_dir, args, rank0=True
         )
@@ -793,6 +800,7 @@ def test_save_checkpoint(
             "megatron.training.checkpointing.maybe_save_dataloader_state",
             wraps=maybe_save_dataloader_state,
         ) as save_dataloader_state:
+            sync_checkpoint_config(args)
             save_checkpoint(
                 iteration,
                 [model],
@@ -815,6 +823,7 @@ def test_save_checkpoint(
             expected_ckpt_path = ckpt_dir / ".metadata"
 
         assert os.path.exists(expected_ckpt_path)
+        sync_checkpoint_config(args)
         state, _, _, _ = _load_base_checkpoint(args.save, args, rank0=True)
         # Legacy args remain unchanged; the run config records the effective policy.
         assert state["args"].profile is False and state["args"].profile_ranks == [99]
@@ -884,6 +893,7 @@ def test_load_checkpoint(
         torch.manual_seed(rng_config.seed + (torch.distributed.get_rank() if owned_rng else 0))
         expected_cpu_rng = torch.get_rng_state().clone()
         with mock.patch("torch.save", wraps=torch.save) as serialized:
+            sync_checkpoint_config(args)
             save_checkpoint(
                 iteration,
                 [model],
@@ -894,7 +904,9 @@ def test_load_checkpoint(
         # With TP=PP=1, rank 0 writes the checkpoint. Other ranks can still call
         # torch.save internally while serializing RNG tensors for all_gather_object.
         if torch.distributed.get_rank() == 0:
-            assert serialized.call_args.args[0]["args"] is args
+            # The persisted arguments are a copy whose checkpoint names follow the section;
+            # for a namespace that agrees with it, the copy is identical.
+            assert vars(serialized.call_args.args[0]["args"]) == vars(args)
         with open(ckpt_dir / f"iter_{iteration:07d}" / "run_config.yaml") as f:
             saved_config = yaml.safe_load(f)
         for field in fields(rng_config):
@@ -906,6 +918,7 @@ def test_load_checkpoint(
         new_opt_param_scheduler = MockState({"opt_param_scheduler": "dummy2"})
 
         # Load checkpoint
+        sync_checkpoint_config(args)
         loaded_iter, loaded_flops = load_checkpoint(
             [new_model], new_optimizer, new_opt_param_scheduler, strict=True, **load_kwargs
         )
@@ -939,6 +952,7 @@ def test_load_checkpoint_stream_ckpt_dequant_refuses_optimizer(create_ckpt_load_
     set_args(args)
 
     with pytest.raises(ValueError, match="inference-only"):
+        sync_checkpoint_config(args)
         load_checkpoint(
             [MockModel(TransformerConfig(num_layers=1, kv_channels=1))], MockState({}), None
         )
@@ -988,6 +1002,7 @@ def test_load_checkpoint_override_opt_param_scheduler(
         )
         num_floating_point_operations_so_far = 456
 
+        sync_checkpoint_config(args)
         save_checkpoint(
             iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
         )
@@ -1006,6 +1021,7 @@ def test_load_checkpoint_override_opt_param_scheduler(
         # Load checkpoint and verify runtime overrides are restored.
         train_state = TrainState()
         get_train_state.return_value = train_state
+        sync_checkpoint_config(args)
         loaded_iter, loaded_flops = load_checkpoint(
             [new_model],
             new_optimizer,
@@ -1023,6 +1039,7 @@ def test_load_checkpoint_override_opt_param_scheduler(
         assert new_opt_param_scheduler.step_calls[-1] == 0
 
         # Ensure loading without optimizer/scheduler remains safe.
+        sync_checkpoint_config(args)
         loaded_iter_none, loaded_flops_none = load_checkpoint(
             [new_model], None, None, strict=True, restore_training_state=True
         )
@@ -1059,6 +1076,7 @@ def test_strict_load_idle_rerun_checkpoint(
         with mock.patch(
             "megatron.training.checkpointing.get_rerun_state_machine", return_value=saved_machine
         ):
+            sync_checkpoint_config(args)
             save_checkpoint(123, [model], None, None, 456)
 
         loaded_model = MockModel(config)
@@ -1068,6 +1086,7 @@ def test_strict_load_idle_rerun_checkpoint(
         with mock.patch(
             "megatron.training.checkpointing.get_rerun_state_machine", return_value=loaded_machine
         ):
+            sync_checkpoint_config(args)
             iteration, flops = load_checkpoint(
                 [loaded_model], None, None, strict=True, restore_training_state=True
             )
@@ -1133,6 +1152,7 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             'megatron.training.checkpointing._build_sharded_state_dict_metadata',
             return_value=first_job_mock_metadata,
         ):
+            sync_checkpoint_config(args)
             save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
         expected_loaded_metadata = {**first_job_mock_metadata, 'checkpoint_version': 3.1}
 
@@ -1146,12 +1166,14 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             return_value=second_job_mock_metadata,
         ):
             # Load checkpoint (into the same model, we don't check load correctness here)
+            sync_checkpoint_config(args)
             load_checkpoint(
                 [model], optimizer, opt_param_scheduler, strict=True, restore_training_state=True
             )
             assert optimizer._called_metadata[-1] == expected_loaded_metadata
 
             # Save the checkpoint again to check if the content metadata for the new checkpoint will be new
+            sync_checkpoint_config(args)
             save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
             assert optimizer._called_metadata[-1] == second_job_mock_metadata
 
@@ -1222,6 +1244,7 @@ def test_checkpoint_load_without_microbatch_calculator(
 
         torch.manual_seed(123)
         model = build_model()
+        sync_checkpoint_config(args)
         save_checkpoint(123, [model], None, None, 456)
         saved_rng = torch.get_rng_state().clone()
         saved_cuda_rng = torch.cuda.get_rng_state().clone()
@@ -1259,11 +1282,13 @@ def test_checkpoint_load_without_microbatch_calculator(
                 side_effect=AssertionError("Inference must not restore training rerun state"),
             ):
                 load_kwargs = {} if load_mode == "default" else {"restore_training_state": False}
+                sync_checkpoint_config(args)
                 metadata = load_checkpoint([restored], None, None, **load_kwargs)
             assert not hasattr(args, "consumed_train_samples")
             assert not hasattr(args, "skipped_train_samples")
             assert not hasattr(args, "consumed_valid_samples")
         else:
+            sync_checkpoint_config(args)
             metadata = load_checkpoint([restored], None, None, restore_training_state=True)
             expected_iteration = 7 if load_mode == "override" else 123
             assert train_state.iteration == expected_iteration
@@ -1322,6 +1347,17 @@ def _make_metadata_args(
     return args
 
 
+def _metadata_checkpoint(args):
+    """The checkpoint section the metadata builder reads; the namespace keeps the rest."""
+    return CheckpointConfig(
+        ckpt_format=args.ckpt_format,
+        dist_ckpt_optim_fully_reshardable=args.dist_ckpt_optim_fully_reshardable,
+        distrib_optim_fully_reshardable_mem_efficient=(
+            args.distrib_optim_fully_reshardable_mem_efficient
+        ),
+    )
+
+
 class TestBuildShardedStateDictMetadata:
     """``_build_sharded_state_dict_metadata`` must set ``distrib_optim_sharding_type``
     whenever a real :class:`DistributedOptimizer` instance will be used at save
@@ -1335,20 +1371,26 @@ class TestBuildShardedStateDictMetadata:
 
     def test_distributed_optimizer_sets_dp_reshardable_default(self):
         args = _make_metadata_args(use_distributed_optimizer=True)
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        metadata = _build_sharded_state_dict_metadata(
+            args, dp_cp_group=self.DUMMY_GROUP, checkpoint=_metadata_checkpoint(args)
+        )
         assert metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
 
     def test_distributed_optimizer_fully_reshardable_flag(self):
         args = _make_metadata_args(
             use_distributed_optimizer=True, dist_ckpt_optim_fully_reshardable=True
         )
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        metadata = _build_sharded_state_dict_metadata(
+            args, dp_cp_group=self.DUMMY_GROUP, checkpoint=_metadata_checkpoint(args)
+        )
         assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
         assert metadata['distrib_optim_fully_reshardable_mem_efficient'] is False
 
     def test_distributed_optimizer_fsdp_dtensor(self):
         args = _make_metadata_args(use_distributed_optimizer=True, ckpt_format='fsdp_dtensor')
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        metadata = _build_sharded_state_dict_metadata(
+            args, dp_cp_group=self.DUMMY_GROUP, checkpoint=_metadata_checkpoint(args)
+        )
         assert metadata['distrib_optim_sharding_type'] == 'fsdp_dtensor'
 
     def test_layer_wise_only_still_sets_sharding_type(self):
@@ -1356,17 +1398,212 @@ class TestBuildShardedStateDictMetadata:
         # use, but the LayerWise + DistOpt split path still has a DistOpt
         # sub-optimizer for non-Muon params, so the metadata is required.
         args = _make_metadata_args(use_layer_wise_distributed_optimizer=True)
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        metadata = _build_sharded_state_dict_metadata(
+            args, dp_cp_group=self.DUMMY_GROUP, checkpoint=_metadata_checkpoint(args)
+        )
         assert metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
 
     def test_layer_wise_with_fully_reshardable(self):
         args = _make_metadata_args(
             use_layer_wise_distributed_optimizer=True, dist_ckpt_optim_fully_reshardable=True
         )
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        metadata = _build_sharded_state_dict_metadata(
+            args, dp_cp_group=self.DUMMY_GROUP, checkpoint=_metadata_checkpoint(args)
+        )
         assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
 
     def test_no_distributed_optimizer_no_sharding_type(self):
         args = _make_metadata_args()
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        metadata = _build_sharded_state_dict_metadata(
+            args, dp_cp_group=self.DUMMY_GROUP, checkpoint=_metadata_checkpoint(args)
+        )
         assert 'distrib_optim_sharding_type' not in metadata
+
+
+def test_save_follows_the_section_not_the_namespace(
+    init_model_parallel, create_args, tmp_path_dist_ckpt, run_config
+):
+    """A save goes where the registered section says, in its format, whatever the namespace says,
+    and the persisted arguments describe the policy that produced the checkpoint."""
+    args = create_args
+    args.use_distributed_optimizer = False
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+    model = MockModel(config)
+    optimizer = MockState({"optimizer": "optimizer_state"})
+    opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
+
+    with TempNamedDir(tmp_path_dist_ckpt / "test_save_follows_the_section", sync=True) as save_dir:
+        args.save = str(save_dir / "section")
+        args.ckpt_format = "torch"
+        args.use_dist_ckpt = False
+        args.save_tokenizer_assets = False
+        set_args(args)
+        before = replace(sync_checkpoint_config(args))
+        # The namespace now disagrees on every setting a save reads.
+        args.save = str(save_dir / "namespace")
+        args.ckpt_format = "torch_dist"
+        args.use_dist_ckpt = True
+        args.async_save = True
+        args.no_save_optim = True
+
+        save_checkpoint(7, [model], optimizer, opt_param_scheduler, 0)
+
+        ckpt_file = save_dir / "section" / "iter_0000007" / "mp_rank_00" / "model_optim_rng.pt"
+        assert os.path.exists(ckpt_file)
+        assert not os.path.exists(save_dir / "namespace")
+        state = torch.load(ckpt_file, weights_only=False)
+        assert "optimizer" in state
+        assert state["args"].save == str(save_dir / "section")
+        assert state["args"].ckpt_format == "torch"
+        assert state["args"].no_save_optim is False and state["args"].use_dist_ckpt is False
+        # Neither the namespace nor the registered section was written.
+        assert args.ckpt_format == "torch_dist" and args.no_save_optim is True
+        assert run_config.checkpoint == before
+
+
+@pytest.mark.parametrize("section_says_rng", [True, False, None])
+def test_the_saved_section_decides_what_a_resume_requests(
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, run_config, section_says_rng
+):
+    """The load template requests what the checkpoint holds as its saved checkpoint section says;
+    the arguments persisted with the checkpoint decide only when there is no saved section (None
+    here: the YAML is removed, and those arguments say the RNG state was saved)."""
+    args = create_ckpt_load_args
+    args.ckpt_format = "torch_dist"
+    args.use_dist_ckpt = True
+    args.use_distributed_optimizer = False
+    args.fp16 = False
+    args.bf16 = False
+    args.save_tokenizer_assets = False
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+
+    with TempNamedDir(tmp_path_dist_ckpt / "test_saved_section_decides", sync=True) as ckpt_dir:
+        args.save = str(ckpt_dir)
+        args.load = str(ckpt_dir)
+        set_args(args)
+        sync_checkpoint_config(args)
+        save_checkpoint(5, [MockModel(config)], None, None, 0)
+
+        config_filename = get_checkpoint_run_config_filename(str(ckpt_dir / "iter_0000005"))
+        if torch.distributed.get_rank() == 0:
+            if section_says_rng is None:
+                os.remove(config_filename)
+            elif section_says_rng is False:
+                with open(config_filename) as handle:
+                    saved = yaml.safe_load(handle)
+                saved["checkpoint"]["save_rng"] = False
+                with open(config_filename, "w") as handle:
+                    yaml.safe_dump(saved, handle)
+        torch.distributed.barrier()
+
+        with mock.patch(
+            "megatron.training.checkpointing.get_rng_state", wraps=checkpointing.get_rng_state
+        ) as rng_template:
+            iteration, _ = load_checkpoint([MockModel(config)], None, None, strict=True)
+        assert iteration == 5
+        # The RNG shard is requested unless the saved section says it is not there.
+        assert rng_template.called is (section_says_rng is not False)
+
+
+@pytest.mark.parametrize(
+    "saved_section, saved_no_save_optim, expected",
+    [
+        ({"checkpoint": {"save_optim": True}}, True, True),  # the saved section wins
+        ({"checkpoint": {"save_optim": False}}, False, False),  # in both directions
+        (None, True, False),  # no saved section: the saved arguments decide
+        (None, False, True),
+    ],
+)
+def test_the_glu_optimizer_guard_follows_the_saved_checkpoint_section(
+    init_model_parallel, monkeypatch, run_config, saved_section, saved_no_save_optim, expected
+):
+    """The guard that keeps optimizer rows from being loaded across a different GLU layout
+    decides whether optimizer state will be loaded exactly as the load template does: from the
+    saved checkpoint section, and from the saved arguments only when the checkpoint has none."""
+    args = SimpleNamespace(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        world_size=1,
+        data_parallel_size=1,
+        swiglu=True,
+        moe_mlp_glu_interleave_size=2,
+        use_distributed_optimizer=False,
+    )
+    saved_args = SimpleNamespace(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        world_size=1,
+        data_parallel_size=1,
+        no_save_optim=saved_no_save_optim,
+        swiglu=True,
+        moe_mlp_glu_interleave_size=1,
+    )
+    state = {"args": saved_args, "model": {}}
+    run_config.checkpoint.load = "/synthetic"
+    run_config.checkpoint.load_rng = False
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr(checkpointing, "unwrap_model", lambda value: value)
+    monkeypatch.setattr(
+        checkpointing, "_otel_managed_span", lambda *a, **k: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        checkpointing,
+        "_load_base_checkpoint",
+        lambda *a, **k: (state, "/synthetic/iter_0000001", False, CheckpointType.GLOBAL),
+    )
+    monkeypatch.setattr(checkpointing, "_read_checkpoint_run_config", lambda *a, **k: saved_section)
+    monkeypatch.setattr(
+        checkpointing, "_maybe_setup_gpt_to_hybrid_load", lambda *a, **k: (None, False)
+    )
+    monkeypatch.setattr(checkpointing, "validate_glu_checkpoint_backend", mock.Mock())
+    decisions = []
+
+    class StopAtTheGuard(Exception):
+        pass
+
+    def guard(state_dict, run_args, *, loading_optimizer):
+        decisions.append(loading_optimizer)
+        raise StopAtTheGuard  # Before any tensor storage is read.
+
+    monkeypatch.setattr(checkpointing, "validate_glu_optimizer_layout", guard)
+    optimizer = SimpleNamespace(is_stub_optimizer=False)
+    with pytest.raises(StopAtTheGuard):
+        load_checkpoint([object()], optimizer, None, restore_training_state=True)
+    assert decisions == [expected]
+
+
+def test_the_pretrained_fallback_folds_finetune_into_the_load_and_keeps_the_legacy_flag(
+    init_model_parallel, monkeypatch, run_config
+):
+    """A missing --load with --pretrained-checkpoint loads the pretrained directory weights-only:
+    the effective policy of that load carries finetune=True, the registered section is not
+    written, and the legacy namespace flag is set for the readers outside checkpointing.py
+    (examples/multimodal/dataloader_resume.py)."""
+    args = SimpleNamespace(
+        finetune=False,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        world_size=1,
+        data_parallel_size=1,
+        swiglu=False,
+        use_distributed_optimizer=False,
+    )
+    run_config.checkpoint.load = "/missing"
+    run_config.checkpoint.pretrained_checkpoint = "/pretrained"
+    run_config.checkpoint.load_rng = False
+    loads = []
+
+    def base_load(load_dir, run_args, *a, checkpoint, **k):
+        loads.append((load_dir, checkpoint.finetune))
+        return None, "", False, None  # Stop right after the fold: nothing to load.
+
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr(checkpointing, "checkpoint_exists", lambda path: path == "/pretrained")
+    monkeypatch.setattr(checkpointing, "unwrap_model", lambda value: value)
+    monkeypatch.setattr(
+        checkpointing, "_otel_managed_span", lambda *a, **k: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(checkpointing, "_load_base_checkpoint", base_load)
+    assert load_checkpoint([object()], None, None) == (0, 0)
+    assert loads and loads[0] == ("/pretrained", True)
+    assert run_config.checkpoint.finetune is False and args.finetune is True

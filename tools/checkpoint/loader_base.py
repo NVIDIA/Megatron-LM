@@ -1,4 +1,5 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import dataclasses
 import json
 import os
 import sys
@@ -214,9 +215,19 @@ class MegatronCheckpointLoaderBase:
                 # Each time we load, we set counters to 0, pass None for optimizer/ LR
                 train_state.consumed_train_samples = 0
                 train_state.consumed_valid_samples = 0
-                self.margs.exit_on_missing_checkpoint = True
-                # Preserve training progress in the converted checkpoint.
-                load_checkpoint(model_list, None, None, restore_training_state=True)
+                # Preserve training progress in the converted checkpoint; a missing source
+                # checkpoint is an error, forced for this load.
+                from megatron.training.global_vars import get_run_config
+
+                load_checkpoint(
+                    model_list,
+                    None,
+                    None,
+                    restore_training_state=True,
+                    checkpoint=dataclasses.replace(
+                        get_run_config().checkpoint, exit_on_missing_checkpoint=True
+                    ),
+                )
 
                 # Validate that train/valid samples match across ranks
                 nonlocal consumed_train_samples, consumed_valid_samples

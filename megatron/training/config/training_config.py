@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import signal
 from dataclasses import dataclass, field
@@ -507,16 +507,16 @@ class CheckpointConfig:
     """Number of latest checkpoint to be saved."""
 
     save_optim: bool = True
-    """Do not save current optimizer."""
+    """Save the optimizer state with every checkpoint (``--no-save-optim`` disables it)."""
 
     save_rng: bool = True
-    """Do not save current rng state."""
+    """Save the RNG state with every checkpoint (``--no-save-rng`` disables it)."""
 
     load: str | None = None
     """Directory containing a model checkpoint."""
 
     load_optim: bool = True
-    """Do not load optimizer when loading checkpoint."""
+    """Load the optimizer state when loading a checkpoint (``--no-load-optim`` disables it)."""
 
     load_main_params_from_ckpt: bool = False
     """Load main parameters from checkpoint. When loading a model from a checkpoint without loading
@@ -525,7 +525,7 @@ class CheckpointConfig:
     """
 
     load_rng: bool = True
-    """Do not load rng state when loading checkpoint."""
+    """Load the RNG state when loading a checkpoint (``--no-load-rng`` disables it)."""
 
     non_persistent_save_interval: int | None = None
     """Number of iterations between non-persistent saves."""
@@ -744,14 +744,51 @@ class CheckpointConfig:
     nvfp4 recipes (not delayed scaling) and, with --ckpt-fully-parallel-load, only the broadcast
     exchange algorithm. Pass it explicitly on the inference command line."""
 
-    def __post_init__(self):
+    dist_ckpt_workers: int = 1
+    """Number of workers for distributed checkpointing. Only used for async save.
+    If set to 1, the checkpointing is performed in a single process."""
+
+    override_ckpt_iteration: int | None = None
+    """Override the iteration stored in the loaded checkpoint. Also resets
+    consumed_train_samples accordingly so the data loader replays samples from that
+    iteration onward."""
+
+    ckpt_drop_redundant_extra_state: bool = False
+    """Drop TE `_extra_state` artifacts that carry no irreplaceable state (no FP8, or
+    block/current FP8 scaling) from the distributed checkpoint, keeping them local instead
+    of writing them. Only delayed-scaling `_extra_state` (amax history + scale) is ever
+    needed and it is always persisted regardless of this flag. By default (flag off) all
+    `_extra_state` are persisted, preserving the previous behavior. Older checkpoints load
+    unchanged either way."""
+
+    @property
+    def use_dist_ckpt(self) -> bool:
+        """Whether ``ckpt_format`` names a distributed checkpoint (everything but ``torch``).
+
+        Derived, never stored: ``update_use_dist_ckpt`` keeps the legacy ``args`` copy for the
+        readers that still take their checkpoint settings from the argument namespace.
+        """
+        return self.ckpt_format != "torch"
+
+    def validate(self) -> None:
+        """Checks that need no other section. Raises only; it neither mutates nor warns.
+
+        Run by ``ConfigContainerBase.validate()`` for the training and the inference container,
+        and by ``validate_args`` right after the entry point's defaults are applied, so a CLI run
+        fails at parse time with the same messages. Megatron-Bridge's subclass runs it from its
+        own ``finalize()``, after its Bridge-only checks: this is the one set of checkpoint rules.
+        """
         from megatron.training.utils import has_nvrx_checkpointing_async_support
 
         assert self.async_strategy in ["nvrx"], \
             f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx."
 
+        # The effective async policy: without a persistent worker a distributed async save is
+        # disabled at finalize (finalize_checkpoint_config), so the capability is only required
+        # when the save stays asynchronous.
         if (
             self.async_save
+            and self.use_persistent_ckpt_worker
             and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]
         ):
             assert has_nvrx_checkpointing_async_support(), (
@@ -762,6 +799,157 @@ class CheckpointConfig:
         if self.verify_integrity:
             assert self.ckpt_format == "torch_dist", \
                 f"`verify_integrity` is only supported with torch_dist checkpoint format."
+
+        if self.ckpt_convert_format is not None:
+            assert self.ckpt_convert_save is not None
+            assert self.load is not None
+
+        assert self.non_persistent_ckpt_type in ['global', 'local', None], \
+            'Currently only global and local checkpoints are supported'
+        if self.non_persistent_ckpt_type == 'local':
+            try:
+                from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
+                    LocalCheckpointManager,
+                )
+            except ModuleNotFoundError as e:
+                raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
+            assert self.non_persistent_local_ckpt_dir is not None, \
+                "Tried to use local checkpointing without specifying --local-ckpt-dir!"
+
+        # A save directory without a periodic interval (None or 0) saves at the end of training and
+        # on the exit paths only; the same rule for both frameworks (Megatron-Bridge's loops read
+        # it this way, Megatron-LM used to require an interval).
+        if self.save_interval is not None:
+            assert self.save_interval >= 0, \
+                "save_interval must be non-negative (None or 0 disables the periodic saves)"
+        if self.save_retain_interval is not None:
+            assert self.save_interval, "save_retain_interval requires a positive save_interval"
+            assert self.save_retain_interval > 0, "save_retain_interval must be positive"
+            assert self.save_retain_interval % self.save_interval == 0, \
+                "save_retain_interval must be divisible by save_interval"
+            assert self.most_recent_k in (None, -1), \
+                "save_retain_interval and most_recent_k cannot be enabled together"
+
+        # The PG-distribution cache stores one file per parallelization group, keyed by that
+        # group's ordered global ranks, and each file holds both the save and the load
+        # distribution derived from one gather over that group. A single create run (even one
+        # that only loads) therefore covers later saves only when save and load use the same
+        # group; otherwise a read run finds no cache file for the other side's group.
+        if self.ckpt_pg_tensors_cache_path is not None:
+            assert (
+                self.ckpt_fully_parallel_save_process_group
+                == self.ckpt_fully_parallel_load_process_group
+            ), (
+                "--ckpt-pg-tensors-cache-path requires --ckpt-fully-parallel-save-process-group and "
+                "--ckpt-fully-parallel-load-process-group to be identical, but got "
+                f"save='{self.ckpt_fully_parallel_save_process_group}' and "
+                f"load='{self.ckpt_fully_parallel_load_process_group}'. The cache is keyed by the "
+                "parallelization group, so with mixed groups a run that creates the cache for one "
+                "side leaves the other side without a cache file."
+            )
+
+        if self.load_main_params_from_ckpt:
+            assert not self.load_optim, (
+                'load_main_params_from_ckpt must be used with load_optim=False '
+                '(--load-main-params-from-ckpt with --no-load-optim).'
+            )
+
+        if self.stream_ckpt_dequant:
+            # Inference-only load path: the loaded state dict holds the re-quantized params
+            # themselves, so nothing that consumes the loaded values in high precision (optimizer
+            # main params) may run. `load_checkpoint` additionally refuses any optimizer. The
+            # precision-recipe rule stays in validate_args until the recipe is config-owned.
+            assert not self.load_optim and not self.finetune, (
+                '--stream-ckpt-dequant is an inference-only load path: it requires --no-load-optim '
+                'and cannot be used with --finetune.'
+            )
+            assert not self.load_main_params_from_ckpt, (
+                '--stream-ckpt-dequant cannot be used with --load-main-params-from-ckpt: the main '
+                'params would be initialized from the re-quantized params instead of the '
+                'high-precision checkpoint values.'
+            )
+            assert (
+                not self.fully_parallel_load
+                or self.ckpt_fully_parallel_load_exchange_algo == 'broadcast'
+            ), (
+                '--stream-ckpt-dequant supports --ckpt-fully-parallel-load only with '
+                '--ckpt-fully-parallel-load-exchange-algo broadcast.'
+            )
+
+        if self.override_ckpt_iteration is not None:
+            assert not self.finetune, \
+                "Cannot override checkpoint iteration together with finetune flag."
+
+        if self.replication:
+            assert self.replication_jump is not None, \
+                "--replication requires the value of --replication-jump!"
+            assert self.non_persistent_ckpt_type == "local", (
+                "--replication requires args.non_persistent_ckpt_type == 'local', but got: "
+                f"{self.non_persistent_ckpt_type}"
+            )
+
+    def validate_run(
+        self,
+        *,
+        use_distributed_optimizer: bool | None = None,
+        use_torch_fsdp2: bool | None = None,
+        use_megatron_fsdp: bool | None = None,
+        use_gloo_process_groups: bool | None = None,
+        overlap_param_gather: bool | None = None,
+    ) -> None:
+        """Check this section against the sections of the run that own the other side.
+
+        Keyword form, as ``SchedulerConfig.validate_run``. ``None`` means the container has no
+        section owning that value and the check is skipped: the inference container passes its
+        ``dist`` values only.
+        """
+        if use_torch_fsdp2:
+            assert self.ckpt_format in ('torch_dist', 'torch_dcp'), \
+                '--use-torch-fsdp2 requires --ckpt-format torch_dist or torch_dcp'
+        if use_torch_fsdp2 is not None and self.ckpt_format == "torch_dcp":
+            assert use_torch_fsdp2, "--ckpt-format torch_dcp is only tested with FSDP."
+        if use_megatron_fsdp:
+            assert self.ckpt_format == "fsdp_dtensor", \
+                "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
+        if use_megatron_fsdp is not None and self.ckpt_format == "fsdp_dtensor":
+            assert use_megatron_fsdp, \
+                "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
+        if use_gloo_process_groups is False and use_distributed_optimizer:
+            # Legacy checkpointing uses Gloo process groups to collect the full distributed
+            # optimizer state in the CPU memory of DP rank 0.
+            assert self.use_dist_ckpt
+            if self.dist_ckpt_optim_fully_reshardable:
+                assert not self.distrib_optim_fully_reshardable_mem_efficient, \
+                    '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
+        if overlap_param_gather and self.save is not None:
+            assert self.save_params_interval is None
+
+    def finalize_checkpoint_config(
+        self, *, skip_train: bool = False, perform_rl_step: bool = False
+    ) -> None:
+        """Apply the derivations ``validate_args`` applies to the arguments, once, at finalize.
+
+        The conditions are the legacy ones. Each warning fires only when a value changes, so a
+        CLI run, whose arguments ``validate_args`` already normalized, stays silent. Idempotent.
+        """
+        from megatron.training.utils import warn_rank_0
+
+        if self.ckpt_convert_format is not None:
+            self.exit_on_missing_checkpoint = True
+        if self.use_dist_ckpt and self.async_save and not self.use_persistent_ckpt_worker:
+            # A legacy torch save keeps async_save and reaches the unsupported-async error in
+            # save_checkpoint, as before.
+            warn_rank_0(
+                '--async-save is not supported without --use-persistent-ckpt-worker. '
+                'Disabling --async-save.'
+            )
+            self.async_save = False
+        if not self.replication and self.replication_jump:
+            warn_rank_0("--replication-jump was specified despite not using replication. Ignoring.")
+            self.replication_jump = None
+        if skip_train and not perform_rl_step and self.load_optim:
+            warn_rank_0('enabling --no-load-optim when skipping training.')
+            self.load_optim = False
 
 
 @dataclass(kw_only=True)

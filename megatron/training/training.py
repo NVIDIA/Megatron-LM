@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Pretrain utilities."""
 
@@ -215,7 +215,6 @@ from .utils import (
     reduce_max_stat_across_model_parallel_group,
     report_memory,
     to_empty_if_meta_device,
-    update_use_dist_ckpt,
 )
 
 _TensorMetricObserverCallback = Callable[..., None]
@@ -645,7 +644,7 @@ def _maybe_reroot_otel_interval():
     save_interval-sized chunks regardless of the resume offset in `iteration`).
     save_interval<=0 (no checkpointing) -> never re-roots (single trace, as before)."""
     global _otel_trace_interval_step
-    freq = getattr(get_args(), 'save_interval', None) or 0
+    freq = get_run_config().checkpoint.save_interval or 0
     if freq > 0 and (_otel_trace_interval_step % freq == 0):
         _reroot_otel_interval()
     _otel_trace_interval_step += 1
@@ -1525,8 +1524,9 @@ def get_start_time_from_progress_log():
     of floating-point operations completed in last saved checkpoint.
     """
     args = get_args()
-    assert args.save is not None
-    progress_log_filename = os.path.join(args.save, "progress.txt")
+    save_dir = get_run_config().checkpoint.save
+    assert save_dir is not None
+    progress_log_filename = os.path.join(save_dir, "progress.txt")
 
     # start_time is time when job with same world size started.
     # start_num_floating_point_operations is the number of floating-point operations
@@ -1748,6 +1748,11 @@ def pretrain(
 
     timestamp_after_inprocess_setup = time.time()
 
+    # Finalize the registered configuration before anything reads it: fault tolerance captures
+    # the checkpoint policy (save directory, async mode) and must see the derived values.
+    # initialize_megatron() re-enters the idempotent finalize later.
+    cfg_container.finalize()
+
     # Early fault tolerance setup - must be done before initialize_megatron
     # to enable monitoring of the initialization process
     ft_integration.setup()
@@ -1796,7 +1801,7 @@ def pretrain(
 
 
     if cfg_container.logger.log_progress:
-        append_to_progress_log(args.save, "Starting job")
+        append_to_progress_log(cfg_container.checkpoint.save, "Starting job")
 
     set_jit_fusion_options(tp_size=args.tensor_model_parallel_size)
 
@@ -2245,12 +2250,16 @@ def pretrain(
 
         print_datetime('after training is done')
 
+        # Without a periodic interval the end of training is the one save of the run.
         if (
             not cfg_container.validation.skip_train
             and cfg_container.checkpoint.save
             and iteration != 0
             and has_iterations_remaining
-            and iteration % cfg_container.checkpoint.save_interval != 0
+            and (
+                not cfg_container.checkpoint.save_interval
+                or iteration % cfg_container.checkpoint.save_interval != 0
+            )
         ):
             save_checkpoint_and_time(
                 iteration,
@@ -2621,7 +2630,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 print_rank_0(">   including expert parallelism AG group")
 
     if has_nvidia_modelopt:
-        maybe_enable_modelopt(args)
+        maybe_enable_modelopt(args, checkpoint=cfg.checkpoint)
 
     # Build model.
     def build_model():
@@ -2930,12 +2939,12 @@ def setup_model_and_optimizer(
     # Even with --skip-train, RL still creates an optimizer unless --no-load-optim is set.
     # RL is only reachable through pretrain(), which passes the container: no container, no RL step.
     perform_rl_step = cfg_container is not None and cfg_container.rl.perform_rl_step
-    has_rl_optimizer = perform_rl_step and not args.no_load_optim
+    has_rl_optimizer = perform_rl_step and cfg.checkpoint.load_optim
     skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
     wrap_with_ddp = not skip_optimizer
 
     if has_nvidia_modelopt:
-        maybe_enable_modelopt(args)
+        maybe_enable_modelopt(args, checkpoint=cfg.checkpoint)
 
     def _build_model_wrapper(wrap_with_ddp: bool):
         if cfg_container is not None and getattr(cfg_container, "model", None) is not None:
@@ -3070,7 +3079,7 @@ def setup_model_and_optimizer(
 
     if args.moe_use_upcycling:
         torch.distributed.barrier()
-        assert not checkpoint_exists(args.save), (
+        assert not checkpoint_exists(cfg.checkpoint.save), (
             "The upcycling destination directory already exists. "
             "Please check if --moe-use-upcycling is mistakenly enabled. "
             "Upcycling should only be set for the first run when converting the dense model. "
@@ -3119,10 +3128,10 @@ def setup_model_and_optimizer(
         del dense_model_for_upcycling
         if (args.fp16 or args.bf16) and optimizer is not None:
             optimizer.reload_model_params()
-        print_rank_0(f'Upcycled checkpoint saved to {args.save}')
+        print_rank_0(f'Upcycled checkpoint saved to {cfg.checkpoint.save}')
 
     if (
-        args.load is not None or args.pretrained_checkpoint is not None
+        cfg.checkpoint.load is not None or cfg.checkpoint.pretrained_checkpoint is not None
     ) and not args.moe_use_upcycling:
         one_logger and one_logger.log_metrics(
             {'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()}
@@ -3139,7 +3148,7 @@ def setup_model_and_optimizer(
                 restore_training_state=True,
                 skip_load_to_model_and_opt=HAVE_FSDP2
                 and cfg.dist.use_torch_fsdp2
-                and args.ckpt_format == "torch_dist",
+                and cfg.checkpoint.ckpt_format == "torch_dist",
                 tp_group=ckpt_pgc.tp if ckpt_pgc is not None else None,
                 pp_group=ckpt_pgc.pp if ckpt_pgc is not None else None,
                 # Replica_id must match the save path (see save_checkpoint_and_time): use the
@@ -3212,14 +3221,18 @@ def setup_model_and_optimizer(
         if args.fp16:
             optimizer.reload_model_params()
 
-    # Convert checkpoint format.
-    if args.ckpt_convert_format is not None:
-        load_ckpt_format = args.ckpt_format
-        args.ckpt_format = args.ckpt_convert_format
-        if args.ckpt_format != "torch_dist":
-            args.verify_integrity = False
-        args.save = os.path.join(args.ckpt_convert_save, args.ckpt_convert_format)
-        update_use_dist_ckpt(args)
+    # Convert checkpoint format: one save under the target format and directory. The override
+    # applies to this save only; the registered section and the arguments are left as they are.
+    if cfg.checkpoint.ckpt_convert_format is not None:
+        converted = dataclasses.replace(
+            cfg.checkpoint,
+            ckpt_format=cfg.checkpoint.ckpt_convert_format,
+            save=os.path.join(cfg.checkpoint.ckpt_convert_save, cfg.checkpoint.ckpt_convert_format),
+            verify_integrity=(
+                cfg.checkpoint.verify_integrity
+                and cfg.checkpoint.ckpt_convert_format == "torch_dist"
+            ),
+        )
 
         save_checkpoint(
             train_state.iteration,
@@ -3228,9 +3241,13 @@ def setup_model_and_optimizer(
             opt_param_scheduler,
             train_state.num_floating_point_operations_so_far,
             preprocess_common_state_dict_fn=preprocess_common_state_dict,
+            checkpoint=converted,
         )
 
-        print_rank_0("> converted checkpoint: %s -> %s." % (load_ckpt_format, args.ckpt_format))
+        print_rank_0(
+            "> converted checkpoint: %s -> %s."
+            % (cfg.checkpoint.ckpt_format, converted.ckpt_format)
+        )
         torch.distributed.barrier()
         exit()
 
@@ -3397,16 +3414,17 @@ def train_step(
     has_wrapped_data_iterator = False
     scheduled_num_microbatches = get_num_microbatches()
     rerun_data_iterator = data_iterator
-    save_params_in_this_iteration = (args.save_params_interval is not None and
-                                     (iteration + 1) % args.save_params_interval == 0)
-    save_activations_in_this_iteration = (args.save_activations_interval is not None and
-                                          (iteration + 1) % args.save_activations_interval == 0)
-    save_tpe_in_this_iteration = (args.save_tokens_per_expert_interval is not None and
-                                  (iteration + 1) % args.save_tokens_per_expert_interval == 0)
-    save_wgrads_in_this_iteration = (args.save_wgrads_interval is not None and
-                                     (iteration + 1) % args.save_wgrads_interval == 0)
-    save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
-                                     (iteration + 1) % args.save_dgrads_interval == 0)
+    checkpoint = cfg.checkpoint
+    save_params_in_this_iteration = (checkpoint.save_params_interval is not None and
+                                     (iteration + 1) % checkpoint.save_params_interval == 0)
+    save_activations_in_this_iteration = (checkpoint.save_activations_interval is not None and
+                                          (iteration + 1) % checkpoint.save_activations_interval == 0)
+    save_tpe_in_this_iteration = (checkpoint.save_tokens_per_expert_interval is not None and
+                                  (iteration + 1) % checkpoint.save_tokens_per_expert_interval == 0)
+    save_wgrads_in_this_iteration = (checkpoint.save_wgrads_interval is not None and
+                                     (iteration + 1) % checkpoint.save_wgrads_interval == 0)
+    save_dgrads_in_this_iteration = (checkpoint.save_dgrads_interval is not None and
+                                     (iteration + 1) % checkpoint.save_dgrads_interval == 0)
     while rerun_state_machine.should_run_forward_backward(rerun_data_iterator):
         # Set grad to zero.
         for model_chunk in model:
@@ -3487,11 +3505,11 @@ def train_step(
 
         # Forward pass.
         if save_activations_in_this_iteration:
-            enable_activation_logging(model, args.save)
+            enable_activation_logging(model, checkpoint.save)
         if save_tpe_in_this_iteration:
-            enable_tokens_per_expert_logging(model, args.save)
+            enable_tokens_per_expert_logging(model, checkpoint.save)
         if save_dgrads_in_this_iteration:
-            enable_dgrad_logging(model, args.save)
+            enable_dgrad_logging(model, checkpoint.save)
         grad_context, forward_only = _forward_backward_grad_context(args)
         _fb_cm = (
             span_cm("megatron.train.iteration.forward_backward", tracer=_otel_step_tracer, num_microbatches=scheduled_num_microbatches)
@@ -3554,7 +3572,7 @@ def train_step(
                     state_dict[model_chunk_name][param_name] = tensor_on_cpu
 
         # iteration is 0-indexed, move to 1-indexed for checkpoint name and logging.
-        save_grads(args.save, state_dict, iteration + 1, label)
+        save_grads(checkpoint.save, state_dict, iteration + 1, label)
 
     # Checkpoint wgrads with parameter names.
     if save_wgrads_in_this_iteration:
@@ -4256,8 +4274,9 @@ def _should_compute_params_norm(args, iteration, is_first_iteration):
 
 def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point_operations_so_far):
     args = get_args()
+    checkpoint = get_run_config().checkpoint
     train_state = get_train_state()
-    if args.save is None:
+    if checkpoint.save is None:
         return
     llm_world_size = getattr(args, 'mimo_llm_world_size', args.world_size)
 
@@ -4279,9 +4298,9 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     ) / (elapsed_time * 10**12 * llm_world_size)
 
     tokens_so_far = train_state.consumed_train_samples * args.seq_length
-    saved_ckpt_prefix = 'Saving async checkpoint' if args.async_save else 'Saved checkpoint'
+    saved_ckpt_prefix = 'Saving async checkpoint' if checkpoint.async_save else 'Saved checkpoint'
     append_to_progress_log(
-        args.save,
+        checkpoint.save,
         f"{saved_ckpt_prefix}\tIteration: {iteration}\t"
         f"Job throughput: {job_throughput:.1f} TFLOP/s/GPU\t"
         f"Cumulative throughput: {cumulative_throughput:.1f} TFLOP/s/GPU\t"
@@ -4463,7 +4482,9 @@ def save_checkpoint_and_time(
         # Log E2E metrics after save-checkpoint
         one_logger_utils.track_e2e_metrics()
 
-        one_logger_utils.on_save_checkpoint_end(save_checkpoint_duration, iteration, args.async_save)
+        one_logger_utils.on_save_checkpoint_end(
+            save_checkpoint_duration, iteration, cfg.checkpoint.async_save
+        )
 
         if cfg.logger.log_progress and not non_persistent_ckpt:
             compute_throughputs_and_append_to_progress_log(
@@ -4612,7 +4633,7 @@ def checkpoint_and_decide_exit(
     if cfg.train.exit_signal_handler:
         signal_handler = get_signal_handler()
         if any(signal_handler.signals_received()):
-            if args.save:
+            if cfg.checkpoint.save:
                 save_checkpoint_and_time(
                     iteration,
                     model,
@@ -4628,7 +4649,11 @@ def checkpoint_and_decide_exit(
             return True
 
     # Regular save (persistent and non-persistent).
-    if args.save and args.save_interval and iteration % args.save_interval == 0:
+    if (
+        cfg.checkpoint.save
+        and cfg.checkpoint.save_interval
+        and iteration % cfg.checkpoint.save_interval == 0
+    ):
         save_checkpoint_and_time(
             iteration,
             model,
@@ -4642,9 +4667,9 @@ def checkpoint_and_decide_exit(
         saved_checkpoint = True
 
     elif (
-        args.save
-        and args.non_persistent_save_interval
-        and iteration % args.non_persistent_save_interval == 0
+        cfg.checkpoint.save
+        and cfg.checkpoint.non_persistent_save_interval
+        and iteration % cfg.checkpoint.non_persistent_save_interval == 0
     ):
         save_checkpoint_and_time(
             iteration,
@@ -4672,7 +4697,7 @@ def checkpoint_and_decide_exit(
         torch.distributed.all_reduce(done_cuda, op=torch.distributed.ReduceOp.MAX)
         done = done_cuda.item()
         if done:
-            if args.save and not saved_checkpoint:
+            if cfg.checkpoint.save and not saved_checkpoint:
                 save_checkpoint_and_time(
                     iteration,
                     model,
@@ -4695,7 +4720,7 @@ def checkpoint_and_decide_exit(
         args.phase_transition_iterations
         and iteration in args.phase_transition_iterations
     ):
-        if args.save and not saved_checkpoint:
+        if cfg.checkpoint.save and not saved_checkpoint:
             save_checkpoint_and_time(
                 iteration,
                 model,
@@ -4798,41 +4823,38 @@ def train(
             }
         else:
             print_rank_0("> Loading pretrained checkpoint for reference weights in RL training...")
-            load, finetune, no_load_optim = args.load, args.finetune, args.no_load_optim
-            args.no_load_optim = True
-
-            # Load pretrained checkpoint
-            args.load = None
-            args.finetune = True
+            skip_load_to_model_and_opt = (
+                HAVE_FSDP2
+                and cfg.dist.use_torch_fsdp2
+                and cfg.checkpoint.ckpt_format == "torch_dist"
+            )
+            # The reference weights come from --pretrained-checkpoint, weights-only: an override
+            # of this load, not a change of the run's checkpoint policy.
             load_checkpoint(
-                    model,
-                    None,  # Don't load optimizer state
-                    None,  # Don't load scheduler state
-                    checkpointing_context=checkpointing_context,
-                    restore_training_state=True,
-                    skip_load_to_model_and_opt=HAVE_FSDP2
-                    and cfg.dist.use_torch_fsdp2
-                    and args.ckpt_format == "torch_dist",
-                )
+                model,
+                None,  # Don't load optimizer state
+                None,  # Don't load scheduler state
+                checkpointing_context=checkpointing_context,
+                restore_training_state=True,
+                skip_load_to_model_and_opt=skip_load_to_model_and_opt,
+                checkpoint=dataclasses.replace(
+                    cfg.checkpoint, load=None, finetune=True, load_optim=False
+                ),
+            )
             ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
 
-            # Reload RL training checkpoint weights
-            args.load = load
-            args.finetune = finetune
+            # Reload RL training checkpoint weights with the run's policy, without the optimizer.
             print_rank_0("> Reloading RL training checkpoint...")
             load_checkpoint(
-                    model,
-                    None,
-                    None,
-                    checkpointing_context=checkpointing_context,
-                    restore_training_state=True,
-                    skip_load_to_model_and_opt=HAVE_FSDP2
-                    and cfg.dist.use_torch_fsdp2
-                    and args.ckpt_format == "torch_dist",
-                )
+                model,
+                None,
+                None,
+                checkpointing_context=checkpointing_context,
+                restore_training_state=True,
+                skip_load_to_model_and_opt=skip_load_to_model_and_opt,
+                checkpoint=dataclasses.replace(cfg.checkpoint, load_optim=False),
+            )
             update_num_microbatches(consumed_samples=train_state.consumed_train_samples, verbose=True)
-
-            args.no_load_optim = no_load_optim
 
     lang_pgc = (
         pg_collection.get_language_model_collection()
@@ -4920,8 +4942,8 @@ def train(
         train_samples=cfg.train.train_samples,
         seq_length=args.seq_length,
         train_iters=cfg.train.train_iters,
-        save=args.save,
-        async_save=args.async_save,
+        save=cfg.checkpoint.save,
+        async_save=cfg.checkpoint.async_save,
         log_throughput=cfg.logger.log_throughput,
         num_floating_point_operations_so_far=train_state.num_floating_point_operations_so_far,
     )
@@ -5215,7 +5237,7 @@ def train(
                     f"Global batch size should not decrease; "
                     f"going from {global_batch_size} to {get_current_global_batch_size()}"
                 )
-                if args.save is not None:
+                if cfg.checkpoint.save is not None:
                     print_rank_0("[StepBatchsizeNumMicroBatchesCalculator] Reached batch size "
                                  "transition, saving checkpoint before exiting.")
                     save_checkpoint_and_time(
@@ -6351,7 +6373,7 @@ def should_disable_forward_pre_hook(args):
     # Typically, --skip-train is the only thing needed to disable the optimizer.
     has_normal_optimizer = not cfg.validation.skip_train
     # Even with --skip-train, RL still creates an optimizer unless --no-load-optim is set.
-    has_rl_optimizer = cfg.rl.perform_rl_step and not args.no_load_optim
+    has_rl_optimizer = cfg.rl.perform_rl_step and cfg.checkpoint.load_optim
     # The forward pre-hooks are part of the distributed optimizer's overlapped param-gather;
     # so in order to disable them, we must check that the optimizer actually exists.
     has_optimizer = has_normal_optimizer or has_rl_optimizer

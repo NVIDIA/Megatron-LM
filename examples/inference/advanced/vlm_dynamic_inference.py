@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Helpers for VLM dynamic-batching inference.
 
@@ -13,6 +13,7 @@ support multimodal checkpoints:
   * :func:`get_model` — build and load either a GPT or LLaVA model
 """
 
+import dataclasses
 import json
 import os
 import re
@@ -26,7 +27,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import unwrap_model
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
-from megatron.training import print_rank_0
+from megatron.training import get_run_config, print_rank_0
 from megatron.training.checkpointing import (
     get_checkpoint_name,
     get_checkpoint_tracker_filename,
@@ -492,13 +493,16 @@ def get_model(is_vlm: bool) -> MegatronModule:
 
         model = _get_model(partial(model_provider, gpt_builder), wrap_with_ddp=False)
 
-    assert args.load is not None
-    args.exit_on_missing_checkpoint = True
+    checkpoint = get_run_config().checkpoint
+    assert checkpoint.load is not None
+    # Inference must not start from random weights: exit_on_missing_checkpoint is forced for
+    # this load; the registered section and the arguments are left as they are.
     load_checkpoint(
         ddp_model=model,
         optimizer=None,
         opt_param_scheduler=None,
         strict=not args.inference_ckpt_non_strict,
+        checkpoint=dataclasses.replace(checkpoint, exit_on_missing_checkpoint=True),
     )
     if is_mimo:
         _check_mimo_checkpoint_fully_loaded(args, model[0])
