@@ -2932,7 +2932,6 @@ def get_grpo_data_iterator(
 
 
 def evaluate_and_print_results_rl(
-    data_iterator: Iterator[TensorDataset],
     model: list[LanguageModule],
     optimizer: MegatronOptimizer,
     iteration: int,
@@ -2942,7 +2941,6 @@ def evaluate_and_print_results_rl(
     """Helper function to evaluate and dump results on screen.
 
     Args:
-        data_iterator: Iterator over batches of evaluation dataset.
         model: Model to evaluate with (may be separate inference model).
         iteration: Current training iteration.
         write_to_tensorboard: Dumpt stuff to tensorboard or not.
@@ -3056,6 +3054,68 @@ def evaluate_and_print_results_rl(
                     'w',
                 ) as f:
                     json.dump([[r.model_dump() for r in group] for group in dp_eval_results], f)
+
+
+def next_rollout_iterator(
+    iteration: int,
+    current_iterator: Any,
+    *,
+    model: list,
+    inference_model: Optional[list],
+    optimizer: Any,
+    ref_state_dict: Optional[dict],
+    rl_config: Any,
+    train_config: Any,
+) -> Any:
+    """The rollout iterator for this iteration, rebuilt on the GRPO schedule."""
+    assert model is not None, "RLSetupCallback has not run; pass it in pretrain(callbacks=...)"
+    if optimizer is None:
+        # Release stale CUDA cached memory before inference.
+        torch.cuda.empty_cache()
+    with torch.no_grad():
+        return get_grpo_data_iterator(
+            model,
+            inference_model,
+            optimizer,
+            iteration,
+            ref_state_dict,
+            grpo_iterations=rl_config.grpo_iterations,
+            grpo_prompts_per_step=rl_config.grpo_prompts_per_step,
+            grpo_group_size=rl_config.grpo_group_size,
+            global_batch_size=train_config.global_batch_size,
+            sequence_packing=rl_config.rl_use_sequence_packing,
+            buffered_rollouts=current_iterator,
+            is_correction=rl_config.rl_inference_logprobs_is_correction,
+            optimizer_is_on_cpu=rl_config.rl_offload_optimizer_during_inference,
+        )
+
+
+def evaluate_rollouts(
+    *,
+    model: list,
+    inference_model: Optional[list],
+    optimizer: Any,
+    prefix: str,
+    iteration: int,
+    verbose: bool,
+    write_to_tensorboard: bool,
+) -> None:
+    """Run the RL evaluation rollouts, on the separate inference model when there is one."""
+    assert model is not None, "RLSetupCallback has not run; pass it in pretrain(callbacks=...)"
+    eval_model, training_model = model, None
+    if inference_model is not None:
+        # Swap the training weights onto the inference model first.
+        inf_core = unwrap_model(inference_model[0])
+        _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
+        refit_inference_model(model, inference_model, get_args())
+        eval_model, training_model = inference_model, model
+    evaluate_and_print_results_rl(
+        eval_model,
+        optimizer,
+        iteration,
+        write_to_tensorboard=write_to_tensorboard,
+        training_model=training_model,
+    )
 
 
 def calculate_grpo_loss(
