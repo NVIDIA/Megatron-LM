@@ -18,24 +18,14 @@
       "finalize_model_grads:accessor:parallel_state.get_tensor_model_parallel_group"
     ],
     "megatron/core/distributed/fsdp/mcore_fsdp_adapter.py": [
-      "FullyShardedDataParallelV1._init_dist_index:accessor:parallel_state.get_data_parallel_group",
-      "FullyShardedDataParallelV1._init_dist_index:accessor:parallel_state.get_data_parallel_group",
-      "FullyShardedDataParallelV1._init_dist_index:accessor:parallel_state.get_data_parallel_group",
-      "FullyShardedDataParallelV1._init_dist_index:accessor:parallel_state.get_expert_data_parallel_group",
-      "FullyShardedDataParallelV1._init_dist_index:accessor:parallel_state.get_expert_data_parallel_group",
-      "FullyShardedDataParallelV1._init_dist_index:accessor:parallel_state.get_expert_data_parallel_group",
-      "FullyShardedDataParallelV1._init_dist_index:accessor:parallel_state.get_expert_model_parallel_group",
-      "FullyShardedDataParallelV1._init_dist_index:accessor:parallel_state.get_expert_model_parallel_group",
-      "FullyShardedDataParallelV1._init_dist_index:accessor:parallel_state.get_expert_tensor_parallel_group",
-      "FullyShardedDataParallelV1._init_dist_index:accessor:parallel_state.get_inter_distributed_optimizer_instance_group",
-      "FullyShardedDataParallelV1._init_dist_index:accessor:parallel_state.get_tensor_model_parallel_group"
+      "FullyShardedDataParallelV1._init_dist_index:guarded:resolve_process_groups"
     ],
     "megatron/core/distributed/param_and_grad_buffer.py": [
       "_ParamAndGradBuffer.__init__:accessor:parallel_state.get_data_and_context_parallel_group",
       "_ParamAndGradBuffer.__init__:accessor:parallel_state.get_tensor_model_parallel_group"
     ],
     "megatron/core/distributed/torch_fully_sharded_data_parallel.py": [
-      "TorchFullyShardedDataParallel.__init__:accessor:parallel_state.get_data_parallel_group"
+      "TorchFullyShardedDataParallel.__init__:guarded:resolve_process_groups"
     ],
     "megatron/core/export/trtllm/trtllm_weights_converter/distributed_trtllm_model_weights_converter.py": [
       "DistributedTRTLLMModelWeightsConverter.__init__:shim:use_mpu_process_groups"
@@ -206,8 +196,7 @@
       "SimplifiedDSGQAIndexer.__init__:shim:use_mpu_process_groups"
     ],
     "megatron/core/transformer/fsdp_dtensor_checkpoint.py": [
-      "get_ep_layer_offset:accessor:parallel_state.get_expert_model_parallel_rank",
-      "get_ep_layer_offset:accessor:parallel_state.get_expert_model_parallel_world_size"
+      "get_ep_layer_offset:guarded:resolve_process_groups"
     ],
     "megatron/core/transformer/module.py": [
       "Float16Module.forward:accessor:parallel_state.get_pipeline_model_parallel_group",
@@ -277,5 +266,5 @@
       "make_tp_sharded_tensor_for_checkpoint:accessor:parallel_state.get_tensor_model_parallel_group"
     ]
   },
-  "total": 173
+  "total": 162
 }
