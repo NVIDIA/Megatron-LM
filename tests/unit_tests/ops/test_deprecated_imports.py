@@ -393,6 +393,23 @@ def test_gdn_package_exports_canonical_classes():
     assert set(namespace) - {'__builtins__'} == set(EXPORTS['megatron.core.ssm.gated_delta_net'])
 
 
+@pytest.mark.skipif(
+    "megatron.core.tensor_parallel.cross_entropy" not in FORWARDED,
+    reason="moved in another PR of this stack",
+)
+def test_cross_entropy_keeps_its_package_export_and_selector_path():
+    """The names callers reached through a package or module that stays keep resolving."""
+    from megatron.core import tensor_parallel
+    from megatron.core.models import backends as model_backends
+    from megatron.core.ops.loss import backends, cross_entropy
+
+    assert (
+        tensor_parallel.vocab_parallel_cross_entropy is cross_entropy.vocab_parallel_cross_entropy
+    )
+    assert model_backends.select_cross_entropy is backends.select_cross_entropy
+    assert model_backends.CrossEntropyTarget is backends.CrossEntropyTarget
+
+
 @pytest.mark.parametrize(
     'old,symbol',
     [
@@ -402,6 +419,10 @@ def test_gdn_package_exports_canonical_classes():
             ('megatron.core.ssm.mamba_mixer', 'MambaMixer'),
             ('megatron.core.ssm.gated_delta_product', 'GatedDeltaProductMixer'),
             ('megatron.core.transformer.experimental_attention_variant.dsa', 'DSAttention'),
+            ('megatron.core.tensor_parallel.cross_entropy', 'VocabParallelCrossEntropy'),
+            ('megatron.core.fusions.fused_layer_norm', 'FusedLayerNorm'),
+            ('megatron.core.transformer.torch_norm', 'WrappedTorchNorm'),
+            ('megatron.core.transformer.torch_norm', 'L2Norm'),
         ]
         if pair[0] in FORWARDED  # each family's move adds its entry
     ],

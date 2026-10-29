@@ -38,11 +38,13 @@ megatron/core/ops/
 │   ├── gated_delta/       common.py, gdn.py, gdn2.py
 │   ├── gdp/               mixer.py, context_parallel.py, kernels
 │   └── context_parallel/  chunkwise CP protocol and the FLA / CuTeDSL GDP adapters
-└── attention/
-    ├── dsa/               modules.py, layout/masking, kernels/, TileLang & cuDNN adapters
-    ├── csa/               modules.py
-    ├── mla.py             absorbed MLA
-    └── dsv4.py            DeepSeek-v4 hybrid attention
+├── attention/
+│   ├── dsa/               modules.py, layout/masking, kernels/, TileLang & cuDNN adapters
+│   ├── csa/               modules.py
+│   ├── mla.py             absorbed MLA
+│   └── dsv4.py            DeepSeek-v4 hybrid attention
+├── loss/                  vocab-parallel cross entropy and select_cross_entropy()
+└── norm/                  norm builder protocols, Torch and Apex norm modules
 ```
 
 A family gains `backends.py` and `reference.py` when it adopts the selector pattern
@@ -60,6 +62,8 @@ below; until then its module carries the availability checks it had before the m
 | `attention/csa` | `modules.py` with compressor/indexer/attention modules and reference kernels |
 | `attention/mla.py` | Absorbed MLA operation and its projection/layout helpers |
 | `attention/dsv4.py` | DeepSeek-v4 hybrid attention operation |
+| `loss` | `backends.py` (`select_cross_entropy` and the `CrossEntropyTarget` contract), eager and `jit_fuser` vocab-parallel cross entropy |
+| `norm` | `torch_norm.py` (builder protocols, `WrappedTorchNorm`, `L2Norm`) and Apex's `FusedLayerNorm` |
 
 Within a family the file roles are fixed:
 
@@ -238,6 +242,29 @@ Say DSA gains a third fused backend, `flashinfer`, next to `tilelang` and `cudnn
    `reference.py` for the new hooks, and run the existing DSA suites with the new
    backend name.
 
+## Adding a cross-entropy or normalization backend
+
+These two families are chosen through `BackendSpecProvider` (see Selection
+below), not by an operation constructor. Say a library `foo` provides both.
+
+- **Cross entropy.** Write `loss/foo_cross_entropy.py` with a target of the
+  `CrossEntropyTarget` shape, `loss = target(logits, labels, tp_group)`; the
+  target owns every reduction over `tp_group`. Add `"foo"` to the accepted values
+  of `cross_entropy_fusion_impl` and give it a branch in `select_cross_entropy`
+  (`loss/backends.py`) that checks the library with `require`, so the other
+  values never import it. Every provider asks that selector, so the choice does
+  not depend on which provider builds the rest of the model.
+- **Normalization.** Write `norm/foo_norm.py` with a module built as a
+  `LayerNormBuilder` (`config=`, `hidden_size=`, `eps=`) and satisfying
+  `LayerNormInterface`. Use the parameter names the existing norms use (`weight`,
+  and `bias` for LayerNorm) so a checkpoint loads under either backend. The
+  provider that offers it returns it from `layer_norm(rms_norm=..., for_qk=...,
+  has_residual=...)`; providers stay in `models/` and `extensions/`.
+- **Tests:** parity against `cross_entropy.vocab_parallel_cross_entropy` or the
+  Torch norm, including backward and TP > 1 for cross entropy; a missing library
+  is an `ImportError` naming the backend when it is selected; the existing values
+  never import it.
+
 ## Dependency checks
 
 Optional kernel libraries are checked once, at construction, with
@@ -285,7 +312,9 @@ directly. This is the pattern used by the new-operation recipe above.
 
 `BackendSpecProvider` in `megatron/core/models/backends.py` supplies the existing
 model-spec components, such as parallel linear layers, normalization, attention,
-and cross entropy. It does not currently provide SSM or sparse-attention kernel
+and cross entropy. Its cross-entropy slot asks `loss/backends.py`'s
+`select_cross_entropy`, and its `layer_norm` slot returns a `norm` module or
+Transformer Engine's. It does not currently provide SSM or sparse-attention kernel
 slots. Keep operation-local kernel selection in the family until an extension
 to that provider interface and its callers is implemented together.
 
