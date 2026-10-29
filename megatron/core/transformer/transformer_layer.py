@@ -1888,7 +1888,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         # chunking), which is also what replay passes. TE fixes the kwarg set at capture, so
         # replays must then always pass a mask; see _te_cuda_graph_replay for the all-False default.
         self._cuda_graph_padding_mask_shape = None
-        if self._moe_router_in_cuda_graph():
+        if self._padding_mask_in_cuda_graph():
             mask_shape = self._padding_mask_shape_seen
             if mask_shape is not None:
                 self._cuda_graph_padding_mask_shape = tuple(mask_shape)
@@ -1896,6 +1896,25 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                     mask_shape, dtype=torch.bool, device=torch.cuda.current_device()
                 )
         return static_inputs
+
+    def _padding_mask_in_cuda_graph(self) -> bool:
+        """Return True when a graphed part of this layer reads the padding mask.
+
+        The MoE router does (masked routing, z-loss, expert bias), and so does an attention
+        module that reads ``PackedSeqParams.padding_mask`` under static packed (THD) inputs
+        (``consumes_packed_padding_mask``, e.g. QSA's indexer loss): the graph rebuilds
+        PackedSeqParams from tensor inputs, so the mask has to be one of them. The layer's mask
+        covers the whole local sequence only without sequence parallelism (with it, the layer
+        receives the SP-scattered mask), so the attention case is limited to that.
+        """
+        if self._moe_router_in_cuda_graph():
+            return True
+        return (
+            self._attention_in_cuda_graph()
+            and self._is_thd_cuda_graph()
+            and not self.config.sequence_parallel
+            and getattr(self.self_attention, "consumes_packed_padding_mask", False)
+        )
 
     def _moe_router_in_cuda_graph(self) -> bool:
         """Return True when this layer's MoE router runs inside the TE CUDA graph."""
@@ -1917,7 +1936,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         """
         graph_mask_shape = self._cuda_graph_padding_mask_shape
         if graph_mask_shape is None:
-            if padding_mask is not None and self._moe_router_in_cuda_graph():
+            if padding_mask is not None and self._padding_mask_in_cuda_graph():
                 raise RuntimeError(
                     "padding_mask was passed to a TE CUDA graph that was captured without a "
                     "padding_mask input: no mask reached this layer during "
@@ -2000,6 +2019,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             # tensor comparison during capture. This restricts TE backend
             # selection for THD to cuDNN fused attention.
             pad_between_seqs=True,
+            # Graph input only when get_layer_static_inputs reserved it. The layer's mask is the
+            # whole local sequence only without sequence parallelism (with it, it is SP-scattered).
+            padding_mask=None if self.config.sequence_parallel else kwargs.get('padding_mask'),
         )
 
     def _te_cuda_graph_capture(self, *args, **kwargs):

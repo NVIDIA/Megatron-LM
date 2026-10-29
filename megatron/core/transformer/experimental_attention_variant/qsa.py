@@ -1001,6 +1001,11 @@ class QSASelfAttention(SelfAttention):
         self._dense_fit_checked = False
         _require_qsa_kernel_support(self.config, self.pg_collection.tp.size())
 
+    @property
+    def consumes_packed_padding_mask(self) -> bool:
+        """The indexer loss reads ``PackedSeqParams.padding_mask`` to drop THD padding rows."""
+        return (self.config.qsa_indexer_loss_coeff or 0.0) > 0
+
     def is_cuda_graph_capturable(self) -> bool:
         """QSA layers are capturable, with or without (allgather) context parallelism.
 

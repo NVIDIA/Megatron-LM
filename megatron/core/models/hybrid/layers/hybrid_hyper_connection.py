@@ -240,6 +240,9 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             # This Python flag is baked into the captured graph and cannot vary
             # between replay batches. Use the conservative THD-safe branch.
             pad_between_seqs=True,
+            # Graph input only when the inner layer reserved it. The layer's mask is the whole
+            # local sequence only without sequence parallelism (with it, it is SP-scattered).
+            padding_mask=None if self.config.sequence_parallel else kwargs.get('padding_mask'),
         )
 
     def __call__(self, *args, **kwargs):
