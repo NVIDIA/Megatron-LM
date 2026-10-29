@@ -71,16 +71,17 @@ class TestAmaxReductionGroupOnGrids:
     def test_standard_collection_matches_global_group(self, grid, tp_only_amax_red):
         from megatron.core.process_groups_config import amax_reduction_group
 
-        if Utils.world_size != 4:
-            pytest.skip("the grid sizes below assume 4 ranks")
+        if Utils.world_size % 4:
+            pytest.skip("the grids below assume a multiple of 4 ranks")
         Utils.initialize_model_parallel(**grid)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
         group = amax_reduction_group(pg_collection, tp_only_amax_red)
 
         assert group is global_amax_group(tp_only_amax_red)
-        # TP x CP is 2 on every grid; the full group spans DP and the gtp_remat peers.
-        assert group.size() == (2 if tp_only_amax_red else 4)
+        # TP x CP is 2 on every grid. PP is 1, so the full group, which spans DP and the
+        # gtp_remat peers, holds every rank.
+        assert group.size() == (2 if tp_only_amax_red else Utils.world_size)
 
     @pytest.mark.parametrize("recipe", [Fp8Recipe.delayed, Fp8Recipe.tensorwise])
     @pytest.mark.parametrize("tp_only_amax_red", [False, True])
