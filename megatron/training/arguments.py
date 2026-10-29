@@ -1895,15 +1895,27 @@ def validate_args(args, defaults={}):
             total_cp_ranks = args.context_parallel_size
         else:
             total_cp_ranks = args.data_parallel_size * args.context_parallel_size
+        # Match SFTDataset's CP/SP alignment: schedulers pack padded lengths,
+        # which can exceed seq_length even for a single truncated sample.
+        cp_divisor = (
+            args.data_parallel_size * args.context_parallel_size * 2
+            if args.dynamic_context_parallel
+            else (args.context_parallel_size * 2 if args.context_parallel_size > 1 else 1)
+        )
+        sp_divisor = args.tensor_model_parallel_size if args.sequence_parallel else 1
+        padding_divisor = cp_divisor * sp_divisor
+        max_padded_length = (
+            (args.seq_length + padding_divisor - 1) // padding_divisor * padding_divisor
+        )
         if args.max_seqlen_per_dp_cp_rank is None:
             args.max_seqlen_per_dp_cp_rank = getattr(args, "max_seqlen_per_cp_rank", None)
         if args.max_seqlen_per_dp_cp_rank is None:
             args.max_seqlen_per_dp_cp_rank = (
-                args.seq_length + total_cp_ranks - 1
+                max_padded_length + total_cp_ranks - 1
             ) // total_cp_ranks
-        assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
+        assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= max_padded_length, (
             f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
-            f'must be >= single sequence max length ({args.seq_length})'
+            f'must be >= padded single sequence max length ({max_padded_length})'
         )
 
     # Data blend checks
@@ -5515,6 +5527,8 @@ def _add_varlen_dataset_args(parser):
         '{"mode":"distribution","type":"lognormal","min_seq_len":1024,'
         '"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, or '
         '{"mode":"verification","data_path":"/prefix/of/IndexedDataset"}. '
+        'Lengths count content tokens: a sampled length n yields n valid training '
+        'tokens after appending EOD and shifting, capped at --seq-length, before padding. '
         'If not specified, defaults to a lognormal distribution with '
         'min_seq_len=seq_length//2, max_seq_len=seq_length, '
         'mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.',
