@@ -2536,6 +2536,20 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         bf16_backward: Optional[bool] = None,
     ) -> torch.Tensor:
         """Forward."""
+        if packed_seq_params is not None and packed_seq_params.has_single_token_sequences():
+            # Single-token sequences [t, np, hn] are the sbhd batch [1, t, np, hn]. Run them as
+            # one, which needs no THD support from the attention backend, and return the packed
+            # output layout [t, hp].
+            return self.forward(
+                query.unsqueeze(0),
+                key.unsqueeze(0),
+                value.unsqueeze(0),
+                attention_mask,
+                attn_mask_type,
+                attention_bias=attention_bias,
+                num_splits=num_splits,
+                bf16_backward=bf16_backward,
+            ).squeeze(0)
         with self._temporary_runtime_context_parallel_group(packed_seq_params):
             return self._forward(
                 query,

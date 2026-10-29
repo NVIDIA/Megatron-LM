@@ -492,11 +492,16 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
 
         if inference_mode or not self.use_mem_eff_path:
             # TODO(ksanthanam): Consider deprecating this path for training
-            assert packed_seq_params is None, (
-                "Training with packed sequences is not supported "
-                "in the non-memory-efficient code path."
-            )
-            y = self._static_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
+            if packed_seq_params is not None:
+                assert packed_seq_params.has_single_token_sequences() and ssm_state is None, (
+                    "Packed sequences are supported in the non-memory-efficient code path only "
+                    "without state caching and with a single token per sequence."
+                )
+                # Single-token sequences [t, 1, d] are the batch [1, t, d] of length-1
+                # sequences, each scanned from a zero state.
+                y = self._static_prefill(zxBCdt.transpose(0, 1), None, None).transpose(0, 1)
+            else:
+                y = self._static_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
         else:
             assert ssm_state is None
             y = self._ssm_training(zxBCdt, packed_seq_params)

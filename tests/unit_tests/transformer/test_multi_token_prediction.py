@@ -31,6 +31,7 @@ from megatron.core.parallel_state import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
 from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_checkpoint
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import multi_token_prediction as mtp_module
@@ -4994,3 +4995,141 @@ class TestLearnedOutputContract:
         for tensor in (hidden_states, head_fn, base, scale):
             assert tensor.grad is not None
             assert torch.count_nonzero(tensor.grad) > 0
+
+
+@pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
+class TestMTPDraftStepRequestIsolation:
+    """A context-free MTP draft step drafts every request on its own.
+
+    Without an MTP draft KV plane, speculative decoding runs `compute_mtp_single_step` with no
+    inference context, one row per request. Each request's draft must depend only on its own
+    inputs, at every depth, for attention (GQA) and Mamba layers in the head.
+    """
+
+    NUM_REQUESTS = 4
+    HIDDEN_SIZE = 256
+    VOCAB_SIZE = 128
+    MTP_DEPTHS = 2
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _build_model(self, model_type, tp):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+        model_parallel_cuda_manual_seed(_SEED)
+        config = TransformerConfig(
+            num_layers=2 if model_type == "hybrid" else 1,
+            hidden_size=self.HIDDEN_SIZE,
+            num_attention_heads=4,
+            num_query_groups=2,
+            ffn_hidden_size=512,
+            mtp_num_layers=self.MTP_DEPTHS,
+            tensor_model_parallel_size=tp,
+            sequence_parallel=tp > 1,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            # Large enough weights that a request leaking into another moves its logits far
+            # beyond bf16 rounding.
+            init_method_std=0.2,
+        )
+        if model_type == "gpt":
+            layer_spec = get_gpt_layer_with_transformer_engine_spec()
+            model = GPTModel(
+                config=config,
+                transformer_layer_spec=layer_spec,
+                vocab_size=self.VOCAB_SIZE,
+                max_sequence_length=64,
+                mtp_block_spec=get_gpt_mtp_block_spec(
+                    config, layer_spec, use_transformer_engine=True
+                ),
+                position_embedding_type="rope",
+            )
+        else:
+            pytest.importorskip("mamba_ssm")
+            # Each MTP depth is a Mamba layer followed by an attention layer.
+            model = HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=self.VOCAB_SIZE,
+                max_sequence_length=64,
+                hybrid_layer_pattern="M*" + "/M*" * self.MTP_DEPTHS,
+                position_embedding_type="none",
+            )
+        return model.cuda().eval()
+
+    def _inputs(self, seed):
+        """Per-request draft inputs: base hidden state, and the next token at every depth."""
+        generator = torch.Generator().manual_seed(seed)
+        hidden = torch.randn(self.NUM_REQUESTS, 1, self.HIDDEN_SIZE, generator=generator)
+        tokens = torch.randint(
+            0, self.VOCAB_SIZE, (self.MTP_DEPTHS, self.NUM_REQUESTS), generator=generator
+        )
+        return hidden.to("cuda", torch.bfloat16), tokens.cuda()
+
+    def _draft(self, model, hidden, tokens):
+        """Run the draft depths on one row per request, as the MTP controller does.
+
+        Pads the rows to a multiple of TP and scatters them for sequence parallelism. Returns
+        each depth's logits for the real rows, [num_requests, vocab].
+        """
+        num_requests = hidden.size(0)
+        tp_group = get_tensor_model_parallel_group()
+        tp = get_pg_size(tp_group)
+        pad = -num_requests % tp
+        hidden = torch.nn.functional.pad(hidden, (0, 0, 0, 0, 0, pad))
+        tokens = torch.nn.functional.pad(tokens, (0, pad))
+        positions = torch.arange(num_requests + pad, device="cuda").unsqueeze(0)
+        if model.config.sequence_parallel:
+            hidden = scatter_to_sequence_parallel_region(hidden, group=tp_group)
+        logits_per_depth = []
+        for depth in range(self.MTP_DEPTHS):
+            hidden, logits = model.compute_mtp_single_step(
+                hidden_states=hidden,
+                next_token_ids=tokens[depth : depth + 1],
+                position_ids=positions + depth,
+                depth=depth,
+            )
+            logits_per_depth.append(logits[:num_requests, 0].float())
+        return logits_per_depth
+
+    @pytest.mark.parametrize("tp", [1, 2])
+    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
+    def test_draft_logits_do_not_depend_on_other_requests(self, model_type, tp):
+        if Utils.world_size < tp:
+            pytest.skip(f"TP={tp} requires at least {tp} ranks")
+        model = self._build_model(model_type, tp)
+        hidden, tokens = self._inputs(seed=1)
+        other_hidden, other_tokens = self._inputs(seed=2)
+        last = self.NUM_REQUESTS - 1
+        other_hidden[last], other_tokens[:, last] = hidden[last], tokens[:, last]
+
+        with torch.inference_mode(), InferenceMode.active():
+            batched = self._draft(model, hidden, tokens)
+            # Every request but the last replaced: the last request's drafts must not move.
+            replaced = self._draft(model, other_hidden, other_tokens)
+            alone = [
+                self._draft(model, hidden[i : i + 1], tokens[:, i : i + 1])
+                for i in range(self.NUM_REQUESTS)
+            ]
+
+        for depth in range(self.MTP_DEPTHS):
+            torch.testing.assert_close(
+                replaced[depth][last],
+                batched[depth][last],
+                rtol=0,
+                atol=0,
+                msg=lambda m: f"depth {depth}: the other requests moved the last one's drafts\n{m}",
+            )
+            # Batch size changes only the GEMM shapes, hence the bf16 rounding.
+            atol = 2e-2 * batched[depth].abs().max().item()
+            for i in range(self.NUM_REQUESTS):
+                torch.testing.assert_close(
+                    alone[i][depth][0],
+                    batched[depth][i],
+                    rtol=0,
+                    atol=atol,
+                    msg=lambda m: f"depth {depth}, request {i}: batched != alone\n{m}",
+                )
