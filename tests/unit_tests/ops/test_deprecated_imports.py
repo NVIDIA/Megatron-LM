@@ -154,25 +154,37 @@ def test_synthetic_forwarder_writes_reach_the_implementation(synthetic_forwarder
     with mock.patch(f'{old}.public', replacement):
         assert first.public is replacement and module.public is replacement
     assert first.public is original and 'public' not in vars(module)
-    monkeypatch.setattr(module, 'public', replacement)
-    assert first.public is replacement
-    monkeypatch.undo()
-    assert first.public is original and module.public is original
-    # Deleting a patched name restores what the patch replaced: mock.patch, and monkeypatch.undo
-    # on pytest 9.2+, undo a patch this way. Nested patches unwind in order.
     inner = object()
+    monkeypatch.setattr(module, 'public', replacement)
+    monkeypatch.setattr(module, 'public', inner)
+    assert first.public is inner
+    monkeypatch.undo()
+    assert first.public is original and module.public is original and 'public' not in vars(module)
+    # Nested patches unwind in order, including an inner patch that restores the original for a
+    # while: the outer patch keeps the name on the forwarder, so the inner one undoes by assignment.
+    for value in (inner, original):
+        with mock.patch(f'{old}.public', replacement):
+            with mock.patch.object(module, 'public', value, create=True):
+                assert first.public is value and module.public is value
+            assert first.public is replacement
+        assert first.public is original and 'public' not in vars(module)
+    # Patching a name the implementation lacks adds it there, and the undo removes it again.
+    with mock.patch(f'{old}.added', replacement, create=True):
+        assert first.added is replacement
+    assert not hasattr(first, 'added') and 'added' not in vars(module)
+    # Reads of a patched name come from the implementation, even while it is patched there too.
     with mock.patch(f'{old}.public', replacement):
-        with mock.patch(f'{old}.public', inner):
-            assert first.public is inner
-        assert first.public is replacement
-    assert first.public is original
+        with mock.patch.object(first, 'public', inner):
+            assert module.public is inner
+        assert module.public is replacement
+    assert module.public is original
     module.public = replacement
     del module.public
-    assert first.public is original
-    # Writing the replaced value back also undoes the write.
+    assert first.public is original and 'public' not in vars(module)
+    # Assigning the original back also ends the write.
     module.public = replacement
     module.public = original
-    assert first.public is original and not vars(module)['__forwarder_replaced__']['public']
+    assert first.public is original and 'public' not in vars(module)
 
 
 def test_specs_load_through_forwarders(tmp_path, monkeypatch):

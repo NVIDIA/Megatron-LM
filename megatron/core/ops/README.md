@@ -340,10 +340,11 @@ A forwarder provides the following compatibility behavior:
   `__module__` keep working, and every object is the canonical one.
 - Writes go where reads come from. Assigning a name on a forwarder, including
   `mock.patch` and `monkeypatch.setattr` on the old path, changes the module that
-  defines it. Deleting the name, which is how those tools undo a patch, restores
-  the value the write replaced, so nested patches unwind in order. A forwarder with
-  several targets has no single home for a name, so writing through it raises
-  `AttributeError`.
+  defines it, and reads of the name still come from there. Until the write is
+  undone the forwarder also holds the name, as a patched module would, so those
+  tools undo nested patches by assignment and the outermost one by deletion, which
+  restores what the implementation held before. A forwarder with several targets
+  has no single home for a name, so writing through it raises `AttributeError`.
 - The forwarders are scheduled for removal in the version recorded by
   `_compat.REMOVAL_VERSION`. In-tree code must use canonical paths, in imports
   and in strings such as patch targets; a unit test enforces this.

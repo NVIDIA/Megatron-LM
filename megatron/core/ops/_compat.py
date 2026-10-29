@@ -32,9 +32,9 @@ from typing import Callable, Iterable, Mapping
 REMOVAL_VERSION = "0.22"  # two minor releases after the move landed in 0.20
 
 # Keys, in a forwarder's ``__dict__``, of the function that names the module a write goes to
-# and of the values that writes through the forwarder replaced.
+# and of what that module held before each write through the forwarder still in effect.
 _OWNER = "__forwarder_owner__"
-_REPLACED = "__forwarder_replaced__"
+_ORIGINALS = "__forwarder_originals__"
 _MISSING = object()
 
 
@@ -44,42 +44,55 @@ class _ForwarderModule(ModuleType):
     Without this, ``setattr`` on a forwarder would only shadow the name in the forwarder, and a
     patch applied through the old path would silently leave the implementation untouched.
 
-    Each write records the value it replaced. Deleting the name -- how ``mock.patch`` and, on
-    pytest 9.2+, ``monkeypatch.undo`` remove a patch -- restores that value instead of deleting
-    the implementation's attribute, and writing the replaced value back undoes the write, so
-    nested patches unwind in order.
+    A written name also stays in the forwarder's own namespace until the write ends, as on any
+    patched module, because patch tools choose how to undo from the target's ``__dict__``:
+    ``mock.patch`` and pytest 9.2+ ``monkeypatch`` restore a name the target held by assigning
+    the value they saved, so nested patches unwind by assignment, and remove a name it did not
+    hold by deleting it. Deleting the name, or assigning the original back as ``monkeypatch``
+    does before pytest 9.2, ends the write and restores what the implementation held before
+    it. Reads of a written name still come from the implementation.
     """
 
+    def __getattribute__(self, name: str) -> object:
+        namespace = super().__getattribute__("__dict__")
+        if name in namespace.get(_ORIGINALS, ()):
+            return getattr(namespace[_OWNER](name), name)
+        return super().__getattribute__(name)
+
     def __setattr__(self, name: str, value: object) -> None:
-        local = (
+        namespace = self.__dict__
+        originals = namespace[_ORIGINALS]
+        local = name not in originals and (
             (name.startswith("__") and name.endswith("__"))
-            or name in self.__dict__
+            or name in namespace
             # The import system binding a forwarder child, ``old_pkg.child``, on its parent.
             or (isinstance(value, ModuleType) and value.__name__ == f"{self.__name__}.{name}")
         )
         if local:
             super().__setattr__(name, value)
             return
-        owner = self.__dict__[_OWNER](name)
-        replaced = self.__dict__[_REPLACED].setdefault(name, [])
-        if replaced and value is replaced[-1]:
-            replaced.pop()
+        owner = namespace[_OWNER](name)
+        original = originals.setdefault(name, vars(owner).get(name, _MISSING))
+        if value is original:
+            del originals[name], namespace[name]
         else:
-            replaced.append(vars(owner).get(name, _MISSING))
+            namespace[name] = value
         setattr(owner, name, value)
 
     def __delattr__(self, name: str) -> None:
-        if name in self.__dict__:
+        namespace = self.__dict__
+        originals = namespace[_ORIGINALS]
+        if name in namespace and name not in originals:
             super().__delattr__(name)
             return
-        owner = self.__dict__[_OWNER](name)
-        replaced = self.__dict__[_REPLACED].get(name)
-        if not replaced:
+        owner = namespace[_OWNER](name)
+        if name not in originals:
             delattr(owner, name)
             return
-        previous = replaced.pop()
-        if previous is not _MISSING:
-            setattr(owner, name, previous)
+        original = originals.pop(name)
+        del namespace[name]
+        if original is not _MISSING:
+            setattr(owner, name, original)
         elif name in vars(owner):
             delattr(owner, name)
 
@@ -127,7 +140,7 @@ def deprecated_module(
     forwarder = sys.modules.get(old_name)
     if forwarder is not None:
         forwarder.__dict__[_OWNER] = _owner
-        forwarder.__dict__.setdefault(_REPLACED, {})
+        forwarder.__dict__.setdefault(_ORIGINALS, {})
         forwarder.__class__ = _ForwarderModule
 
     def _submodule(name: str) -> object | None:
