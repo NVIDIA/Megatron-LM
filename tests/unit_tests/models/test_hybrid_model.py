@@ -84,6 +84,8 @@ def test_hybrid_logging_process_groups_are_paired():
 @pytest.mark.parametrize("tp_size,cp_size,pp_size", [(2, 1, 4), (1, 1, 8), (8, 1, 1)])
 def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_size):
     """Test HybridModel with custom process groups."""
+    if Utils.world_size != 8:
+        pytest.skip(f"requires 8 ranks, got {Utils.world_size}")
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tp_size,
         context_parallel_size=cp_size,
@@ -107,11 +109,13 @@ def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_
         cp_group = grid.create_pg("cp")
         tp_group = grid.create_pg("tp")
         dp_cp_group = grid.create_pg(["cp", "dp"])
-        embd_group_ranks = parallel_state.default_embedding_ranks(
-            torch.distributed.get_process_group_ranks(pp_group)
-        )
-        embd_group = torch.distributed.new_group(
-            ranks=embd_group_ranks, timeout=timedelta(minutes=30)
+        # Every world rank must create all embedding groups in the same order.
+        embd_rank_groups = [
+            parallel_state.default_embedding_ranks(pp_ranks)
+            for pp_ranks in grid.get_rank_enum("pp")
+        ]
+        embd_group, _ = torch.distributed.new_subgroups_by_enumeration(
+            embd_rank_groups, timeout=timedelta(minutes=30)
         )
 
         # Create model with custom process groups
@@ -466,6 +470,7 @@ class TestHybridModel:
             # Exercise both layout boundaries without requiring a multi-rank CP group.
             layout_state = SimpleNamespace(
                 prepare_layer=lambda index, tensor: (tensor.roll(1, dims=0), None),
+                get_layer_padding_mask=lambda index, default, masks: default,
                 finalize_layer=lambda index, tensor: tensor.roll(-1, dims=0),
             )
             monkeypatch.setattr(

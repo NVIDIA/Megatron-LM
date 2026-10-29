@@ -1079,7 +1079,7 @@ class TestMegatronFSDPE2E:
             pretrain_cfg_container_from_args,
         )
         from megatron.training.arguments import add_megatron_arguments, validate_args
-        from megatron.training.global_vars import set_global_variables, unset_global_variables
+        from megatron.training.global_vars import set_args, set_run_config, unset_global_variables
 
         # Because we are using pretrain() to test, destroy the entire global state
         # before calling pretrain() for the next test case.
@@ -1180,9 +1180,10 @@ class TestMegatronFSDPE2E:
             args.rank = int(os.getenv("RANK", "0"))
             args.world_size = int(os.getenv("WORLD_SIZE", "1"))
             validate_args(args)
-            set_global_variables(args)
+            set_args(args)
             model_cfg = gpt_config_from_args(args)
             cfg = pretrain_cfg_container_from_args(args, model_cfg)
+            set_run_config(cfg)
 
             from gpt_builders import gpt_builder
             from model_provider import model_provider

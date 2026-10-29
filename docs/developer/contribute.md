@@ -40,6 +40,9 @@ File any bugs you find, keeping the following in mind:
 - Write the commit message subject line in the imperative mood ("Change the default argument for X", not "Changed the default argument for X").
 - Write your commit messages in proper English, with care and punctuation.
 - Check the spelling of your code, comments, and commit messages.
+- Put new operation implementations and kernel backends under `megatron/core/ops`, following
+  [the operations guide](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/ops/README.md) (how to add an operation, how to add
+  a backend kernel to an existing one).
 
 ### Don't
 

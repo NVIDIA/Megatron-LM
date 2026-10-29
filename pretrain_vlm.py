@@ -38,9 +38,11 @@ from megatron.training import (
     set_startup_timestamps,
 )
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
-from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import (
+    get_run_config,
+    set_run_config,
+)
 from pretrain_gpt import loss_func
 
 
@@ -70,6 +72,7 @@ def model_provider(
         model (megatron.core.models.multimodal.llava_model.LLaVAModel): A multimodal model
     """
     args = get_args()
+    cfg = get_run_config()
     vision_model_type = "clip"
 
     assert (
@@ -209,7 +212,7 @@ def model_provider(
     model = LLaVAModel(
         language_transformer_config=language_transformer_config,
         language_transformer_layer_spec=language_transformer_layer_spec,
-        language_vocab_size=args.padded_vocab_size,
+        language_vocab_size=cfg.tokenizer.padded_vocab_size,
         language_max_sequence_length=language_max_sequence_length,
         vision_transformer_config=vision_transformer_config,
         vision_transformer_layer_spec=vision_transformer_layer_spec,
@@ -250,10 +253,11 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     Returns:
         train_ds, val_ds, test_ds (megatron.core.datasets.multimodal_dataset.MockMultimodalDataset): Train, validation, and test datasets, respectively.
     """
+    cfg = get_run_config()
     args = get_args()
 
     config = MultimodalDatasetConfig(
-        random_seed=args.seed,
+        random_seed=cfg.rng.seed,
         split=args.split,
         sequence_length=args.dataloader_seq_length,
         tokenizer=get_tokenizer(),
@@ -500,8 +504,7 @@ if __name__ == "__main__":
         extra_args_provider=add_vlm_extra_args, args_defaults={'tokenizer_type': 'GPT2BPETokenizer'}
     )
     full_config = pretrain_cfg_container_from_args(args)
-    initialize_runtime_services(args)
-    resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
+    set_run_config(full_config)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,

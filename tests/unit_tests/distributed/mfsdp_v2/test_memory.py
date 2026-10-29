@@ -1,6 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Memory-accounting tests for Megatron-FSDP."""
+"""Memory-accounting tests for Megatron-FSDP.
+
+Tests asserting memory usage or storage release belong here, including during
+CUDA graph capture and replay.
+"""
 
 import logging
 
@@ -13,6 +17,7 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
+    RuntimePolicy,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
@@ -145,7 +150,10 @@ def test_training_step_peak_memory_bounds_full_size_buffers(
     model = MultiChildModel(dim=dim, num_children=8).to(dtype=dtype)
     placements = _default_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    with fully_shard_context(device=device, unify_communication_stream=unify_communication_stream):
+    with fully_shard_context(
+        device=device,
+        runtime_policy=RuntimePolicy(unify_communication_stream=unify_communication_stream),
+    ):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
         fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)

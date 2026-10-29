@@ -20,7 +20,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
-from megatron.core.transformer.wide_residual_layer import WideResidualTransformerLayer
+from megatron.core.transformer.wide_residual_transformer_layer import WideResidualTransformerLayer
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -156,9 +156,9 @@ class TestWideResidualMTPAndMIMO:
         assert model.decoder.uses_wide_residual_stream
         assert model.decoder.residual_stream_readout is not None
         assert type(model.decoder.layers[0]) is WideResidualMambaLayer
-        assert model.decoder.layers[0].residual_connection is not None
+        assert model.decoder.layers[0].residual_read is not None
         assert type(model.decoder.layers[1]) is WideResidualTransformerLayer
-        assert model.decoder.layers[1].residual_connection_mlp is not None
+        assert model.decoder.layers[1].residual_read_mlp is not None
         assert not mtp_stack.uses_wide_residual_stream
         assert mtp_stack.residual_stream_readout is None
         assert mtp_stack.layers[0].is_mtp_layer
@@ -167,7 +167,8 @@ class TestWideResidualMTPAndMIMO:
         assert mtp_stack.layers[1].is_mtp_layer
         assert isinstance(mtp_stack.layers[1], TransformerLayer)
         assert not isinstance(mtp_stack.layers[1], WideResidualTransformerLayer)
-        assert mtp_stack.layers[1]._get_mlp_residual_connection() is None
+        for operation in ("read", "write"):
+            assert mtp_stack.layers[1]._get_mlp_residual_connection(operation=operation) is None
         assert model.mtp.layers[0].eh_proj.weight.grad is not None
         assert model.embedding.word_embeddings.weight.grad is not None
         assert loss.shape == input_ids.shape
@@ -299,8 +300,8 @@ class TestWideResidualMTPAndMIMO:
         for shortcut in shortcuts:
             assert shortcut.shortcut_residual_read is not None
             assert shortcut.shortcut_residual_read.read_map.logit.grad is not None
-            assert shortcut.compute_layer.residual_connection.read_map.logit.grad is not None
-            assert shortcut.moe_layer.residual_connection_mlp.read_map.logit.grad is not None
+            assert shortcut.compute_layer.residual_read.read_map.logit.grad is not None
+            assert shortcut.moe_layer.residual_read_mlp.read_map.logit.grad is not None
             assert shortcut.shortcut_post_norm.weight.grad is not None
         assert not mtp_stack.uses_wide_residual_stream
         assert len(mtp_stack.layers) == 1
