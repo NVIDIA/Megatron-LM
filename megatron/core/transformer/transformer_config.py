@@ -1324,10 +1324,10 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     cuda_graph_dynamic_microbatches: bool = False
-    """Allow TE graph replay when packing reduces the source microbatch count.
+    """Deprecated compatibility flag; packed TE graphs infer microbatch handling.
 
-    A fixed source global batch size bounds graph instances. Input slots stay
-    live until backward, independently of the number of packed microbatches.
+    No longer required for PP/VPP. Retained for existing configs and CLI recipes;
+    explicitly enabling it still validates the original supported combinations.
     """
 
     cuda_graph_modules: Union[str, CudaGraphModule, List[str], List[CudaGraphModule]] = "full"
@@ -3814,18 +3814,21 @@ class TransformerConfig(ModelParallelConfig):
             assert self.thd_max_packed_sequences >= (
                 2 if pad_enabled else 1
             ), "THD metadata capacity must leave room for the dummy padding document."
+        scheduler_te_graphs = (
+            self.sequence_packing_scheduler is not None
+            and self.cuda_graph_impl == "transformer_engine"
+        )
         if self.cuda_graph_dynamic_microbatches:
             assert self.cuda_graph_impl == "transformer_engine"
             assert self.sequence_packing_scheduler == "dp_balanced"
+        if self.cuda_graph_dynamic_microbatches or (
+            scheduler_te_graphs and self.pipeline_model_parallel_size > 1
+        ):
             assert not self.overlap_moe_expert_parallel_comm and not self.delay_wgrad_compute
             assert not self.moe_paged_stash
-        if (
-            self.sequence_packing_scheduler is not None
-            and self.cuda_graph_impl == "transformer_engine"
-        ):
+        if scheduler_te_graphs:
             assert self.pad_packed_seq_alignment in ("max", self.max_seqlen_per_dp_cp_rank)
             assert self.thd_max_packed_sequences is not None
-            assert self.pipeline_model_parallel_size == 1 or self.cuda_graph_dynamic_microbatches
             assert self.cuda_graph_modules == [
                 CudaGraphModule.attn
             ], "Scheduler-produced THD CUDA graphs currently support attention capture only."

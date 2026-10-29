@@ -1287,7 +1287,6 @@ class TestTECudaGraphHelper:
                 cuda_graph_impl="transformer_engine",
                 thd_max_packed_sequences=4,
                 cuda_graph_modules=[CudaGraphModule.attn],
-                cuda_graph_dynamic_microbatches=True,
                 sequence_packing_scheduler="dp_balanced",
                 max_seqlen_per_dp_cp_rank=16,
                 pad_packed_seq_alignment="max",
