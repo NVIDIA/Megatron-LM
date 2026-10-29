@@ -528,8 +528,12 @@ class InferenceRowParallelLinear(TERowParallelLinear):
     def _set_next_layer_norm_weights(self, weights: torch.Tensor):
         """
         Set next layer norm weights for fused reduce-scatter + add + rms-norm + all-gather.
+        Pass the norm weight parameter itself: the kernel reads it on every forward, so it
+        sees the parameter's current storage after the model is moved, cast or wrapped.
         """
-        self.next_layer_norm_weights = weights
+        # The parameter belongs to the next layer's norm. Bypass nn.Module.__setattr__,
+        # which would also register it as a parameter of this layer.
+        object.__setattr__(self, "next_layer_norm_weights", weights)
 
     def _set_residual(self, residual: torch.Tensor):
         """

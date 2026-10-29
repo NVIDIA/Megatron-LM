@@ -1702,8 +1702,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
     def _set_fc2_next_layer_norm_weights(self, weights: Optional[Tensor]):
         """Set next layer norm weights for MLP FC2."""
         if weights is None:
-            # Create dummy tensor for last layer (same shape as fc1 norm weights)
-            weights = torch.empty_like(self.get_mlp_layer_norm_weights())
+            # The last layer has no next norm, but its FC2 still runs the fused kernel for the
+            # residual add, and nothing reads the normalized output. Any weights of the right
+            # shape will do: use this layer's FC1 norm weights, which, unlike a tensor made
+            # here, follow the model to its final device and dtype.
+            weights = self.get_mlp_layer_norm_weights()
         self.mlp.linear_fc2._set_next_layer_norm_weights(weights)
 
     def _set_proj_residual(self, residual: Tensor):
@@ -1719,18 +1722,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         Get the MLP FC1 layer norm weights.
 
         Returns:
-            Tensor: The layer norm weight data.
+            Tensor: The layer norm weight parameter itself. Not its data: moving or casting
+                the model (e.g. .cuda(), .bfloat16()) and wrapping it in DDP rebind the
+                parameter to new storage, which a tensor taken from it here would not follow.
         """
-        return self.mlp.linear_fc1.layer_norm_weight.data
+        return self.mlp.linear_fc1.layer_norm_weight
 
     def get_qkv_layer_norm_weights(self) -> Tensor:
         """
         Get the QKV layer norm weights.
 
         Returns:
-            Tensor: The layer norm weight data.
+            Tensor: The layer norm weight parameter itself (see get_mlp_layer_norm_weights).
         """
-        return self.self_attention.linear_qkv.layer_norm_weight.data
+        return self.self_attention.linear_qkv.layer_norm_weight
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
