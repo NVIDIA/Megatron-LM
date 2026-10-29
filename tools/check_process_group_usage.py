@@ -25,8 +25,13 @@ Each entry has one of four kinds:
   which reads the same globals, or ``parallel_state.get_registered_process_groups()``, which
   returns the collection registered for the run. The registry is not deprecated, but Megatron
   Core takes its groups from the caller;
-* ``guarded``: ``resolve_process_groups()``, the warned fallback in ``process_groups_config.py``.
-  It reads the globals only when the caller omits its groups, and warns first.
+* ``guarded``: a helper of ``process_groups_config.py`` that reads the globals only when the
+  caller omits its groups, and warns for that fallback (``GUARDED_HELPERS``):
+  ``resolve_process_groups()``, ``resolve_gtp_remat_group()``, and
+  ``ProcessGroupCollection.setup_process_groups_for_ddp()`` and
+  ``setup_process_groups_for_optimizer()``. ``resolve_gtp_remat_group()`` does not warn when
+  its caller passes ``owner=None`` because that caller has warned already. Their own reads are
+  in an exempt file, so each call counts, whether or not the argument it forwards can be None.
 
 A guarded call is still a read, so wrapping a fallback in ``resolve_process_groups()`` does not
 remove it from the allowlist. A guarded call that replaces a removed accessor, function or shim
@@ -119,9 +124,25 @@ DEPRECATED_FUNCTIONS = {
     "_set_global_memory_buffer",
 }
 
-# Entry kinds in --stats order. "guarded" calls always warn before they read the globals.
+# Entry kinds in --stats order. "guarded" calls warn for the fallback when they read the globals,
+# apart from resolve_gtp_remat_group(owner=None), whose caller has warned already.
 KINDS = ("accessor", "function", "shim", "guarded")
 GUARDED = "guarded"
+
+# The helpers of process_groups_config.py that read the global grid when the caller omits its
+# groups, and the detail of their entries. The file is exempt, so their reads count at each call.
+# A helper whose fallback is removed leaves this map.
+GUARDED_HELPERS = {
+    "megatron.core.process_groups_config.resolve_process_groups": "resolve_process_groups",
+    "megatron.core.process_groups_config.resolve_gtp_remat_group": "resolve_gtp_remat_group",
+    "megatron.core.process_groups_config.ProcessGroupCollection.setup_process_groups_for_ddp": (
+        "setup_process_groups_for_ddp"
+    ),
+    (
+        "megatron.core.process_groups_config.ProcessGroupCollection"
+        ".setup_process_groups_for_optimizer"
+    ): "setup_process_groups_for_optimizer",
+}
 
 # A call of another kind that a fallback warning dominates ends with this suffix: an earlier
 # statement of the same block, or of a block that contains it, in the same function, calls
@@ -361,8 +382,8 @@ def _violations_in(path: pathlib.Path):
                 "megatron.core.process_groups_config.ProcessGroupCollection.use_mpu_process_groups"
             ):
                 identity = "shim:use_mpu_process_groups"
-            elif name == "megatron.core.process_groups_config.resolve_process_groups":
-                identity = "guarded:resolve_process_groups"
+            elif name in GUARDED_HELPERS:
+                identity = f"{GUARDED}:{GUARDED_HELPERS[name]}"
             if identity:
                 scope = ".".join(self.scope) or "<module>"
                 if self.warned and not identity.startswith(GUARDED + ":"):
@@ -536,8 +557,10 @@ def main(argv=None) -> int:
             "Note that neither ProcessGroupCollection.use_mpu_process_groups() nor "
             "parallel_state.get_registered_process_groups() is a valid replacement -- they "
             "return the same global groups.\n"
-            "resolve_process_groups() is counted too: it may only replace a read in the same "
-            "function, for callers that do not pass their groups yet.\n"
+            "resolve_process_groups() and the other guarded helpers of process_groups_config.py "
+            "(resolve_gtp_remat_group(), ProcessGroupCollection.setup_process_groups_for_ddp() "
+            "and setup_process_groups_for_optimizer()) are counted too: a call may only replace "
+            "a read in the same function, for callers that do not pass their groups yet.\n"
             "See https://github.com/NVIDIA/Megatron-LM/issues/6307\n"
         )
     if added or lost:

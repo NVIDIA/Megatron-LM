@@ -30,6 +30,8 @@ SHIM_CALL = "ProcessGroupCollection.use_mpu_process_groups()"
 GUARDED_IMPORT = "from megatron.core.process_groups_config import resolve_process_groups\n"
 GUARDED_ARGS = "(None, owner='Model', required=('tp',))"
 GUARDED_CALL = "resolve_process_groups" + GUARDED_ARGS
+GTP_IMPORT = "from megatron.core.process_groups_config import resolve_gtp_remat_group\n"
+GTP_CALL = "resolve_gtp_remat_group(None, is_expert=False)"
 WARN_IMPORT = "from megatron.core.process_groups_config import warn_global_process_group_fallback\n"
 WARN = "warn_global_process_group_fallback('f')"
 WARNED_HIT = "f:accessor:parallel_state.get_tensor_model_parallel_group:warned"
@@ -131,6 +133,55 @@ class TestDetection(unittest.TestCase):
                     self.hits(prefix + call), ["<module>:guarded:resolve_process_groups"]
                 )
 
+    def test_flags_the_other_grid_helpers_as_guarded(self):
+        cases = [
+            (GTP_IMPORT, GTP_CALL, "resolve_gtp_remat_group"),
+            (
+                "from ..process_groups_config import resolve_gtp_remat_group as resolve\n",
+                "resolve(pg_collection, True)",
+                "resolve_gtp_remat_group",
+            ),
+            (
+                "from megatron.core import process_groups_config as pgc\n",
+                "pgc.resolve_gtp_remat_group(None, False, owner=None)",
+                "resolve_gtp_remat_group",
+            ),
+            (
+                SHIM_IMPORT,
+                "ProcessGroupCollection.setup_process_groups_for_ddp(None, config, ddp_config)",
+                "setup_process_groups_for_ddp",
+            ),
+            (
+                "from megatron.core.process_groups_config import ProcessGroupCollection as PGC\n",
+                "PGC.setup_process_groups_for_optimizer(pg_collection, model_chunks)",
+                "setup_process_groups_for_optimizer",
+            ),
+        ]
+        for prefix, call, helper in cases:
+            with self.subTest(call=call):
+                self.assertEqual(self.hits(prefix + call), [f"<module>:guarded:{helper}"])
+
+    def test_counts_every_grid_reading_helper_of_process_groups_config(self):
+        # process_groups_config.py is exempt, so each helper there that calls a deprecated
+        # parallel_state function or use_mpu_process_groups() counts at its calls instead.
+        path = REPO_ROOT / "megatron" / "core" / "process_groups_config.py"
+        readers = set()
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+                    continue
+                name = call.func.attr
+                deprecated = (
+                    checker._is_deprecated_accessor(name) or name in checker.DEPRECATED_FUNCTIONS
+                )
+                if name == "use_mpu_process_groups" or (
+                    ast.unparse(call.func.value) == "parallel_state" and deprecated
+                ):
+                    readers.add(node.name)
+        self.assertEqual(readers, {helper.rpartition(".")[2] for helper in checker.GUARDED_HELPERS})
+
     def test_guarded_calls_are_keyed_by_enclosing_scope(self):
         self.assertEqual(
             self.hits(
@@ -147,6 +198,8 @@ class TestDetection(unittest.TestCase):
                 "from megatron.core import process_groups_config as pgc\n"
                 "pgc.require_process_groups(pg_collection, ('tp',), owner='Model')\n"
                 "pgc.warn_global_process_group_fallback('Model')\n"
+                "pgc.ProcessGroupCollection.is_gtp_remat_active({})\n"
+                "pgc.amax_reduction_group(pg_collection, True)\n"
                 "from unrelated import resolve_process_groups\n" + GUARDED_CALL
             ),
             [],
@@ -731,6 +784,16 @@ class TestRatchet(unittest.TestCase):
                 )
                 self.assertEqual(allowlist["total"], 1)
                 self.assertEqual(self.run_check(), 0)
+
+    def test_conversion_to_another_guarded_helper_swaps_the_entry(self):
+        self.write_baseline(SHIM_IMPORT + "def build():\n    " + SHIM_CALL)
+        self.source.write_text(GTP_IMPORT + "def build():\n    " + GTP_CALL, encoding="utf-8")
+        self.assertEqual(self.run_check(), 1)
+        self.assertEqual(self.run_check("--update"), 0)
+        self.assertEqual(
+            json.loads(self.allowlist.read_text())["allowed"],
+            {"megatron/core/sample.py": ["build:guarded:resolve_gtp_remat_group"]},
+        )
 
     def test_guarded_call_without_a_replaced_read_is_new(self):
         other = self.core / "other.py"
