@@ -17,16 +17,20 @@ device-memory pressure from enabling Shortcut-MoE.
 
 from __future__ import annotations
 
-from typing import Sequence
+from contextlib import AbstractContextManager
+from typing import Callable, Sequence
 
 import torch
 
+from megatron.core.context_parallel.layout import ContextParallelLayoutState
 from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
-from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.layer_interface import AuxInputs, LayerInterface
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
@@ -129,7 +133,7 @@ def group_layers_into_shortcut_blocks(
     return grouped_layers
 
 
-class ShortcutMoEBlock(MegatronModule):
+class ShortcutMoEBlock(MegatronModule, LayerInterface):
     """Own and execute one attention-layer/shortcut-MoE pair."""
 
     _parallel_stream: torch.cuda.Stream | None = None
@@ -397,61 +401,30 @@ class ShortcutMoEBlock(MegatronModule):
         combined_output.record_stream(torch.cuda.current_stream())
         return combined_output
 
-    def _forward_compute_atomic(
-        self,
-        hidden_states,
-        *,
-        attention_mask,
-        inference_context,
-        rotary_pos_emb,
-        sequence_len_offset,
-        packed_seq_params,
-        padding_mask,
-    ):
-        """Run the paired layer's ordinary forward, which updates its KV cache or recurrent state.
-
-        Uses the same per-layer arguments as HybridStack.forward passes to unpaired layers.
-        """
-        if isinstance(self.compute_layer, MambaLayer):
-            return self.compute_layer(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-                packed_seq_params=packed_seq_params,
-            )
-        hidden_states, _ = self.compute_layer(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            sequence_len_offset=sequence_len_offset,
-            packed_seq_params=packed_seq_params,
-            padding_mask=padding_mask,
-        )
-        return hidden_states
-
     def forward(
         self,
-        hidden_states,
-        attention_mask,
-        inference_context,
-        rotary_pos_emb,
-        sequence_len_offset,
-        packed_seq_params,
-        padding_mask,
-        quant_context_factory,
-        cp_layout_state=None,
-        packed_sequence_cp_metadata=None,
-        attn_recompute_context: ResidualStreamRecomputeContext | None = None,
-        moe_recompute_context: ResidualStreamRecomputeContext | None = None,
+        hidden_states: torch.Tensor,
+        quant_context_factory: Callable[[TransformerConfig, int], AbstractContextManager],
+        cp_layout_state: ContextParallelLayoutState | None = None,
+        residual_stream_recompute_plan: Sequence[ResidualStreamRecomputeContext | None] = (),
+        inference_context: BaseInferenceContext | None = None,
+        packed_seq_params: PackedSeqParams | None = None,
+        padding_mask: torch.Tensor | None = None,
         padding_mask_by_layout=None,
-    ):
-        """Run the eager schedule with each physical layer's quantization context.
+        *,
+        aux_inputs: AuxInputs,
+    ) -> torch.Tensor:
+        """Run the paired layers with their quantization and context-parallel settings.
 
-        In inference the paired layer runs its ordinary forward instead of the two-stage split,
-        which never updates KV-cache or recurrent state, and communication stays on the current
-        stream.
-        """
+        Inference uses the paired layer's full forward to update its cache or recurrent
+        state. Training may split the layer into stages and overlap communication."""
+
+        attn_recompute_context = moe_recompute_context = None
+        if residual_stream_recompute_plan:
+            if self.attn_local_idx is None or self.moe_local_idx is None:
+                raise ValueError("Shortcut replay requires both physical layer indices.")
+            attn_recompute_context = residual_stream_recompute_plan[self.attn_local_idx]
+            moe_recompute_context = residual_stream_recompute_plan[self.moe_local_idx]
 
         select_token_dispatcher = getattr(self.moe_layer.mlp, "select_token_dispatcher", None)
         if select_token_dispatcher is not None:
@@ -511,32 +484,25 @@ class ShortcutMoEBlock(MegatronModule):
         # Launch the input and attn of the attention layer
         paired_state = None  # initialize variable early to make pylint happy
         with quant_context_factory(attn_config, self.attn_layer_idx):
+            compute_inputs = aux_inputs.update(
+                residual_stream_recompute_context=attn_recompute_context
+            )
             if inference:
-                attn_layer_output = self._forward_compute_atomic(
+                attn_layer_output, aux_outputs = self.compute_layer(
                     hidden_states,
-                    attention_mask=attention_mask,
+                    compute_inputs,
                     inference_context=inference_context,
-                    rotary_pos_emb=rotary_pos_emb,
-                    sequence_len_offset=sequence_len_offset,
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
                 )
-            elif attn_recompute_context is None:
-                paired_state = self.compute_layer.forward_pre_attn_and_core_attn(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    rotary_pos_emb=rotary_pos_emb,
-                    packed_seq_params=packed_seq_params,
-                    packed_sequence_cp_metadata=packed_sequence_cp_metadata,
-                )
+                assert aux_outputs.bias is None, "Shortcut blocks require complete residual layers"
             else:
                 paired_state = self.compute_layer.forward_pre_attn_and_core_attn(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    rotary_pos_emb=rotary_pos_emb,
+                    hidden_states,
+                    compute_inputs,
+                    inference_context=inference_context,
                     packed_seq_params=packed_seq_params,
-                    packed_sequence_cp_metadata=packed_sequence_cp_metadata,
-                    residual_stream_recompute_context=attn_recompute_context,
+                    padding_mask=padding_mask,
                 )
 
         # Launch the dispatch, experts, and combine
@@ -564,13 +530,16 @@ class ShortcutMoEBlock(MegatronModule):
             assert paired_state is not None
             with quant_context_factory(attn_config, self.attn_layer_idx):
                 if attn_recompute_context is None:
-                    attn_layer_output = self.compute_layer.forward_post_core_attn(*paired_state)
-                else:
-                    attn_layer_output = self.compute_layer.forward_post_core_attn(
-                        *paired_state, residual_stream_recompute_context=attn_recompute_context
+                    attn_layer_output, aux_outputs = self.compute_layer.forward_post_core_attn(
+                        *paired_state, aux_inputs=aux_inputs
                     )
-                if isinstance(attn_layer_output, tuple):
-                    attn_layer_output = attn_layer_output[0]
+                else:
+                    attn_layer_output, aux_outputs = self.compute_layer.forward_post_core_attn(
+                        *paired_state,
+                        aux_inputs=aux_inputs,
+                        residual_stream_recompute_context=attn_recompute_context,
+                    )
+                assert aux_outputs.bias is None, "Shortcut blocks require complete residual layers"
 
         if cp_layout_state is not None:
             attn_layer_output, moe_packed_seq_params = cp_layout_state.prepare_layer(

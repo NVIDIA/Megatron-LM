@@ -196,7 +196,6 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-        packed_sequence_cp_metadata=None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -205,10 +204,6 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         Return:
             torch.Tensor: Normalized recurrence output.
         """
-        assert (
-            packed_sequence_cp_metadata is None
-        ), "GDN does not support packed-sequence chunkwise CP metadata."
-
         inference_context = deprecate_inference_params(inference_context, inference_params)
         # Training-only. Inference is dispatched by forward() before this stage, because
         # ssm_dynamic_inference already applies the output projection while this method must

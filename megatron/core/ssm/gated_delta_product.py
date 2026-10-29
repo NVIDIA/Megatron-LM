@@ -36,6 +36,7 @@ from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.layer_interface import LayerInterface
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
@@ -168,7 +169,9 @@ class GatedDeltaProductMixerSubmodules:
     out_proj: Union[ModuleSpec, type] = None
 
 
-class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLayer):
+class GatedDeltaProductMixer(
+    SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLayer, LayerInterface
+):
     """Gated Delta Product (GDP) sequence mixer for hybrid models.
 
     The mixer accepts hidden states with shape ``[sequence, batch, hidden]`` and returns

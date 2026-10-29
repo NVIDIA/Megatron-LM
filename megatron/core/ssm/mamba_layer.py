@@ -25,6 +25,11 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.layer_interface import (
+    LayerInterface,
+    bind_layer_input_stage,
+    bind_layer_output_stage,
+)
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.residual_connection import ResidualBranchInput
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
@@ -59,7 +64,7 @@ class MambaLayerSubmodules:
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
 
 
-class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
+class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer, LayerInterface):
     """
     A single Mamba layer.
 
@@ -191,14 +196,11 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
 
         return ssm_output, state
 
+    @bind_layer_input_stage
     def forward_pre_attn_and_core_attn(
         self,
         hidden_states: Tensor,
-        attention_mask: Optional[Tensor] = None,  # Not used in MambaLayer
         inference_context: Optional[BaseInferenceContext] = None,
-        rotary_pos_emb: Optional[Tensor] = None,  # Not used in MambaLayer
-        sequence_len_offset: Optional[int] = None,  # Not used in MambaLayer
-        padding_mask: Optional[Tensor] = None,  # Not used in MambaLayer
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
@@ -210,10 +212,8 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         Args:
             hidden_states (Tensor): Input tensor of shape [s, b, h] where s is sequence length,
                 b is batch size, and h is hidden size.
-            attention_mask (Tensor): Mask tensor for self-attention. Not used by this layer.
             inference_context (BaseInferenceContext, optional): Must be ``None`` because two-stage
                 mixer execution is training-only.
-            rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
 
         Returns:
             Core SSM result and residual, followed by connection state for a connected layer.
@@ -230,10 +230,15 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         ssm_output = self.mixer.forward_pre_attn_and_core_attn(
             prepared.branch_input,
             packed_seq_params=packed_seq_params,
-            packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+            packed_sequence_cp_metadata=(
+                packed_sequence_cp_metadata
+                if getattr(self.mixer, "chunkwise_context_parallel", False)
+                else None
+            ),
         )
         return self._pack_two_stage_output(ssm_output, prepared.state)
 
+    @bind_layer_output_stage
     def forward_post_core_attn(
         self,
         ssm_output: Tensor,
@@ -255,9 +260,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
     def forward(
         self,
         hidden_states: Tensor,
-        attention_mask: Optional[Tensor] = None,  # Not used in MambaLayer
         inference_context: Optional[BaseInferenceContext] = None,
-        rotary_pos_emb: Optional[Tensor] = None,  # Not used in MambaLayer
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
@@ -273,10 +276,8 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         Args:
             hidden_states (Tensor): Input tensor of shape [s, b, h] where s is sequence length,
                 b is batch size, and h is hidden size.
-            attention_mask (Tensor): Mask tensor for self-attention. Not used by this layer.
             inference_context (BaseInferenceContext, optional): Parameters for inference-time
                 optimizations.
-            rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
             packed_sequence_cp_metadata (PackedSequenceCPMetadata, optional): Rank-local
                 packed-sequence metadata for chunkwise CP.
             residual_stream_recompute_context (ResidualStreamRecomputeContext, optional):
@@ -303,19 +304,15 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             # transformer layer's self_attention/mlp (this is where the SSD kernel autotune
             # lands on the first pass).
             with _otel_managed_span('layer', 'megatron.layer.mamba'):
-                if packed_sequence_cp_metadata is None:
-                    mixer_out_with_bias = self.mixer(
-                        prepared.branch_input,
-                        inference_context=inference_context,
-                        packed_seq_params=packed_seq_params,
-                    )
-                else:
-                    mixer_out_with_bias = self.mixer(
-                        prepared.branch_input,
-                        inference_context=inference_context,
-                        packed_seq_params=packed_seq_params,
-                        packed_sequence_cp_metadata=packed_sequence_cp_metadata,
-                    )
+                mixer_kwargs = {}
+                if getattr(self.mixer, "chunkwise_context_parallel", False):
+                    mixer_kwargs["packed_sequence_cp_metadata"] = packed_sequence_cp_metadata
+                mixer_out_with_bias = self.mixer(
+                    prepared.branch_input,
+                    inference_context=inference_context,
+                    packed_seq_params=packed_seq_params,
+                    **mixer_kwargs,
+                )
 
             hidden_states = self._apply_mixer_update(
                 mixer_out_with_bias, prepared.state, recompute_context=recompute_context

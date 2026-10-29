@@ -196,11 +196,7 @@ class TestMambaLayer:
         sequence_length = 32
         hidden_states = torch.ones((sequence_length, micro_batch_size, layer.config.hidden_size))
         hidden_states = hidden_states.cuda()
-        attention_mask = torch.ones(
-            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
-        )
-        attention_mask = attention_mask.cuda()
-        output = layer(hidden_states, attention_mask=attention_mask)
+        output = layer(hidden_states)
         assert output.shape[0] == sequence_length
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == layer.config.hidden_size

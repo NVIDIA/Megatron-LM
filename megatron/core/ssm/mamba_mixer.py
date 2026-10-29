@@ -38,6 +38,7 @@ from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.layer_interface import LayerInterface
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
@@ -141,7 +142,7 @@ class MambaMixerSubmodules:
     out_proj: Union[ModuleSpec, type] = None
 
 
-class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLayer):
+class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLayer, LayerInterface):
     """
     Args:
         config: The config of the model.

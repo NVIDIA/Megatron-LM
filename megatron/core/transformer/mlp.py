@@ -26,6 +26,7 @@ from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.layer_interface import LayerInterface
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -154,7 +155,7 @@ class MLPSubmodules:
     """
 
 
-class MLP(MegatronModule):
+class MLP(MegatronModule, LayerInterface):
     """
     MLP will take the input with h hidden state, project it to 4*h
     hidden dimension, perform nonlinear transformation, and project the

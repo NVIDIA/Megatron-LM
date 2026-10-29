@@ -11,6 +11,7 @@ from megatron.core import tensor_parallel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.layer_interface import AuxInputs
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
@@ -103,11 +104,20 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         # _apply_mlp_bda_step — do not delete; appears unused only at the class level.
         self._mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None
 
+    def bind_layer_inputs(self, hidden_states, aux_inputs, **kwargs):
+        """Keep the per-call recompute manager outside the executable arguments."""
+        inputs = vars(aux_inputs).copy()
+        self._mhc_recompute_manager = inputs.pop("mhc_recompute_manager", None)
+        return super().bind_layer_inputs(hidden_states, AuxInputs(**inputs), **kwargs)
+
     def __call__(self, *args, **kwargs):
-        # Pull the manager off kwargs before super().__call__ hands them to the
-        # CUDA-graph machinery (which can't handle a CheckpointWithoutOutputManager).
-        # forward() reads the value back from self.
-        self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
+        # Shared calls extract the manager in bind_layer_inputs, including additional
+        # keyword arguments. Legacy calls keep it outside CUDA-graph arguments here instead.
+        shared_inputs = (len(args) > 1 and isinstance(args[1], AuxInputs)) or isinstance(
+            kwargs.get("aux_inputs", kwargs.get("inputs")), AuxInputs
+        )
+        if not shared_inputs:
+            self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
         return super().__call__(*args, **kwargs)
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):

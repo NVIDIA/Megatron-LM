@@ -1,97 +1,102 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from contextlib import nullcontext
-from typing import List, Optional, Set, Tuple, Union
+from typing import Any, List, Optional, Set
 
 from torch import Tensor
+from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from megatron.core.context_parallel import ContextParallelLayoutState, CPLayout
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.tensor_observation import observe_layer_residuals
+from megatron.core.transformer.layer_interface import AuxInputs, bind_aux_inputs
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import precision_aware_checkpoint
 from megatron.core.utils import make_viewless_tensor
 
 
+@bind_aux_inputs
 def checkpointed_forward(
     self: MegatronModule,
     hidden_states: Tensor,
-    attention_mask: Tensor,
-    context: Optional[Tensor],
-    context_mask: Optional[Tensor],
-    rotary_pos_emb: Tensor,
-    attention_bias: Optional[Tensor],
-    packed_seq_params: PackedSeqParams,
     use_inner_quantization_context: bool,
     padding_mask: Optional[Tensor] = None,
     padding_mask_by_layout: Optional[dict[CPLayout, Optional[Tensor]]] = None,
     extract_layer_indices: Optional[Set[int]] = None,
     layer_offset: int = 0,
     cp_layout_state: Optional[ContextParallelLayoutState] = None,
-    packed_sequence_cp_metadata: object | None = None,
-    input_ids: Optional[Tensor] = None,
-) -> Union[Tensor, Tuple[Tensor, Tensor]]:
-    """Forward method with activation checkpointing.
+    rotary_pos_emb: Tensor | tuple[Tensor, Tensor] | list[Tensor] | None = None,
+    *,
+    aux_inputs: AuxInputs | None = None,
+    **layer_kwargs: Any,
+) -> Tensor | tuple[Tensor, list[Tensor]]:
+    """Run layers in checkpointed chunks using packed or explicit layer inputs.
 
-    Args:
-        extract_layer_indices (Set[int], optional): Global layer
-            indices (across all pipeline stages) from which to
-            extract features.
-        layer_offset (int): The global layer offset for the current
-            pipeline stage. Used to convert local layer indices to
-            global indices when checking extract_layer_indices.
-        cp_layout_state (ContextParallelLayoutState, optional): CP layout state for this forward.
-        packed_sequence_cp_metadata (optional): Packed-sequence CP metadata for Mamba layers.
-        input_ids (Tensor, optional): Token IDs forwarded to hash-routed MoE layers.
-
-    Returns:
-        If extract_layer_indices is empty: hidden_states tensor
-        If extract_layer_indices is non-empty: (hidden_states, intermediate_hidden_states) tuple
-    """
+    Return hidden states alone unless ``extract_layer_indices`` requests intermediate
+    states. Those indices are global; ``layer_offset`` locates this pipeline stage."""
     if extract_layer_indices is None:
         extract_layer_indices = set()
     intermediate_hidden_states: List[Tensor] = []
-
-    # Wrap non-dual RoPE to tuple to unify custom_forward interface.
-    is_dual_rope = isinstance(rotary_pos_emb, (tuple, list))
-    assert not is_dual_rope or len(rotary_pos_emb) == 2, "Dual RoPE input length is not equal to 2"
-    rotary_pos_emb = rotary_pos_emb if is_dual_rope else (None, rotary_pos_emb)
+    shared_inputs = aux_inputs is not None
+    if shared_inputs and layer_kwargs:
+        raise TypeError("Pass either auxiliary inputs or explicit layer arguments")
+    input_fields = dict(
+        vars(aux_inputs) if shared_inputs else layer_kwargs,
+        rotary_pos_emb=rotary_pos_emb,
+        padding_mask=padding_mask,
+        padding_mask_by_layout=padding_mask_by_layout,
+    )
+    if isinstance(rotary_pos_emb, (tuple, list)):
+        assert len(rotary_pos_emb) == 2, "Dual RoPE input length is not equal to 2"
 
     def custom(start: int, end: int):
-        def custom_forward(
-            hidden_states,
-            attention_mask,
-            context,
-            context_mask,
-            rotary_pos_emb_local,
-            rotary_pos_emb_global,
-            padding_mask=None,
-            input_ids=None,
-        ):
-            rotary_pos_emb = (
-                (rotary_pos_emb_local, rotary_pos_emb_global)
-                if is_dual_rope
-                else rotary_pos_emb_global
-            )
+        # Checkpoint functions accept only tensors. Keep non-tensor metadata in
+        # the closure, and reconstruct immutable input snapshots for each replay.
+        leaves, input_spec = tree_flatten(input_fields)
+        tensor_indices = [i for i, value in enumerate(leaves) if isinstance(value, Tensor)]
+        tensor_inputs = tuple(leaves[i] for i in tensor_indices)
+        for i in tensor_indices:
+            leaves[i] = None
 
+        def custom_forward(hidden_states, *input_tensors):
+            restored = list(leaves)
+            for i, tensor in zip(tensor_indices, input_tensors):
+                restored[i] = tensor
+            layer_kwargs = tree_unflatten(restored, input_spec)
+            padding_mask = layer_kwargs.pop("padding_mask")
+            padding_mask_by_layout = layer_kwargs.pop("padding_mask_by_layout")
+            # Restore checkpointed metadata once, then select its consumers per layer.
+            packed_sequence_cp_metadata = (
+                layer_kwargs.pop("packed_sequence_cp_metadata", None) if shared_inputs else None
+            )
             for index in range(start, end):
                 # Use self.layers[index] (not self._get_layer) so this
                 # function works for both TransformerBlock and HybridStack.
                 layer = self.layers[index]
-                layer_packed_seq_params = packed_seq_params
                 if cp_layout_state is not None:
                     hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
                         index, hidden_states
                     )
+                    layer_kwargs["packed_seq_params"] = layer_packed_seq_params
                 # Keep both residuals in the layer's layout, inside the CP conversions.
                 residual_accumulator = hidden_states
                 layer_padding_mask = padding_mask
                 if cp_layout_state is not None:
                     layer_padding_mask = cp_layout_state.get_layer_padding_mask(
                         index, padding_mask, padding_mask_by_layout
+                    )
+
+                layer_kwargs["padding_mask"] = layer_padding_mask
+                layer_inputs = AuxInputs(**layer_kwargs) if shared_inputs else None
+                if (
+                    shared_inputs
+                    and packed_sequence_cp_metadata is not None
+                    and type(layer.config) is MambaLayerConfig
+                    and layer.config.linear_cp_mode == "chunkwise"
+                ):
+                    layer_inputs = layer_inputs.update(
+                        packed_sequence_cp_metadata=packed_sequence_cp_metadata
                     )
 
                 # Get appropriate inner quantization context
@@ -110,72 +115,27 @@ def checkpointed_forward(
                 else:
                     inner_quantization_context = nullcontext()
 
-                # Build the full TransformerLayer kwarg set. Hybrid mHC wrappers expose
-                # an explicit capability flag so this module does not need to import
-                # hybrid_block (which would create a circular import).
-                layer_kwargs = dict(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    context=context,
-                    context_mask=context_mask,
-                    rotary_pos_emb=rotary_pos_emb,
-                    attention_bias=attention_bias,
-                    inference_context=None,
-                    packed_seq_params=layer_packed_seq_params,
-                    padding_mask=layer_padding_mask,
-                )
-                inner_layer = getattr(layer, "inner_layer", layer)
-                router = getattr(getattr(inner_layer, "mlp", None), "router", None)
-                if input_ids is not None and getattr(router, "is_hash_layer", False):
-                    layer_kwargs["input_ids"] = input_ids
                 with inner_quantization_context:
-                    if isinstance(layer, TransformerLayer):
-                        hidden_states, context = layer(**layer_kwargs)
-                    elif getattr(layer, "supports_hybrid_recompute_kwargs", False):
-                        # HyperConnectionHybridLayer accepts the routing metadata
-                        # consumed by wrapped MoE layers, but not cross-attention kwargs
-                        # from the TransformerLayer interface. This also covers a wrapper
-                        # around a MambaLayer; the wrapper narrows kwargs for its inner layer.
-                        for k in ("context", "context_mask", "attention_bias"):
-                            layer_kwargs.pop(k, None)
-                        if packed_sequence_cp_metadata is not None:
-                            layer_kwargs["packed_sequence_cp_metadata"] = (
-                                packed_sequence_cp_metadata
-                            )
-                        hidden_states, context = layer(**layer_kwargs)
-                    else:  # MambaLayer (HybridStack `M` slot)
-                        for k in (
-                            "context",
-                            "context_mask",
-                            "attention_bias",
-                            "padding_mask",
-                            "input_ids",
-                        ):
-                            layer_kwargs.pop(k, None)
-                        if (
-                            packed_sequence_cp_metadata is not None
-                            and type(layer.config) is MambaLayerConfig
-                            and layer.config.linear_cp_mode == "chunkwise"
-                        ):
-                            layer_kwargs["packed_sequence_cp_metadata"] = (
-                                packed_sequence_cp_metadata
-                            )
-                        hidden_states = layer(**layer_kwargs)
-                        context = None
+                    if layer_inputs is not None:
+                        hidden_states, aux_outputs = layer(hidden_states, layer_inputs)
+                        assert (
+                            aux_outputs.bias is None
+                        ), "Recompute requires complete residual layers"
+                    else:
+                        hidden_states, layer_kwargs["context"] = layer(
+                            hidden_states=hidden_states, **layer_kwargs
+                        )
 
-                # Some layer paths may still return a tuple (defensive).
-                if isinstance(hidden_states, tuple):
-                    hidden_states = hidden_states[0]
                 observe_layer_residuals(layer, residual_accumulator, hidden_states)
                 if cp_layout_state is not None:
                     hidden_states = cp_layout_state.finalize_layer(index, hidden_states)
-            return hidden_states, context
+            return hidden_states if shared_inputs else (hidden_states, layer_kwargs.get("context"))
 
-        return custom_forward
+        return custom_forward, tensor_inputs
 
     def chunk_runner(start: int, end: int, use_checkpoint: bool):
-        nonlocal hidden_states, context
-        cf = custom(start, end)
+        nonlocal hidden_states
+        cf, tensor_inputs = custom(start, end)
         if use_checkpoint and self.config.enable_mhc_connections:
             # mHC expands the block input and its zero-dropout BDA path can return views.
             # Distributed activation checkpointing replaces the first input's .data, which
@@ -183,18 +143,9 @@ def checkpointed_forward(
             hidden_states = make_viewless_tensor(
                 inp=hidden_states, requires_grad=True, keep_graph=True
             )
-        # Unpack the RoPE tuple as torch cannot save tuples for backward pass.
-        args = (
-            hidden_states,
-            attention_mask,
-            context,
-            context_mask,
-            *rotary_pos_emb,
-            padding_mask,
-            input_ids,
-        )
+        args = (hidden_states, *tensor_inputs)
         if use_checkpoint:
-            hidden_states, context = precision_aware_checkpoint(
+            result = precision_aware_checkpoint(
                 cf,
                 self.config,
                 self.pg_collection.tp,
@@ -202,9 +153,11 @@ def checkpointed_forward(
                 distribute_saved_activations=self.config.distribute_saved_activations,
             )
         else:
-            # Note: original block-branch no-checkpoint path omitted padding_mask
-            # (relied on its default=None); restored here for consistency.
-            hidden_states, context = cf(*args)
+            result = cf(*args)
+        if shared_inputs:
+            hidden_states = result
+        else:
+            hidden_states, input_fields["context"] = result
 
         if self.config.recompute_method == "uniform":
             if (end - 1 + layer_offset) in extract_layer_indices:
@@ -241,8 +194,6 @@ def checkpointed_forward(
     else:
         raise ValueError("Invalid activation recompute method.")
 
-    # Return intermediate hidden states if feature extraction was requested
-    if len(extract_layer_indices) > 0:
+    if extract_layer_indices:
         return hidden_states, intermediate_hidden_states
-
     return hidden_states

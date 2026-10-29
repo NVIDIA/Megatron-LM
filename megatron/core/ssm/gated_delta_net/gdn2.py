@@ -164,7 +164,6 @@ class GatedDeltaNet2(_GDNBase):
         sequence_len_offset: int | None = None,
         *,
         inference_params: BaseInferenceContext | None = None,
-        packed_sequence_cp_metadata=None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -173,10 +172,6 @@ class GatedDeltaNet2(_GDNBase):
         Return:
             torch.Tensor: Normalized recurrence output.
         """
-        assert (
-            packed_sequence_cp_metadata is None
-        ), "GDN2 does not support packed-sequence chunkwise CP metadata."
-
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         seq_len, batch, _ = hidden_states.shape
