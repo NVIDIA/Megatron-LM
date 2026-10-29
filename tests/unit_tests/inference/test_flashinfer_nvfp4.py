@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import functools
 from types import SimpleNamespace
 
 import pytest
@@ -164,6 +165,29 @@ def test_flashinfer_nvfp4_refresh_requantizes_in_place(monkeypatch):
     assert captured["fc2"] is grouped_mlp._fc2_weight
 
 
+@pytest.mark.parametrize("built", [False, True], ids=["before_first_forward", "after"])
+def test_refit_cache_refresh_requantizes_nvfp4(monkeypatch, built):
+    """Every refit path ends in refresh_module_caches; it must reach the NVFP4 stacks."""
+    from megatron.core.resharding.execution import refresh_module_caches
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    calls, syncs = [], []
+
+    def _refresh(self):
+        calls.append(self)
+        return built
+
+    monkeypatch.setattr(InferenceGroupedMLP, "refresh_flashinfer_nvfp4_weights", _refresh)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: syncs.append(True))
+    grouped_mlp = InferenceGroupedMLP.__new__(InferenceGroupedMLP)
+    torch.nn.Module.__init__(grouped_mlp)
+
+    refresh_module_caches([torch.nn.Sequential(grouped_mlp)])
+
+    assert calls == [grouped_mlp]
+    assert syncs == ([True] if built else [])
+
+
 def test_flashinfer_forward_dispatches_to_nvfp4(monkeypatch):
     from megatron.core.transformer.moe import experts
 
@@ -193,6 +217,9 @@ def test_flashinfer_forward_dispatches_to_nvfp4(monkeypatch):
         num_local_experts=2,
         ep_group=SimpleNamespace(size=lambda: 4, rank=lambda: 3),
     )
+    grouped_mlp._flashinfer_routed_forward = functools.partial(
+        experts.InferenceGroupedMLP._flashinfer_routed_forward, grouped_mlp
+    )
     monkeypatch.setattr(experts.InferenceMode, "_use_bounded_mxfp8_rows", True)
 
     output, bias = experts.InferenceGroupedMLP._flashinfer_forward(
@@ -214,10 +241,11 @@ def test_flashinfer_forward_dispatches_to_nvfp4(monkeypatch):
 
 
 @pytest.mark.parametrize("built", [False, True], ids=["before_first_forward", "after"])
-def test_refit_rejects_built_nvfp4_expert_weights(monkeypatch, built):
-    """A refit after the NVFP4 copy is built would leave generation on the old weights.
+def test_refit_accepts_built_nvfp4_expert_weights(monkeypatch, built):
+    """Refit runs whether or not the NVFP4 copy exists yet.
 
-    Before the first forward there is no copy yet; it is built from the refit weights.
+    Before the first forward there is no copy; it is built from the refit weights.
+    After it, execute_reshard_plan's refresh_module_caches requantizes it in place.
     """
     from megatron.core.resharding import refit
 
@@ -233,12 +261,8 @@ def test_refit_rejects_built_nvfp4_expert_weights(monkeypatch, built):
     )
     service = SimpleNamespace(set_model_roles=lambda **kwargs: None)
 
-    if built:
-        with pytest.raises(NotImplementedError, match="per-token NVFP4"):
-            refit.reshard_model_weights(None, target, service)
-    else:
-        refit.reshard_model_weights(None, target, service)
-    assert executed == ["plan"], "the plan must run on every rank before raising"
+    refit.reshard_model_weights(None, target, service)
+    assert executed == ["plan"]
 
 
 def test_gated_fc1_is_padded_per_half_and_interleaved_up_gate():

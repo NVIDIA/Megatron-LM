@@ -289,6 +289,10 @@ class MoELayer(BaseMoELayer):
             config.recompute_granularity == 'selective'
             and "shared_experts" in config.recompute_modules
         )
+        # The value pass runs generation's dispatcher and expert kernel; the recompute
+        # pass runs the training path and builds the backward.
+        self.match_generation_forward = config.moe_match_generation_forward
+        self._inference_pass_is_value = False
 
         self.tp_group = pg_collection.tp
 
@@ -539,6 +543,67 @@ class MoELayer(BaseMoELayer):
             self.token_dispatcher = self._training_token_dispatcher
             self.shared_expert_overlap = self.config.moe_shared_expert_overlap
 
+    def _value_pass_uses_nvls_buffers(self) -> bool:
+        """Whether the value pass gathers through the NVLS buffers, which need EP > 1."""
+        dispatcher = self._inference_token_dispatcher
+        return (
+            isinstance(dispatcher, NVLSAllGatherVDispatcher)
+            and utils.get_pg_size(dispatcher.tp_ep_group) > 1
+        )
+
+    def _allocate_parity_symmetric_buffers(self):
+        """Allocate the NVLS symmetric buffers as a generation context would.
+
+        Their size is the row count of the FlashInfer launch. Without a generation
+        context in this process they are sized for the default `max_tokens`; a trainer
+        whose generation sets `max_tokens` allocates them first, sized the same way.
+        """
+        tp_ep_group = self._inference_token_dispatcher.tp_ep_group
+        if NVLSAllGatherVDispatcher._symm_rsv is not None:
+            rows = NVLSAllGatherVDispatcher._symm_rsv["tensor"].shape[0]
+            per_rank = NVLSAllGatherVDispatcher._per_rank_worst_case_token_count
+            if rows != per_rank * utils.get_pg_size(tp_ep_group):
+                raise RuntimeError(
+                    "moe_match_generation_forward requires the generation expert-parallel size"
+                )
+            return
+        from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=DynamicInferenceContext.round_up_tokens(
+                DynamicInferenceContext.DEFAULT_MAX_TOKENS
+            )
+            // utils.get_pg_size(self.tp_group),
+            topk=self.config.moe_router_topk,
+            hidden_size=self.config.moe_latent_size or self.config.hidden_size,
+            tp_ep_group=tp_ep_group,
+        )
+
+    def _chunked_dispatch_and_compute(self, hidden_states, probs):
+        """Dispatch, expert compute and combine in launches that fit the NVLS buffers.
+
+        Every rank of the dispatcher's group runs the same number of launches, since
+        each one is collective.
+        """
+        dispatcher = self.token_dispatcher
+        capacity = NVLSAllGatherVDispatcher._per_rank_worst_case_token_count
+        routing_map = dispatcher.routing_map
+        num_tokens = hidden_states.shape[0]
+        max_tokens = torch.tensor([num_tokens], device=hidden_states.device, dtype=torch.int64)
+        torch.distributed.all_reduce(
+            max_tokens, op=torch.distributed.ReduceOp.MAX, group=dispatcher.tp_ep_group
+        )
+        outputs, mlp_bias = [], None
+        for start in range(0, int(max_tokens.item()), capacity):
+            chunk = slice(min(start, num_tokens), min(start + capacity, num_tokens))
+            dispatcher.routing_map = routing_map[chunk]
+            dispatcher._local_tokens = chunk.stop - chunk.start
+            dispatched_input, chunk_probs = self.dispatch(hidden_states[chunk], probs[chunk])
+            output, mlp_bias = self.routed_experts_compute(dispatched_input, chunk_probs)
+            outputs.append(self.combine(output))
+        dispatcher._local_tokens = num_tokens
+        return torch.cat(outputs), mlp_bias
+
     def setup_delayed_wgrad_for_dispatch_backward_overlap(self):
         """Initializes CUDA events and streams for overlapping expert
         weight gradient computation with dispatch backward.
@@ -671,7 +736,13 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        if hasattr(self, "_inference_token_dispatcher") and InferenceMode.is_active():
+        # Inference kernels route themselves and take the routing map; so does the
+        # match-generation value pass.
+        needs_routing_map = hasattr(self, "_inference_token_dispatcher") and (
+            InferenceMode.is_active()
+            or (self._inference_forward_applies() and not self.experts._in_inference_recompute)
+        )
+        if needs_routing_map:
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
@@ -794,6 +865,30 @@ class MoELayer(BaseMoELayer):
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             shared_expert_output = None
+            value_pass = False
+            if self._inference_forward_applies():
+                value_pass = self._inference_pass_is_value
+                # Any later call of this closure is the recompute.
+                self._inference_pass_is_value = False
+                if value_pass:
+                    # Normally allocated by the inference context.
+                    if NCCLAllGatherDispatcher._valid_tokens_tensor is None:
+                        NCCLAllGatherDispatcher.allocate_buffers()
+                    if self._value_pass_uses_nvls_buffers():
+                        self._allocate_parity_symmetric_buffers()
+                self.token_dispatcher = (
+                    self._inference_token_dispatcher
+                    if value_pass
+                    else self._training_token_dispatcher
+                )
+                # As in select_token_dispatcher: the inference dispatcher may run the
+                # shared experts itself.
+                self.shared_expert_overlap = (
+                    self._inference_token_dispatcher.shared_experts is not None
+                    if value_pass
+                    else self.config.moe_shared_expert_overlap
+                )
+                self.experts._in_inference_recompute = not value_pass
             try:
                 if "route" in self.fwd_execution_map:
                     # preprocess rebinds hidden_states to the dispatch input (latent, flattened);
@@ -802,9 +897,15 @@ class MoELayer(BaseMoELayer):
                     if not self.run_shared_experts_after_router:
                         shared_expert_output = self.shared_experts_compute(layer_input)
 
-                    probs, routing_map = self.route(
-                        layer_input, padding_mask, input_ids, packed_seq_params=packed_seq_params
-                    )
+                    if value_pass:
+                        probs, routing_map = self._route_as_generation(layer_input, input_ids)
+                    else:
+                        probs, routing_map = self.route(
+                            layer_input,
+                            padding_mask,
+                            input_ids,
+                            packed_seq_params=packed_seq_params,
+                        )
                     hidden_states, probs = self.preprocess(
                         layer_input, probs, routing_map, padding_mask
                     )
@@ -826,12 +927,15 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
-                dispatched_input, probs = self.dispatch(hidden_states, probs)
-                output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                if value_pass and self._value_pass_uses_nvls_buffers():
+                    output, mlp_bias = self._chunked_dispatch_and_compute(hidden_states, probs)
+                else:
+                    dispatched_input, probs = self.dispatch(hidden_states, probs)
+                    output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                    output = self.combine(output)
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-                output = self.combine(output)
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias
@@ -847,6 +951,9 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias
 
+        # The first custom_forward call is the value pass; it clears this flag.
+        self._inference_pass_is_value = self._inference_forward_applies()
+
         if self.moe_layer_recompute and self.training:
             outputs = precision_aware_checkpoint(
                 custom_forward,
@@ -860,6 +967,24 @@ class MoELayer(BaseMoELayer):
             outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
 
         return outputs
+
+    def _inference_forward_applies(self) -> bool:
+        """Whether a non-inference forward runs generation's expert kernel.
+
+        Not gated on ``self.training``: RL runs the log-prob forward under ``model.eval()``.
+        """
+        return self.match_generation_forward and not InferenceMode.is_active()
+
+    def _route_as_generation(self, hidden_states, input_ids):
+        """Route through generation's router path, returning [tokens, topk] probs and ids.
+
+        The FlashInfer kernel sums each token's routes in the order listed, so the value
+        pass must list them in generation's top-k order to match it bitwise.
+        """
+        hidden_states = self.token_dispatcher.wrap_layer_input(hidden_states)
+        return self.router._forward(
+            hidden_states.reshape(-1, 1, hidden_states.shape[-1]), input_ids=input_ids
+        )
 
     def backward_dw(self, routed_experts: bool = True, shared_experts: bool = False):
         """Compute weight gradients for experts and shared experts."""

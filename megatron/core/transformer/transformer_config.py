@@ -1541,6 +1541,12 @@ class TransformerConfig(ModelParallelConfig):
       grouped-GEMM path, allowing per-layer mixed BF16/MXFP8 policies.
     """
 
+    moe_match_generation_forward: bool = False
+    """Run the training MoE forward through generation's FlashInfer routed MXFP8 or
+    per-token NVFP4 expert kernel, so training log-probs match generation bitwise.
+    The backward comes from the TE recompute pass. Requires
+    transformer_impl='inference_optimized', inference_grouped_gemm_backend='flashinfer',
+    batch_invariant_mode and selective 'moe' recompute."""
     inference_moe_disable_fused_quant_kernels: bool = False
     """When False (default), use fused kernels that combine permute/activation with
     MXFP8 quantization + swizzle into a single kernel launch. Only applies when
@@ -2376,6 +2382,86 @@ class TransformerConfig(ModelParallelConfig):
                         "batch_invariant_mode with inference-optimized MoE and expert "
                         "parallelism requires inference_moe_token_dispatcher_type='nvls'."
                     )
+
+        if self.moe_match_generation_forward:
+            if self.transformer_impl != 'inference_optimized':
+                raise ValueError(
+                    "moe_match_generation_forward requires "
+                    f"transformer_impl='inference_optimized'; got '{self.transformer_impl}'."
+                )
+            # Not yet converted to the enum on every path.
+            backend = self.inference_grouped_gemm_backend
+            if isinstance(backend, InferenceGroupedGemmBackend):
+                backend = backend.value
+            if backend != InferenceGroupedGemmBackend.FLASHINFER.value:
+                raise ValueError(
+                    "moe_match_generation_forward supports only "
+                    f"inference_grouped_gemm_backend='flashinfer'; got '{backend}'. "
+                    "The torch and vLLM kernels already match TE training under "
+                    "batch_invariant_mode."
+                )
+            if (
+                not (bool(self.fp8) and self.fp8_recipe == Fp8Recipe.mxfp8)
+                and self.inference_moe_nvfp4_recipe is None
+            ):
+                raise ValueError(
+                    "moe_match_generation_forward requires FlashInfer routed MXFP8 "
+                    "(fp8_recipe='mxfp8') or per-token NVFP4 (inference_moe_nvfp4_recipe). "
+                    "The FlashInfer BF16 kernel is not batch invariant."
+                )
+            if self.expert_tensor_parallel_size > 1:
+                raise ValueError(
+                    "moe_match_generation_forward does not support expert tensor parallelism."
+                )
+            if not self.batch_invariant_mode:
+                raise ValueError(
+                    "moe_match_generation_forward requires batch_invariant_mode, so "
+                    "that a token's output does not depend on how many tokens share the "
+                    "kernel launch."
+                )
+            if self.recompute_granularity != 'selective' or (
+                self.recompute_modules is not None and 'moe' not in self.recompute_modules
+            ):
+                raise ValueError(
+                    "moe_match_generation_forward requires "
+                    "recompute_granularity='selective' with 'moe' in recompute_modules: "
+                    "the value pass stores no activations, so the backward must come "
+                    "from a recompute pass."
+                )
+            if self.cuda_graph_impl == 'local':
+                raise ValueError(
+                    "moe_match_generation_forward is incompatible with "
+                    "cuda_graph_impl='local', which disables MoE-layer recompute."
+                )
+            if self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "moe_match_generation_forward is incompatible with "
+                    "overlap_moe_expert_parallel_comm: the overlapped schedule does "
+                    "not go through MoELayer.forward, where the value pass is chosen."
+                )
+            # The value pass runs the training router; these make it pick other experts.
+            balancing = self.moe_router_load_balancing_type
+            balancing = balancing if isinstance(balancing, list) else [balancing]
+            unsupported = {"sinkhorn", "quantile_balancing"}.intersection(balancing)
+            if unsupported:
+                raise ValueError(
+                    f"moe_match_generation_forward does not support "
+                    f"moe_router_load_balancing_type={sorted(unsupported)}: generation "
+                    "routes with plain top-k, so the training forward would select "
+                    "different experts."
+                )
+            if self.moe_input_jitter_eps is not None:
+                raise ValueError(
+                    "moe_match_generation_forward is incompatible with "
+                    "moe_input_jitter_eps: jitter perturbs the router input in "
+                    "training only, so the two forwards would route differently."
+                )
+            if self.moe_router_force_load_balancing or self.moe_router_force_biased is not None:
+                raise ValueError(
+                    "moe_match_generation_forward is incompatible with "
+                    "moe_router_force_load_balancing / moe_router_force_biased, which "
+                    "overwrite the training router's logits."
+                )
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
