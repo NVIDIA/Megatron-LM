@@ -1,8 +1,7 @@
 ---
 name: mcore-determinism-debug
-description: Root-cause method when two Megatron runs that should be bit-identical diverge: fingerprint every op, diff the two traces, first mismatch is the culprit.
+description: "Root-cause method when two Megatron runs that should be bit-identical diverge: fingerprint every op, diff the two traces, first mismatch is the culprit. Use when two identical training runs give different loss; a run is bit-exact at N nodes but not 2N; you need to know which op, layer or kernel first diverged; 'nondeterminism', 'not bit-exact', 'runs diverge', 'determinism trace', 'first divergence', 'which kernel is nondeterministic'."
 license: Apache-2.0
-when_to_use: Two identical training runs give different loss; a run is bit-exact at N nodes but not 2N; you need to know which op, layer or kernel first diverged; 'nondeterminism', 'not bit-exact', 'runs diverge', 'determinism trace', 'first divergence', 'which kernel is nondeterministic'.
 metadata:
   author: Zhiyu Li <zhiyul@nvidia.com>
 ---
