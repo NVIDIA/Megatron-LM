@@ -437,10 +437,15 @@ class PretrainConfigContainer(ConfigContainerBase):
             cuda_graph_impl=cuda_graph_impl,
             micro_batch_size=self.train.micro_batch_size,
             global_batch_size=global_batch_size,
+            train_iters=self.train.train_iters,
+            train_samples=self.train.train_samples,
             skip_train=self.validation.skip_train,
             load_optim=self.checkpoint.load_optim,
             save_interval=self.checkpoint.save_interval,
             exit_interval=self.train.exit_interval,
+            # The rollout deployment (inference shards, model CP) is not a pretrain section;
+            # validate_args checks that rule from the launch arguments.
+            separate_inference_model=None,
         )
         self.scheduler.validate_run(
             train_iters=self.train.train_iters,

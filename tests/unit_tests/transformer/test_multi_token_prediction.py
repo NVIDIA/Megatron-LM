@@ -148,7 +148,7 @@ def test_checkpointed_forward_uses_layer_tp_group_not_global(precision, monkeypa
     )
     object.__setattr__(layer, "config", config)
     object.__setattr__(layer, "tp_group", tp_group)
-    object.__setattr__(layer, "mtp_layer_pattern", None)
+    object.__setattr__(layer, "is_hybrid_mtp", False)
     object.__setattr__(
         layer,
         "_proj_and_transformer_layer",
@@ -4128,7 +4128,7 @@ class TestMultiTokenPredictionHybrid:
         layer = MultiTokenPredictionLayer.__new__(MultiTokenPredictionLayer)
         torch.nn.Module.__init__(layer)
         layer.config = types.SimpleNamespace(recompute_granularity='full')
-        layer.mtp_layer_pattern = "M"
+        layer.is_hybrid_mtp = True
         layer.training = True
 
         input_ids = torch.arange(4).reshape(1, 4)
@@ -4416,6 +4416,7 @@ class TestMultiTokenPredictionHybrid:
             ),
             pre_process=False,
             post_process=True,
+            hybrid_layer_config_list=None,
             position_embedding_type='none',
             decoder=decoder,
             share_embeddings_and_output_weights=False,

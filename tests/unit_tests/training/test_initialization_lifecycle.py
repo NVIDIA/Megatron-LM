@@ -1588,17 +1588,31 @@ def test_invalid_config_stops_before_runtime_services(monkeypatch, isolated_glob
     services.assert_not_called()
 
 
-def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(monkeypatch, isolated_globals, run_config):
+@pytest.mark.parametrize("rollout_only", [False, True])
+def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(
+    monkeypatch, isolated_globals, run_config, rollout_only
+):
     import megatron.training as training_package
+    from megatron.rl import rl_utils
     from megatron.rl.callbacks import RLCheckpointCallback, RLLoggingCallback
+    from megatron.rl.training_setup import RLSetupCallback
     from megatron.training import argument_utils, utils
 
-    args = Namespace(reset_attention_mask=False, batch_invariant_mode=False)
+    args = Namespace(
+        reset_attention_mask=False,
+        batch_invariant_mode=False,
+        perform_rl_step=True,
+        no_load_optim=False,
+    )
     model = Mock()
     # The real RL callback derives its rollout interval from these batch values.
     cfg = run_config
     cfg.train.micro_batch_size = 1
     cfg.train.global_batch_size = 8
+    # The entrypoint branches on the container; the namespace carries the matching attrs
+    # anyway so the test stays green under a raw-args read as well.
+    cfg.rl.perform_rl_step = True
+    cfg.rl.rl_rollout_only = rollout_only
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
     monkeypatch.setattr(logging, "basicConfig", Mock())
     monkeypatch.setattr(arguments, "parse_and_validate_args", Mock(return_value=args))
@@ -1609,13 +1623,24 @@ def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(monkeypatch, isolated_gl
     monkeypatch.setattr(global_vars, "initialize_runtime_services", services)
     pretrain = Mock()
     monkeypatch.setattr(training_package, "pretrain", pretrain)
+    # The entrypoint's finally owns the shutdown; the real one would os._exit the test process.
+    shutdown = Mock()
+    monkeypatch.setattr(rl_utils, "rl_inference_interface_shutdown", shutdown)
 
     runpy.run_path(str(Path(__file__).resolve().parents[3] / "train_rl.py"), run_name="__main__")
 
     pretrain.assert_called_once()
     assert pretrain.call_args.args[0] is cfg
-    callbacks = pretrain.call_args.kwargs["callbacks"]
-    assert [type(callback) for callback in callbacks] == [RLLoggingCallback, RLCheckpointCallback]
+    assert pretrain.call_args.args[1] is None  # RL builds no datasets
+    kwargs = pretrain.call_args.kwargs
+    assert [type(callback) for callback in kwargs["callbacks"]] == [
+        RLSetupCallback,
+        RLLoggingCallback,
+        RLCheckpointCallback,
+    ]
+    assert kwargs["run_train_loop_without_updates"] is rollout_only
+    assert kwargs["suppress_microbatch_rampup_handling"] is False
+    assert callable(kwargs["next_train_iterator"]) and callable(kwargs["run_eval"])
     assert global_vars.get_run_config() is cfg
     assert global_vars._GLOBAL_TOKENIZER is None
     services.assert_not_called()

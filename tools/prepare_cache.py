@@ -17,8 +17,9 @@ from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.config import TrainingConfig, ValidationConfig
+from megatron.training.config.container import update_train_iters
 from megatron.training.global_vars import set_args, unset_global_variables
-from megatron.training.training import calculate_train_valid_test_num_samples, update_train_iters
+from megatron.training.training import calculate_train_valid_test_num_samples
 from megatron.training.utils import get_blend_and_blend_per_split
 
 try:
