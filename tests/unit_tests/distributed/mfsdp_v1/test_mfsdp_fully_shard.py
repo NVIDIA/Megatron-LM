@@ -69,7 +69,7 @@ def _prefetch_size_pipeline(sizes, sharded):
     pipeline = AllGatherPipeline.__new__(AllGatherPipeline)
     pipeline.buffer = SimpleNamespace(
         num_buckets=len(sizes),
-        ddp_config=SimpleNamespace(fsdp_double_buffer=False),
+        fsdp_config=SimpleNamespace(double_buffer=False),
         parameter_groups=[
             SimpleNamespace(
                 fsdp_unit_id=bucket_id,
@@ -259,10 +259,8 @@ def test_hfsdp_pipeline_preserves_inner_prefetch_size_policy():
             SimpleNamespace(fsdp_unit_id=unit_id, transpose_weight_buffer=None)
             for unit_id in range(2)
         ],
-        ddp_config=SimpleNamespace(
-            fsdp_double_buffer=False,
-            hfsdp_param_gather_overlap=True,
-            outer_dp_sharding_strategy="optim",
+        fsdp_config=SimpleNamespace(
+            double_buffer=False, hfsdp_param_gather_overlap=True, outer_dp_sharding_strategy="optim"
         ),
         dist_index=SimpleNamespace(use_hybrid_fsdp=True),
     )

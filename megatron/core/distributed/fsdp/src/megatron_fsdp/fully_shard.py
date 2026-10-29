@@ -22,7 +22,7 @@ from torch.distributed import DeviceMesh
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
 
-from .distributed_data_parallel_config import VALID_SHARDING_STRATEGIES
+from .fully_sharded_data_parallel_config import VALID_SHARDING_STRATEGIES
 from .megatron_fsdp import MegatronFSDP
 from .mixed_precision import MixedPrecisionPolicy
 from .uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
@@ -30,12 +30,12 @@ from .utils import FSDPDistributedIndex, create_updated_function_signature
 
 try:
     # Default to Megatron-LM FW.
-    from megatron.core.distributed.distributed_data_parallel_config import (
-        DistributedDataParallelConfig,
+    from megatron.core.distributed.fully_sharded_data_parallel_config import (
+        FullyShardedDataParallelConfig,
     )
 except ImportError:
     # Megatron-LM is not installed, use Megatron-FSDP as a standalone module.
-    from .distributed_data_parallel_config import DistributedDataParallelConfig
+    from .fully_sharded_data_parallel_config import FullyShardedDataParallelConfig
 
 
 logger = logging.getLogger(__name__)
@@ -411,8 +411,8 @@ def fully_shard_model(
             "supported or necessary for the 'no_shard' / 0 sharding strategy."
         )
 
-    # DDP Config for Megatron FSDP.
-    ddp_config = DistributedDataParallelConfig(
+    # Resolve settings at the standalone API boundary, as the MCore adapter does.
+    fsdp_config = FullyShardedDataParallelConfig(
         data_parallel_sharding_strategy=zero_dp_strategy,
         expert_data_parallel_sharding_strategy=expert_zero_dp_strategy,
         outer_dp_sharding_strategy=outer_dp_sharding_strategy,
@@ -422,13 +422,13 @@ def fully_shard_model(
         average_in_collective=average_in_collective,
         keep_fp8_transpose_cache=keep_fp8_transpose_cache,  # pylint: disable=C0301
         nccl_ub=nccl_ub,
-        fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
-        fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
+        double_buffer=fsdp_double_buffer or nccl_ub,
+        db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
-        megatron_fsdp_use_decoupled_grad=use_decoupled_grad,
-        megatron_fsdp_cuda_graph_mode=cuda_graph_mode,
-        megatron_fsdp_max_pool_double_buffer=maxpool_double_buffer,
-    )
+        use_decoupled_grad=use_decoupled_grad,
+        cuda_graph_mode=cuda_graph_mode,
+        max_pool_double_buffer=maxpool_double_buffer,
+    ).resolved()
 
     # Create FSDPDistributedIndex.
     dist_index = FSDPDistributedIndex(
@@ -458,7 +458,7 @@ def fully_shard_model(
     model = MegatronFSDP(
         module=module,
         dist_index=dist_index,
-        ddp_config=ddp_config,
+        fsdp_config=fsdp_config,
         mixed_precision_policy=mixed_precision_policy,
         fsdp_unit_modules=fsdp_unit_modules,
         disable_bucketing=disable_bucketing,

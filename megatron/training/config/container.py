@@ -15,6 +15,9 @@ except ImportError:
 
 from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.distributed.fully_sharded_data_parallel_config import (
+    FullyShardedDataParallelConfig,
+)
 from megatron.core.msc_utils import maybe_msc
 from megatron.core.num_microbatches_calculator import (
     get_current_global_batch_size,
@@ -290,7 +293,11 @@ class PretrainConfigContainer(ConfigContainerBase):
     """The dataset config, the loader settings and the dataset class. The GPT entry points build
     their datasets from it (``gpt_data_config_from_args``); every other entry point carries the
     loader settings only (``data.dataset is None``). See ``megatron.training.config.dataset_config``."""
-    ddp: DistributedDataParallelConfig = field(default_factory=DistributedDataParallelConfig)
+    data_parallel: DistributedDataParallelConfig | FullyShardedDataParallelConfig | None = None
+    """Configuration whose type selects the data-parallel implementation."""
+
+    ddp: DistributedDataParallelConfig | None = None
+    """Legacy alternative to data_parallel, retained for existing Python and YAML callers."""
     dist: DistributedInitConfig = field(default_factory=DistributedInitConfig)
     rng: RNGConfig = field(default_factory=RNGConfig)
     logger: LoggerConfig
@@ -301,6 +308,24 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
+
+    def __post_init__(self) -> None:
+        if self.data_parallel is not None and self.ddp is not None:
+            raise ValueError("Specify only one of data_parallel and ddp")
+        if self.data_parallel is None and self.ddp is None:
+            self.ddp = DistributedDataParallelConfig()
+
+    @property
+    def data_parallel_config(
+        self,
+    ) -> DistributedDataParallelConfig | FullyShardedDataParallelConfig:
+        """Return the active configuration without maintaining a second mutable copy."""
+        if self.data_parallel is not None and self.ddp is not None:
+            raise ValueError("Specify only one of data_parallel and ddp")
+        config = self.data_parallel if self.data_parallel is not None else self.ddp
+        if not isinstance(config, (DistributedDataParallelConfig, FullyShardedDataParallelConfig)):
+            raise TypeError("data_parallel must be a DDP or FSDP configuration")
+        return config
 
     def _resolve_batch_sizes(
         self, batch_parallel_size: int | None = None
@@ -388,10 +413,20 @@ class PretrainConfigContainer(ConfigContainerBase):
             else:
                 self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
 
-
     def validate(self) -> None:
         """Validate each section, then the RL section against the rest of the run."""
-        self.rl.validate_ddp_config(self.ddp)
+        data_parallel_config = self.data_parallel_config
+        if isinstance(data_parallel_config, FullyShardedDataParallelConfig):
+            if self.dist.use_torch_fsdp2:
+                raise ValueError(
+                    "FullyShardedDataParallelConfig cannot be used with use_torch_fsdp2"
+                )
+            if self.rl.requires_grad_buffer_offload:
+                raise ValueError(
+                    "RL gradient-buffer offload requires DistributedDataParallelConfig"
+                )
+        else:
+            self.rl.validate_ddp_config(data_parallel_config)
         super().validate()
         global_batch_size, _, _ = self._resolve_batch_sizes()
         self._validate_rl_config(global_batch_size)
@@ -602,8 +637,10 @@ class PretrainConfigContainer(ConfigContainerBase):
                 )
                 dataset.hybrid_context_parallel = False
         self.data.finalize()
-        if self.rl.perform_rl_step:
-            self.rl.finalize_ddp_config(self.ddp)
+        if self.rl.perform_rl_step and isinstance(
+            self.data_parallel_config, DistributedDataParallelConfig
+        ):
+            self.rl.finalize_ddp_config(self.data_parallel_config)
 
 
 def update_train_iters(train: TrainingConfig) -> None:

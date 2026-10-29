@@ -277,7 +277,7 @@ def _allreduce_embedding_grad(
         else:  # We do not support an interleaved schedule for models with encoders yet.
             model_module = model[0]
 
-        ddp_config = model_module.ddp_config
+        uses_fsdp = hasattr(model_module, "fsdp_config")
         model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
 
         weight = weight_getter(model_module)
@@ -286,7 +286,7 @@ def _allreduce_embedding_grad(
 
         grad_attr = _get_main_grad_attr(weight)
         orig_grad = getattr(weight, grad_attr)
-        if ddp_config.use_megatron_fsdp:
+        if uses_fsdp:
             # Expand the uneven (flat-buffer) sharded embedding grad to the full logical gradient
             # so the cross-stage all-reduce below combines matching rows (see _full_embedding_grad).
             grad = _full_embedding_grad(orig_grad)
@@ -296,7 +296,7 @@ def _allreduce_embedding_grad(
         if grad is None and skip_if_none:
             return
         torch.distributed.all_reduce(grad, group=embd_group)
-        if ddp_config.use_megatron_fsdp:
+        if uses_fsdp:
             _copy_embedding_grad_back(orig_grad, grad)
         else:
             setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
@@ -524,7 +524,7 @@ def _allreduce_non_tensor_model_parallel_grads(
     grads_avg = []
 
     for model_chunk in model:
-        ddp_config = model_chunk.ddp_config
+        uses_fsdp = hasattr(model_chunk, "fsdp_config")
         for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
             if param.requires_grad:
                 # Check if this param needs average reduction (average_gradients_across_tp_domain)
@@ -534,7 +534,7 @@ def _allreduce_non_tensor_model_parallel_grads(
                     if grad is None:
                         continue
                     params_avg.append(param)
-                    if ddp_config.use_megatron_fsdp:
+                    if uses_fsdp:
                         grads_avg.append(grad._local_tensor.data)
                     else:
                         grad = _unshard_if_dtensor(grad)
@@ -548,7 +548,7 @@ def _allreduce_non_tensor_model_parallel_grads(
                     if grad is None:
                         continue
                     params_sum.append(param)
-                    if ddp_config.use_megatron_fsdp:
+                    if uses_fsdp:
                         grads_sum.append(grad._local_tensor.data)
                     else:
                         grad = _unshard_if_dtensor(grad)
@@ -569,7 +569,7 @@ def _allreduce_non_tensor_model_parallel_grads(
                 buf.copy_(synced)
                 grad_attr = _get_main_grad_attr(param)
                 orig_grad = getattr(param, grad_attr)
-                if ddp_config.use_megatron_fsdp:
+                if uses_fsdp:
                     setattr(param, grad_attr, orig_grad)
                 else:
                     setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))

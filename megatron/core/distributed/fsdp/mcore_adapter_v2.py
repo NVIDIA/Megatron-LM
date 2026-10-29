@@ -28,8 +28,10 @@ from torch.distributed.tensor.placement_types import Placement
 
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
-from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.fsdp_unit_collector import FsdpUnitCollector
+from megatron.core.distributed.fully_sharded_data_parallel_config import (
+    FullyShardedDataParallelConfig,
+)
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -124,14 +126,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
     """MFSDP v2 wrapper for the Megatron model.
 
     Supports MXFP8 compute with either high-precision or MXFP8 parameter gathers.
-    For MXFP8 gathers, enable both ``config.fp8_param`` and ``ddp_config.fp8_param_gather``;
+    For MXFP8 gathers, enable both ``config.fp8_param`` and ``fsdp_config.fp8_param_gather``;
     MCore's model initialization preserves the high-precision values used for main weights.
     """
 
     def __init__(
         self,
         config: TransformerConfig,
-        ddp_config: DistributedDataParallelConfig,
+        fsdp_config: FullyShardedDataParallelConfig,
         module: torch.nn.Module,
         fsdp_unit_modules: Optional[List[Type[torch.nn.Module]]] = None,
         disable_bucketing: bool = False,
@@ -142,7 +144,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         Args:
             config: Transformer configuration for the model.
-            ddp_config: Data-parallel and sharding configuration.
+            fsdp_config: Data-parallel and sharding configuration.
             module: Root model module to shard.
             fsdp_unit_modules: Module types to shard as child FSDP units. If
                 unspecified, transformer and Mamba layers, shortcut MoE blocks, and
@@ -165,19 +167,25 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ValueError: If required process groups are missing or the configuration
                 requests a feature unsupported by MFSDP v2.
         """
+        if not isinstance(fsdp_config, FullyShardedDataParallelConfig):
+            raise TypeError("fsdp_config must be a FullyShardedDataParallelConfig")
+        if fsdp_config.version != 2:
+            raise ValueError("FullyShardedDataParallelV2 requires version=2")
+        fsdp_config = fsdp_config.resolved()
+
         if not HAVE_MEGATRON_FSDP:
             raise IMPORT_MEGATRON_FSDP_ERROR
         if pg_collection is None:
             raise ValueError("MFSDP v2 requires an explicit ProcessGroupCollection.")
         FullyShardedDataParallelV2._validate_config(
-            config, ddp_config, module, pg_collection, disable_bucketing
+            config, fsdp_config, module, pg_collection, disable_bucketing
         )
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
         # Optimizer construction reads this attribute; retain the v1 contract for compatibility.
-        self.ddp_config = ddp_config
+        self.fsdp_config = fsdp_config
 
         # Importing experts at module load creates a cycle through pipeline schedules
         # and fsdp_dtensor_checkpoint, which then incorrectly marks MFSDP unavailable.
@@ -193,12 +201,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ]
 
         log_single_rank(
-            logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", ddp_config
+            logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", fsdp_config
         )
         self.mp_policy = MixedPrecisionPolicy(
-            main_params_dtype=ddp_config.megatron_fsdp_main_params_dtype,
-            main_grads_dtype=ddp_config.megatron_fsdp_main_grads_dtype,
-            grad_comm_dtype=ddp_config.megatron_fsdp_grad_comm_dtype,
+            main_params_dtype=fsdp_config.main_params_dtype,
+            main_grads_dtype=fsdp_config.main_grads_dtype,
+            grad_comm_dtype=fsdp_config.grad_comm_dtype,
         )
         log_single_rank(
             logger,
@@ -209,15 +217,15 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         device_type = device.type if device is not None else "cuda"
 
-        if has_outer_dp_axis := ddp_config.num_distributed_optimizer_instances > 1:
+        if has_outer_dp_axis := fsdp_config.num_distributed_optimizer_instances > 1:
             # There is no HSDP/HFSDP special case:
             # each axis takes the placements of its own strategy, so no_shard outer over
             # ZeRO-3 inner is HSDP and ZeRO-1 outer over ZeRO-3 inner is HFSDP.
             dp_mesh = _build_hybrid_dp_mesh(
                 pg_collection.inter_dist_opt, pg_collection.intra_dp_cp, device_type
             )
-            outer = _DATA_PARALLEL_PLACEMENTS[ddp_config.outer_dp_sharding_strategy]
-            inner = _DATA_PARALLEL_PLACEMENTS[ddp_config.data_parallel_sharding_strategy]
+            outer = _DATA_PARALLEL_PLACEMENTS[fsdp_config.outer_dp_sharding_strategy]
+            inner = _DATA_PARALLEL_PLACEMENTS[fsdp_config.data_parallel_sharding_strategy]
             dense_placements = Placements(
                 dp_axes=[0, 1],
                 parameter=[outer.parameter, inner.parameter],
@@ -228,7 +236,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             dp_mesh = DeviceMesh.from_group(
                 pg_collection.dp_cp, device_type=device_type, mesh_dim_names=("dp",)
             )
-            axis = _DATA_PARALLEL_PLACEMENTS[ddp_config.data_parallel_sharding_strategy]
+            axis = _DATA_PARALLEL_PLACEMENTS[fsdp_config.data_parallel_sharding_strategy]
             dense_placements = Placements(
                 dp_axes=[0],
                 parameter=[axis.parameter],
@@ -236,7 +244,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 optimizer=[axis.optimizer],
             )
         expert_dp_mesh, expert_placements = _build_expert_mesh_and_placements(
-            config, ddp_config, pg_collection, device_type
+            config, fsdp_config, pg_collection, device_type
         )
         dense_grad_scale, expert_grad_scale = _get_grad_scales(config, dp_mesh, expert_dp_mesh)
 
@@ -245,8 +253,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # ncclCommWindowRegister:
         # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
         schedule_policy = SchedulePolicy(
-            forward_prefetch_size=ddp_config.suggested_communication_unit_size,
-            backward_prefetch_size=ddp_config.suggested_communication_unit_size,
+            forward_prefetch_size=fsdp_config.suggested_communication_unit_size,
+            backward_prefetch_size=fsdp_config.suggested_communication_unit_size,
             register_hooks=not config.overlap_moe_expert_parallel_comm,
         )
         common_fully_shard_kwargs = dict(
@@ -254,7 +262,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             schedule_policy=schedule_policy,
             shard_layout=(
                 ShardLayout.PADDED
-                if ddp_config.megatron_fsdp_padded_shards
+                if fsdp_config.padded_shards
                 else ShardLayout.UNPADDED
             ),
         )
@@ -267,9 +275,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 FsdpContext(
                     device=device,
                     runtime_policy=RuntimePolicy(
-                        use_symmetric_memory=ddp_config.nccl_ub,
+                        use_symmetric_memory=fsdp_config.nccl_ub,
                         caller_managed_grad_sync=True,
-                        overlap_outer_communication=ddp_config.overlap_outer_communication,
+                        overlap_outer_communication=fsdp_config.overlap_outer_communication,
                     ),
                 )
             )
@@ -310,7 +318,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
     @staticmethod
     def _validate_config(
         config: TransformerConfig,
-        ddp_config: DistributedDataParallelConfig,
+        fsdp_config: FullyShardedDataParallelConfig,
         module: torch.nn.Module,
         pg_collection: ProcessGroupCollection,
         disable_bucketing: bool,
@@ -319,7 +327,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         Args:
             config: Transformer configuration describing the requested model topology.
-            ddp_config: Data-parallel and sharding configuration to validate.
+            fsdp_config: Data-parallel and sharding configuration to validate.
             module: Model whose parameters are checked for expert parallelism.
             pg_collection: Materialized process groups whose topology must match the
                 supported MFSDP v2 topology.
@@ -401,66 +409,66 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             if not any(isinstance(submodule, MoELayer) for submodule in module.modules()):
                 raise ValueError("MFSDP v2 with EP requires MoE transformer layers.")
         if (
-            ddp_config.outer_dp_sharding_strategy != "no_shard"
-            and ddp_config.num_distributed_optimizer_instances <= 1
+            fsdp_config.outer_dp_sharding_strategy != "no_shard"
+            and fsdp_config.num_distributed_optimizer_instances <= 1
         ):
             # Without a second instance there is no outer axis for the strategy to apply
             # to, so honouring it is impossible and ignoring it would be silent.
             raise ValueError(
                 "MFSDP v2 outer_dp_sharding_strategy="
-                f"{ddp_config.outer_dp_sharding_strategy!r} requires an outer DP axis, "
+                f"{fsdp_config.outer_dp_sharding_strategy!r} requires an outer DP axis, "
                 "i.e. num_distributed_optimizer_instances > 1."
             )
         if (
-            ddp_config.expert_outer_dp_sharding_strategy != "no_shard"
-            and ddp_config.num_distributed_optimizer_instances <= 1
+            fsdp_config.expert_outer_dp_sharding_strategy != "no_shard"
+            and fsdp_config.num_distributed_optimizer_instances <= 1
         ):
             raise ValueError(
                 "MFSDP v2 expert_outer_dp_sharding_strategy="
-                f"{ddp_config.expert_outer_dp_sharding_strategy!r} requires "
+                f"{fsdp_config.expert_outer_dp_sharding_strategy!r} requires "
                 "num_distributed_optimizer_instances > 1."
             )
         if config.gradient_accumulation_fusion:
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
         if config.calculate_per_token_loss and (
             config.pipeline_model_parallel_size != 1
-            or ddp_config.num_distributed_optimizer_instances != 1
+            or fsdp_config.num_distributed_optimizer_instances != 1
         ):
             raise ValueError(
                 "MFSDP v2 per-token loss has not been tested with PP>1 "
                 "or multiple optimizer instances."
             )
-        if config.fp4 or ddp_config.fp4_param_gather:
+        if config.fp4 or fsdp_config.fp4_param_gather:
             raise ValueError("MFSDP v2 does not currently support FP4.")
         if config.fp8 and config.fp8_recipe != "mxfp8":
             raise ValueError("MFSDP v2 only supports FP8 with the MXFP8 recipe.")
-        if config.fp8_param != ddp_config.fp8_param_gather:
+        if config.fp8_param != fsdp_config.fp8_param_gather:
             raise ValueError("MFSDP v2 requires fp8_param and fp8_param_gather to match.")
 
-        if ddp_config.fsdp_db_use_persist_buf_on_alloc_fail:
+        if fsdp_config.db_use_persist_buf_on_alloc_fail:
             raise ValueError(
-                "MFSDP v2 does not support fsdp_db_use_persist_buf_on_alloc_fail: "
+                "MFSDP v2 does not support db_use_persist_buf_on_alloc_fail: "
                 "it allocates communication buffers from PyTorch memory pools."
             )
-        if ddp_config.nccl_ub and ddp_config.disable_symmetric_registration:
+        if fsdp_config.nccl_ub and fsdp_config.disable_symmetric_registration:
             raise ValueError("MFSDP v2 requires symmetric registration when nccl_ub is enabled.")
-        if ddp_config.nccl_ub and not ddp_config.megatron_fsdp_padded_shards:
+        if fsdp_config.nccl_ub and not fsdp_config.padded_shards:
             raise ValueError(
-                "MFSDP v2 megatron_fsdp_padded_shards=False is incompatible with nccl_ub: "
+                "MFSDP v2 padded_shards=False is incompatible with nccl_ub: "
                 "symmetric-memory collectives require equal shard sizes."
             )
-        if ddp_config.fsdp_manual_registration:
-            raise ValueError("MFSDP v2 does not support fsdp_manual_registration.")
-        if ddp_config.num_buckets is not None:
+        if fsdp_config.manual_registration:
+            raise ValueError("MFSDP v2 does not support manual_registration.")
+        if fsdp_config.num_buckets is not None:
             raise ValueError("MFSDP v2 does not support num_buckets.")
-        if ddp_config.megatron_fsdp_use_decoupled_grad:
-            raise ValueError("MFSDP v2 does not support megatron_fsdp_use_decoupled_grad.")
-        if ddp_config.megatron_fsdp_enable_fine_grained_param_gather:
+        if fsdp_config.use_decoupled_grad:
+            raise ValueError("MFSDP v2 does not support use_decoupled_grad.")
+        if fsdp_config.enable_fine_grained_param_gather:
             raise ValueError(
-                "MFSDP v2 does not support megatron_fsdp_enable_fine_grained_param_gather."
+                "MFSDP v2 does not support enable_fine_grained_param_gather."
             )
-        if ddp_config.megatron_fsdp_max_pool_double_buffer:
-            raise ValueError("MFSDP v2 does not support megatron_fsdp_max_pool_double_buffer.")
+        if fsdp_config.max_pool_double_buffer:
+            raise ValueError("MFSDP v2 does not support max_pool_double_buffer.")
 
     @contextlib.contextmanager
     def no_sync(self):
@@ -599,7 +607,7 @@ def _get_grad_scales(
 
 def _build_expert_mesh_and_placements(
     config: TransformerConfig,
-    ddp_config: DistributedDataParallelConfig,
+    fsdp_config: FullyShardedDataParallelConfig,
     pg_collection: ProcessGroupCollection,
     device_type: str,
 ) -> Tuple[DeviceMesh | None, Placements | None]:
@@ -607,16 +615,16 @@ def _build_expert_mesh_and_placements(
     if config.num_moe_experts is None:
         return None, None
 
-    inner_strategy = get_sharding_strategy(ddp_config, is_expert_param=True)
+    inner_strategy = get_sharding_strategy(fsdp_config, is_expert_param=True)
 
-    if ddp_config.num_distributed_optimizer_instances > 1:
+    if fsdp_config.num_distributed_optimizer_instances > 1:
         # Match v1 topology: dense and expert parameters share the outer DP axis,
         # while experts use the existing expert-DP inner group. Only placements differ.
         dp_mesh = _build_hybrid_dp_mesh(
             pg_collection.inter_dist_opt, pg_collection.intra_expt_dp, device_type
         )
         inner = _DATA_PARALLEL_PLACEMENTS[inner_strategy]
-        outer = _DATA_PARALLEL_PLACEMENTS[ddp_config.expert_outer_dp_sharding_strategy]
+        outer = _DATA_PARALLEL_PLACEMENTS[fsdp_config.expert_outer_dp_sharding_strategy]
         placements = Placements(
             dp_axes=[0, 1],
             parameter=[outer.parameter, inner.parameter],

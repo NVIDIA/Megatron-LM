@@ -47,7 +47,11 @@ from megatron.training.argument_utils import (
     core_transformer_config_from_args,
 )
 from megatron.training.async_utils import init_persistent_async_worker
-from megatron.training.global_vars import get_run_config, get_train_state, initialize_runtime_services
+from megatron.training.global_vars import (
+    get_run_config,
+    get_train_state,
+    initialize_runtime_services,
+)
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
 logger = logging.getLogger(__name__)
@@ -93,6 +97,21 @@ def initialize_megatron(
     cfg = get_run_config()
     # Resolve runtime config before distributed initialization and RNG setup.
     cfg.finalize()
+    # The remaining training bootstrap still reads these CLI names. Native FSDP
+    # configuration owns their values, including topology before groups are built.
+    from megatron.core.distributed import FullyShardedDataParallelConfig
+
+    data_parallel_config = getattr(cfg, "data_parallel_config", None)
+    if isinstance(data_parallel_config, FullyShardedDataParallelConfig):
+        from dataclasses import fields
+
+        from megatron.core.distributed.fully_sharded_data_parallel_config import _LEGACY_NAMES
+
+        resolved_config = data_parallel_config.resolved()
+        for config_field in fields(resolved_config):
+            legacy_name = _LEGACY_NAMES.get(config_field.name, config_field.name)
+            setattr(args, legacy_name, getattr(resolved_config, config_field.name))
+        args.use_megatron_fsdp = True
     transformer_config = getattr(cfg.model, "transformer", None)
     # Legacy model-provider entrypoints do not construct a model config yet.
     tp_comm_overlap = (
