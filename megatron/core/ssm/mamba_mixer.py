@@ -486,6 +486,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         inference_mode=False,
     ):
         """Run Mamba through its normalized SSM output, before output projection."""
+        batch_first = self._use_batch_first_ssm(inference_mode)
+        if batch_first:
+            # l b h -> b l h on the d_model-wide input instead of the wider in_proj output.
+            hidden_states = hidden_states.transpose(0, 1).contiguous()
         zxBCdt, _ = self.in_proj(hidden_states)
 
         zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
@@ -499,9 +503,30 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             y = self._static_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
         else:
             assert ssm_state is None
-            y = self._ssm_training(zxBCdt, packed_seq_params)
+            y = self._ssm_training(zxBCdt, packed_seq_params, batch_first=batch_first)
 
         return y
+
+    def _use_batch_first_ssm(self, inference_mode: bool) -> bool:
+        """Whether the training path keeps in_proj, the SSM and out_proj batch-first.
+
+        The SSM kernel is batch-first, so this moves the two l<->b transposes from the
+        in_proj/SSM outputs to the narrower d_model-wide input and output. Sequence parallel
+        and context parallel communicate along the sequence dim, so they keep the old layout.
+        """
+        return (
+            self.use_mem_eff_path
+            and not inference_mode
+            and self.cp.cp_size == 1
+            and not self.config.sequence_parallel
+        )
+
+    def _out_proj(self, y: torch.Tensor, batch_first: bool):
+        """Apply out_proj, returning the output in [sequence, batch, hidden] layout."""
+        out, out_bias = self.out_proj(y)
+        if batch_first:
+            out = out.transpose(0, 1).contiguous()
+        return out, out_bias
 
     def forward_pre_attn_and_core_attn(
         self,
@@ -521,7 +546,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
 
     def forward_post_core_attn(self, y):
         """Apply the Mamba output projection to an SSM output tensor."""
-        return self.out_proj(y)
+        return self._out_proj(y, self._use_batch_first_ssm(inference_mode=False))
 
     def forward(
         self,
@@ -559,7 +584,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             packed_seq_params=packed_seq_params,
             inference_mode=in_inference_mode,
         )
-        return self.out_proj(y)
+        return self._out_proj(y, self._use_batch_first_ssm(in_inference_mode))
 
     # ==================================================================
     # Static / eager inference
@@ -716,7 +741,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         return y
 
     def _ssm_training(
-        self, zxBCdt: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
+        self,
+        zxBCdt: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        batch_first: bool = False,
     ) -> torch.Tensor:
         """
         Performs SSM computation for training step.
@@ -726,8 +754,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         training.
         """
 
-        # transpose: l b pd --> b l pd
-        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
+        if not batch_first:
+            # transpose: l b pd --> b l pd
+            zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
 
         # (nheads_local_tpcp)
         A = -torch.exp(self.cp.get_A_log().float())
@@ -765,7 +794,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             **state_dtype_kwarg,
         )
 
-        y = rearrange(y, "b l d -> l b d").contiguous()
+        if not batch_first:
+            y = rearrange(y, "b l d -> l b d").contiguous()
         y = self.cp.post_conv_ssm(y, packed_seq_params)
 
         if self.rmsnorm:
