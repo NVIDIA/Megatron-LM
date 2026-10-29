@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import copy
 import signal
 import sys
 import types
@@ -82,7 +83,10 @@ def _minimal_training_args(monkeypatch):
 
 
 @pytest.mark.parametrize("rotary_base,rotary_percent", [(10000, 1.0), (500000, 0.5)])
-def test_dsa_indexer_receives_model_rope_settings(monkeypatch, rotary_base, rotary_percent):
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Indexer RoPE requires CUDA")
+def test_dsa_indexer_preserves_legacy_checkpoint_rope(monkeypatch, rotary_base, rotary_percent):
+    from megatron.core.transformer.experimental_attention_variant import dsa_gqa
+
     args = _minimal_training_args(monkeypatch)
     args.params_dtype = torch.bfloat16
     args.experimental_attention_variant = 'dsa'
@@ -100,13 +104,45 @@ def test_dsa_indexer_receives_model_rope_settings(monkeypatch, rotary_base, rota
     args.rotary_base = rotary_base
     args.rotary_percent = rotary_percent
     args.rotary_seq_len_interpolation_factor = 2.0
+    args.use_rope_scaling = True
+    args.rope_scaling_factor = 4.0
 
     config = core_transformer_config_from_args(args)
+    legacy_args = copy.deepcopy(args)
+    legacy_args.rotary_base = 10000
+    legacy_args.rotary_percent = 1.0
+    legacy_args.rotary_seq_len_interpolation_factor = None
+    legacy_args.use_rope_scaling = False
+    legacy_args.rope_scaling_factor = 8.0
+    legacy_config = core_transformer_config_from_args(legacy_args)
 
-    assert config.rope_type == 'rope'
-    assert config.rotary_base == rotary_base
-    assert config.rotary_percent == rotary_percent
-    assert config.rotary_seq_len_interpolation_factor == 2.0
+    class IndexerLinear(torch.nn.Linear):
+        def forward(self, x):
+            return super().forward(x), None
+
+    def build_linear(_spec, input_size, output_size, **_kwargs):
+        return IndexerLinear(input_size, output_size, bias=False)
+
+    monkeypatch.setattr(dsa_gqa, 'build_module', build_linear)
+    singleton_group = SimpleNamespace(size=lambda: 1)
+    groups = SimpleNamespace(tp=singleton_group, cp=singleton_group)
+    submodules = dsa_gqa.SimplifiedDSGQAIndexerSubmodules(
+        linear_q=IndexerLinear, linear_k=IndexerLinear
+    )
+    legacy_indexer = dsa_gqa.SimplifiedDSGQAIndexer(
+        legacy_config, submodules, pg_collection=groups
+    ).to(device='cuda', dtype=torch.bfloat16)
+    restored_indexer = dsa_gqa.SimplifiedDSGQAIndexer(config, submodules, pg_collection=groups).to(
+        device='cuda', dtype=torch.bfloat16
+    )
+    restored_indexer.load_state_dict(legacy_indexer.state_dict(), strict=True)
+
+    hidden = torch.randn(32, 1, args.hidden_size, device='cuda', dtype=torch.bfloat16)
+    with torch.no_grad():
+        expected = legacy_indexer.forward_qk(hidden, use_rope=True)
+        actual = restored_indexer.forward_qk(hidden, use_rope=True)
+    for actual_tensor, expected_tensor in zip(actual, expected):
+        torch.testing.assert_close(actual_tensor, expected_tensor, atol=0, rtol=0)
 
 
 def test_moe_norm_flag_reaches_transformer_config():

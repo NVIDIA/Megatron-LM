@@ -506,7 +506,6 @@ def core_transformer_config_from_args(args, config_class=None):
 
     _apply_yarn_config_from_args(config, args)
     _model_rng_config(args).finalize_model_config(config)
-    _apply_dsa_rope_config_from_args(config, args)
 
     # Return config.
     return config
@@ -542,23 +541,6 @@ def _apply_yarn_config_from_args(config, args) -> None:
     _set('yarn_mscale', args.mscale, 1.0)
     _set('yarn_mscale_all_dim', args.mscale_all_dim, 0.0)
     _set('yarn_correction_range_round_to_int', args.yarn_correction_range_round_to_int, True)
-
-
-def _apply_dsa_rope_config_from_args(config, args) -> None:
-    """Pass model RoPE settings to the independently projected DSA-over-GQA indexer."""
-    if getattr(config, 'experimental_attention_variant', None) != 'dsa':
-        return
-    if getattr(config, 'multi_latent_attention', False):
-        return
-
-    from megatron.core.transformer.experimental_attention_variant.dsa_gqa import _DSA_ROPE_DEFAULTS
-
-    # These options are declared by the CLI, rather than TransformerConfig fields.
-    # Preserve settings already provided by a specialized config class.
-    for name, default in _DSA_ROPE_DEFAULTS.items():
-        if not hasattr(config, name):
-            value = getattr(args, name, None)
-            setattr(config, name, default if value is None else value)
 
 
 def _default_config_from_args(
