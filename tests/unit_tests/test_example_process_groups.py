@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 from megatron.core import parallel_state, process_groups_config
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
@@ -69,6 +70,85 @@ def test_model_provider_warns_without_a_collection(monkeypatch, folder, name):
         script.model_provider()
 
     shim.assert_called_once_with()
+
+
+class _Model:
+    """A model stand-in that holds its process groups and returns ``output``."""
+
+    def __init__(self, pg_collection, output):
+        self.pg_collection = pg_collection
+        self.output = output
+
+    def __call__(self, *args, **kwargs):
+        return self.output
+
+
+def _broadcast(batch, received):
+    """A stand-in for tensor_parallel.broadcast_data that records the group it is given."""
+
+    def broadcast_data(keys, data, datatype, tp_group=None):
+        received.append(tp_group)
+        return {key: batch[key] for key in keys}
+
+    return broadcast_data
+
+
+def test_bert_step_uses_the_groups_of_the_model(monkeypatch):
+    """The batch is broadcast over the model's tensor-parallel group and the losses are averaged
+    over its data-parallel group, without a fallback to the global grid."""
+    script = _import_example(monkeypatch, "bert", "pretrain_bert")
+    pg_collection = ProcessGroupCollection(tp=object(), dp_gtp_remat=object())
+    batch = {
+        name: torch.ones(1, 4, dtype=torch.int64)
+        for name in ("text", "types", "labels", "is_random", "loss_mask", "padding_mask")
+    }
+    broadcast_groups, averaged_over = [], []
+    monkeypatch.setattr(script, "get_args", lambda: SimpleNamespace(bert_binary_head=False))
+    monkeypatch.setattr(script, "get_timers", lambda: Mock())
+    monkeypatch.setattr(
+        script.tensor_parallel, "broadcast_data", _broadcast(batch, broadcast_groups)
+    )
+
+    def average_losses(losses, group=None):
+        averaged_over.append(group)
+        return torch.cat([loss.view(1) for loss in losses])
+
+    monkeypatch.setattr(script, "average_losses_across_data_parallel_group", average_losses)
+    model = _Model(pg_collection, (torch.ones(1, 4), None))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ProcessGroupFallbackWarning)
+        output, loss_func = script.forward_step(iter([batch]), model)
+        loss_func(output)
+
+    assert broadcast_groups == [pg_collection.tp]
+    assert averaged_over == [pg_collection.dp_gtp_remat]
+
+
+def test_t5_step_broadcasts_over_the_tensor_parallel_group_of_the_model(monkeypatch):
+    script = _import_example(monkeypatch, "t5", "pretrain_t5")
+    pg_collection = ProcessGroupCollection(tp=object())
+    batch = {
+        name: torch.ones(1, 4, dtype=torch.int64)
+        for name in ("text_enc", "text_dec", "labels", "loss_mask", "enc_mask", "dec_mask")
+    }
+    broadcast_groups = []
+    monkeypatch.setattr(script, "get_args", lambda: SimpleNamespace(transformer_impl="local"))
+    monkeypatch.setattr(script, "get_timers", lambda: Mock())
+    monkeypatch.setattr(
+        script.tensor_parallel, "broadcast_data", _broadcast(batch, broadcast_groups)
+    )
+    monkeypatch.setattr(
+        script.T5MaskedWordPieceDataset,
+        "config_attention_mask",
+        staticmethod(lambda tokens_enc, tokens_dec, enc_mask, dec_mask, use_local: (None,) * 3),
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ProcessGroupFallbackWarning)
+        script.forward_step(iter([batch]), _Model(pg_collection, torch.ones(1, 4)))
+
+    assert broadcast_groups == [pg_collection.tp]
 
 
 @pytest.fixture
