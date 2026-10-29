@@ -265,6 +265,32 @@ def test_rejects_shared_context_without_caller_managed_grad_sync(
         assert not isinstance(layer, FsdpModule)
 
 
+@pytest.mark.parametrize("dp_cp", ["unset", "none"])
+def test_rejects_collection_without_dp_cp(process_group_collection, distributed_setup, dp_cp):
+    """A collection whose dp_cp is unset or None is rejected before a mesh is built from it."""
+    pg_collection = ProcessGroupCollection(**vars(process_group_collection))
+    if dp_cp == "unset":
+        delattr(pg_collection, "dp_cp")
+    else:
+        pg_collection.dp_cp = None
+    config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4)
+    layer = torch.nn.Linear(16, 16, device=distributed_setup.device)
+
+    with pytest.raises(ValueError, match="requires an explicit dp_cp process group"):
+        FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=layer,
+            pg_collection=pg_collection,
+        )
+    assert not isinstance(layer, FsdpModule)
+
+
 def test_finish_grad_sync_waits_for_delayed_wgrad(process_group_collection, distributed_setup):
     """Delayed-wgrad reductions must rejoin the compute stream before capture ends."""
     config = TransformerConfig(
