@@ -872,8 +872,8 @@ def validate_args(args, defaults={}):
         if args.virtual_pipeline_model_parallel_size == 1:
             args.virtual_pipeline_model_parallel_size = None
     else:
-        # CLI patterns and Python configs may already provide the VPP topology.
-        if not hasattr(args, 'virtual_pipeline_model_parallel_size'):
+        # Only set VPP to None if it wasn't already derived from --hybrid-layer-pattern
+        if args.hybrid_layer_pattern is None:
             args.virtual_pipeline_model_parallel_size = None
 
     if args.virtual_pipeline_model_parallel_size is not None:

@@ -442,6 +442,9 @@ class TestHybridModelBuilderBuildModel:
         config = _make_hybrid_config(
             transformer=transformer, hybrid_layer_config_list=source_config_list
         )
+        expected_depth = 1 if with_mtp else None
+        mock_model.return_value.config = _make_transformer(mtp_num_layers=expected_depth)
+        mock_model.return_value.mtp_num_depths = expected_depth or 0
 
         HybridModelBuilder(config).build_model(self.pg, pre_process=True, post_process=True)
 
@@ -449,8 +452,9 @@ class TestHybridModelBuilderBuildModel:
         assert forwarded is source_config_list
         assert forwarded[0] is layer_config
         assert forwarded[1] is layer_config
-        expected_depth = 1 if with_mtp else None
-        assert mock_model.call_args.kwargs["config"].mtp_num_layers == expected_depth
+        assert mock_model.call_args.kwargs["config"] is transformer
+        assert transformer.mtp_num_layers is None
+        assert config.transformer is mock_model.return_value.config
         assert args.mtp_num_layers == expected_depth
         assert args.is_hybrid_model is True
         assert layer_config.mtp_num_layers is None

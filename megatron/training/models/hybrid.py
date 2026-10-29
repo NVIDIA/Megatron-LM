@@ -9,7 +9,6 @@ import torch
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.hybrid import HybridLayerEntry
-from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_layer_config_list
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
@@ -188,7 +187,6 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         matching preconfigured virtual-pipeline topology.
         """
         hybrid_layer_config_list = self._model_config.hybrid_layer_config_list
-        parsed_config_list = None
         try:
             args = get_args()
         except AssertionError:
@@ -209,44 +207,12 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             has_deprecated_ratio = self._model_config.hybrid_attention_ratio != 0.0 or (
                 self._model_config.hybrid_mlp_ratio != 0.0
             )
-            if (
-                self._model_config.hybrid_layer_pattern is not None
-                or self._model_config.hybrid_override_pattern is not None
-                or has_deprecated_ratio
-            ):
+            if self._model_config.hybrid_override_pattern is not None or has_deprecated_ratio:
                 raise ValueError(
                     "hybrid_layer_config_list is mutually exclusive with "
-                    "hybrid_layer_pattern, hybrid_override_pattern, "
+                    "hybrid_override_pattern, "
                     "hybrid_attention_ratio, and hybrid_mlp_ratio"
                 )
-
-            parsed_config_list = parse_hybrid_layer_config_list(
-                hybrid_layer_config_list,
-                expected_num_layers=self._model_config.transformer.num_layers,
-                expected_mtp_num_layers=self._model_config.transformer.mtp_num_layers,
-            )
-            # The stack-level config is normally separate from layer entries. If a caller reuses
-            # the same supported config object for both roles, detach the stack-level copy before
-            # synchronizing inferred runtime state so the list entry remains read-only.
-            if any(entry is self._model_config.transformer for entry in hybrid_layer_config_list):
-                transformer = self._model_config.transformer
-                self._model_config.transformer = type(transformer).from_config(transformer)
-            if (
-                self._model_config.transformer.mtp_num_layers is None
-                and parsed_config_list.mtp_num_depths > 0
-            ):
-                self._model_config.transformer.mtp_num_layers = parsed_config_list.mtp_num_depths
-
-            if args is not None:
-                if (
-                    args_mtp_num_layers is not None
-                    and args_mtp_num_layers != parsed_config_list.mtp_num_depths
-                ):
-                    raise ValueError(
-                        "hybrid_layer_config_list defines "
-                        f"{parsed_config_list.mtp_num_depths} MTP depths, but runtime "
-                        f"mtp_num_layers is {args_mtp_num_layers}"
-                    )
 
         hybrid_stack_spec = resolve_hybrid_stack_spec(self._model_config)
 
@@ -288,14 +254,20 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             pg_collection=pg_collection,
             vp_stage=vp_stage,
         )
+        if hybrid_layer_config_list is not None:
+            # Core owns config cloning and MTP inference; retain its resolved root config.
+            self._model_config.transformer = model.config
+            if args is not None:
+                if args_mtp_num_layers is not None and args_mtp_num_layers != model.mtp_num_depths:
+                    raise ValueError(
+                        "hybrid_layer_config_list defines "
+                        f"{model.mtp_num_depths} MTP depths, but runtime "
+                        f"mtp_num_layers is {args_mtp_num_layers}"
+                    )
+                if model.mtp_num_depths > 0:
+                    args.mtp_num_layers = model.mtp_num_depths
         if args is not None:
             args.is_hybrid_model = True
-            if (
-                parsed_config_list is not None
-                and args_mtp_num_layers is None
-                and parsed_config_list.mtp_num_depths > 0
-            ):
-                args.mtp_num_layers = parsed_config_list.mtp_num_depths
         return model
 
     def build_distributed_models(
