@@ -20,8 +20,11 @@ from megatron.core.datasets.gpt_dataset import _get_ltor_masks_and_position_ids
 from megatron.core.enums import ModelType
 from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.utils import get_model_config
 from megatron.training import get_args, get_tokenizer
 from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
@@ -37,20 +40,15 @@ FORWARD_ITERS = 1  # *3
 SKIP_CONVERSION = False
 
 
-def is_model_parallel_rank_0():
-    return (
-        parallel_state.get_tensor_model_parallel_rank() == 0
-        and parallel_state.get_pipeline_model_parallel_rank() == 0
-    )
+def is_model_parallel_rank_0(pg_collection):
+    return pg_collection.tp.rank() == 0 and pg_collection.pp.rank() == 0
 
 
-def broadcast(item):
+def broadcast(item, tp_group):
     """Broadcast data from TP rank 0 to other ranks."""
     if item is not None:
         torch.distributed.broadcast(
-            item,
-            parallel_state.get_tensor_model_parallel_src_rank(),
-            group=parallel_state.get_tensor_model_parallel_group(),
+            item, torch.distributed.get_global_rank(tp_group, 0), group=tp_group
         )
 
 
@@ -135,6 +133,8 @@ class Pipeline:
         assert isinstance(dst, ModelMeta)
         self.src = src
         self.dst = dst
+        # Process groups of the grid that init_args_and_model() set up last.
+        self.pg_collection = None
 
     def __str__(self):
         return f"src <{self.src}>; dst <{self.dst}>"
@@ -165,6 +165,8 @@ class Pipeline:
             pipeline_model_parallel_size=meta.mp.pp,
             expert_model_parallel_size=meta.mp.ep,
         )
+        # The groups that initialize_model_parallel() built for this grid and registered.
+        self.pg_collection = parallel_state.get_registered_process_groups()
 
         # Environment vars.
         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
@@ -215,27 +217,27 @@ class Pipeline:
 
         # Random seed.
         torch.manual_seed(123)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_cuda_manual_seed(123, pg_collection=self.pg_collection)
 
         # Model.
         models = self.build_model()
 
         return args, models
 
-    @staticmethod
-    def build_model():
+    def build_model(self):
         model_provider_func = partial(model_provider, gpt_builder)
         models = get_model(
-            model_provider_func=model_provider_func, model_type=ModelType.encoder_or_decoder
+            model_provider_func=model_provider_func,
+            model_type=ModelType.encoder_or_decoder,
+            pg_collection=self.pg_collection,
         )
         [m.eval() for m in models]
 
         return models
 
-    @staticmethod
-    def get_input_ids():
+    def get_input_ids(self):
         """Randomly initialize input token IDs."""
-        if is_model_parallel_rank_0():
+        if is_model_parallel_rank_0(self.pg_collection):
             # Generate different data on each DP rank.
             args = get_args()
 
@@ -254,15 +256,15 @@ class Pipeline:
         else:
             return None
 
-    @staticmethod
-    def get_batch(input_ids):
+    def get_batch(self, input_ids):
         """Get batch of data, from input token IDs."""
 
         args = get_args()
+        pg_collection = self.pg_collection
 
         # TP rank 0, PP rank 0.
         # (Note: mimics megatron/training/utils.py:get_batch_on_this_tp_rank().)
-        if is_model_parallel_rank_0():
+        if is_model_parallel_rank_0(pg_collection):
 
             tokenizer = get_tokenizer()
 
@@ -279,7 +281,7 @@ class Pipeline:
             attention_mask = attention_mask.unsqueeze(0)
 
         # Other TP ranks on PP rank 0.
-        elif parallel_state.is_pipeline_first_stage():
+        elif is_pp_first_stage(pg_collection.pp):
             input_ids = torch.empty(
                 (args.micro_batch_size, args.seq_length),
                 dtype=torch.int64,
@@ -307,15 +309,14 @@ class Pipeline:
             attention_mask = None
 
         # Broadcast.
-        if parallel_state.is_pipeline_first_stage():
-            broadcast(input_ids)
-            broadcast(attention_mask)
-            broadcast(position_ids)
+        if is_pp_first_stage(pg_collection.pp):
+            broadcast(input_ids, pg_collection.tp)
+            broadcast(attention_mask, pg_collection.tp)
+            broadcast(position_ids, pg_collection.tp)
 
         return input_ids, position_ids, attention_mask
 
-    @classmethod
-    def forward_step(cls, orig_input_ids: T.Iterator, model: torch.nn.Module):
+    def forward_step(self, orig_input_ids: T.Iterator, model: torch.nn.Module):
         """Forward step.
 
         Args:
@@ -327,7 +328,7 @@ class Pipeline:
         orig_input_ids = list(orig_input_ids)[0]
 
         # Get batch.
-        input_ids, position_ids, attention_mask = cls.get_batch(orig_input_ids)
+        input_ids, position_ids, attention_mask = self.get_batch(orig_input_ids)
 
         # Forward pass test data (multi iters for JIT warm-up).
         for _ in range(FORWARD_ITERS):
@@ -344,16 +345,18 @@ class Pipeline:
 
         return output_tensor, lambda _, non_loss_data: data
 
-    @classmethod
-    def forward_model(cls, models, orig_input_ids):
+    def forward_model(self, models, orig_input_ids):
         """Forward pass data, and gather parallel output tensors."""
 
         args = get_args()
+        pg_collection = self.pg_collection
 
-        # Forward pass.
-        forward_backward_func = get_forward_backward_func()
+        # Forward pass. The grid has no virtual pipeline stages.
+        forward_backward_func = get_forward_backward_func(
+            pp_size=pg_collection.pp.size(), vp_size=None
+        )
         data = forward_backward_func(
-            forward_step_func=cls.forward_step,
+            forward_step_func=self.forward_step,
             data_iterator=iter([orig_input_ids]),
             model=models,
             num_microbatches=1,
@@ -361,15 +364,21 @@ class Pipeline:
             micro_batch_size=args.micro_batch_size,
             forward_only=True,
             collect_non_loss_data=True,
+            p2p_communicator=P2PCommunicator(
+                pp_group=pg_collection.pp, config=get_model_config(models[0])
+            ),
+            pg_collection=pg_collection,
         )
-        if parallel_state.is_pipeline_last_stage():
+        if is_pp_last_stage(pg_collection.pp):
             output_tensor = data[0]["output_tensor"]
         else:
             output_tensor = None
 
         # All-gather across the partitions.
-        if parallel_state.is_pipeline_last_stage():
-            output_tensor_gathered = gather_from_tensor_model_parallel_region(output_tensor)
+        if is_pp_last_stage(pg_collection.pp):
+            output_tensor_gathered = gather_from_tensor_model_parallel_region(
+                output_tensor, group=pg_collection.tp
+            )
         else:
             output_tensor_gathered = None
 
@@ -396,7 +405,7 @@ class Pipeline:
                 emb = model.module.module.shared_embedding_or_output_weight()
                 # Make embedding the same on ranks that has is
                 if emb is not None:
-                    torch.distributed.all_reduce(emb, group=parallel_state.get_embedding_group())
+                    torch.distributed.all_reduce(emb, group=self.pg_collection.embd)
 
     def save_checkpoint(self):
         """Initialize params, forward pass data, and save checkpoint."""
@@ -654,10 +663,9 @@ class LLaVAPipeline(Pipeline):
         test_image = torch.ones((1, 3, args.img_h, args.img_w)).to("cuda")
         return test_image
 
-    @staticmethod
-    def get_input_ids():
+    def get_input_ids(self):
         """Randomly initialize input token IDs."""
-        if is_model_parallel_rank_0():
+        if is_model_parallel_rank_0(self.pg_collection):
             # Generate different data on each DP rank.
             args = get_args()
 
@@ -679,8 +687,7 @@ class LLaVAPipeline(Pipeline):
         else:
             return None
 
-    @classmethod
-    def forward_step(cls, orig_input_ids: T.Iterator, model: torch.nn.Module):
+    def forward_step(self, orig_input_ids: T.Iterator, model: torch.nn.Module):
         """Forward step.
 
         Args:
@@ -692,11 +699,11 @@ class LLaVAPipeline(Pipeline):
         orig_input_ids = list(orig_input_ids)[0]
 
         # Get batch.
-        input_ids, position_ids, _ = cls.get_batch(orig_input_ids)
+        input_ids, position_ids, _ = self.get_batch(orig_input_ids)
 
         # Forward pass test data (multi iters for JIT warm-up).
         for _ in range(FORWARD_ITERS):
-            output_tensor = model(cls.get_test_image(), input_ids, position_ids, None)
+            output_tensor = model(self.get_test_image(), input_ids, position_ids, None)
 
         # Aggregate data, for validation.
         data = {
@@ -709,16 +716,18 @@ class LLaVAPipeline(Pipeline):
 
         return output_tensor, lambda _, non_loss_data: data
 
-    @classmethod
-    def forward_model(cls, models, orig_input_ids):
+    def forward_model(self, models, orig_input_ids):
         """Forward pass data, and gather parallel output tensors."""
 
         args = get_args()
+        pg_collection = self.pg_collection
 
-        # Forward pass.
-        forward_backward_func = get_forward_backward_func()
+        # Forward pass. The grid has no virtual pipeline stages.
+        forward_backward_func = get_forward_backward_func(
+            pp_size=pg_collection.pp.size(), vp_size=None
+        )
         data = forward_backward_func(
-            forward_step_func=cls.forward_step,
+            forward_step_func=self.forward_step,
             data_iterator=iter([orig_input_ids]),
             model=models,
             num_microbatches=1,
@@ -726,27 +735,34 @@ class LLaVAPipeline(Pipeline):
             micro_batch_size=args.micro_batch_size,
             forward_only=True,
             collect_non_loss_data=True,
+            p2p_communicator=P2PCommunicator(
+                pp_group=pg_collection.pp, config=get_model_config(models[0])
+            ),
+            pg_collection=pg_collection,
         )
 
-        if parallel_state.is_pipeline_last_stage():
+        if is_pp_last_stage(pg_collection.pp):
             output_tensor = data[0]["output_tensor"][0]
         else:
             output_tensor = None
 
         # All-gather across the partitions.
-        if parallel_state.is_pipeline_last_stage():
-            output_tensor_gathered = gather_from_tensor_model_parallel_region(output_tensor)
+        if is_pp_last_stage(pg_collection.pp):
+            output_tensor_gathered = gather_from_tensor_model_parallel_region(
+                output_tensor, group=pg_collection.tp
+            )
         else:
             output_tensor_gathered = None
 
         return output_tensor_gathered
 
-    @staticmethod
-    def build_model():
+    def build_model(self):
         from examples.multimodal.model import model_provider
 
         models = get_model(
-            model_provider_func=model_provider, model_type=ModelType.encoder_or_decoder
+            model_provider_func=model_provider,
+            model_type=ModelType.encoder_or_decoder,
+            pg_collection=self.pg_collection,
         )
         [m.eval() for m in models]
 
@@ -768,6 +784,8 @@ class LLaVAPipeline(Pipeline):
             pipeline_model_parallel_size=meta.mp.pp,
             expert_model_parallel_size=meta.mp.ep,
         )
+        # The groups that initialize_model_parallel() built for this grid and registered.
+        self.pg_collection = parallel_state.get_registered_process_groups()
 
         # Environment vars.
         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
@@ -820,7 +838,7 @@ class LLaVAPipeline(Pipeline):
 
         # Random seed.
         torch.manual_seed(123)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_cuda_manual_seed(123, pg_collection=self.pg_collection)
 
         # Model.
         models = self.build_model()
