@@ -480,6 +480,7 @@ def _build_ddp_distopt_and_optim(
     """Real distributed-optimizer setup (Adam), matching the 64-GPU production path."""
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+    from megatron.core.process_groups_config import ProcessGroupCollection
 
     # The stack's own layers already carry the config they were built with (including
     # gtp_weight_remat_size/expert_gtp_weight_remat_size/expert_model_parallel_size, set
@@ -510,7 +511,9 @@ def _build_ddp_distopt_and_optim(
         exp_avg_sq_dtype=torch.float32,
         clip_grad=1.0,  # reported grad-norm is computed pre-clip, so this is just for the step
     )
-    optim = get_megatron_optimizer(opt_config, [ddp_model])
+    optim = get_megatron_optimizer(
+        opt_config, [ddp_model], pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+    )
     return ddp_model, optim
 
 
