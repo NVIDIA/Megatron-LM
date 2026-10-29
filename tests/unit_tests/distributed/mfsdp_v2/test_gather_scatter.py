@@ -8,6 +8,7 @@ computed inputs from a separate DBuffer, then scatter results into remote-owned 
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import DBuffer, layout_builder
@@ -46,6 +47,12 @@ def _known_full_tensors(dbuffer: DBuffer) -> list[torch.Tensor]:
                 full.flatten()[offset : offset + shard_range.numel].view(local_view.shape)
             )
     return full_tensors
+
+
+def _wait(works: list[dist.Work]) -> None:
+    """Order the current stream after the posted transfers."""
+    for work in works:
+        work.wait()
 
 
 @pytest.mark.parametrize("subgroup", [False, True])
@@ -87,15 +94,15 @@ def test_gather_scatter_round_trip(subgroup, placement, distributed_setup):
 
     # Momentum/Nesterov-style computed inputs can use separate storage with the same layout.
     source = DBuffer.from_local(dbuffer.local_buffer + 2, mesh, [placement], layout)
-    gather(source, {}, tensor_to_owner={})
-    scatter({}, dbuffer, tensor_to_owner={})
+    _wait(gather(source, {}, tensor_to_owner={}))
+    _wait(scatter({}, dbuffer, tensor_to_owner={}))
     torch.testing.assert_close(dbuffer.local_buffer, original, atol=0, rtol=0)
 
     owned = {i for i, owner in tensor_to_owner.items() if owner == this_rank}
     destination = {
         i: torch.empty(full_tensors[i].shape, dtype=dbuffer.dtype, device=device) for i in owned
     }
-    gather(source, destination, tensor_to_owner=tensor_to_owner)
+    _wait(gather(source, destination, tensor_to_owner=tensor_to_owner))
     for i in owned:
         torch.testing.assert_close(destination[i], full_tensors[i] + 2, atol=0, rtol=0)
     assert set(destination) == owned
@@ -103,7 +110,7 @@ def test_gather_scatter_round_trip(subgroup, placement, distributed_setup):
 
     for tensor in destination.values():
         tensor.add_(1)
-    scatter(destination, dbuffer, tensor_to_owner=tensor_to_owner)
+    _wait(scatter(destination, dbuffer, tensor_to_owner=tensor_to_owner))
 
     expected_buffer = original.clone()
     for i in tensor_to_owner:
@@ -141,8 +148,8 @@ def test_gather_scatter_with_stream(distributed_setup):
     stream = torch.cuda.Stream(device=device)
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        gather(dbuffer, destination, tensor_to_owner=tensor_to_owner)
-        scatter(destination, scratch, tensor_to_owner=tensor_to_owner)
+        _wait(gather(dbuffer, destination, tensor_to_owner=tensor_to_owner))
+        _wait(scatter(destination, scratch, tensor_to_owner=tensor_to_owner))
     stream.synchronize()
 
     for i in owned:
@@ -152,3 +159,47 @@ def test_gather_scatter_with_stream(distributed_setup):
         result_view = scratch.get_tensor_view(i)
         expected = torch.full_like(local_view, -1) if i in owned else local_view
         torch.testing.assert_close(result_view, expected, atol=0, rtol=0)
+
+
+def test_gather_scatter_pipelines_buffers(distributed_setup):
+    """Transfers of several buffers stay in flight until each is waited on."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("Needs at least two ranks.")
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    this_rank = mesh.get_rank()
+    shapes = [[(8, 4), (4, 4)], [(6, 4)], [(4, 8), (8, 8)]]
+    dbuffers = [DBuffer.empty(mesh, [RowAtomic()], s, torch.float32, device) for s in shapes]
+    full_tensors = [_known_full_tensors(dbuffer) for dbuffer in dbuffers]
+    tensor_to_owners = [assign_owner_work([dbuffer])[0] for dbuffer in dbuffers]
+    owned = [{i for i, owner in t2o.items() if owner == this_rank} for t2o in tensor_to_owners]
+    destinations = [
+        {i: torch.empty_like(full[i]) for i in owned_i}
+        for full, owned_i in zip(full_tensors, owned)
+    ]
+    scratches = [
+        DBuffer.from_local(torch.full_like(d.local_buffer, -1), mesh, d.placements, d.layout)
+        for d in dbuffers
+    ]
+
+    # All gathers are in flight before the first is waited on.
+    gathers = [
+        gather(d, dest, tensor_to_owner=t2o)
+        for d, dest, t2o in zip(dbuffers, destinations, tensor_to_owners)
+    ]
+    scatters = []
+    for works, full, dest, owned_i, scratch, t2o in zip(
+        gathers, full_tensors, destinations, owned, scratches, tensor_to_owners
+    ):
+        _wait(works)
+        for i in owned_i:
+            torch.testing.assert_close(dest[i], full[i], atol=0, rtol=0)
+        scatters.append(scatter(dest, scratch, tensor_to_owner=t2o))
+    for works, dbuffer, owned_i, scratch, t2o in zip(
+        scatters, dbuffers, owned, scratches, tensor_to_owners
+    ):
+        _wait(works)
+        for i in t2o:
+            local_view = dbuffer.get_tensor_view(i)
+            expected = torch.full_like(local_view, -1) if i in owned_i else local_view
+            torch.testing.assert_close(scratch.get_tensor_view(i), expected, atol=0, rtol=0)

@@ -59,6 +59,7 @@ def _train(
     return torch.stack(losses)
 
 
+@pytest.mark.parametrize("lookahead", [0, 2])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("weight_decay_method", ["decoupled", "independent", "l2", "palm"])
 @pytest.mark.parametrize(
@@ -78,9 +79,12 @@ def _train(
     ],
 )
 def test_muon_matches_reference(
-    distributed_setup, dtype, weight_decay_method, nesterov, kernel_options
+    distributed_setup, dtype, weight_decay_method, nesterov, kernel_options, lookahead
 ):
-    """FSDP and unsharded Muon should produce identical loss curves."""
+    """FSDP and unsharded Muon should produce identical loss curves.
+
+    Each linear layer is its own FSDP group, so lookahead pipelines several groups' communication.
+    """
     world_size = distributed_setup.world_size
     if world_size < 2 or world_size % 2:
         pytest.skip("Requires an even number of ranks for two-rank DP meshes.")
@@ -93,16 +97,17 @@ def test_muon_matches_reference(
     reference = copy.deepcopy(model).float()
     reference_params = dict(reference.named_parameters())
     with fully_shard_context(device=device):
-        fully_shard(
-            model,
-            mesh=mesh,
-            placements=Placements(
-                dp_axes=[0],
-                parameter=[RowAtomic()],
-                gradient=[RowAtomic()],
-                optimizer=[RowAtomic()],
-            ),
-        )
+        for layer in (m for m in model.modules() if isinstance(m, nn.Linear)):
+            fully_shard(
+                layer,
+                mesh=mesh,
+                placements=Placements(
+                    dp_axes=[0],
+                    parameter=[RowAtomic()],
+                    gradient=[RowAtomic()],
+                    optimizer=[RowAtomic()],
+                ),
+            )
     params = dict(model.named_parameters())
     kwargs = dict(
         lr=0.05,
@@ -113,7 +118,7 @@ def test_muon_matches_reference(
     )
     excluded_names = ["block2.3.weight", "block2.3.bias"]
     muon_names = [name for name in params if name not in excluded_names]
-    optimizer = muon.FsdpMuon([params[name] for name in muon_names], **kwargs)
+    optimizer = muon.FsdpMuon([params[name] for name in muon_names], lookahead=lookahead, **kwargs)
     fully_shard_optimizer(optimizer, precision_aware=True)
     reference_optimizer = Muon([reference_params[name] for name in muon_names], **kwargs)
     other_optimizer = torch.optim.SGD([params[n] for n in excluded_names], lr=0.01, foreach=False)

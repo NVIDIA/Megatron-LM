@@ -98,6 +98,14 @@ moves only remote fragments. In the example, `P0`, `P3`, and `P4` require
 no optimizer-step network traffic. Persistent ownership stays unchanged;
 full inputs and updates exist temporarily on compute owners.
 
+Gathers and scatters return their P2P works instead of waiting, so communication
+overlaps Newton–Schulz. Before a group is orthogonalized, the gathers of the next
+`lookahead` groups are posted, and a group's updates are applied once `lookahead`
+later groups have been scattered, so each scatter overlaps their Newton–Schulz.
+Each group in flight holds its momentum inputs, full tensors, and received
+updates, so `lookahead` trades memory for overlap; zero gives the
+non-overlapped order.
+
 A simpler alternative in [issue #5533](https://github.com/NVIDIA/Megatron-LM/issues/5533)
 all-gathers boundary-matrix inputs and duplicates orthogonalization. The
 current path avoids that redundant computation.
@@ -141,10 +149,9 @@ and [collectives](../megatron_fsdp/experimental/dbuffer.py) for this.
 
 ## Next step
 
-1. **Optimize performance.** Overlap communication with Muon computation,
-   batch Newton–Schulz across FSDP units (it currently runs one unit at a
-   time), and make parameter placement aware of hardware topology to keep
-   traffic on fast links, as discussed in [#6368](https://github.com/NVIDIA/Megatron-LM/issues/6368).
+1. **Optimize performance.** Batch Newton–Schulz across FSDP units (it
+   currently runs one unit at a time), and make parameter placement aware of
+   hardware topology to keep traffic on fast links, as discussed in [#6368](https://github.com/NVIDIA/Megatron-LM/issues/6368).
 2. **Evaluate TensorAtomic at larger scale.** Compare it with gather/scatter
    on larger models across multiple nodes, measuring forward/backward time,
    full-step time, and peak memory.
