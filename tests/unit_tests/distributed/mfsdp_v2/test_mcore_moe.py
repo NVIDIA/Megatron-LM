@@ -3,6 +3,7 @@
 """MoE training and gradient clipping tests for the MFSDP v2 adapter."""
 
 import logging
+from copy import deepcopy
 from dataclasses import replace
 
 import pytest
@@ -11,6 +12,7 @@ import torch
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec,
     wide_residual_hybrid_stack_spec,
@@ -21,6 +23,7 @@ from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimize
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.moe.experts import SequentialMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
@@ -65,7 +68,10 @@ def process_group_collections(distributed_setup):
     destroy_model_parallel()
 
 
-def test_standard_moe_training_and_clipping(process_group_collections, distributed_setup):
+@pytest.mark.parametrize("grouped_gemm", [True, False], ids=["grouped", "sequential"])
+def test_standard_moe_training_and_clipping(
+    process_group_collections, distributed_setup, grouped_gemm
+):
     """Compare ordinary MoE training and clipping against an EP=1 reference."""
     process_group_collection, reference_process_group_collection = process_group_collections
     config = TransformerConfig(
@@ -77,8 +83,9 @@ def test_standard_moe_training_and_clipping(process_group_collections, distribut
         moe_layer_freq=[0, 1],
         moe_token_dispatcher_type="alltoall",
         moe_router_topk=2,
-        moe_grouped_gemm=True,
+        moe_grouped_gemm=grouped_gemm,
         moe_ffn_hidden_size=128,
+        moe_shared_expert_intermediate_size=128,
         add_bias_linear=False,
         use_cpu_initialization=True,
         params_dtype=torch.float32,
@@ -87,10 +94,14 @@ def test_standard_moe_training_and_clipping(process_group_collections, distribut
         gradient_accumulation_fusion=False,
         attention_backend=AttnBackend.unfused,
     )
+    stack_spec = deepcopy(hybrid_stack_spec)
+    stack_spec.submodules.moe_layer.submodules.mlp = get_moe_module_spec(
+        use_te=True, num_experts=config.num_moe_experts, moe_grouped_gemm=grouped_gemm
+    )
     torch.manual_seed(123)
     reference_model = HybridModel(
         config=replace(config, expert_model_parallel_size=1),
-        hybrid_stack_spec=hybrid_stack_spec,
+        hybrid_stack_spec=stack_spec,
         vocab_size=128,
         max_sequence_length=8,
         hybrid_layer_pattern="*E",
@@ -98,7 +109,7 @@ def test_standard_moe_training_and_clipping(process_group_collections, distribut
     ).cuda()
     model = HybridModel(
         config=config,
-        hybrid_stack_spec=hybrid_stack_spec,
+        hybrid_stack_spec=stack_spec,
         vocab_size=128,
         max_sequence_length=8,
         hybrid_layer_pattern="*E",
@@ -120,7 +131,12 @@ def test_standard_moe_training_and_clipping(process_group_collections, distribut
     )
     assert isinstance(model.module, FsdpModule)
 
-    assert isinstance(model.module.decoder.layers[1].mlp.experts, FsdpModule)
+    layer = model.module.decoder.layers[1]
+    assert isinstance(layer, FsdpModule)
+    assert not isinstance(layer.mlp, FsdpModule)
+    assert not isinstance(layer.mlp.router, FsdpModule)
+    assert not isinstance(layer.mlp.shared_experts, FsdpModule)
+    assert isinstance(layer.mlp.experts, FsdpModule)
 
     optimizer_config = OptimizerConfig(
         lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
@@ -222,6 +238,9 @@ def test_shortcut_moe_training_and_clipping(process_group_collections, distribut
 
     block = model.module.decoder.layers[0]
     assert isinstance(block, FsdpModule)
+    assert not isinstance(block.compute_layer, FsdpModule)
+    assert not isinstance(block.moe_layer, FsdpModule)
+    assert not isinstance(block.moe_layer.mlp, FsdpModule)
     assert isinstance(block.moe_layer.mlp.experts, FsdpModule)
     assert isinstance(model.module.decoder.layers[-1], FsdpModule)
 
@@ -269,6 +288,12 @@ def _sync_model_parameters(reference_model, model):
         if not isinstance(moe, MoELayer):
             continue
         reference_moe = reference_model.get_submodule(name)
+        if isinstance(moe.experts, SequentialMLP):
+            for local, global_ in enumerate(moe.local_expert_indices):
+                moe.experts.local_experts[local].load_state_dict(
+                    reference_moe.experts.local_experts[global_].state_dict()
+                )
+            continue
         for fc in ("linear_fc1", "linear_fc2"):
             model_fc = getattr(moe.experts, fc)
             reference_fc = getattr(reference_moe.experts, fc)

@@ -18,12 +18,11 @@ from torch import nn
 
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.ssm.mamba_layer import MambaLayer
-from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
 class FsdpUnitCollector:
-    """Collect selected units and their routed experts in pre-order."""
+    """Collect selected FSDP units in pre-order."""
 
     def __init__(self, fsdp_unit_module_types: tuple[type[nn.Module], ...]) -> None:
         self._fsdp_unit_module_types = fsdp_unit_module_types
@@ -39,9 +38,6 @@ class FsdpUnitCollector:
         if self._should_shard(module, under_shortcut):
             self._collected_units_in_preorder[module] = None
 
-        if MoELayer in self._fsdp_unit_module_types and isinstance(module, MoELayer):
-            self._collected_units_in_preorder[module.experts] = None
-
         under_shortcut = under_shortcut or isinstance(module, ShortcutMoEBlock)
         for child in module.children():
             self._visit(child, under_shortcut)
@@ -52,14 +48,13 @@ class FsdpUnitCollector:
             return False
 
         # ShortcutMoEBlock interleaves stages during training by calling
-        # compute_layer.forward_pre_attn_and_core_attn()/forward_post_core_attn(),
-        # moe_layer._pre_mlp_layernorm_and_residual(), and moe_layer.mlp.route()/dispatch().
-        # These helper calls bypass the __call__ hooks of compute_layer,
-        # moe_layer, and moe_layer.mlp. Sharding these modules separately would leave
+        # compute_layer.forward_pre_attn_and_core_attn()/forward_post_core_attn() and
+        # moe_layer._pre_mlp_layernorm_and_residual(). These helper calls bypass the
+        # layers' __call__ hooks. Sharding these modules separately would leave
         # their weights ungathered. Leave their parameters with the enclosing FSDP unit.
         # We still visit their children. In particular,
         # moe_layer.mlp.experts runs through experts(...), which invokes its hooks,
-        # so selecting MoELayer also selects its experts for the expert-DP mesh.
-        if under_shortcut and isinstance(module, (TransformerLayer, MambaLayer, MoELayer)):
+        # so the expert container can remain a separate FSDP unit.
+        if under_shortcut and isinstance(module, (TransformerLayer, MambaLayer)):
             return False
         return True

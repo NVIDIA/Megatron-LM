@@ -45,6 +45,7 @@ from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
@@ -601,11 +602,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ddp_config: Data-parallel and sharding configuration.
             module: Root model module to shard.
             fsdp_unit_modules: Module types to shard as child FSDP units. If
-                unspecified, transformer, MoE transformer, MoE MLP, Mamba layers, and
-                shortcut MoE blocks are used. An explicit list replaces these defaults.
-                Including MoELayer also selects its routed experts for the expert-DP
-                mesh. Custom lists must include MoELayer when expert and dense
-                sharding settings differ.
+                unspecified, transformer and Mamba layers, shortcut MoE blocks, and
+                TEGroupedMLP/SequentialMLP expert containers are used. An explicit list
+                replaces these defaults. Expert containers use the expert-DP mesh;
+                custom lists must include them when expert and dense sharding settings
+                differ.
                 Directly invoked shortcut helper layers remain owned by their enclosing
                 FSDP unit.
             disable_bucketing: Compatibility argument that must remain ``False`` for
@@ -640,10 +641,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if fsdp_unit_modules is None:
             fsdp_unit_modules = [
                 TransformerLayer,
-                MoETransformerLayer,
-                MoELayer,
                 MambaLayer,
                 ShortcutMoEBlock,
+                TEGroupedMLP,
+                SequentialMLP,
             ]
 
         log_single_rank(
@@ -735,10 +736,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
             # Reverse pre-order: children claim their parameters before their parents.
             for submodule in reversed(units_to_shard):
-                is_expert = any(
-                    isinstance(parent, MoELayer) and submodule is parent.experts
-                    for parent in module.modules()
-                )
+                is_expert = isinstance(submodule, (TEGroupedMLP, SequentialMLP))
                 if config.init_model_with_meta_device:
                     _materialize_owned_meta_modules(submodule, device)
                 fully_shard(
