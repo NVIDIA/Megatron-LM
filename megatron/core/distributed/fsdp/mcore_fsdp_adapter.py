@@ -607,8 +607,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 replaces these defaults. Expert containers use the expert-DP mesh;
                 custom lists must include them when expert and dense sharding settings
                 differ.
-                Directly invoked shortcut helper layers remain owned by their enclosing
-                FSDP unit.
             disable_bucketing: Compatibility argument that must remain ``False`` for
                 MFSDP v2.
             device: Device used to construct the data-parallel mesh and, when this wrapper
