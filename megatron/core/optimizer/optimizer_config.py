@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 import fnmatch
 import logging
 import math
@@ -535,9 +536,18 @@ class OptimizerConfig:
         # Dtypes may still be CLI strings here; finalize_optimizer_config maps them to torch.dtype.
         fp32 = (torch.float32, 'fp32')
         if self.use_precision_aware_optimizer:
-            assert (
-                self.optimizer == 'adam'
-            ), '--use-precision-aware-optimizer only supported with adam'
+            # Under Muon the flag applies to the scalar Adam that owns the non-matrix params
+            # (embeddings, norms, Engram tables); Muon's own state is unaffected.
+            assert self.optimizer == 'adam' or (
+                self.optimizer in ('muon', 'dist_muon') and self.muon_scalar_optimizer == 'adam'
+            ), (
+                '--use-precision-aware-optimizer only supported with adam, or with muon whose '
+                'scalar optimizer is adam'
+            )
+            # TE FusedAdam cannot store param remainders in capturable mode, which the
+            # optimizer CUDA graph turns on; keep full FP32 master params there.
+            if self.optimizer_cuda_graph:
+                self.store_param_remainders = False
 
             # Only the FusedAdam in TE and HybridDeviceOptimizer supports
             # --use-precision-aware-optimizer.
@@ -710,6 +720,21 @@ class OptimizerConfig:
             if self.use_distributed_optimizer:
                 self.use_layer_wise_distributed_optimizer = True
                 self.use_distributed_optimizer = False
+
+    def without_precision_aware_optimizer(self) -> "OptimizerConfig":
+        """Copy of this config with the precision-aware optimizer turned off.
+
+        Used for the optimizers that keep plain FP32 main params and ``.grad`` next to a
+        precision-aware scalar Adam (e.g. Muon's), and to compare chained configs that differ
+        only in that respect.
+        """
+        config = copy.copy(self)
+        config.use_precision_aware_optimizer = False
+        config.main_grads_dtype = torch.float32
+        config.main_params_dtype = torch.float32
+        config.exp_avg_dtype = torch.float32
+        config.exp_avg_sq_dtype = torch.float32
+        return config
 
 
 # Backward-compatible aliases (deprecated; use OptimizerConfig directly).

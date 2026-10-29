@@ -300,3 +300,55 @@ def test_embedding_min_norm_projection_replays(monkeypatch, end_in_padding):
     unchanged[num_rows:] = True
     flat_unchanged = unchanged.repeat_interleave(row_width)[start:end]
     assert bytes_equal(projected[flat_unchanged], shard[flat_unchanged])
+
+
+def test_chained_zero_count_reads_each_childs_own_grad_source():
+    """A Muon chain pairs a precision-aware scalar Adam (.decoupled_grad) with a plain
+    layer-wise optimizer (.grad). One fused count would read a single attribute for both, so the
+    chain counts per child: the total is the sum of the children's counts on every replay."""
+    from megatron.core import parallel_state
+    from megatron.core.optimizer.clip_grads import count_zeros_fp32
+    from megatron.core.optimizer.optimizer import ChainedOptimizer
+
+    Utils.initialize_model_parallel()
+    try:
+        seeded()
+        group = parallel_state.get_data_parallel_group()
+
+        def params(grad_attr, zeros):
+            out = []
+            for grad in _grads(num=16):
+                grad[:zeros] = 0
+                param = torch.zeros_like(grad)
+                setattr(param, grad_attr, grad)
+                out.append(param)
+            return out
+
+        def child(parameters, use_decoupled_grad):
+            return SimpleNamespace(
+                config=SimpleNamespace(
+                    use_precision_aware_optimizer_no_fp8_or_ds_fp8=use_decoupled_grad,
+                    log_num_zeros_in_grad=True,
+                ),
+                get_grad_stats_parallel_group=lambda: group,
+                get_parameters=lambda: parameters,
+                count_zeros=lambda: count_zeros_fp32(
+                    parameters,
+                    grad_stats_parallel_group=group,
+                    use_decoupled_grad=use_decoupled_grad,
+                ),
+            )
+
+        aware, plain = params("decoupled_grad", 3), params("grad", 5)
+        chain = object.__new__(ChainedOptimizer)
+        chain.chained_optimizers = [child(aware, True), child(plain, False)]
+        local = sum(int((p.decoupled_grad == 0).sum()) for p in aware)
+        local += sum(int((p.grad == 0).sum()) for p in plain)
+        assert local >= 16 * (3 + 5)
+        expected = local * torch.distributed.get_world_size(group)
+        for replay in range(4):
+            with RacingStreams():
+                count = chain.count_zeros()
+            assert int(count) == expected, f"replay {replay}"
+    finally:
+        Utils.destroy_model_parallel()
