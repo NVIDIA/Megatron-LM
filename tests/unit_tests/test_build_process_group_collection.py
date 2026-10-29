@@ -113,6 +113,7 @@ def _forbid_parallel_state_accessors():
 
 
 def _destroy_groups(pg_collection, extras):
+    """Destroy the built groups that destroy_model_parallel() has not destroyed already."""
     groups = {}
     values = [getattr(pg_collection, name) for name in FIELDS]
     values += [getattr(extras, field.name) for field in dataclasses.fields(extras)]
@@ -123,7 +124,8 @@ def _destroy_groups(pg_collection, extras):
             if isinstance(group, torch.distributed.ProcessGroup):
                 groups[id(group)] = group
     for group in groups.values():
-        torch.distributed.destroy_process_group(group)
+        if group in torch.distributed.distributed_c10d._world.pg_map:
+            torch.distributed.destroy_process_group(group)
 
 
 def _initialize(**kwargs):
@@ -164,21 +166,28 @@ def test_build_matches_registered_groups_without_parallel_state(grid_id, kwargs,
     try:
         assert _changed_globals(before) == []
         assert sorted(vars(pg_collection)) == sorted(FIELDS)
+        # Read the ranks first: initializing again calls destroy_model_parallel(), which also
+        # destroys the groups that build_process_group_collection() created.
+        built_ranks = {name: _ranks(getattr(pg_collection, name)) for name in FIELDS}
+        extras_ranks = {
+            name: _ranks(getattr(extras, name))
+            for name in ("tp_dp", "intra_dp_cp_gtp_remat", "dp_gloo", "expt_dp_gloo")
+        }
 
         registered = _initialize(**kwargs)
         for name in FIELDS:
             built, expected = getattr(pg_collection, name), getattr(registered, name)
-            assert _ranks(built) == _ranks(expected), name
+            assert built_ranks[name] == _ranks(expected), name
             if isinstance(built, dict):
                 assert all(built[key] is not expected[key] for key in built), name
             else:
                 assert built is None or built is not expected, name
-        assert _ranks(extras.tp_dp) == _ranks(ps.get_tensor_and_data_parallel_group())
-        assert _ranks(extras.intra_dp_cp_gtp_remat) == _ranks(
+        assert extras_ranks["tp_dp"] == _ranks(ps.get_tensor_and_data_parallel_group())
+        assert extras_ranks["intra_dp_cp_gtp_remat"] == _ranks(
             ps.get_data_parallel_group(with_context_parallel=True, partial_data_parallel=True)
         )
-        assert _ranks(extras.dp_gloo) == _ranks(ps._DATA_PARALLEL_GROUP_GLOO)
-        assert _ranks(extras.expt_dp_gloo) == _ranks(ps._EXPERT_DATA_PARALLEL_GROUP_GLOO)
+        assert extras_ranks["dp_gloo"] == _ranks(ps._DATA_PARALLEL_GROUP_GLOO)
+        assert extras_ranks["expt_dp_gloo"] == _ranks(ps._EXPERT_DATA_PARALLEL_GROUP_GLOO)
         assert extras.tp_global_ranks == ps._TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
         assert extras.pp_global_ranks == ps._PIPELINE_GLOBAL_RANKS
         assert extras.dp_global_ranks == ps._DATA_PARALLEL_GLOBAL_RANKS
