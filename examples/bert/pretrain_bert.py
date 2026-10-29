@@ -26,7 +26,7 @@ from megatron.core.process_groups_config import (
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.spec_utils import import_module
-from megatron.core.utils import get_pg_rank
+from megatron.core.utils import get_attr_wrapped_model, get_pg_rank
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
@@ -88,8 +88,15 @@ def model_provider(pre_process=True, post_process=True, vp_stage=None, config=No
     return model
 
 
-def get_batch(data_iterator):
-    """Build the batch."""
+def get_batch(data_iterator, tp_group=None):
+    """Build the batch.
+
+    Args:
+        data_iterator: Iterator over the samples, None on ranks that do not read them.
+        tp_group: Tensor-parallel group of the model, from whose first rank the batch is
+            broadcast. Omitting it is deprecated: the group is then taken from the global
+            parallel state, with a ProcessGroupFallbackWarning.
+    """
 
     # Items and their type.
     keys = ['text', 'types', 'labels',
@@ -101,7 +108,7 @@ def get_batch(data_iterator):
         data = next(data_iterator)
     else:
         data = None
-    data_b = tensor_parallel.broadcast_data(keys, data, datatype)
+    data_b = tensor_parallel.broadcast_data(keys, data, datatype, tp_group=tp_group)
 
     # Unpack.
     tokens = data_b['text'].long()
@@ -114,7 +121,17 @@ def get_batch(data_iterator):
     return tokens, types, sentence_order, loss_mask, lm_labels, padding_mask
 
 
-def loss_func(loss_mask, sentence_order, output_tensor):
+def loss_func(loss_mask, sentence_order, output_tensor, dp_group=None):
+    """Loss function.
+
+    Args:
+        loss_mask: Mask of the tokens that count towards the masked-LM loss.
+        sentence_order: Sentence-order labels of the samples.
+        output_tensor: The masked-LM losses and the sentence-order logits of the model.
+        dp_group: Data-parallel group over which the reported losses are averaged. Omitting it
+            is deprecated: the group is then taken from the global parallel state, with a
+            ProcessGroupFallbackWarning.
+    """
     lm_loss_, sop_logits = output_tensor
 
     lm_loss_ = lm_loss_.float()
@@ -129,13 +146,13 @@ def loss_func(loss_mask, sentence_order, output_tensor):
         sop_loss = sop_loss.float()
         loss = lm_loss + sop_loss
         averaged_losses = average_losses_across_data_parallel_group(
-            [lm_loss, sop_loss])
+            [lm_loss, sop_loss], group=dp_group
+        )
         return loss, {'lm loss': averaged_losses[0],
                       'sop loss': averaged_losses[1]}
     else:
         loss = lm_loss
-        averaged_losses = average_losses_across_data_parallel_group(
-            [lm_loss])
+        averaged_losses = average_losses_across_data_parallel_group([lm_loss], group=dp_group)
         return loss, {'lm loss': averaged_losses[0]}
 
 
@@ -143,11 +160,13 @@ def forward_step(data_iterator, model):
     """Forward step."""
     args = get_args()
     timers = get_timers()
+    pg_collection = get_attr_wrapped_model(model, "pg_collection")
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
     tokens, types, sentence_order, loss_mask, lm_labels, padding_mask = get_batch(
-        data_iterator)
+        data_iterator, tp_group=pg_collection.tp
+    )
     timers('batch-generator').stop()
 
     if not args.bert_binary_head:
@@ -157,7 +176,10 @@ def forward_step(data_iterator, model):
     output_tensor = model(tokens, padding_mask,
                           tokentype_ids=types, lm_labels=lm_labels)
 
-    return output_tensor, partial(loss_func, loss_mask, sentence_order)
+    # The losses are averaged over the data-parallel group that holds distinct samples.
+    return output_tensor, partial(
+        loss_func, loss_mask, sentence_order, dp_group=pg_collection.dp_gtp_remat
+    )
 
 
 def train_valid_test_datasets_provider(
