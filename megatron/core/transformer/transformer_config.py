@@ -2157,6 +2157,24 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
             )
 
+    def _validate_a2a_max_cp_size(
+        self, cp_comm_type: str | None, local_heads: tuple[int, int, int], tp_size: int
+    ) -> None:
+        """Validate a known layer's TP-local heads against the explicit DCP cap."""
+        if not self.dynamic_context_parallel or self.max_cp_size is None or cp_comm_type != "a2a":
+            return
+        if any(heads <= 0 or heads % self.max_cp_size for heads in local_heads):
+            raise ValueError(
+                "cp_comm_type='a2a' requires TP-local Q/K/V head counts to be positive "
+                "and divisible by max_cp_size. "
+                f"TP={tp_size}, local_q_heads={local_heads[0]}, "
+                f"local_k_heads={local_heads[1]}, local_v_heads={local_heads[2]}, "
+                f"static_cp_size={self.context_parallel_size}, max_cp_size={self.max_cp_size}. "
+                "DCP schedules groups up to max_cp_size, independently of static "
+                "context_parallel_size. Choose a compatible max_cp_size or TP configuration, "
+                "or explicitly select p2p."
+            )
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -2661,10 +2679,47 @@ class TransformerConfig(ModelParallelConfig):
             # across CP ranks; chunkwise CP keeps all TP-local heads on each CP rank. GDN2 has no
             # chunkwise path and always splits its heads across CP ranks.
             linear_head_parallel_size = self.tensor_model_parallel_size
-            if self.context_parallel_size > 1 and (
+            linear_cp_size = self.context_parallel_size
+            if self.dynamic_context_parallel and self.max_cp_size is not None:
+                # Hybrid/custom layer layouts are checked by the actual GDN constructor.
+                # Do not impose GDN's CP constraint on an all-SDPA GPT pattern.
+                has_linear_layers = not self.is_hybrid_model and (
+                    (
+                        isinstance(self.linear_attention_freq, int)
+                        and self.linear_attention_freq > 1
+                        and self.num_layers > 0
+                    )
+                    or (
+                        isinstance(self.linear_attention_freq, list)
+                        and 1 in self.linear_attention_freq
+                    )
+                )
+                linear_cp_size = self.max_cp_size if has_linear_layers else 1
+            if linear_cp_size > 1 and (
                 self.linear_cp_mode == "headwise" or self.experimental_attention_variant == "gdn2"
             ):
-                linear_head_parallel_size *= self.context_parallel_size
+                linear_head_parallel_size *= linear_cp_size
+            if (
+                self.dynamic_context_parallel
+                and self.max_cp_size is not None
+                and linear_cp_size == self.max_cp_size
+                and self.linear_cp_mode == "headwise"
+                and (
+                    self.linear_num_key_heads % linear_head_parallel_size
+                    or self.linear_num_value_heads % linear_head_parallel_size
+                )
+            ):
+                raise ValueError(
+                    "GDN-family headwise DCP requires key/value heads divisible by "
+                    f"TP * max_cp_size ({linear_head_parallel_size}). "
+                    f"Got key_heads={self.linear_num_key_heads}, "
+                    f"value_heads={self.linear_num_value_heads}, "
+                    f"TP={self.tensor_model_parallel_size}, max_cp_size={self.max_cp_size}, "
+                    f"static context_parallel_size={self.context_parallel_size}. "
+                    "DCP schedules runtime groups up to max_cp_size, independently of static CP. "
+                    "Choose a compatible max_cp_size/TP or linear_cp_mode='chunkwise'; "
+                    "cp_comm_type='p2p' does not disable GDN headwise A2A."
+                )
             assert self.linear_num_key_heads % linear_head_parallel_size == 0, (
                 f"{self.linear_num_key_heads=} must be a multiple of "
                 f"{linear_head_parallel_size=} for {self.linear_cp_mode=} "
@@ -5591,6 +5646,28 @@ class TransformerConfig(ModelParallelConfig):
                 assert isinstance(
                     self.cp_comm_type, str
                 ), "Unsupported communication type for context parallelism!"
+
+        if (
+            self.dynamic_context_parallel
+            and self.max_cp_size is not None
+            and type(self) is TransformerConfig
+            and not self.is_hybrid_model
+            and not self.heterogeneous_block_specs
+            and not self.multi_latent_attention
+            and self.experimental_attention_variant is None
+        ):
+            # Only this standard layout is known here. Other layouts validate in their
+            # actual attention constructors, after resolving each layer and TP group.
+            cp_comm_types = (
+                self.cp_comm_type if isinstance(self.cp_comm_type, list) else [self.cp_comm_type]
+            )
+            if "a2a" in cp_comm_types:
+                tp_size = self.tensor_model_parallel_size
+                local_q_heads = self.num_attention_heads // tp_size
+                local_kv_heads = max(1, self.num_query_groups // tp_size)
+                self._validate_a2a_max_cp_size(
+                    "a2a", (local_q_heads, local_kv_heads, local_kv_heads), tp_size
+                )
 
         assert (
             self.pipeline_model_parallel_size > 0

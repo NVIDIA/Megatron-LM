@@ -778,6 +778,19 @@ class MLASelfAttention(MultiLatentAttention):
             name=name,
         )
 
+        if (
+            type(self) is MLASelfAttention
+            and config.dynamic_context_parallel
+            and config.max_cp_size is not None
+            and cp_comm_type == "a2a"
+        ):
+            # This implementation expands Q, K and V to the same TP-local head count.
+            self.config._validate_a2a_max_cp_size(
+                cp_comm_type,
+                (self.num_attention_heads_per_partition,) * 3,
+                get_pg_size(self.pg_collection.tp),
+            )
+
         # Resolve which classes to use for Q and KV linear up projections and norms, based on
         # QK-norm selection.
         layer_classes = self._resolve_qk_norm_config(submodules)
@@ -1650,6 +1663,17 @@ class FusedMLASelfAttention(MLASelfAttention):
             "FusedMLASelfAttention requires q_lora_rank to be set; "
             "fallback to MLASelfAttention for q_lora_rank=None."
         )
+        if (
+            type(self) is FusedMLASelfAttention
+            and config.dynamic_context_parallel
+            and config.max_cp_size is not None
+            and cp_comm_type == "a2a"
+        ):
+            self.config._validate_a2a_max_cp_size(
+                cp_comm_type,
+                (self.num_attention_heads_per_partition,) * 3,
+                get_pg_size(self.pg_collection.tp),
+            )
         # Resolve which linear class to use for Q and KV up projections,
         # based on QK-norm selection.
         layer_classes = self._resolve_qk_norm_config(submodules)

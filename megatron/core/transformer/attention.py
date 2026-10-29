@@ -2029,6 +2029,24 @@ class SelfAttention(Attention):
             name=name,
         )
 
+        if (
+            type(self) is SelfAttention
+            and config.dynamic_context_parallel
+            and config.max_cp_size is not None
+            and cp_comm_type == "a2a"
+        ):
+            tp_size = get_pg_size(self.pg_collection.tp)
+            # The replicated-KV path slices Q down to Q/TP before core attention.
+            self.config._validate_a2a_max_cp_size(
+                cp_comm_type,
+                (
+                    divide(self.config.num_attention_heads, tp_size),
+                    self.num_query_groups_per_partition,
+                    self.num_query_groups_per_partition,
+                ),
+                tp_size,
+            )
+
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
         if self.config.attention_output_gate:
             self.linear_qkv_out_dim += self.config.kv_channels * self.config.num_attention_heads
@@ -2574,6 +2592,17 @@ class CrossAttention(Attention):
         if self.config.num_query_groups != self.config.num_attention_heads:
             raise ValueError("Group query attention is not currently supported in cross attention.")
         assert self.query_projection_size == self.kv_projection_size
+
+        if (
+            type(self) is CrossAttention
+            and config.dynamic_context_parallel
+            and config.max_cp_size is not None
+            and cp_comm_type == "a2a"
+        ):
+            tp_size = get_pg_size(self.pg_collection.tp)
+            self.config._validate_a2a_max_cp_size(
+                cp_comm_type, (divide(self.config.num_attention_heads, tp_size),) * 3, tp_size
+            )
 
         self.linear_q = submodules.linear_q(
             self.config.hidden_size,

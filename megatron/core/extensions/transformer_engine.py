@@ -2554,6 +2554,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     )
                 else:
                     extra_kwargs["cp_comm_type"] = cp_comm_type
+        elif self.config.dynamic_context_parallel and self.config.max_cp_size is not None:
+            # CP1 is disabled at construction, but a later DCP group must retain the
+            # layer's requested communication type rather than TE's default p2p.
+            assert is_te_min_version("1.10.0"), "Dynamic CP communication requires TE >= 1.10.0"
+            extra_kwargs["cp_comm_type"] = cp_comm_type or "p2p"
 
         if self.config.deterministic_mode:
             if int(os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")) != 0:

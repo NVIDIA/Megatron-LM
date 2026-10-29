@@ -173,7 +173,15 @@ class ModelParallelConfig:
 
     min_dynamic_context_parallel_size: int = 1
     """Minimum CP group size for dynamic context parallel. Default 1 (no CP).
-    The maximum is dp_size * context_parallel_size (the full DPxCP group)."""
+    The maximum is max_cp_size, or the full DPxCP group when it is unset."""
+
+    max_cp_size: Optional[int] = None
+    """Optional, user-specified power-of-two upper bound on dynamic CP group sizes.
+    This does not change context_parallel_size or the initial process groups. When unset,
+    dynamic CP retains its full-DPxCP limit. Without DCP, this is set to context_parallel_size
+    regardless of the supplied value and is not used for validation. With DCP, head-sharding
+    layers validate this bound against their TP-local heads.
+    """
 
     hybrid_context_parallel: bool = False
     """Deprecated. Use ``dynamic_context_parallel`` instead."""
@@ -666,6 +674,18 @@ class ModelParallelConfig:
             self.dynamic_context_parallel = True
             self.hybrid_context_parallel = False
 
+        if not self.dynamic_context_parallel:
+            self.max_cp_size = self.context_parallel_size
+        elif self.max_cp_size is not None:
+            if (
+                type(self.max_cp_size) is not int
+                or self.max_cp_size < 1
+                or self.max_cp_size & (self.max_cp_size - 1)
+            ):
+                raise ValueError(
+                    f"max_cp_size must be a positive power of two, got {self.max_cp_size}"
+                )
+
         if self.dynamic_context_parallel:
             if self.sequence_packing_scheduler is None:
                 self.sequence_packing_scheduler = 'default_dynamic_cp'
@@ -679,6 +699,14 @@ class ModelParallelConfig:
                 raise ValueError(
                     f"min_dynamic_context_parallel_size must be >= 1, "
                     f"got {self.min_dynamic_context_parallel_size}"
+                )
+            if (
+                self.max_cp_size is not None
+                and self.min_dynamic_context_parallel_size > self.max_cp_size
+            ):
+                raise ValueError(
+                    f"min_dynamic_context_parallel_size ({self.min_dynamic_context_parallel_size}) "
+                    f"must be <= max_cp_size ({self.max_cp_size})."
                 )
 
             if self.deterministic_mode:
