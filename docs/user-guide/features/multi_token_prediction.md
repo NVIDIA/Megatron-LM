@@ -56,3 +56,17 @@ Use `m` for MTP layers in the pipeline layout string. For example:
 ## Unsupported Combinations
 
 Context Parallel (CP), arbitrary `AttnMaskType`, and learned absolute position embeddings are not supported with MTP.
+
+
+## Detach only the auxiliary output weight
+
+Set `mtp_detach_output_weight=True` to prevent the MTP objective from updating
+its output projection weight while retaining gradients into its hidden inputs,
+backbone and input embeddings. This applies to tied and untied output weights,
+and to deferred and early-backward MTP loss execution. It does not freeze the
+main language-model output projection: its ordinary objective still trains it.
+
+The default is `False`, preserving existing behavior. `mtp_detach_heads=True`
+continues to detach both the MTP inputs and output weight regardless of this
+new option. Use the independent option when auxiliary supervision should train
+the model but should not update the policy's output head.
