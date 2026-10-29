@@ -694,6 +694,20 @@ def is_checkpointing():
     return IS_CHECKPOINTING
 
 
+@contextlib.contextmanager
+def _checkpointing_context():
+    """Restore the enclosing checkpoint state, including on exceptional exits."""
+    previous = is_checkpointing()
+    _set_checkpointing()
+    try:
+        yield
+    finally:
+        if previous:
+            _set_checkpointing()
+        else:
+            _unset_checkpointing()
+
+
 _R = TypeVar('_R')
 _Ts = TypeVarTuple('_Ts')
 
@@ -715,35 +729,33 @@ class CheckpointFunction(torch.autograd.Function):
         *args: Unpack[_Ts],
     ) -> _R:
         """Forward pass."""
-        _set_checkpointing()
+        with _checkpointing_context():
+            ctx.run_function = run_function
+            ctx.distribute_saved_activations = distribute_saved_activations
+            # Activation recomputation must use the same autocast policy as the original forward.
+            # Otherwise it replays under the ambient autocast state.
+            ctx.autocast_enabled = torch.is_autocast_enabled("cuda")
+            ctx.autocast_dtype = torch.get_autocast_dtype("cuda")
+            ctx.autocast_cache_enabled = torch.is_autocast_cache_enabled()
 
-        ctx.run_function = run_function
-        ctx.distribute_saved_activations = distribute_saved_activations
-        # Activation recomputation must use the same autocast policy as the original forward.
-        # Otherwise it replays under the ambient autocast state.
-        ctx.autocast_enabled = torch.is_autocast_enabled("cuda")
-        ctx.autocast_dtype = torch.get_autocast_dtype("cuda")
-        ctx.autocast_cache_enabled = torch.is_autocast_cache_enabled()
+            # Copy the rng states.
+            ctx.rng_states = _get_all_rng_states()
 
-        # Copy the rng states.
-        ctx.rng_states = _get_all_rng_states()
+            with torch.no_grad():
+                outputs = run_function(*args)
 
-        with torch.no_grad():
-            outputs = run_function(*args)
+            # Divide hidden states across model parallel group and only keep
+            # the chunk corresponding to the current rank.
+            if distribute_saved_activations:
+                ctx.input_0_shape = args[0].data.shape
+                safely_set_viewless_tensor_data(
+                    args[0], split_tensor_into_1d_equal_chunks(args[0].data, new_buffer=True)
+                )
 
-        # Divide hidden states across model parallel group and only keep
-        # the chunk corresponding to the current rank.
-        if distribute_saved_activations:
-            ctx.input_0_shape = args[0].data.shape
-            safely_set_viewless_tensor_data(
-                args[0], split_tensor_into_1d_equal_chunks(args[0].data, new_buffer=True)
-            )
+            # Store everything.
+            ctx.save_for_backward(*args)
 
-        # Store everything.
-        ctx.save_for_backward(*args)
-
-        _unset_checkpointing()
-        return outputs
+            return outputs
 
     # pylint: disable=missing-function-docstring
     @staticmethod
@@ -756,41 +768,41 @@ class CheckpointFunction(torch.autograd.Function):
                 "Checkpointing is not compatible with .grad(), "
                 "please use .backward() if possible"
             )
-        _set_checkpointing()
+        with _checkpointing_context():
+            inputs = ctx.saved_tensors
+            if ctx.distribute_saved_activations:
+                safely_set_viewless_tensor_data(
+                    inputs[0], gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape)
+                )
 
-        inputs = ctx.saved_tensors
-        if ctx.distribute_saved_activations:
-            safely_set_viewless_tensor_data(
-                inputs[0], gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape)
+            with _fork_rng():
+                # Set the states to what it used to be before the forward pass.
+                _set_all_rng_states(*ctx.rng_states)
+
+                # Compute the forward pass.
+                detached_inputs = detach_variable(inputs)
+                autocast_context = torch.autocast(
+                    device_type="cuda",
+                    dtype=ctx.autocast_dtype,
+                    enabled=ctx.autocast_enabled,
+                    cache_enabled=ctx.autocast_cache_enabled,
+                )
+                with torch.enable_grad(), autocast_context, suspend_tensor_observations():
+                    outputs = ctx.run_function(*detached_inputs)
+
+            if isinstance(outputs, torch.Tensor):
+                outputs = (outputs,)
+
+            # filter out non tensor outputs for backward pass
+            outputs, args = zip(
+                *filter(lambda x: torch.is_tensor(x[0]) and x[0].requires_grad, zip(outputs, args))
+            )
+            torch.autograd.backward(outputs, args)
+            grads = tuple(
+                inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs
             )
 
-        with _fork_rng():
-            # Set the states to what it used to be before the forward pass.
-            _set_all_rng_states(*ctx.rng_states)
-
-            # Compute the forward pass.
-            detached_inputs = detach_variable(inputs)
-            autocast_context = torch.autocast(
-                device_type="cuda",
-                dtype=ctx.autocast_dtype,
-                enabled=ctx.autocast_enabled,
-                cache_enabled=ctx.autocast_cache_enabled,
-            )
-            with torch.enable_grad(), autocast_context, suspend_tensor_observations():
-                outputs = ctx.run_function(*detached_inputs)
-
-        if isinstance(outputs, torch.Tensor):
-            outputs = (outputs,)
-
-        # filter out non tensor outputs for backward pass
-        outputs, args = zip(
-            *filter(lambda x: torch.is_tensor(x[0]) and x[0].requires_grad, zip(outputs, args))
-        )
-        torch.autograd.backward(outputs, args)
-        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
-
-        _unset_checkpointing()
-        return (None, None) + grads
+            return (None, None) + grads
 
 
 def checkpoint(
