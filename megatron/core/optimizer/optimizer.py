@@ -1331,10 +1331,11 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         """
         float16_dtype = torch.float16 if self.config.fp16 else torch.bfloat16
         main_param_ids = {id(param) for param in self.fp32_from_float16_groups[group_index]}
+        # Main params are detached copies that never require grad, so keep them by identity.
         trainable_params = [
             param
             for param in self.optimizer.param_groups[group_index]['params']
-            if param.requires_grad
+            if id(param) in main_param_ids or param.requires_grad
         ]
         surplus = len(saved_group) - sum(id(param) in main_param_ids for param in trainable_params)
         saved_index = 0
