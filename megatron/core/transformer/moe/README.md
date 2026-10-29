@@ -615,9 +615,30 @@ The equivalent backend-specific CLI value is a JSON object:
 --moe-megakernel-backend mok --moe-megakernel-backend-config '{"fwd_num_comm_sms": 40, "bwd_num_comm_sms": 28}'
 ```
 
+`moe_megakernel_backend_config.shared_expert_mode` selects `auto` (default), `fused`, or
+`native`. `auto` fuses a shared MLP only with TP=1, no latent projection, matching routed/shared
+intermediate sizes, and dense non-interleaved shared weights. `fused` rejects incompatible
+configurations; `native` keeps shared experts in MCore. This option is consumed by MCore before
+passing the remaining options to MOK. Without shared experts, MOK runs routed experts only.
+
+Latent MoE routes in the original hidden space and runs its shared expert there. MCore owns
+the latent down/up projections and optional `moe_use_norm_before_up_proj` normalization;
+MOK receives the projected routed tokens. TP>1 consumes each rank's sequence-parallel tokens
+with unsharded ETP=1 expert weights.
+
+On main, SiTU-GLU uses the existing SwiGLU activation with both tanh scales, for example:
+
+```yaml
+activation_func_tanh_clamp_scale: 4.0
+activation_func_tanh_clamp_scale_linear: 25.0
+```
+
+Both scales are passed as MOK's `situ_beta`, independently of shared-expert fusion. A gate-only
+tanh clamp is unsupported by MOK's two-scale SiTU API and is rejected during configuration.
+
 MOK is an optional dependency, imported only when the backend is selected. The ARM64 development
 image already installs the supported
-[MCore integration snapshot](https://github.com/QiZhangNV/mixture-of-kittens/tree/7a8cfb7fdd96a1cfba506caf4756c6c86073399a)
+[MCore integration snapshot](https://github.com/QiZhangNV/mixture-of-kittens/tree/ee7bdaba515fd3d557105d71809ec74cd523d5a1)
 through `docker/common/install_mok.sh`. Use that image or its installation helper to retain the
 supported dependency and Blackwell build targets. The AMD64 image skips MOK because its H100
 target is unsupported.
@@ -627,12 +648,12 @@ target is unsupported.
 | GPU architecture | NVIDIA Blackwell SM100/SM103; upstream integration validated on GB300 |
 | Routed precision | BF16, or MXFP8 with `fp8_param=True` and native TE rowwise/columnwise payloads and scales |
 | Router precision | `moe_router_dtype=None` or `"fp32"`; FP64 routing/weighted averaging is unsupported |
-| Shared experts | Required; BF16; same intermediate size as routed experts; optional BF16 sigmoid output gate via `moe_shared_expert_gate` |
-| Activation | SwiGLU, without a linear offset or tanh clamp |
+| Shared experts | Optional; compatible shared MLPs fuse in BF16, otherwise MCore executes them with native precision; optional sigmoid output gate via `moe_shared_expert_gate` |
+| Activation | SwiGLU or SiTU-GLU; no linear offset. SiTU requires both `activation_func_tanh_clamp_scale` and `activation_func_tanh_clamp_scale_linear` |
 | Routed weight layout | Per-expert non-single weights, or single-grouped weights with `moe_use_grouped_tensor=True` and Transformer Engine 2.14+ |
-| Parallelism | TP=1, expert TP=1, EP in {1, 4, 8, 16, 32, 64}; each EP group must fit within one NVLink domain supporting PyTorch symmetric memory and multicast |
+| Parallelism | Expert TP=1; TP>1 requires sequence parallelism and native shared execution; EP in {1, 4, 8, 16, 32, 64}; each EP group must fit within one NVLink domain supporting PyTorch symmetric memory and multicast |
 | Shapes | Hidden and expert intermediate sizes divisible by 256; at least 512 local tokens per rank, divisible by 256; identical token, hidden, and top-k shapes across EP ranks |
-| Recomputation | Whole-MoE activation recompute |
+| Recomputation | Whole-MoE activation recompute; shared-expert recompute when shared execution is native |
 | CUDA Graph | Full-iteration capture |
 | Checkpointing | Save/resume with unchanged backend, weight layout, and parallel configuration |
 
@@ -656,8 +677,8 @@ static input token counts alone do not establish that lifecycle.
 
 The current backend requires grouped experts and fused gradient accumulation. It does not support
 linear biases, applying router probabilities to expert inputs, MCore EP 1F1B overlap or delayed
-wgrad, native shared-expert overlap, shared-expert-only
-recompute, latent MoE, GTP weight rematerialization, shortcut MoE, inference-optimized layers,
+wgrad, native shared-expert overlap, shared-expert-only recompute when fused,
+GTP weight rematerialization, shortcut MoE, inference-optimized layers,
 partial MoE CUDA Graph replay, MCore expert-input
 capacity padding, FC1 GLU-interleaved weights, or checkpoint conversion between physical weight
 layouts.
