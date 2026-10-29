@@ -160,6 +160,7 @@ def test_stage_dispatch_preserves_call_settings_and_reader_state(is_mlp, mode):
     layer = _layer().eval()
     layer.config.fp32_residual_connection = True
     layer.config.params_dtype = torch.bfloat16
+    layer.to(dtype=layer.config.params_dtype)
     layer.hidden_dropout = 0.25
     # A replaced norm can leave stale metadata; the reader still owns the residual.
     layer._input_layernorm_returns_residual = layer._pre_mlp_layernorm_returns_residual = True
