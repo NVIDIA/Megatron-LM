@@ -172,6 +172,10 @@ class GPTModelConfig(ModelConfig):
 
     ### GPT Model initialization ###
     seq_length: int = 1024
+    """Position-embedding capacity, passed to GPTModel as max_sequence_length; the launcher fills
+    it from --max-position-embeddings. The training sequence length that core modules size
+    buffers from is TransformerConfig.max_seq_length_per_sample on ``transformer``.
+    """
     fp16_lm_cross_entropy: bool = False
     logit_dtype: torch.dtype | None = None
     parallel_output: bool = True
@@ -212,8 +216,7 @@ class GPTModelConfig(ModelConfig):
             # `transformer` not yet initialised; store the attribute on self.
             super().__setattr__(name, value)
             return
-        # Fields declared on this config (e.g. seq_length) take precedence over the proxy.
-        if name not in type(self).__dataclass_fields__ and hasattr(transformer, name):
+        if hasattr(transformer, name):
             setattr(transformer, name, value)
         else:
             super().__setattr__(name, value)
@@ -223,10 +226,6 @@ class GPTModelConfig(ModelConfig):
 
         if hasattr(self.transformer, "finalize") and callable(self.transformer.finalize):
             self.transformer.finalize()
-
-        # Core modules that size buffers from the sequence length read it off TransformerConfig.
-        if self.transformer.seq_length is None:
-            self.transformer.seq_length = self.seq_length
 
         if self.transformer.cuda_graph_impl != "none":
             assert self.transformer.use_te_rng_tracker, (

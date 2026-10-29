@@ -212,7 +212,7 @@ class MoEModelTestContainer:
             fp8=kwargs.get("fp8", None),
             fp8_recipe=kwargs.get("fp8_recipe", "delayed"),
             calculate_per_token_loss=kwargs.get("calculate_per_token_loss", False),
-            seq_length=kwargs.get("seq_length", None),
+            max_seq_length_per_sample=kwargs.get("max_seq_length_per_sample", None),
         )
 
         # init moe layer
@@ -795,7 +795,7 @@ def _ncclep_manager_stub(**config_overrides):
         context_parallel_size=1,
         sequence_parallel=False,
         max_seqlen_per_dp_cp_rank=None,
-        seq_length=None,
+        max_seq_length_per_sample=None,
     )
     cfg.update(config_overrides)
     manager.config = SimpleNamespace(**cfg)
@@ -838,25 +838,25 @@ def test_ncclep_padding_mask_marks_routes_invalid(routing_mode):
     "is_thd,num_local_tokens,config_overrides,expected",
     [
         # BSHD: the first dispatch's count, rounded up to the HT chunk.
-        (False, 100, dict(seq_length=4096), 128),
-        # THD: max_seqlen_per_dp_cp_rank wins over seq_length; sequence-parallel slice.
+        (False, 100, dict(max_seq_length_per_sample=4096), 128),
+        # THD: max_seqlen_per_dp_cp_rank wins over max_seq_length_per_sample; SP slice.
         (
             True,
             100,
             dict(
                 max_seqlen_per_dp_cp_rank=1000,
-                seq_length=4096,
+                max_seq_length_per_sample=4096,
                 tensor_model_parallel_size=2,
                 sequence_parallel=True,
             ),
             512,
         ),
-        # THD: seq_length split over CP and the sequence-parallel TP slice.
+        # THD: max_seq_length_per_sample split over CP and the sequence-parallel TP slice.
         (
             True,
             100,
             dict(
-                seq_length=4096,
+                max_seq_length_per_sample=4096,
                 context_parallel_size=2,
                 tensor_model_parallel_size=2,
                 sequence_parallel=True,
@@ -867,7 +867,11 @@ def test_ncclep_padding_mask_marks_routes_invalid(routing_mode):
         (
             True,
             100,
-            dict(seq_length=4096, context_parallel_size=2, tensor_model_parallel_size=2),
+            dict(
+                max_seq_length_per_sample=4096,
+                context_parallel_size=2,
+                tensor_model_parallel_size=2,
+            ),
             2048,
         ),
     ],
@@ -909,10 +913,10 @@ def test_ncclep_thd_rejects_first_microbatch_above_the_bound(monkeypatch):
     monkeypatch.setattr(
         token_dispatcher, "ensure_nccl_ep_bootstrapped", lambda *a, **kw: bootstrap_calls.append(kw)
     )
-    manager = _ncclep_manager_stub(seq_length=2048)
+    manager = _ncclep_manager_stub(max_seq_length_per_sample=2048)
     manager.num_local_tokens = 3000
     manager._is_thd = True
-    with pytest.raises(RuntimeError, match="per-rank bound from seq_length"):
+    with pytest.raises(RuntimeError, match="per-rank bound from max_seq_length_per_sample"):
         manager._ensure_bootstrap()
     assert not bootstrap_calls
 
@@ -941,7 +945,7 @@ def test_ncclep_dispatch_guard_names_the_right_remedy(monkeypatch, is_thd):
     with pytest.raises(RuntimeError, match="sized for") as excinfo:
         manager.dispatch(torch.zeros(192, manager.hidden_dim))
     message = str(excinfo.value)
-    assert ("seq_length" in message) is is_thd
+    assert ("max_seq_length_per_sample" in message) is is_thd
     assert ("first microbatch" in message) is not is_thd
 
 
@@ -1417,7 +1421,7 @@ class TestFlexDispatcher:
             moe_flex_dispatcher_backend="ncclep",
             hidden_size=1024,
             test_dtype=torch.bfloat16,
-            seq_length=seq_length,
+            max_seq_length_per_sample=seq_length,
         )
         container.dispatcher_thd_uneven_tokens_test(seq_length)
 
@@ -1451,6 +1455,6 @@ class TestFlexDispatcher:
             moe_flex_dispatcher_backend="ncclep",
             hidden_size=1024,
             test_dtype=test_dtype,
-            seq_length=256,
+            max_seq_length_per_sample=256,
         )
         container.dispatcher_thd_parity_vs_alltoall_test(rtol=rtol, atol=atol)

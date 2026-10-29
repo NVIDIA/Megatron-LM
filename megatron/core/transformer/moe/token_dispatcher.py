@@ -1994,20 +1994,21 @@ class _NCCLEPManager(_DispatchManager):
         if config.max_seqlen_per_dp_cp_rank is not None:
             bound = -(-config.max_seqlen_per_dp_cp_rank // tp_size)
             source = "max_seqlen_per_dp_cp_rank"
-        elif config.seq_length is not None:
-            bound = -(-config.seq_length // (config.context_parallel_size * tp_size))
-            source = "seq_length"
+        elif config.max_seq_length_per_sample is not None:
+            bound = -(-config.max_seq_length_per_sample // (config.context_parallel_size * tp_size))
+            source = "max_seq_length_per_sample"
         else:
             raise ValueError(
                 "The 'ncclep' backend sizes its buffers once from an upper bound on the tokens "
-                "per rank, and packed (THD) inputs vary per rank: set seq_length (the packed "
-                "sequence length) or max_seqlen_per_dp_cp_rank in the config."
+                "per rank, and packed (THD) inputs vary per rank: set "
+                "TransformerConfig.max_seq_length_per_sample (the packed sequence length) or "
+                "max_seqlen_per_dp_cp_rank."
             )
         if self.num_local_tokens > bound:
             raise RuntimeError(
                 f"'ncclep' got {self.num_local_tokens} packed tokens on this rank, above the "
                 f"{bound} per-rank bound from {source}; raise max_seqlen_per_dp_cp_rank or "
-                "seq_length to the real per-rank maximum."
+                "max_seq_length_per_sample to the real per-rank maximum."
             )
         utils.log_single_rank(
             logger, logging.INFO, f"ncclep: max dispatch tokens per rank {bound} from {source}"
@@ -2099,7 +2100,8 @@ class _NCCLEPManager(_DispatchManager):
         self._ensure_bootstrap()
         if hidden_states.shape[0] > self._max_tokens_per_rank:
             remedy = (
-                "raise max_seqlen_per_dp_cp_rank or seq_length to the real per-rank maximum"
+                "raise max_seqlen_per_dp_cp_rank or max_seq_length_per_sample to the real "
+                "per-rank maximum"
                 if self._is_thd
                 else "non-packed (BSHD) inputs are sized from the first microbatch, so later "
                 "microbatches must not carry more tokens per rank"
