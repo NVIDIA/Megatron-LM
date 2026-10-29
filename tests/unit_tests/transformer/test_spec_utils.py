@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import dataclasses
+import errno
+import traceback
 from functools import partial
 from typing import Protocol
 
@@ -82,6 +84,73 @@ class TestBuildModule:
         assert isinstance(mixed, ExampleA)
         assert mixed.x == 3
         assert mixed.y == 'ghi'
+
+    @pytest.mark.parametrize("use_spec", [False, True])
+    def test_constructor_preserves_unicode_error(self, use_spec):
+        """Keep structured exceptions that cannot be reconstructed from a string."""
+        original_errors = []
+
+        class DecodeModule:
+            def __init__(self) -> None:
+                try:
+                    b"\xff".decode("utf-8")
+                except UnicodeDecodeError as error:
+                    original_errors.append(error)
+                    raise
+
+        spec = ModuleSpec(module=DecodeModule) if use_spec else DecodeModule
+        with pytest.raises(UnicodeDecodeError) as raised:
+            build_module(spec)
+
+        assert raised.value is original_errors[0]
+        assert raised.value.object == b"\xff"
+        assert raised.value.encoding == "utf-8"
+        assert (raised.value.start, raised.value.end) == (0, 1)
+        assert "when instantiating DecodeModule" in raised.value.__notes__
+
+    def test_constructor_preserves_file_error(self, tmp_path):
+        """Keep the filename and errno produced by an actual file operation."""
+        missing = tmp_path / "missing.txt"
+
+        class ReadModule:
+            def __init__(self) -> None:
+                missing.read_bytes()
+
+        with pytest.raises(FileNotFoundError) as raised:
+            build_module(ReadModule)
+
+        assert raised.value.errno == errno.ENOENT
+        assert raised.value.filename == str(missing)
+        assert "when instantiating ReadModule" in raised.value.__notes__
+
+    def test_nested_constructor_preserves_cause_and_context_notes(self):
+        """Annotate each factory without replacing the original exception or cause."""
+        cause = ValueError("invalid configuration")
+        original = RuntimeError("construction failed")
+        original.add_note("existing diagnostic")
+
+        class Inner:
+            def __init__(self) -> None:
+                raise original from cause
+
+        class Outer:
+            def __init__(self) -> None:
+                build_module(Inner)
+
+        with pytest.raises(RuntimeError) as raised:
+            build_module(Outer)
+
+        assert raised.value is original
+        assert raised.value.__cause__ is cause
+        assert raised.value.__notes__ == [
+            "existing diagnostic",
+            "when instantiating Inner",
+            "when instantiating Outer",
+        ]
+        formatted = "".join(traceback.format_exception(raised.value))
+        assert "raise original from cause" in formatted
+        assert "when instantiating Inner" in formatted
+        assert "when instantiating Outer" in formatted
 
 
 class TestImportModule:
