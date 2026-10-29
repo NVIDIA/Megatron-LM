@@ -1068,6 +1068,9 @@ is the opposite of the `MegatronLLM` constructor default.
   size of exactly 64, and the `flash_mla` package. RoPE fusion, sliding-window
   attention, Flash Decoding, and the Triton KV-append fast path are all
   incompatible with the latent cache.
+- **DeepSeek sparse attention (DSA) is not supported.** The latent-cache attention
+  is dense and has no DSA indexer or top-k sparse path, so `cache_mla_latents=True`
+  with `experimental_attention_variant='dsa'` raises at configuration time.
 - **GDN2 is not supported.** `experimental_attention_variant='gdn2'` raises
   `NotImplementedError`. GDN is also dynamic-batching only; static batching
   raises.

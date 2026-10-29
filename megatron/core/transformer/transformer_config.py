@@ -5033,3 +5033,13 @@ class MLATransformerConfig(TransformerConfig):
             assert (
                 self.apply_rope_fusion is False
             ), "Rope Fusion is not compatible with caching latents"
+            if self.experimental_attention_variant == "dsa":
+                # The latent-cache attention is dense FlashAttention / FlashMLA over the paged
+                # latents. DSA would also need a paged cache of its indexer keys and top-k sparse
+                # attention over the latents, which the dynamic backend does not provide.
+                raise ValueError(
+                    "cache_mla_latents (required for dynamic-batching MLA inference) is not "
+                    "supported with experimental_attention_variant='dsa': the latent-cache "
+                    "attention path is dense and would skip the DSA indexer and top-k sparse "
+                    "attention."
+                )

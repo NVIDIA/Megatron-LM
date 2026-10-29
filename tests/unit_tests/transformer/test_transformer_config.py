@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from megatron.core.activations import squared_relu
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import is_te_min_version
 
 
@@ -191,6 +191,28 @@ def test_dsa_kpool_requires_divisible_topk():
 def test_dsa_kpool_requires_topk():
     with pytest.raises(ValueError, match="dsa_indexer_topk must be set"):
         _make_dsa_kpool_config(dsa_indexer_kpool=4)
+
+
+def _make_mla_latent_cache_config(**overrides) -> MLATransformerConfig:
+    return MLATransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        add_bias_linear=False,
+        cache_mla_latents=True,
+        **overrides,
+    )
+
+
+def test_cache_mla_latents_accepts_mla():
+    assert _make_mla_latent_cache_config().cache_mla_latents
+
+
+def test_cache_mla_latents_rejects_dsa():
+    # Dynamic-batching MLA attends densely over the cached latents, so DSA's indexer and top-k
+    # sparse attention would never run.
+    with pytest.raises(ValueError, match="experimental_attention_variant='dsa'"):
+        _make_mla_latent_cache_config(experimental_attention_variant="dsa", dsa_indexer_topk=4)
 
 
 @pytest.mark.parametrize("backend", ["native", "triton", "cutile"])
