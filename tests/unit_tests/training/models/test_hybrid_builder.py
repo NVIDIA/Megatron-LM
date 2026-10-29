@@ -6,12 +6,13 @@ from unittest.mock import Mock, call, patch
 import pytest
 import torch
 
-from megatron.core.models.hybrid import MTPSplit
+from megatron.core.models.hybrid import MTPSplit, PipelineSplit
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
+from megatron.training.utils.checkpoint_utils import read_run_config
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -82,28 +83,47 @@ class TestHybridModelConfigInitialization:
         config = _make_hybrid_config()
         assert config.hybrid_stack_spec is None
 
-    def test_config_list_is_omitted_from_parent_run_config_serialization(
-        self, run_config, tmp_path
+    @pytest.mark.parametrize("container_type", [list, tuple])
+    def test_config_list_is_saved_in_parent_run_config_metadata(
+        self, run_config, tmp_path, container_type
     ):
         transformer = _make_transformer()
         transformer.is_hybrid_model = True
         layer_config = AttentionLayerConfig.from_config(transformer)
-        source_config_list = [layer_config, layer_config]
+        other_layer_config = AttentionLayerConfig.from_config(transformer)
+        other_layer_config.attention_dropout = 0.25
+        source_config_list = container_type(
+            [layer_config, PipelineSplit, other_layer_config, MTPSplit, layer_config]
+        )
         config = _make_hybrid_config(
             transformer=transformer, hybrid_layer_config_list=source_config_list
         )
         run_config.model = config
 
         serialized = run_config.to_dict()
-        assert "hybrid_layer_config_list" not in serialized["model"]
         assert serialized["model"]["transformer"]["is_hybrid_model"] is True
 
         yaml_path = tmp_path / "run_config.yaml"
         run_config.to_yaml(yaml_path)
-        assert "hybrid_layer_config_list" not in yaml_path.read_text()
+        saved = read_run_config(str(yaml_path))
+        for metadata in (serialized, saved):
+            layers = metadata["model"]["hybrid_layer_config_list"]
+            assert len(layers) == 5
+            for index in (0, 2, 4):
+                assert layers[index]["_target_"].endswith(".AttentionLayerConfig")
+                assert layers[index]["hidden_size"] == 128
+            assert layers[0]["attention_dropout"] == layer_config.attention_dropout
+            assert layers[2]["attention_dropout"] == 0.25
+            assert layers[4] == layers[0]
+            for index, marker in ((1, PipelineSplit), (3, MTPSplit)):
+                assert layers[index] == {
+                    "_target_": f"{marker.__module__}.{marker.__qualname__}",
+                    "_call_": False,
+                }
         assert config.hybrid_layer_config_list is source_config_list
         assert source_config_list[0] is layer_config
-        assert source_config_list[1] is layer_config
+        assert source_config_list[4] is layer_config
+        assert layer_config.mtp_num_layers is None
 
 
 class TestHybridModelConfigGetAttr:
