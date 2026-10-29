@@ -8,8 +8,8 @@ Transformer Engine linear reads its GTP replica group and the amax group of a pe
 quantization recipe from that collection, and falls back to the global groups without one.
 
 An owner built without a collection falls back to one from the global grid. That collection
-carries the GTP weight-remat groups, so the linears built on it do not fall back for them as well,
-and the omission warns once.
+carries the GTP weight-remat groups that the owner's linears read, if any, so the linears do not
+fall back for them as well: with GTP off, the omission warns once.
 
 Without CUDA, the local-spec owners build on CPU in one process with a gloo group; the Transformer
 Engine and GDN owners need GPUs.
@@ -29,6 +29,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_local_submodules,
+    get_gpt_layer_with_transformer_engine_submodules,
     get_gpt_mtp_block_spec,
 )
 from megatron.core.post_training.modelopt.layers import Linear
@@ -413,10 +414,10 @@ def _transformer_config(**overrides):
     return TransformerConfig(**config)
 
 
-def _build_self_attention():
+def _build_self_attention(get_submodules=get_gpt_layer_local_submodules):
     return SelfAttention(
         _transformer_config(),
-        get_gpt_layer_local_submodules().self_attention.submodules,
+        get_submodules().self_attention.submodules,
         layer_number=1,
         attn_mask_type=AttnMaskType.causal,
     )
@@ -520,6 +521,18 @@ def global_grid(monkeypatch):
             torch.distributed.destroy_process_group()
 
 
+def _fallbacks_of(build):
+    """Build an owner and return the owner and argument of each fallback warning it emits."""
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        build()
+    return [
+        _FALLBACK_MESSAGE.match(str(warning.message)).groups()
+        for warning in record
+        if issubclass(warning.category, ProcessGroupFallbackWarning)
+    ]
+
+
 @pytest.mark.parametrize("owner", list(_owners_without_collection()))
 def test_owner_without_collection_warns_once(global_grid, owner):
     """The linears of an owner built without a collection take their GTP groups from its fallback.
@@ -528,15 +541,7 @@ def test_owner_without_collection_warns_once(global_grid, owner):
     linears do not fall back for them and warn as well: the omission warns once, for the owner.
     """
     build, name = _owners_without_collection()[owner]
-    with warnings.catch_warnings(record=True) as record:
-        warnings.simplefilter("always")
-        build()
-    fallbacks = [
-        _FALLBACK_MESSAGE.match(str(warning.message)).groups()
-        for warning in record
-        if issubclass(warning.category, ProcessGroupFallbackWarning)
-    ]
-    assert fallbacks == [(name, "pg_collection")]
+    assert _fallbacks_of(build) == [(name, "pg_collection")]
 
 
 @pytest.mark.parametrize(
@@ -590,6 +595,22 @@ class TestTransformerEngineOwnersPassTheirCollection:
             assert isinstance(linear, te_classes), name
             assert linear.given_pg_collection is owner_pg_collection, name
             assert linear._pg_collection is owner_pg_collection, name
+
+    @pytest.mark.parametrize("owner", ["self_attention", "cross_attention"])
+    def test_owner_without_collection_warns_once(self, global_grid, owner):
+        """Transformer Engine linears also take their GTP group from the owner's fallback.
+
+        With GTP off, the layer-norm column, column and row Transformer Engine linears fall back
+        neither for the gtp_remat group nor for the replica group of their GTP shards.
+        """
+        build, name = {
+            "self_attention": (
+                partial(_build_self_attention, get_gpt_layer_with_transformer_engine_submodules),
+                "SelfAttention",
+            ),
+            "cross_attention": (partial(_te_owners()["cross_attention"], None), "CrossAttention"),
+        }[owner]
+        assert _fallbacks_of(build) == [(name, "pg_collection")]
 
     @pytest.mark.skipif(not HAVE_FLA, reason="GDN needs FLA")
     def test_gdn_passes_its_collection(self, monkeypatch, owner_pg_collection):
