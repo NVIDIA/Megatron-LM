@@ -11,7 +11,7 @@ from torch import testing
 from torch.testing import assert_close
 
 import megatron.core.parallel_state as mpu
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import DistributedDataParallelConfig, FullyShardedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
@@ -92,7 +92,11 @@ class TestFullyShardedDataParallel:
         Utils.destroy_model_parallel()
 
     def _build_fsdp_model(
-        self, main_params_dtype=torch.float32, main_grads_dtype=None, grad_comm_dtype=None
+        self,
+        main_params_dtype=torch.float32,
+        main_grads_dtype=None,
+        grad_comm_dtype=None,
+        legacy_config=True,
     ):
         """Helper to construct a FullyShardedDataParallel with the given dtype args."""
         fsdp_config = DistributedDataParallelConfig(
@@ -109,20 +113,26 @@ class TestFullyShardedDataParallel:
         transformer_config = TransformerConfig(
             num_attention_heads=1, num_layers=1, context_parallel_size=1
         )
+        config_kwargs = (
+            {"ddp_config": fsdp_config}
+            if legacy_config
+            else {"fsdp_config": FullyShardedDataParallelConfig.from_ddp_config(fsdp_config)}
+        )
         fsdp_model = FullyShardedDataParallel(
             config=transformer_config,
-            ddp_config=fsdp_config,
+            **config_kwargs,
             module=model,
             fsdp_unit_modules=[torch.nn.Linear],
         )
         return fsdp_model
 
-    def test_fsdp_mp_policy_with_default_args(self):
+    @pytest.mark.parametrize("legacy_config", [False, True])
+    def test_fsdp_mp_policy_with_default_args(self, legacy_config):
         """Test that FullyShardedDataParallel with default dtype args produces the expected policy."""
         if not is_torch_min_version("2.4.0"):
             pytest.skip("Megatron FSDP requires torch >= 2.4.0")
 
-        fsdp_model = self._build_fsdp_model()
+        fsdp_model = self._build_fsdp_model(legacy_config=legacy_config)
         assert fsdp_model.mp_policy.main_params_dtype == torch.float32
         assert fsdp_model.mp_policy.main_grads_dtype is None
         assert fsdp_model.mp_policy.grad_comm_dtype is None

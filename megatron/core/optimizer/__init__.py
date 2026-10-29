@@ -56,7 +56,10 @@ from megatron.core.optimizer_param_scheduler import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 
-from ..distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
+from ..distributed.fsdp.mcore_fsdp_adapter import (
+    FullyShardedDataParallelV1,
+    FullyShardedDataParallelV2,
+)
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
@@ -1143,13 +1146,13 @@ def get_megatron_optimizer(
 
     optimizers = []
     model_chunk_offset = 0
-    ddp_config = model_chunks[0].ddp_config  # Use the first model chunk's DDP config
-    if ddp_config.use_megatron_fsdp:
+    if isinstance(model_chunks[0], (FullyShardedDataParallelV1, FullyShardedDataParallelV2)):
+        fsdp_config = model_chunks[0].fsdp_config
         # For no_shard, gradients are replicated across DP ranks after all-reduce, so grad stats
         # should only be reduced over TP/PP (model_parallel_group) to avoid inflating the norm.
-        if ddp_config.data_parallel_sharding_strategy == 'no_shard':
+        if fsdp_config.data_parallel_sharding_strategy == 'no_shard':
             effective_intra_dist_opt_group = mp_group
-        elif ddp_config.outer_dp_sharding_strategy != 'no_shard':
+        elif fsdp_config.outer_dp_sharding_strategy != 'no_shard':
             # Hybrid FSDP that shards the optimizer state over DP-Outer leaves each optimizer
             # instance with a distinct slice of the gradient instead of a replica of it, so the
             # stats have to be reduced over every instance to cover the whole gradient.
