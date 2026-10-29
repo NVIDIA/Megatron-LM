@@ -99,6 +99,51 @@ def test_repository_gb200_mapping_respects_recipe_and_marker_filtering(monkeypat
     ]
 
 
+def _module_at(path):
+    """Load the stdlib module at ``path`` without adding it to ``sys.modules``."""
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_repository_maps_the_parallel_state_checks_to_what_they_scan(monkeypatch, capsys):
+    # These stdlib checks read the source as text, so Testmon never selects them: the mapping
+    # must cover every folder they scan and every top-level script, and the H100 bucket that
+    # holds them must run them.
+    checks = [
+        "tests/unit_tests/test_check_process_group_usage.py",
+        "tests/unit_tests/test_parallel_state_accessor_uses.py",
+        "tests/unit_tests/test_removal_versions.py",
+    ]
+    checker = _module_at(ROOT / "tools/check_process_group_usage.py")
+    folders = {
+        *_module_at(ROOT / checks[1]).SCANNED_FOLDERS,
+        *_module_at(ROOT / checks[2]).SCANNED_FOLDERS,
+        checker.SCAN_ROOT.relative_to(ROOT).parts[0],
+        checker.ALLOWLIST.relative_to(ROOT).parts[0],
+    }
+    changed = [f"{folder}/example.py" for folder in sorted(folders)]
+    changed += sorted(path.name for path in ROOT.glob("*.py"))
+    mappings = mandatory.load_mappings(CONFIG_PATH)
+    for changed_file in changed:
+        _, patterns = mandatory.triggered_patterns(mappings, [changed_file], "dgx_h100")
+        assert set(checks) <= set(patterns), changed_file
+
+    monkeypatch.chdir(ROOT)
+    recipe = yaml.safe_load((ROOT / "tests/test_utils/recipes/h100/unit-tests.yaml").read_text())
+    buckets = [case for product in recipe["products"] for case in product["test_case"]]
+    bucket = "tests/unit_tests/**/*.py"
+    assert bucket in buckets
+    finder = sys.modules["find_test_cases"]
+    monkeypatch.setattr(finder, "get_test_cases", lambda _: buckets)
+    monkeypatch.setattr(sys, "argv", ["find_test_cases.py", bucket, "h100"])
+    finder.main()
+    ignored = {line.removeprefix("--ignore=") for line in capsys.readouterr().out.splitlines()}
+    _, patterns = mandatory.triggered_patterns(mappings, ["pretrain_gpt.py"], "dgx_h100")
+    assert mandatory.mandatory_files(patterns, bucket, ignored) == checks
+
+
 @pytest.mark.parametrize(
     "document",
     [
