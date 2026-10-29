@@ -706,6 +706,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "order is hardware defined and needs an NVLink peer group. Batch-invariant mode routes around them.",
     ),
     KernelEntry(
+        name="inference_nccl_packed_dispatch",
+        sources=("megatron/core/transformer/moe/token_dispatcher_inference.py",),
+        tests=(
+            K + "test_nccl_dispatcher.py",
+            "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
+        ),
+        kind="torch-op",
+        training_path=False,
+        notes="Byte-exact packed gather and CUDA graph replay; BI and autograd retain separate gathers.",
+    ),
+    KernelEntry(
         name="unified_memory_allocator",
         sources=("megatron/core/inference/unified_memory.py",),
         kind="cuda-ext",
