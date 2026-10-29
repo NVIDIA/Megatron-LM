@@ -8,7 +8,9 @@ import torch
 import transformer_engine as te
 
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.models.hybrid import hybrid_block as hybrid_block_module
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
+from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
     group_layers_into_shortcut_blocks,
@@ -25,6 +27,60 @@ from megatron.core.transformer.wide_residual_config import WideResidualConfig
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="shortcut norms are Transformer Engine norms"
 )
+
+
+@pytest.mark.parametrize("is_mtp_layer", [False, True])
+@pytest.mark.parametrize("disable_mtp", [False, True])
+def test_disable_mtp_shortcuts_preserves_decoder(monkeypatch, is_mtp_layer, disable_mtp):
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=8,
+        num_attention_heads=1,
+        num_moe_experts=2,
+        moe_shortcut_connection=True,
+        moe_shortcut_parallel=True,
+        moe_shortcut_post_norm=True,
+        moe_shortcut_disable_mtp=disable_mtp,
+    )
+    layer_config_list = validate_segment_layers(LayerSymbols.ATTENTION + LayerSymbols.MOE, config)
+    grouped_configs = []
+
+    class FakeLayer(torch.nn.Module):
+        def __init__(self, config, layer_number, **kwargs) -> None:
+            super().__init__()
+            self.config = config
+            self.layer_number = layer_number
+
+    def record_grouping(layers, layer_types, config, **kwargs):
+        grouped_configs.append(config)
+        return layers
+
+    monkeypatch.setattr(hybrid_block_module, "group_layers_into_shortcut_blocks", record_grouping)
+    stack = hybrid_block_module.HybridStack(
+        config=config,
+        submodules=hybrid_block_module.HybridStackSubmodules(
+            attention_layer=FakeLayer, moe_layer=FakeLayer
+        ),
+        layer_config_list=layer_config_list,
+        post_layer_norm=False,
+        pg_collection=SimpleNamespace(
+            pp=None, tp=None, cp=SimpleNamespace(size=lambda: 1), tp_cp=None
+        ),
+        is_mtp_layer=is_mtp_layer,
+    )
+    disabled = is_mtp_layer and disable_mtp
+    assert len(grouped_configs) == (0 if disabled else 1)
+    for flag in ("moe_shortcut_connection", "moe_shortcut_parallel", "moe_shortcut_post_norm"):
+        assert getattr(stack.config, flag) == (not disabled)
+        assert getattr(config, flag), "The shared decoder config must remain unchanged"
+        for layer, layer_config in zip(stack.layers, layer_config_list):
+            assert getattr(layer.config, flag) == (not disabled)
+            assert getattr(layer_config, flag), "The decoder layer configs must remain unchanged"
+    assert all(
+        layer.config is layer_config
+        for layer, layer_config in zip(stack.layers, stack.layer_config_list)
+    )
+    assert (stack.config is config) == (not disabled)
 
 
 def _shortcut_config(*, parallel: bool = False, wide_residual: WideResidualConfig | None = None):
