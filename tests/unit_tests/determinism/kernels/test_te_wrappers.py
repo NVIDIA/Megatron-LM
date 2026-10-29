@@ -13,6 +13,7 @@ localises to one kernel family.
 
 import inspect
 import os
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -33,7 +34,9 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     _compute_index_scores,
+    _dsa_index_share_carrier_scope,
     _dsa_weights_proj_forward_gemm,
+    _DSAIndexShareCarrier,
     _DSAWeightsProjection,
 )
 from megatron.core.transformer.mlp import MLPSubmodules
@@ -296,7 +299,7 @@ class TestTEWrappers:
         "backend", ["te", "torch"], ids=["te-general-gemm", "torch-mm-fallback"]
     )
     def test_dsa_indexer_fp32_weights_projection_replays_fwd_bwd(self, backend):
-        """Replay the DSA BF16-operand/FP32-output projection and its custom backward."""
+        """Projection outputs and gradients must be independent of the forward's carrier."""
         seeded()
         x = torch.randn(4096, 2, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         weight = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -316,18 +319,29 @@ class TestTEWrappers:
         def project(actual_x, actual_weight):
             return _DSAWeightsProjection.apply(actual_x, actual_weight, linear, indexer)
 
-        outputs, gradients = assert_replays_bit_exact(
-            project,
-            (x, weight),
-            replays=3,
-            backward=True,
-            grad_outputs={"out": grad_output},
-            contention=True,
-            what=f"DSA weights projection[{backend}]",
-        )
-        assert outputs["out"].dtype is torch.float32
-        assert gradients["in[0]"].dtype is torch.bfloat16
-        assert gradients["in[1]"].dtype is torch.bfloat16
+        reference = None
+        # Scope creation and teardown must not change the GEMM dispatch or its numerics.
+        for carrier in (None, _DSAIndexShareCarrier(), _DSAIndexShareCarrier(), None):
+            scope = nullcontext() if carrier is None else _dsa_index_share_carrier_scope(carrier)
+            with scope:
+                outputs, gradients = assert_replays_bit_exact(
+                    project,
+                    (x, weight),
+                    replays=3,
+                    backward=True,
+                    grad_outputs={"out": grad_output},
+                    contention=True,
+                    what=f"DSA weights projection[{backend}, scoped={carrier is not None}]",
+                )
+            assert outputs["out"].dtype is torch.float32
+            assert gradients["in[0]"].dtype is torch.bfloat16
+            assert gradients["in[1]"].dtype is torch.bfloat16
+            if reference is None:
+                reference = outputs, gradients
+            for expected, actual in zip(reference, (outputs, gradients)):
+                assert actual.keys() == expected.keys()
+                for name in expected:
+                    assert bytes_equal(expected[name], actual[name]), name
         assert indexer._weights_proj_te_gemm_supported is te_gemm_supported
 
     @pytest.mark.parametrize("use_relu", [False, True], ids=["no-relu", "relu"])

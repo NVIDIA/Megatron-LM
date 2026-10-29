@@ -20,6 +20,7 @@
 """
 
 import contextlib
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -179,6 +180,78 @@ def test_dsa_kpool_chunked_selection_replays(monkeypatch):
         backward=False,
         contention=True,
         what="DSA KPool chunked selection",
+    )
+
+
+@pytest.mark.parametrize("with_attention_mask", [False, True])
+def test_dsa_index_share_support_replays_across_forward_scopes(with_attention_mask):
+    """Interleaved forwards must replay their own indices and optional lengths bit for bit."""
+    from megatron.core.transformer.enums import AttnMaskType
+    from megatron.core.transformer.experimental_attention_variant import dsa
+
+    seeded()
+    config = SimpleNamespace(
+        dsa_indexer_topk=8,
+        dsa_indexer_topk_freq=4,
+        dsa_indexer_skip_topk_offset=1,
+        kv_channels=16,
+    )
+    attention = dsa.DSAttention(
+        config=config,
+        submodules=dsa.DSAttentionSubmodules(indexer=object()),
+        layer_number=2,
+        attn_mask_type=AttnMaskType.causal,
+        attention_type="self",
+        softmax_scale=1.0,
+        pg_collection=SimpleNamespace(),
+    )
+    attention_mask = torch.empty(1, device="cuda") if with_attention_mask else None
+    # Distinct candidate sets and lengths make cross-forward contamination visible.
+    supports = (
+        torch.arange(8, device="cuda", dtype=torch.int64).reshape(1, 2, 4),
+        torch.arange(8, 16, device="cuda", dtype=torch.int64).reshape(1, 2, 4),
+    )
+    lengths = (
+        torch.tensor([[1, 3]], device="cuda", dtype=torch.int32),
+        torch.tensor([[2, 4]], device="cuda", dtype=torch.int32),
+    )
+
+    def run():
+        carriers = (dsa._DSAIndexShareCarrier(), dsa._DSAIndexShareCarrier())
+        # F1 -> F2 -> replay F1 -> replay F2, sharing the same mask/config fallback.
+        for carrier, indices, valid_length in zip(carriers, supports, lengths):
+            with dsa._dsa_index_share_carrier_scope(carrier):
+                attention._get_index_share_topk_holder(None, attention_mask)[1] = indices
+                attention._get_index_share_topk_length_holder(None, attention_mask)[1] = (
+                    valid_length
+                )
+
+        replayed = []
+        for carrier, indices, valid_length in zip(carriers, supports, lengths):
+            with dsa._dsa_index_share_carrier_scope(carrier):
+                actual_indices = attention._get_index_share_topk_holder(None, attention_mask)[1]
+                actual_length = attention._get_index_share_topk_length_holder(
+                    None, attention_mask
+                )[1]
+                assert bytes_equal(actual_indices, indices)
+                assert bytes_equal(actual_length, valid_length)
+                replayed.extend((actual_indices.clone(), actual_length.clone()))
+
+        # Leaving the scope must restore the fallback without attaching holders to it.
+        fallback = attention_mask if attention_mask is not None else config
+        assert attention._get_index_share_carrier(None, attention_mask) is fallback
+        for owner in (config, attention_mask):
+            if owner is not None:
+                assert not hasattr(owner, dsa.DSAttention._HOLDER_ATTR)
+                assert not hasattr(owner, dsa.DSAttention._LENGTH_HOLDER_ATTR)
+        return tuple(replayed)
+
+    assert_replays_bit_exact(
+        run,
+        (),
+        backward=False,
+        contention=True,
+        what="DSA per-forward index-share support",
     )
 
 
