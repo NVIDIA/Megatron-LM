@@ -230,10 +230,15 @@ def test_moe_layer_without_collection_warns_once_per_owner(tp, ep, grouped_gemm)
             MoELayer(config, submodules),
             CustomMoELayer(config, submodules),
         ]
-    assert sorted(_fallback_warnings(record)) == [
-        ("CustomMoELayer", "pg_collection"),
-        ("MoELayer", "pg_collection"),
-    ]
+    expected_fallbacks = [("CustomMoELayer", "pg_collection"), ("MoELayer", "pg_collection")]
+    if not grouped_gemm:
+        # The default collection sets no GTP_remat axes, so the local experts' linear layers
+        # read theirs from the global grid as well, and say so.
+        expected_fallbacks += [
+            ("ColumnParallelLinear", "pg_collection.expt_gtp_remat"),
+            ("RowParallelLinear", "pg_collection.expt_gtp_remat"),
+        ]
+    assert sorted(_fallback_warnings(record)) == sorted(expected_fallbacks)
 
     expected = _global_moe_groups()
     for layer in layers:
@@ -336,6 +341,8 @@ def test_collection_without_gtp_inclusive_groups_is_accepted():
         "tp_ep_pp",
         "dp_cp",
         "tp_dp_cp",
+        "gtp_remat",
+        "expt_gtp_remat",
     )
     pg_collection = ProcessGroupCollection(**{name: full[name] for name in names})
     with warnings.catch_warnings():
