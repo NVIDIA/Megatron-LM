@@ -2,6 +2,7 @@
 """DSv4 backend, packed-layout and CP parity; run on at least 4 GPUs."""
 
 import json
+from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
 from types import SimpleNamespace
@@ -240,8 +241,8 @@ def test_packed_cp_matches_full_attention_and_gradients(
     capability = torch.cuda.get_device_capability()[0]
     if capability < 9:
         pytest.skip("Fused CSA CP tests require SM90+")
-    if capability == 9 and ratio == 4 and coeff > 0 and not sparse:
-        pytest.skip("TransformerConfig rejects dense indexer loss with the ratio-4 indexer on SM90")
+    # TransformerConfig rejects dense indexer loss with the ratio-4 indexer on SM90.
+    rejected = capability == 9 and ratio == 4 and coeff > 0 and not sparse
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=cp_size
     )
@@ -255,30 +256,38 @@ def test_packed_cp_matches_full_attention_and_gradients(
         # exclude internal padding; a repeated prefix exercises empty documents.
         physical_cu = [0, 133, 133, 1157, 2048]
         real_cu = [0, 129, 129, 1141, 2016]
-        cfg = _make_config(
-            num_layers=1,
-            hidden_size=256,
-            num_attention_heads=64,
-            v_head_dim=512,
-            qk_pos_emb_head_dim=64,
-            q_lora_rank=128,
-            csa_compress_ratios=[ratio],
-            csa_window_size=128,
-            dsa_indexer_n_heads=64,
-            dsa_indexer_head_dim=128,
-            dsa_indexer_topk=512,
-            dsa_indexer_loss_coeff=coeff,
-            dsa_indexer_use_sparse_loss=sparse,
-            dsa_kernel_backend="cudnn",
-            context_parallel_size=cp_size,
-            attention_cp_layout="contiguous",
-            linear_cp_layout="contiguous",
-            qk_layernorm=True,
-            apply_rope_fusion=rope_fusion,
-            gradient_accumulation_fusion=True,
-            recompute_granularity="selective" if recompute else None,
-            recompute_modules=["mla_up_proj"] if recompute else [],
+        rejection = (
+            pytest.raises(ValueError, match="dense indexer loss is not supported on SM90")
+            if rejected
+            else nullcontext()
         )
+        with rejection:
+            cfg = _make_config(
+                num_layers=1,
+                hidden_size=256,
+                num_attention_heads=64,
+                v_head_dim=512,
+                qk_pos_emb_head_dim=64,
+                q_lora_rank=128,
+                csa_compress_ratios=[ratio],
+                csa_window_size=128,
+                dsa_indexer_n_heads=64,
+                dsa_indexer_head_dim=128,
+                dsa_indexer_topk=512,
+                dsa_indexer_loss_coeff=coeff,
+                dsa_indexer_use_sparse_loss=sparse,
+                dsa_kernel_backend="cudnn",
+                context_parallel_size=cp_size,
+                attention_cp_layout="contiguous",
+                linear_cp_layout="contiguous",
+                qk_layernorm=True,
+                apply_rope_fusion=rope_fusion,
+                gradient_accumulation_fusion=True,
+                recompute_granularity="selective" if recompute else None,
+                recompute_modules=["mla_up_proj"] if recompute else [],
+            )
+        if rejected:
+            return
         # Isolate CP: keep the packed layout, backend and recompute settings identical.
         ref_cfg = replace(cfg, context_parallel_size=1)
         model = _build_attention(cfg, 1, pg).cuda()
