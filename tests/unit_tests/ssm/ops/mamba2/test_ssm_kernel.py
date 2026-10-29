@@ -66,6 +66,9 @@ class MockContextParallel:
 
 class TestMambaDynamicInference(unittest.TestCase):
 
+    # Heads on this rank.
+    nheads = 8
+
     def setUp(self):
         torch.manual_seed(42)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -78,8 +81,7 @@ class TestMambaDynamicInference(unittest.TestCase):
         self.headdim = 64
         self.d_conv = 4
         self.ngroups = 1
-        self.d_inner = self.d_model * 2  # expand=2
-        self.nheads = self.d_inner // self.headdim
+        self.d_inner = self.nheads * self.headdim
 
         # Create the Mixer instance directly
         self.mixer = MagicMock(spec=MambaMixer)
@@ -195,6 +197,12 @@ class TestMambaDynamicInference(unittest.TestCase):
             torch.allclose(remaining_ssm_states, torch.zeros_like(remaining_ssm_states)),
             "SSM states for padding requests (indices 1 to N-1) should remain 0",
         )
+
+
+class TestMambaDynamicInferenceSingleHead(TestMambaDynamicInference):
+    """The same tests on a rank that holds one head, as `mamba_num_heads == TP size` gives."""
+
+    nheads = 1
 
 
 if __name__ == '__main__':

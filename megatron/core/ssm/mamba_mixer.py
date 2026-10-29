@@ -930,9 +930,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         # Unified varlen SSM path: all prefill requests through single kernel call
         initial_ssm_state = ssm_state[batch_indices]
 
+        # Drop the batch dim. A has none: it stays (nheads_local_tpcp,), even with one head.
         x = x.squeeze(0)
         dt = dt.squeeze(0)
-        A = A.squeeze(0)
         B = B.squeeze(0)
         C = C.squeeze(0)
         z = z.squeeze(0)
