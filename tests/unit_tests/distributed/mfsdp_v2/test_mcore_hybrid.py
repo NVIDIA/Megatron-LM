@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+
 """Hybrid data-parallel placement and training tests for the MFSDP v2 adapter."""
 
 import os
@@ -8,7 +9,7 @@ import pytest
 import torch
 from torch.distributed.tensor import Replicate, Shard
 
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import FullyShardedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
@@ -60,10 +61,8 @@ def _build_model_and_optimizer(
     model_parallel_cuda_manual_seed(1234)
     model = FullyShardedDataParallel(
         config=config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            use_distributed_optimizer=False,
+        fsdp_config=FullyShardedDataParallelConfig(
+            version=2,
             data_parallel_sharding_strategy=inner_strategy,
             num_distributed_optimizer_instances=outer_size,
             outer_dp_sharding_strategy=outer_strategy,
@@ -136,10 +135,8 @@ def test_hybrid_placements(model_parallel_cleanup, outer_strategy, inner_strateg
     config = _config()
     model = FullyShardedDataParallel(
         config=config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            use_distributed_optimizer=False,
+        fsdp_config=FullyShardedDataParallelConfig(
+            version=2,
             data_parallel_sharding_strategy=inner_strategy,
             num_distributed_optimizer_instances=2,
             outer_dp_sharding_strategy=outer_strategy,
@@ -238,10 +235,8 @@ def test_moe_with_independent_hybrid_placements(
     )
     model = FullyShardedDataParallel(
         config=config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            use_distributed_optimizer=False,
+        fsdp_config=FullyShardedDataParallelConfig(
+            version=2,
             data_parallel_sharding_strategy="optim_grads",
             expert_data_parallel_sharding_strategy="optim_grads_params",
             num_distributed_optimizer_instances=outer_size,

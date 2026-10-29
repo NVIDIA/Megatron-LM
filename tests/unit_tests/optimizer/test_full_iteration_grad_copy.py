@@ -38,7 +38,7 @@ def make_optimizer(dtype, reuse=True, precision_aware=False):
     fp32.main_grad = torch.empty_like(fp32)
     fp32_master = torch.nn.Parameter(torch.zeros_like(fp32))
     optimizer.is_stub_optimizer = False
-    optimizer.ddp_config = SimpleNamespace(use_megatron_fsdp=False)
+    optimizer.fsdp_config = None
     optimizer.config = SimpleNamespace(
         use_precision_aware_optimizer_no_fp8_or_ds_fp8=precision_aware
     )

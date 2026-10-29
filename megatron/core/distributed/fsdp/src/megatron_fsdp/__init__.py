@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .fully_shard import fully_shard, fully_shard_model, fully_shard_optimizer
+from .fully_sharded_data_parallel_config import FullyShardedDataParallelConfig
 from .megatron_fsdp import MegatronFSDP
 from .mixed_precision import MixedPrecisionPolicy
 from .package_info import (
@@ -32,7 +32,7 @@ from .package_info import (
 from .utils import FSDPDistributedIndex
 
 __all__ = [
-    "DistributedDataParallelConfig",
+    "FullyShardedDataParallelConfig",
     "MegatronFSDP",
     "FSDPDistributedIndex",
     "MixedPrecisionPolicy",

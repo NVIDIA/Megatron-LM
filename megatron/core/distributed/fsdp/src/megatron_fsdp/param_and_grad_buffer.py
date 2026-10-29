@@ -66,8 +66,8 @@ logger = logging.getLogger(__name__)
 
 try:
     # Default to Megatron-LM FW.
-    from megatron.core.distributed.distributed_data_parallel_config import (
-        DistributedDataParallelConfig,
+    from megatron.core.distributed.fully_sharded_data_parallel_config import (
+        FullyShardedDataParallelConfig,
     )
     from megatron.core.tensor_parallel import get_cuda_rng_tracker
     from megatron.core.utils import is_submodule
@@ -77,7 +77,7 @@ try:
 
 except ImportError:
     # Megatron-LM is not installed, use Megatron-FSDP as a standalone module.
-    from .distributed_data_parallel_config import DistributedDataParallelConfig
+    from .fully_sharded_data_parallel_config import FullyShardedDataParallelConfig
     from .utils import get_cuda_rng_tracker, is_submodule
 
     HAVE_MCORE = False
@@ -289,7 +289,7 @@ def build_data_parallel_buffer_index(
     data_parallel_rank: int,
     data_parallel_world_size: int,
     is_data_distributed: bool,
-    ddp_config: DistributedDataParallelConfig,
+    fsdp_config: FullyShardedDataParallelConfig,
     bucket_id: int = 0,
     chunk_size_factor: int = 1,
 ) -> Tuple[List[tuple], BucketIndex, ShardBucketIndex]:
@@ -315,7 +315,7 @@ def build_data_parallel_buffer_index(
         # Padded whenever any parameter class is sharded. Over-padding an unsharded
         # buffer only costs a few elements, and this index is built before the
         # buffer knows which parameter class it holds.
-        if not all_sharding_strategies_in(ddp_config, ["no_shard"]):
+        if not all_sharding_strategies_in(fsdp_config, ["no_shard"]):
             return _pad(data_index, data_parallel_world_size * chunk_size_factor)
         return data_index
 
@@ -1235,7 +1235,7 @@ class DataParallelBuffer:
 
     def __init__(
         self,
-        ddp_config: DistributedDataParallelConfig,
+        fsdp_config: FullyShardedDataParallelConfig,
         params: List[torch.nn.Parameter],
         is_data_distributed: bool,
         bucket_id: int,
@@ -1252,7 +1252,7 @@ class DataParallelBuffer:
         bucket_index: Optional[BucketIndex] = None,
         shard_bucket_index: Optional[ShardBucketIndex] = None,
     ) -> None:
-        self.ddp_config = ddp_config
+        self.fsdp_config = fsdp_config
         self.params = params
         _param_dtype = {p.dtype for p in self.params}
 
@@ -1302,7 +1302,7 @@ class DataParallelBuffer:
                     self.dp_rank,
                     self.dp_world_size,
                     is_data_distributed,
-                    ddp_config,
+                    fsdp_config,
                     bucket_id=bucket_id,
                     chunk_size_factor=chunk_size_factor,
                 )
@@ -2054,7 +2054,7 @@ class ParamAndGradBuffer:
         parameter management and communication are crucial for performance.
 
     Args:
-        ddp_config (DistributedDataParallelConfig): The distributed data parallel
+        fsdp_config (FullyShardedDataParallelConfig): The distributed data parallel
             configuration.
         module (torch.nn.Module): The module whose parameters are to be grouped
             and flatten.
@@ -2074,7 +2074,7 @@ class ParamAndGradBuffer:
 
     def __init__(
         self,
-        ddp_config: DistributedDataParallelConfig,
+        fsdp_config: FullyShardedDataParallelConfig,
         module: torch.nn.Module,
         bucketing_policy: BucketingPolicy,
         dist_index: FSDPDistributedIndex,
@@ -2086,16 +2086,16 @@ class ParamAndGradBuffer:
         reset_parameters_for_meta_device_init_module: bool = False,
     ):
         # Ensure consistent data parallel sharding settings across configurations
-        # This assignment aligns the 'bucketing_policy' setting with the 'ddp_config'
+        # This assignment aligns the 'bucketing_policy' setting with the 'fsdp_config'
         bucketing_policy.data_parallel_sharding_strategy = (
-            ddp_config.data_parallel_sharding_strategy
+            fsdp_config.data_parallel_sharding_strategy
         )
         bucketing_policy.expert_data_parallel_sharding_strategy = (
-            ddp_config.expert_data_parallel_sharding_strategy
+            fsdp_config.expert_data_parallel_sharding_strategy
         )
 
-        self.ddp_config = ddp_config
-        self.use_decoupled_grad = ddp_config.megatron_fsdp_use_decoupled_grad
+        self.fsdp_config = fsdp_config
+        self.use_decoupled_grad = fsdp_config.use_decoupled_grad
         self.module = module
         self.bucketing_policy = bucketing_policy
         self.param_to_name = {p: name for name, p in self.module.named_parameters()}
@@ -2114,20 +2114,20 @@ class ParamAndGradBuffer:
         self.ubr_groups = None
         self.already_registered = False
         # User buffer registration related settings
-        if self.ddp_config.nccl_ub:
+        if self.fsdp_config.nccl_ub:
             assert nccl_allocator is not None, (
                 "To use user buffer registration, "
                 "either requires megatron.core.nccl_allocator or apex.contrib.nccl_allocator"
             )
             # Since the user buffer registration requires (non-dynamic) persistent memory,
             # it always uses fsdp double buffer.
-            self.ddp_config.fsdp_double_buffer = True
+            self.fsdp_config.double_buffer = True
             # Initialize the NCCL memory pool.
             global NCCL_MEMORY_POOL
             # Initialize NCCL allocator runtime if available
             nccl_allocator.init()
             NCCL_MEMORY_POOL = nccl_allocator.create_nccl_mem_pool(
-                symmetric=not self.ddp_config.disable_symmetric_registration
+                symmetric=not self.fsdp_config.disable_symmetric_registration
             )
             log_single_rank(
                 logger,
@@ -2199,7 +2199,7 @@ class ParamAndGradBuffer:
         # Buffer is registered to data_parallel_group and expert_data_parallel_group if it exists
         # In the case of not using nccl_ub, it returns a nullcontext
         self.mem_alloc_context = self.get_mem_alloc_context(
-            groups=self.ubr_groups, symmetric=not self.ddp_config.disable_symmetric_registration
+            groups=self.ubr_groups, symmetric=not self.fsdp_config.disable_symmetric_registration
         )
 
         # Mark FP8 params. If TransformerEngine is not installed, we can skip this.
@@ -2235,7 +2235,7 @@ class ParamAndGradBuffer:
         """
         Get the memory allocation context for the parameter and gradient buffers.
         """
-        if self.ddp_config.nccl_ub:
+        if self.fsdp_config.nccl_ub:
             assert nccl_allocator is not None, (
                 "To use user buffer registration, "
                 "either requires megatron.core.nccl_allocator or apex.contrib.nccl_allocator"
@@ -2246,7 +2246,7 @@ class ParamAndGradBuffer:
                 groups = [self.dist_index.get_fsdp_group(is_expert_parallel=False)]
 
             if NCCL_ALLOCATOR == "MCORE":
-                if self.ddp_config.fsdp_manual_registration:
+                if self.fsdp_config.manual_registration:
                     return functools.partial(
                         nccl_allocator.MemPoolAllocatorWithoutRegistration, NCCL_MEMORY_POOL
                     )
@@ -2266,7 +2266,7 @@ class ParamAndGradBuffer:
                         symmetric=symmetric,
                     )
             elif NCCL_ALLOCATOR == "APEX":
-                if self.ddp_config.fsdp_manual_registration:
+                if self.fsdp_config.manual_registration:
                     logging.warning(
                         "FSDP manual registration is not supported for APEX NCCL allocator."
                         "falling back to default registration. "
@@ -2299,9 +2299,9 @@ class ParamAndGradBuffer:
         """
         Manually register the FSDP communication buffers to NCCL user buffer.
         """
-        assert self.ddp_config.nccl_ub, "NCCL UBR is not enabled"
-        assert self.ddp_config.fsdp_double_buffer, "FSDP double buffer is not enabled"
-        assert self.ddp_config.fsdp_manual_registration, "FSDP manual registration is not enabled"
+        assert self.fsdp_config.nccl_ub, "NCCL UBR is not enabled"
+        assert self.fsdp_config.double_buffer, "FSDP double buffer is not enabled"
+        assert self.fsdp_config.manual_registration, "FSDP manual registration is not enabled"
         assert not self.already_registered, "Mem pool is already registered"
 
         self.already_registered = True
@@ -2321,7 +2321,7 @@ class ParamAndGradBuffer:
             nccl_allocator.register_mem_pool(
                 NCCL_MEMORY_POOL,
                 group,
-                symmetric=not self.ddp_config.disable_symmetric_registration,
+                symmetric=not self.fsdp_config.disable_symmetric_registration,
             )
             log_single_rank(
                 logger,
@@ -2399,7 +2399,7 @@ class ParamAndGradBuffer:
         # FSDP Sharding Strategy: no-shard, optim, optim_grads, optim_grads_params.
         # Raise on an unrecognized strategy before any buffer is allocated. Which buffers
         # each strategy distributes is resolved per parameter group in the loop below.
-        for strategy in get_sharding_strategies_in_use(self.ddp_config):
+        for strategy in get_sharding_strategies_in_use(self.fsdp_config):
             _buffer_distribution_for_strategy(strategy)
 
         """
@@ -2551,7 +2551,7 @@ class ParamAndGradBuffer:
         """
         should_create_hfsdp_helper_buffers = (
             self.dist_index.use_hybrid_fsdp
-            and self.ddp_config.outer_dp_sharding_strategy != "no_shard"
+            and self.fsdp_config.outer_dp_sharding_strategy != "no_shard"
         )
         # DP-Outer sharding indexes every DP-wide shard by logical hybrid rank, so all of the
         # buffers it touches are communicated through a DP-Shard helper (created per buffer
@@ -2564,7 +2564,7 @@ class ParamAndGradBuffer:
         if should_create_hfsdp_helper_buffers:
             unsupported = [
                 s
-                for s in get_sharding_strategies_in_use(self.ddp_config)
+                for s in get_sharding_strategies_in_use(self.fsdp_config)
                 if s in ("no_shard", "optim")
             ]
             if unsupported:
@@ -2574,14 +2574,14 @@ class ParamAndGradBuffer:
                     "[Megatron-FSDP] DP-Outer sharding requires a DP-Shard strategy that shards "
                     f"gradients (optim_grads or optim_grads_params), but got {unsupported}.\n"
                     "Megatron-FSDP DP-Shard Strategy: "
-                    f"{self.ddp_config.data_parallel_sharding_strategy}\nMegatron-FSDP "
+                    f"{self.fsdp_config.data_parallel_sharding_strategy}\nMegatron-FSDP "
                     "DP-Shard Expert Strategy: "
-                    f"{self.ddp_config.expert_data_parallel_sharding_strategy}\nMegatron-FSDP "
-                    f"DP-Outer Strategy: {self.ddp_config.outer_dp_sharding_strategy}"
+                    f"{self.fsdp_config.expert_data_parallel_sharding_strategy}\nMegatron-FSDP "
+                    f"DP-Outer Strategy: {self.fsdp_config.outer_dp_sharding_strategy}"
                 )
 
-        if self.ddp_config.nccl_ub:
-            assert self.ddp_config.fsdp_double_buffer, (
+        if self.fsdp_config.nccl_ub:
+            assert self.fsdp_config.double_buffer, (
                 "NCCL UB is only supported with FSDP double buffer. "
                 "Please set fsdp_double_buffer=True in the ddp config."
             )
@@ -2590,7 +2590,7 @@ class ParamAndGradBuffer:
         for group in self.parameter_groups:
             group.grad_dtype = self._resolve_group_grad_dtype(group, meta_device_init_fp8_params)
 
-        if self.ddp_config.gradient_reduce_div_fusion:
+        if self.fsdp_config.gradient_reduce_div_fusion:
             # PyTorch uses the first bucket's ReduceOp for the entire coalesced call.
             # Mixing BF16 (pre-scaled SUM) with other dtypes (PREMUL_SUM) is unsafe.
             requires_grad_only = (
@@ -2613,26 +2613,24 @@ class ParamAndGradBuffer:
                         "(--no-gradient-reduce-div-fusion) or use a single grad_comm_dtype."
                     )
 
-        if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
+        if self.fsdp_config.double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
             # Double Buffering
             UB_BUFFER_NUM = 2
             # Double Buffer Allocator Choice
             FIXED_POOL_ALLOC_TYPE = (
-                MaxPoolAllocator
-                if self.ddp_config.megatron_fsdp_max_pool_double_buffer
-                else FixedPoolAllocator
+                MaxPoolAllocator if self.fsdp_config.max_pool_double_buffer else FixedPoolAllocator
             )
             self.weight_alloc = FIXED_POOL_ALLOC_TYPE(
                 name="fsdp_params",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
-                fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
+                fallback_to_persistent_buffer=self.fsdp_config.db_use_persist_buf_on_alloc_fail,
             )
             self.transpose_weight_alloc = FIXED_POOL_ALLOC_TYPE(
                 name="fsdp_fp8_transpose_params",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
-                fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
+                fallback_to_persistent_buffer=self.fsdp_config.db_use_persist_buf_on_alloc_fail,
             )
             # Resolve gradient bucket dtype used for MaxPoolAllocator bucket allocation
             # planning and FixedPoolAllocator unit symmetries. Falls back to each
@@ -2647,9 +2645,7 @@ class ParamAndGradBuffer:
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
                 dtype_fn=grad_dtype_fn,
-                fallback_to_persistent_buffer=(
-                    self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
-                ),
+                fallback_to_persistent_buffer=(self.fsdp_config.db_use_persist_buf_on_alloc_fail),
             )
             if self.dist_index.use_hybrid_fsdp:
                 # Only required for custom communication dtype buffer allocation
@@ -2662,7 +2658,7 @@ class ParamAndGradBuffer:
                     size=UB_BUFFER_NUM,
                     dtype_fn=grad_dtype_fn,
                     fallback_to_persistent_buffer=(
-                        self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
+                        self.fsdp_config.db_use_persist_buf_on_alloc_fail
                     ),
                 )
             self.double_buf_units = self.weight_alloc.fsdp_double_buffer_units
@@ -2751,7 +2747,7 @@ class ParamAndGradBuffer:
             # Initialize the model weight buffer from bucket parameters.
             if data_parallel_sharding_strategy != "no_shard":
                 group.model_weight_buffer = DataParallelBuffer(
-                    self.ddp_config,
+                    self.fsdp_config,
                     group.params,
                     is_data_distributed=is_model_weight_buffer_distributed
                     and model_wbuf_dp_group.size() > 1,
@@ -2770,7 +2766,7 @@ class ParamAndGradBuffer:
                 )
                 if should_create_transpose_weight_buffer:
                     group.transpose_weight_buffer = DataParallelBuffer(
-                        self.ddp_config,
+                        self.fsdp_config,
                         group.params,
                         is_data_distributed=is_model_weight_buffer_distributed
                         and main_buf_dp_group.size() > 1,
@@ -2792,7 +2788,7 @@ class ParamAndGradBuffer:
                 and self.mp_policy.main_params_dtype is not None
             ):
                 group.main_weight_buffer = DataParallelBuffer(
-                    self.ddp_config,
+                    self.fsdp_config,
                     group.params,
                     is_data_distributed=is_main_weight_buffer_distributed
                     and main_buf_dp_group.size() > 1,
@@ -2811,7 +2807,7 @@ class ParamAndGradBuffer:
                     group.grad_dtype.is_floating_point
                 ), f"Main gradient dtype ({group.grad_dtype}) must be Float."
                 group.main_grad_buffer = DataParallelBuffer(
-                    self.ddp_config,
+                    self.fsdp_config,
                     # Proxy because the number of gradient parameters is the same
                     # as the number of model parameters.
                     group.params,
@@ -2905,7 +2901,7 @@ class ParamAndGradBuffer:
                         data_parallel_rank=fsdp_group.rank(),
                     )
                 group.hsdp_comm_gbuf = DataParallelBuffer(
-                    self.ddp_config,
+                    self.fsdp_config,
                     group.params,
                     is_data_distributed=is_grad_buffer_distributed and fsdp_group.size() > 1,
                     # Set allocation to grad_comm_dtype, or default to param(.grad).dtype.
@@ -2921,7 +2917,7 @@ class ParamAndGradBuffer:
                     **hfsdp_kwargs,
                 )
 
-        reset_context_args = {"init_param_with_fp8": self.ddp_config.fp8_param_gather}
+        reset_context_args = {"init_param_with_fp8": self.fsdp_config.fp8_param_gather}
         module_reset_flag = {}
         if self.reset_parameters_for_meta_device_init_module:
             self.param_to_direct_module = {}
@@ -3048,7 +3044,7 @@ class ParamAndGradBuffer:
 
                             # After resetting parameters, delete fp8 transpose cache
                             # if we do not need keep cache.
-                            if not self.ddp_config.keep_fp8_transpose_cache:
+                            if not self.fsdp_config.keep_fp8_transpose_cache:
                                 for _param in m.parameters(recurse=False):
                                     if is_float8tensor(_param):
                                         fp8_discard_transpose_cache(_param)
@@ -3323,7 +3319,7 @@ class ParamAndGradBuffer:
         this gradient shard will increase memory utilization as this gradient is a
         persistent casted-copy of the accumulated gradient.
         """
-        if not self.ddp_config.megatron_fsdp_cuda_graph_mode:
+        if not self.fsdp_config.cuda_graph_mode:
             # Dereference the sharded gradient to reclaim memory
             # unless a full-iteration CUDA graph is utilized.
             for name, param in self.optimizer_named_parameters:
@@ -3790,7 +3786,7 @@ class ParamAndGradBuffer:
             [not g.model_weight_buffer.is_data_distributed for g in self.parameter_groups]
         ), "all_gather_parameters() should only be called when parameters are not sharded."
         assert (
-            self.ddp_config.outer_dp_sharding_strategy == "no_shard"
+            self.fsdp_config.outer_dp_sharding_strategy == "no_shard"
         ), "all_gather_parameters() should not be called when outer-DP sharding is enabled."
 
         all_gather_ops = []
@@ -3821,7 +3817,7 @@ class ParamAndGradBuffer:
             [not g.main_grad_buffer.is_data_distributed for g in self.parameter_groups]
         ), "reduce_scatter_gradients() should only be called when gradients are not sharded."
         assert (
-            self.ddp_config.outer_dp_sharding_strategy == "no_shard"
+            self.fsdp_config.outer_dp_sharding_strategy == "no_shard"
         ), "reduce_scatter_gradients() should not be called when outer-DP sharding is enabled."
 
         reduce_scatter_ops = []
@@ -3830,12 +3826,12 @@ class ParamAndGradBuffer:
             if gbuf is None:
                 continue
             scaling_factor = gbuf.gradient_scaling_factor
-            if self.ddp_config.check_for_nan_in_grad:
+            if self.fsdp_config.check_for_nan_in_grad:
                 _check_nan_in_grad(gbuf.data)
             reduce_op = gradient_reduce_preprocessing(
                 gbuf.data,
                 scaling_factor,
-                self.ddp_config,
+                self.fsdp_config,
                 group_size=gbuf.data_parallel_group.size(),
             )
             reduce_scatter_handler = torch.distributed.reduce_scatter_tensor(
@@ -3866,7 +3862,7 @@ class ParamAndGradBuffer:
             ]
         ), "all_reduce_gradients() should only be called when gradients are not sharded."
         assert (
-            self.ddp_config.outer_dp_sharding_strategy == "no_shard"
+            self.fsdp_config.outer_dp_sharding_strategy == "no_shard"
         ), "all_reduce_gradients() should not be called when outer-DP sharding is enabled."
 
         all_reduce_ops = []
@@ -3875,12 +3871,12 @@ class ParamAndGradBuffer:
             if gbuf is None:
                 continue
             scaling_factor = gbuf.gradient_scaling_factor
-            if self.ddp_config.check_for_nan_in_grad:
+            if self.fsdp_config.check_for_nan_in_grad:
                 _check_nan_in_grad(gbuf.data)
             reduce_op = gradient_reduce_preprocessing(
                 gbuf.data,
                 scaling_factor,
-                self.ddp_config,
+                self.fsdp_config,
                 group_size=gbuf.data_parallel_group.size(),
             )
             all_reduce_handler = torch.distributed.all_reduce(
@@ -3948,7 +3944,7 @@ def _create_hfsdp_helper_buffer(
         as `dp_buffer` but with an inner-DP `shard_bucket_index`.
     """
     helper_buffer = DataParallelBuffer(
-        dp_buffer.ddp_config,
+        dp_buffer.fsdp_config,
         dp_buffer.params,
         is_data_distributed=is_data_distributed,
         dtype=dp_buffer.dtype,
@@ -4189,7 +4185,7 @@ class GradReducePipeline:
                 free_up_grad_bucket()
 
     def _enforce_double_buffer_limit(self, add_buckets):
-        if not self.buffer.ddp_config.fsdp_double_buffer:
+        if not self.buffer.fsdp_config.double_buffer:
             return
 
         param_groups = self.buffer.parameter_groups
@@ -4266,9 +4262,9 @@ class GradReducePipeline:
         # When using FSDP double buffer, waiting for the necessary bucket to be
         # released ensures that our double buffer will not explode due to too
         # many empty bucket requests.
-        ddp_config = self.buffer.ddp_config
+        fsdp_config = self.buffer.fsdp_config
         mp_policy = self.buffer.mp_policy
-        if ddp_config.fsdp_double_buffer:
+        if fsdp_config.double_buffer:
             self._enforce_double_buffer_limit(bucket_group)
 
         current_stream = torch.cuda.current_stream()
@@ -4317,7 +4313,7 @@ class GradReducePipeline:
                     reduce_op = gradient_reduce_preprocessing(
                         unreduced_grad,
                         scaling_factor,
-                        ddp_config,
+                        fsdp_config,
                         group_size=gbuf.data_parallel_group.size(),
                     )
 
@@ -4401,7 +4397,7 @@ class GradReducePipeline:
                     for bucket_id in bucket_group:
                         # Skip gradient scaling for DP-Outer, because the
                         # (DP-Shard, DP-Outer) scaling is already applied.
-                        if ddp_config.average_in_collective:
+                        if fsdp_config.average_in_collective:
                             reduce_op = torch.distributed.ReduceOp.AVG
                         else:
                             reduce_op = torch.distributed.ReduceOp.SUM
@@ -4437,7 +4433,7 @@ class GradReducePipeline:
                             ).data
 
                         # All-reduce or reduce-scatter the DP-Shard gradients across DP-Outer.
-                        if ddp_config.outer_dp_sharding_strategy != "no_shard":
+                        if fsdp_config.outer_dp_sharding_strategy != "no_shard":
                             # Retrieve the (DP-Outer, DP-Shard) gradient shard from the
                             # main gradient buffer which shards across the entire DP group,
                             # i.e. across all DP-Shard and DP-Outer ranks.
@@ -4577,7 +4573,7 @@ class AllGatherPipeline:
 
         if (
             self.buffer.dist_index.use_hybrid_fsdp
-            and self.buffer.ddp_config.outer_dp_sharding_strategy != "no_shard"
+            and self.buffer.fsdp_config.outer_dp_sharding_strategy != "no_shard"
         ):
             # If there are multiple FSDP groups and full sharding, we need to
             # all-gather parameters across groups.
@@ -4747,7 +4743,7 @@ class AllGatherPipeline:
         prefetched_size = 0
         bucket_id = next_bucket_id()
         while bucket_id is not None and prefetched_size < suggested_prefetch_size:
-            if self.buffer.ddp_config.fsdp_double_buffer:
+            if self.buffer.fsdp_config.double_buffer:
                 fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
                 double_buffer_units.add(fsdp_unit_id)
                 if len(double_buffer_units) > 2:
@@ -4849,7 +4845,7 @@ class AllGatherPipeline:
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
         parameter_groups = self.buffer.parameter_groups
         double_buf_units = set()
-        if self.buffer.ddp_config.fsdp_double_buffer:
+        if self.buffer.fsdp_config.double_buffer:
             for bucket_id in ag_buckets:
                 fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
                 if fsdp_unit_id in self.buffer.double_buf_units:
@@ -4875,13 +4871,13 @@ class AllGatherPipeline:
             # un-shard irrelevant model components that pointlessly steal buffer
             # allocations from the expected FSDP unit allocation and violating
             # the maximum limit of 2 buffers allocated at any point in time.
-            self.buffer.ddp_config.fsdp_double_buffer
+            self.buffer.fsdp_config.double_buffer
             and no_fsdp_units
         )
         pipeline_hfsdp_gathers = (
-            self.buffer.ddp_config.hfsdp_param_gather_overlap
+            self.buffer.fsdp_config.hfsdp_param_gather_overlap
             and self.buffer.dist_index.use_hybrid_fsdp
-            and self.buffer.ddp_config.outer_dp_sharding_strategy == "optim"
+            and self.buffer.fsdp_config.outer_dp_sharding_strategy == "optim"
         )
         outer_ag_buckets = []
 
@@ -5114,7 +5110,7 @@ class AllGatherPipeline:
 
 
 @torch.no_grad()
-def gradient_reduce_preprocessing(grad_data, scaling_factor, ddp_config, group_size=None):
+def gradient_reduce_preprocessing(grad_data, scaling_factor, fsdp_config, group_size=None):
     """
     Gradient reduce preprocessing for gradient averaging and gradient scaling.
 
@@ -5127,7 +5123,7 @@ def gradient_reduce_preprocessing(grad_data, scaling_factor, ddp_config, group_s
     if scaling_factor is None:
         # No scaling - use SUM reduction.
         reduce_op = torch.distributed.ReduceOp.SUM
-    elif ddp_config.average_in_collective:
+    elif fsdp_config.average_in_collective:
         # Scaling overridden by AVG reduction.
         reduce_op = torch.distributed.ReduceOp.AVG
     elif group_size == 1:
@@ -5138,7 +5134,7 @@ def gradient_reduce_preprocessing(grad_data, scaling_factor, ddp_config, group_s
         # and again under HFSDP when DP-Shard holds a single rank.
         grad_data.mul_(scaling_factor)
         reduce_op = torch.distributed.ReduceOp.SUM
-    elif ddp_config.gradient_reduce_div_fusion and grad_data.dtype != torch.bfloat16:
+    elif fsdp_config.gradient_reduce_div_fusion and grad_data.dtype != torch.bfloat16:
         # Fused SUM reduction.
         reduce_op = torch.distributed._make_nccl_premul_sum(scaling_factor)
     else:

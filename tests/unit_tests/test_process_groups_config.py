@@ -35,7 +35,7 @@ class TestProcessGroupsConfig:
         ddp_config = mocker.Mock(
             num_distributed_optimizer_instances=1, use_distributed_optimizer=True
         )
-        chunk = mocker.Mock(ddp_config=ddp_config)
+        chunk = mocker.Mock(ddp_config=ddp_config, fsdp_config=None)
         ddp_groups = ProcessGroupCollection.setup_process_groups_for_ddp(pg, config, ddp_config)
         optimizer_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
             pg, [chunk], use_gloo_process_groups=False

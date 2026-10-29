@@ -117,7 +117,7 @@ def test_native_builder_uses_dist_and_ddp_configs(monkeypatch, run_config, fsdp2
     with pytest.raises(ReachedBuilder):
         training.setup_model_and_optimizer(Mock(), cfg_container=run_config)
     kwargs = builder.build_distributed_models.call_args.kwargs
-    assert kwargs["ddp_config"] is run_config.ddp
+    assert kwargs["data_parallel_config"] is run_config.data_parallel_config
     assert kwargs["use_torch_fsdp2"] is fsdp2
     # Forward both flags unchanged, including the pair rejected by the builder.
     assert kwargs["use_megatron_fsdp"] is megatron_fsdp

@@ -24,7 +24,7 @@ def test_mixed_precision_context_preserves_fixed_buffer_dtype_and_restores_polic
     param_and_grad_buffer = SimpleNamespace(mp_policy=original_policy)
     fsdp = SimpleNamespace(
         mp_policy=original_policy,
-        ddp_config=SimpleNamespace(nccl_ub=nccl_ub, fsdp_double_buffer=fsdp_double_buffer),
+        fsdp_config=SimpleNamespace(nccl_ub=nccl_ub, double_buffer=fsdp_double_buffer),
         param_and_grad_buffer=param_and_grad_buffer,
     )
     fsdp.reset_mixed_precision_policy = MethodType(

@@ -1,11 +1,18 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from contextlib import nullcontext
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
 import torch.nn as nn
 
+from megatron.core.distributed import (
+    DistributedDataParallelConfig,
+    FullyShardedDataParallelConfig,
+    TorchFullyShardedDataParallelConfig,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import RuntimePolicy
 from megatron.core.enums import ModelType
 from megatron.core.transformer.module import Float16Module
 from megatron.training.models.dist_utils import (
@@ -17,6 +24,75 @@ from megatron.training.models.dist_utils import (
     to_empty_if_meta_device,
     unimodal_build_distributed_models,
 )
+
+
+@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_independent_fsdp_config_selects_backend_and_shared_context(version, legacy):
+    config = FullyShardedDataParallelConfig(version=version)
+    input_config = (
+        DistributedDataParallelConfig(use_megatron_fsdp=True, megatron_fsdp_version=version)
+        if legacy
+        else config
+    )
+    models = [Mock(), Mock()]
+    with (
+        patch("megatron.training.models.dist_utils.FullyShardedDataParallel") as fsdp,
+        patch("megatron.training.models.dist_utils.DistributedDataParallel") as ddp,
+        patch("megatron.training.models.dist_utils.get_model_config") as get_config,
+        patch("megatron.training.models.dist_utils.fully_shard_context") as context,
+        patch("torch.cuda.current_stream"),
+        patch("torch.cuda.stream", return_value=nullcontext()),
+    ):
+        get_config.return_value.cuda_graph_impl = "none"
+        context.return_value = nullcontext()
+        _ddp_wrap(
+            models, False, input_config, False, use_megatron_fsdp=legacy, pg_collection=_make_pg()
+        )
+        ddp.assert_not_called()
+        assert fsdp.call_count == 2
+        for index, call in enumerate(fsdp.call_args_list):
+            assert isinstance(call.kwargs["fsdp_config"], FullyShardedDataParallelConfig)
+            assert call.kwargs["fsdp_config"].version == version
+            if not legacy:
+                assert call.kwargs["fsdp_config"] is config
+            assert "ddp_config" not in call.kwargs
+            assert call.kwargs["disable_bucketing"] == (version == 1 and index > 0)
+        if version == 2:
+            context.assert_called_once_with(
+                runtime_policy=RuntimePolicy(
+                    use_symmetric_memory=False, caller_managed_grad_sync=True
+                )
+            )
+        else:
+            context.assert_not_called()
+
+
+def test_torch_fsdp_config_selects_its_own_backend():
+    config = TorchFullyShardedDataParallelConfig()
+    with (
+        patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel") as torch_fsdp,
+        patch("megatron.training.models.dist_utils.FullyShardedDataParallel") as fsdp,
+        patch("megatron.training.models.dist_utils.get_model_config") as get_config,
+        patch("torch.cuda.current_stream"),
+        patch("torch.cuda.stream", return_value=nullcontext()),
+    ):
+        get_config.return_value.cuda_graph_impl = "none"
+        _ddp_wrap([Mock()], False, config, False, pg_collection=_make_pg())
+        torch_fsdp.assert_called_once()
+        fsdp.assert_not_called()
+
+
+def test_builder_rejects_both_config_inputs():
+    with pytest.raises(ValueError, match="only one"):
+        unimodal_build_distributed_models(
+            Mock(),
+            Mock(),
+            Mock(),
+            ddp_config=Mock(),
+            data_parallel_config=FullyShardedDataParallelConfig(),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers

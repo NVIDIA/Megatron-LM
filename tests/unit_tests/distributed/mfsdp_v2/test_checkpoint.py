@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+
 """DCP save/load roundtrip tests for Megatron-FSDP v2.
 
 Covers the standalone checkpoint helpers and MCore expert-parallel save/load by
@@ -19,7 +20,7 @@ from torch.distributed.checkpoint.state_dict import get_model_state_dict, get_op
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
 
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import FullyShardedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
@@ -535,14 +536,12 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
             ).cuda()
             model = FullyShardedDataParallel(
                 config=config,
-                ddp_config=DistributedDataParallelConfig(
-                    use_megatron_fsdp=True,
-                    megatron_fsdp_version=2,
-                    use_distributed_optimizer=True,
+                fsdp_config=FullyShardedDataParallelConfig(
+                    version=2,
                     data_parallel_sharding_strategy="optim_grads_params",
-                    megatron_fsdp_main_params_dtype=torch.float32,
-                    megatron_fsdp_main_grads_dtype=torch.bfloat16,
-                    fsdp_all_gather_in_start_param_sync=False,
+                    main_params_dtype=torch.float32,
+                    main_grads_dtype=torch.bfloat16,
+                    all_gather_in_start_param_sync=False,
                 ),
                 module=model,
                 pg_collection=groups,

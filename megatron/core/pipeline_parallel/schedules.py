@@ -867,11 +867,7 @@ def forward_backward_no_pipelining(
     # Reset all_gather_pipeline bucket status before next validation iteration
     if forward_only:
         for model_chunk in [model]:
-            if (
-                hasattr(model_chunk, 'ddp_config')
-                and model_chunk.ddp_config.use_megatron_fsdp
-                and model_chunk.ddp_config.overlap_param_gather
-            ):
+            if hasattr(model_chunk, 'fsdp_config') and model_chunk.fsdp_config.overlap_param_gather:
                 model_chunk.synchronize_param_gather()
 
     if config.timers is not None:

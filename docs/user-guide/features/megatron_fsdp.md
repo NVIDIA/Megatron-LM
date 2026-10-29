@@ -189,15 +189,17 @@ Megatron-FSDP has a lower-level `FullyShardedDataParallel` class API that can be
 
 ```python
 # Initialize model and optimizer.
-ddp_config.use_megatron_fsdp = True
+from megatron.core.distributed import FullyShardedDataParallel, FullyShardedDataParallelConfig
 # Megatron-FSDP Base Sharding Strategies:
 # no_shard, optim, optim_grads, optim_grads_params
-ddp_config.data_parallel_sharding_strategy = "optim_grads_params"
+fsdp_config = FullyShardedDataParallelConfig(
+    data_parallel_sharding_strategy="optim_grads_params",
+)
 model = GPTModel(transformer_config)
 model = FullyShardedDataParallel(
-    transformer_config,
-    model,
-    ddp_config,
+    config=transformer_config,
+    module=model,
+    fsdp_config=fsdp_config,
     fsdp_unit_modules = [TransformerLayer, LanguageModelEmbedding],
 )
 optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
