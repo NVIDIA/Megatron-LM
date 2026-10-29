@@ -24,6 +24,7 @@ from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     require_process_groups,
     resolve_process_groups,
+    warn_global_process_group_fallback,
 )
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.tensor_observation import observe_layer_residuals
@@ -94,21 +95,29 @@ def get_num_layers_to_build(
     Args:
         config (TransformerConfig): Configuration object containing transformer model parameters.
         vp_stage (Optional[int]): Virtual pipeline stage number.
-        pp_rank (Optional[int]): Pipeline parallel rank.
+        pp_rank (Optional[int]): Rank of this stage in the model's pipeline-parallel group. A
+            model with a single pipeline stage does not need it. With pipeline parallelism,
+            omitting it is deprecated: the global pipeline rank in ``parallel_state`` is used
+            instead, with a ``ProcessGroupFallbackWarning``.
 
     Returns:
         int: The number of layers to be built for the current pipeline stage.
     """
+    if pp_rank is None:
+        if config.pipeline_model_parallel_size == 1:
+            pp_rank = 0
+        else:
+            warn_global_process_group_fallback(
+                "get_num_layers_to_build", "pp_rank", deprecated_in="0.21", removed_in="0.23"
+            )
+            pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+
     # If we have a custom PP layout, straightforwardly
     # return the number of decoders in the layout array.
     if config.pipeline_model_parallel_layout is not None:
         return config.pipeline_model_parallel_layout.get_num_layers_to_build(
-            layer_type=LayerType.decoder, vp_stage=vp_stage
+            layer_type=LayerType.decoder, vp_stage=vp_stage, pp_rank=pp_rank
         )
-
-    # Fallback for legacy tests.
-    if pp_rank is None:
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
 
     is_first_pp_stage = pp_rank == 0
     is_last_pp_stage = pp_rank == config.pipeline_model_parallel_size - 1

@@ -1637,14 +1637,21 @@ def test_packed_sequence_dataset_built_on_rank(script, sequence_packing_schedule
     pp_rank = mpu.get_pipeline_model_parallel_rank()
 
     args = SimpleNamespace(sequence_packing_scheduler=sequence_packing_scheduler)
-    config = SimpleNamespace(pipeline_model_parallel_layout=None, mtp_num_layers=None)
+    config = SimpleNamespace(
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=None,
+        virtual_pipeline_model_parallel_size=vp_size,
+    )
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "pp"])
     vp_stages = [None] if vp_size is None else range(vp_size)
     with (
         patch.object(script, "get_args", return_value=args),
         patch.object(script, "core_transformer_config_from_args", return_value=config),
     ):
         for vp_stage in vp_stages:
-            built = script.is_dataset_built_on_rank(vp_stage=vp_stage, is_packed_sequence=True)
+            built = script.is_dataset_built_on_rank(
+                vp_stage=vp_stage, is_packed_sequence=True, pg_collection=pg_collection
+            )
 
             if sequence_packing_scheduler is None:
                 expected = tp_rank == 0

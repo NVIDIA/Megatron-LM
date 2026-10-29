@@ -135,7 +135,6 @@
     ],
     "megatron/core/pipeline_parallel/schedules.py": [
       "_build_default_pg_collection:guarded:resolve_process_groups",
-      "forward_step_calc_loss:accessor:parallel_state.get_context_parallel_world_size",
       "get_forward_backward_func:accessor:parallel_state.get_pipeline_model_parallel_world_size"
     ],
     "megatron/core/resharding/refit.py": [
@@ -255,5 +254,5 @@
       "make_tp_sharded_tensor_for_checkpoint:guarded:resolve_process_groups"
     ]
   },
-  "total": 153
+  "total": 152
 }

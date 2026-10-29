@@ -6284,14 +6284,30 @@ def get_train_valid_test_num_samples():
     return (train_samples_in_current_phase, eval_samples, test_samples)
 
 
-def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, train_valid_test_num_samples=None):
-    """Build pretraining datasets."""
+def build_train_valid_test_datasets(
+    build_train_valid_test_datasets_provider, train_valid_test_num_samples=None, pg_collection=None
+):
+    """Build pretraining datasets.
+
+    Args:
+        build_train_valid_test_datasets_provider: Function that builds the train, validation
+            and test datasets from their target sizes. A provider with a ``pg_collection``
+            parameter also receives ``pg_collection``, which decides the ranks that build the
+            datasets; other providers are called with the target sizes alone.
+        train_valid_test_num_samples: Target sizes of the train, validation and test datasets.
+            None computes them from the run configuration.
+        pg_collection: Process groups of the run.
+    """
     if train_valid_test_num_samples is None:
         train_valid_test_num_samples = get_train_valid_test_num_samples()
     print_rank_0(' > datasets target sizes (minimum size):')
     print_rank_0('    train:      {}'.format(train_valid_test_num_samples[0]))
     print_rank_0('    validation: {}'.format(train_valid_test_num_samples[1]))
     print_rank_0('    test:       {}'.format(train_valid_test_num_samples[2]))
+    if "pg_collection" in inspect.signature(build_train_valid_test_datasets_provider).parameters:
+        return build_train_valid_test_datasets_provider(
+            train_valid_test_num_samples, pg_collection=pg_collection
+        )
     return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
 
 
@@ -6304,9 +6320,10 @@ def build_train_valid_test_data_loaders(
         build_train_valid_test_datasets_provider: Function that builds the train, validation
             and test datasets.
         pg_collection: Process groups of the run. Unless the provider is distributed-aware,
-            the first rank of its tensor-parallel group builds the data pipeline, and the
-            loaders shard samples over its data-parallel group. None uses the global
-            parallel state.
+            the first rank of its tensor-parallel group builds the data pipeline. A provider
+            with a ``pg_collection`` parameter receives it, and the loaders shard samples over
+            its data-parallel group. Omitting it is deprecated: the global parallel state is
+            used instead, with a ProcessGroupFallbackWarning.
     """
 
     args = get_args()
@@ -6370,7 +6387,9 @@ def build_train_valid_test_data_loaders(
 
         else:
             # Build datasets.
-            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
+            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+                build_train_valid_test_datasets_provider, pg_collection=pg_collection
+            )
             valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
             if cfg.validation.skip_train:
                 train_dataloader = None
@@ -6425,8 +6444,9 @@ def build_train_valid_test_data_iterators(
         build_train_valid_test_datasets_provider: Function that builds the train, validation
             and test datasets.
         pg_collection: Process groups of the run, used to build the data loaders and to agree
-            on the number of full-validation iterations across its data-parallel ranks. None
-            uses the global parallel state.
+            on the number of full-validation iterations across its data-parallel ranks.
+            Omitting it is deprecated: the global parallel state is used instead, with a
+            ProcessGroupFallbackWarning.
     """
 
     cfg = get_run_config()
