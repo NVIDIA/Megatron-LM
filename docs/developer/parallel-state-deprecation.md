@@ -43,9 +43,10 @@ removed in 0.23, under the N+2 policy in
 Bootstrap, teardown and the registry are not deprecated: `initialize_model_parallel()`,
 `build_process_group_collection()`, `destroy_model_parallel()`, `is_initialized()`,
 `model_parallel_is_initialized()`, `register_process_groups()` and
-`get_registered_process_groups()`. Neither are the helpers that create groups or configure
-their communicators, such as `create_group()`, `create_all_gather_groups()` and
-`get_nccl_options()`.
+`get_registered_process_groups()`. Neither are `create_group()` and `update_pg_timeout()`, which
+manage the lifetime of the groups that `parallel_state` creates, `get_nccl_options()`, nor
+`create_all_gather_groups()` with a `pg_collection`; without one, it falls back to the global grid
+with a `ProcessGroupFallbackWarning`.
 
 ### How the warning behaves
 
@@ -207,6 +208,9 @@ parallel_state.register_process_groups(pg_collection)
   argument, which `build_process_group_collection()` returns. Without it, the rank lists are
   derived from the collection's groups, and the groups that a collection cannot describe, such as
   the full data-parallel Gloo groups and the tensor × data-parallel group, are not registered.
+- `pretrain()` and `initialize_megatron()` in `megatron.training` take their groups from the
+  registered collection. A grid that was set up without registering one is read through
+  `use_mpu_process_groups()` instead, with a `ProcessGroupFallbackWarning`.
 
 `get_registered_process_groups()` returns the registered collection itself, not a copy, and
 every reader shares it. To add fields, such as the all-gather groups `dp_cp_ag` and
