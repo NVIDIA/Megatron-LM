@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
 Absorbed Multi-Latent Attention implementation.
@@ -67,11 +67,8 @@ def _restore_packed_thd_batch_dim(
     core_attn_out: torch.Tensor, hidden_states: torch.Tensor, packed_seq_params
 ) -> torch.Tensor:
     """Restore the singleton packed-THD batch dim only when core attention omitted it."""
-    if (
-        packed_seq_params is not None
-        and packed_seq_params.qkv_format == 'thd'
-        and core_attn_out.ndim == hidden_states.ndim - 1
-    ):
+    thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+    if thd_packed_seq and core_attn_out.ndim == hidden_states.ndim - 1:
         core_attn_out = core_attn_out.unsqueeze(1)
     return core_attn_out
 
@@ -474,7 +471,7 @@ class AbsorbedMLASelfAttention(Attention):
             # NoPE: no rotary embedding; q_absorbed/kv_compressed carry no pos slice.
             rotary_pos_emb = None
 
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+        if thd_packed_seq:
             if packed_seq_params.cu_seqlens_q_padded is not None:
                 cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
             else:
@@ -545,7 +542,7 @@ class AbsorbedMLASelfAttention(Attention):
                 # k_pos_emb: [s, b, qk_pos_emb_head_dim]
                 k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=self.tp_group)
 
-        if packed_seq_params is not None:
+        if thd_packed_seq:
             assert q_compressed.ndim == 3 and q_compressed.size(1) == 1
             assert kv_compressed.ndim == 3 and kv_compressed.size(1) == 1
             assert k_pos_emb.ndim == 3 and k_pos_emb.size(1) == 1
@@ -660,7 +657,7 @@ class AbsorbedMLASelfAttention(Attention):
                     sequence_start = inference_context.sequence_len_offset
                     sequence_end = sequence_start + q_len
                     rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
-                elif packed_seq_params is None or self.config.context_parallel_size == 1:
+                elif not thd_packed_seq or self.config.context_parallel_size == 1:
                     # Shorten rotary_pos_emb to the sequence length when inference_params
                     # is not provided. This makes sure we can run forward directly with
                     # any sequence length. During training, the sequence length is always
@@ -878,6 +875,23 @@ class AbsorbedMLASelfAttention(Attention):
         assert (
             inference_context is None and inference_params is None
         ), "Inference is not supported for AbsorbedMLA"
+
+        cp_group = (
+            packed_seq_params.cp_group
+            if packed_seq_params is not None and packed_seq_params.cp_group is not None
+            else self.pg_collection.cp
+        )
+        input_partition_mode = (
+            packed_seq_params.cp_partition_mode
+            if packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+            else getattr(self, "_cp_input_partition_mode", self.config.cp_partition_mode)
+        )
+        if cp_group is not None and get_pg_size(cp_group) > 1 and input_partition_mode != "zigzag":
+            raise ValueError(
+                "AbsorbedMLASelfAttention requires cp_partition_mode='zigzag', but "
+                f"the input layout is {input_partition_mode!r}. CP partition "
+                "conversion must be handled before entering MLA."
+            )
 
         # =====================
         # Query, Key, and Value

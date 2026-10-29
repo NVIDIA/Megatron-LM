@@ -18,7 +18,10 @@ from megatron.core.models.gpt.moe_module_specs import (
 )
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2, GatedDeltaNetSubmodules
-from megatron.core.ssm.gated_delta_net.kda import KimiDeltaAttention, KimiDeltaAttentionSubmodules
+from megatron.core.ssm.gated_delta_net import (
+    KimiDeltaAttention,
+    KimiDeltaAttentionSubmodules,
+)
 from megatron.core.ssm.gated_delta_product import (
     GatedDeltaProductMixer,
     GatedDeltaProductMixerSubmodules,
@@ -189,16 +192,14 @@ hybrid_stack_spec = ModuleSpec(
                     module=KimiDeltaAttention,
                     submodules=KimiDeltaAttentionSubmodules(
                         in_proj=TEColumnParallelLinear,
-                        beta_proj=TEColumnParallelLinear,
-                        # Two-stage low-rank gates (GLM-5.3-Flash); only used when
-                        # config.kda_two_stage_gates=True, else IdentityOp.
-                        # f_a/g_a are replicated (TELinear parallel_mode="duplicated");
-                        # f_b/g_b are TP-sharded column-parallel.
+                        beta_proj=TELinear,
+                        out_norm=TENorm,
+                        f_proj=TEColumnParallelLinear,
                         f_a_proj=TELinear,
                         f_b_proj=TEColumnParallelLinear,
+                        g_proj=TEColumnParallelLinear,
                         g_a_proj=TELinear,
                         g_b_proj=TEColumnParallelLinear,
-                        out_norm=TENorm,
                         out_proj=TERowParallelLinear,
                     ),
                 ),

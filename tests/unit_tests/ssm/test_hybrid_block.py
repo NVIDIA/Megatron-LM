@@ -1,4 +1,4 @@
-# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from types import SimpleNamespace
 
@@ -196,6 +196,7 @@ def test_cp_layouts_are_selected_by_layer_config_type(monkeypatch):
         "zigzag",
     )
     assert layout_manager_kwargs["boundary_layout"] == "contiguous"
+    assert layout_manager_kwargs["cuda_graph_impl"] == config.cuda_graph_impl
 
 
 def test_hybrid_stack_rejects_layer_config_subclasses(monkeypatch):
@@ -1472,3 +1473,46 @@ class TestHybridBlock:
         layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLA + Symbols.MAMBA
         with pytest.raises(ValueError):
             block = self.get_mla_hybrid_block(layer_pattern)
+
+
+@pytest.mark.parametrize("layout", ["zigzag", "contiguous"])
+def test_scheduler_marks_mixer_and_attention_boundary_layout(monkeypatch, layout):
+    class BuiltLayer(torch.nn.Module):
+        def __init__(self, config, layer_number):
+            super().__init__()
+            self.config = config
+            self.layer_number = layer_number
+            if isinstance(config, MambaLayerConfig):
+                self.mixer = SimpleNamespace()
+            else:
+                self.self_attention = SimpleNamespace()
+
+    monkeypatch.setattr(
+        hybrid_block_module,
+        "build_module",
+        lambda module_spec, **kwargs: BuiltLayer(kwargs["config"], kwargs["layer_number"]),
+    )
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=64,
+        num_attention_heads=4,
+        context_parallel_size=2,
+        cp_partition_mode=layout,
+        linear_cp_layout="contiguous",
+        sequence_packing_scheduler="dp_balanced",
+        max_seqlen_per_dp_cp_rank=512,
+    )
+    block = HybridStack(
+        config=config,
+        submodules=hybrid_stack_spec.submodules,
+        layer_config_list=validate_segment_layers("M*", config),
+        pre_process=False,
+        post_layer_norm=False,
+        post_process=False,
+        pg_collection=SimpleNamespace(
+            pp=None, tp=None, cp=SimpleNamespace(size=lambda: 2), tp_cp=None
+        ),
+    )
+    assert block._cp_layout_manager is None
+    assert block.layers[0].mixer._cp_input_partition_mode == layout
+    assert block.layers[1].self_attention._cp_input_partition_mode == layout
