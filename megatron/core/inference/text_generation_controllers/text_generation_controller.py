@@ -2856,7 +2856,7 @@ class TextGenerationController(MTPControllerMixin):
             input_ids_gpu_view, position_ids_gpu_view, bookkeeping_done_event = (
                 self._dynamic_step_context_init(record_bookkeeping_done_event=True)
             )
-            if self.num_speculative_tokens > 0 and self.model_config.expert_model_parallel_size > 1:
+            if self.num_speculative_tokens > 0 and self._moe_dispatch_spans_ranks():
                 self._run_dummy_serial_mtp_forward()
             self._run_async_sched_forward(input_ids_gpu_view, position_ids_gpu_view)
 
@@ -3193,7 +3193,7 @@ class TextGenerationController(MTPControllerMixin):
                     assert primer_launched, "Initial no-overlap step must launch a forward primer."
                     launched_decode_only = context.is_decode_only()
                     self._synchronize_async_sched_event(bookkeeping_done_event)
-            elif had_pending_forward and self.model_config.expert_model_parallel_size > 1:
+            elif had_pending_forward and self._moe_dispatch_spans_ranks():
                 self._run_dummy_async_sched_base_step()
 
         decode_only = DecodeOnly(consumed=consumed_decode_only, launched=launched_decode_only)

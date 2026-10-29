@@ -31,7 +31,12 @@ from megatron.core.tensor_parallel.mappings import (
 )
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push, round_up_to_nearest_multiple
+from megatron.core.utils import (
+    get_pg_size,
+    nvtx_range_pop,
+    nvtx_range_push,
+    round_up_to_nearest_multiple,
+)
 
 
 @dataclass
@@ -119,6 +124,24 @@ class MTPControllerMixin:
         )
         self._async_sched_mtp_verification_gpu_ready_event = torch.cuda.Event()
         self._async_sched_accepted_counts_cpu_ready_event = torch.cuda.Event()
+
+    def _moe_dispatch_spans_ranks(self) -> bool:
+        """Whether MoE token dispatch spans other ranks, which must then issue matching forwards.
+
+        The inference dispatchers gather tokens over the expert tensor-and-model-parallel (tp_ep)
+        group, which is the EP group when expert TP is 1 and also includes the expert-TP peers
+        when it is not. A rank with no work must run dummy forwards whenever that group has
+        more than one rank, so gating on the EP size alone hangs EP == 1, ETP > 1 deployments.
+        """
+        wrapped = getattr(self, "inference_wrapped_model", None)
+        context = getattr(wrapped, "inference_context", None)
+        group = getattr(context, "expert_tensor_and_model_parallel_group", None)
+        if group is not None:
+            return get_pg_size(group) > 1
+        config = self.model_config
+        ep_size = getattr(config, "expert_model_parallel_size", None) or 1
+        etp_size = getattr(config, "expert_tensor_parallel_size", None) or 1
+        return ep_size * etp_size > 1
 
     def _mtp_commit_graph_supported(self) -> bool:
         """Whether the commit pass can be CUDA-graphed at all for this model.
@@ -825,7 +848,7 @@ class MTPControllerMixin:
         """
         if self.num_speculative_tokens == 0 or self.num_mtp_depths == 0:
             return
-        if self.model_config.expert_model_parallel_size <= 1:
+        if not self._moe_dispatch_spans_ranks():
             return
 
         context = self.inference_wrapped_model.inference_context

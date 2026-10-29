@@ -27,6 +27,9 @@ import torch
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.contexts.mtp_context_mixin import MTPContextMixin
 from megatron.core.inference.contexts.mtp_metadata import MTPMetadata
+from megatron.core.inference.text_generation_controllers.mtp_controller_mixin import (
+    MTPControllerMixin,
+)
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -1772,3 +1775,63 @@ class TestMtpKvCacheCombinations:
             f"{scenario_name}: real rank issued {len(model.all_forwards)} MTP forwards, "
             f"idle rank issued {len(dummy)}"
         )
+
+
+class TestMoeDispatchSpansRanks:
+    """Idle-rank dummy forwards are gated on the dispatch (tp_ep) group, not on EP alone."""
+
+    @staticmethod
+    def _controller(ep_size, etp_size, group=None):
+        context = SimpleNamespace(expert_tensor_and_model_parallel_group=group)
+        return SimpleNamespace(
+            inference_wrapped_model=SimpleNamespace(inference_context=context),
+            model_config=SimpleNamespace(
+                expert_model_parallel_size=ep_size, expert_tensor_parallel_size=etp_size
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        "ep_size, etp_size, expected",
+        [(1, 1, False), (2, 1, True), (1, 4, True), (2, 2, True)],
+        ids=["no-moe-parallelism", "ep-only", "etp-only", "ep-and-etp"],
+    )
+    def test_falls_back_to_config_without_a_group(self, ep_size, etp_size, expected):
+        controller = self._controller(ep_size, etp_size)
+        assert MTPControllerMixin._moe_dispatch_spans_ranks(controller) is expected
+
+    @pytest.mark.parametrize("group_size, expected", [(1, False), (4, True)])
+    def test_uses_the_tp_ep_group_size_when_available(self, group_size, expected):
+        # The group decides even when the config alone would say otherwise.
+        controller = self._controller(ep_size=1, etp_size=1, group=object())
+        with mock.patch(
+            "megatron.core.inference.text_generation_controllers.mtp_controller_mixin.get_pg_size",
+            return_value=group_size,
+        ):
+            assert MTPControllerMixin._moe_dispatch_spans_ranks(controller) is expected
+
+    @pytest.mark.parametrize("kv_cache_on", [False, True])
+    def test_idle_rank_runs_dummy_forwards_under_expert_tp_only(self, kv_cache_on):
+        """EP == 1, ETP > 1: the idle rank must still issue its dummy MTP forwards."""
+        context = _make_context(num_decode_requests=0)
+        context.enable_mtp_kv_cache = kv_cache_on
+        model = _make_model()
+
+        def compute_mtp_single_step(**kwargs):
+            model.all_forwards.append(("mtp_step", kwargs))
+            hidden = kwargs["hidden_states"]
+            n = hidden.shape[0] if hidden is not None else 1
+            return hidden, torch.zeros((n, 1, VOCAB_SIZE), device=DEVICE)
+
+        model.compute_mtp_single_step = compute_mtp_single_step
+        controller = _make_controller(context, model)
+        controller.num_mtp_depths = 2
+        controller.model_config.expert_model_parallel_size = 1
+        controller.model_config.expert_tensor_parallel_size = 4
+        controller._mtp_resolved_padded_count = None
+        context.expert_tensor_and_model_parallel_group = None
+
+        patches = _identity_sp_patches()
+        with patches[0], patches[1]:
+            controller._run_dummy_serial_mtp_forward()
+
+        assert len(model.all_forwards) == 2 + (1 if kv_cache_on else 0)
