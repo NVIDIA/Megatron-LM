@@ -13,6 +13,8 @@ from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.ssm.utils import _validate_dynamic_cp_head_geometry
 from megatron.core.transformer import TransformerConfig
 
+pytestmark = pytest.mark.launch_on_gb200
+
 
 def _group(size):
     return SimpleNamespace(size=lambda: size, rank=lambda: 0)

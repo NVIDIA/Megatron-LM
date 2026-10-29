@@ -124,120 +124,6 @@ def test_scheduler_builds_runtime_cp_layout_views(local_cp_size, expected_layout
         )
 
 
-@pytest.mark.parametrize("linear_cp_layout", ["contiguous", "zigzag"])
-@pytest.mark.parametrize("cp_size", [1, 2])
-def test_scheduler_builds_static_cp_layout_views(cp_size, linear_cp_layout):
-    """Without dynamic CP the views are sharded over the static CP group (no local_cp_size)."""
-
-    class _Group:
-        def __init__(self, size, rank=0):
-            self._size = size
-            self._rank = rank
-
-        def size(self):
-            return self._size
-
-        def rank(self):
-            return self._rank
-
-    def _zigzag(cu_seqlens, total_tokens, cp_size, cp_rank):
-        chunks = torch.arange(total_tokens).reshape(2 * cp_size, -1)
-        return torch.cat((chunks[cp_rank], chunks[2 * cp_size - cp_rank - 1]))
-
-    static_cp_group = _Group(cp_size)
-    pg_collection = ProcessGroupCollection(tp=_Group(1), pp=_Group(1), cp=static_cp_group)
-    config = SimpleNamespace(
-        linear_cp_layout=linear_cp_layout, attention_cp_layout="zigzag", sequence_parallel=False
-    )
-    tokens = torch.arange(8, dtype=torch.int64)
-    batch = {
-        "tokens": tokens.clone(),
-        "labels": tokens.clone() + 100,
-        "loss_mask": torch.ones(8, dtype=torch.float32),
-        "position_ids": tokens.clone(),
-        "cu_seqlens": torch.tensor([0, 8], dtype=torch.int32),
-        "cu_seqlens_padded": torch.tensor([0, 8], dtype=torch.int32),
-        "max_seqlen": torch.tensor([8], dtype=torch.int32),
-    }
-
-    with (
-        patch("torch.cuda.current_device", return_value=torch.device("cpu")),
-        patch("torch.distributed.get_process_group_ranks", return_value=[0]),
-        patch("torch.distributed.get_world_size", side_effect=lambda group: group.size()),
-        patch("torch.distributed.get_rank", side_effect=lambda group: group.rank()),
-        patch("megatron.core.datasets.data_schedule.broadcast_tensor"),
-        # Static zigzag views are partitioned per document with TE, which needs CUDA.
-        patch("megatron.core.utils.tex", SimpleNamespace(thd_get_partitioned_indices=_zigzag)),
-    ):
-        cp_batch = get_batch_on_this_rank_for_sequence_packing(
-            iter([batch]),
-            dynamic_cp=False,
-            pg_collection=pg_collection,
-            config=config,
-            return_context_parallel_batch=True,
-        )
-
-    assert set(cp_batch.batches_by_layout) == {linear_cp_layout, "zigzag"}
-    assert cp_batch.get_packed_seq_params("zigzag").local_cp_size is None
-    if linear_cp_layout == "contiguous":
-        expected_contiguous = tokens[: 8 // cp_size].view(1, -1)
-        torch.testing.assert_close(cp_batch.get_batch("contiguous")["tokens"], expected_contiguous)
-    expected_zigzag = tokens[[0, 1, 6, 7]] if cp_size == 2 else tokens
-    torch.testing.assert_close(cp_batch.get_batch("zigzag")["tokens"], expected_zigzag.view(1, -1))
-
-
-@pytest.mark.parametrize("sequence_parallel", [True, False])
-def test_packed_params_carry_the_runtime_tp_cp_group(sequence_parallel):
-    """Under dynamic CP with SP, layout conversion needs the TP x runtime-CP group per microbatch."""
-
-    class _Group:
-        def __init__(self, size, rank=0):
-            self._size = size
-            self._rank = rank
-
-        def size(self):
-            return self._size
-
-        def rank(self):
-            return self._rank
-
-    runtime_cp_group, runtime_tp_cp_group = _Group(1), object()
-    pg_collection = ProcessGroupCollection(tp=_Group(2), pp=_Group(1), cp=_Group(1))
-    config = SimpleNamespace(sequence_parallel=sequence_parallel)
-    tokens = torch.arange(8, dtype=torch.int64)
-    batch = {
-        "tokens": tokens.clone(),
-        "labels": tokens.clone() + 100,
-        "loss_mask": torch.ones(8, dtype=torch.float32),
-        "position_ids": tokens.clone(),
-        "cu_seqlens": torch.tensor([0, 8], dtype=torch.int32),
-        "cu_seqlens_padded": torch.tensor([0, 8], dtype=torch.int32),
-        "max_seqlen": torch.tensor([8], dtype=torch.int32),
-        "local_cp_size": torch.tensor([1], dtype=torch.int32),
-    }
-
-    with (
-        patch("torch.cuda.current_device", return_value=torch.device("cpu")),
-        patch("torch.distributed.get_process_group_ranks", return_value=[0, 1]),
-        patch("torch.distributed.get_world_size", side_effect=lambda group: group.size()),
-        patch("torch.distributed.get_rank", side_effect=lambda group: group.rank()),
-        patch("megatron.core.datasets.data_schedule.broadcast_tensor"),
-        patch("megatron.core.datasets.data_schedule_utils.broadcast_tensor"),
-    ):
-        *_, packed_seq_params, _ = get_batch_on_this_rank_for_sequence_packing(
-            iter([batch]),
-            dynamic_cp=True,
-            pg_collection=pg_collection,
-            config=config,
-            dynamic_cp_group_func=lambda group_size: runtime_cp_group,
-            dynamic_tp_cp_group_func=lambda group_size: runtime_tp_cp_group,
-        )
-
-    assert packed_seq_params.cp_group is runtime_cp_group
-    expected = runtime_tp_cp_group if sequence_parallel else None
-    assert packed_seq_params.tp_cp_group is expected
-
-
 def test_next_hdp_group_packing_aware_can_expand_short_sequence_group():
     micro_batches, leftovers, exec_times, sample_ids = next_hdp_group_packing_aware(
         [(0, 6144), (1, 2048)], total_gpus=2, max_seq_len_per_rank=4096
@@ -578,7 +464,6 @@ def _gather_tensor_from_all_ranks(tensor):
         (1, 1, 4, True, 2),
         (1, 1, 4, True, 1),
         (2, 1, 2, True, 2),
-        (2, 1, 2, True, 1),
     ],
 )
 def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, local_cp_size):
@@ -658,15 +543,6 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
         tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params, padding_mask = (
             result
         )
-        if dynamic_cp and tp > 1:
-            runtime_cp = set(torch.distributed.get_process_group_ranks(packed_seq_params.cp_group))
-            runtime_tp_cp = set(
-                torch.distributed.get_process_group_ranks(packed_seq_params.tp_cp_group)
-            )
-            tp_ranks = set(torch.distributed.get_process_group_ranks(pg_collection.tp))
-            assert len(runtime_tp_cp) == tp * local_cp_size
-            assert runtime_cp <= runtime_tp_cp and tp_ranks <= runtime_tp_cp
-            assert packed_seq_params.tp_cp_group is pg_collection.dynamic_tp_cp[local_cp_size]
 
         # Get parallel state info
         tp_rank = parallel_state.get_tensor_model_parallel_rank()

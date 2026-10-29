@@ -9,6 +9,8 @@ from megatron.core.extensions.transformer_engine import HAVE_TE_GDN, TEGatedDelt
 from tests.unit_tests.ssm.te_gdn_test_utils import patch_te_gdn_op, torch_te_gdn_op
 from tests.unit_tests.test_utilities import Utils
 
+pytestmark = pytest.mark.launch_on_gb200
+
 
 @pytest.mark.skipif(
     not (HAVE_TE_GDN and torch.cuda.is_available()), reason="requires CUDA and TE GDN"

@@ -11,6 +11,8 @@ import torch
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.packed_seq_params import PackedSeqParams
 
+pytestmark = pytest.mark.launch_on_gb200
+
 
 def test_shortcut_router_receives_runtime_cp_metadata():
     hidden = torch.randn(4, 1, 2)

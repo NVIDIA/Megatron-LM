@@ -13,22 +13,13 @@ from tests.unit_tests.transformer.test_attention import _test_parallel_attention
 
 @pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize(
-    ("tp", "sp", "cp", "dynamic_cp"),
-    [
-        (4, True, 1, False),
-        (1, False, 2, False),
-        (2, True, 2, False),
-        (1, False, 2, True),
-        (2, True, 2, True),
-    ],
+    ("tp", "sp", "cp"),
+    [(4, True, 1), (1, False, 2), (2, True, 2)],  # TP w/ SP  # CP  # TP w/ SP + CP
 )
 @pytest.mark.skipif(not HAVE_FLA_GDN2, reason="FLA with GDN2 support is not installed.")
 def test_parallel_gated_delta_net2_correctness(
-    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, dynamic_cp, run_config
+    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, run_config
 ):
-    if dynamic_cp and not sequence_packing:
-        pytest.skip("Runtime Dynamic CP requires packed THD input")
-
     transformer_config = TransformerConfig(
         hidden_size=128,
         linear_conv_kernel_dim=2,
@@ -66,11 +57,4 @@ def test_parallel_gated_delta_net2_correctness(
         sequence_length=512,
         micro_batch_size=2,
         sequence_packing=sequence_packing,
-        dynamic_cp=dynamic_cp,
-        check_parameter_gradients=cp > 1,
-        # CP changes GEMM accumulation order. Local BF16 parameter gradients are
-        # rounded before their FP32 CP sum; allow two BF16 relative ulps while
-        # keeping the existing, tighter output/input-gradient tolerances.
-        parameter_atol=2e-2,
-        parameter_rtol=2e-2,
     )

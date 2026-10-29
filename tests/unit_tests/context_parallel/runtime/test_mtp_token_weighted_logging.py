@@ -7,6 +7,8 @@ import torch
 
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 
+pytestmark = pytest.mark.launch_on_gb200
+
 
 @pytest.fixture(autouse=True)
 def tracker(monkeypatch):

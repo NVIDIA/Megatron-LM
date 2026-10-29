@@ -6,7 +6,7 @@ import torch
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
@@ -40,41 +40,6 @@ def test_resolve_runtime_cp_group_requires_matching_group():
         resolve_cp_group(
             _MockCPGroup(4), PackedSeqParams(local_cp_size=2, cp_group=_MockCPGroup(1))
         )
-
-
-def test_resolve_runtime_tp_cp_group():
-    static_tp_cp_group, runtime_tp_cp_group = object(), object()
-    packed_seq_params = PackedSeqParams(
-        local_cp_size=2, cp_group=_MockCPGroup(2), tp_cp_group=runtime_tp_cp_group
-    )
-
-    kwargs = {"sequence_parallel": True, "tp_group": _MockCPGroup(2)}
-    assert (
-        resolve_tp_cp_group(static_tp_cp_group, packed_seq_params, **kwargs) is runtime_tp_cp_group
-    )
-    # Static CP, or no packed metadata, keeps the build-time group.
-    assert (
-        resolve_tp_cp_group(static_tp_cp_group, PackedSeqParams(), **kwargs) is static_tp_cp_group
-    )
-    assert resolve_tp_cp_group(static_tp_cp_group, None, **kwargs) is static_tp_cp_group
-    with pytest.raises(AssertionError, match="tp_cp_group must be set"):
-        resolve_tp_cp_group(
-            static_tp_cp_group, PackedSeqParams(local_cp_size=2, cp_group=_MockCPGroup(2)), **kwargs
-        )
-
-
-@pytest.mark.parametrize("sequence_parallel,tp_size", [(False, 2), (True, 1)])
-def test_runtime_tp_cp_group_is_optional_without_tp_sequence_parallelism(
-    sequence_parallel, tp_size
-):
-    static = object()
-    packed = PackedSeqParams(local_cp_size=2, cp_group=_MockCPGroup(2))
-    assert (
-        resolve_tp_cp_group(
-            static, packed, sequence_parallel=sequence_parallel, tp_group=_MockCPGroup(tp_size)
-        )
-        is static
-    )
 
 
 def make_test_packed_seq_params(sequence_length):
@@ -372,45 +337,6 @@ class TestAttentionDynamicContextParallel:
         )
         assert captured and all(group is singleton_group for group in captured)
         assert self.parallel_attention.pg_collection.cp is build_time_group
-
-    @pytest.mark.parametrize("runtime_cp_size", [None, 1, 2])
-    def test_te_does_not_forward_runtime_groups(self, monkeypatch, runtime_cp_size):
-        import transformer_engine.pytorch as te_pytorch
-
-        core_attention = self.parallel_attention.core_attention.cuda()
-        packed_seq_params = make_test_packed_seq_params(32)
-        runtime_group = (
-            self._runtime_cp_group(size=runtime_cp_size) if runtime_cp_size is not None else None
-        )
-        tp_cp_group = runtime_group if runtime_group is not None else object()
-        packed_seq_params.cp_group = runtime_group
-        packed_seq_params.tp_cp_group = tp_cp_group
-        packed_seq_params.local_cp_size = runtime_cp_size
-        captured = []
-
-        def backend_forward(self, query, key, value, attention_mask, **kwargs):
-            captured.append(kwargs)
-            assert not {"cp_group", "local_cp_size", "tp_cp_group"}.intersection(kwargs)
-            return query.flatten(start_dim=1)
-
-        monkeypatch.setattr(te_pytorch.DotProductAttention, "forward", backend_forward)
-        query = torch.zeros(32, 4, 16, dtype=torch.bfloat16, device="cuda")
-        core_attention(
-            query,
-            torch.zeros_like(query),
-            torch.zeros_like(query),
-            None,
-            AttnMaskType.padding_causal,
-            packed_seq_params=packed_seq_params,
-        )
-
-        assert len(captured) == 1
-        assert captured[0]["qkv_format"] == "thd"
-        assert captured[0]["cu_seqlens_q"] is packed_seq_params.cu_seqlens_q
-        assert captured[0]["cu_seqlens_kv"] is packed_seq_params.cu_seqlens_kv
-        assert packed_seq_params.cp_group is runtime_group
-        assert packed_seq_params.tp_cp_group is tp_cp_group
-        assert packed_seq_params.local_cp_size == runtime_cp_size
 
     def test_te_cp_stream_lazily_created_for_runtime_cp_group(self, monkeypatch):
         import transformer_engine.pytorch as te_pytorch

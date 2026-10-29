@@ -8,7 +8,9 @@ and backward (cross-row dgamma reduction), grouped GEMMs over uneven expert load
 attention with GQA (dK/dV accumulate across query groups), fused RoPE, and the DSA indexer's
 BF16-input/FP32-output projection. Each wrapper is replayed standalone under side-stream
 contention; the bare TE modules are what the model-level suite composes, so a regression here
-localises to one kernel family.
+localises to one kernel family. Runtime CP head-geometry and MLA projection/RoPE
+replays live in ``context_parallel/runtime/test_te_replay.py`` and
+``context_parallel/runtime/test_mla_replay.py`` so their distributed cases have a dedicated CI bucket.
 """
 
 import inspect
@@ -87,52 +89,6 @@ def _config(**overrides):
     )
     kwargs.update(overrides)
     return TransformerConfig(**kwargs)
-
-
-@pytest.mark.parametrize("packed", [False, True])
-def test_te_gdn_runtime_head_selection_replays(monkeypatch, packed):
-    """Replay TE's real frontend and reference recurrence across CP1/2/4/1 head counts."""
-    from megatron.core.extensions.transformer_engine import HAVE_TE_GDN, TEGatedDeltaNetAttention
-
-    if not HAVE_TE_GDN:
-        pytest.skip("requires Transformer Engine GDN")
-    from tests.unit_tests.ssm.te_gdn_test_utils import patch_te_gdn_op
-
-    Utils.initialize_distributed()
-    seeded()
-    # Keep TE's layout, gate and head validation; the reference op runs on pre-Hopper GPUs too.
-    patch_te_gdn_op(monkeypatch)
-    module = TEGatedDeltaNetAttention(8, qk_head_dim=4, value_head_dim=6, layer_number=1)
-    default_backend = module.te_attention
-    batch, sequence = (1, 8) if packed else (2, 4)
-    bounds = torch.tensor([0, 3, 8], device="cuda", dtype=torch.int32) if packed else None
-    q, k, v = [
-        (torch.randn(batch, sequence, 8, dim, device="cuda") * 0.05).bfloat16() for dim in (4, 4, 6)
-    ]
-    g = torch.full((batch, sequence, 8), -0.1, device="cuda")
-    beta = torch.full_like(g, 0.2)
-    reference = None
-    for heads in (8, 4, 2, 8):
-        inputs = tuple(
-            tensor[:, :, :heads].detach().requires_grad_() for tensor in (q, k, v, g, beta)
-        )
-
-        def run(query, key, value, decay, strength):
-            return module(query, key, value, decay, strength, cu_seqlens=bounds)[0]
-
-        result = assert_replays_bit_exact(
-            run, inputs, replays=3, contention=True, what=f"TE GDN runtime heads={heads}"
-        )
-        assert module.te_attention is default_backend
-        assert default_backend.num_attention_heads == 8
-        assert len(result[1]) == 5
-        if reference is None:
-            reference = result
-        for expected, actual in zip(reference, result):
-            assert expected.keys() == actual.keys()
-            assert all(
-                bytes_equal(tensor[:, :, :heads], actual[name]) for name, tensor in expected.items()
-            )
 
 
 @pytest.mark.parametrize("parallel_mode", ["column", "row"])
@@ -937,109 +893,6 @@ class TestTEWrappers:
 
 
 # --- fused RoPE --------------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("absorbed", [False, True])
-@pytest.mark.parametrize("fused_rope", [False, True])
-def test_mla_runtime_cp_projection_rope_replays(absorbed, fused_rope):
-    """Replay the actual MLA projection/RoPE dispatch with runtime CP1/2/4 metadata."""
-    from megatron.core.models.gpt.gpt_layer_specs import (
-        get_gpt_layer_with_transformer_engine_submodules,
-    )
-    from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
-        AbsorbedMLASelfAttention,
-        AbsorbedMLASelfAttentionSubmodules,
-    )
-    from megatron.core.transformer.multi_latent_attention import MLASelfAttention
-    from megatron.core.transformer.transformer_config import MLATransformerConfig
-    from tests.unit_tests.determinism.kernels.test_runtime_cp_attention import _zigzag_shard
-
-    if Utils.world_size < 4 or Utils.world_size % 4:
-        pytest.skip("requires four distributed ranks")
-    Utils.initialize_model_parallel(dynamic_context_parallel=True)
-    try:
-        model_parallel_cuda_manual_seed(123)
-        seeded()
-        config = MLATransformerConfig(
-            num_layers=1,
-            hidden_size=128,
-            num_attention_heads=4,
-            q_lora_rank=32,
-            kv_lora_rank=32,
-            qk_head_dim=64,
-            v_head_dim=64,
-            qk_pos_emb_head_dim=32,
-            rope_type="yarn" if fused_rope else "rope",
-            add_bias_linear=False,
-            apply_rope_fusion=fused_rope,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            use_cpu_initialization=True,
-            deterministic_mode=True,
-        )
-        submodules = get_gpt_layer_with_transformer_engine_submodules(
-            multi_latent_attention=True
-        ).self_attention.submodules
-        cls = MLASelfAttention
-        if absorbed:
-            cls = AbsorbedMLASelfAttention
-            submodules = AbsorbedMLASelfAttentionSubmodules(
-                **{
-                    name: getattr(submodules, name)
-                    for name in AbsorbedMLASelfAttentionSubmodules.__dataclass_fields__
-                }
-            )
-        attention = cls(
-            config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
-        ).cuda()
-
-        class Projections(torch.nn.Module):
-            def __init__(self, module):
-                super().__init__()
-                self.module = module
-
-            def forward(self, hidden, packed):
-                tensors = self.module.get_query_key_value_tensors(hidden, packed_seq_params=packed)
-                return torch.cat(
-                    [tensor.reshape(-1) for tensor in tensors if isinstance(tensor, torch.Tensor)]
-                )
-
-        module = Projections(attention)
-        hidden = torch.randn(320, 1, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        bounds = torch.tensor([0, 128, 320], dtype=torch.int32, device="cuda")
-        build_group = attention.pg_collection.cp
-        reference = None
-        for size in (1, 2, 4, 1):
-            group = parallel_state.get_dynamic_data_context_parallel_groups(group_size=size)
-            packed = PackedSeqParams(
-                qkv_format="thd",
-                cu_seqlens_q=bounds,
-                cu_seqlens_kv=bounds,
-                max_seqlen_q=192,
-                max_seqlen_kv=192,
-                local_cp_size=size,
-                cp_group=group,
-            )
-            local = _zigzag_shard(hidden, (128, 192), size, group.rank()).detach().requires_grad_()
-            result = assert_module_replays_bit_exact(
-                module,
-                (local, packed),
-                replays=3,
-                contention=True,
-                what=f"MLA[absorbed={absorbed}, fused={fused_rope}, CP{size}]",
-            )
-            assert attention.pg_collection.cp is build_group
-            assert result[1]
-            for tensors in result:
-                assert all(torch.isfinite(tensor).all() for tensor in tensors.values())
-            if size == 1:
-                if reference is None:
-                    reference = result
-                for expected, actual in zip(reference, result):
-                    assert expected.keys() == actual.keys()
-                    assert all(bytes_equal(expected[name], actual[name]) for name in expected)
-    finally:
-        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])

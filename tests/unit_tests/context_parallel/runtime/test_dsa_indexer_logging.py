@@ -12,6 +12,8 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from tests.unit_tests.test_utilities import Utils
 
+pytestmark = pytest.mark.launch_on_gb200
+
 
 @pytest.fixture(scope="module")
 def logging_groups():

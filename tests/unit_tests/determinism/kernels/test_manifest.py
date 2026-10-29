@@ -87,7 +87,11 @@ def test_registered_test_imports_kernel(entry):
         return
     sources = {_module_of(src) for src in entry.sources if src.endswith(".py")}
     for test in entry.tests:
-        if not test.startswith("tests/unit_tests/determinism/kernels/") or not sources:
+        is_replay_module = test.startswith("tests/unit_tests/determinism/kernels/") or (
+            test.startswith("tests/unit_tests/context_parallel/runtime/")
+            and test.endswith("_replay.py")
+        )
+        if not is_replay_module or not sources:
             continue
         imported = _imported_modules(REPO_ROOT / test)
         assert any(

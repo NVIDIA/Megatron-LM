@@ -18,6 +18,8 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
+pytestmark = pytest.mark.launch_on_gb200
+
 
 @pytest.mark.parametrize("variant", ["mamba", "gdp_headwise", "gdp_chunkwise"])
 def test_runtime_cp_full_mixer_matches_static_cp(variant):

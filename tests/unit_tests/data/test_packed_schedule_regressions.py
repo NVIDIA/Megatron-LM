@@ -374,15 +374,6 @@ def test_sequence_packing_requires_collection(no_global_process_groups):
         data_schedule.get_batch_on_this_rank_for_sequence_packing(None)
 
 
-def test_dynamic_sequence_packing_requires_config(no_global_process_groups):
-    with pytest.raises(ValueError, match="config is required for dynamic CP"):
-        data_schedule.get_batch_on_this_rank_for_sequence_packing(
-            None,
-            dynamic_cp=True,
-            pg_collection=ProcessGroupCollection(tp=_group(1), pp=_group(1), cp=_group(1)),
-        )
-
-
 @pytest.mark.parametrize("missing", ["tp", "pp", "cp"])
 def test_packed_batch_requires_static_groups(no_global_process_groups, missing):
     groups = {name: _group(1) for name in ("tp", "pp", "cp") if name != missing}

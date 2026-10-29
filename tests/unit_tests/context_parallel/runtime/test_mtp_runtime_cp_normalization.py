@@ -12,6 +12,8 @@ import torch.nn.functional as F
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import multi_token_prediction as mtp
 
+pytestmark = pytest.mark.launch_on_gb200
+
 
 @pytest.fixture(autouse=True)
 def loss_scale(monkeypatch):
