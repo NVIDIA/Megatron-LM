@@ -28,6 +28,7 @@ from megatron.core.ssm.gated_delta_net.common import (
     get_parameter_local_cp,
 )
 from megatron.core.ssm.kda_layer_config import KDALayerConfig
+from megatron.core.tensor_parallel.inference_layers import is_inference_column_parallel_linear
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -171,6 +172,25 @@ class KimiDeltaAttention(_GDNBase):
                         name=f"{name}.{b_name}" if name is not None else None,
                     ),
                 )
+
+        self._set_projection_all_gather_barriers()
+
+    def _set_projection_all_gather_barriers(self) -> None:
+        """Make each projection barrier before its input all-gather reuses the buffer.
+
+        _forward_compute runs in_proj, beta_proj and, with two-stage gates, f_b_proj and
+        g_b_proj back to back, with no reduce-scatter in between. Inference-optimized
+        column-parallel linears all-gather into the same "tp" symmetric buffer, so each of
+        these all-gathers after the first must not overwrite it while a peer's GEMM still
+        reads the previous projection's input there. in_proj follows the previous layer's
+        reduce-scatter and needs no barrier.
+        """
+        projections = [self.in_proj, self.beta_proj]
+        if self.two_stage_gates:
+            projections += [self.f_b_proj, self.g_b_proj]
+        for previous, projection in zip(projections, projections[1:]):
+            if all(is_inference_column_parallel_linear(p) for p in (previous, projection)):
+                projection.set_barrier_before_all_gather(True)
 
     def _setup_variant_attrs(self) -> None:
         """Set KDA dimensions, projection checkpoint metadata, and kernel callable."""
