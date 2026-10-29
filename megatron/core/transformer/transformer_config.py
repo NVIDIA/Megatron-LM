@@ -2399,7 +2399,7 @@ class TransformerConfig(ModelParallelConfig):
                     )
 
         if self.moe_match_generation_forward:
-            if self.transformer_impl != 'inference_optimized':
+            if self.transformer_impl != "inference_optimized":
                 raise ValueError(
                     "moe_match_generation_forward requires "
                     f"transformer_impl='inference_optimized'; got '{self.transformer_impl}'."
@@ -2434,8 +2434,10 @@ class TransformerConfig(ModelParallelConfig):
                     "that a token's output does not depend on how many tokens share the "
                     "kernel launch."
                 )
-            if self.recompute_granularity != 'selective' or (
-                self.recompute_modules is not None and 'moe' not in self.recompute_modules
+            # moe_layer_recompute (deprecated) adds 'moe' later; None later means ["core_attn"].
+            if not self.moe_layer_recompute and (
+                self.recompute_granularity != "selective"
+                or "moe" not in (self.recompute_modules or [])
             ):
                 raise ValueError(
                     "moe_match_generation_forward requires "
@@ -2443,7 +2445,7 @@ class TransformerConfig(ModelParallelConfig):
                     "the value pass stores no activations, so the backward must come "
                     "from a recompute pass."
                 )
-            if self.cuda_graph_impl == 'local':
+            if self.cuda_graph_impl == "local":
                 raise ValueError(
                     "moe_match_generation_forward is incompatible with "
                     "cuda_graph_impl='local', which disables MoE-layer recompute."
