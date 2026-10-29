@@ -416,7 +416,7 @@ class Pipeline:
             model=models,
             optimizer=None,
             opt_param_scheduler=None,
-            num_floating_point_operations_so_far=None,
+            num_floating_point_operations_so_far=0,
         )
 
         return output_tensor, orig_input_ids
