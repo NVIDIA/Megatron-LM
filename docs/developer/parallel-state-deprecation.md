@@ -491,7 +491,8 @@ spelling in the whole file, so it also counts in the other classes of the file, 
 that inherit it included. Reviewers still look for reads it cannot see.
 
 `tests/unit_tests/test_parallel_state_accessor_uses.py` guards the code outside Megatron Core:
-the non-test code under `megatron/`, `examples/`, `tools/`, `tasks/`, `scripts/` and `docs/`, and
+the functional tests under `tests/functional_tests/`, the non-test code under `megatron/`,
+`examples/`, `tools/`, `tasks/`, `scripts/` and `docs/`, and
 the top-level scripts. It allows a call of a deprecated function or of `use_mpu_process_groups()`
 only in a `global_process_group_fallback()` block, or in a `warnings.catch_warnings()` block
 whose body calls `warnings.simplefilter("ignore", ParallelStateDeprecationWarning)` (or the

@@ -184,7 +184,7 @@ with a `pg_collection`; without one, it falls back to the global grid with a
   from `megatron.core.process_groups_config`. It emits one `ProcessGroupFallbackWarning` for the
   fallback, and the accessors and `use_mpu_process_groups()` it calls do not warn again.
   `tests/unit_tests/test_parallel_state_accessor_uses.py` checks that the code of this
-  repository outside Megatron Core and its tests calls them only in such a block or in a
+  repository outside Megatron Core and its unit tests calls them only in such a block or in a
   `with warnings.catch_warnings()` block whose body calls
   `warnings.simplefilter("ignore", ParallelStateDeprecationWarning)` (or the matching
   `warnings.filterwarnings()`) after a statement that is only a call of
