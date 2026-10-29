@@ -175,13 +175,6 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Rejected by --deterministic-mode (op catalog); the replay test records its status as xfail(strict=False).",
     ),
     KernelEntry(
-        name="te_fused_cross_entropy",
-        sources=("megatron/core/extensions/transformer_engine.py",),
-        tests=(K + "test_te_wrappers.py",),
-        kind="external-lib",
-        notes="Replays TE's overwrite_input path when supported.",
-    ),
-    KernelEntry(
         name="jit_fuser",
         sources=("megatron/core/jit.py",),
         kind="torch.compile",
@@ -320,11 +313,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/extensions/transformer_engine.py",),
         tests=(
             K + "test_te_wrappers.py",
+            K + "test_te_row_batch_invariant.py",
             C + "test_fp8_determinism.py",
             K + "test_runtime_cp_attention.py",
         ),
         kind="te-wrapper",
         notes="TE Linear / LayerNormLinear / Norm / GroupedLinear / DotProductAttention / fused RoPE replayed standalone; "
+        "TE cross-entropy overwrite_input is also replayed when supported. "
         "FP8/FP4 recipes in the model-level suite. Runtime CP binding and restoration are "
         "replayed through packed SelfAttention in test_runtime_cp_attention.py. "
         "QB-capable TE routing replays probabilities, gradients, and atomic histograms.",
