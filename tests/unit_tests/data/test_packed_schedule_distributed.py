@@ -148,6 +148,8 @@ def test_packed_schedule_pipeline_cp_and_hybrid_sp(dynamic_cp, cp_size, hybrid):
                 mtp_process=False,
                 pg_collection=pg,
             )
+            model._preprocess = HybridModel._preprocess.__get__(model)
+            model._postprocess = HybridModel._postprocess.__get__(model)
             boundary = result.get_batch('contiguous')
             decoder.input_tensor = torch.zeros(
                 boundary['padding_mask'].shape[1] // pg.tp.size(), 1, 8, device='cuda'
