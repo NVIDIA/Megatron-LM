@@ -156,7 +156,7 @@ from megatron.training.checkpointing import (
     save_checkpoint,
     save_grads,
 )
-from megatron.training.config import FaultInjectorConfig, TrainingConfig
+from megatron.training.config import FaultInjectorConfig, TrainingConfig, ValidationConfig
 from megatron.training.config.container import PretrainConfigContainer, update_train_iters
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.initialize import (
@@ -864,13 +864,11 @@ def num_floating_point_operations(
             CP-alignment padding or end-of-sequence padding, so neither kind of
             padding shows up in the reported FLOPs.
     """
-    from megatron.training.vocab_utils import model_vocab_size
-
     transformer = model_config.transformer
     llm_seq_length = sequence_length
     group_query_attention = transformer.num_query_groups != transformer.num_attention_heads
     swiglu = transformer.gated_linear_unit and transformer.activation_func is torch.nn.functional.silu
-    vocab_size = model_vocab_size(model_config)
+    vocab_size = model_config.effective_vocab_size
 
     # Defaults: BSHD layout assumption (full causal mask, every sample length =
     # llm_seq_length, no padding). For BSHD ``total_real_tokens = batch * s`` and
@@ -6137,30 +6135,49 @@ def get_train_valid_test_num_samples():
     args = get_args()
     train_state = get_train_state()
 
+    return calculate_train_valid_test_num_samples(
+        cfg.train,
+        cfg.validation,
+        phase_transition_iterations=args.phase_transition_iterations,
+        iteration=train_state.iteration,
+    )
+
+
+def calculate_train_valid_test_num_samples(
+    train: TrainingConfig,
+    validation: ValidationConfig,
+    *,
+    phase_transition_iterations: list[int] | None,
+    iteration: int,
+) -> tuple[int, int | None, int]:
+    """Calculate dataset sample counts without model or runtime initialization."""
+    eval_global_batch_size = validation.eval_global_batch_size
+    if eval_global_batch_size is None:
+        eval_global_batch_size = train.global_batch_size
     # Number of train/valid/test samples.
-    if cfg.train.train_samples:
-        train_samples = cfg.train.train_samples
+    if train.train_samples:
+        train_samples = train.train_samples
     else:
-        train_samples = cfg.train.train_iters * cfg.train.global_batch_size
-    if cfg.validation.full_validation:
+        train_samples = train.train_iters * train.global_batch_size
+    if validation.full_validation:
         eval_samples = None
     else:
-        if cfg.validation.skip_train:
-            eval_iters = cfg.validation.eval_iters
+        if validation.skip_train:
+            eval_iters = validation.eval_iters
         else:
-            assert cfg.train.train_iters is not None
-            total_eval_points = cfg.train.train_iters // cfg.validation.eval_interval + 1
-            if cfg.validation.start_eval_at_iter is not None:
-                skipped_eval_points = cfg.validation.start_eval_at_iter // cfg.validation.eval_interval
+            assert train.train_iters is not None
+            total_eval_points = train.train_iters // validation.eval_interval + 1
+            if validation.start_eval_at_iter is not None:
+                skipped_eval_points = validation.start_eval_at_iter // validation.eval_interval
                 total_eval_points = max(0, total_eval_points - skipped_eval_points)
-            eval_iters = total_eval_points * cfg.validation.eval_iters
-        eval_samples = eval_iters * cfg.validation.eval_global_batch_size
-    test_samples = cfg.validation.eval_iters * cfg.validation.eval_global_batch_size
+            eval_iters = total_eval_points * validation.eval_iters
+        eval_samples = eval_iters * eval_global_batch_size
+    test_samples = validation.eval_iters * eval_global_batch_size
 
     # Get train_samples in current phase.
-    if args.phase_transition_iterations:
-        phase_transition_samples = [0] + [t * cfg.train.global_batch_size for t in args.phase_transition_iterations] + [cfg.train.train_samples]
-        current_sample = train_state.iteration * cfg.train.global_batch_size
+    if phase_transition_iterations:
+        phase_transition_samples = [0] + [t * train.global_batch_size for t in phase_transition_iterations] + [train.train_samples]
+        current_sample = iteration * train.global_batch_size
         last_transition_sample = max(s for s in phase_transition_samples if s <= current_sample)
         next_transition_sample = min(s for s in phase_transition_samples if s > current_sample)
         train_samples_in_current_phase = next_transition_sample - last_transition_sample

@@ -4,10 +4,11 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from megatron.core.transformer import TransformerConfig
+from megatron.training.models.base import VocabSizeMixin
 
 
 @dataclass(kw_only=True)
-class T5ModelConfig:
+class T5ModelConfig(VocabSizeMixin):
     """T5 encoder-decoder inputs for the application's model provider."""
 
     transformer: TransformerConfig

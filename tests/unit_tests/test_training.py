@@ -25,6 +25,32 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.mark.parametrize(
+    "overrides,phase,iteration,expected",
+    [
+        ({}, None, 0, (80, 48, 16)),
+        ({"eval_global_batch_size": 4}, None, 0, (80, 24, 8)),
+        ({"full_validation": True}, None, 0, (80, None, 16)),
+        ({"skip_train": True}, None, 0, (80, 16, 16)),
+        ({"start_eval_at_iter": 5}, None, 0, (80, 32, 16)),
+        ({}, [5], 6, (40, 48, 16)),
+    ],
+)
+def test_sample_counts_without_model_or_runtime(monkeypatch, overrides, phase, iteration, expected):
+    train = TrainingConfig(train_iters=10, train_samples=80, global_batch_size=8)
+    validation = ValidationConfig(eval_iters=2, eval_interval=5, **overrides)
+    for name in ("get_args", "get_run_config", "get_train_state"):
+        monkeypatch.setattr(training, name, Mock(side_effect=AssertionError("runtime access")))
+    assert (
+        training.calculate_train_valid_test_num_samples(
+            train, validation, phase_transition_iterations=phase, iteration=iteration
+        )
+        == expected
+    )
+    assert train.train_iters == 10
+    assert validation.eval_global_batch_size == overrides.get("eval_global_batch_size")
+
+
 def mock_train_valid_test_datasets_provider(train_val_test_num_samples):
     return iter([1]), iter([2]), iter([3])
 

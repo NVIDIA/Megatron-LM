@@ -9,7 +9,7 @@ from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar, runtime_
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer import MegatronModule
+from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.transformer.module import Float16Module
 
 
@@ -25,6 +25,48 @@ class Serializable(Protocol):
     def from_dict(cls, data: dict[str, Any]) -> "Serializable":
         """Deserialize from dictionary using _target_ to identify class."""
         ...
+
+
+class VocabSizeMixin:
+    """Derived vocabulary dimension for language-model configs, without stored state."""
+
+    vocab_size: int | None
+    should_pad_vocab: bool
+    make_vocab_size_divisible_by: int
+    transformer: TransformerConfig
+
+    @property
+    def effective_vocab_size(self) -> int:
+        """Return the vocabulary dimension used by embeddings and output projections.
+
+        Unlike the stored ``vocab_size``, which may be raw or already padded,
+        this is the final model dimension: when ``should_pad_vocab`` is True,
+        round up to a multiple of ``make_vocab_size_divisible_by`` times the
+        transformer's tensor-parallel size. Otherwise return ``vocab_size``
+        unchanged. For example, size 261 with alignment 128 and TP=2 gives 512
+        when padding is enabled, and 261 when it is disabled.
+
+        Tokenizer-resolved padded sizes are stored in ``vocab_size`` with
+        ``should_pad_vocab=False``, so they are not padded again. Reading this
+        property neither updates ``vocab_size`` nor builds a tokenizer; it is
+        computed on demand and is not an additional serialized config field.
+
+        Raises:
+            ValueError: If ``vocab_size`` is still None. Tokenizer-derived
+                vocabulary must be resolved before model construction or warmup.
+        """
+        if self.vocab_size is None:
+            raise ValueError("Model vocabulary must be resolved before model construction or warmup.")
+        if self.should_pad_vocab:
+            from megatron.training.vocab_utils import calculate_padded_vocab_size
+
+            return calculate_padded_vocab_size(
+                self.vocab_size,
+                self.make_vocab_size_divisible_by,
+                self.transformer.tensor_model_parallel_size,
+                logging_enabled=False,
+            )
+        return self.vocab_size
 
 
 @dataclass

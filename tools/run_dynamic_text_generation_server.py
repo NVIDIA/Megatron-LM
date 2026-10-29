@@ -178,12 +178,17 @@ def parse_args_and_detect_vlm(
     args = get_args()
 
     is_vlm = _detect_vlm_from_checkpoint(args, user_passed_attrs=user_passed_attrs)
-    if is_vlm and getattr(args, "mimo_checkpoint_prefix_map", None) is None:
-        from megatron.training.argument_utils import model_config_from_args
-        from megatron.training.models import LLaVAModelConfig
+    from megatron.training.argument_utils import model_config_from_args
+    from megatron.training.models import LLaVAModelConfig
 
-        # This entrypoint discovers the model family only after distributed startup.
-        get_run_config().model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
+    # Detection can update text-only and MIMO language backbones as well as VLMs.
+    # Keep the MIMO checkpoint provider's Hybrid configuration and prefix dispatch.
+    model_config_cls = (
+        LLaVAModelConfig
+        if is_vlm and getattr(args, "mimo_checkpoint_prefix_map", None) is None
+        else None
+    )
+    cfg.model = model_config_from_args(args, model_config_cls=model_config_cls)
     cfg.tokenizer = tokenizer_config_from_args(args)
     rebuild_tokenizer(cfg, args)
     from megatron.training.argument_utils import resolve_tokenizer_vocab_size

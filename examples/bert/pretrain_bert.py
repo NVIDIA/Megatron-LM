@@ -17,7 +17,6 @@ from megatron.training import pretrain
 from megatron.training.utils import average_losses_across_data_parallel_group
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
-from megatron.training.vocab_utils import model_vocab_size
 from megatron.training.argument_utils import model_config_from_args
 from megatron.training.models import BertModelConfig
 from megatron.training.global_vars import (
@@ -49,7 +48,7 @@ def model_provider(pre_process=True, post_process=True, vp_stage=None, config=No
     model = BertModel(
         config=config,
         transformer_layer_spec=transformer_layer_spec,
-        vocab_size=model_vocab_size(cfg.model),
+        vocab_size=cfg.model.effective_vocab_size,
         max_sequence_length=cfg.model.seq_length,
         num_tokentypes=num_tokentypes,
         add_binary_head=cfg.model.bert_binary_head,

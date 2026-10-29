@@ -2,38 +2,10 @@
 
 import math
 from functools import lru_cache
-from typing import TYPE_CHECKING
 
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer, vocab_size_with_padding
 from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.utils import print_rank_0
-
-if TYPE_CHECKING:
-    from megatron.training.models import (
-        BertModelConfig,
-        LLaVAModelConfig,
-        MimoBuildConfig,
-        ModelConfig,
-        T5ModelConfig,
-    )
-
-
-def model_vocab_size(
-    model_config: "ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoBuildConfig",
-    *,
-    logging_enabled: bool = False,
-) -> int:
-    """Return the vocabulary dimension used to construct the configured model."""
-    if model_config.vocab_size is None:
-        raise ValueError("Model vocabulary must be resolved before model construction or warmup.")
-    if model_config.should_pad_vocab:
-        return calculate_padded_vocab_size(
-            model_config.vocab_size,
-            model_config.make_vocab_size_divisible_by,
-            model_config.transformer.tensor_model_parallel_size,
-            logging_enabled=logging_enabled,
-        )
-    return model_config.vocab_size
 
 
 def calculate_padded_vocab_size(

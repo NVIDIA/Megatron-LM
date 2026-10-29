@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from megatron.core.transformer import TransformerConfig
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.arguments import _add_rl_args, parse_args, validate_args
 from megatron.training.config import RLConfig, rl_config
@@ -243,9 +244,9 @@ def test_validate_run_at_every_call_site():
     @dataclasses.dataclass
     class TransformerModelConfig(ModelConfig):
         builder: typing.ClassVar[str] = "tests.transformer"
-        transformer: types.SimpleNamespace = dataclasses.field(
-            default_factory=lambda: types.SimpleNamespace(
-                cuda_graph_impl="none", gtp_remat_num_sequence_shards=1
+        transformer: TransformerConfig = dataclasses.field(
+            default_factory=lambda: TransformerConfig(
+                num_layers=2, hidden_size=32, num_attention_heads=4
             )
         )
 

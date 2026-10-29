@@ -10,6 +10,7 @@ from dataclasses import fields as dataclass_fields
 from typing import Any
 
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.spec_utils import ModuleSpec
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,9 @@ def serialize_dataclass(
     """
     if isinstance(config, TransformerConfig):
         skip_fields = skip_fields | _TRANSFORMER_RUNTIME_FIELDS
+        encode_callables = True
+    if isinstance(config, ModuleSpec):
+        # Specs contain partials whose keyword arguments can themselves be dataclasses.
         encode_callables = True
     convert = functools.partial(
         serialize_value, skip_fields=skip_fields, encode_callables=encode_callables

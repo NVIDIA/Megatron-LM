@@ -623,7 +623,7 @@ def test_training_batch_topology_uses_model_config(
 
 
 @pytest.mark.parametrize("spec", [None, ["local"], ["custom_module", "custom_spec"]])
-def test_bert_spec_is_resolved_at_config_boundary(monkeypatch, run_config, spec):
+def test_bert_spec_is_resolved_at_config_boundary(monkeypatch, tmp_path, run_config, spec):
     import megatron.training.argument_utils as adapters
     from megatron.core.models.bert.bert_layer_specs import bert_layer_local_spec
 
@@ -642,6 +642,18 @@ def test_bert_spec_is_resolved_at_config_boundary(monkeypatch, run_config, spec)
     run_config.model = model
     restored = type(run_config).from_dict(run_config.to_dict())
     assert restored.to_dict() == run_config.to_dict()
+    path = tmp_path / "bert.yaml"
+    run_config.to_yaml(path)
+    restored = type(run_config).from_yaml(path)
+    assert restored.to_dict() == run_config.to_dict()
+    if spec is not None:
+        original_mlp = model.transformer_layer_spec.submodules.mlp
+        restored_mlp = restored.model.transformer_layer_spec.submodules.mlp
+        assert restored_mlp.func == original_mlp.func
+        for name in ("linear_fc1", "linear_fc2"):
+            assert getattr(restored_mlp.keywords["submodules"], name) is getattr(
+                original_mlp.keywords["submodules"], name
+            )
 
 
 @pytest.mark.parametrize("model_cls", [BertModelConfig, T5ModelConfig])
@@ -1047,7 +1059,12 @@ def test_training_topology_rejects_invalid_rank_counts(
     )
     run_config.train.micro_batch_size = 1
     before = deepcopy(run_config.to_dict())
-    with pytest.raises(ValueError, match="Training model world size must fit"):
+    message = (
+        "MIMO language-model world size must be positive"
+        if mimo_llm_world_size == 0
+        else "Training model world size must fit"
+    )
+    with pytest.raises(ValueError, match=message):
         run_config.finalize()
     assert run_config.to_dict() == before
     assert not run_config._finalized
@@ -1250,10 +1267,15 @@ def test_dataset_helpers_use_registered_model(
         entrypoint.mpu, "get_virtual_pipeline_model_parallel_world_size", lambda: None
     )
     monkeypatch.setattr(entrypoint, "is_first_or_last_pipeline_stage", lambda stage: False)
-    assert entrypoint.is_dataset_built_on_rank() is (sequence_packing_scheduler is None)
-    assert entrypoint.is_dataset_built_on_rank(is_packed_sequence=True) is (
-        sequence_packing_scheduler is None
-    )
+    # MTP requires data here; packing also requires data on every pipeline stage.
+    assert entrypoint.is_dataset_built_on_rank()
+    assert entrypoint.is_dataset_built_on_rank(is_packed_sequence=True)
+    monkeypatch.setattr(entrypoint, "mtp_on_this_rank_func", lambda **kwargs: False)
+    assert entrypoint.is_dataset_built_on_rank() is (sequence_packing_scheduler is not None)
+    assert entrypoint.is_dataset_built_on_rank(is_packed_sequence=True)
+    monkeypatch.setattr(entrypoint.mpu, "get_tensor_model_parallel_rank", lambda: 1)
+    assert not entrypoint.is_dataset_built_on_rank()
+    assert not entrypoint.is_dataset_built_on_rank(is_packed_sequence=True)
     assert args.data_parallel_size == 999
     assert args.context_parallel_size == args.tensor_model_parallel_size == 1
     assert args.mtp_num_layers is None

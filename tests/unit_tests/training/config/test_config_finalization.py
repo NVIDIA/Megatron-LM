@@ -17,6 +17,7 @@ from megatron.training.config import (
 from megatron.training.models import (
     BertModelConfig,
     GPTModelConfig,
+    HybridModelConfig,
     LLaVAModelConfig,
     MimoBuildConfig,
     T5ModelConfig,
@@ -183,7 +184,15 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
 
 @pytest.mark.parametrize("storage", ["dict", "yaml"])
 @pytest.mark.parametrize(
-    "model_cls", [BertModelConfig, T5ModelConfig, LLaVAModelConfig, MimoBuildConfig]
+    "model_cls",
+    [
+        GPTModelConfig,
+        HybridModelConfig,
+        BertModelConfig,
+        T5ModelConfig,
+        LLaVAModelConfig,
+        MimoBuildConfig,
+    ],
 )
 def test_serialization_starts_a_new_lifecycle(
     monkeypatch, run_config, model_cls, storage, tmp_path
@@ -193,6 +202,9 @@ def test_serialization_starts_a_new_lifecycle(
     run_config.model = model_cls(
         transformer=run_config.model.transformer, seq_length=16, vocab_size=128, **kwargs
     )
+    if isinstance(run_config.model, ModelConfig):
+        # Preserve builder metadata without treating it as a constructor keyword.
+        run_config.model.builder = "megatron.training.models.gpt.GPTModelBuilder"
     run_config.train.micro_batch_size = 1
     run_config.finalize()
     # Training attaches live objects to the transformer; checkpoint metadata must omit them.

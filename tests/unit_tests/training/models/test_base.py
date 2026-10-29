@@ -8,7 +8,55 @@ import pytest
 import torch
 
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.models import (
+    BertModelConfig,
+    GPTModelConfig,
+    HybridModelConfig,
+    LLaVAModelConfig,
+    MimoBuildConfig,
+    T5ModelConfig,
+)
 from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
+
+
+@pytest.mark.parametrize(
+    "model_cls",
+    [
+        GPTModelConfig,
+        HybridModelConfig,
+        BertModelConfig,
+        T5ModelConfig,
+        LLaVAModelConfig,
+        MimoBuildConfig,
+    ],
+)
+@pytest.mark.parametrize(
+    "vocab_size,pad,expected",
+    [(None, True, None), (261, False, 261), (261, True, 512), (512, True, 512), (768, False, 768)],
+)
+def test_effective_vocab_size(model_cls, vocab_size, pad, expected):
+    from megatron.training.config.utils import serialize_dataclass
+
+    model = model_cls(
+        transformer=TransformerConfig(
+            num_layers=2, hidden_size=32, num_attention_heads=4, tensor_model_parallel_size=2
+        ),
+        seq_length=16,
+        vocab_size=vocab_size,
+        should_pad_vocab=pad,
+        **({"encoder_num_layers": 2} if model_cls is T5ModelConfig else {}),
+    )
+    before = serialize_dataclass(model)
+    if expected is None:
+        with pytest.raises(ValueError, match="Model vocabulary must be resolved"):
+            _ = model.effective_vocab_size
+    else:
+        assert model.effective_vocab_size == expected
+        assert model.effective_vocab_size == expected
+        with pytest.raises(AttributeError):
+            model.effective_vocab_size = 1
+    assert serialize_dataclass(model) == before
+    assert "effective_vocab_size" not in before
 
 
 @pytest.fixture(autouse=True)

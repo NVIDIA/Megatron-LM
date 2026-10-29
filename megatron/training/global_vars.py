@@ -197,7 +197,10 @@ def initialize_runtime_services(
     cfg = get_run_config()
     if build_tokenizer:
         _build_tokenizer(cfg, args)
-    resolve_tokenizer_vocab_size(cfg)
+    # Tokenizer-free bootstrap may discover the model family and rebuild the
+    # tokenizer later. Bind known sizes now; otherwise defer until that rebuild.
+    if build_tokenizer or cfg.tokenizer.padded_vocab_size is not None:
+        resolve_tokenizer_vocab_size(cfg)
     _set_wandb_writer(args)
     _set_telemetry(args, include_training=training)
 

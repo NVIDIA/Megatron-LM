@@ -5,10 +5,11 @@ from typing import Any
 
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.training.models.base import VocabSizeMixin
 
 
 @dataclass(kw_only=True)
-class BertModelConfig:
+class BertModelConfig(VocabSizeMixin):
     """BERT model inputs; construction remains with the application's provider."""
 
     transformer: TransformerConfig

@@ -624,6 +624,8 @@ def test_checkpoint_padded_vocabulary_uses_tokenizer_config(run_config, saved_co
         make_vocab_size_divisible_by=128,
         tokenizer_type="NullTokenizer",
         padded_vocab_size=512,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
     )
     saved = run_config.to_dict() if saved_config else None
     if saved_config:

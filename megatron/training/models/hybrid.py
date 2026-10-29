@@ -23,7 +23,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
+from megatron.training.models.base import ModelBuilder, ModelConfig, VocabSizeMixin, compose_hooks
 from megatron.training.models.dist_utils import unimodal_build_distributed_models
 from megatron.training.vocab_utils import calculate_padded_vocab_size
 
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(kw_only=True)
-class HybridModelConfig(ModelConfig):
+class HybridModelConfig(ModelConfig, VocabSizeMixin):
     """Configuration for a Megatron Core Hybrid model.
 
     This is purely a configuration object. All model construction

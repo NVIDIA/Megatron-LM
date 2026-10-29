@@ -7,7 +7,6 @@ import math
 
 import torch
 
-from megatron.training.vocab_utils import model_vocab_size
 from .utils import is_hybrid_model, print_rank_0
 
 NUM_BYTES_IN_MEGABYTE = 1024 * 1024
@@ -17,7 +16,7 @@ def compute_weight_and_optimizer_memory(
     model_config, optimizer, *, data_parallel_size: int, world_size: int, verbose=False
 ):
     transformer = model_config.transformer
-    vocab_size = model_vocab_size(model_config)
+    vocab_size = model_config.effective_vocab_size
     swiglu = transformer.gated_linear_unit and transformer.activation_func is torch.nn.functional.silu
     # Attention projection size.
     query_projection_size = transformer.kv_channels * transformer.num_attention_heads
@@ -315,7 +314,7 @@ def compute_activation_memory(
     model_config, num_microbatches, *, sequence_length: int, micro_batch_size: int, verbose=False
 ):
     transformer = model_config.transformer
-    vocab_size = model_vocab_size(model_config)
+    vocab_size = model_config.effective_vocab_size
     # Using formula in Table 2 of https://arxiv.org/pdf/2205.05198.pdf.
     # We are trying to compute the maximum activation footprint, so all calculations in this
     # function are for the first pipeline stage.
@@ -393,7 +392,7 @@ def compute_activation_memory_without_sp(
     model_config, num_microbatches, *, sequence_length: int, micro_batch_size: int, verbose=False
 ):
     transformer = model_config.transformer
-    vocab_size = model_vocab_size(model_config)
+    vocab_size = model_config.effective_vocab_size
     """Compute activation memory without sequence parallelism"""
 
     # 4. Compute per-layer memory
