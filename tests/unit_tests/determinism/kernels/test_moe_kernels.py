@@ -33,7 +33,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.moe import moe_utils
+from megatron.core.transformer.moe import batch_invariant, moe_utils
 from megatron.core.transformer.moe.experts import (
     SequentialMLP,
     TEGroupedMLP,
@@ -1276,24 +1276,34 @@ class TestMoEModules:
         not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
         reason="MXFP8 parameter storage needs Blackwell",
     )
-    def test_vllm_mxfp8_weight_stacking_replays(self):
-        """The mixed-precision vLLM path builds canonical expert stacks bit-exactly."""
+    @pytest.mark.parametrize("backend", ["vllm", "flashinfer"])
+    def test_mxfp8_weight_stacking_replays(self, backend):
+        """Canonical and CUTLASS execution expert stacks replay bit-exactly."""
         from types import SimpleNamespace
 
         from megatron.core.inference.moe import InferenceGroupedGemmBackend
+        from megatron.core.inference.moe.flashinfer_mxfp8 import HAVE_FLASHINFER_CUTLASS_MXFP8
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
         from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+        if backend == "flashinfer" and not HAVE_FLASHINFER_CUTLASS_MXFP8:
+            pytest.skip("requires FlashInfer CUTLASS MXFP8")
 
         class GroupedMLPStub:
             _stack_mxfp8_linear_weight = InferenceGroupedMLP._stack_mxfp8_linear_weight
 
         seeded()
-        weights = tuple(torch.randn(64, 128, device="cuda", dtype=torch.bfloat16) for _ in range(4))
+        weights = tuple(
+            torch.randn(128, 128, device="cuda", dtype=torch.bfloat16) for _ in range(4)
+        )
 
         def build_stacks(*bf16_weights):
             grouped = GroupedMLPStub()
             grouped.num_local_experts = 2
-            grouped.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.VLLM
+            grouped.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.from_config(
+                backend
+            )
+            grouped._activation_clamp_scale = 16.0
             grouped.linear_fc1 = SimpleNamespace()
             grouped.linear_fc2 = SimpleNamespace()
             for linear, offset in ((grouped.linear_fc1, 0), (grouped.linear_fc2, 2)):
@@ -1312,7 +1322,7 @@ class TestMoEModules:
             )
 
         assert_replays_bit_exact(
-            build_stacks, weights, backward=False, what="vLLM MXFP8 expert-weight stacking"
+            build_stacks, weights, backward=False, what=f"{backend} MXFP8 expert-weight stacking"
         )
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
@@ -1390,6 +1400,12 @@ class TestMoEModules:
         [
             ("allgather", 1, {}),
             ("alltoall", 1, {}),
+            pytest.param(
+                "alltoall",
+                1,
+                {"moe_shared_expert_intermediate_size": 2048},
+                id="alltoall-native-shared-expert",
+            ),
             pytest.param(
                 "alltoall",
                 1,
@@ -1491,3 +1507,39 @@ class TestMoEModules:
         with deterministic_algorithms(True):
             layer(hidden)
         assert layer.token_dispatcher.probs is None
+
+
+@pytest.mark.parametrize("collective", ["ordered", "multimem"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_batch_invariant_unpermute_replays(monkeypatch, collective, dtype):
+    """The fused batch-invariant unpermute (``probs=None``) and its backward replay bit-exactly."""
+    if not batch_invariant.HAVE_TRITON:
+        pytest.skip("requires Triton")
+    seeded()
+    monkeypatch.setattr(batch_invariant, "get_batch_invariant_collective", lambda: collective)
+    monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: 2)
+    num_tokens, hidden = 4096, 520
+    rows = torch.randn(2 * num_tokens, hidden, device="cuda", dtype=dtype, requires_grad=True)
+    # Two experts on two EP ranks, one slot each: every token sums one row per rank.
+    inverse_map = torch.stack(
+        (
+            torch.arange(2 * num_tokens, device="cuda").view(2, num_tokens).T,
+            torch.tensor([0, 1], device="cuda").expand(num_tokens, 2),
+        )
+    )
+    grad = torch.randn(num_tokens, hidden, device="cuda", dtype=dtype)
+    grad.view(-1)[::7] = -0.0
+
+    def combine(x):
+        return batch_invariant.unpermute(
+            x, torch.Size((num_tokens, hidden)), probs=None, num_experts=2, inverse_map=inverse_map
+        )
+
+    assert_replays_bit_exact(
+        combine,
+        (rows,),
+        replays=3,
+        contention=True,
+        grad_outputs={"out": grad},
+        what=f"batch-invariant unpermute[{collective=}, {dtype=}]",
+    )
