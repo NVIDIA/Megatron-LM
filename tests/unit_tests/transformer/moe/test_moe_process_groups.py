@@ -107,7 +107,8 @@ def _fallback_warnings(record):
 
 
 def _forbid_global_process_groups(monkeypatch):
-    """Make the accessors the checker counts, and the collection shim, raise when called."""
+    """Make the accessors the checker counts, the registry getter, and the collection shim,
+    raise when called."""
 
     def forbidden(*args, **kwargs):
         raise AssertionError("read a process group from megatron.core.parallel_state")
@@ -115,7 +116,7 @@ def _forbid_global_process_groups(monkeypatch):
     accessors = {
         id(value)
         for name, value in vars(parallel_state).items()
-        if callable(value) and _checker._is_deprecated_accessor(name)
+        if callable(value) and _checker._returns_global_groups(name)
     }
     # Patch the accessors in parallel_state and wherever a module imported them by name.
     for module in list(sys.modules.values()):

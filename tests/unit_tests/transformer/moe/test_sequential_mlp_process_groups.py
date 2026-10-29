@@ -37,9 +37,10 @@ LINEAR_SPECS = {
 def forbid_global_grid_reads():
     """Make every read of the global parallel grid raise AssertionError inside the block.
 
-    Covers each parallel_state accessor that tools/check_process_group_usage.py counts, on
-    parallel_state and in every imported megatron module that bound it by name, and the
-    ProcessGroupCollection.use_mpu_process_groups() shim that resolvers fall back to.
+    Covers each parallel_state accessor that tools/check_process_group_usage.py counts and the
+    registry getter, on parallel_state and in every imported megatron module that bound it by
+    name, and the ProcessGroupCollection.use_mpu_process_groups() shim that resolvers fall back
+    to.
     """
     modules = [
         module
@@ -48,7 +49,7 @@ def forbid_global_grid_reads():
     ]
     with contextlib.ExitStack() as stack:
         for name, original in list(vars(parallel_state).items()):
-            if not (callable(original) and check_process_group_usage._is_deprecated_accessor(name)):
+            if not (callable(original) and check_process_group_usage._returns_global_groups(name)):
                 continue
             stub = mock.Mock(
                 side_effect=AssertionError(f"parallel_state.{name}() reads the global grid")

@@ -274,6 +274,7 @@ class TestDetection(unittest.TestCase):
         names = [
             "initialize_model_parallel",
             "destroy_model_parallel",
+            "register_model_parallel_teardown",
             "is_initialized",
             "model_parallel_is_initialized",
             "register_process_groups",
@@ -283,6 +284,56 @@ class TestDetection(unittest.TestCase):
         self.assertEqual(
             self.hits(IMPORT + "\n".join(f"parallel_state.{name}()" for name in names)), []
         )
+
+    def test_registered_collection_is_a_shim_not_an_accessor(self):
+        # The registry replaces the accessors outside Megatron Core and is not deprecated, but it
+        # returns the same global groups: Megatron Core still takes its groups from callers.
+        self.assertFalse(checker._is_deprecated_accessor("get_registered_process_groups"))
+        for prefix, call in [
+            (IMPORT, "parallel_state.get_registered_process_groups()"),
+            ("from megatron.core import mpu\n", "mpu.get_registered_process_groups()"),
+            (
+                "from ..parallel_state import get_registered_process_groups as registered\n",
+                "registered()",
+            ),
+        ]:
+            with self.subTest(call=call):
+                self.assertEqual(
+                    self.hits(prefix + call),
+                    ["<module>:shim:parallel_state.get_registered_process_groups"],
+                )
+
+    def test_counts_only_the_deprecated_parallel_state_functions_as_accessors(self):
+        # A function that parallel_state does not deprecate is not an accessor or a function
+        # entry, even when the accessor naming rule matches it.
+        source = (REPO_ROOT / "megatron" / "core" / "parallel_state.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        retained = [
+            node.name
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and not any("_deprecated_accessor" in ast.unparse(d) for d in node.decorator_list)
+        ]
+        self.assertIn("get_registered_process_groups", retained)
+        counted = [
+            name
+            for name in retained
+            if checker._is_deprecated_accessor(name) or name in checker.DEPRECATED_FUNCTIONS
+        ]
+        self.assertEqual(counted, [])
+
+    def test_forbid_helpers_stub_the_accessors_and_the_registry_getter(self):
+        # The test helpers that forbid the global grid stub what _returns_global_groups selects:
+        # every deprecated accessor, and the registry getter, which returns the same groups.
+        source = (REPO_ROOT / "megatron" / "core" / "parallel_state.py").read_text(encoding="utf-8")
+        functions = [
+            node.name for node in ast.parse(source).body if isinstance(node, ast.FunctionDef)
+        ]
+        selected = {name for name in functions if checker._returns_global_groups(name)}
+        accessors = {name for name in functions if checker._is_deprecated_accessor(name)}
+        self.assertIn("get_tensor_model_parallel_group", accessors)
+        self.assertEqual(selected - accessors, {"get_registered_process_groups"})
+        self.assertEqual(checker.REGISTRY_GETTERS, {"get_registered_process_groups"})
 
     def test_flags_other_deprecated_functions(self):
         names = [

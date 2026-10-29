@@ -34,7 +34,8 @@ def _skip_unless_world_size_divisible_by(size):
 
 @contextlib.contextmanager
 def _forbid_global_process_groups():
-    """Make every parallel_state accessor that the process-group checker counts raise.
+    """Make every parallel_state accessor that the process-group checker counts, and the
+    registry getter, raise.
 
     The accessors are patched on parallel_state and wherever an imported megatron module bound
     them by name, and ProcessGroupCollection.use_mpu_process_groups() raises too.
@@ -42,7 +43,7 @@ def _forbid_global_process_groups():
     accessors = {
         name: value
         for name, value in vars(parallel_state).items()
-        if callable(value) and check_process_group_usage._is_deprecated_accessor(name)
+        if callable(value) and check_process_group_usage._returns_global_groups(name)
     }
 
     def forbidden(name):

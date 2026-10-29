@@ -398,7 +398,8 @@ def _rebind_in_megatron_modules(replacements):
 def forbid_global_process_groups(*, allow=(), forbid_shim=True, forbid_stage_predicates=True):
     """Make every read of the global parallel grid raise AssertionError inside the block.
 
-    Covers each parallel_state accessor that tools/check_process_group_usage.py counts, both on
+    Covers each parallel_state accessor that tools/check_process_group_usage.py counts, and the
+    registry getter get_registered_process_groups, which returns the same groups, both on
     parallel_state and wherever an imported megatron module bound it by name (for example
     `from megatron.core.parallel_state import get_tensor_model_parallel_group`). Calls made by
     parallel_state itself still work, so initialize_model_parallel, destroy_model_parallel,
@@ -408,18 +409,21 @@ def forbid_global_process_groups(*, allow=(), forbid_shim=True, forbid_stage_pre
     give the component a grid whose layout differs from the global one.
 
     Args:
-        allow: Names of accessors or stage predicates that may still be called.
+        allow: Names of accessors, of get_registered_process_groups or of stage predicates that
+            may still be called, for example by an entry point outside Megatron Core.
         forbid_shim: Also forbid `ProcessGroupCollection.use_mpu_process_groups()`. When False,
             code in process_groups_config.py (the shim and its fallbacks) may read the grid.
         forbid_stage_predicates: Also forbid `is_pipeline_first_stage` and
             `is_pipeline_last_stage`.
     """
     accessors = [
-        name for name in vars(ps) if check_process_group_usage._is_deprecated_accessor(name)
+        name for name in vars(ps) if check_process_group_usage._returns_global_groups(name)
     ]
     unknown = set(allow) - set(accessors) - set(_STAGE_PREDICATES)
     if unknown:
-        raise ValueError(f"not a parallel_state accessor or stage predicate: {sorted(unknown)}")
+        raise ValueError(
+            f"not a parallel_state accessor, registry getter or stage predicate: {sorted(unknown)}"
+        )
     names = accessors + list(_STAGE_PREDICATES if forbid_stage_predicates else ())
     originals = {name: vars(ps)[name] for name in names if name not in allow}
     # Code in these modules may read the grid, like the files the checker exempts.
