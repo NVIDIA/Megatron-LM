@@ -1837,6 +1837,8 @@ def build_process_group_collection(
         expt_dp_ag=None,
         intra_dp_cp=intra_dp_cp,
         intra_expt_dp=intra_expt_dp,
+        intra_dp_cp_gloo=intra_dp_cp_gloo,
+        intra_expt_dp_gloo=intra_expt_dp_gloo,
         inter_dist_opt=inter_dist_opt,
         intra_dist_opt=intra_dist_opt,
     )
