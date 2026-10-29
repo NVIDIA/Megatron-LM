@@ -119,7 +119,13 @@ class TestTensorModelParallelGroupIfNone:
         with warnings.catch_warnings(record=True) as record:
             warnings.simplefilter("always")
             ColumnParallelLinear(
-                8, 8, config=_config(), init_method=torch.nn.init.zeros_, bias=False
+                8,
+                8,
+                config=_config(),
+                init_method=torch.nn.init.zeros_,
+                bias=False,
+                # GTP is off: only the tensor-parallel group is omitted.
+                pg_collection=ProcessGroupCollection(gtp_remat=None, expt_gtp_remat=None),
             )
             copy_to_tensor_model_parallel_region(torch.ones(2, device="cuda"))
 

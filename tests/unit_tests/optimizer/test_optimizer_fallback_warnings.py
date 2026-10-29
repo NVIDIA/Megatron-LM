@@ -165,7 +165,7 @@ class TestDuplicateFilterFallbacks:
         ):
             with pytest.warns(ProcessGroupFallbackWarning) as record:
                 assert not param_is_not_gtp_duplicate(param)
-        resolve.assert_called_once_with(None, is_expert=is_expert)
+        resolve.assert_called_once_with(None, is_expert=is_expert, owner=None)
         (message,) = _fallback_messages(record)
         assert message.startswith(f"param_is_not_gtp_duplicate was called without `{argument}`")
         assert "deprecated since Megatron Core 0.21 and will be removed in 0.23" in message

@@ -603,8 +603,8 @@ def model_parallel_cuda_manual_seed(
             warn_global_process_group_fallback(
                 "model_parallel_cuda_manual_seed", deprecated_in="0.21", removed_in="0.23"
             )
-            gtp_remat_group = resolve_gtp_remat_group(None, is_expert=False)
-            egtp_remat_group = resolve_gtp_remat_group(None, is_expert=True)
+            gtp_remat_group = resolve_gtp_remat_group(None, is_expert=False, owner=None)
+            egtp_remat_group = resolve_gtp_remat_group(None, is_expert=True, owner=None)
     if tp_rank is None:
         tp_rank = get_pg_rank(tp_group)
     if ep_rank is None:
