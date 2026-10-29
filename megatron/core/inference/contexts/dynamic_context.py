@@ -912,7 +912,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # The FlashInfer MXFP8 token bound (inference_flashinfer_mxfp8_token_capacity) covers
         # the tokens of all EP ranks, so it is safe only when every EP rank is decoding. The
         # NVLS dispatcher it requires does not sync that across EP, so sync it per step.
-        self._sync_ep_decode_only = model_config.inference_flashinfer_mxfp8_token_capacity is not None
+        self._sync_ep_decode_only = (
+            model_config.inference_flashinfer_mxfp8_token_capacity is not None
+        )
         self._ep_decode_only = False
 
         # We only allow non-decode cuda graphs for the nvls dispatcher
