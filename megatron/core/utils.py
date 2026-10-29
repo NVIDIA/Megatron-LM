@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Utility functions used throughout Megatron core"""
 
@@ -57,15 +57,6 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-try:
-    # Register the TE CUDA kernels
-    import transformer_engine  # pylint: disable=unused-import
-
-    # Alias the PyTorch wrapper so we can call tex.* APIs
-    import transformer_engine_torch as tex
-except ImportError:
-    # TE isn’t installed or the torch wrapper is missing
-    tex = None
 
 try:
     _torch_version = PkgVersion(torch.__version__)
@@ -2604,6 +2595,8 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
         dict[str, torch.Tensor]: The batch with sequence-dimension tensors
         partitioned to this CP rank.
     """
+    from megatron.core.context_parallel.layout.partition import get_cp_partition_indices, partition_batch
+
     cp_size = torch.distributed.get_world_size(cp_group)
     cp_rank = torch.distributed.get_rank(cp_group)
 
@@ -2834,6 +2827,7 @@ def get_batch_on_this_cp_rank(
     dynamic_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]] = None,
     use_per_sequence_balancing: bool = False,
     use_contiguous_cp: bool = False,
+    cp_partition_mode: Optional[str] = None,
 ):
     """Dispatch batch partitioning across context-parallel ranks.
 
@@ -2863,6 +2857,9 @@ def get_batch_on_this_cp_rank(
             masking where document lengths are not divisible by
             ``2 * cp_size``).
         use_contiguous_cp (bool): Use contiguous sequence shards for the linear CP layout.
+        cp_partition_mode (Optional[str]): Compatibility spelling for the requested model-boundary
+            layout. When provided, ``"contiguous"`` selects contiguous shards and ``"zigzag"``
+            selects the standard balancing path.
 
     Returns:
         Dict[str, Any]: The batch with sequence-dimension tensors partitioned
@@ -2973,6 +2970,16 @@ def nvtx_range_pop(msg=None, suffix=None) -> None:
 
     # Pop NVTX range
     torch.cuda.nvtx.range_pop()
+
+
+@contextmanager
+def nvtx_range(msg=None, suffix=None):
+    """Create an NVTX range controlled by ``configure_nvtx_profiling``."""
+    nvtx_range_push(msg, suffix)
+    try:
+        yield
+    finally:
+        nvtx_range_pop(msg, suffix)
 
 
 @lru_cache(maxsize=None)

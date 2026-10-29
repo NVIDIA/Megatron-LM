@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import random
 from types import SimpleNamespace
@@ -501,15 +501,16 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
     try:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         # Create mock data iterator with variable-length sequences
+        sequence_lengths = [1024, 2048, 512, 1536, 3072]
+        assert (
+            sum(sequence_lengths) == args.seq_length
+        ), f"Sequence lengths sum {sum(sequence_lengths)} != total {args.seq_length}"
+
         # Only TP rank 0 needs the iterator; other TP ranks pass None
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
         if tp_rank == 0:
             # Use deterministic seed based on DP rank so same data within TP/PP/CP group
             dp_rank = parallel_state.get_data_parallel_rank()
-            sequence_lengths = [1024, 2048, 512, 1536, 3072]
-            assert (
-                sum(sequence_lengths) == args.seq_length
-            ), f"Sequence lengths sum {sum(sequence_lengths)} != total {args.seq_length}"
             data_iterator = iter(
                 MockVariableLengthSequencePackingDataIterator(
                     total_seq_length=args.seq_length,
@@ -631,6 +632,33 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
                 assert (
                     actual_seq_len == expected_seq_len
                 ), f"CP partitioned tokens have wrong shape: {actual_seq_len} != {expected_seq_len}"
+
+                full_position_ids = torch.cat(
+                    [
+                        torch.arange(length, device=position_ids.device)
+                        for length in sequence_lengths
+                    ]
+                )
+                if cp_partition_mode == "contiguous":
+                    expected_position_ids = full_position_ids[
+                        cp_rank * expected_seq_len : (cp_rank + 1) * expected_seq_len
+                    ]
+                else:
+                    expected_chunks = []
+                    sequence_start = 0
+                    for length in sequence_lengths:
+                        chunk_length = length // (2 * cp)
+                        front_start = sequence_start + cp_rank * chunk_length
+                        back_start = sequence_start + (2 * cp - cp_rank - 1) * chunk_length
+                        expected_chunks.append(
+                            full_position_ids[front_start : front_start + chunk_length]
+                        )
+                        expected_chunks.append(
+                            full_position_ids[back_start : back_start + chunk_length]
+                        )
+                        sequence_start += length
+                    expected_position_ids = torch.cat(expected_chunks)
+                torch.testing.assert_close(position_ids.squeeze(0), expected_position_ids)
 
             # Verify labels only if all CP ranks are at last stage
             if is_last_stage:

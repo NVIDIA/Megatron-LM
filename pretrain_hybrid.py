@@ -23,7 +23,11 @@ import torch
 
 from hybrid_builders import hybrid_builder
 from megatron.core import mpu
-from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_this_cp_rank
+from megatron.core.context_parallel import (
+    ContextParallelBatch,
+    finalize_packed_seq_params,
+    get_batches_on_this_cp_rank,
+)
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -210,7 +214,7 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
     if cp_size > 1 and config.linear_cp_layout != config.attention_cp_layout:
         additional_layouts.add(config.attention_cp_layout)
     return get_batches_on_this_cp_rank(
-        batch,
+        batch=batch,
         boundary_layout=config.linear_cp_layout,
         dynamic_cp=False,
         cp_group=get_context_parallel_group(),
@@ -545,8 +549,8 @@ if __name__ == "__main__":
     # so its mere presence is a compatible fallback signal for an agent that predates NVRX_CYCLE.
     _NVRX_CYCLE_START = _env_float('NVRX_CYCLE_START_TIME')
     _IS_NVRX_RESTART = (
-        (_NVRX_CYCLE not in ('', '0') and _NVRX_CYCLE.isdigit()) or _NVRX_CYCLE_START is not None
-    )
+        _NVRX_CYCLE not in ('', '0') and _NVRX_CYCLE.isdigit()
+    ) or _NVRX_CYCLE_START is not None
     if _NVRX_LAUNCH_TIME is not None:
         _LAUNCH_SCRIPT_PRESRUN_TIME = None
         if _IS_NVRX_RESTART:
