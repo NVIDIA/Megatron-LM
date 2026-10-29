@@ -619,7 +619,11 @@ class MultiLatentAttention(Attention):
             )
 
         # We are doing absorption with cache mla latents and decode mode.
-        if self.cache_mla_latents and inference_context.is_decode_only():
+        if (
+            self.cache_mla_latents
+            and inference_context is not None
+            and inference_context.is_decode_only()
+        ):
             # core_attn_out = self.self.up_v_layer(core_attn_out)
             core_attn_out = torch.einsum("sbhc,hdc->sbhd", core_attn_out, self.up_v_weight)
             core_attn_out = core_attn_out.contiguous()
@@ -1102,8 +1106,13 @@ class MLASelfAttention(MultiLatentAttention):
                 # q: [num_tokens, n, q_head_dim]
                 q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
 
+            # With cached latents, prepare_for_absorption has replaced linear_kv_up_proj by its
+            # linear part; kv_layernorm above applied the norm.
+            kv_up_proj = (
+                self.linear_kv_up_proj_linear if self.cache_mla_latents else self.linear_kv_up_proj
+            )
             # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
-            kv, _ = self.linear_kv_up_proj(_up_proj_input(self.linear_kv_up_proj, kv_compressed))
+            kv, _ = kv_up_proj(_up_proj_input(kv_up_proj, kv_compressed))
 
             # kv: [num_tokens, n, (qk_head_dim + v_head_dim)]
             kv = kv.view(
@@ -1265,14 +1274,16 @@ class MLASelfAttention(MultiLatentAttention):
                 qkv_up_proj_and_rope_apply, q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
             )
         else:
-            if self.cache_mla_latents:
+            if self.cache_mla_latents and inference_context is not None:
                 assert (
-                    inference_context and not inference_context.is_static_batching()
+                    not inference_context.is_static_batching()
                 ), "Caching MLA latents only works with dynamic backend inference"
                 query, key, value = qkv_up_proj_and_rope_apply_for_cached_latent_kv(
                     q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
                 )
             else:
+                # A forward without an inference context, such as an MTP draft step, has no
+                # latent cache to attend over: it runs the unabsorbed attention training uses.
                 query, key, value = qkv_up_proj_and_rope_apply(
                     q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
                 )
