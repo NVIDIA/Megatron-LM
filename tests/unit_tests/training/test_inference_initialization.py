@@ -11,6 +11,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.training import arguments, global_vars, initialize
 from megatron.training.argument_utils import inference_cfg_container_from_args
@@ -51,12 +52,20 @@ def test_generate_samples_uses_inference_startup(monkeypatch, load_checkpoint, c
     ):
         calls[name] = Mock()
         monkeypatch.setattr(script, name, calls[name])
-    monkeypatch.setattr(script, "get_model", Mock(return_value=[model]))
+    get_model = Mock(return_value=[model])
+    monkeypatch.setattr(script, "get_model", get_model)
+    registered = ProcessGroupCollection()
+    monkeypatch.setattr(parallel_state, "_REGISTERED_PROCESS_GROUPS", registered)
 
     script.main()
 
     calls["set_run_config"].assert_called_once_with(cfg)
     calls["initialize_megatron"].assert_called_once_with()
+    get_model.assert_called_once_with(
+        script.model_provider, wrap_with_ddp=False, pg_collection=registered
+    )
+    # Equal collections need not be the same one; main() must pass the registered object.
+    assert get_model.call_args.kwargs["pg_collection"] is registered
     if load_checkpoint:
         calls["load_checkpoint"].assert_called_once_with([model], None, None)
     else:
