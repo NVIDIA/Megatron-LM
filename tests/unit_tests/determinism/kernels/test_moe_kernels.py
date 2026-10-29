@@ -1276,29 +1276,40 @@ class TestMoEModules:
         not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
         reason="MXFP8 parameter storage needs Blackwell",
     )
-    @pytest.mark.parametrize("backend", ["VLLM", "FLASHINFER"])
+    @pytest.mark.parametrize("backend", ["vllm", "flashinfer_cutlass", "flashinfer_routed"])
     def test_mxfp8_expert_weight_build_replays(self, backend):
-        """vLLM canonical stacks and FlashInfer write-through routed stacks build bit-exactly."""
+        """Canonical, CUTLASS and write-through routed expert stacks build bit-exactly."""
         from types import SimpleNamespace
 
         from megatron.core.inference.moe import InferenceGroupedGemmBackend
-        from megatron.core.inference.moe.flashinfer_mxfp8 import HAVE_FLASHINFER_ROUTED_MXFP8
-
-        if backend == "FLASHINFER" and not HAVE_FLASHINFER_ROUTED_MXFP8:
-            pytest.skip("needs FlashInfer routed MXFP8")
+        from megatron.core.inference.moe.flashinfer_mxfp8 import (
+            HAVE_FLASHINFER_CUTLASS_MXFP8,
+            HAVE_FLASHINFER_ROUTED_MXFP8,
+        )
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
         from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+        if backend == "flashinfer_cutlass" and not HAVE_FLASHINFER_CUTLASS_MXFP8:
+            pytest.skip("requires FlashInfer CUTLASS MXFP8")
+        if backend == "flashinfer_routed" and not HAVE_FLASHINFER_ROUTED_MXFP8:
+            pytest.skip("requires FlashInfer routed MXFP8")
 
         class GroupedMLPStub:
             _stack_mxfp8_linear_weight = InferenceGroupedMLP._stack_mxfp8_linear_weight
 
         seeded()
-        weights = tuple(torch.randn(64, 128, device="cuda", dtype=torch.bfloat16) for _ in range(4))
+        weights = tuple(
+            torch.randn(128, 128, device="cuda", dtype=torch.bfloat16) for _ in range(4)
+        )
 
         def build_stacks(*bf16_weights):
             grouped = GroupedMLPStub()
             grouped.num_local_experts = 2
-            grouped.inference_grouped_gemm_backend = InferenceGroupedGemmBackend[backend]
+            grouped.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.from_config(
+                backend.split("_")[0]
+            )
+            # A clamp selects FlashInfer CUTLASS; without one FlashInfer uses the routed kernel.
+            grouped._activation_clamp_scale = None if backend == "flashinfer_routed" else 16.0
             grouped.linear_fc1 = SimpleNamespace()
             grouped.linear_fc2 = SimpleNamespace()
             for linear, offset in ((grouped.linear_fc1, 0), (grouped.linear_fc2, 2)):
@@ -1398,6 +1409,12 @@ class TestMoEModules:
             pytest.param(
                 "alltoall",
                 1,
+                {"moe_shared_expert_intermediate_size": 2048},
+                id="alltoall-native-shared-expert",
+            ),
+            pytest.param(
+                "alltoall",
+                1,
                 {
                     "moe_num_hash_layers": 1,
                     "hash_moe_vocab_size": 128,
@@ -1471,3 +1488,28 @@ class TestMoEModules:
                 )
             finally:
                 torch.utils.deterministic.fill_uninitialized_memory = prev_fill
+
+    def test_alltoall_dispatcher_releases_router_probs_after_forward(self):
+        """combine_preprocess drops ``self.probs`` so it does not pin the recompute graph.
+
+        The all-to-all dispatcher sets ``self.probs`` during dispatch and clears it at the end
+        of ``combine_preprocess`` (the last consumer of router probs). After a forward pass the
+        reference must be gone, otherwise the recomputed MoE forward graph is retained until the
+        next iteration.
+        """
+        self._init(ep=1)
+        seeded()
+        config = _moe_config(moe_token_dispatcher_type="alltoall", expert_model_parallel_size=1)
+        if not HAVE_TE:
+            config.moe_grouped_gemm = False
+            mlp_spec = get_gpt_layer_local_submodules(num_experts=8, moe_grouped_gemm=False).mlp
+        else:
+            mlp_spec = get_gpt_layer_with_transformer_engine_spec(
+                num_experts=8, moe_grouped_gemm=True
+            ).submodules.mlp
+        layer = MoELayer(config, get_submodules(mlp_spec)).cuda()
+        layer.set_layer_number(0)
+        hidden = torch.randn(2048, 2, 1024, device="cuda", dtype=torch.bfloat16)
+        with deterministic_algorithms(True):
+            layer(hidden)
+        assert layer.token_dispatcher.probs is None
