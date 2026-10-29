@@ -64,6 +64,11 @@ class HybridModelConfig(ModelConfig):
     hybrid_override_pattern: str | None = None
     hybrid_layer_pattern: str | None = None
     hybrid_layer_config_list: Sequence[HybridLayerEntry] | None = None
+    """Python-defined layers and split markers, mutually exclusive with a pattern.
+
+    Forwarded unchanged to Core and recorded in run-config metadata. Model construction
+    still uses the supplied Python definition when resuming from a checkpoint.
+    """
     seq_length: int = 8192
     # HybridModel with no attention has no need for position embeddings, so none is default
     position_embedding_type: Literal["learned_absolute", "rope", "none"] = "none"
@@ -121,18 +126,6 @@ class HybridModelConfig(ModelConfig):
 
         if hasattr(self.transformer, "finalize") and callable(self.transformer.finalize):
             self.transformer.finalize()
-
-    @override
-    def as_dict(self) -> dict[str, Any]:
-        """Serialize scalar model metadata without the Python-defined architecture list.
-
-        Config-list architectures are reconstructed from their supplied Python definition on
-        resume. Keeping the list out of run-config metadata also avoids converting its config
-        objects and split sentinels into an intermediate serialized representation.
-        """
-        result = super().as_dict()
-        result.pop("hybrid_layer_config_list", None)
-        return result
 
 
 def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:

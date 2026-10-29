@@ -90,5 +90,7 @@ Additional arguments are forwarded to Megatron after the launch defaults.
 `CHECKPOINT_PATH`, `DATA_CACHE_PATH`, and `TENSORBOARD_PATH` may also be overridden
 individually. Normal resume restores optimizer and RNG state; the Python config
 list is reconstructed by `puzzle.py`, not serialized into checkpoint arguments.
+The ordered layer configs and split markers are recorded in run-config metadata
+for inspection; they do not replace the supplied Python definition on resume.
 Keep the architecture unchanged when resuming. Changes to topology, sequence
 length, or batch size require their own memory/compatibility validation.
