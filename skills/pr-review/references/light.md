@@ -26,11 +26,25 @@ this file → applicable style guidance → review).
     `parallel_state` functions, `use_mpu_process_groups()`,
     `get_registered_process_groups()` or the guarded helpers of
     `process_groups_config.py`, such as `resolve_process_groups()`, unless the
-    call replaces an existing read in the same function
-  - Outside `megatron/core` and the tests, including `megatron/training`, flag
-    a deprecated call or `use_mpu_process_groups()` that is not in a
-    `global_process_group_fallback()` block or in bootstrap code that ignores
-    `ParallelStateDeprecationWarning`
+    call replaces an existing read in the same function, and any use of a
+    private `parallel_state` attribute
+  - Outside `megatron/core` and the unit tests, including `megatron/training`
+    and the functional tests, flag a deprecated call or
+    `use_mpu_process_groups()` that is not in a
+    `global_process_group_fallback()` block or in bootstrap code, in a
+    `warnings.catch_warnings()` block whose body calls
+    `warnings.simplefilter("ignore", ParallelStateDeprecationWarning)` (or the
+    matching `warnings.filterwarnings()`), after reporting the call itself: a
+    statement that is only a call of
+    `warnings.warn(..., ParallelStateDeprecationWarning)` or
+    `warn_global_process_group_fallback()` comes before the `with`, in the
+    block that holds it or in a block that contains that block, of the same
+    function (of the module for module-level code); a warning inside an
+    earlier branch, loop or `with`, or inside the `catch_warnings()` block,
+    does not count. Also flag any use of a private `parallel_state`
+    attribute, and any memory-buffer alias taken from `parallel_state`
+    (`_set_global_memory_buffer()` included): the buffer comes from
+    `megatron.core.utils`
   - Prefer passing a `ProcessGroupCollection` or explicit
     `torch.distributed.ProcessGroup` from the caller
 - GPU kernel changes without a determinism test

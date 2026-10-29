@@ -77,23 +77,36 @@ in `docs/developer/parallel-state-deprecation.md`.
   grid as findings: added calls of the deprecated `parallel_state` functions,
   of `ProcessGroupCollection.use_mpu_process_groups()` or
   `parallel_state.get_registered_process_groups()`, and of the guarded helpers
-  of `process_groups_config.py`, such as `resolve_process_groups()`. A new
-  fallback is a finding even when it warns, unless it replaces an existing
-  read in the same function. The code should receive a
-  `ProcessGroupCollection` or explicit `torch.distributed.ProcessGroup` from
-  its caller.
+  of `process_groups_config.py`, such as `resolve_process_groups()`, and any
+  use of a private `parallel_state` attribute. A new fallback is a finding
+  even when it warns, unless it replaces an existing read in the same
+  function. The code should receive a `ProcessGroupCollection` or explicit
+  `torch.distributed.ProcessGroup` from its caller.
 - Outside `megatron/core`, in `megatron/training` and the rest of `megatron/`,
-  `examples/`, `tools/`, `tasks/`, `scripts/`, `docs/` and the top-level
-  scripts, flag a call of a deprecated function or of `use_mpu_process_groups()`
-  that is not in a `global_process_group_fallback()` block or in bootstrap code
-  that ignores `ParallelStateDeprecationWarning` in a
-  `warnings.catch_warnings()` block.
+  `examples/`, `tools/`, `tasks/`, `scripts/`, `docs/`,
+  `tests/functional_tests/` and the top-level scripts, flag a call of a
+  deprecated function or of `use_mpu_process_groups()` that is not in a
+  `global_process_group_fallback()` block or in bootstrap code, in a
+  `warnings.catch_warnings()` block whose body calls
+  `warnings.simplefilter("ignore", ParallelStateDeprecationWarning)` (or the
+  matching `warnings.filterwarnings()`), after reporting the call itself: a
+  statement that is only a call of
+  `warnings.warn(..., ParallelStateDeprecationWarning)` or
+  `warn_global_process_group_fallback()` comes before the `with`, in the
+  block that holds it or in a block that contains that block, of the same
+  function (of the module for module-level code); a warning inside an earlier
+  branch, loop or `with`, or inside the `catch_warnings()` block, does not
+  count. Flag any use of a private `parallel_state` attribute there too, and
+  any memory-buffer alias taken from `parallel_state`
+  (`_set_global_memory_buffer()` included): the buffer comes from
+  `megatron.core.utils`, and `tests/unit_tests/test_global_memory_buffer_imports.py`
+  rejects the aliases even in a fallback.
 - A fallback reads the grid only through the warned helpers of
   `process_groups_config.py`, dated 0.21 and 0.23 by default; a comment does
   not make a read a fallback.
 - Do not flag `megatron/core/parallel_state.py`,
-  `megatron/core/process_groups_config.py`, or tests, which may use the global
-  grid.
+  `megatron/core/process_groups_config.py`, or the unit tests, which may use
+  the global grid.
 
 ### Mandatory check: unused new variables / arguments
 
