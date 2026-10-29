@@ -1212,6 +1212,8 @@ def validate_args(args, defaults={}):
             "including GTP sequence shards."
 
     if getattr(args, 'dataloader_inter_document_masking', False):
+        assert args.context_parallel_size == 1, \
+            "--dataloader-inter-document-masking is not supported with --context-parallel-size > 1"
         # The dataset omits attention_mask when inter-document masking is
         # enabled; disable the flag to avoid a TP broadcast mismatch.
         if args.create_attention_mask_in_dataloader:

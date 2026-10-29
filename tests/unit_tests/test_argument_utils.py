@@ -294,6 +294,15 @@ def test_moe_norm_flag_requires_latent_size(monkeypatch):
         validate_args(args)
 
 
+def test_inter_document_masking_requires_cp1(monkeypatch):
+    args = _minimal_training_args(monkeypatch)
+    args.world_size = 2
+    args.context_parallel_size = 2
+    args.dataloader_inter_document_masking = True
+    with pytest.raises(AssertionError, match="inter-document-masking is not supported"):
+        validate_args(args)
+
+
 @pytest.mark.parametrize(
     ("overrides", "error"),
     [
