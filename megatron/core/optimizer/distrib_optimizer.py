@@ -3408,28 +3408,23 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def start_param_sync_for_bucket_group_subset(self) -> None:
         """Trigger ``start_param_sync`` on DistOpt-managed bucket groups only.
 
-        Walks each model chunk's DDP bucket groups and skips those tagged
-        ``is_managed_by_layer_wise_optimizer=True`` (so a sibling
-        :class:`LayerWiseDistributedOptimizer` does not double-sync the same
-        buckets). When no LayerWise tagging is present every bucket group is
-        included — matching the previous ``model_chunk.start_param_sync()``
-        behaviour. Uses :meth:`DistributedDataParallel._start_bucket_group_param_sync`
+        Walks each model chunk's DDP bucket groups and selects only buckets
+        from this optimizer's buffers. Dense, expert, and LayerWise siblings
+        must not publish each other's parameters before their updates complete.
+        Uses :meth:`DistributedDataParallel._start_bucket_group_param_sync`
         so FP8 post-all-gather processing (and MXFP8 copy) still runs.
         """
-        # Deferred import: layer_wise_optimizer's compute_full_param_layout
-        # lazily imports DistributedOptimizer, so importing the helper at
-        # module load here would create a cycle.
-        from .layer_wise_optimizer import _bucket_is_managed_by_layer_wise_optimizer
-
+        if self.is_stub_optimizer:
+            return
+        # A model chunk may have distinct dense, expert, and LayerWise owners.
+        # Gathering another optimizer's buckets before it has stepped publishes
+        # stale parameters and may prevent its later gather from being dispatched.
+        owned_buckets = {id(bucket) for buffer in self.buffers for bucket in buffer.buckets}
         for model_chunk in self.model_chunks:
             for bucket_group in (
                 model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
             ):
-                if not bucket_group.buckets:
-                    continue
-                if _bucket_is_managed_by_layer_wise_optimizer(
-                    bucket_group.buckets[0], default_for_untagged=False
-                ):
+                if not bucket_group.buckets or id(bucket_group.buckets[0]) not in owned_buckets:
                     continue
                 model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
 
