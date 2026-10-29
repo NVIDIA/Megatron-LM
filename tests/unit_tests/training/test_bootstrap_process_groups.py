@@ -9,8 +9,8 @@ parallel_state accessors. The collection must be the one that use_mpu_process_gr
 field by field. These tests compare the two on the standard grid, on collections that a framework
 registers, and on grids set up without the registry, where bootstrap still reads the global grid,
 now with a deprecation warning. They also cover the all-gather groups of
---create-all-gather-group, which are built from the collection in any rank order, and the
-deprecation of the overrides that --lazy-mpu-init sets.
+--create-all-gather-group, which are built from the collection in any rank order, the timeout
+update of the run's groups, and the deprecation of the overrides that --lazy-mpu-init sets.
 """
 
 import dataclasses
@@ -26,8 +26,10 @@ import pytest
 import torch
 
 from megatron.core import parallel_state, process_groups_config
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.parallel_state import ParallelStateDeprecationWarning
 from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
     ProcessGroupFallbackWarning,
     enable_strict_process_group_fallbacks,
@@ -561,3 +563,75 @@ class TestStandardGrid:
             assert torch.distributed.get_process_group_ranks(
                 all_gather_group
             ) == torch.distributed.get_process_group_ranks(group)
+
+    @pytest.mark.parametrize("multi_module", [False, True])
+    def test_timeout_update_reaches_the_groups_of_the_collection(self, monkeypatch, multi_module):
+        """Groups that parallel_state did not create are updated through the run's collection."""
+        Utils.initialize_model_parallel()
+        registered = parallel_state.get_registered_process_groups()
+        # A framework's group, created without parallel_state.create_group().
+        world = list(range(torch.distributed.get_world_size()))
+        framework_group = torch.distributed.new_group(ranks=world)
+        pg_collection = ProcessGroupCollection(
+            tp=registered.tp, dp=framework_group, hcp=[framework_group, registered.cp]
+        )
+        if multi_module:
+            pg_collection = MultiModuleProcessGroupCollection(
+                module_pgs={
+                    "encoder": ProcessGroupCollection(cp=registered.cp),
+                    "llm": pg_collection,
+                },
+                language_model_module_name="llm",
+            )
+        updated = []
+        monkeypatch.setattr(
+            torch.distributed.distributed_c10d,
+            "_set_pg_timeout",
+            lambda timeout, group: updated.append(group),
+        )
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+        created = list(parallel_state._global_process_group_list)
+
+        try:
+            parallel_state.update_pg_timeout(timedelta(minutes=7))
+            assert updated == created
+
+            updated.clear()
+            parallel_state.update_pg_timeout(timedelta(minutes=7), pg_collection=pg_collection)
+            # Each group once: the created ones, then the framework's.
+            assert updated == created + [framework_group]
+        finally:
+            torch.distributed.destroy_process_group(framework_group)
+
+    @pytest.mark.parametrize("multi_module", [False, True])
+    def test_timeout_update_reaches_a_grid_that_a_framework_built(self, monkeypatch, multi_module):
+        """A run whose groups a framework built, as a multi-module run's HyperCommGrid does,
+        created no group with parallel_state.create_group()."""
+        _require_divisible(2)
+        Utils.initialize_distributed()
+        monkeypatch.setattr(parallel_state, "_global_process_group_list", None)
+        grid = HyperCommGrid([2, torch.distributed.get_world_size() // 2], ["tp", "dp"])
+        tp, dp = grid.create_pg("tp"), grid.create_pg("dp")
+        pg_collection = ProcessGroupCollection(tp=tp, dp=dp)
+        if multi_module:
+            pg_collection = MultiModuleProcessGroupCollection(
+                module_pgs={"llm": pg_collection}, language_model_module_name="llm"
+            )
+        updated = []
+        monkeypatch.setattr(
+            torch.distributed.distributed_c10d,
+            "_set_pg_timeout",
+            lambda timeout, group: updated.append(group),
+        )
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+
+        try:
+            parallel_state.update_pg_timeout(timedelta(minutes=7))
+            # None is the default process group.
+            assert updated == [None]
+
+            updated.clear()
+            parallel_state.update_pg_timeout(timedelta(minutes=7), pg_collection=pg_collection)
+            assert updated == [None, tp, dp]
+        finally:
+            grid.destroy()

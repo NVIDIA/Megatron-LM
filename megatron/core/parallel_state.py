@@ -14,7 +14,7 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -36,7 +36,10 @@ except ImportError:
     HAVE_EINOPS = False
 
 if TYPE_CHECKING:
-    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.process_groups_config import (
+        MultiModuleProcessGroupCollection,
+        ProcessGroupCollection,
+    )
 
 # The accessors of the global grid, its rank and size overrides, the virtual-pipeline state and
 # the memory-buffer aliases are deprecated in Megatron Core 0.21 and removed two releases later,
@@ -407,15 +410,29 @@ def get_nccl_options(pg_name, nccl_comm_cfgs):
 
 
 def update_pg_timeout(
-    timeout: timedelta, pg: Optional[torch._C._distributed_c10d.ProcessGroup] = None
+    timeout: timedelta,
+    pg: Optional[torch._C._distributed_c10d.ProcessGroup] = None,
+    pg_collection: Optional[
+        Union["ProcessGroupCollection", "MultiModuleProcessGroupCollection"]
+    ] = None,
 ):
     """Update the timeout for all process groups or a specific process group.
        Synchronize the process groups before updating the timeout.
+
+    With create_group() and destroy_model_parallel(), this function manages the lifetime of the
+    process groups that this module creates. It reads no parallel grid and is not deprecated.
+
     Args:
         timeout(datetime.timedelta): The timeout to set for the process group(s)
         pg(Optional[torch._C._distributed_c10d.ProcessGroup], default=None):
             The process group to update the timeout for.
-            If None, all process groups are updated.
+            If None, all process groups are updated: the default process group and every group
+            created with create_group(), which include the groups that
+            initialize_model_parallel() and build_process_group_collection() build.
+        pg_collection (ProcessGroupCollection or MultiModuleProcessGroupCollection, optional):
+            When pg is None, the groups of this collection are updated as well, including those
+            that were not created with create_group(), such as the groups of a grid that a
+            framework built itself. Each group is updated once.
     """
     if hasattr(torch.distributed.distributed_c10d, "_set_pg_timeout"):
         torch.distributed.barrier(pg)
@@ -423,7 +440,12 @@ def update_pg_timeout(
         try:
             if pg is None:
                 global _global_process_group_list
-                for group in _global_process_group_list:
+                # None stands for the default process group, which create_group() records first;
+                # a run whose groups a framework built may not have called create_group() at all.
+                created_groups = _global_process_group_list or [None]
+                for group in created_groups:
+                    torch.distributed.distributed_c10d._set_pg_timeout(timeout, group)
+                for group in _other_process_groups(pg_collection, created_groups):
                     torch.distributed.distributed_c10d._set_pg_timeout(timeout, group)
             else:
                 torch.distributed.distributed_c10d._set_pg_timeout(timeout, pg)
@@ -435,6 +457,38 @@ def update_pg_timeout(
             raise e
 
 
+def _other_process_groups(pg_collection, known_groups):
+    """Return each process group of pg_collection that is not in known_groups, once.
+
+    The groups are the collection's fields, the groups of its list and dictionary fields, and,
+    for a MultiModuleProcessGroupCollection, those of each module's collection.
+    """
+    # Imported here because process_groups_config imports this module.
+    from megatron.core.process_groups_config import MultiModuleProcessGroupCollection
+
+    if pg_collection is None:
+        return []
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        collections = list(pg_collection.values())
+    else:
+        collections = [pg_collection]
+    seen = {id(group) for group in known_groups}
+    groups = []
+    for collection in collections:
+        for value in vars(collection).values():
+            if isinstance(value, dict):
+                members = list(value.values())
+            elif isinstance(value, list):
+                members = value
+            else:
+                members = [value]
+            for group in members:
+                if isinstance(group, torch.distributed.ProcessGroup) and id(group) not in seen:
+                    seen.add(id(group))
+                    groups.append(group)
+    return groups
+
+
 def create_group(
     ranks=None,
     timeout=None,
@@ -443,7 +497,13 @@ def create_group(
     use_local_synchronization=False,
     group_desc=None,
 ):
-    """Creates a ProcessGroup."""
+    """Create a process group and record it for update_pg_timeout() and destroy_model_parallel().
+
+    Every group that this module builds is created with this function, which passes its
+    arguments to torch.distributed.new_group(). With update_pg_timeout() and
+    destroy_model_parallel(), it manages the lifetime of the process groups that this module
+    creates. It reads no parallel grid and is not deprecated.
+    """
     kwargs = {
         "ranks": ranks,
         "timeout": timeout,
