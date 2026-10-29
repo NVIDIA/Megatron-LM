@@ -23,6 +23,9 @@ from tests.unit_tests.test_utilities import Utils
 @pytest.fixture
 def device():
     """Use the device selected by the distributed unit-test launcher."""
+    # Bind this rank's GPU first. Fixtures that build process groups, like vision_cp_group, run
+    # after this one, and before the binding every rank's current device is cuda:0.
+    Utils.initialize_distributed()
     return torch.device("cuda", torch.cuda.current_device())
 
 
