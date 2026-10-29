@@ -1,9 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Exact histogram top-k using public CuTe DSL operations, without custom PTX."""
+
+"""Exact CuTe DSL top-k with Triton radix fallback and long-context chunk merging."""
+
+import math
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
+import torch
+import triton
+import triton.language as tl
 from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import from_dlpack
 
@@ -254,3 +260,186 @@ def _compile_kernel(scores, lengths, output, flags):
     return cute.compile(
         topk, *(from_dlpack(t) for t in (scores, lengths, output, flags)), cuda.CUstream(0)
     )
+
+
+@triton.jit
+def radix_topk(Scores, Lengths, Indices, WIDTH: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr):
+    """Select exact ordered float keys, resolving cutoff ties by position."""
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    length = tl.minimum(tl.load(Lengths + row), WIDTH)
+    valid = offsets < length
+    values = tl.load(Scores + row * WIDTH + offsets, mask=valid, other=float("-inf"))
+    bits = values.to(tl.uint32, bitcast=True)
+    ordered = bits ^ tl.where((bits & 0x80000000) != 0, 0xFFFFFFFF, 0x80000000).to(tl.uint32)
+    active = valid
+    remaining = tl.minimum(K, length)
+    prefix = tl.full((), 0, tl.uint32)
+    bins = tl.arange(0, 256)
+    for shift in tl.static_range(24, -1, -8):
+        digits = ((ordered >> shift) & 255).to(tl.int32)
+        counts = tl.histogram(tl.where(active, digits, 256), 256)
+        cumulative = tl.cumsum(counts, 0, reverse=True)
+        crossing = tl.max(tl.where(cumulative >= remaining, bins, -1), 0)
+        above = tl.sum(tl.where(bins > crossing, counts, 0), 0)
+        remaining -= above
+        active &= digits == crossing
+        prefix |= crossing.to(tl.uint32) << shift
+    greater = valid & (ordered > prefix)
+    equal = valid & (ordered == prefix)
+    count = tl.sum(greater.to(tl.int32), 0)
+    equal_rank = tl.cumsum(equal.to(tl.int32), 0)
+    selected = greater | (equal & (equal_rank <= tl.minimum(K, length) - count))
+    rank = tl.cumsum(selected.to(tl.int32), 0) - 1
+    slots = tl.arange(0, K)
+    tl.store(Indices + row * K + slots, -1)
+    tl.debug_barrier()
+    tl.store(Indices + row * K + rank, offsets, mask=selected & (rank < K))
+
+
+@triton.jit
+def fallback_if_needed(
+    Scores, Lengths, Indices, Flags, WIDTH: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr
+):
+    """Repair only rows rejected by the CuTe histogram fast path."""
+    if tl.load(Flags + tl.program_id(0)):
+        radix_topk(Scores, Lengths, Indices, WIDTH, K, BLOCK)
+
+
+class CuteTopK:
+    """Compile a bounded CuTe selection launch with preallocated exact fallback storage."""
+
+    def __init__(
+        self, scores: torch.Tensor, lengths: torch.Tensor, output: torch.Tensor, flags: torch.Tensor
+    ) -> None:
+        self.scores, self.lengths, self.output, self.flags = (scores, lengths, output, flags)
+        self.arguments = tuple(from_dlpack(t) for t in (scores, lengths, output, flags))
+        self.compiled = _compile_kernel(scores, lengths, output, flags)
+
+    def __call__(self) -> None:
+        """Run the prepared CuTe selection and conditional exact fallback."""
+        self.compiled(*self.arguments, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+        fallback_if_needed[(self.scores.shape[0],)](
+            self.scores,
+            self.lengths,
+            self.output,
+            self.flags,
+            WIDTH=self.scores.shape[1],
+            K=self.output.shape[1],
+            BLOCK=triton.next_power_of_2(self.scores.shape[1]),
+            num_warps=16,
+            enable_fp_fusion=False,
+        )
+
+
+@triton.jit
+def chunk_lengths(Lengths, Local, Candidate, CHUNKS: tl.constexpr, K: tl.constexpr):
+    """Compute each bounded row length and its exact candidate-union size."""
+    row = tl.program_id(0)
+    n = tl.load(Lengths + row)
+    total = tl.full((), 0, tl.int32)
+    for chunk in tl.static_range(CHUNKS):
+        length = tl.minimum(tl.maximum(n - chunk * 65536, 0), 65536)
+        tl.store(Local + row * CHUNKS + chunk, length)
+        total += tl.minimum(length, K)
+    tl.store(Candidate + row, total)
+
+
+@triton.jit
+def gather_candidates(
+    Scores, Local, Candidates, WIDTH: tl.constexpr, CHUNKS: tl.constexpr, K: tl.constexpr
+):
+    """Gather original scores for the union of disjoint chunk-local top-k supports."""
+    row = tl.program_id(0)
+    chunk = tl.program_id(1)
+    slots = tl.arange(0, K)
+    index = tl.load(Local + (row * CHUNKS + chunk) * K + slots)
+    value = tl.load(Scores + row * WIDTH + chunk * 65536 + index, index >= 0, float("-inf"))
+    tl.store(Candidates + (row * CHUNKS + chunk) * K + slots, value)
+
+
+@triton.jit
+def remap(Local, Selected, Out, CHUNKS: tl.constexpr, K: tl.constexpr):
+    """Map selected candidate slots back to logical key positions."""
+    row = tl.program_id(0)
+    slots = tl.arange(0, K)
+    selected = tl.load(Selected + row * K + slots)
+    local = tl.load(Local + row * CHUNKS * K + selected, selected >= 0, -1)
+    tl.store(
+        Out + row * K + slots,
+        tl.where((selected >= 0) & (local >= 0), selected // K * 65536 + local, -1),
+    )
+
+
+class CuteTopKWorkspace:
+    """Use disjoint bounded row chunks, then exact top-k of their union.
+
+    The score stride must include complete 65536-element chunks for long contexts.
+    Every buffer and CuTe launch is prepared before graph capture.
+    """
+
+    def __init__(self, scores: torch.Tensor, lengths: torch.Tensor, indices: torch.Tensor) -> None:
+        self.batch, self.width = scores.shape
+        self.k = indices.shape[1]
+        self.chunks = math.ceil(self.width / 65536)
+        self.indices = indices
+        self.lengths = lengths
+        self.scores = scores
+        if self.chunks == 1:
+            self.flags = torch.empty(self.batch, device=scores.device, dtype=torch.int32)
+            self.select = CuteTopK(scores, lengths, indices, self.flags)
+        else:
+            if self.width % 65536:
+                raise ValueError(
+                    "Long-context score stride must be padded to complete 65536-element chunks"
+                )
+            self.local_lengths = torch.empty(
+                self.batch * self.chunks, device=scores.device, dtype=torch.int32
+            )
+            self.candidate_lengths = torch.empty(
+                self.batch, device=scores.device, dtype=torch.int32
+            )
+            self.local_indices = torch.empty(
+                self.batch * self.chunks, self.k, device=scores.device, dtype=torch.int32
+            )
+            self.candidates = torch.empty(
+                self.batch, self.chunks * self.k, device=scores.device, dtype=torch.float32
+            )
+            self.selected = torch.empty_like(indices)
+            self.flags = torch.empty_like(self.local_lengths)
+            self.merge_flags = torch.empty_like(lengths)
+            self.select = CuteTopK(
+                scores.view(self.batch * self.chunks, 65536),
+                self.local_lengths,
+                self.local_indices,
+                self.flags,
+            )
+            self.merge = CuteTopK(
+                self.candidates, self.candidate_lengths, self.selected, self.merge_flags
+            )
+
+    def __call__(self) -> None:
+        """Select into stable output storage, merging chunk supports when needed."""
+        if self.chunks == 1:
+            self.select()
+        else:
+            chunk_lengths[(self.batch,)](
+                self.lengths,
+                self.local_lengths,
+                self.candidate_lengths,
+                CHUNKS=self.chunks,
+                K=self.k,
+            )
+            self.select()
+            gather_candidates[(self.batch, self.chunks)](
+                self.scores,
+                self.local_indices,
+                self.candidates,
+                WIDTH=self.width,
+                CHUNKS=self.chunks,
+                K=self.k,
+            )
+            self.merge()
+            remap[(self.batch,)](
+                self.local_indices, self.selected, self.indices, CHUNKS=self.chunks, K=self.k
+            )
