@@ -295,6 +295,7 @@ class TEGroupedMLP(MegatronModule):
             self.config.add_bias_linear and config.bias_dropout_fusion
         ), "bias_dropout_fusion is not supported in TEGroupedMLP when add_bias_linear=True"
 
+        self.pg_collection = pg_collection
         self.ep_group = pg_collection.ep
         self.tp_group = pg_collection.expt_tp
 
@@ -1286,8 +1287,12 @@ class TEGroupedMLP(MegatronModule):
         Maps local expert to global experts.
         The sharded state dict is interchangable with SequentialMLP's.
         """
-        # Guard for cases metadata is not provided
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        # Guard for cases metadata is not provided: fill in the GTP-inclusive dense DP x CP group,
+        # the group the global default stands for and the one a model passes down. TE grouped
+        # linears set the DP entry of each replica id from the expert data-parallel groups.
+        metadata = ensure_metadata_has_dp_cp_group(
+            metadata, self.pg_collection.dp_cp_gtp_remat or self.pg_collection.dp_cp
+        )
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
         for name, module in self._modules.items():
@@ -1841,6 +1846,7 @@ class SequentialMLP(MegatronModule):
 
         self.num_local_experts = num_local_experts
         self.local_experts = torch.nn.ModuleList()
+        self.pg_collection = pg_collection
         self.ep_group = pg_collection.ep
         self.tp_group = pg_collection.expt_tp
         # use pg_collection.expt_dp_group as data parallel group in this module.
@@ -1933,8 +1939,12 @@ class SequentialMLP(MegatronModule):
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Maps local expert to global experts."""
-        # Guard for cases metadata is not provided
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        # Guard for cases metadata is not provided: fill in the GTP-inclusive dense DP x CP group,
+        # the group the global default stands for and the one a model passes down. The DP entry
+        # of each expert replica id is set below from the expert data-parallel group.
+        metadata = ensure_metadata_has_dp_cp_group(
+            metadata, self.pg_collection.dp_cp_gtp_remat or self.pg_collection.dp_cp
+        )
 
         sharded_state_dict = {}
         num_global_experts = self.ep_group.size() * self.num_local_experts
