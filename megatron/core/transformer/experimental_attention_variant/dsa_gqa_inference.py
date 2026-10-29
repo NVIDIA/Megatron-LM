@@ -255,7 +255,7 @@ class TritonDSADecodeWorkspace:
     page sizes must be multiples of 128. Every positive context length must fit
     max_context and reference valid allocated pages in block_table. Active request
     indices must address valid rows of block_table. Score inputs must be NaN-free.
-    CuTe DSL selects exact top-k with a pure Triton radix fallback for every shape.
+    CuTe DSL selects exact top-k with a PyTorch fallback for rejected rows.
 
     Args:
         batch_size: Number of padded decode rows.

@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Exact CuTe DSL top-k with Triton radix fallback and long-context chunk merging."""
+"""Exact CuTe DSL top-k with PyTorch fallback and long-context chunk merging."""
 
 import math
 
@@ -21,8 +21,8 @@ CAPACITY = 1024  # Maximum crossing-bucket candidates, independent of the output
 @cute.jit
 def cta_prefix(value: cutlass.Int32, scratch: cute.Tensor, thread: cutlass.Int32):
     """Inclusive scan of one count per thread, via warp scans and warp totals."""
-    lane = thread % 32
-    warp = thread // 32
+    lane = cute.arch.lane_idx()
+    warp = cute.arch.warp_idx()
     total = value
     for stage in cutlass.range_constexpr(5):
         step = 1 << stage
@@ -63,7 +63,7 @@ class HistogramTopK:
     def kernel(
         self, scores: cute.Tensor, lengths: cute.Tensor, output: cute.Tensor, flags: cute.Tensor
     ):
-        """Select one bounded row, marking rows that need an exact radix fallback."""
+        """Select one bounded row, marking rows that need an exact PyTorch fallback."""
         tid, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
         lane = tid % 32
@@ -262,52 +262,8 @@ def _compile_kernel(scores, lengths, output, flags):
     )
 
 
-@triton.jit
-def radix_topk(Scores, Lengths, Indices, WIDTH: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr):
-    """Select exact ordered float keys, resolving cutoff ties by position."""
-    row = tl.program_id(0)
-    offsets = tl.arange(0, BLOCK)
-    length = tl.minimum(tl.load(Lengths + row), WIDTH)
-    valid = offsets < length
-    values = tl.load(Scores + row * WIDTH + offsets, mask=valid, other=float("-inf"))
-    bits = values.to(tl.uint32, bitcast=True)
-    ordered = bits ^ tl.where((bits & 0x80000000) != 0, 0xFFFFFFFF, 0x80000000).to(tl.uint32)
-    active = valid
-    remaining = tl.minimum(K, length)
-    prefix = tl.full((), 0, tl.uint32)
-    bins = tl.arange(0, 256)
-    for shift in tl.static_range(24, -1, -8):
-        digits = ((ordered >> shift) & 255).to(tl.int32)
-        counts = tl.histogram(tl.where(active, digits, 256), 256)
-        cumulative = tl.cumsum(counts, 0, reverse=True)
-        crossing = tl.max(tl.where(cumulative >= remaining, bins, -1), 0)
-        above = tl.sum(tl.where(bins > crossing, counts, 0), 0)
-        remaining -= above
-        active &= digits == crossing
-        prefix |= crossing.to(tl.uint32) << shift
-    greater = valid & (ordered > prefix)
-    equal = valid & (ordered == prefix)
-    count = tl.sum(greater.to(tl.int32), 0)
-    equal_rank = tl.cumsum(equal.to(tl.int32), 0)
-    selected = greater | (equal & (equal_rank <= tl.minimum(K, length) - count))
-    rank = tl.cumsum(selected.to(tl.int32), 0) - 1
-    slots = tl.arange(0, K)
-    tl.store(Indices + row * K + slots, -1)
-    tl.debug_barrier()
-    tl.store(Indices + row * K + rank, offsets, mask=selected & (rank < K))
-
-
-@triton.jit
-def fallback_if_needed(
-    Scores, Lengths, Indices, Flags, WIDTH: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr
-):
-    """Repair only rows rejected by the CuTe histogram fast path."""
-    if tl.load(Flags + tl.program_id(0)):
-        radix_topk(Scores, Lengths, Indices, WIDTH, K, BLOCK)
-
-
 class CuteTopK:
-    """Compile a bounded CuTe selection launch with preallocated exact fallback storage."""
+    """Compile a bounded CuTe selection launch with an exact PyTorch fallback."""
 
     def __init__(
         self, scores: torch.Tensor, lengths: torch.Tensor, output: torch.Tensor, flags: torch.Tensor
@@ -315,21 +271,32 @@ class CuteTopK:
         self.scores, self.lengths, self.output, self.flags = (scores, lengths, output, flags)
         self.arguments = tuple(from_dlpack(t) for t in (scores, lengths, output, flags))
         self.compiled = _compile_kernel(scores, lengths, output, flags)
+        self.positions = torch.arange(scores.shape[1], device=scores.device)
+
+    def _torch_topk(self) -> None:
+        # A valid -inf must outrank padding. FP64 leaves room below every finite
+        # FP32 score for a finite sentinel representing valid -inf values.
+        scores = self.scores.double()
+        scores.masked_fill_(torch.isneginf(scores), torch.finfo(torch.float64).min)
+        scores.masked_fill_(self.positions >= self.lengths[:, None], -torch.inf)
+        indices = torch.topk(scores, self.output.shape[1], dim=-1, sorted=False).indices
+        torch.where(
+            self.flags[:, None].bool(), indices.to(self.output.dtype), self.output, out=self.output
+        )
 
     def __call__(self) -> None:
         """Run the prepared CuTe selection and conditional exact fallback."""
         self.compiled(*self.arguments, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
-        fallback_if_needed[(self.scores.shape[0],)](
-            self.scores,
-            self.lengths,
-            self.output,
-            self.flags,
-            WIDTH=self.scores.shape[1],
-            K=self.output.shape[1],
-            BLOCK=triton.next_power_of_2(self.scores.shape[1]),
-            num_warps=16,
-            enable_fp_fusion=False,
-        )
+        needs_fallback = self.flags.any()
+        if torch.cuda.is_current_stream_capturing():
+            graph = torch.cuda.CUDAGraph.get_currently_capturing_graph()
+            graph.begin_capture_to_if_node(needs_fallback)
+            try:
+                self._torch_topk()
+            finally:
+                graph.end_capture_to_conditional_node()
+        elif needs_fallback:
+            self._torch_topk()
 
 
 @triton.jit

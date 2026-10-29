@@ -392,8 +392,7 @@ class TransformerConfig(ModelParallelConfig):
         Literal["none", "tilelang", "cudnn", "min-memory-triton", "min-memory-torch", "reference"]
         | None
     ) = None
-    """Which training/MLA DSA implementation to run. Dynamic DSA-GQA inference uses
-    the paged Triton inference path.
+    """Which DSA implementation to run. This is the only backend selector.
 
     When unset, DSv4 hybrid resolves to ``cudnn`` and every other attention variant to
     ``none``, which the DSA-over-GQA path then resolves again as described below.
