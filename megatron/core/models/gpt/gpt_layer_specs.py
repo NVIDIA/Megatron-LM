@@ -113,7 +113,7 @@ def get_gpt_layer_with_inference_submodules(
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=IdentityOp,
+            pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
         )
