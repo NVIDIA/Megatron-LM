@@ -32,6 +32,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     PipelineOffloadManager,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe import batch_invariant, moe_utils
 from megatron.core.transformer.moe.experts import (
@@ -1370,6 +1371,105 @@ class TestMoEModules:
             contention=True,
             what=f"TEGroupedMLP[tanh clamp, {'op fuser' if op_fuser else 'unfused'}]",
         )
+
+    @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
+    def test_te_grouped_mlp_replays_under_quantized_precision_override(self, monkeypatch):
+        """Fused ``TEGroupedMLP`` whose ``--te-precision-config-file`` override keeps the experts
+        quantized but with a different recipe than the ambient autocast (MXFP8 experts under a
+        global NVFP4 recipe). ``_fused_quant_context`` presents the module recipe to the op
+        fuser, so the fused forward and backward must quantize with MXFP8 and replay bit-exactly
+        under stream contention; the quantizer check guards against silently inheriting NVFP4."""
+        if torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("fused grouped MLP under MXFP8 / NVFP4 needs SM100+")
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import NVFP4BlockScaling
+        from transformer_engine.pytorch import MXFP8Quantizer
+        from transformer_engine.pytorch.ops import GroupedLinear
+
+        for probe in (te.is_mxfp8_available, te.is_nvfp4_available):
+            available, reason = probe(return_reason=True)
+            if not available:
+                pytest.skip(reason)
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+        self._init()
+        seeded()
+        quant_recipe = RecipeConfig.from_config_dict(
+            {
+                "configs": {
+                    "mxfp8": {
+                        "transformer_engine_config_type": "TEQuantizationParams",
+                        "training_recipe": {"fp8_quantization_recipe": "mxfp8"},
+                    }
+                },
+                "matchers": {
+                    "experts_mxfp8": {
+                        "type": "glob",
+                        "enabled": True,
+                        "pattern": "*experts*",
+                        "config": "mxfp8",
+                    }
+                },
+            }
+        )
+        config = _moe_config(
+            hidden_size=2048,
+            ffn_hidden_size=4096,
+            gated_linear_unit=False,
+            activation_func=squared_relu,
+            bias_activation_fusion=False,
+            use_fused_weighted_squared_relu=True,
+            use_transformer_engine_op_fuser=True,
+            fp8="e4m3",
+            fp8_recipe="nvfp4",
+            quant_recipe=quant_recipe,
+        )
+        spec = get_gpt_layer_with_transformer_engine_spec(num_experts=8, moe_grouped_gemm=True)
+        with get_fp8_context(config, is_init=True):
+            # The override is resolved by module path, so the experts need their name populated.
+            experts = get_submodules(spec.submodules.mlp).experts(
+                num_local_experts=8,
+                config=config,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                name="mlp.experts",
+            )
+        assert isinstance(experts, TEGroupedMLP)
+        assert experts._with_fused_impl, "a quantized override must keep fusion"
+        assert experts.linear_fc1.te_quant_params is not None
+        assert experts.linear_fc1.te_quant_params == experts.linear_fc2.te_quant_params
+        experts = experts.cuda()
+        tokens_per_expert = torch.tensor([4096, 17, 0, 2048, 1, 8191, 33, 1998], dtype=torch.int64)
+        rows = int(tokens_per_expert.sum())
+        hidden = torch.randn(rows, 2048, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        probs = torch.rand(rows, device="cuda", requires_grad=True)
+
+        class _InNVFP4Autocast(torch.nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def forward(self, *args):
+                with te.fp8_autocast(enabled=True, fp8_recipe=NVFP4BlockScaling()):
+                    return self.module(*args)
+
+        assert_module_replays_bit_exact(
+            _InNVFP4Autocast(experts),
+            (hidden, tokens_per_expert, probs),
+            replays=3,
+            contention=True,
+            what="TEGroupedMLP[op fuser, MXFP8 override under NVFP4 autocast]",
+        )
+        # The grouped GEMMs quantized with the module's MXFP8 recipe, not the ambient NVFP4 one.
+        # Without the CuTeDSL kernel TE runs the same ops unfused, so walk both op layouts.
+        (sequential,) = experts._fused_ops
+        grouped_linears = [
+            basic
+            for op, _ in sequential._module_groups[0]._forward_ops
+            for basic in getattr(op, "basic_ops", [op])
+            if isinstance(basic, GroupedLinear)
+        ]
+        assert len(grouped_linears) == 2, grouped_linears
+        for fc in grouped_linears:
+            assert isinstance(fc.get_quantizer("forward", 1), MXFP8Quantizer)
 
     def test_sequential_mlp_replays_on_uneven_experts(self):
         self._init()
