@@ -41,11 +41,6 @@ UNWARNED_HIT = "f:accessor:parallel_state.get_tensor_model_parallel_group"
 # read sits under an ``if`` on a value that only a warned fallback leaves None, which the check
 # does not follow. Remove an entry once its read follows the warning in the same block.
 UNWARNED_READS = {
-    # if dp_group is None: after an if/else whose branches warn for the missing pg_collection
-    # or pg_collection.dp_cp_gtp_remat.
-    "megatron/core/transformer/moe/moe_logging.py": [
-        "MoEMetricsTracker._sync_metrics:accessor:parallel_state.get_data_parallel_group"
-    ],
     # if pp_size is None: only the branch that warns for the missing pp_group sets it to None.
     "megatron/core/transformer/multi_token_prediction.py": [
         "mtp_on_this_rank:accessor:parallel_state.get_pipeline_model_parallel_world_size"
