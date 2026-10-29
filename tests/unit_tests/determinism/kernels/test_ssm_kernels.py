@@ -740,6 +740,46 @@ def test_torch_chunk_gated_delta_rule_replays_fwd_bwd():
     assert_replays_bit_exact(fn, (q, k, v, g, beta), replays=3, what="torch_chunk_gated_delta_rule")
 
 
+def test_kda_gate_jit_path_replays_fwd_bwd():
+    """KDA's jit-fused gate reshaping and beta activation replay bit-exactly."""
+    from types import SimpleNamespace
+
+    from megatron.core.ssm.gated_delta_net.kda import KimiDeltaAttention
+
+    seeded()
+    batch, seq_len, heads, head_dim = 2, 256, 4, 32
+    dummy = SimpleNamespace(key_head_dim=head_dim)
+    A_log = torch.randn(heads, device="cuda")
+    dt_bias = torch.randn(heads, device="cuda")
+    raw_g = torch.randn(
+        batch * seq_len * heads * head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    beta = torch.randn(
+        batch * seq_len * heads, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+
+    def fn(raw_g, beta):
+        raw_g, gates = KimiDeltaAttention._compute_gates(
+            dummy, A_log, dt_bias, batch, seq_len, raw_g, beta
+        )
+        return raw_g, gates["beta"]
+
+    assert_replays_bit_exact(fn, (raw_g, beta), replays=3, what="KDA gate JIT path")
+
+
+def test_kda_fp8_opt_out_scope_is_replay_safe():
+    """KDA-only FP8 initialization selection remains stable across the dispatch path."""
+    from megatron.core.ssm.gated_delta_net.common import _kda_fp8_disabled
+    from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
+    from megatron.core.ssm.kda_layer_config import KDALayerConfig
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+    config.kda_disable_fp8 = True
+    assert _kda_fp8_disabled(KDALayerConfig.from_config(config))
+    assert not _kda_fp8_disabled(GDNLayerConfig.from_config(config))
+
+
 @pytest.mark.xfail(
     strict=False, reason="FLA chunk_gated_delta_rule is documented non-deterministic; recorded"
 )

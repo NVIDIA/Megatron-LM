@@ -92,6 +92,23 @@ BATCH_KEYS = [
 ]
 
 
+# The args object and the transformer config built from it, reused until the args object
+# is replaced.
+_transformer_config_cache = None
+
+
+def _get_transformer_config(args):
+    """Return the transformer config for args, building it only when args is a new object.
+
+    get_batch runs every microbatch, and rebuilding the config there re-runs
+    TransformerConfig.__post_init__, which repeats its validation warnings in the log.
+    """
+    global _transformer_config_cache
+    if _transformer_config_cache is None or _transformer_config_cache[0] is not args:
+        _transformer_config_cache = (args, core_transformer_config_from_args(args))
+    return _transformer_config_cache[1]
+
+
 def get_batch(
     data_iterator,
     vp_stage: Optional[int] = None,
@@ -100,7 +117,7 @@ def get_batch(
     """Generate a batch."""
 
     args = get_args()
-    config = core_transformer_config_from_args(args)
+    config = _get_transformer_config(args)
 
     if args.sequence_packing_scheduler is not None:
         if pg_collection is None:
