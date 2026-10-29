@@ -47,7 +47,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Run the test file directly to avoid the unit-test package's GPU fixtures.
+      # Run the test file directly to avoid the unit-test package's GPU fixtures. It also
+      # classifies the reads in megatron/core: one that no fallback warning precedes, apart from
+      # those its UNWARNED_READS lists, fails this step, whether or not the allowlist holds it.
       - name: Test the process-group usage checker
         run: python tests/unit_tests/test_check_process_group_usage.py
 

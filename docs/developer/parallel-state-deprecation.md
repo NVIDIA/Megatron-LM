@@ -502,6 +502,11 @@ In CI, the *Process group usage check* workflow runs the checker and the guard a
 steps: what they find is listed in the step's log, and the job still passes. The job fails when
 the checker's own tests fail, or when `tests/unit_tests/test_removal_versions.py` finds code that
 announces a removal the package version has reached (see [Removal schedule](#removal-schedule)).
+The checker's tests include one over the tree: every read that the checker counts in
+`megatron/core` must be guarded or warned, apart from the reads listed in `UNWARNED_READS` in
+`tests/unit_tests/test_check_process_group_usage.py`. A new unwarned read, or a warned read that
+loses its warning, therefore fails the job whether or not the allowlist holds it; how many warned
+fallbacks Megatron Core may add is left to the report-only ratchet.
 [API backward compatibility checking](../api-backwards-compatibility-check.md) describes the job.
 
 ### When the check reports a new read
