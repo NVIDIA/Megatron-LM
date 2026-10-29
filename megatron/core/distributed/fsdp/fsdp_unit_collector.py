@@ -22,17 +22,17 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
 class FsdpUnitCollector:
-    """Collect selected FSDP units in pre-order."""
+    """Collect selected FSDP units in wrapping order, children before parents."""
 
     def __init__(self, fsdp_unit_module_types: tuple[type[nn.Module], ...]) -> None:
         self._fsdp_unit_module_types = fsdp_unit_module_types
         self._collected_units_in_preorder: dict[nn.Module, None] = {}
 
     def collect(self, module: nn.Module) -> list[nn.Module]:
-        """Return selected modules in pre-order, parents before children."""
+        """Return selected modules in reverse pre-order, including the root last."""
         self._collected_units_in_preorder = {module: None}
         self._visit(module, under_shortcut=False)
-        return list(self._collected_units_in_preorder)
+        return list(reversed(self._collected_units_in_preorder))
 
     def _visit(self, module: nn.Module, under_shortcut: bool) -> None:
         if self._should_shard(module, under_shortcut):

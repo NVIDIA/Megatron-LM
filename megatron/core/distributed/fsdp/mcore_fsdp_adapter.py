@@ -732,10 +732,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             construction_context = nullcontext(active_context)
         with construction_context:
             collector = FsdpUnitCollector(tuple(fsdp_unit_modules))
-            units_to_shard = collector.collect(module)
-
-            # Reverse pre-order: children claim their parameters before their parents.
-            for submodule in reversed(units_to_shard):
+            for submodule in collector.collect(module):
                 is_expert = isinstance(submodule, (TEGroupedMLP, SequentialMLP))
                 if config.init_model_with_meta_device:
                     _materialize_owned_meta_modules(submodule, device)
