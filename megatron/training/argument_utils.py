@@ -670,8 +670,13 @@ def _hybrid_inference_stack_spec(spec: list[str], wide_residual: bool) -> Module
     training_spec = import_module((base_path, name))
     module = importlib.import_module(base_path)
     # dir() and getattr() rather than vars(): a deprecated import path (megatron.core.ops._compat)
-    # serves its names through module __getattr__.
-    module_specs = {spec: getattr(module, spec) for spec in dir(module) if not spec.startswith("_")}
+    # serves its names, private ones included, through module __getattr__, which answers no
+    # dunder names.
+    module_specs = {
+        spec: getattr(module, spec)
+        for spec in dir(module)
+        if not (spec.startswith("__") and spec.endswith("__"))
+    }
     aliases = sorted({alias for alias, value in module_specs.items() if value is training_spec})
     for alias in aliases or [name]:
         stem = alias.removeprefix("wide_residual_").replace("_inference_", "_")

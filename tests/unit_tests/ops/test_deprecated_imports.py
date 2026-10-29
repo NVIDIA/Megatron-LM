@@ -204,6 +204,11 @@ def test_specs_load_through_forwarders(tmp_path, monkeypatch):
         'from megatron.core.transformer.spec_utils import ModuleSpec\n'
         'foo_stack_spec = ModuleSpec(module=object)\n'
         'foo_inference_stack_spec = ModuleSpec(module=object)\n'
+        'wide_residual_foo_inference_stack_spec = ModuleSpec(module=object)\n'
+        'alias_stack_spec = foo_stack_spec\n'
+        '_private_stack_spec = ModuleSpec(module=object)\n'
+        '_private_inference_stack_spec = ModuleSpec(module=object)\n'
+        'bar_stack_spec = ModuleSpec(module=object)\n'
     )
     (root / 'old_specs.py').write_text(
         'from megatron.core.ops._compat import deprecated_module\n'
@@ -213,13 +218,21 @@ def test_specs_load_through_forwarders(tmp_path, monkeypatch):
     try:
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', DeprecationWarning)
-            old = f'{package}.old_specs'
             specs = importlib.import_module(f'{package}.specs')
-            assert import_spec((old, 'foo_stack_spec')) is specs.foo_stack_spec
-            with pytest.raises(ImportError, match='missing_stack_spec'):
-                import_spec((old, 'missing_stack_spec'))
-            inference = _hybrid_inference_stack_spec([old, 'foo_stack_spec'], wide_residual=False)
-            assert inference is specs.foo_inference_stack_spec
+            counterparts = (
+                ('foo_stack_spec', False, specs.foo_inference_stack_spec),
+                ('alias_stack_spec', False, specs.foo_inference_stack_spec),
+                ('foo_stack_spec', True, specs.wide_residual_foo_inference_stack_spec),
+                ('_private_stack_spec', False, specs._private_inference_stack_spec),
+                ('bar_stack_spec', False, None),
+            )
+            for path in (specs.__name__, f'{package}.old_specs'):
+                assert import_spec((path, 'foo_stack_spec')) is specs.foo_stack_spec
+                with pytest.raises(ImportError, match='missing_stack_spec'):
+                    import_spec((path, 'missing_stack_spec'))
+                for name, wide_residual, counterpart in counterparts:
+                    found = _hybrid_inference_stack_spec([path, name], wide_residual=wide_residual)
+                    assert found is counterpart, (path, name, wide_residual)
     finally:
         for name in list(sys.modules):
             if name == package or name.startswith(package + '.'):
