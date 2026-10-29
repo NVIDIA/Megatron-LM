@@ -1468,6 +1468,15 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self._match_generation_forward = config.moe_match_generation_forward
         # Set by MoELayer: True on the recompute pass, which takes the TE path.
         self._in_inference_recompute = False
+        # The value pass's kernel weights, kept until the parameters may have moved:
+        # MegatronModule.set_is_first_microbatch sets is_first_microbatch at the first
+        # microbatch of every forward-backward call, as for TE's weight cache.
+        self._match_generation_weights = None
+        if self._match_generation_forward:
+            self.is_first_microbatch = True
+            self.register_load_state_dict_post_hook(
+                lambda module, _: setattr(module, "is_first_microbatch", True)
+            )
 
     @torch.inference_mode(False)
     def _build_flashinfer_clamp_limit(self, device: torch.device) -> None:
@@ -1955,10 +1964,27 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _match_generation_forward_pass(self, hidden_states, probs, routing_map):
         """Training value pass through generation's FlashInfer kernel.
 
-        The kernel weights are requantized from the live parameters on every call and
-        freed afterwards, so they never lag an optimizer step.
+        The kernel weights are rebuilt from the parameters on the first microbatch of
+        each forward-backward call, after which the parameters cannot move until the
+        next one, and reused for the rest of it.
         """
         assert routing_map is not None, "routing_map is required for the training forward."
+        if self.is_first_microbatch or self._match_generation_weights is None:
+            self._match_generation_weights = None
+            self._match_generation_weights = self._build_match_generation_weights()
+            self.is_first_microbatch = False
+        mxfp8_weights, nvfp4_weights = self._match_generation_weights
+        output = self._flashinfer_routed_forward(
+            hidden_states,
+            routing_map,
+            probs,
+            mxfp8_weights=mxfp8_weights,
+            nvfp4_weights=nvfp4_weights,
+        )
+        return output, None
+
+    def _build_match_generation_weights(self):
+        """The value pass's (MXFP8, NVFP4) kernel weights, one of them None, from the parameters."""
         mxfp8_weights = nvfp4_weights = None
         with torch.no_grad():
             if self._nvfp4_recipe is not None:
@@ -1987,14 +2013,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     prepare_routed_mxfp8_weights(self._mxfp8_training_stack(linear_name, backend))
                     for linear_name, _ in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS
                 )
-        output = self._flashinfer_routed_forward(
-            hidden_states,
-            routing_map,
-            probs,
-            mxfp8_weights=mxfp8_weights,
-            nvfp4_weights=nvfp4_weights,
-        )
-        return output, None
+        return mxfp8_weights, nvfp4_weights
 
     def forward(
         self,

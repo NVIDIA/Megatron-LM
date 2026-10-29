@@ -585,10 +585,22 @@ class MoELayer(BaseMoELayer):
         Every rank of the dispatcher's group runs the same number of launches, since
         each one is collective. Every launch refreshes the dispatch metadata, which
         generation refreshes only on its first MoE layer, and none applies generation's
-        padding mask: every training row is real.
+        padding mask: every training row is real. Each launch hands the kernel only the
+        gathered rows that can hold tokens rather than the whole buffer; the rows past
+        the real ones are routed nowhere and are never combined. Both kernels are batch
+        invariant in the row count, so this matches generation's full-buffer launches.
+
+        The routed MXFP8 kernel sizes its token tile from rows * top_k / local experts
+        and has no config for small tiles at some shapes, so MXFP8 launches keep enough
+        rows for its largest tile, the one generation's full-buffer launches use.
         """
         dispatcher = self.token_dispatcher
         capacity = NVLSAllGatherVDispatcher._per_rank_worst_case_token_count
+        group_size = utils.get_pg_size(dispatcher.tp_ep_group)
+        min_rows = 0
+        if self.experts._nvfp4_recipe is None:
+            # Above 128 routes per local expert the kernel's tile is its largest, 256.
+            min_rows = 128 * self.num_local_experts // self.config.moe_router_topk + 1
         routing_map = dispatcher.routing_map
         num_tokens = hidden_states.shape[0]
         max_tokens = torch.tensor([num_tokens], device=hidden_states.device, dtype=torch.int64)
@@ -598,14 +610,19 @@ class MoELayer(BaseMoELayer):
         real_token_count = NVLSAllGatherVDispatcher._real_token_count_tensor
         NVLSAllGatherVDispatcher._real_token_count_tensor = None
         outputs, mlp_bias = [], None
+        max_tokens = int(max_tokens.item())
         try:
-            for start in range(0, int(max_tokens.item()), capacity):
+            for start in range(0, max_tokens, capacity):
                 chunk = slice(min(start, num_tokens), min(start + capacity, num_tokens))
                 dispatcher.routing_map = routing_map[chunk]
                 dispatcher._local_tokens = chunk.stop - chunk.start
                 if not dispatcher._runs_metadata_sync:
                     dispatcher.update_metadata(dispatcher._local_tokens)
                 dispatched_input, chunk_probs = self.dispatch(hidden_states[chunk], probs[chunk])
+                rows = group_size * min(capacity, max_tokens - start)
+                rows = min(max(rows, min_rows), dispatched_input.shape[0])
+                dispatched_input, chunk_probs = dispatched_input[:rows], chunk_probs[:rows]
+                dispatcher.routing_map = dispatcher.routing_map[:rows]
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, chunk_probs)
                 outputs.append(self.combine(output))
         finally:

@@ -1132,3 +1132,84 @@ def test_flashinfer_nvfp4_moe_is_batch_invariant(gated):
             f"FlashInfer NVFP4 MoE output changed at batch {name}; max abs diff: "
             f"{(output_alone.float() - output.float()).abs().max().item()}"
         )
+
+
+def test_flashinfer_routed_mxfp8_moe_is_batch_invariant():
+    """A routed token must be bitwise stable as the launch's row count changes.
+
+    Generation's prefill launches on the whole NVLS buffer, with unused rows routed
+    to -1, while the training value pass launches on only the rows that can hold
+    tokens. Both the row count M and the target experts' loads change here.
+    """
+    from megatron.core.inference.moe.flashinfer_mxfp8 import (
+        HAVE_FLASHINFER_ROUTED_MXFP8,
+        flashinfer_routed_mxfp8_moe,
+        prepare_routed_mxfp8_weights,
+    )
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        set_batch_invariant_mode,
+    )
+
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("routed MXFP8 MoE requires Blackwell")
+    if not HAVE_FLASHINFER_ROUTED_MXFP8:
+        pytest.skip("FlashInfer >= 0.6.4 routed MXFP8 MoE is unavailable")
+    torch.manual_seed(1234)
+    num_experts, hidden_size, topk = 4, 256, 2
+
+    def _weights():
+        quantized = [
+            MXFP8Tensor.from_bf16(
+                torch.randn(hidden_size, hidden_size, device="cuda", dtype=torch.bfloat16),
+                backend="triton",
+            )
+            for _ in range(num_experts)
+        ]
+        return prepare_routed_mxfp8_weights(
+            MXFP8Tensor(
+                data=torch.stack([weight.data for weight in quantized]).contiguous(),
+                scale=torch.stack([weight.scale for weight in quantized]).contiguous(),
+                backend="triton",
+                dtype=torch.bfloat16,
+            )
+        )
+
+    fc1_weight, fc2_weight = _weights(), _weights()
+    target = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
+    target_experts = torch.tensor([0, 1], device="cuda", dtype=torch.int64)
+    target_probs = torch.tensor([0.625, 0.375], device="cuda", dtype=torch.float32)
+
+    def _run(num_tokens: int, target_row: int, rows: int | None = None) -> torch.Tensor:
+        rows = num_tokens if rows is None else rows
+        hidden_states = torch.randn(rows, hidden_size, device="cuda", dtype=torch.bfloat16)
+        routing_map = torch.full((rows, topk), -1, device="cuda", dtype=torch.int64)
+        routing_map[:num_tokens].copy_(target_experts)
+        probs = torch.full((rows, topk), 0.5, device="cuda", dtype=torch.float32)
+        hidden_states[target_row].copy_(target)
+        probs[target_row].copy_(target_probs)
+        return flashinfer_routed_mxfp8_moe(
+            hidden_states,
+            routing_map,
+            probs,
+            fc1_weight,
+            fc2_weight,
+            num_experts=num_experts,
+            local_expert_offset=0,
+            activation_type=6,
+        )[target_row]
+
+    with torch.no_grad(), set_batch_invariant_mode(True):
+        output_alone = _run(1, 0)
+        outputs = {
+            "193": _run(193, 73),
+            "1024": _run(1024, 517),
+            "4096": _run(4096, 3001),
+            "193 in a 4096-row buffer": _run(193, 73, rows=4096),
+        }
+
+    for name, output in outputs.items():
+        assert torch.equal(output_alone, output), (
+            f"FlashInfer routed MXFP8 MoE output changed at batch {name}; max abs diff: "
+            f"{(output_alone.float() - output.float()).abs().max().item()}"
+        )
