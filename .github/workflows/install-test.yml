@@ -85,6 +85,24 @@ jobs:
           package-name: megatron.training
           python-binary: ${{ env.UV_PROJECT_ENVIRONMENT }}/bin/python
 
+      # megatron.rl ships only its shared-prefix packing modules (plus generation_api); NeMo-RL
+      # imports them directly. Run outside the checkout so the installed wheel is imported, not the
+      # source tree, and check that the RL runtime is not shipped. This job runs in a container, so
+      # use the environment variables (container paths), not the ${{ }} contexts (host paths).
+      - name: Check imports for the shipped megatron.rl packing modules
+        run: |
+          cd "$RUNNER_TEMP"
+          "$UV_PROJECT_ENVIRONMENT/bin/python" -I - "$GITHUB_WORKSPACE/pyproject.toml" <<'EOF'
+          import importlib, importlib.util, sys, tomllib
+          with open(sys.argv[1], "rb") as handle:
+              shipped = tomllib.load(handle)["tool"]["setuptools"]["py-modules"]
+          packing = [name for name in shipped if name != "megatron.rl.generation_api"]
+          for name in packing:
+              importlib.import_module(name)
+          assert importlib.util.find_spec("megatron.rl.rl_utils") is None, "RL runtime is shipped"
+          print(f"imported {len(packing)} shipped megatron.rl packing modules from the wheel")
+          EOF
+
   uv-test-pytorch:
     needs: [pre-flight]
     if: |

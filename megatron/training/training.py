@@ -219,13 +219,37 @@ _TensorMetricObserverCallback = Callable[..., None]
 
 # Optional dependencies. Each is guarded so the module imports cleanly when the
 # dependency is unavailable; the ``has_*``/``HAVE_*`` flags gate later usage.
-try:
-    from megatron.rl import rl_utils
-    from megatron.rl.inference.disagg import build_disagg_inference_model
 
+# megatron.rl's training hooks import the RL agent, inference and server stack, so they are
+# imported by _import_rl_utils for RL runs only, not when this module loads.
+rl_utils = None
+build_disagg_inference_model = None
+has_rl_utils = False
+
+
+def _import_rl_utils(rl_config) -> None:
+    """Import megatron.rl when RL steps are enabled.
+
+    ``rl_config`` is the run's RL config section, which the training loop reads
+    ``perform_rl_step`` from. Sets ``has_rl_utils`` and the module-level RL names; a missing
+    package leaves ``has_rl_utils`` False, as the guarded module-level import used to. RL
+    profiling and sequence-packing logging run in ``megatron.rl.callbacks``, which the RL entry
+    point registers, so they need no import here.
+    """
+    global rl_utils, build_disagg_inference_model, has_rl_utils
+    if has_rl_utils or not getattr(rl_config, "perform_rl_step", False):
+        return
+    try:
+        from megatron.rl import rl_utils as _rl_utils
+        from megatron.rl.inference.disagg import (
+            build_disagg_inference_model as _build_disagg_inference_model,
+        )
+    except ImportError:
+        return
+    rl_utils = _rl_utils
+    build_disagg_inference_model = _build_disagg_inference_model
     has_rl_utils = True
-except ImportError:
-    has_rl_utils = False
+
 
 try:
     from modelopt.torch.distill.plugins.megatron import get_tensor_shapes_adjust_fn_for_distillation
@@ -1776,6 +1800,7 @@ def pretrain(
     args = get_args()
     train_state = get_train_state()
     timers = get_timers()
+    _import_rl_utils(cfg_container.rl)
 
     if tensor_metric_observer is None and cfg_container.logger.tensor_metrics:
         from .tensor_metrics.observer import build_tensor_metric_observer
@@ -4752,6 +4777,7 @@ def train(
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
+    _import_rl_utils(cfg.rl)
     timers = get_timers()
     train_state = get_train_state()
 
