@@ -12,14 +12,20 @@ claims a violation that no longer exists (so the allowlist shrinks as the migrat
 Entries count each accessor within its enclosing function/class, independently of line numbers.
 This is a syntactic check, not data-flow analysis. It counts every reference to the functions
 and attributes below, called or not, made through ``parallel_state``, ``mpu``, an import
-(``import ... as``, ``from ... import``, a star import), an assigned alias
-(``grid = parallel_state``, an attribute such as ``self.grid``, or a class attribute through
-``self``, ``cls`` and the class), ``getattr()`` with a constant name,
-``importlib.import_module()`` or ``sys.modules``. A reference sees the most recent import or alias
-of its name that precedes it in the same scope, even if the name is reassigned later. It does not
-follow a module passed as an argument, returned by a function or stored in a container, nor a
-name built at run time; an alias of a function is not followed either, because the reference
-that makes it counts.
+(``import ... as``, ``from ... import``, a star import, ``megatron.core``'s included), an
+assigned alias (``grid = parallel_state``, either side of a conditional expression or of ``and``
+and ``or``, an assignment expression, a name declared ``global`` or ``nonlocal``, an attribute
+such as ``self.grid``, or a class attribute through ``self``, ``cls`` and the class),
+``getattr()``, ``setattr()`` or ``delattr()`` with a constant name,
+``importlib.import_module()`` with a constant name, relative or not, or ``sys.modules``. A
+reference sees the most recent import or alias of its name that precedes it in the same scope,
+even if the name is reassigned later. It does not follow a module passed as an argument (a
+parameter default included), returned by a function, stored in a container or bound by ``for``
+or ``with ... as``, an import in a class body that methods reach through ``self``, nor a name
+built at run time; an alias of a function is not followed either, because the reference that
+makes it counts. An attribute alias is known by its spelling in the whole file: once one class
+sets ``self.grid = parallel_state``, ``self.grid`` counts in every class of the file, which also
+covers the subclasses that inherit it.
 
 Each entry has one of five kinds:
 
@@ -66,8 +72,10 @@ Usage::
 
 import argparse
 import ast
+import importlib.util
 import json
 import pathlib
+import re
 import sys
 from collections import Counter
 
@@ -242,10 +250,11 @@ def _assigned_pairs(target, value):
 def _scope_bindings(node):
     """Collect the binding events of one scope without leaking nested scopes into their parent.
 
-    Returns ``{name: [(position, target), ...]}``. ``target`` is the dotted path a name was
-    imported from, the expression an assignment binds it to, which may be a module alias, or
+    Returns ``({name: [(position, target), ...]}, declared)``. ``target`` is the dotted path a name
+    was imported from, the expression an assignment binds it to, which may be a module alias, or
     ``""`` for any other binding (parameter, nested definition). A star import binds ``STAR`` to
-    its module.
+    its module. ``declared`` holds the names that the body declares ``global`` or ``nonlocal``,
+    whose events belong to another scope (_moved_bindings).
     """
 
     class Bindings(ast.NodeVisitor):
@@ -253,6 +262,7 @@ def _scope_bindings(node):
 
         def __init__(self):
             self.events = {}
+            self.declared = set()
 
         def bind(self, name, node, target):
             """Record that ``name`` is bound to ``target`` at ``node``'s position."""
@@ -317,15 +327,30 @@ def _scope_bindings(node):
         visit_AsyncFunctionDef = visit_FunctionDef
         visit_ClassDef = visit_FunctionDef
 
+        def visit_Global(self, node):
+            """Record the names that the body binds in another scope."""
+            self.declared.update(node.names)
+
+        visit_Nonlocal = visit_Global
+
         def visit_Lambda(self, node):
             """Do not collect bindings from an anonymous nested scope."""
             pass
 
-        # Comprehension targets and lambda arguments have their own scope.
-        visit_ListComp = visit_Lambda
-        visit_SetComp = visit_Lambda
-        visit_DictComp = visit_Lambda
-        visit_GeneratorExp = visit_Lambda
+        def visit_ListComp(self, node):
+            """Bind the target of each assignment expression in a comprehension, which binds it
+            in the enclosing scope; its loop targets and lambda arguments have their own scope."""
+            nodes = [node]
+            while nodes:
+                child = nodes.pop()
+                if isinstance(child, ast.NamedExpr):
+                    self.assign(child.target, child.value, child)
+                if not isinstance(child, ast.Lambda):
+                    nodes.extend(ast.iter_child_nodes(child))
+
+        visit_SetComp = visit_ListComp
+        visit_DictComp = visit_ListComp
+        visit_GeneratorExp = visit_ListComp
 
     bindings = Bindings()
     if hasattr(node, "args"):
@@ -336,19 +361,80 @@ def _scope_bindings(node):
                 bindings.events.setdefault(arg.arg, []).append(((0, -1), ""))
     for statement in node.body:
         bindings.visit(statement)
-    return bindings.events
+    return bindings.events, bindings.declared
+
+
+def _moved_bindings(tree, source):
+    """Return the binding events that ``global`` and ``nonlocal`` declarations move.
+
+    Returns ``{id(scope node): {name: [(position, target), ...]}}``. A function or class body
+    that declares a name ``global`` binds it in the module, and one that declares it ``nonlocal``
+    binds it in the nearest enclosing function that binds it. The events keep their positions and
+    are resolved in the scope they move to.
+    """
+    moved = {}
+    # Only a source with one of the words can declare a name; skip the walk of the others.
+    if not re.search(r"\b(?:global|nonlocal)\b", source):
+        return moved
+    collected = {}
+
+    def bindings(scope):
+        if id(scope) not in collected:
+            collected[id(scope)] = _scope_bindings(scope)
+        return collected[id(scope)]
+
+    def owner(name, enclosing):
+        """Return the nearest function of ``enclosing`` that binds ``name`` itself, or None."""
+        for scope in reversed(enclosing):
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                events, declared = bindings(scope)
+                if name in events and name not in declared:
+                    return scope
+        return None
+
+    def visit(statements, chain):
+        """Visit the declarations among ``statements``, nested blocks included; ``chain`` lists
+        the module, function and class nodes that enclose them, innermost last."""
+        for statement in statements:
+            if isinstance(statement, (ast.Global, ast.Nonlocal)) and len(chain) > 1:
+                events = bindings(chain[-1])[0]
+                for name in statement.names:
+                    if isinstance(statement, ast.Global):
+                        target = tree
+                    else:
+                        target = owner(name, chain[1:-1])
+                    if target is not None:
+                        moved.setdefault(id(target), {}).setdefault(name, []).extend(
+                            events.get(name, [])
+                        )
+            elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                visit(statement.body, chain + [statement])
+            else:
+                # The blocks of compound statements, and of except handlers and match cases.
+                for field in ("body", "orelse", "finalbody", "handlers", "cases"):
+                    visit(getattr(statement, field, ()), chain)
+
+    visit(tree.body, [tree])
+    return moved
 
 
 class _Scope:
     """The binding events of a module, class or function body.
 
     ``parent`` is the nearest enclosing scope whose names the body sees: a function nested in a
-    class sees the names of the scope around the class, not those of the class body.
+    class sees the names of the scope around the class, not those of the class body. ``moved``
+    holds the events that ``global`` and ``nonlocal`` declarations move (_moved_bindings).
     """
 
-    def __init__(self, kind, node, parent):
+    def __init__(self, kind, node, parent, moved):
         self.kind = kind
-        self.events = _scope_bindings(node)
+        self.events, declared = _scope_bindings(node)
+        if kind != "module":
+            # The body binds and reads these names in the module or an enclosing function.
+            for name in declared:
+                self.events.pop(name, None)
+        for name, events in moved.get(id(node), {}).items():
+            self.events.setdefault(name, []).extend(events)
         self.parent = parent
         # What each name refers to when a nested scope runs, once resolved.
         self.seen = {}
@@ -363,7 +449,9 @@ def _string(node):
 
 def _violations_in(path: pathlib.Path):
     """Return (lineno, scope:kind:detail) pairs for global process-group reads in one file."""
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(path))
+    moved = _moved_bindings(tree, source)
 
     class Visitor(ast.NodeVisitor):
         """Attach a stable enclosing scope to each reference to the global grid."""
@@ -371,7 +459,7 @@ def _violations_in(path: pathlib.Path):
         def __init__(self, attribute_aliases):
             self.scope = []
             self.hits = []
-            self.scopes = [_Scope("module", tree, None)]
+            self.scopes = [_Scope("module", tree, None, moved)]
             # What each binding event refers to, once resolved (_target).
             self.targets = {}
             # Whether a fallback warning dominates the statement being visited.
@@ -399,7 +487,7 @@ def _violations_in(path: pathlib.Path):
         def _visit_scope(self, node, kind):
             current = self.scopes[-1]
             parent = current.parent if current.kind == "class" else current
-            self.scopes.append(_Scope(kind, node, parent))
+            self.scopes.append(_Scope(kind, node, parent, moved))
             self.scope.append(node.name)
             # A function body runs when it is called, not where it is defined; a class body runs
             # in place.
@@ -517,11 +605,15 @@ def _violations_in(path: pathlib.Path):
             if found is not None:
                 return found
             # A star import binds the public names of its module; follow only those the check
-            # counts, so that builtins such as getattr keep their meaning.
+            # counts or follows, so that builtins such as getattr keep their meaning.
             star = self._binding_at(scope.events.get(STAR, []), position, scope)
             star = star or self._enclosing(STAR, scope)
-            if star and not name.startswith("_") and _classify(f"{star}.{name}"):
-                return f"{star}.{name}"
+            if star == "megatron.core" and name == "mpu":
+                # megatron.core.__all__ exports parallel_state but not mpu.
+                return name
+            path = f"{star}.{name}"
+            if star and not name.startswith("_") and (_classify(path) or path in ALIAS_TARGETS):
+                return path
             return name
 
         def _path(self, node, scope=None):
@@ -536,16 +628,16 @@ def _violations_in(path: pathlib.Path):
                         return alias
                 owner = self._path(node.value, scope)
                 return f"{owner}.{node.attr}" if owner else ""
-            if isinstance(node, ast.Call) and not node.keywords:
-                # getattr(owner, "name"[, default]) and importlib.import_module("module").
-                if len(node.args) in (2, 3) and _string(node.args[1]):
-                    if self._path(node.func, scope) == "getattr":
-                        owner = self._path(node.args[0], scope)
-                        return f"{owner}.{node.args[1].value}" if owner else ""
-                elif len(node.args) == 1 and _string(node.args[0]):
-                    module = node.args[0].value
-                    if self._path(node.func, scope) == "importlib.import_module":
-                        return "" if module.startswith(".") else module
+            if isinstance(node, (ast.IfExp, ast.BoolOp)):
+                # Either side of a conditional expression, and any operand of ``and`` and ``or``,
+                # can be its value: follow the first that is a module or class the check follows.
+                options = (node.body, node.orelse) if isinstance(node, ast.IfExp) else node.values
+                paths = (self._path(option, scope) for option in options)
+                return next((path for path in paths if path in ALIAS_TARGETS), "")
+            if isinstance(node, ast.Call):
+                return self._named_attribute(node, ("getattr",), scope) or self._imported_module(
+                    node, scope
+                )
             if (
                 isinstance(node, ast.Subscript)
                 and _string(node.slice)
@@ -554,13 +646,45 @@ def _violations_in(path: pathlib.Path):
                 return node.slice.value
             return ""
 
+        def _named_attribute(self, node, functions, scope=None):
+            """Return the dotted path of the attribute that a call of one of ``functions``, such
+            as ``getattr(owner, "name"[, default])``, names with a constant, or ``""``."""
+            if (
+                isinstance(node, ast.Call)
+                and not node.keywords
+                and len(node.args) in (2, 3)
+                and _string(node.args[1])
+                and self._path(node.func, scope) in functions
+            ):
+                owner = self._path(node.args[0], scope)
+                return f"{owner}.{node.args[1].value}" if owner else ""
+            return ""
+
+        def _imported_module(self, node, scope):
+            """Return the module that ``importlib.import_module(name[, package])`` imports, if
+            its name, and the package of a relative name, are constants, or ``""``."""
+            keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+            name = _string(node.args[0] if node.args else keywords.get("name"))
+            if not name or self._path(node.func, scope) != "importlib.import_module":
+                return ""
+            package = _string(node.args[1] if len(node.args) > 1 else keywords.get("package"))
+            try:
+                return importlib.util.resolve_name(name, package)
+            except ImportError:
+                # A relative name without a package, or beyond the top-level package.
+                return ""
+
         def _calls(self, node, function):
             """True if ``node`` calls ``function``, given as its dotted import path."""
             return isinstance(node, ast.Call) and self._path(node.func) == function
 
         def _reference(self, node):
-            """Record ``node`` if it refers to a function or attribute that the check counts."""
-            identity = _classify(self._path(node))
+            """Record ``node`` if it refers to a function or attribute that the check counts, or
+            writes or deletes one with ``setattr()`` or ``delattr()``."""
+            path = self._path(node)
+            if not path and isinstance(node, ast.Call):
+                path = self._named_attribute(node, ("setattr", "delattr"))
+            identity = _classify(path)
             if identity:
                 scope = ".".join(self.scope) or "<module>"
                 if self.warned and identity.split(":", 1)[0] not in (GUARDED, PRIVATE):
@@ -578,7 +702,8 @@ def _violations_in(path: pathlib.Path):
             self.generic_visit(node)
 
         def visit_Call(self, node):
-            """Record ``getattr()`` of a counted function or attribute with a constant name."""
+            """Record ``getattr()``, ``setattr()`` or ``delattr()`` of a counted function or
+            attribute with a constant name."""
             self._reference(node)
             self.generic_visit(node)
 

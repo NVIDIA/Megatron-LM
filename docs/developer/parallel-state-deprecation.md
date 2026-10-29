@@ -472,12 +472,17 @@ whose call is gone.
 
 The check is syntactic. It counts every reference, called or not (a function passed as a
 callback counts too), made through `parallel_state`, `mpu`, an import (`import ... as`,
-`from megatron.core.parallel_state import ...` or a star import), an assigned alias
-(`grid = parallel_state`, `self.grid = parallel_state`, or a class attribute reached through
-`self`, `cls` or the class), `getattr()` with a constant name, `importlib.import_module()` or
-`sys.modules`. It does not follow a module passed as an argument, returned by a function or
-stored in a container, or a name built at run time (`getattr(parallel_state, name)`). Reviewers
-still look for reads it cannot see.
+`from megatron.core.parallel_state import ...` or a star import, `megatron.core`'s included), an
+assigned alias (`grid = parallel_state`, `grid = parallel_state if lazy else None`, an
+assignment expression, a name declared `global` or `nonlocal`, `self.grid = parallel_state`, or a
+class attribute reached through `self`, `cls` or the class), `getattr()`, `setattr()` or
+`delattr()` with a constant name, `importlib.import_module()` with a constant name, relative or
+not, or `sys.modules`. It does not follow a module passed as an argument or a parameter default,
+returned by a function, stored in a container or bound by `for` or `with ... as`, an import in a
+class body that methods reach through `self`, or a name built at run time
+(`getattr(parallel_state, name)`). An attribute alias such as `self.grid` is known by its
+spelling in the whole file, so it also counts in the other classes of the file, the subclasses
+that inherit it included. Reviewers still look for reads it cannot see.
 
 `tests/unit_tests/test_parallel_state_accessor_uses.py` guards the code outside Megatron Core:
 the non-test code under `megatron/`, `examples/`, `tools/`, `tasks/`, `scripts/` and `docs/`, and
@@ -489,8 +494,9 @@ calls `warnings.warn()` with that category or `warn_global_process_group_fallbac
 another function named `warn`, such as a logger's, does not count. It never allows a read, write
 or deletion of a private attribute of `parallel_state`, apart from the deprecated
 `_set_global_memory_buffer()`, which it treats like the other deprecated functions. It also
-follows the module through assigned aliases, `getattr()` with a constant name,
-`importlib.import_module()` and `sys.modules`.
+follows the module through assigned aliases, `getattr()`, `setattr()` and `delattr()` with a
+constant name, `importlib.import_module()` and `sys.modules`, and does not follow the forms the
+checker does not follow.
 
 In CI, the *Process group usage check* workflow runs the checker and the guard as report-only
 steps: what they find is listed in the step's log, and the job still passes. The job fails when
