@@ -341,6 +341,14 @@ class OptimizerConfig:
     all groups are live at once — disable (or lower muon_ns_batch_size) if peak memory is
     tight. Only used when muon_tp_mode='layer_sharded'. Defaults to True."""
 
+    muon_store_param_remainders: bool = False
+    """Keep each Muon-managed param as its BF16 model param plus an int16 remainder instead of
+    an FP32 main copy, saving 2 bytes per param (the scheme TE FusedAdam uses for
+    ``store_param_remainders``). The FP32 main value is rebuilt exactly for each update, so the
+    optimizer math is unchanged; the BF16 model copy rounds ties away from zero instead of to
+    even. Requires muon_tp_mode='layer_sharded', bf16 and use_precision_aware_optimizer (the
+    FP32 grads are read from ``param.decoupled_grad``)."""
+
     muon_scalar_optimizer: str = 'adam'
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
     One of 'adam' or 'lion'. Defaults to 'adam'."""
@@ -535,6 +543,20 @@ class OptimizerConfig:
 
         # Dtypes may still be CLI strings here; finalize_optimizer_config maps them to torch.dtype.
         fp32 = (torch.float32, 'fp32')
+        if self.muon_store_param_remainders:
+            if self.muon_tp_mode != 'layer_sharded':
+                raise ValueError(
+                    "muon_store_param_remainders requires muon_tp_mode='layer_sharded'."
+                )
+            if not (self.bf16 and self.use_precision_aware_optimizer):
+                raise ValueError(
+                    "muon_store_param_remainders requires bf16 and use_precision_aware_optimizer."
+                )
+            if self.main_params_dtype not in fp32 or self.optimizer_cpu_offload:
+                raise ValueError(
+                    "muon_store_param_remainders requires FP32 main params on the GPU "
+                    "(main_params_dtype=fp32, no optimizer_cpu_offload)."
+                )
         if self.use_precision_aware_optimizer:
             # Under Muon the flag applies to the scalar Adam that owns the non-matrix params
             # (embeddings, norms, Engram tables); Muon's own state is unaffected.
@@ -681,6 +703,8 @@ class OptimizerConfig:
         This is also the flag to determine the usage of param.grad or param.decoupled_grad
         Derived on access so configs built directly (without finalize_optimizer_config) work.
         """
+        if getattr(self, "_decoupled_grads_forced", False):
+            return True
         return bool(
             self.use_precision_aware_optimizer
             and (
@@ -721,6 +745,17 @@ class OptimizerConfig:
                 self.use_layer_wise_distributed_optimizer = True
                 self.use_distributed_optimizer = False
 
+    def with_decoupled_grads(self) -> "OptimizerConfig":
+        """Copy of this config that reads grads from ``.decoupled_grad`` whatever the FP8 recipe.
+
+        Used for an optimizer that steps the BF16 params and keeps their FP32 grads in
+        ``.decoupled_grad`` (Muon with param remainders), so grad-norm, clipping and zero
+        counting read them there too.
+        """
+        config = copy.copy(self)
+        config._decoupled_grads_forced = True
+        return config
+
     def without_precision_aware_optimizer(self) -> "OptimizerConfig":
         """Copy of this config with the precision-aware optimizer turned off.
 
@@ -734,6 +769,7 @@ class OptimizerConfig:
         config.main_params_dtype = torch.float32
         config.exp_avg_dtype = torch.float32
         config.exp_avg_sq_dtype = torch.float32
+        config.muon_store_param_remainders = False
         return config
 
 

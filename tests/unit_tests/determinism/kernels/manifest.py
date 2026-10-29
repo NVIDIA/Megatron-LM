@@ -1275,6 +1275,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "write-back hands to the gates' backward and, with gradient-accumulation fusion, "
         "the parameter gradients accumulated into main_grad.",
     ),
+    KernelEntry(
+        name="muon_param_remainder_update",
+        sources=("megatron/core/optimizer/param_remainders.py",),
+        tests=(K + "test_param_remainder_kernels.py",),
+        kind="triton",
+        notes="apply_update_with_remainder: elementwise decoupled weight decay and update of "
+        "the FP32 main param held as a BF16 param plus an int16 remainder, with unique "
+        "stores. Replays the stored params, the remainders and the rebuilt main params.",
+    ),
     # ==== end of the Qwen3.8-Flash-Next stack ====
 )
 
