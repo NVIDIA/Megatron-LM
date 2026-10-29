@@ -7,10 +7,16 @@ compressor and GDN hold a collection and pass it, with its TP group, to every li
 Transformer Engine linear reads its GTP replica group and the amax group of a per-module
 quantization recipe from that collection, and falls back to the global groups without one.
 
+An owner built without a collection falls back to one from the global grid. That collection
+carries the GTP weight-remat groups, so the linears built on it do not fall back for them as well,
+and the omission warns once.
+
 Without CUDA, the local-spec owners build on CPU in one process with a gloo group; the Transformer
 Engine and GDN owners need GPUs.
 """
 
+import re
+import warnings
 from functools import partial
 from operator import attrgetter
 
@@ -18,13 +24,24 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core import parallel_state, process_groups_config
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_local_submodules,
+    get_gpt_mtp_block_spec,
+)
 from megatron.core.post_training.modelopt.layers import Linear
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.core.ssm.gated_delta_net import HAVE_FLA, GatedDeltaNet
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.attention import CrossAttention, CrossAttentionSubmodules
+from megatron.core.transformer import multi_token_prediction
+from megatron.core.transformer.attention import (
+    CrossAttention,
+    CrossAttentionSubmodules,
+    SelfAttention,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
@@ -39,6 +56,8 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
     DSAIndexerSubmodules,
+    DSAttention,
+    DSAttentionSubmodules,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     SimplifiedDSGQAIndexer,
@@ -51,6 +70,8 @@ from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttention,
     MLASelfAttentionSubmodules,
 )
+from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from tests.unit_tests.test_utilities import (
@@ -74,6 +95,8 @@ if HAVE_TE:
     )
 
 _NOT_PASSED = object()
+
+_FALLBACK_MESSAGE = re.compile(r"^(\S+) was called without `([^`]+)`")
 
 
 def _record_given_collections(patch, classes):
@@ -381,6 +404,146 @@ def test_local_spec_owner_passes_its_collection(monkeypatch, owner_pg_collection
         linear = attrgetter(name)(module)
         assert type(linear) in local_classes, name
         assert linear.given_pg_collection is owner_pg_collection, name
+
+
+def _transformer_config(**overrides):
+    config = dict(num_layers=1, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True)
+    config.update(overrides)
+    return TransformerConfig(**config)
+
+
+def _build_self_attention():
+    return SelfAttention(
+        _transformer_config(),
+        get_gpt_layer_local_submodules().self_attention.submodules,
+        layer_number=1,
+        attn_mask_type=AttnMaskType.causal,
+    )
+
+
+def _build_dsa_attention():
+    config = _mla_config(
+        dsa_indexer_n_heads=4,
+        dsa_indexer_head_dim=32,
+        dsa_indexer_topk=8,
+        dsa_indexer_loss_coeff=1.0,
+    )
+    indexer = ModuleSpec(
+        module=DSAIndexer,
+        submodules=DSAIndexerSubmodules(
+            linear_wq_b=Linear,
+            linear_wk=Linear,
+            k_norm=WrappedTorchNorm,
+            linear_weights_proj=Linear,
+        ),
+    )
+    return DSAttention(
+        config,
+        DSAttentionSubmodules(indexer=indexer),
+        layer_number=1,
+        attn_mask_type=AttnMaskType.causal,
+        attention_type="self",
+    )
+
+
+def _build_mtp_block():
+    config = _transformer_config(num_layers=2, mtp_num_layers=1)
+    spec = get_gpt_mtp_block_spec(
+        config, get_gpt_layer_local_spec(), use_transformer_engine=False, pp_rank=0
+    )
+    return MultiTokenPredictionBlock(config=config, spec=spec)
+
+
+def _owners_without_collection():
+    """Owners built without a collection, and the owner that their fallback warning names."""
+    local = _local_owners()
+    return {
+        "self_attention": (_build_self_attention, "SelfAttention"),
+        "cross_attention": (partial(local["cross_attention"], None), "CrossAttention"),
+        "mla": (partial(local["mla"], None), "MLASelfAttention"),
+        "dsa_indexer": (partial(local["dsa_indexer"], None), "DSAIndexer"),
+        "dsa_attention": (_build_dsa_attention, "DSAttention"),
+        "simplified_dsa_indexer": (
+            partial(local["simplified_dsa_indexer"], None),
+            "SimplifiedDSGQAIndexer",
+        ),
+        "mtp_block": (_build_mtp_block, "MultiTokenPredictionBlock"),
+    }
+
+
+@pytest.fixture
+def global_grid(monkeypatch):
+    """The global grid of parallel_state, which owners built without a collection fall back to."""
+    # Each test observes the first fallback warning of every owner.
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+    if not HAVE_TE:
+        # Without Transformer Engine, the inference linears that MTP checks its layers against
+        # are not classes, and the isinstance check raises.
+        monkeypatch.setattr(
+            multi_token_prediction, "is_inference_column_parallel_linear", lambda module: False
+        )
+    if torch.cuda.is_available():
+        Utils.initialize_model_parallel()
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+    else:
+        created_default_group = not torch.distributed.is_initialized()
+        if created_default_group:
+            torch.distributed.init_process_group(
+                "gloo", store=torch.distributed.HashStore(), rank=0, world_size=1
+            )
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+        parallel_state.initialize_model_parallel()
+        yield
+        parallel_state.destroy_model_parallel()
+        if created_default_group:
+            # Later tests in the session must not find this one-rank default group.
+            torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize("owner", list(_owners_without_collection()))
+def test_owner_without_collection_warns_once(global_grid, owner):
+    """The linears of an owner built without a collection take their GTP groups from its fallback.
+
+    The fallback collection sets the GTP weight-remat groups that the owner's linears read, so the
+    linears do not fall back for them and warn as well: the omission warns once, for the owner.
+    """
+    build, name = _owners_without_collection()[owner]
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        build()
+    fallbacks = [
+        _FALLBACK_MESSAGE.match(str(warning.message)).groups()
+        for warning in record
+        if issubclass(warning.category, ProcessGroupFallbackWarning)
+    ]
+    assert fallbacks == [(name, "pg_collection")]
+
+
+@pytest.mark.parametrize(
+    "owner,fallback_collection,fields",
+    [
+        ("self_attention", attrgetter("pg_collection"), ("gtp_remat",)),
+        ("mtp_block", attrgetter("layers.0.pg_collection"), ("gtp_remat",)),
+    ],
+    ids=["self_attention", "mtp_block"],
+)
+def test_owner_fallback_collection_holds_the_global_gtp_groups(
+    global_grid, owner, fallback_collection, fields
+):
+    """The linears get the GTP groups that they would have read from the global grid."""
+    build, _ = _owners_without_collection()[owner]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ProcessGroupFallbackWarning)
+        module = build()
+    groups = vars(fallback_collection(module))
+    global_groups = {
+        "gtp_remat": parallel_state.get_gtp_weight_remat_group(),
+        "expt_gtp_remat": parallel_state.get_expert_gtp_weight_remat_group(),
+    }
+    for field in fields:
+        assert groups[field] is global_groups[field], field
 
 
 @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is not installed")
