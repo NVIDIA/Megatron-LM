@@ -2311,6 +2311,15 @@ def _add_inference_args(parser):
                             '"async" (default) overlaps asynchronous scheduling phases by '
                             'reordering them to prepare-before-resolve. Select "legacy" to '
                             'disable async scheduling and use the resolve-before-prepare path.')
+    group.add_argument('--inference-gc-mode',
+                       type=str, default='default',
+                       choices=['default', 'freeze', 'freeze_overlap'],
+                       help='Python garbage collection policy while the inference engine serves '
+                            'requests. "default" leaves automatic collection unchanged. '
+                            '"freeze" freezes the long-lived heap after engine setup so '
+                            'collections skip it. "freeze_overlap" also runs due collections '
+                            'right after each forward pass is submitted, overlapping them with '
+                            'GPU work.')
     group.add_argument('--inference-dynamic-batching-logprobs-mode',
                        type=str, default='raw_logprobs',
                        choices=['raw_logprobs', 'processed_logprobs'],

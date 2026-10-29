@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import gc
 import os
 import random
 import string
@@ -792,6 +793,33 @@ def test_run_async_sched_publish_bookkeeping_skips_gpu_input_ids():
         skip_token_input_ids=True, record_done_event=True
     )
     assert done_event == "bookkeeping"
+
+
+@pytest.mark.parametrize(
+    "count, threshold, expected_generation",
+    [
+        ((700, 0, 0), (700, 10, 10), None),
+        ((701, 0, 0), (700, 10, 10), 0),
+        ((701, 11, 0), (700, 10, 10), 1),
+        ((701, 11, 11), (700, 10, 10), 2),
+        ((5000, 50, 50), (0, 10, 10), None),
+    ],
+)
+def test_trigger_gc_now_follows_cpython_thresholds(
+    monkeypatch, count, threshold, expected_generation
+):
+    """Collect the oldest due generation once the youngest is due; threshold 0 disables GC."""
+    collect = mock.Mock(return_value=0)
+    monkeypatch.setattr(gc, "get_count", lambda: count)
+    monkeypatch.setattr(gc, "get_threshold", lambda: threshold)
+    monkeypatch.setattr(gc, "collect", collect)
+
+    TextGenerationController.__new__(TextGenerationController)._trigger_gc_now()
+
+    if expected_generation is None:
+        collect.assert_not_called()
+    else:
+        collect.assert_called_once_with(expected_generation)
 
 
 @pytest.mark.parametrize(
