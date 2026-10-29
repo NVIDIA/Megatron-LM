@@ -3306,6 +3306,7 @@ def megatron_rl_inference_mode(
 
 
 def rl_inference_interface_shutdown():
+    """Tear down rollout generation and the local inference interface."""
     global _INFERENCE_INTERFACE
     global _ROLLOUT_GENERATOR
     global _ROLLOUT_PIPELINE
@@ -3321,13 +3322,7 @@ def rl_inference_interface_shutdown():
         loop.run_until_complete(_INFERENCE_INTERFACE.kill())
         _INFERENCE_INTERFACE = None
     else:
-        logger.warning("No inference interface to shutdown. This should not happen.")
-
-    # TODO(rkirby): This is a hack to hard exit. There is a bug that is preventing us from using sys.exit(0).
-    # It seem the Flask server has non-daemon threads that are preventing the program from exiting.
-    # We need to find a way to gracefully complete all in progress requests and shutdown the Flask server.
-    import os
-    os._exit(0)
+        logger.warning("No inference interface to shut down.")
 
 
 def _pad_nonnull_with_zeros(data: list[Optional[torch.Tensor]], max_len: int) -> torch.Tensor:
