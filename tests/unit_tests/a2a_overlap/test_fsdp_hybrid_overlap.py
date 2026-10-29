@@ -116,6 +116,10 @@ def _make_ddp_config():
         overlap_grad_reduce=True,
         overlap_param_gather=True,
         megatron_fsdp_main_params_dtype=None,
+        # The model is not wrapped in Float16Module, so MambaMixer's A_log and D stay
+        # FP32 next to BF16 weights in the same group FSDP unit. Fused reduce/division
+        # rejects mixed gradient dtypes in one coalesced bucket group.
+        gradient_reduce_div_fusion=False,
     )
 
 
