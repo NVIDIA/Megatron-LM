@@ -893,22 +893,35 @@ class TestTEWrappers:
 # --- fused RoPE --------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("layout", ["sbhd", "thd"])
-def test_te_fused_rope_replays_fwd_bwd(layout):
+@pytest.mark.parametrize("layout", ["sbhd", "thd", "thd_per_token"])
+@pytest.mark.parametrize("rotary_interleaved", [False, True])
+def test_te_fused_rope_replays_fwd_bwd(layout, rotary_interleaved, monkeypatch):
     from megatron.core.models.common.embeddings import rope_utils
     from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 
-    if (
-        rope_utils.fused_apply_rotary_pos_emb is None
-        and rope_utils.fused_apply_rotary_pos_emb_thd is None
-    ):
+    kernel_name = (
+        "fused_apply_rotary_pos_emb_thd" if layout == "thd" else "fused_apply_rotary_pos_emb"
+    )
+    kernel = getattr(rope_utils, kernel_name)
+    if kernel is None:
         pytest.skip("TE fused RoPE unavailable")
+    calls = []
+
+    def checked_kernel(t, *args, **kwargs):
+        calls.append(t.shape)
+        return kernel(t, *args, **kwargs)
+
+    monkeypatch.setattr(rope_utils, kernel_name, checked_kernel)
     Utils.initialize_model_parallel()
     try:
         seeded()
-        config = _config(apply_rope_fusion=True)
+        config = _config(apply_rope_fusion=True, rotary_interleaved=rotary_interleaved)
         s, b, h, d = 4096, 2, 32, 128
-        freqs = RotaryEmbedding(kv_channels=d, rotary_percent=1.0)(s)
+        max_seqlen = None if layout == "sbhd" else 2048
+        freq_rows = max_seqlen if layout == "thd" else s
+        freqs = RotaryEmbedding(
+            kv_channels=d, rotary_percent=1.0, rotary_interleaved=rotary_interleaved
+        )(freq_rows)
         if layout == "sbhd":
             t = torch.randn(s, b, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
             cu_seqlens = None
@@ -917,9 +930,22 @@ def test_te_fused_rope_replays_fwd_bwd(layout):
             cu_seqlens = torch.tensor([0, 1000, 1500, 2048, 4096], dtype=torch.int32, device="cuda")
 
         def fn(t):
-            return rope_utils.apply_rotary_pos_emb(t, freqs, config, cu_seqlens=cu_seqlens)
+            return rope_utils.apply_rotary_pos_emb(
+                t, freqs, config, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
+            )
 
-        assert_replays_bit_exact(fn, (t,), replays=3, what=f"TE fused RoPE[{layout}]")
+        outputs, gradients = assert_replays_bit_exact(
+            fn,
+            (t,),
+            replays=3,
+            grad_outputs={"out": torch.randn_like(t)},
+            contention=True,
+            what=f"TE fused RoPE[{layout}, interleaved={rotary_interleaved}]",
+        )
+        expected_shape = (s, 1, h, d) if layout == "thd_per_token" else t.shape
+        assert calls == [expected_shape] * 3
+        assert outputs["out"].shape == t.shape
+        assert gradients["in[0]"].shape == t.shape
     finally:
         Utils.destroy_model_parallel()
 
