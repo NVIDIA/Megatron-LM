@@ -46,7 +46,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import DSAtten
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
-from megatron.core.utils import is_te_min_version, log_single_rank
+from megatron.core.utils import is_te_min_version, log_single_rank, unwrap_model
 
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp import (
@@ -799,6 +799,26 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 does not support disabling bucketing.")
         if not hasattr(pg_collection, 'dp_cp'):
             raise ValueError("MFSDP v2 requires an explicit dp_cp process group.")
+
+        mtp_number_layers = 0 if config.mtp_num_layers is None else config.mtp_num_layers
+        if config.overlap_moe_expert_parallel_comm and mtp_number_layers not in (0, 1):
+            raise ValueError(
+                "overlap_moe_expert_parallel_comm requires mtp_num_layers <= 1 "
+                f"(got {mtp_number_layers})."
+            )
+
+        if config.pipeline_model_parallel_size > 1 and mtp_number_layers > 0:
+            model = unwrap_model(module)
+            if getattr(model, "share_embeddings_and_output_weights", False):
+                # Check global topology, rather than rank-local mtp_process, so
+                # every PP rank rejects before constructing FSDP collective state.
+                # TODO: Remove after GPTModel/HybridModel stop allocating an unused
+                # tied MTP output weight (https://github.com/NVIDIA/Megatron-LM/pull/8330).
+                raise ValueError(
+                    "MFSDP v2 does not currently support PP > 1 with MTP and tied embeddings. "
+                    "The last MTP stage allocates an unused output weight that never receives "
+                    "a gradient. See https://github.com/NVIDIA/Megatron-LM/pull/8330."
+                )
 
         if config.mtp_detach_heads:
             # Detached MTP heads are tagged into a separate gradient-norm group, which

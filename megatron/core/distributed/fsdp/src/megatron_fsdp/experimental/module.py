@@ -75,14 +75,11 @@ class FsdpModule:
         schedule_policy: SchedulePolicy = SchedulePolicy(),
         use_symmetric_memory: bool = False,
         register_hooks: bool = True,
-        grad_accumulation_count: int | None = None,
         shard_layout: ShardLayout = ShardLayout.PADDED,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module.
 
         Args:
-            grad_accumulation_count: Total parameter-gradient callbacks per reduction
-                window. Defaults to one per owned trainable parameter.
             shard_layout: Padded or unpadded rank segments for every parameter group.
                 See ``fully_shard``.
         """
@@ -117,9 +114,7 @@ class FsdpModule:
             )
         self._parameter_groups = tuple(parameter_groups)
         self._trainable_parameter_countdown = Countdown(
-            grad_accumulation_count
-            if grad_accumulation_count is not None
-            else sum(1 for _ in self._trainable_fsdp_parameters())
+            sum(1 for _ in self._trainable_fsdp_parameters())
         )
         # The state-dict safety hook is registered unconditionally. It is still
         # required to keep loading a state dict safe when ``register_hooks`` is

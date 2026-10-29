@@ -17,24 +17,15 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
     fully_shard_optimizer,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import finish_fsdp_backward
 
 
-def _sharded_unit(setup, model, grad_accumulation_count):
+def _sharded_unit(setup, model):
     """Shard one unit with caller-managed execution and gradient synchronization."""
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
     placements = Placements([0], [Shard(0)], [Shard(0)], [Shard(0)])
     with fully_shard_context(device=setup.device, caller_managed_grad_sync=True):
-        fully_shard(
-            model,
-            mesh=mesh,
-            placements=placements,
-            register_hooks=False,
-            grad_accumulation_count=grad_accumulation_count,
-        )
-    # The test drives materialization around each GraphTask; the completion hook
-    # only reduces gradients once all declared contributions have accumulated.
-    model.register_post_backward_hook(FsdpModule._reduce_gradient_groups)
+        fully_shard(model, mesh=mesh, placements=placements, register_hooks=False)
     return model
 
 
@@ -70,9 +61,7 @@ def test_gradients_and_updates_match_baseline(distributed_setup, nodes):
     baseline = nn.Sequential(nn.Linear(16, 16, bias=False), nn.Linear(16, 16, bias=False)).to(
         setup.device
     )
-    model = _sharded_unit(
-        setup, copy.deepcopy(baseline), sum(2 if node is None else 1 for node in nodes)
-    )
+    model = _sharded_unit(setup, copy.deepcopy(baseline))
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     fully_shard_optimizer(optimizer)
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.1)
@@ -81,7 +70,7 @@ def test_gradients_and_updates_match_baseline(distributed_setup, nodes):
     for _ in range(2):
         optimizer.zero_grad()
         baseline_optimizer.zero_grad()
-        # Two windows per step exercise countdown re-arming and gradient accumulation.
+        # The scheduler closes each window after all of its GraphTasks finish.
         for _ in range(2):
             for node in nodes:
                 inputs = torch.randn(4, 16, device=setup.device)
@@ -89,6 +78,7 @@ def test_gradients_and_updates_match_baseline(distributed_setup, nodes):
                 baseline_loss = consumer(inputs).square().mean()
                 baseline_loss.backward()
                 torch.testing.assert_close(_graph_task(model, inputs, node), baseline_loss.detach())
+            finish_fsdp_backward(model)
         model.context.finish_grad_sync()
         for reference, parameter in zip(baseline.parameters(), model.parameters()):
             dist.all_reduce(reference.grad, op=dist.ReduceOp.AVG)
