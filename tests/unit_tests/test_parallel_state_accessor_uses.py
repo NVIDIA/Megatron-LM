@@ -42,10 +42,20 @@ WARNING = "ParallelStateDeprecationWarning"
 # ProcessGroupCollection.use_mpu_process_groups(), deprecated with the parallel_state accessors.
 # The name is unique to it, so every attribute of that name counts, whatever its owner.
 SHIM = "use_mpu_process_groups"
-# Every top-level folder with Python code except tests/, which uses the global grid on purpose,
-# and the CI configuration in .github/ and .gitlab/, whose scripts do not import Megatron.
-# megatron/core is scanned by tools/check_process_group_usage.py instead.
-SCANNED_FOLDERS = ("megatron", "examples", "tools", "tasks", "scripts", "docs")
+# Every top-level folder with Python code except tests/, .github/ and .gitlab/, plus the
+# functional tests in tests/, which run Megatron end to end like the entry points. The rest of
+# tests/ is skipped: the unit tests use the global grid on purpose, and tests/test_utils and
+# tests/performance_tests, like the CI configuration in .github/ and .gitlab/, hold scripts that
+# do not import Megatron. megatron/core is scanned by tools/check_process_group_usage.py instead.
+SCANNED_FOLDERS = (
+    "megatron",
+    "examples",
+    "tools",
+    "tasks",
+    "scripts",
+    "docs",
+    "tests/functional_tests",
+)
 EXCLUDED_FOLDER = REPO_ROOT / "megatron" / "core"
 # Files that cannot run, and the missing module each imports: tasks/eval_utils.py still imports
 # megatron.schedules, which moved to megatron.core.pipeline_parallel in 2023.
