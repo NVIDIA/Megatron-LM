@@ -756,6 +756,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-pad-expert-input-to-capacity | Pad to capacity | False |
 | --moe-token-drop-policy | Drop policy: probs, position | probs |
 | --moe-permute-fusion | Fuse permutation ops | False |
+| --moe-combine-reduce-in-activation-dtype | alltoall with expert-TP size 2: reduce-scatter the combine in the activation dtype instead of the router dtype (bit-identical under NCCL Ring/PAT) | False |
 
 ### Performance Optimization
 | Argument | Description | Default |

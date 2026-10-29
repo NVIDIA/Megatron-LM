@@ -67,6 +67,15 @@ logger = logging.getLogger(__name__)
 _HYBRIDEP_INT16_EXPERT_LIMIT = 1 << 15
 
 
+def _nccl_algo_may_use_nvls() -> bool:
+    """Returns whether ``NCCL_ALGO`` asks for NVLS.
+
+    Matches values such as ``NVLS`` or ``reducescatter:nvls``, but not the exclusion ``^NVLS``.
+    """
+    algo = os.environ.get("NCCL_ALGO", "").lower()
+    return "nvls" in algo and not algo.startswith("^")
+
+
 class MoETokenDispatcher:
     """
     MoE Token Dispatcher
@@ -807,6 +816,33 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = None
         return global_input_tokens, tokens_per_expert, global_probs
 
+    def _tp_reduce_dtype(self, hidden_states: torch.Tensor) -> torch.dtype:
+        """Returns the dtype for the expert-TP Reduce-Scatter in ``combine_preprocess``.
+
+        By default the expert outputs are upcast to the router probs dtype (e.g. FP32 with
+        ``moe_router_dtype='fp32'``), which avoids repeated low-precision roundings when the
+        expert-TP group has more than two ranks. With exactly two ranks the reduction is a
+        single addition per element, which NCCL's Ring and PAT kernels accumulate in FP32 and
+        round once, so the result equals the FP32 sum cast back to the activation dtype and the
+        upcast only costs an FP32 copy of every token-expert row. When
+        ``moe_combine_reduce_in_activation_dtype`` is set, the upcast is skipped for 2-rank
+        groups. NVLS reduces inside the NVSwitch and rounds differently, so the upcast is kept
+        whenever ``NCCL_ALGO`` asks for NVLS.
+
+        Args:
+            hidden_states (torch.Tensor): Expert outputs about to be reduce-scattered.
+
+        Returns:
+            torch.dtype: The dtype to reduce-scatter in.
+        """
+        if (
+            self.config.moe_combine_reduce_in_activation_dtype
+            and self.tp_size == 2
+            and not _nccl_algo_may_use_nvls()
+        ):
+            return hidden_states.dtype
+        return self.probs.dtype
+
     def combine_preprocess(self, hidden_states):
         """Prepares hidden states for token combination after expert computations.
 
@@ -841,7 +877,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             else:
                 input_split_sizes = self.output_splits_tp.tolist()
             hidden_states = reduce_scatter_to_sequence_parallel_region(
-                hidden_states.to(self.probs.dtype),
+                hidden_states.to(self._tp_reduce_dtype(hidden_states)),
                 group=self.tp_group,
                 input_split_sizes=input_split_sizes,
             ).to(hidden_states.dtype)
