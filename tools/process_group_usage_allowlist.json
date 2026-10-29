@@ -174,7 +174,7 @@
       "get_mtp_layer_offset:accessor:parallel_state.get_pipeline_model_parallel_rank:warned",
       "get_mtp_num_layers_to_build:accessor:parallel_state.get_pipeline_model_parallel_rank:warned",
       "mtp_on_this_rank:accessor:parallel_state.get_pipeline_model_parallel_rank:warned",
-      "mtp_on_this_rank:accessor:parallel_state.get_pipeline_model_parallel_world_size",
+      "mtp_on_this_rank:accessor:parallel_state.get_pipeline_model_parallel_world_size:warned",
       "mtp_on_this_rank:function:parallel_state.get_virtual_pipeline_model_parallel_world_size:warned",
       "process_mtp_loss:accessor:parallel_state.get_data_parallel_group:warned"
     ],
