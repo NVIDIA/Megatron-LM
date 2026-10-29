@@ -19,6 +19,7 @@ from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.determinism.kernels.harness import deterministic_algorithms
 
 
 @pytest.fixture(autouse=True)
@@ -578,6 +579,80 @@ def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch, clamp_s
     else:
         assert "clamped_relu2_limit" not in captured
     assert "swiglu_limit" not in captured
+
+
+@pytest.mark.parametrize("mode", ["default", "deterministic", "batch_invariant"])
+def test_bf16_flashinfer_rules_out_fused_finalize_when_deterministic(monkeypatch, mode):
+    """Fused-finalize GEMM2 tactics sum the top-k routes with atomics; the autotuner must not
+    be able to select them in deterministic or batch-invariant mode."""
+    from megatron.core.transformer.moe import experts
+
+    captured = {}
+
+    def cutlass_fused_moe(*args, **kwargs):
+        captured.update(kwargs)
+        return (torch.empty(4, 8, dtype=torch.bfloat16),)
+
+    monkeypatch.setattr(experts, "HAVE_FLASHINFER", True)
+    monkeypatch.setattr(experts, "HAVE_FLASHINFER_UNFUSED_FINALIZE", True)
+    monkeypatch.setattr(
+        experts, "fused_moe", SimpleNamespace(cutlass_fused_moe=cutlass_fused_moe), raising=False
+    )
+    monkeypatch.setattr(
+        experts, "is_batch_invariant_mode_enabled", lambda: mode == "batch_invariant"
+    )
+    grouped_mlp = SimpleNamespace(
+        _uses_mxfp8_weights=False,
+        _nvfp4_weights=None,
+        _fc1_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
+        _fc2_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
+        _flashinfer_activation_type=object(),
+        _activation_clamp_scale=None,
+        _nvls_dispatcher=False,
+        ep_group=SimpleNamespace(size=lambda: 1, rank=lambda: 0),
+    )
+    with deterministic_algorithms(mode == "deterministic"):
+        experts.InferenceGroupedMLP._flashinfer_forward(
+            grouped_mlp,
+            torch.empty(4, 8, dtype=torch.bfloat16),
+            torch.zeros(4, 2, dtype=torch.int64),
+            torch.zeros(4, 2, dtype=torch.float32),
+        )
+
+    # FlashInfer defaults use_fused_finalize to True.
+    assert captured.get("use_fused_finalize", True) is (mode == "default")
+
+
+@pytest.mark.parametrize("mode", ["deterministic_mode", "batch_invariant_mode"])
+def test_bf16_flashinfer_weight_build_requires_unfused_finalize(monkeypatch, mode):
+    """FlashInfer < 0.6.15 cannot rule out the fused finalize, so a deterministic or
+    batch-invariant config is rejected when BF16 FlashInfer expert weights are built."""
+    from megatron.core.inference.moe import InferenceGroupedGemmBackend
+    from megatron.core.transformer.moe import experts
+
+    monkeypatch.setattr(experts, "HAVE_FLASHINFER_UNFUSED_FINALIZE", False)
+    grouped_mlp = SimpleNamespace(
+        _concatenated_weights_built=False,
+        num_local_experts=1,
+        linear_fc1=SimpleNamespace(weight0=torch.empty(1, dtype=torch.bfloat16)),
+        linear_fc2=SimpleNamespace(weight0=torch.empty(1, dtype=torch.bfloat16)),
+        _build_concatenated_weights=lambda: None,
+        _nvfp4_recipe=None,
+        inference_grouped_gemm_backend=InferenceGroupedGemmBackend.FLASHINFER,
+        config=SimpleNamespace(
+            **{"deterministic_mode": False, "batch_invariant_mode": False, mode: True}
+        ),
+        _flashinfer_forward=lambda *args: pytest.fail("fused finalize stays selectable"),
+    )
+
+    with InferenceMode.active(), pytest.raises(RuntimeError, match="flashinfer-python >= 0.6.15"):
+        experts.InferenceGroupedMLP.forward(
+            grouped_mlp,
+            torch.empty(1, 1),
+            None,
+            torch.empty(1, 1),
+            routing_map=torch.zeros(1, 1, dtype=torch.int64),
+        )
 
 
 def test_flashinfer_nvls_clears_routing_before_metadata_fence(monkeypatch):
