@@ -1182,6 +1182,76 @@ def test_deleting_te_cuda_graphs_releases_the_captured_mok_weight_views(monkeypa
     assert module._routed_weight_view_cache is None
 
 
+@pytest.mark.parametrize("swap", [False, True])
+def test_captured_weight_views_reject_a_conversion_before_any_parameter_changes(monkeypatch, swap):
+    """A conversion while captured graphs reference the cached weight views raises before it
+    changes a parameter or a derived cache; deleting the graphs lets the same conversion run."""
+    module, _, _ = _split_module_with_main_grads(monkeypatch)
+    module._weight_views_refreshed_outside_graph = True
+    module._weight_views_captured = False
+    capturing = [False]
+    # Like MOK's BF16 views, these alias the parameter storage.
+    monkeypatch.setattr(
+        mok_backend,
+        "_native_split_weight_view",
+        lambda params, **kwargs: tuple(map(torch.Tensor.detach, params)),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing[0])
+    module.refresh_weight_views()
+    module.main_grad_arguments()
+    module.shared_fc1_gate_up()
+    module.finish_routed_weight_gradients()
+    capturing[0] = True
+    module.quantized_routed_weights()  # the capture records the cached views
+    capturing[0] = False
+    derived_state = (
+        "_routed_weight_view_cache",
+        "_routed_parameter_cache",
+        "_routed_dummy_gradient_buffers",
+        "_main_grad_arguments_cache",
+        "_shared_fc1_gate_up_cache",
+    )
+    caches = {name: getattr(module, name) for name in derived_state}
+    assert module._weight_views_captured
+    assert all(cache is not None for cache in caches.values())
+    parameters = dict(module._parameters)
+
+    def parameter_state():
+        return {
+            name: (param.dtype, param.device, param.untyped_storage().data_ptr())
+            for name, param in module._parameters.items()
+        }
+
+    state = parameter_state()
+    views = module._routed_weight_view_cache[0] + module._routed_weight_view_cache[1]
+
+    swap_before = torch.__future__.get_swap_module_params_on_conversion()
+    try:
+        torch.__future__.set_swap_module_params_on_conversion(swap)
+        with pytest.raises(RuntimeError, match="captured CUDA graphs"):
+            module.float()
+
+        assert module._parameters.keys() == parameters.keys()
+        assert all(module._parameters[name] is param for name, param in parameters.items())
+        assert parameter_state() == state
+        assert all(getattr(module, name) is cache for name, cache in caches.items())
+        routed = module.autograd_routed_parameters
+        assert all(
+            view.data_ptr() == param.data_ptr() for view, param in zip(views, routed, strict=True)
+        )
+        assert module._weight_views_captured and not module.is_first_microbatch
+
+        module.cuda_graphs_deleted()
+        module.float()
+    finally:
+        torch.__future__.set_swap_module_params_on_conversion(swap_before)
+
+    assert all(param.dtype == torch.float32 for param in module.parameters())
+    assert all(hasattr(param, "main_grad") for param in module.parameters())
+    assert all(getattr(module, name) is None for name in derived_state)
+    assert module.is_first_microbatch
+
+
 def test_register_shared_output_gate_rejects_non_bf16_parameter(monkeypatch):
     module, shared, _ = _mock_backend(monkeypatch)
     shared.gate_weight = torch.nn.Parameter(torch.zeros((1, 8), dtype=torch.float32))
