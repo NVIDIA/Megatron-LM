@@ -63,5 +63,6 @@ MODEL_ARGS:
   --async-save: true
   --use-persistent-ckpt-worker: true
   --verify-integrity: true
+  --strict-process-group-fallbacks: true
 TEST_TYPE: ckpt-resume
 LAUNCHER: ft_launcher
