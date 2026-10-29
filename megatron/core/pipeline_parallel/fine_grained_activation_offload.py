@@ -1279,38 +1279,43 @@ class ChunkOffloadHandler:
         return len(count_modules)
 
     def bulk_reload_group(self):
-        """Reload the next group into buffers that belong to the stream that will consume them
-        (the current stream) rather than to the H2D stream.
+        """Reload the next group from host memory into buffers owned by the consumer stream.
 
-        A buffer allocated on the H2D stream lives in that stream's allocator pool: once the
-        backward frees it, only another reload can reuse the block, and ``record_stream`` keeps
-        it out of circulation until the consumer's read has retired, so the pool grows with the
-        host's lead over the GPU. Allocated on the consumer stream, the blocks are reused in
-        that stream's order like every other activation. Ordering, with two events and no
-        ``record_stream``:
+        The destinations are allocated on the current stream, the one whose backward will read
+        and free them, and only the copies run on the H2D stream. A destination allocated on the
+        H2D stream would belong to that stream's allocator pool: after the backward frees it,
+        only another reload could reuse the block, and ``record_stream`` would hold the block
+        until the consumer's read had retired, so the H2D pool grows with the host's lead over
+        the GPU while the compute stream grows its own pool for the same bytes.
 
-          1. the destinations are allocated on the consumer stream; the caching allocator may
-             hand out blocks whose previous user is still queued there, so
-          2. the H2D stream waits once for the consumer stream (and, outside CUDA-graph capture,
-             for this group's D2H offload; a captured reload is ordered behind the offload by
-             the capture's own dependencies) before copying, and
-          3. records the group's reload event, which the consumer waits on before the first
-             use (``on_group_commit_backward``, or the backward record function under capture);
-             it frees the tensors in its own stream order.
+        Ordering (two events, no ``record_stream``):
+
+        1. Allocate every destination on the consumer stream. The caching allocator may hand
+           out a block whose previous user is still queued on that stream.
+        2. The H2D stream waits once for the consumer stream, and, outside CUDA-graph capture,
+           for this group's D2H offload event. Under capture the H2D stream is already forked
+           from the capturing stream in ``on_group_start_backward`` and the offload event lives
+           outside the graph, so that wait is skipped as before.
+        3. Copy on the H2D stream and record the group's reload event there. The consumer waits
+           on it before the first use (``on_group_commit_backward``, or the backward record
+           function under capture) and frees the tensors in its own stream order.
         """
         debug_rank("----bulk_reload_group")
         group_to_reload = self._groups_to_reload[-1]
         nvtx_msg = "activation reloading " + group_to_reload._name
         nvtx_range_push(nvtx_msg)
+        # 1. Destinations on the consumer stream (only tensors that were offloaded).
         consumer_stream = torch.cuda.current_stream()
         staged = [
             (tensor_tag, state, self._allocate_reload_destination(state))
             for tensor_tag, state in group_to_reload._tensors.items()
-            if isinstance(state, tuple)  # only tensors that were offloaded
+            if isinstance(state, tuple)
         ]
+        # 2. The H2D stream waits for the consumer stream and, outside capture, for the offload.
         self.h2d_stream.wait_stream(consumer_stream)
         if not is_graph_capturing():
             group_to_reload.wait_offload_event(self.h2d_stream)
+        # 3. Copy on the H2D stream and record the reload event there.
         with torch.cuda.stream(self.h2d_stream):
             for tensor_tag, state, gpu_tensor in staged:
                 recovered_tensor = self._reload_into(state, gpu_tensor, stream=self.h2d_stream)
