@@ -103,6 +103,13 @@ K = "tests/unit_tests/determinism/kernels/"
 C = "tests/unit_tests/determinism/correctness/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
+    KernelEntry(
+        name="masked_router_replay",
+        sources=("megatron/core/transformer/moe/router_replay.py",),
+        tests=(K + "test_router_replay_mask.py",),
+        kind="torch-op",
+        notes="Masked route selection and gathered-score backward retain exact forward choices.",
+    ),
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
     KernelEntry(
         name="fused_bias_swiglu",
