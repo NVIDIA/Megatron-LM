@@ -154,7 +154,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_fused_activations.py",),
         kind="torch.compile",
         notes="squared_relu/quick_gelu/fast_gelu/tanh_soft_clamp/situ/situ_glu, openai/erf GELU, "
-        "L2Norm._norm (row reduction).",
+        "L2Norm._norm (row reduction), and eager unfused_fast_gelu for variable-length projections.",
     ),
     KernelEntry(
         name="attention_kernels_and_dispatch",

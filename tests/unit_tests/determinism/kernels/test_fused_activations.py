@@ -182,6 +182,16 @@ def test_compiled_activations_replay_bit_exactly(case):
     assert_replays_bit_exact(ACTIVATION_CASES[case], (x,), replays=3, what=case)
 
 
+@pytest.mark.parametrize("tokens", [5, 13])
+def test_unfused_fast_gelu_replays_bit_exactly(tokens):
+    """Variable-length projector activation preserves output and gradient bits on replay."""
+    seeded()
+    x = _act((tokens, 96))
+    assert_replays_bit_exact(
+        activations.unfused_fast_gelu, (x,), replays=3, what="unfused_fast_gelu"
+    )
+
+
 def test_attention_output_gate_replays_bit_exactly():
     """``Attention._apply_output_gate`` is a compiled method; ``self`` is unused."""
     seeded()
