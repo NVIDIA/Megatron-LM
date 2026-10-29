@@ -6,8 +6,9 @@ get_model_for_inference(), get_dynamic_inference_engine() and get_model() build 
 collection they are given. The inference entry points, and every other script in this repository
 that calls megatron.training's get_model(), pass the registered one,
 parallel_state.get_registered_process_groups(); a caller that omits it falls back to the global
-grid with a ProcessGroupFallbackWarning. The tests run without torch.distributed, with stand-ins
-for the model builder and the checkpoint loader.
+grid with a ProcessGroupFallbackWarning. get_model() passes the collection and the model config on
+to the model provider, so every provider takes both. The tests run without torch.distributed, with
+stand-ins for the model builder and the checkpoint loader.
 """
 
 import ast
@@ -28,6 +29,17 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 SCANNED_FOLDERS = ("megatron", "examples", "tools", "tasks")
 # The modules that scripts import megatron.training's get_model() from.
 GET_MODEL_MODULES = ("megatron.training", "megatron.training.training")
+# The keywords that get_model() passes to the model provider besides pre_process, post_process
+# and, under virtual pipeline parallelism, vp_stage.
+PROVIDER_KEYWORDS = ("config", "pg_collection")
+# Scripts whose model providers once took neither keyword, so that get_model() failed to call
+# them. No test runs them: two import a module that was removed, and the third needs the GPU
+# container.
+OWN_PROVIDER_SCRIPTS = (
+    "examples/academic_paper_scripts/detxoify_lm/generate_samples_gpt.py",
+    "examples/multimodal/model_converter/vision_model_tester.py",
+    "examples/multimodal/run_text_generation.py",
+)
 # The groups that get_model_for_inference passes to load_checkpoint.
 CHECKPOINT_GROUPS = {
     "tp_group": "tp",
@@ -311,16 +323,18 @@ def _imported_module(node, package):
     return ".".join(parts + ((node.module,) if node.module else ()))
 
 
-def _get_model_calls(path, root=REPO_ROOT):
+def _get_model_calls(path, root=REPO_ROOT, tree=None):
     """Return every call of megatron.training's get_model() in ``path``, in line order.
 
     A call matches under any name that ``path`` imports get_model() or its module as, such as
     ``get_training_model(...)`` or ``training.get_model(...)``, by an absolute import or by a
     relative one, which resolves against the package of ``path`` under ``root``; a function of
-    another module that is also named get_model does not.
+    another module that is also named get_model does not. The calls are nodes of ``tree``, the
+    syntax tree of ``path``, which is parsed when it is not given.
     """
     package = path.relative_to(root).parent.parts
-    tree = ast.parse(path.read_text(encoding="utf-8"))
+    if tree is None:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
     functions, modules = set(), set(GET_MODEL_MODULES)
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
@@ -420,3 +434,301 @@ def test_in_tree_callers_pass_their_collection_to_get_model():
 
     assert calls, "found no call of get_model"
     assert [site for site, call in calls if not _passes(call, "pg_collection")] == []
+
+
+def _module_file(module, path):
+    """Return the file of ``module`` that the script ``path`` imports, next to it or at the root.
+
+    Returns None for a module in neither place, such as one that the script imports from a folder
+    that it adds to sys.path.
+    """
+    relative = pathlib.Path(*module.split("."))
+    for folder in (path.parent, REPO_ROOT):
+        for candidate in (folder / f"{relative}.py", folder / relative / "__init__.py"):
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+# The nodes that open a scope: a name that they bind is not seen outside them.
+_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+
+def _parents(tree):
+    """Return the parent of each node of ``tree``."""
+    return {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+
+
+def _blocks(node):
+    """Return the statement lists of ``node``, such as the body and the else of an if."""
+    blocks = (getattr(node, field, None) for field in ("body", "orelse", "finalbody", "handlers"))
+    return [block for block in blocks if isinstance(block, list)]
+
+
+def _nested_statements(statements):
+    """Yield ``statements`` and the statements of their blocks, outside nested scopes."""
+    for statement in statements:
+        yield statement
+        if not isinstance(statement, _SCOPES):
+            for block in _blocks(statement):
+                yield from _nested_statements(block)
+
+
+def _binds(statement, name):
+    """Whether ``statement`` binds ``name`` by a definition, an import or an assignment."""
+    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return statement.name == name
+    if isinstance(statement, (ast.Import, ast.ImportFrom)):
+        return any((alias.asname or alias.name.split(".")[0]) == name for alias in statement.names)
+    if isinstance(statement, ast.Assign) or (
+        isinstance(statement, ast.AnnAssign) and statement.value is not None
+    ):
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        return any(
+            isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == name
+            for target in targets
+            for node in ast.walk(target)
+        )
+    return False
+
+
+def _reaching(statements, name):
+    """Return the bindings of ``name`` in ``statements`` that may hold after them.
+
+    Also returns whether one of them certainly holds. The last statement of ``statements`` that
+    binds ``name`` itself hides the bindings before it; a binding in a block of a statement, such
+    as one arm of an if, may not run, so it hides none. Loops are not followed.
+    """
+    bindings = []
+    for statement in reversed(statements):
+        if _binds(statement, name):
+            return bindings + [statement], True
+        if not isinstance(statement, _SCOPES):
+            bindings += [
+                nested
+                for block in _blocks(statement)
+                for nested in _nested_statements(block)
+                if _binds(nested, name)
+            ]
+    return bindings, False
+
+
+def _parameters(scope):
+    """Return the names of the parameters of the function or lambda ``scope``."""
+    if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        return set()
+    arguments = scope.args
+    names = arguments.posonlyargs + arguments.args + arguments.kwonlyargs
+    names += [argument for argument in (arguments.vararg, arguments.kwarg) if argument]
+    return {argument.arg for argument in names}
+
+
+def _body(scope):
+    """Return the statements of the module, function or lambda ``scope``; a lambda has none."""
+    return scope.body if isinstance(scope.body, list) else []
+
+
+def _bindings(name, node, parents):
+    """Return the statements that may bind ``name`` where the expression ``node`` reads it.
+
+    As Python does, the name resolves in the innermost function that binds it, else in the
+    module. In the function that reads it, a binding counts when it comes before the read in a
+    block that holds the read, so a branch does not see the imports of another branch; in an
+    enclosing function or in the module, which ran first, the bindings at its end count. Returns
+    no statement for a parameter, which the caller binds, and for an unbound name.
+    """
+    bindings, child = [], node
+    while True:
+        parent = parents[child]
+        for block in _blocks(parent):
+            index = next((at for at, statement in enumerate(block) if statement is child), None)
+            if index is not None:
+                found, certain = _reaching(block[:index], name)
+                bindings += found
+                if certain:
+                    return bindings
+        if isinstance(parent, (ast.Module, *_SCOPES)):
+            break
+        child = parent
+    scope = parent
+    if bindings or isinstance(scope, ast.Module):
+        return bindings
+    if name in _parameters(scope) or any(
+        _binds(statement, name) for statement in _nested_statements(_body(scope))
+    ):
+        return []
+    while not isinstance(scope, ast.Module):
+        scope = parents[scope]
+        if isinstance(scope, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            found, _ = _reaching(_body(scope), name)
+            if found or name in _parameters(scope):
+                return found
+    return []
+
+
+def _provider_definitions(provider, path, parents):
+    """Return the functions that ``provider``, a model provider expression in ``path``, may be.
+
+    ``parents`` maps each node of the syntax tree of ``path`` to its parent. A provider is a
+    lambda, functools.partial() of a provider, or a name, which _bindings() resolves in the
+    scope that reads it: to a function that ``path`` defines, to the value of an assignment, or
+    to a function that ``path`` imports by name from a module that _module_file() finds and that
+    defines it. Other providers are not found, such as one that the calling function receives
+    from its own caller or imports from a folder that the script adds to sys.path.
+    """
+    if isinstance(provider, ast.Lambda):
+        return [provider]
+    if isinstance(provider, ast.Call) and _called_name(provider) == "partial" and provider.args:
+        return _provider_definitions(provider.args[0], path, parents)
+    if not isinstance(provider, ast.Name):
+        return []
+    definitions = []
+    for binding in _bindings(provider.id, provider, parents):
+        if isinstance(binding, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            definitions.append(binding)
+        elif isinstance(binding, (ast.Assign, ast.AnnAssign)):
+            definitions += _provider_definitions(binding.value, path, parents)
+        elif isinstance(binding, ast.ImportFrom) and binding.module and not binding.level:
+            module_file = _module_file(binding.module, path)
+            for alias in binding.names:
+                if module_file is not None and (alias.asname or alias.name) == provider.id:
+                    module = ast.parse(module_file.read_text(encoding="utf-8"))
+                    definitions += [
+                        definition
+                        for definition in _reaching(module.body, alias.name)[0]
+                        if isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    ]
+    return definitions
+
+
+def _ignored_provider_keywords(provider):
+    """Return the keywords of PROVIDER_KEYWORDS that the function ``provider`` rejects or ignores.
+
+    A provider that names a keyword must read it, or it builds the model on other groups, or with
+    another config, than get_model() passes. One that takes ``**kwargs`` accepts every keyword;
+    whether it passes them on is not checked.
+    """
+    arguments = provider.args
+    named = {argument.arg for argument in arguments.args + arguments.kwonlyargs}
+    body = provider.body if isinstance(provider.body, list) else [provider.body]
+    read = {
+        node.id
+        for statement in body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+    return [
+        keyword
+        for keyword in PROVIDER_KEYWORDS
+        if (keyword not in read if keyword in named else arguments.kwarg is None)
+    ]
+
+
+def _provider(call):
+    """Return the model provider expression that the get_model() call ``call`` passes, if any."""
+    if call.args:
+        return call.args[0]
+    return next(
+        (keyword.value for keyword in call.keywords if keyword.arg == "model_provider_func"), None
+    )
+
+
+def test_the_provider_check_finds_providers_and_their_ignored_keywords(tmp_path):
+    """Providers resolve in the scope of the call, and their ignored keywords are found.
+
+    A defined, nested, imported, partial, lambda or assigned provider is found; a branch sees its
+    own import, and a function of the same name in another scope does not count. A provider that
+    is a parameter, that is passed in ``**kwargs`` or that the script imports from a module out
+    of reach is not found.
+    """
+    (tmp_path / "providers.py").write_text(
+        "def imported(pre_process, post_process, config=None, pg_collection=None):\n"
+        "    return config, pg_collection\n"
+        "def rejected(pre_process, post_process):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "from functools import partial\n"
+        "from megatron.training import get_model\n"
+        "from providers import imported\n"
+        "def rejects(pre_process, post_process):\n"
+        "    pass\n"
+        "def unrelated():\n"
+        "    def imported(pre_process, post_process):\n"
+        "        pass\n"
+        "def main(passed_by_the_caller, choice, **kwargs):\n"
+        "    def ignores(pre_process, post_process, config=None, pg_collection=None):\n"
+        "        return config\n"
+        "    get_model(rejects)\n"
+        "    get_model(ignores)\n"
+        "    get_model(partial(imported))\n"
+        "    get_model(lambda pre_process, post_process, **kwargs: None)\n"
+        "    get_model(model_provider_func=passed_by_the_caller)\n"
+        "    assigned = partial(rejects)\n"
+        "    get_model(assigned)\n"
+        "    get_model(**kwargs)\n"
+        "    if choice:\n"
+        "        from providers import rejected as chosen\n"
+        "        get_model(chosen)\n"
+        "    else:\n"
+        "        from providers import imported as chosen\n"
+        "        get_model(chosen)\n"
+        "def out_of_reach():\n"
+        "    from elsewhere import imported\n"
+        "    get_model(imported)\n",
+        encoding="utf-8",
+    )
+    tree = ast.parse(probe.read_text(encoding="utf-8"))
+    parents = _parents(tree)
+
+    found = [
+        (
+            call.lineno,
+            [
+                _ignored_provider_keywords(definition)
+                for definition in _provider_definitions(_provider(call), probe, parents)
+            ],
+        )
+        for call in _get_model_calls(probe, root=tmp_path, tree=tree)
+    ]
+
+    assert found == [
+        (12, [["config", "pg_collection"]]),
+        (13, [["pg_collection"]]),
+        (14, [[]]),
+        (15, [[]]),
+        (16, []),
+        (18, [["config", "pg_collection"]]),
+        (19, []),
+        (22, [["config", "pg_collection"]]),
+        (25, [[]]),
+        (28, []),
+    ]
+
+
+def test_the_providers_given_to_get_model_take_its_keywords():
+    """get_model() calls the model provider with config= and pg_collection=.
+
+    A provider that rejects them fails with a TypeError. One that names them must read them, or
+    it builds the model on other groups, or with another config, than get_model() passes; one
+    that takes them through ``**kwargs`` is only checked to accept them. The check covers the
+    providers that _provider_definitions() finds, among them those of OWN_PROVIDER_SCRIPTS, and
+    skips the others.
+    """
+    checked, ignored = set(), []
+    for path in sorted(set(_sources())):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        calls = _get_model_calls(path, tree=tree)
+        parents = _parents(tree) if calls else {}
+        for call in calls:
+            for definition in _provider_definitions(_provider(call), path, parents):
+                checked.add(str(path.relative_to(REPO_ROOT)))
+                ignored += [
+                    f"{path.relative_to(REPO_ROOT)}:{call.lineno} {keyword}"
+                    for keyword in _ignored_provider_keywords(definition)
+                ]
+
+    assert ignored == []
+    assert set(OWN_PROVIDER_SCRIPTS) <= checked
