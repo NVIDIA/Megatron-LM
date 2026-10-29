@@ -499,20 +499,37 @@ def wrap_data_iterator(
     Args:
         data_iterator: The original data_iterator to wrap around
         config: The config object containing the max_seqlen_per_dp_cp_rank
-        pg_collection: Caller-owned process groups; must define dp_cp, dp, tp, and pp.
+        num_microbatches: The number of microbatches each DP rank reads from data_iterator.
+        pg_collection: Caller-owned process groups. Packing reads ``tp`` and ``pp`` and
+            spans the GTP-remat-inclusive data groups ``dp_cp_gtp_remat`` and
+            ``dp_gtp_remat``, using ``dp_cp`` and ``dp`` where those are unset (they cover
+            the same ranks when GTP-remat is off). Dynamic-CP scheduling also reads
+            ``dynamic_cp``.
+
+    Raises:
+        ValueError: If ``pg_collection`` is None or does not define one of these groups.
     """
+
+    if pg_collection is None:
+        raise ValueError("pg_collection is required for sequence packing")
 
     # GTP_remat peers consume distinct samples, so packing must span them like the rest of DP.
     dp_cp_group = pg_collection.dp_cp_gtp_remat or pg_collection.dp_cp
     dp_group = pg_collection.dp_gtp_remat or pg_collection.dp
     tp_group = pg_collection.tp
     pp_group = pg_collection.pp
-    assert (
-        dp_cp_group is not None
-        and dp_group is not None
-        and tp_group is not None
-        and pp_group is not None
-    ), "dp_cp, dp, tp, and pp must be defined in pg_collection for sequence packing"
+    missing = [
+        name
+        for name, group in (
+            ("dp_cp_gtp_remat (or dp_cp)", dp_cp_group),
+            ("dp_gtp_remat (or dp)", dp_group),
+            ("tp", tp_group),
+            ("pp", pp_group),
+        )
+        if group is None
+    ]
+    if missing:
+        raise ValueError(f"pg_collection must define {', '.join(missing)} for sequence packing")
 
     dev = torch.cuda.current_device()
     dp_size = dp_group.size()
