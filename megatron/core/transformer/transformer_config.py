@@ -4703,10 +4703,12 @@ class TransformerConfig(ModelParallelConfig):
                 # Checked rather than set: the autotune config lists are fixed at
                 # import, so setting the flag here would change nothing.
                 assert use_deterministic_mode(), (
-                    "Batch invariant mode on a hybrid model requires MAMBA_DETERMINISTIC=1 "
-                    "in the environment before Megatron is imported, so the SSM Triton "
-                    "kernels pin their autotune configs instead of choosing per call "
-                    "shape. Setting it after import has no effect; relaunch with it set."
+                    "Batch invariant mode on a hybrid model requires deterministic mode, so "
+                    "the SSM Triton kernels pin their autotune configs instead of choosing "
+                    "per call shape. Run with --deterministic-mode; applications that build "
+                    "models without Megatron's training initializer enable it as "
+                    "megatron/core/tuning/README.md describes. MAMBA_DETERMINISTIC=1 does not "
+                    "enable it: it only configures the external mamba_ssm package."
                 )
 
             # Context parallelism routes through TE's FA2 fwd/bwd kernels directly, which
