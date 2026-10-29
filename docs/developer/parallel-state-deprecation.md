@@ -509,6 +509,11 @@ loses its warning, therefore fails the job whether or not the allowlist holds it
 fallbacks Megatron Core may add is left to the report-only ratchet.
 [API backward compatibility checking](../api-backwards-compatibility-check.md) describes the job.
 
+The unit-test buckets run the three test files as well. They read the source as text, so a
+selective (Testmon) run would never select them for a source change;
+`tests/unit_tests/testmon_mandatory_tests.yaml` adds them whenever a pull request changes a file
+under the folders they scan or a top-level script. A new top-level script needs an entry there.
+
 ### When the check reports a new read
 
 The checker lists each new read with its location, the enclosing scope, the kind and the
