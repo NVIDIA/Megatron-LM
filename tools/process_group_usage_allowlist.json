@@ -189,7 +189,7 @@
       "Attention.__init__:shim:use_mpu_process_groups"
     ],
     "megatron/core/transformer/cuda_graphs.py": [
-      "CudaGraphManager.__init__:shim:use_mpu_process_groups",
+      "CudaGraphManager._resolve_reuse_cudagraphs:shim:use_mpu_process_groups",
       "TECudaGraphHelper.__init__:shim:use_mpu_process_groups"
     ],
     "megatron/core/transformer/dot_product_attention.py": [
