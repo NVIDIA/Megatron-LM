@@ -75,7 +75,7 @@ jobs:
       - name: Install dependencies
         if: steps.pr.outputs.number
         run: |
-          pip install --no-cache-dir codeowners PyGithub slack-sdk
+          pip install --no-cache-dir PyGithub slack-sdk
 
       - name: Run Auto Swap Labels
         if: steps.pr.outputs.number
