@@ -275,6 +275,53 @@ After establishing a working parallel configuration, profile your training to id
 
 ## Feature Documentation
 
+### Latent MoE Projection Scaling
+
+Latent MoE projects routed tokens from `hidden_size` to `moe_latent_size` before expert
+dispatch and projects the combined expert output back to `hidden_size`. Shared experts
+and the router operate at the full model width.
+
+Enable `--moe-latent-projection-scaling` together with `--moe-latent-size` to multiply
+the hidden-to-latent projection output by `sqrt(hidden_size / moe_latent_size)`.
+The latent-to-hidden projection remains unscaled unless the independent
+`--moe-latent-up-projection-scaling` flag is enabled:
+
+```text
+scale = sqrt(hidden_size / moe_latent_size)
+latent_input = fc1_latent_proj(hidden_states)
+if moe_latent_projection_scaling:
+    latent_input = scale * latent_input
+latent_output = combine(routed_experts(latent_input))
+if moe_use_norm_before_up_proj:
+    latent_output = fc2_norm(latent_output)
+output = fc2_latent_proj(latent_output)
+if moe_latent_up_projection_scaling:
+    output = scale * output
+output = output + shared_expert_output
+```
+
+For `hidden_size=7168` and `moe_latent_size=3584`, each enabled gain is `sqrt(2)`.
+The down-projection gain changes expert inputs; the up-projection gain changes routed
+branch output amplitude. Each scales projection biases when present. Router inputs,
+shared expert outputs, activation definitions, weight initialization, and checkpoint
+tensor shapes are unchanged. Gains are applied in the common preprocessing and
+postprocessing paths used by training and inference.
+
+Both flags are disabled by default. When resuming or serving a checkpoint trained with
+these options, enable the same flags again to reproduce that checkpoint's computation.
+The up-projection gain is generally unnecessary if its initializer already uses
+`1/sqrt(moe_latent_size)`, with any additional depth factor. With a fixed weight std
+based on `hidden_size`, it can compensate for the smaller up-projection fan-in.
+Normalization before the up-projection normalizes its input; it does not compensate
+for the subsequent matrix's weight scale. The up-projection gain cannot change the
+expert nonlinearity's input scale, because it is applied after the experts.
+
+This is an architecture experiment: fan-in-aware expert initialization can also
+compensate for a smaller latent dimension. Neither end-to-end variance preservation
+nor a training-quality improvement is assumed. Compare down/up scaling independently
+with the same initialization, both with and without `--moe-use-norm-before-up-proj`,
+and measure activation RMS, gradients, loss, and throughput.
+
 ### Router and Load Balancing
 
 Routers determine which expert(s) handle each token. A lightweight MLP scores every token and applies `softmax` or `sigmoid` to compute routing probabilities. The router then selects the top-K experts for each token.
