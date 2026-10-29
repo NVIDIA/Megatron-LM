@@ -435,8 +435,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_batch_invariant_unpermute",
         sources=("megatron/core/transformer/moe/batch_invariant.py",),
-        tests=("tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",),
-        kind="torch-op",
+        tests=(
+            "tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",
+            "tests/unit_tests/transformer/moe/test_moe_batch_invariant_unpermute.py",
+            K + "test_moe_kernels.py",
+        ),
+        kind="triton",
+        notes="Fused rank-tree unpermute (probs=None) and its fixed-shape scatter backward "
+        "replay bit-exactly in test_moe_kernels.py and match the reference loop bitwise.",
     ),
     KernelEntry(
         name="inference_routing_mask_kernel",
