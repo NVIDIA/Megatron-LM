@@ -9,11 +9,13 @@ import torch.nn.functional as F
 
 from megatron.core import parallel_state
 from megatron.core.fp8_utils import get_fp8_context, is_float8tensor
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.layers.utils import Symbols, create_layer_config
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import HAVE_FLA_GDN2, HAVE_FLA_KDA, KimiDeltaAttention
 from megatron.core.ssm.gated_delta_net.common import _kda_fp8_disabled
@@ -74,6 +76,20 @@ def _make_config(
     )
     settings.update(overrides)
     return KDALayerConfig(**settings)
+
+
+def _replay_in_cuda_graph(fn):
+    """Warm ``fn`` up, capture it in a CUDA graph, and return the output of a replay."""
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        fn()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = fn()
+    graph.replay()
+    return output.clone()
 
 
 def _build_kda(config: KDALayerConfig) -> KimiDeltaAttention:
@@ -218,6 +234,42 @@ def test_kda_packed_matches_unpacked_cp1(two_stage_gates):
             unpacked_output.transpose(0, 1).reshape(-1, kda.config.hidden_size),
             atol=5e-3,
             rtol=5e-3,
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+def test_kda_single_token_sequences_in_cuda_graph(two_stage_gates):
+    """In inference, packed sequences of one token each, as an MTP draft step without a context
+    packs its requests, run without host syncs, so a CUDA graph captures them, and give every
+    token the output it has as a sequence of its own."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(321)
+        kda = _build_kda(_make_config(two_stage_gates=two_stage_gates))
+        num_tokens = 6
+        hidden_states = torch.randn(
+            (num_tokens, 1, kda.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        packed_seq_params = PackedSeqParams.single_token_sequences(
+            num_tokens, device=hidden_states.device
+        )
+
+        with torch.inference_mode(), InferenceMode.active():
+            alone_output = torch.cat(
+                [kda(hidden_states[i : i + 1], None)[0] for i in range(num_tokens)]
+            )
+            packed_output = _replay_in_cuda_graph(
+                lambda: kda(hidden_states, None, packed_seq_params=packed_seq_params)[0]
+            )
+        # The recurrent and chunked kernels round their bf16 intermediates differently.
+        torch.testing.assert_close(
+            packed_output, alone_output, rtol=0, atol=2e-2 * alone_output.abs().max().item()
         )
     finally:
         Utils.destroy_model_parallel()

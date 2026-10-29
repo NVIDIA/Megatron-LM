@@ -18,7 +18,10 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    gated_delta_product_stack_spec,
+    hybrid_stack_spec,
+)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -53,7 +56,7 @@ from megatron.core.transformer.multi_token_prediction import (
     roll_tensor,
     roll_tensor_precomputed_embeddings,
 )
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import (
     get_batch_on_this_cp_rank,
     get_pg_rank,
@@ -5003,13 +5006,17 @@ class TestMTPDraftStepRequestIsolation:
 
     Without an MTP draft KV plane, speculative decoding runs `compute_mtp_single_step` with no
     inference context, one row per request. Each request's draft must depend only on its own
-    inputs, at every depth, for attention (GQA) and Mamba layers in the head.
+    inputs, at every depth, whatever the head's sequence mixers: GQA or MLA attention, Mamba or
+    Gated Delta Product. The draft step must also stay capturable in a CUDA graph.
     """
 
     NUM_REQUESTS = 4
     HIDDEN_SIZE = 256
     VOCAB_SIZE = 128
     MTP_DEPTHS = 2
+    # The assertion fix/n7-mla-mtp-draft removes: without it, MLA with cached latents cannot
+    # run a forward without an inference context, so it cannot draft at all.
+    MLA_CACHED_LATENTS_ERROR = "Caching MLA latents only works with dynamic backend inference"
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -5017,11 +5024,10 @@ class TestMTPDraftStepRequestIsolation:
     def _build_model(self, model_type, tp):
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
         model_parallel_cuda_manual_seed(_SEED)
-        config = TransformerConfig(
-            num_layers=2 if model_type == "hybrid" else 1,
+        settings = dict(
+            num_layers=2 if model_type in ("mamba", "gdp") else 1,
             hidden_size=self.HIDDEN_SIZE,
             num_attention_heads=4,
-            num_query_groups=2,
             ffn_hidden_size=512,
             mtp_num_layers=self.MTP_DEPTHS,
             tensor_model_parallel_size=tp,
@@ -5035,8 +5041,30 @@ class TestMTPDraftStepRequestIsolation:
             # beyond bf16 rounding.
             init_method_std=0.2,
         )
-        if model_type == "gpt":
-            layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        if model_type in ("gpt", "mla", "mla_cached_latents"):
+            multi_latent_attention = model_type != "gpt"
+            if multi_latent_attention:
+                # Absorption, which cached latents run, builds modules mid-forward on the device
+                # of the weights it splits.
+                settings["use_cpu_initialization"] = False
+                config = MLATransformerConfig(
+                    **settings,
+                    q_lora_rank=64,
+                    kv_lora_rank=64,
+                    qk_head_dim=128,
+                    v_head_dim=128,
+                    qk_pos_emb_head_dim=64,
+                    rotary_base=10000,
+                    original_max_position_embeddings=32,
+                    # Absorption splits the KV norm fused into linear_kv_up_proj.
+                    qk_layernorm=True,
+                    cache_mla_latents=model_type == "mla_cached_latents",
+                )
+            else:
+                config = TransformerConfig(**settings, num_query_groups=2)
+            layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                multi_latent_attention=multi_latent_attention, qk_layernorm=multi_latent_attention
+            )
             model = GPTModel(
                 config=config,
                 transformer_layer_spec=layer_spec,
@@ -5049,10 +5077,23 @@ class TestMTPDraftStepRequestIsolation:
             )
         else:
             pytest.importorskip("mamba_ssm")
-            # Each MTP depth is a Mamba layer followed by an attention layer.
+            if model_type == "gdp":
+                pytest.importorskip("fla")
+                # The mixer of each "M" layer is Gated Delta Product rather than Mamba.
+                stack_spec = gated_delta_product_stack_spec
+                settings.update(
+                    mamba_num_heads=16,
+                    mamba_head_dim=16,
+                    mamba_num_groups=4,
+                    mamba_state_dim=16,
+                    gdp_num_householder=2,
+                )
+            else:
+                stack_spec = hybrid_stack_spec
+            # Each MTP depth is a recurrent layer followed by an attention layer.
             model = HybridModel(
-                config=config,
-                hybrid_stack_spec=hybrid_stack_spec,
+                config=TransformerConfig(**settings, num_query_groups=2),
+                hybrid_stack_spec=stack_spec,
                 vocab_size=self.VOCAB_SIZE,
                 max_sequence_length=64,
                 hybrid_layer_pattern="M*" + "/M*" * self.MTP_DEPTHS,
@@ -5068,6 +5109,14 @@ class TestMTPDraftStepRequestIsolation:
             0, self.VOCAB_SIZE, (self.MTP_DEPTHS, self.NUM_REQUESTS), generator=generator
         )
         return hidden.to("cuda", torch.bfloat16), tokens.cuda()
+
+    def _inputs_with_others_replaced(self):
+        """Two batches that share only their last request."""
+        hidden, tokens = self._inputs(seed=1)
+        other_hidden, other_tokens = self._inputs(seed=2)
+        last = self.NUM_REQUESTS - 1
+        other_hidden[last], other_tokens[:, last] = hidden[last], tokens[:, last]
+        return (hidden, tokens), (other_hidden, other_tokens)
 
     def _draft(self, model, hidden, tokens):
         """Run the draft depths on one row per request, as the MTP controller does.
@@ -5095,26 +5144,8 @@ class TestMTPDraftStepRequestIsolation:
             logits_per_depth.append(logits[:num_requests, 0].float())
         return logits_per_depth
 
-    @pytest.mark.parametrize("tp", [1, 2])
-    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
-    def test_draft_logits_do_not_depend_on_other_requests(self, model_type, tp):
-        if Utils.world_size < tp:
-            pytest.skip(f"TP={tp} requires at least {tp} ranks")
-        model = self._build_model(model_type, tp)
-        hidden, tokens = self._inputs(seed=1)
-        other_hidden, other_tokens = self._inputs(seed=2)
+    def _assert_last_request_unmoved(self, batched, replaced):
         last = self.NUM_REQUESTS - 1
-        other_hidden[last], other_tokens[:, last] = hidden[last], tokens[:, last]
-
-        with torch.inference_mode(), InferenceMode.active():
-            batched = self._draft(model, hidden, tokens)
-            # Every request but the last replaced: the last request's drafts must not move.
-            replaced = self._draft(model, other_hidden, other_tokens)
-            alone = [
-                self._draft(model, hidden[i : i + 1], tokens[:, i : i + 1])
-                for i in range(self.NUM_REQUESTS)
-            ]
-
         for depth in range(self.MTP_DEPTHS):
             torch.testing.assert_close(
                 replaced[depth][last],
@@ -5123,6 +5154,34 @@ class TestMTPDraftStepRequestIsolation:
                 atol=0,
                 msg=lambda m: f"depth {depth}: the other requests moved the last one's drafts\n{m}",
             )
+
+    @pytest.mark.parametrize("tp", [1, 2])
+    @pytest.mark.parametrize("model_type", ["gpt", "mla", "mla_cached_latents", "mamba", "gdp"])
+    def test_draft_logits_do_not_depend_on_other_requests(self, model_type, tp):
+        if Utils.world_size < tp:
+            pytest.skip(f"TP={tp} requires at least {tp} ranks")
+        model = self._build_model(model_type, tp)
+        (hidden, tokens), (other_hidden, other_tokens) = self._inputs_with_others_replaced()
+
+        with torch.inference_mode(), InferenceMode.active():
+            try:
+                batched = self._draft(model, hidden, tokens)
+            except AssertionError as error:
+                if self.MLA_CACHED_LATENTS_ERROR not in str(error):
+                    raise
+                pytest.skip(
+                    "MLA with cached latents drafts without an inference context only with "
+                    "fix/n7-mla-mtp-draft"
+                )
+            # Every request but the last replaced: the last request's drafts must not move.
+            replaced = self._draft(model, other_hidden, other_tokens)
+            alone = [
+                self._draft(model, hidden[i : i + 1], tokens[:, i : i + 1])
+                for i in range(self.NUM_REQUESTS)
+            ]
+
+        self._assert_last_request_unmoved(batched, replaced)
+        for depth in range(self.MTP_DEPTHS):
             # Batch size changes only the GEMM shapes, hence the bf16 rounding.
             atol = 2e-2 * batched[depth].abs().max().item()
             for i in range(self.NUM_REQUESTS):
@@ -5133,3 +5192,41 @@ class TestMTPDraftStepRequestIsolation:
                     atol=atol,
                     msg=lambda m: f"depth {depth}, request {i}: batched != alone\n{m}",
                 )
+
+    @pytest.mark.parametrize("model_type", ["gpt", "mla", "mamba", "gdp"])
+    def test_graphed_draft_step(self, model_type):
+        """The draft steps capture into a CUDA graph, as the engine captures them, which needs
+        them to be free of host syncs. A replay drafts each request on its own."""
+        model = self._build_model(model_type, tp=1)
+        (hidden, tokens), (other_hidden, other_tokens) = self._inputs_with_others_replaced()
+        static_hidden, static_tokens = hidden.clone(), tokens.clone()
+
+        with torch.inference_mode(), InferenceMode.active():
+            eager = self._draft(model, hidden, tokens)
+            # Warm up on a side stream before capturing, so that Triton autotuning and library
+            # initialization stay out of the graph.
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                self._draft(model, static_hidden, static_tokens)
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graphed = self._draft(model, static_hidden, static_tokens)
+
+            graph.replay()
+            batched = [logits.clone() for logits in graphed]
+            static_hidden.copy_(other_hidden)
+            static_tokens.copy_(other_tokens)
+            graph.replay()
+            replaced = [logits.clone() for logits in graphed]
+
+        for depth in range(self.MTP_DEPTHS):
+            torch.testing.assert_close(
+                batched[depth],
+                eager[depth],
+                rtol=0,
+                atol=2e-2 * eager[depth].abs().max().item(),
+                msg=lambda m: f"depth {depth}: the replay differs from the eager draft\n{m}",
+            )
+        self._assert_last_request_unmoved(batched, replaced)

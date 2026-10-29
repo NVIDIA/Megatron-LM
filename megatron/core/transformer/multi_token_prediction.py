@@ -1928,7 +1928,8 @@ class MultiTokenPredictionLayer(MegatronModule):
             # The N positions belong to different requests and, without a context, have no draft
             # history to attend over. Make each one its own sequence: as a single sequence,
             # causal attention and recurrent layers would carry every request into the ones
-            # after it.
+            # after it. Sequence mixers run such a pack without host syncs or per-sequence
+            # state (see PackedSeqParams.has_single_token_sequences).
             assert next_token_ids.size(0) == 1, "positions without a context must have B == 1"
             packed_seq_params = PackedSeqParams.single_token_sequences(
                 next_token_ids.size(1), device=next_token_ids.device

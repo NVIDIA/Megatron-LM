@@ -64,6 +64,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_specs import gated_delta_product_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm import ssm_inference
 from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
 from megatron.core.ssm.ops.gdp.chunk import chunk_gated_delta_product_varlen
@@ -562,6 +563,36 @@ class TestGDPDynamicInference:
         decode_last = decode_logits[:, -1, :].float()
 
         torch.testing.assert_close(decode_last, recompute, atol=_DECODE_ATOL, rtol=_DECODE_RTOL)
+
+
+@pytest.mark.skipif(not HAVE_GDP_DEPS, reason="GDP requires fla, mamba_ssm, and einops")
+class TestGDPSingleTokenSequences:
+    """Packed sequences of one token each, as an MTP draft step without an inference context
+    packs its requests, run as fresh decode steps without state caches."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_each_token_matches_its_own_sequence(self):
+        """Every token's output equals that of the chunked kernel on a sequence of its own."""
+        mixer = _build_model(tp=1).decoder.layers[0].mixer
+        assert isinstance(mixer, GatedDeltaProductMixer)
+        num_tokens = 6
+        hidden_states = torch.randn(
+            num_tokens, 1, mixer.config.hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        packed_seq_params = PackedSeqParams.single_token_sequences(
+            num_tokens, device=hidden_states.device
+        )
+
+        with torch.inference_mode(), InferenceMode.active():
+            packed, _ = mixer(hidden_states, packed_seq_params=packed_seq_params)
+            alone = torch.cat([mixer(hidden_states[i : i + 1])[0] for i in range(num_tokens)])
+        # The recurrent and chunked kernels round their bf16 intermediates differently.
+        torch.testing.assert_close(packed, alone, rtol=0, atol=2e-2 * alone.abs().max().item())
 
 
 # ======================================================================

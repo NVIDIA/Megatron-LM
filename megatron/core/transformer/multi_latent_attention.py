@@ -198,9 +198,11 @@ def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_s
     """Prepare value tensor for MLA core attention THD execution."""
     orig_v_dim = value.shape[-1] if value is not None else None
     padded_v_dim = orig_v_dim
+    # Single-token sequences run as an sbhd batch, which takes V's own head dim.
     need_v_pad = (
         packed_seq_params is not None
         and packed_seq_params.qkv_format == "thd"
+        and not packed_seq_params.has_single_token_sequences()
         and parallel_attention.config.experimental_attention_variant is None
         and value is not None
         and query.shape[-1] != orig_v_dim

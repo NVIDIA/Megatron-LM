@@ -98,8 +98,9 @@ class PackedSeqParams:
     def has_single_token_sequences(self) -> bool:
         """Whether every packed sequence holds at most one token.
 
-        The `[t, ...]` packed tokens are then exactly a `[1, t, ...]` (sbhd) batch of length-1
-        sequences, which modules without a THD path can run instead.
+        The `[t, ...]` packed tokens are then a batch of length-1 sequences: attention can run
+        them as the sbhd batch `[1, t, ...]`, and a recurrent layer as one step per sequence
+        from a zero state, without varlen kernels.
         """
         return self.qkv_format == "thd" and self.max_seqlen_q == 1 and self.max_seqlen_kv == 1
 

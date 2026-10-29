@@ -289,6 +289,17 @@ class DSv4HybridAttention(Attention):
             inference_context is None and inference_params is None
         ), "Inference is not supported for DSv4HybridAttention."
 
+        if packed_seq_params is not None and packed_seq_params.has_single_token_sequences():
+            # TP is 1, so no rank splits the tokens: single-token sequences [t, 1, h] are the sbhd
+            # batch [1, t, h] of length-1 sequences. Run them as one.
+            output, bias = self.forward(
+                hidden_states.transpose(0, 1),
+                attention_mask,
+                key_value_states=key_value_states,
+                position_ids=position_ids,
+            )
+            return output.transpose(0, 1), bias
+
         cp_group = self.pg_collection.cp
         cp_size = cp_group.size()
         packed_seq = packed_seq_params is not None

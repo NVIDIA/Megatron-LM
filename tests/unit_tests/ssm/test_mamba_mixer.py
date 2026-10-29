@@ -7,6 +7,7 @@ from megatron.core.inference.contexts.static_context import StaticInferenceConte
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
@@ -123,6 +124,37 @@ class TestMambaMixer:
         torch.testing.assert_close(mixer._A_neg_exp_cache, -torch.exp(mixer.A_log.float()))
         assert mixer._A_neg_exp_cache.data_ptr() == cache_ptr
         assert not mixer._A_neg_exp_cache_stale
+
+    @pytest.mark.parametrize("graphed", [False, True], ids=["eager", "cuda_graph"])
+    def test_single_token_sequences_match_each_token_alone(self, graphed):
+        """In inference, packed sequences of one token each, as an MTP draft step without a
+        context packs its requests, give every token the output it has as a sequence of its
+        own. They run without host syncs, so a CUDA graph captures them."""
+        mixer = self.get_mixer()
+        num_tokens = 6
+        hidden_states = torch.randn((num_tokens, 1, mixer.config.hidden_size), device="cuda")
+        packed_seq_params = PackedSeqParams.single_token_sequences(
+            num_tokens, device=hidden_states.device
+        )
+
+        def packed_forward():
+            return mixer(hidden_states, packed_seq_params=packed_seq_params)[0]
+
+        with torch.inference_mode(), InferenceMode.active():
+            alone = torch.cat([mixer(hidden_states[i : i + 1])[0] for i in range(num_tokens)])
+            packed = packed_forward()
+            if graphed:
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    packed_forward()
+                torch.cuda.current_stream().wait_stream(stream)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    packed = packed_forward()
+                graph.replay()
+        # Different GEMM shapes and scan tiles: fp32 rounding only.
+        torch.testing.assert_close(packed, alone, rtol=0, atol=1e-3 * alone.abs().max().item())
 
 
 class TestMambaMixerErrorChecks:

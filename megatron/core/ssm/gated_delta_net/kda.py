@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from megatron.core import tensor_parallel
 from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -35,12 +36,12 @@ from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx
 
 try:
     from fla.modules.fused_norm_gate import rms_norm_gated
-    from fla.ops.kda import chunk_kda
+    from fla.ops.kda import chunk_kda, fused_recurrent_kda
 
     # KDA also relies on the shared FLA convolution, normalization, and CP helpers.
     HAVE_FLA_KDA = HAVE_FLA
 except ImportError:  # pragma: no cover
-    chunk_kda = None
+    chunk_kda = fused_recurrent_kda = None
     HAVE_FLA_KDA = False
 
 
@@ -323,6 +324,14 @@ class KimiDeltaAttention(_GDNBase):
             assert not self.config.sequence_parallel
             raise NotImplementedError("KimiDeltaAttention does not support inference for now.")
 
+        if (
+            InferenceMode.is_active()
+            and packed_seq_params is not None
+            and packed_seq_params.has_single_token_sequences()
+        ):
+            assert cp_size_runtime == 1, "KDA single-token sequences do not support CP."
+            return self._forward_single_token_sequences(hidden_states)
+
         if cp_size_headwise > 1 and self.config.linear_cp_layout != "zigzag":
             raise ValueError(
                 "KimiDeltaAttention with headwise CP requires zigzag layout. CP partition "
@@ -436,6 +445,52 @@ class KimiDeltaAttention(_GDNBase):
             )
 
         return out, out_bias
+
+    def _forward_single_token_sequences(self, hidden_states):
+        """Run packed sequences of one token each, as a context-free MTP draft step packs them.
+
+        The packed tokens are a batch of length-1 sequences that all start from a zero state:
+        the conv sees each token alone, and the recurrent kernel takes one step per sequence
+        without reading or storing a state. Unlike the chunked kernel, it needs no varlen
+        metadata and keeps no per-sequence chunk state. Inference only: the kernel has no
+        backward.
+        """
+        qkvfg, _ = self._proj(self.in_proj, hidden_states)
+        beta, _ = self._proj(self.beta_proj, hidden_states)
+        raw_g = gate = None
+        if self.two_stage_gates:
+            f_a, _ = self._proj(self.f_a_proj, hidden_states)
+            raw_g, _ = self._proj(self.f_b_proj, f_a)
+            g_a, _ = self._proj(self.g_a_proj, hidden_states)
+            gate, _ = self._proj(self.g_b_proj, g_a)
+            raw_g, gate = raw_g.transpose(0, 1), gate.transpose(0, 1)
+
+        # pre_gated_delta_rule reads (seq, batch) input, so [1, t] is t sequences of one token.
+        num_tokens = qkvfg.size(0)
+        query, key, value, gate, beta, raw_g, A_log, dt_bias = self.pre_gated_delta_rule(
+            qkvfg.transpose(0, 1),
+            beta.transpose(0, 1),
+            batch=num_tokens,
+            seq_len=1,
+            cp_size_headwise=1,
+            cp_group_headwise=None,
+            raw_g=raw_g,
+            gate=gate,
+        )
+        core_attn_out, _ = fused_recurrent_kda(
+            query,
+            key,
+            value,
+            raw_g,
+            beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            use_qk_l2norm_in_kernel=self.two_stage_gates and self.use_qk_l2norm,
+            use_gate_in_kernel=True,
+            lower_bound=self.config.kda_lower_bound,
+        )
+        norm_out = self._apply_gated_norm(core_attn_out, gate).reshape(num_tokens, 1, -1)
+        return self._proj(self.out_proj, norm_out)
 
     def _forward_compute(
         self,

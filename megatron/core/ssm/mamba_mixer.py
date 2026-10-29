@@ -492,16 +492,12 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
 
         if inference_mode or not self.use_mem_eff_path:
             # TODO(ksanthanam): Consider deprecating this path for training
-            if packed_seq_params is not None:
-                assert packed_seq_params.has_single_token_sequences() and ssm_state is None, (
-                    "Packed sequences are supported in the non-memory-efficient code path only "
-                    "without state caching and with a single token per sequence."
-                )
-                # Single-token sequences [t, 1, d] are the batch [1, t, d] of length-1
-                # sequences, each scanned from a zero state.
-                y = self._static_prefill(zxBCdt.transpose(0, 1), None, None).transpose(0, 1)
-            else:
-                y = self._static_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
+            y = self._static_prefill(
+                zxBCdt,
+                conv_state=conv_state,
+                ssm_state=ssm_state,
+                packed_seq_params=packed_seq_params,
+            )
         else:
             assert ssm_state is None
             y = self._ssm_training(zxBCdt, packed_seq_params)
@@ -600,25 +596,43 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         zxBCdt: torch.Tensor,
         conv_state: Optional[torch.Tensor],
         ssm_state: Optional[torch.Tensor],
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> torch.Tensor:
         """
-        Performs single-sequence SSM prefill for static-batching inference and the
+        Performs SSM prefill for static-batching inference and the
         non-memory-efficient (`use_mem_eff_path=False`) training fallback.
 
         `conv_state` / `ssm_state` are `None` for the training fallback and
         non-`None` for static-batching inference (updated in place).
+
+        Packed sequences are each convolved and scanned from a zero state, through the
+        per-token sequence index `seq_idx`, as in `_ssm_training`. Their states are not
+        cached. A context-free MTP draft step packs one token per sequence.
 
         Args:
             zxBCdt: The input tensor of shape (l, b, d), a concatenation of
                 z, x, B, C, and dt projections.
             conv_state: The convolution state tensor, or `None` for training.
             ssm_state: The selective scan state tensor, or `None` for training.
+            packed_seq_params: Sequence boundaries of packed (THD) input, or `None`.
 
         Returns:
             Output tensor of shape (l, b, d).
         """
         # transpose: l b pd --> b l pd
         zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
+
+        seq_idx = None
+        if packed_seq_params is not None:
+            assert (
+                conv_state is None and ssm_state is None
+            ), "Static-batching state caching does not support packed sequences."
+            assert (
+                causal_conv1d_fn is not None
+            ), "Packed sequences require causal_conv1d: the fallback convolution has no boundaries."
+            seq_idx = packed_seq_params.seq_idx
+            if seq_idx is None:
+                seq_idx = build_packed_seq_idx(packed_seq_params, zxBCdt.shape[1])
 
         # (nheads_local_tpcp)
         A = -torch.exp(self.cp.get_A_log().float())
@@ -633,8 +647,13 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             dim=-1,
         )
 
-        # Compute short convolution (single-sequence / non-varlen).
-        xBC = rearrange(xBC, "b l d -> b d l").contiguous()
+        # Compute short convolution. causal_conv1d restarts it at the packed-sequence boundaries
+        # in `seq_idx` only on channels-last input. Copy to standard strides first: contiguous()
+        # would keep a [1, 1, d] slice of the projection, whose strides the kernel can reject.
+        if seq_idx is None:
+            xBC = rearrange(xBC, "b l d -> b d l").contiguous()
+        else:
+            xBC = rearrange(xBC.clone(memory_format=torch.contiguous_format), "b l d -> b d l")
         if conv_state is not None:
             # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
             # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
@@ -649,6 +668,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
                 x=xBC,
                 weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
                 bias=self.cp.get_conv1d_bias(),
+                seq_idx=seq_idx,
                 activation=self.activation,
             )
         xBC = rearrange(xBC, "b d l -> b l d").contiguous()
@@ -702,6 +722,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             dt_softplus=True,
             return_final_states=ssm_state is not None,
             initial_states=initial_ssm_state,
+            seq_idx=seq_idx,
             **state_dtype_kwarg,
         )
 

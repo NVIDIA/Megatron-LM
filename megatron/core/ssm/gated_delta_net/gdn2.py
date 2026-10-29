@@ -14,6 +14,7 @@ import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gated_delta_net.common import (
@@ -26,12 +27,13 @@ from megatron.core.ssm.gated_delta_net.common import (
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 try:
-    # The GDN2 kernel is only available in flash-linear-attention >= 0.5.1.
+    # The GDN2 kernels are only available in flash-linear-attention >= 0.5.1.
     from fla.ops.gdn2.chunk import chunk_gdn2
+    from fla.ops.gdn2.fused_recurrent import fused_recurrent_gdn2
 
     HAVE_FLA_GDN2 = True
 except ImportError:
-    chunk_gdn2 = None
+    chunk_gdn2 = fused_recurrent_gdn2 = None
     HAVE_FLA_GDN2 = False
 
 logger = logging.getLogger(__name__)
@@ -190,6 +192,13 @@ class GatedDeltaNet2(_GDNBase):
             # TODO: support inference
             raise NotImplementedError("GDN2 does not support inference for now.")
 
+        if (
+            InferenceMode.is_active()
+            and packed_seq_params is not None
+            and packed_seq_params.has_single_token_sequences()
+        ):
+            return self._single_token_sequences_pre_attn_and_core_attn(hidden_states)
+
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
             assert (
@@ -242,7 +251,40 @@ class GatedDeltaNet2(_GDNBase):
         # Transpose: s b x --> b s x
         # From sbhd to bshd format
         qkvzfbw = qkvzfbw.transpose(0, 1)
+        kernel_inputs, gate = self._conv_and_prepare_kernel_inputs(
+            qkvzfbw, batch, seq_len, cu_seqlens_q
+        )
 
+        nvtx_range_push(suffix="gated_delta_rule")
+        core_attn_out, _ = self.gated_delta_rule(
+            **kernel_inputs,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=cu_seqlens_q,
+        )
+        nvtx_range_pop(suffix="gated_delta_rule")
+
+        if self.recompute_norm_out:
+            self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            norm_func = partial(
+                self._gated_norm_and_a2a,
+                thd_cp_a2a_inv=thd_cp_a2a_inv,
+                batch=batch,
+                seq_len=seq_len,
+                packed_seq_params=packed_seq_params,
+            )
+            norm_out = self.norm_out_checkpoint.checkpoint(norm_func, core_attn_out, gate)
+        else:
+            norm_out = self._gated_norm_and_a2a(
+                core_attn_out, gate, thd_cp_a2a_inv, batch, seq_len, packed_seq_params
+            )
+
+        return norm_out
+
+    def _conv_and_prepare_kernel_inputs(self, qkvzfbw, batch, seq_len, cu_seqlens_q):
+        """Split the bshd in_proj output, run the causal conv over q/k/v, and prepare the
+        recurrence inputs. Returns the kernel inputs and the output gate (z)."""
         # Split the tensor into q/k/v, gate (z), and the GDN2 gate features f, b, w
         qkv, gate, f, b, w = torch.split(qkvzfbw, self.feat_dim_split, dim=-1)
         gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
@@ -310,32 +352,26 @@ class GatedDeltaNet2(_GDNBase):
         gate = kernel_inputs.pop("gate")
         nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
 
-        nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, _ = self.gated_delta_rule(
-            **kernel_inputs,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-            cu_seqlens=cu_seqlens_q,
-        )
-        nvtx_range_pop(suffix="gated_delta_rule")
+        return kernel_inputs, gate
 
-        if self.recompute_norm_out:
-            self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            norm_func = partial(
-                self._gated_norm_and_a2a,
-                thd_cp_a2a_inv=thd_cp_a2a_inv,
-                batch=batch,
-                seq_len=seq_len,
-                packed_seq_params=packed_seq_params,
-            )
-            norm_out = self.norm_out_checkpoint.checkpoint(norm_func, core_attn_out, gate)
-        else:
-            norm_out = self._gated_norm_and_a2a(
-                core_attn_out, gate, thd_cp_a2a_inv, batch, seq_len, packed_seq_params
-            )
+    def _single_token_sequences_pre_attn_and_core_attn(self, hidden_states):
+        """Run packed sequences of one token each, as a context-free MTP draft step packs them.
 
-        return norm_out
+        The packed tokens [t, 1, x] are already the bshd batch of t length-1 sequences, all
+        starting from a zero state: the conv sees each token alone, and the recurrent kernel
+        takes one step per sequence without reading or storing a state. Unlike the chunked
+        kernel, it needs no varlen metadata and keeps no per-sequence chunk state. Inference
+        only: the kernel has no backward.
+        """
+        assert self.cp_size == 1, "GDN2 single-token sequences do not support CP."
+        assert (
+            fused_recurrent_gdn2 is not None
+        ), "GDN2 inference requires flash-linear-attention >= 0.5.1 with fla.ops.gdn2."
+        qkvzfbw, _ = self.in_proj(hidden_states)
+        num_tokens = qkvzfbw.size(0)
+        kernel_inputs, gate = self._conv_and_prepare_kernel_inputs(qkvzfbw, num_tokens, 1, None)
+        core_attn_out, _ = fused_recurrent_gdn2(**kernel_inputs, use_qk_l2norm_in_kernel=False)
+        return self._apply_gated_norm(core_attn_out, gate).reshape(num_tokens, 1, -1)
 
 
 ####################
