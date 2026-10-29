@@ -1548,8 +1548,10 @@ class TransformerConfig(ModelParallelConfig):
     transformer_impl='inference_optimized', inference_grouped_gemm_backend='flashinfer',
     batch_invariant_mode and selective 'moe' recompute. The kernel weights are rebuilt
     from the parameters on the first microbatch of each forward-backward call, as TE
-    refreshes its quantized weights; a forward that bypasses the pipeline schedules after
-    the parameters change must call the model's set_is_first_microbatch() first."""
+    refreshes its quantized weights, and held until the next call unless the model's
+    release_match_generation_weights() frees them first. A forward that bypasses the
+    pipeline schedules after the parameters change must call the model's
+    set_is_first_microbatch() first."""
     inference_moe_disable_fused_quant_kernels: bool = False
     """When False (default), use fused kernels that combine permute/activation with
     MXFP8 quantization + swizzle into a single kernel launch. Only applies when

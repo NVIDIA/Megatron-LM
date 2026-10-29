@@ -555,6 +555,25 @@ class TestValuePassRuns:
         assert len(builds) == 2
         assert len(hook_calls) == 2
 
+    @pytest.mark.parametrize("recipe", list(RECIPES))
+    def test_release_frees_the_kernel_weights_and_the_next_pass_rebuilds_them(self, recipe):
+        """A caller can free the kernel weights between forward-backward calls.
+
+        The next value pass rebuilds them and matches the pass before the release.
+        """
+        _skip_unless_supported(recipe)
+        gen_config, train_config = _generation_and_training_configs(recipe)
+        _, layer = _layer_pair(recipe, gen_config, train_config, max_tokens=HEAP_TOKENS)
+        hidden = _hidden(train_config, seed=0)
+        with torch.no_grad(), _fp8_context(train_config):
+            before = layer(hidden)[0].clone()
+            assert layer.experts._match_generation_weights is not None
+            layer.release_match_generation_weights()
+            assert layer.experts._match_generation_weights is None
+            after = layer(hidden)[0]
+        assert layer.experts._match_generation_weights is not None
+        assert torch.equal(before, after)
+
 
 @_on_flashinfer_gpu("_batch_invariant")
 class TestTrainGenParity:
