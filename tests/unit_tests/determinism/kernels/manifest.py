@@ -956,6 +956,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "numerical CP parity is covered by test_dsv4_packed_cp.py.",
     ),
     KernelEntry(
+        name="v41_engram_embedding",
+        sources=("megatron/core/models/engram/distributed_embedding.py",),
+        tests=("tests/unit_tests/models/test_v41_engram.py",),
+        kind="torch-op",
+        notes="Sorted repeated-row accumulation in deterministic mode; real Gloo EP lookup "
+        "and gradient parity, including uneven shards. NCCL GPU replay remains to be qualified.",
+    ),
+    KernelEntry(
         name="dsa_dispatch",
         sources=("megatron/core/transformer/experimental_attention_variant/dsa.py",),
         tests=(K + "test_fused_triton_kernels.py",),
