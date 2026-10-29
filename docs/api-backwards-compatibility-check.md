@@ -153,7 +153,9 @@ replacement:
 Bootstrap, teardown and the registry are not deprecated: `initialize_model_parallel()`,
 `destroy_model_parallel()`, `is_initialized()`, `model_parallel_is_initialized()`,
 `register_process_groups()`, `get_registered_process_groups()` and
-`build_process_group_collection()`.
+`build_process_group_collection()`. Neither is `create_all_gather_groups()` with a
+`pg_collection`; without one, it falls back to the global grid with a
+`ProcessGroupFallbackWarning`.
 
 - **Megatron Core's own calls do not warn.** Its compatibility fallbacks emit a
   `ProcessGroupFallbackWarning` for the caller that omitted its groups instead.

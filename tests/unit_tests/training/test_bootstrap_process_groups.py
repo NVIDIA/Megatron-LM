@@ -8,13 +8,15 @@ reading it with ProcessGroupCollection.use_mpu_process_groups(), which 0.23 remo
 parallel_state accessors. The collection must be the one that use_mpu_process_groups() returned,
 field by field. These tests compare the two on the standard grid, on collections that a framework
 registers, and on grids set up without the registry, where bootstrap still reads the global grid,
-now with a deprecation warning.
+now with a deprecation warning. They also cover the all-gather groups of
+--create-all-gather-group, which are built from the collection in any rank order.
 """
 
 import dataclasses
 import re
 import warnings
 from contextlib import contextmanager
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -61,6 +63,26 @@ GRIDS = [
         "tp2_dynamic_cp2",
         dict(tensor_model_parallel_size=2, context_parallel_size=2, dynamic_context_parallel=True),
         4,
+    ),
+]
+
+# Grids with expert parallelism for the all-gather groups. Without a collection,
+# create_all_gather_groups() lays the expert ranks out in the default order without expert GTP:
+# with the tp-cp-ep-pp-dp order and both pipeline and expert data parallelism its expert groups
+# differ from expt_dp, and with expert GTP they name ranks outside the world.
+EXPERT_GRIDS = [
+    ("ep2", dict(expert_model_parallel_size=2), 2),
+    ("ep2_egtp2", dict(expert_model_parallel_size=2, expert_gtp_remat_size=2), 4),
+    (
+        "tp2_pp2_ep2_tp_pp_dp_order",
+        dict(
+            tensor_model_parallel_size=2,
+            pipeline_model_parallel_size=2,
+            expert_model_parallel_size=2,
+            expert_tensor_parallel_size=1,
+            order="tp-cp-ep-pp-dp",
+        ),
+        8,
     ),
 ]
 
@@ -407,3 +429,74 @@ class TestStandardGrid:
         Utils.initialize_model_parallel(**kwargs)
 
         _assert_bootstrap_matches_the_shim()
+
+    @pytest.mark.parametrize(
+        "grid", [grid[1:] for grid in EXPERT_GRIDS], ids=[grid[0] for grid in EXPERT_GRIDS]
+    )
+    def test_all_gather_groups_mirror_the_collection(self, grid):
+        kwargs, num_ranks = grid
+        _require_divisible(num_ranks)
+        Utils.initialize_model_parallel(**kwargs)
+        pg_collection = parallel_state.get_registered_process_groups()
+
+        with _recorded_warnings() as record:
+            dp_cp_ag, expt_dp_ag = parallel_state.create_all_gather_groups(
+                for_expert_parallelism=True,
+                timeout=timedelta(minutes=3),
+                pg_collection=pg_collection,
+            )
+
+        assert _fallbacks(record) == []
+        for all_gather_group, group in (
+            (dp_cp_ag, pg_collection.dp_cp),
+            (expt_dp_ag, pg_collection.expt_dp),
+        ):
+            # A separate communicator over the ranks of the group it gathers for.
+            assert all_gather_group is not group
+            assert torch.distributed.get_process_group_ranks(
+                all_gather_group
+            ) == torch.distributed.get_process_group_ranks(group)
+
+    @pytest.mark.usefixtures("run_config", "fresh_fallback_record")
+    @pytest.mark.parametrize(
+        "grid", [grid[1:] for grid in EXPERT_GRIDS], ids=[grid[0] for grid in EXPERT_GRIDS]
+    )
+    def test_training_builds_all_gather_groups_in_any_rank_order(self, grid):
+        """--create-all-gather-group supported experts only in the default order without EGTP."""
+        kwargs, num_ranks = grid
+        _require_divisible(num_ranks)
+        Utils.initialize_model_parallel(**kwargs)
+        args = SimpleNamespace(create_all_gather_group=True, expert_model_parallel_size=2)
+
+        with _recorded_warnings() as record:
+            pg_collection = training._build_pg_collection_from_parallel_state(args)
+
+        assert _fallbacks(record) == []
+        for name in ("dp_cp", "expt_dp"):
+            all_gather_group = getattr(pg_collection, f"{name}_ag")
+            assert all_gather_group is not getattr(pg_collection, name)
+            assert torch.distributed.get_process_group_ranks(
+                all_gather_group
+            ) == torch.distributed.get_process_group_ranks(getattr(pg_collection, name))
+
+    @pytest.mark.usefixtures("fresh_fallback_record")
+    def test_all_gather_groups_without_a_collection_warn(self):
+        """The deprecated form keeps its groups: the default rank order on the global grid."""
+        _require_divisible(2)
+        Utils.initialize_model_parallel(expert_model_parallel_size=2)
+        pg_collection = parallel_state.get_registered_process_groups()
+
+        with _recorded_warnings() as record:
+            dp_cp_ag, expt_dp_ag = parallel_state.create_all_gather_groups(
+                for_expert_parallelism=True
+            )
+
+        assert _fallbacks(record) == [("create_all_gather_groups", "pg_collection")]
+        assert _of_category(record, ParallelStateDeprecationWarning) == []
+        for all_gather_group, group in (
+            (dp_cp_ag, pg_collection.dp_cp),
+            (expt_dp_ag, pg_collection.expt_dp),
+        ):
+            assert torch.distributed.get_process_group_ranks(
+                all_gather_group
+            ) == torch.distributed.get_process_group_ranks(group)

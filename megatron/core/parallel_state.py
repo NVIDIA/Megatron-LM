@@ -2291,34 +2291,56 @@ def initialize_model_parallel(
     return pg_collection
 
 
-def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_comm_cfgs=None):
+def create_all_gather_groups(
+    for_expert_parallelism=False, timeout=None, nccl_comm_cfgs=None, pg_collection=None
+):
     """
     Helper function to create all-gather process groups for AG/RS overlap.
 
     Creates separate communicators with the same ranks as data parallel groups
     to enable overlapping all-gather operations with reduce-scatter operations.
 
+    Group creation is collective: every rank of the default process group calls this function,
+    with its own pg_collection. A rank whose collection has no data-parallel group, such as a
+    rank outside the window of a grid built with a rank offset, gets None for that group.
+
     Args:
         for_expert_parallelism (bool): If True, also creates AG group for expert parameters.
         timeout (timedelta): Timeout for distributed collectives.
         nccl_comm_cfgs (dict): NCCL communicator configurations.
+        pg_collection (ProcessGroupCollection): The process groups that the all-gather groups
+            mirror: each all-gather group has the ranks of a ``dp_cp`` group, or, for expert
+            parameters with expert parallelism (``ep`` larger than one rank), of an ``expt_dp``
+            group, so any rank order is supported. Omitting it is deprecated: the groups then
+            come from the global parallel state, with a ProcessGroupFallbackWarning, and the
+            expert groups support only the default tp-cp-ep-dp-pp rank order without a rank
+            offset.
 
     Returns:
         tuple: (dp_cp_ag_group, expt_dp_ag_group) where expt_dp_ag_group is None
                if for_expert_parallelism=False.
 
     Example:
-        # After pg_collection = initialize_model_parallel(...):
-        dp_cp_ag, expt_dp_ag = parallel_state.create_all_gather_groups(
-            for_expert_parallelism=True
-        )
-
+        pg_collection = initialize_model_parallel(...)
         # initialize_model_parallel() returns the registered collection itself, so add the
         # groups to a copy:
         pg_collection = copy.copy(pg_collection)
-        pg_collection.dp_cp_ag = dp_cp_ag
-        pg_collection.expt_dp_ag = expt_dp_ag
+        pg_collection.dp_cp_ag, pg_collection.expt_dp_ag = (
+            parallel_state.create_all_gather_groups(
+                for_expert_parallelism=True, pg_collection=pg_collection
+            )
+        )
     """
+    if pg_collection is not None:
+        return _create_all_gather_groups_from_collection(
+            pg_collection, for_expert_parallelism, timeout, nccl_comm_cfgs
+        )
+    # Imported here because process_groups_config imports this module.
+    from megatron.core.process_groups_config import warn_global_process_group_fallback
+
+    warn_global_process_group_fallback(
+        "create_all_gather_groups", deprecated_in="0.21", removed_in="0.23"
+    )
     if not is_initialized():
         raise RuntimeError(
             "create_all_gather_groups() requires parallel state to be initialized. "
@@ -2371,6 +2393,45 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
                 expt_dp_ag_group = expert_dp_ag
 
     return dp_cp_ag_group, expt_dp_ag_group
+
+
+def _create_all_gather_groups_from_collection(
+    pg_collection, for_expert_parallelism, timeout, nccl_comm_cfgs
+):
+    """Create the all-gather groups of create_all_gather_groups() from pg_collection's groups."""
+
+    def global_ranks(group):
+        return None if group is None else tuple(torch.distributed.get_process_group_ranks(group))
+
+    with_experts = (
+        for_expert_parallelism and pg_collection.ep is not None and pg_collection.ep.size() > 1
+    )
+    own_ranks = (
+        global_ranks(pg_collection.dp_cp),
+        global_ranks(pg_collection.expt_dp) if with_experts else None,
+    )
+    # Each rank knows only its own groups, but every rank creates every group, in the same
+    # order: gather the groups of all ranks and create each distinct one in sorted order.
+    all_ranks = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(all_ranks, own_ranks)
+
+    all_gather_groups = []
+    for index, pg_name, group_desc in (
+        (0, "dp_cp", "DATA_PARALLEL_GROUP_WITH_CP_AG"),
+        (1, "ep_dp", "EXPERT_DATA_PARALLEL_GROUP_AG"),
+    ):
+        all_gather_group = None
+        for ranks in sorted({entry[index] for entry in all_ranks if entry[index] is not None}):
+            group = create_group(
+                list(ranks),
+                timeout=timeout,
+                pg_options=get_nccl_options(pg_name, nccl_comm_cfgs or {}),
+                group_desc=group_desc,
+            )
+            if ranks == own_ranks[index]:
+                all_gather_group = group
+        all_gather_groups.append(all_gather_group)
+    return tuple(all_gather_groups)
 
 
 def is_initialized():
