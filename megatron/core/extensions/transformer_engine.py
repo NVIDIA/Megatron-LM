@@ -38,6 +38,7 @@ from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
     amax_reduction_group,
+    require_process_groups,
     resolve_gtp_remat_group,
     resolve_process_groups,
     warn_global_process_group_fallback,
@@ -764,6 +765,7 @@ def split_te_layernorm_column_parallel_linear(
         is_expert=False,
         tp_comm_buffer_name=fused_layer.ub_name,
         tp_group=tp_group or fused_layer.tp_group,
+        pg_collection=fused_layer._pg_collection,
     )
 
     with torch.no_grad():
@@ -1390,6 +1392,11 @@ class TELinear(te.pytorch.Linear):
     ):
         """
         Args:
+            tp_group (Optional[torch.distributed.ProcessGroup]): tensor-parallel group of the
+                module that owns this layer. In "column" and "row" mode the weight is sharded
+                over it. In "duplicated" mode every rank of the group holds the full weight,
+                Transformer Engine runs the layer without TP communication, and the group only
+                sets the weight's checkpoint replica id. None falls back to the global group.
             name (str | None): module instance name passed top-down from its paranet module
             pg_collection (ProcessGroupCollection | None): process groups of the model that owns
                 this layer. A per-module quantization recipe reduces amaxes over its amax
@@ -1480,7 +1487,6 @@ class TELinear(te.pytorch.Linear):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = symmetric_ar_type
         if parallel_mode == "duplicated":
-            assert tp_group is None, "duplicated linear should not have tp_group set"
             tp_size = 1
         else:
             tp_size = get_pg_size(tp_group)
@@ -2461,14 +2467,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 cp=get_context_parallel_group(check_initialized=False),
                 hcp=get_hierarchical_context_parallel_groups(check_initialized=False),
             )
-        else:
-            assert hasattr(
-                pg_collection, "tp"
-            ), "TEDotProductAttention pg_collection must have tp pg"
-            assert hasattr(
-                pg_collection, "cp"
-            ), "TEDotProductAttention pg_collection must have cp pg"
-        self._tp_group = pg_collection.tp
+        # An unset tp raises; a None tp reaches TE as "no group yet", to be set later through
+        # set_tensor_parallel_group(). cp is read only with context parallelism, which rejects
+        # an unset or None cp group below.
+        (self._tp_group,) = require_process_groups(
+            pg_collection, ("tp",), owner=type(self).__name__
+        )
 
         if is_te_min_version("0.10.0"):
             extra_kwargs["attention_type"] = attention_type
@@ -3591,13 +3595,14 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             del is_mtp_layer
             if hash_moe_layer_threshold is not None and hash_moe_layer_threshold > 0:
                 raise ValueError("Dense MLP does not support hash MoE routing.")
-            assert hasattr(
-                pg_collection, 'tp'
-            ), 'TP process group is required for TEFusedMLP in TransformerLayer'
+            (tp_group,) = require_process_groups(
+                pg_collection, ('tp',), owner=f"{cls.__name__}.as_mlp_submodule"
+            )
             return cls(
                 config=config,
                 submodules=submodules,
-                tp_group=pg_collection.tp,
+                tp_group=tp_group,
+                pg_collection=pg_collection,
                 is_expert=is_expert,
                 input_size=input_size,
                 ffn_hidden_size=ffn_hidden_size,

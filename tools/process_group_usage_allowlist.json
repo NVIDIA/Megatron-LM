@@ -116,9 +116,6 @@
       "_build_default_pg_collection:guarded:resolve_process_groups",
       "get_forward_backward_func:accessor:parallel_state.get_pipeline_model_parallel_world_size"
     ],
-    "megatron/core/resharding/refit.py": [
-      "_unwrap_model_cores:accessor:parallel_state.get_data_parallel_group"
-    ],
     "megatron/core/ssm/mamba_mixer.py": [
       "ExtendedRMSNorm.sharded_state_dict:guarded:resolve_process_groups"
     ],
@@ -231,5 +228,5 @@
       "make_tp_sharded_tensor_for_checkpoint:guarded:resolve_process_groups"
     ]
   },
-  "total": 133
+  "total": 132
 }

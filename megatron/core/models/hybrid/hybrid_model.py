@@ -21,7 +21,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, require_process_groups
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_observation import observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
@@ -47,11 +47,16 @@ logger = logging.getLogger(__name__)
 
 
 def _hybrid_logging_pg_kwargs(pg_collection: ProcessGroupCollection) -> dict:
-    tp_group = getattr(pg_collection, 'tp', None)
-    dp_cp_group = getattr(pg_collection, 'dp_cp', None)
+    # tp and dp_cp choose the ranks that print the per-stage layer log, so a field the collection
+    # never set raises instead of reading as None. Both None drops the kwargs and leaves the log
+    # to the global grid; HybridModel cannot get there with torch.distributed initialized,
+    # because LanguageModule then rejects a None tp.
+    tp_group, dp_cp_group = require_process_groups(
+        pg_collection, ('tp', 'dp_cp'), owner='HybridModel'
+    )
     if (tp_group is None) != (dp_cp_group is None):
         raise ValueError(
-            "pg_collection.tp and pg_collection.dp_cp must both be set or both be unset."
+            "pg_collection.tp and pg_collection.dp_cp must both be process groups or both be None."
         )
     if tp_group is None:
         return {}
@@ -837,9 +842,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                     input_ids=mtp_inputs.input_ids,
                     mtp_input_mask=mtp_inputs.mtp_input_mask,
+                    # dp_cp_gtp_remat accompanies dp_cp; without it, the metrics average over dp_cp.
                     metric_avg_group=(
-                        getattr(self.pg_collection, 'dp_cp_gtp_remat', None)
-                        or self.pg_collection.dp_cp
+                        vars(self.pg_collection).get('dp_cp_gtp_remat') or self.pg_collection.dp_cp
                     ),
                     main_hidden_states=hidden_states,
                 )

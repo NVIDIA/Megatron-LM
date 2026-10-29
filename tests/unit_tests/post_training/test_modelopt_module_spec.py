@@ -426,5 +426,18 @@ def test_modelopt_linear_accepts_duplicated_parallel_mode():
     assert linear.tp_group is None
     assert linear.weight.tensor_model_parallel is False
 
+    # Like TELinear, a duplicated Linear keeps its owner's TP group for checkpoint replica ids.
+    tp_group = object()
+    linear = Linear(
+        4,
+        4,
+        config=config,
+        init_method=config.init_method,
+        bias=False,
+        parallel_mode="duplicated",
+        tp_group=tp_group,
+    )
+    assert linear.tp_group is tp_group
+
     with pytest.raises(ValueError, match="only supports parallel_mode"):
         Linear(4, 4, config=config, init_method=config.init_method, parallel_mode="column")

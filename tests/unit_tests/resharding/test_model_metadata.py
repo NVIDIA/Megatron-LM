@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Model module declarations add ownership and matching names to ordinary refit."""
 
+import contextlib
 import gc
 import weakref
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.resharding import refit
 from megatron.core.resharding.planner import _extract_module_metadata, _find_source_metadata
 from megatron.core.resharding.refit import (
@@ -15,7 +17,12 @@ from megatron.core.resharding.refit import (
     _harmonize_buffer_dtypes,
     _unwrap_model_cores,
 )
-from megatron.core.resharding.utils import ReshardPlan, TransferOp, get_refit_tensor_dict
+from megatron.core.resharding.utils import (
+    ReshardPlan,
+    TransferOp,
+    extract_param_metadata,
+    get_refit_tensor_dict,
+)
 from megatron.core.transformer.module import Float16Module, MegatronModule
 
 
@@ -73,6 +80,39 @@ def test_ordinary_models_require_root_groups(explicit_none):
         _unwrap_model_cores(None, model)
 
 
+@pytest.mark.parametrize("dp", ["missing", "none"])
+def test_ordinary_source_without_dp_is_rejected(monkeypatch, dp):
+    """Refit never fills a missing dp from the global grid into the model's collection."""
+    monkeypatch.setattr(
+        "megatron.core.parallel_state.get_data_parallel_group",
+        lambda **kwargs: SimpleNamespace(name="global data-parallel group"),
+    )
+    model = MegatronModule(SimpleNamespace(num_moe_experts=None))
+    model.pg_collection = ProcessGroupCollection(tp=(0,), pp=(0,))
+    if dp == "none":
+        model.pg_collection.dp = None
+    before = dict(vars(model.pg_collection))
+    with contextlib.suppress(ValueError):
+        _unwrap_model_cores(model, None)
+    # Later readers of the collection, such as checkpointing, must not see another grid's group.
+    assert vars(model.pg_collection) == before
+    with pytest.raises(ValueError, match="pg_collection must set dp"):
+        _unwrap_model_cores(model, None)
+    with pytest.raises(ValueError, match="pg_collection must set dp"):
+        refit.prepare_swap_model_weights(model, None)
+
+
+def test_ordinary_source_with_dp_reads_no_global_group(monkeypatch):
+    monkeypatch.setattr(
+        "megatron.core.parallel_state.get_data_parallel_group",
+        lambda **kwargs: pytest.fail("Refit must not read the global DP group"),
+    )
+    model = MegatronModule(SimpleNamespace(num_moe_experts=None))
+    model.pg_collection = groups()
+    assert _unwrap_model_cores(model, None) == (model, None, None)
+    assert model.pg_collection.dp == (0,)
+
+
 def test_provider_supplies_matching_names_groups_and_expert_count():
     model = Composite()
     model.first.config = SimpleNamespace(num_moe_experts=8)
@@ -94,7 +134,7 @@ def test_provider_owns_groups_independently_of_root(monkeypatch, root_groups):
     else:
         model.pg_collection.dp = None
     monkeypatch.setattr(
-        "megatron.core.resharding.refit.parallel_state.get_data_parallel_group",
+        "megatron.core.parallel_state.get_data_parallel_group",
         lambda **kwargs: pytest.fail("Module declarations must not read global DP groups"),
     )
     assert _unwrap_model_cores(model, None) == (model, None, None)
@@ -367,3 +407,73 @@ def test_buffer_dtypes_match_transfer_ids_across_different_storage_names(
     assert get_refit_tensor_dict(target)["inference.state"] is target["inference"].state
     _harmonize_buffer_dtypes(plan, source, target)
     assert len(calls) == 1
+
+
+def _sharded_parameter(tensor_parallel=True, expert_parallel=False):
+    parameter = torch.nn.Parameter(torch.zeros(2, 2))
+    parameter.tensor_model_parallel = tensor_parallel
+    parameter.partition_dim = 0
+    if expert_parallel:
+        parameter.allreduce = False
+    return parameter
+
+
+def test_parameter_metadata_uses_the_groups_of_the_collection():
+    pg_collection = ProcessGroupCollection(tp=(0, 1), pp=(0, 2), dp=(1, 3))
+    entry = extract_param_metadata(_sharded_parameter(), "linear.weight", 0, pg_collection)
+    assert entry.tensor_parallel_group_ranks == [0, 1]
+    assert entry.pipeline_parallel_group_ranks == [0, 2]
+    assert entry.data_parallel_group_ranks == [1, 3]
+
+
+@pytest.mark.parametrize("field", ["tp", "pp", "dp"])
+def test_parameter_metadata_rejects_an_unset_group(field):
+    # An unset field reads as None: without tp, a tensor-parallel shard would be described as a
+    # whole tensor, and without dp, torch.distributed would use the default group.
+    groups = dict(tp=(0, 1), pp=(0,), dp=(0,))
+    del groups[field]
+    with pytest.raises(ValueError, match=f"pg_collection to set {field}"):
+        extract_param_metadata(
+            _sharded_parameter(), "linear.weight", 0, ProcessGroupCollection(**groups)
+        )
+
+
+def test_parameter_metadata_treats_none_tp_and_pp_as_axes_that_are_off(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+    pg_collection = ProcessGroupCollection(tp=None, pp=None, dp=(0, 1))
+    entry = extract_param_metadata(_sharded_parameter(), "linear.weight", 0, pg_collection)
+    assert entry.tensor_parallel_group_ranks is None
+    assert entry.pipeline_parallel_group_ranks == [0, 1, 2, 3]
+
+
+def test_parameter_metadata_rejects_a_none_dp():
+    pg_collection = ProcessGroupCollection(tp=(0,), pp=(0,), dp=None)
+    with pytest.raises(ValueError, match="pg_collection.dp to be a process group"):
+        extract_param_metadata(_sharded_parameter(), "linear.weight", 0, pg_collection)
+
+
+@pytest.mark.parametrize("ep", ["unset", "none"])
+def test_expert_parallel_parameter_metadata_rejects_a_missing_ep(ep):
+    groups = dict(tp=(0,), pp=(0,), dp=(0,), expt_tp=(0,))
+    if ep == "none":
+        groups["ep"] = None
+    with pytest.raises(ValueError, match="requires pg_collection.ep"):
+        extract_param_metadata(
+            _sharded_parameter(expert_parallel=True),
+            "experts.weight",
+            0,
+            ProcessGroupCollection(**groups),
+        )
+
+
+def test_expert_parameter_metadata_uses_the_expert_tensor_parallel_group():
+    groups = dict(tp=(0, 1), pp=(0,), dp=(0,), ep=(0, 2))
+    parameter = _sharded_parameter(tensor_parallel=False, expert_parallel=True)
+    entry = extract_param_metadata(
+        parameter, "experts.weight", 0, ProcessGroupCollection(expt_tp=(0, 3), **groups)
+    )
+    assert entry.tensor_parallel_group_ranks == [0, 3]
+    assert entry.expert_parallel_group_ranks == [0, 2]
+    # A collection without an expert tensor-parallel group describes expert weights with tp.
+    entry = extract_param_metadata(parameter, "experts.weight", 0, ProcessGroupCollection(**groups))
+    assert entry.tensor_parallel_group_ranks == [0, 1]
