@@ -2454,6 +2454,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
         self.kept_packed_seq_params.discard("cp_scatter_cache")
+        # padding_mask marks THD padding slots for Megatron-side token aggregates (QSA indexer
+        # loss, Engram buckets); TE attention gets the padding from cu_seqlens instead.
+        self.kept_packed_seq_params.discard("padding_mask")
 
         if get_te_version() < PkgVersion("2.2.0"):
             self.kept_packed_seq_params.discard("pad_between_seqs")
