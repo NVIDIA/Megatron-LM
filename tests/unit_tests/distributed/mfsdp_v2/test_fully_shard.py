@@ -796,7 +796,7 @@ def test_fully_shard_preserves_parameter_attributes(distributed_setup):
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = nn.Linear(8, 8, bias=False, device=device)
-    attributes = {"use_muon": False}
+    attributes = {"use_muon": False, "is_wide_residual_retention_parameter": True}
     for name, value in attributes.items():
         setattr(model.weight, name, value)
 
