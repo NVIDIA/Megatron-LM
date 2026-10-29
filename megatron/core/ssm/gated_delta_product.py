@@ -1013,14 +1013,15 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             precomputed_seq_start=seq_start,
         ).unsqueeze(0)
 
-    def _compute_gating(self, ba):
+    def _compute_gating(self, ba: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute the beta and g gating tensors from the ba slice."""
         b, a = torch.split(
             ba, [self.nheads_local_cp * self.num_householder, self.nheads_local_cp], dim=-1
         )
 
         b, a = b.contiguous(), a.contiguous()
-        beta = b.sigmoid()
+        # Save FP32 sigmoid values for backward, retaining the kernel's input dtype.
+        beta = b.float().sigmoid().to(b.dtype)
 
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         if self.chunkwise_context_parallel:
