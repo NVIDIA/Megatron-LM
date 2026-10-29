@@ -292,6 +292,10 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
     "cross attn" specializations.
     """
 
+    # Per-call shared-prefix forest. A shared-prefix caller sets it on the instance around one
+    # layer call and deletes it afterwards, restoring this default.
+    _shared_prefix_forest = None
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -1687,7 +1691,44 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         core_attn_manager = off_interface(
             self.offload_core_attention and self.training, query, "core_attn"
         )
-        if self.checkpoint_core_attention and self.training:
+        shared_prefix_forest = self._shared_prefix_forest
+        if shared_prefix_forest is not None:
+            if inference_context is not None or packed_seq_params is not None:
+                raise NotImplementedError(
+                    "shared-prefix fused attention only supports static, unpacked training"
+                )
+            if attention_mask is not None or attention_bias is not None:
+                raise ValueError(
+                    'shared-prefix fused attention owns its tree mask and does not accept a '
+                    'mask/bias'
+                )
+            if query.dtype not in (torch.float16, torch.bfloat16):
+                raise TypeError("shared-prefix fused attention requires fp16 or bf16 Q/K/V")
+
+            from megatron.core.transformer.shared_prefix_attention import (
+                flash_composed_forest_attention,
+                flash_composed_forest_attention_cp,
+            )
+
+            softmax_scale = self.get_softmax_scale(query)
+            with core_attn_manager as query:
+                if self.pg_collection.cp.size() > 1:
+                    core_attn_out = flash_composed_forest_attention_cp(
+                        query,
+                        key,
+                        value,
+                        shared_prefix_forest,
+                        cp_group=self.pg_collection.cp,
+                        scale=softmax_scale,
+                    )
+                else:
+                    core_attn_out = flash_composed_forest_attention(
+                        query, key, value, shared_prefix_forest, scale=softmax_scale
+                    )
+            core_attn_out = core_attn_manager.group_offload(
+                core_attn_out, forced_released_tensors=[query, key, value]
+            )
+        elif self.checkpoint_core_attention and self.training:
             # Upstream _checkpointed_attention_forward now threads tensor-valued
             # core-attention kwargs (e.g. DSA's x/qr) through the checkpoint, so the
             # variant no longer has to opt out of checkpointing.
