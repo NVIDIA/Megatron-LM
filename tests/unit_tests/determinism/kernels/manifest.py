@@ -750,13 +750,78 @@ KERNELS: Tuple[KernelEntry, ...] = (
             C + "test_ssm_conv1d.py",
             K + "test_ssm_kernels.py",
             "tests/unit_tests/inference/engines/test_batch_invariant_mamba_prefix_caching.py",
+            K + "test_shared_prefix_mamba_kernels.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_module_call.py",
         ),
         kind="dispatch",
         notes="Selects the pip causal_conv1d / mamba_ssm kernels (causal_conv1d_fn, "
         "mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined, causal_conv1d_update_cuda) or "
         "the Megatron forks (ops/common, ops/mamba2: varlen scan, causal_conv1d_update, "
         "selective_state_update). Module-level replay: test_ssm_conv1d.py::TestMambaMixerDeterminism; "
-        "kernels replayed piecewise in test_ssm_kernels.py.",
+        "kernels replayed piecewise in test_ssm_kernels.py. The shared-prefix branch (a "
+        "MambaSharedPrefixCall attached by forward_mamba_layer_shared_prefix) hands the mixer half "
+        "to mamba_shared_prefix; its ragged and packed scans are replayed through a real "
+        "MambaMixer in test_shared_prefix_mamba_kernels.py, and "
+        "test_shared_prefix_mamba_module_call.py checks that the branch runs through the layer "
+        "and mixer module calls.",
+    ),
+    # Shared-prefix Mamba: the ragged state-fork forest, the chunk-aligned packed recurrence
+    # and the NRL_SP_MAMBA_IMPL dispatch that selects them.
+    KernelEntry(
+        name="ssm_mamba_ragged_forest",
+        sources=("megatron/core/ssm/mamba_ragged.py", "megatron/core/ssm/mamba_ragged_scan.py"),
+        tests=(
+            K + "test_shared_prefix_mamba_kernels.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_backends.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_numerics.py",
+        ),
+        kind="triton",
+        notes="_RaggedGather forward/backward (one owner per input element, fixed-order FP32 "
+        "sibling sum, no atomics), channel-last causal_conv1d_fn with seq_idx, and the forest "
+        "state-passing kernels around the private mamba_ssm SSD kernels, whose ddt/dD/ddA "
+        "atomics need MAMBA_DETERMINISTIC=1 (negative control without it). Replayed kernel by "
+        "kernel (star and forest, D per head and per head-dim, save_intermediates on/off "
+        "bitwise equal) and through a real MambaMixer's parameters. "
+        "test_shared_prefix_mamba_backends.py checks int32 and int64 offsets bitwise, the "
+        "gather backward against index_add_ and compile reuse across lengths; "
+        "test_shared_prefix_mamba_numerics.py compares the layer with dense rows and checks "
+        "eval == train forward bitwise.",
+    ),
+    KernelEntry(
+        name="ssm_mamba_sequence_packing",
+        sources=("megatron/core/ssm/mamba_sequence_packing.py",),
+        tests=(
+            K + "test_shared_prefix_mamba_kernels.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_numerics.py",
+        ),
+        kind="dispatch",
+        notes="Pads every sequence to a scan-chunk boundary and calls causal_conv1d_fn and "
+        "mamba_chunk_scan_combined with seq_idx; scan_mamba_packed_recurrence is replayed "
+        "through a real MambaMixer's parameters in test_shared_prefix_mamba_kernels.py, and "
+        "the packed_recurrence backend is compared with dense rows in "
+        "test_shared_prefix_mamba_numerics.py.",
+    ),
+    KernelEntry(
+        name="ssm_mamba_shared_prefix_dispatch",
+        sources=("megatron/core/ssm/mamba_shared_prefix.py",),
+        tests=(
+            K + "test_shared_prefix_mamba_kernels.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_backends.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_numerics.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_module_call.py",
+        ),
+        kind="dispatch",
+        notes="forward_mamba_layer_shared_prefix routes every Mamba layer through "
+        "NRL_SP_MAMBA_IMPL: the default ragged forest (mamba_ragged), the packed recurrence "
+        "(mamba_sequence_packing), the opt-in state_fork/replay_prefix helpers, which call "
+        "causal_conv1d_fn and mamba_chunk_scan_combined directly, or the packed_fused "
+        "diagnostic oracle. The ragged and packed scans are replayed in "
+        "test_shared_prefix_mamba_kernels.py. test_shared_prefix_mamba_backends.py covers the "
+        "selector and dispatch; test_shared_prefix_mamba_numerics.py compares the four "
+        "differentiable backends (not packed_fused) with dense rows and checks eval == train "
+        "bitwise; test_shared_prefix_mamba_module_call.py checks that the layer runs through "
+        "MambaLayer.__call__ and MambaMixer.__call__. The state_fork/replay_prefix helpers have "
+        "no bit-exact backward replay.",
     ),
     KernelEntry(
         name="ssm_gated_delta_product",
