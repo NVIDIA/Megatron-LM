@@ -37,12 +37,121 @@ permissions:
   id-token: write
 
 jobs:
+  select:
+    name: unit tests selection
+    # Only main has a supported Testmon baseline. Other targets run full buckets.
+    if: inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_target_branch == 'main'
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      has_tests: ${{ steps.plan.outputs.has_tests }}
+    steps:
+      # Native pytest/Testmon discovery runs here; bucket jobs consume its plans.
+      - name: Checkout
+        id: checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.sha }}
+
+      - name: Setup Python
+        id: python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+      - name: Install selection dependencies
+        id: dependencies
+        run: |
+          uv sync --locked --only-group test
+          npm install --prefix "$RUNNER_TEMP/testmon" --no-package-lock --ignore-scripts --no-audit --no-fund \
+            @actions/cache@4.0.3 @actions/artifact@5.0.0
+
+      - name: Match the baseline cache compression
+        id: cache-compression
+        shell: bash -e -u -o pipefail {0}
+        run: |
+          # The existing baseline namespace uses gzip. Cache compression is
+          # part of the cache version, so keep the same compression here.
+          # Make its zstd probe unavailable during selection.
+          TESTMON_CACHE_BIN=$(mktemp -d "$RUNNER_TEMP/unit-testmon-gzip.XXXXXX")
+          printf '#!/bin/sh\nexit 1\n' > "$TESTMON_CACHE_BIN/zstd"
+          chmod +x "$TESTMON_CACHE_BIN/zstd"
+          printf 'path=%s:%s\n' "$TESTMON_CACHE_BIN" "$PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare PR file download
+        id: pr-files-directory
+        shell: bash -e -u -o pipefail {0}
+        run: |
+          PR_FILES_DIR=$(mktemp -d "$RUNNER_TEMP/unit-test-pr-files.XXXXXX")
+          echo "path=$PR_FILES_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Download PR files for mandatory unit tests
+        id: pr-files
+        if: inputs.unit_test_pr_files_artifact_id != ''
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        continue-on-error: true
+        with:
+          artifact-ids: ${{ inputs.unit_test_pr_files_artifact_id }}
+          path: ${{ steps.pr-files-directory.outputs.path }}
+          merge-multiple: true
+
+      - name: Pull test container
+        env:
+          CONTAINER_IMAGE: ${{ inputs.container-image }}
+        run: docker pull "$CONTAINER_IMAGE"
+
+      - name: Select affected tests for all buckets
+        id: plan
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          BUCKETS: ${{ inputs.buckets }}
+          CONTAINER_IMAGE: ${{ inputs.container-image }}
+          RECIPE_PLATFORM: ${{ inputs.platform }}
+          SOURCE_SHA: ${{ inputs.sha }}
+          TARGET_BRANCH: ${{ inputs.unit_testmon_target_branch }}
+          PR_FILES_DIR: ${{ steps.pr-files-directory.outputs.path }}
+          PATH: ${{ steps.cache-compression.outputs.path }}
+        with:
+          script: |
+            // Only SDK transport lives here; Python owns selection and the matrix.
+            const client = `
+              (async () => {
+                const [operation, ...args] = process.argv.slice(1);
+                const modules = process.env.RUNNER_TEMP + '/testmon/node_modules/';
+                if (operation === 'restore') {
+                  const key = await require(modules + '@actions/cache').restoreCache(
+                    [args[0]], args[1], [args[2]]);
+                  require('node:fs').writeFileSync(args[3], key || '');
+                } else {
+                  const {DefaultArtifactClient} = require(modules + '@actions/artifact');
+                  await new DefaultArtifactClient().uploadArtifact(args[0], [args[1]], args[2]);
+                }
+              })().catch(error => { console.error(error); process.exitCode = 1; });
+            `;
+            await exec.exec('uv', ['run', '--no-sync', 'python', '.github/scripts/select_unit_tests.py'], {
+              env: {...process.env, TESTMON_NODE: process.execPath, TESTMON_ACTIONS: client},
+            });
+
   run:
     name: ${{ matrix.bucket }}
+    needs: select
+    # Missing selection evidence schedules full buckets; only proven empty plans skip.
+    if: ${{ !cancelled() && (needs.select.result != 'success' || needs.select.outputs.has_tests != 'false') }}
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(inputs.buckets) }}
+        include: ${{ fromJSON(needs.select.result == 'success' && needs.select.outputs.matrix || inputs.buckets) }}
     runs-on: ${{ fromJSON(inputs.runner) }}
     timeout-minutes: 60
     env:
@@ -67,7 +176,7 @@ jobs:
           container-image: ${{ inputs.container-image }}
           platform: ${{ inputs.platform }}
           sha: ${{ inputs.sha }}
-          # Select and execute on the same GPU workers using main's baseline.
-          unit_testmon_mode: ${{ inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_target_branch == 'main' && 'enforce' || 'full' }}
+          unit_testmon_mode: ${{ matrix.mode || 'full' }}
           unit_testmon_target_branch: ${{ inputs.unit_testmon_target_branch }}
+          unit_testmon_plan_artifact: ${{ matrix.plan_artifact }}
           unit_test_pr_files_artifact_id: ${{ inputs.unit_test_pr_files_artifact_id }}

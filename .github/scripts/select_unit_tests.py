@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Select all unit-test buckets on one CPU runner and publish the GPU matrix."""
+"""Discover tests for all buckets on one GPU runner and publish execution plans."""
 
 import hashlib
 import json
@@ -30,20 +30,104 @@ def _python(script: str, args: list[str]) -> dict[str, str]:
     return dict(line.split("=", 1) for line in output.strip().splitlines())
 
 
+def _clear_cache(cache_dir: Path) -> None:
+    # Native collection writes rank-private files as the container user.
+    subprocess.run(["sudo", "rm", "-rf", "--", str(cache_dir)], check=True)
+
+
+def _launch_gpu_selection(bucket: str) -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            "tests/test_utils/python_scripts/launch_nemo_run_workload.py",
+            "--scope",
+            "unit-tests",
+            "--model",
+            "unit-tests",
+            "--test-case",
+            bucket,
+            "--environment",
+            "dev",
+            "--platform",
+            os.environ["RECIPE_PLATFORM"],
+            "--tag",
+            "latest",
+            "--unit-testmon-mode",
+            "select-only",
+            "--container-image",
+            os.environ["CONTAINER_IMAGE"],
+            "--hf-home",
+            "/mnt/datadrive/TestData/nemo-fw/TestData/HF_HOME",
+        ],
+        env={**os.environ, "PYTHONPATH": str(Path.cwd()), "NEMORUN_HOME": str(Path.cwd())},
+        check=True,
+    )
+
+
+def _select_on_gpu(bucket: str, cache_dir: Path, identity_path: Path, matched_key: str) -> dict:
+    subprocess.run(
+        [
+            sys.executable,
+            "tests/unit_tests/testmon_cache.py",
+            "validate",
+            "--cache-dir",
+            str(cache_dir),
+            "--identity",
+            str(identity_path),
+            "--matched-key",
+            matched_key,
+        ],
+        check=True,
+    )
+    pr_files = Path(os.environ["PR_FILES_DIR"])
+    metadata = json.loads((pr_files / "metadata.json").read_text())
+    changed_text = (pr_files / "changed-files").read_text()
+    changed = changed_text.splitlines()
+    if (
+        metadata["tested_sha"] != os.environ["SOURCE_SHA"]
+        or type(metadata["changed_files"]) is not int
+        or not 0 <= metadata["changed_files"] <= 3000
+        or type(metadata["changed_paths"]) is not int
+        or not 0 <= metadata["changed_paths"] <= 6000
+        or metadata["changed_paths"] != len(changed)
+        or metadata["changed_paths"] != changed_text.count("\n")
+    ):
+        raise ValueError("PR changed-file evidence is incomplete or belongs to another commit")
+    shutil.copyfile(pr_files / "changed-files", cache_dir / "changed-files")
+    _launch_gpu_selection(bucket)
+    phases = {}
+    mandatory = set()
+    for phase in ("prod", "experimental"):
+        directory = cache_dir / ".testmon-work" / phase
+        phases[phase] = (directory / "selected-tests").read_text().splitlines()
+        mandatory.update((directory / "mandatory-tests").read_text().splitlines())
+    return {
+        "schema": 1,
+        "source_sha": os.environ["SOURCE_SHA"],
+        "bucket": bucket,
+        "platform": os.environ["RECIPE_PLATFORM"],
+        "mode": "selected",
+        "reason": "native pytest/Testmon discovery on GPU workers",
+        "phases": phases,
+        "mandatory_files": sorted(mandatory),
+    }
+
+
 def main() -> None:
-    """Restore each baseline, run the existing selector, and upload its plan."""
+    """Restore each baseline, collect on GPU workers, and upload execution plans."""
     if os.environ["TARGET_BRANCH"] != "main":
         raise ValueError("Testmon selection requires main")
     platform = os.environ["RECIPE_PLATFORM"]
     generation = f"{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
     temporary = Path(os.environ["RUNNER_TEMP"])
     cache_dir = Path("assets_dir/testmon")
-    plan = "assets_dir/testmon-plan/plan.json"
+    plan = Path("assets_dir/testmon-plan/plan.json")
+    plan.parent.mkdir(parents=True, exist_ok=True)
     matrix = []
     summary = [
         "### Unit tests selection",
         "",
-        "| Bucket | Mode | GPU required |",
+        "| Bucket | Mode | Execution required |",
         "| --- | --- | --- |",
     ]
 
@@ -51,6 +135,13 @@ def main() -> None:
     for entry in json.loads(os.environ["BUCKETS"]):
         bucket = entry["bucket"]
         logger.info("Selecting %s", bucket)
+        # These bespoke recipes intentionally always execute in full.
+        if bucket == "tests/unit_tests/inference/test_batch_invariant_fp8.py" or (
+            bucket.startswith("tests/unit_tests/inference/") and "/test_disagg_" in bucket
+        ):
+            matrix.append({**entry, "mode": "full", "plan_artifact": ""})
+            summary.append(f"| `{bucket}` | full | true |")
+            continue
         identity = _python(
             "testmon_cache.py",
             [
@@ -63,8 +154,8 @@ def main() -> None:
                 str(temporary / "unit-testmon-identity.json"),
             ],
         )
-        if cache_dir.exists():
-            shutil.rmtree(cache_dir)
+        _clear_cache(cache_dir)
+        plan.unlink(missing_ok=True)
         matched_key = ""
         key_file = temporary / "unit-testmon-matched-key"
         prefix = identity["cache_prefix"]
@@ -73,42 +164,27 @@ def main() -> None:
                 "restore", str(cache_dir), f"{prefix}lookup-{generation}", prefix, str(key_file)
             )
             matched_key = key_file.read_text()
-        except subprocess.CalledProcessError:
+        except (OSError, subprocess.SubprocessError):
             logger.warning("Testmon cache restore failed for %s", bucket)
-        result = _python(
-            "testmon_selector.py",
-            [
-                "select",
-                "--cache-dir",
-                str(cache_dir),
-                "--bucket",
-                bucket,
-                "--platform",
-                platform,
-                "--source-sha",
-                os.environ["SOURCE_SHA"],
-                "--matched-key",
-                matched_key,
-                "--pr-files-dir",
-                os.environ["PR_FILES_DIR"],
-                "--output",
-                plan,
-            ],
-        )
-        mode, has_tests = result["mode"], result["has_tests"]
-        if (
-            mode not in {"selected", "full"}
-            or has_tests not in {"true", "false"}
-            or (mode == "full" and has_tests != "true")
-        ):
-            raise ValueError(f"Invalid Testmon selection result for {bucket}")
+        try:
+            result = _select_on_gpu(
+                bucket, cache_dir, temporary / "unit-testmon-identity.json", matched_key
+            )
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+            logger.warning(
+                "GPU selection unavailable for %s; scheduling its full bucket: %s", bucket, error
+            )
+            result = {"mode": "full"}
+        mode = result["mode"]
+        has_tests = mode == "full" or any(result["phases"].values())
         artifact = ""
         if mode == "selected":
             bucket_hash = hashlib.sha256(bucket.encode()).hexdigest()[:16]
             artifact = f"unit-test-plan-{platform}-{bucket_hash}-{generation}"
             # Upload empty plans too: the coverage gate uses them as skip evidence.
-            _actions("upload", artifact, plan, "assets_dir/testmon-plan")
-        if has_tests == "true":
+            plan.write_text(json.dumps(result, indent=2) + "\n")
+            _actions("upload", artifact, str(plan), "assets_dir/testmon-plan")
+        if has_tests:
             matrix.append(
                 {
                     **entry,
@@ -116,7 +192,7 @@ def main() -> None:
                     "plan_artifact": artifact,
                 }
             )
-        summary.append(f"| `{bucket}` | {mode} | {has_tests} |")
+        summary.append(f"| `{bucket}` | {mode} | {str(has_tests).lower()} |")
 
     with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as stream:
         stream.write("\n".join(summary) + "\n")

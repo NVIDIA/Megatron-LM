@@ -36,7 +36,7 @@ def _function(source: str, name: str) -> str:
     return source.split(f"{name}() {{", 1)[1].split("\n}\n", 1)[0]
 
 
-def _invoke(project, cache, mode, phase="prod", rank=0, pytest_args=()):
+def _invoke(project, cache, mode, phase="prod", rank=0, pytest_args=(), target="tests"):
     return subprocess.run(
         [
             sys.executable,
@@ -52,7 +52,7 @@ def _invoke(project, cache, mode, phase="prod", rank=0, pytest_args=()):
             "-c",
             str(project / "pytest.ini"),
             *pytest_args,
-            "tests",
+            target,
         ],
         cwd=project,
         env={
@@ -220,6 +220,21 @@ def test_new_test_file_is_discovered_from_old_baseline(project, cache):
     assert selected.read_text().splitlines() == ["tests/test_new.py::test_new"]
 
 
+@pytest.mark.parametrize("target", ["tests", "tests/test_app.py"])
+def test_new_case_in_existing_file_is_discovered_from_old_baseline(project, cache, target):
+    before = _snapshot(cache / "prod")
+    test_file = project / "tests/test_app.py"
+    test_file.write_text(
+        test_file.read_text()
+        + "\ndef test_added():\n    raise AssertionError('selection must not execute tests')\n"
+    )
+    result = _invoke(project, cache, "select", target=target)
+    assert result.returncode == 0, result.stdout + result.stderr
+    selected = cache / ".testmon-work/prod/rank-0/selected-tests"
+    assert "tests/test_app.py::test_added" in selected.read_text().splitlines()
+    assert _snapshot(cache / "prod") == before
+
+
 def test_changed_function_selects_and_runs_only_affected_cases_in_same_file(project, tmp_path):
     parameter_ids = ["space value", 'quote " and $value']
     (project / "tests/test_app.py").write_text(
@@ -325,6 +340,7 @@ def test_invalid_baseline_falls_back_before_private_copy(project, cache, problem
             'run_testmon_phase() { RANK=0 WORLD_SIZE=1 "$TEST_PYTHON" "$WRAPPER" '
             '--mode "$1" --phase "$2" --cache-dir "$UNIT_TESTMON_CACHE_DIR" '
             '-- -q -c "$PROJECT/pytest.ini" "$PROJECT/tests"; }',
+            "select_testmon_tests() {" + _function(runner, "select_testmon_tests") + "\n}",
             "run_enforced_tests() {" + _function(runner, "run_enforced_tests") + "\n}",
             "run_enforced_tests",
         )
@@ -378,6 +394,84 @@ def test_empty_phase_does_not_launch_pytest(tmp_path):
     assert "UNEXPECTED_EXECUTION" not in result.stdout
 
 
+@pytest.mark.parametrize(
+    "failed_step",
+    [
+        "",
+        "collect/prod",
+        "merge/prod",
+        "mandatory/prod",
+        "collect/experimental",
+        "merge/experimental",
+        "mandatory/experimental",
+    ],
+)
+def test_selection_only_never_executes_tests_or_full_fallback(tmp_path, failed_step):
+    runner = _source("tests/unit_tests/run_ci_test.sh")
+    cache = tmp_path / "cache"
+    stale = cache / ".testmon-work/stale"
+    stale.parent.mkdir(parents=True)
+    stale.touch()
+    script = "\n".join(
+        (
+            "set -euo pipefail",
+            "BUCKET=tests/unit_tests/example IGNORE_ARGS=() MARKER_ARG='not flaky'",
+            'event() { echo "$1/$2" >> "$EVENTS"; [[ "$1/$2" != "$FAILED_STEP" ]] || return 7; }',
+            'run_testmon_phase() { event collect "$2"; }',
+            'merge_rank_selections() { event merge "$1" || return; '
+            'mkdir -p "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1"; '
+            'echo tests/unit_tests/test_example.py::test_one > "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/selected-tests"; }',
+            'apply_mandatory_tests() { event mandatory "$1" || return; '
+            ': > "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/mandatory-tests"; }',
+            'forbidden() { echo FORBIDDEN >> "$EVENTS"; return 99; }',
+            "run_full_tests() { forbidden; }",
+            "run_selected_phase() { forbidden; }",
+            "run_baseline_tests() { forbidden; }",
+            "coverage() { forbidden; }",
+            "uv() { forbidden; }",
+            'write_testmon_summary() { echo "$1" >> "$EVENTS"; }',
+            "select_testmon_tests() {" + _function(runner, "select_testmon_tests") + "\n}",
+            runner[runner.index('case "$UNIT_TESTMON_MODE" in') :],
+        )
+    )
+    events = tmp_path / "events"
+    result = subprocess.run(
+        ["bash"],
+        input=script,
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "UNIT_TESTMON_MODE": "select-only",
+            "UNIT_TESTMON_CACHE_DIR": str(cache),
+            "FAILED_STEP": failed_step,
+            "EVENTS": str(events),
+        },
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert result.returncode == (7 if failed_step else 0), result.stdout + result.stderr
+    executed = events.read_text().splitlines()
+    assert "FORBIDDEN" not in executed
+    assert not stale.exists()
+    if failed_step:
+        assert executed[-1] == failed_step
+    else:
+        assert executed == [
+            "collect/prod",
+            "merge/prod",
+            "mandatory/prod",
+            "collect/experimental",
+            "merge/experimental",
+            "mandatory/experimental",
+            "GPU selection completed",
+        ]
+        for phase in ("prod", "experimental"):
+            assert (cache / ".testmon-work" / phase / "selected-tests").is_file()
+            assert (cache / ".testmon-work" / phase / "mandatory-tests").is_file()
+    assert not list(tmp_path.glob(".coverage*"))
+
+
 def test_selected_test_failure_does_not_run_full_bucket(tmp_path):
     runner = _source("tests/unit_tests/run_ci_test.sh")
     result = subprocess.run(
@@ -394,6 +488,7 @@ def test_selected_test_failure_does_not_run_full_bucket(tmp_path):
                 'apply_mandatory_tests() { : > "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/mandatory-tests"; }',
                 "run_selected_phase() { return 1; }",
                 "run_full_tests() { echo UNEXPECTED_FULL_BUCKET; }",
+                "select_testmon_tests() {" + _function(runner, "select_testmon_tests") + "\n}",
                 "run_enforced_tests() {" + _function(runner, "run_enforced_tests") + "\n}",
                 "run_enforced_tests",
             )
@@ -456,7 +551,7 @@ def test_mode_is_passed_as_container_environment():
     gb200_recipe = _source("tests/test_utils/recipes/gb200/unit-tests.yaml")
 
     assert '"UNIT_TESTMON_MODE": unit_testmon_mode' in launcher
-    assert '["full", "enforce", "preselected", "baseline"]' in launcher
+    assert '["full", "enforce", "preselected", "baseline", "select-only"]' in launcher
     assert "{unit_testmon_mode}" not in h100_recipe + gb200_recipe
 
 

@@ -147,7 +147,7 @@ def _collect_failure_logs(workdir: pathlib.Path) -> list[str]:
 @click.option("--tag", required=False, type=str, help="Tag of the workload")
 @click.option(
     "--unit-testmon-mode",
-    type=click.Choice(["full", "enforce", "preselected", "baseline"]),
+    type=click.Choice(["full", "enforce", "preselected", "baseline", "select-only"]),
     default="full",
     show_default=True,
     help="Selective unit-test mode.",
