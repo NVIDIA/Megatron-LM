@@ -1064,6 +1064,8 @@ class TestMoEModules:
             moe_router_score_function="sigmoid" if expert_bias else "softmax",
             moe_router_enable_expert_bias=expert_bias,
             moe_router_fusion=True,
+            # Dense TopK coverage should not require TE's deterministic aux-loss API.
+            moe_router_aux_loss_fusion=False,
             moe_token_dispatcher_type="flex",
             moe_flex_dispatcher_backend=backend,
         )
