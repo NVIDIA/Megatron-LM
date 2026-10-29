@@ -795,6 +795,15 @@ class InferenceConfig:
     """Which sampling kernels to use during inference. Falls back to "torch" with a warning if
     "flashinfer" is requested but the package is not installed."""
 
+    fp64_sampling_noise: bool = False
+    """
+    If True, the torch sampling backend draws its exponential race noise from float64 uniforms
+    (52 or 53 random bits) instead of float32 ones. Float32 noise cannot draw a token more than
+    about 20 nats below a row's top token and draws tokens about 16-20 nats below it at the wrong
+    rate; float64 noise moves that limit to about 40 nats. Changes the random stream, so seeded
+    outputs differ from the default. Requires sampling_backend='torch'.
+    """
+
     offset_sampling_seed_by_dp_rank: bool = True
     """
     If True, offset `inference_sampling_seed` by the data-parallel rank when seeding the
@@ -889,3 +898,9 @@ class InferenceConfig:
                     "package is not installed; falling back to sampling_backend='torch'."
                 )
                 self.sampling_backend = 'torch'
+
+        if self.fp64_sampling_noise and self.sampling_backend != 'torch':
+            raise ValueError(
+                "fp64_sampling_noise=True requires sampling_backend='torch'; "
+                "the FlashInfer sampling kernels draw float32 uniforms."
+            )

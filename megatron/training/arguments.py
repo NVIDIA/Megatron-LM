@@ -2296,6 +2296,11 @@ def _add_inference_args(parser):
                        help='Which sampling kernels to use during inference. '
                             'Falls back to "torch" with a warning if "flashinfer" '
                             'is requested but the package is not installed.')
+    group.add_argument('--inference-dynamic-batching-fp64-sampling-noise',
+                       action='store_true', default=False,
+                       help='Draw the torch sampling backend\'s race noise from float64 '
+                            'uniforms, so tokens far below a row\'s top token are drawn at '
+                            'their softmax rate. Requires the torch sampling backend.')
     group.add_argument('--use-same-sampling-seed-across-dp-ranks',
                        action='store_false', dest='offset_sampling_seed_by_dp_rank',
                        default=True,
