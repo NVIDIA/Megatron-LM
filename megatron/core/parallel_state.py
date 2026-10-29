@@ -15,7 +15,7 @@ import torch
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 
 from .tensor_parallel.gtp_parallel_layout import GTPParallelLayout
-from .utils import GlobalMemoryBuffer, is_torch_min_version
+from .utils import destroy_global_memory_buffer, get_global_memory_buffer, is_torch_min_version
 
 logger = logging.getLogger(__name__)
 
@@ -162,9 +162,6 @@ _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
 
 # Paralel group of all GPUs in a distributed optimizer instance
 _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
-
-# Memory buffers to avoid dynamic memory allocation
-_GLOBAL_MEMORY_BUFFER = None
 
 
 # List of all process groups
@@ -1973,12 +1970,6 @@ def initialize_model_parallel(
     )
     _register_process_groups(pg_collection, extras)
 
-    # Initialize global memory buffer
-    # This isn't really "parallel state" but there isn't another good place to
-    # put this. If we end up with a more generic initialization of megatron-core
-    # we could stick it there
-    _set_global_memory_buffer()
-
     return pg_collection
 
 
@@ -2934,22 +2925,12 @@ def get_inter_distributed_optimizer_instance_group(check_initialized=True):
 
 
 def _set_global_memory_buffer():
-    """Initialize global buffer."""
-    global _GLOBAL_MEMORY_BUFFER
-    assert _GLOBAL_MEMORY_BUFFER is None, "global memory buffer is already initialized"
-    _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
+    """Create the process-wide GlobalMemoryBuffer if it does not exist yet.
 
-
-def get_global_memory_buffer():
-    """Return the global GlobalMemoryBuffer object"""
-    assert _GLOBAL_MEMORY_BUFFER is not None, "global memory buffer is not initialized"
-    return _GLOBAL_MEMORY_BUFFER
-
-
-def destroy_global_memory_buffer():
-    """Sets the global memory buffer to None"""
-    global _GLOBAL_MEMORY_BUFFER
-    _GLOBAL_MEMORY_BUFFER = None
+    Calling this is optional: get_global_memory_buffer (from megatron.core.utils) creates the
+    buffer on first use.
+    """
+    get_global_memory_buffer()
 
 
 def get_all_ranks():
@@ -3070,8 +3051,7 @@ def destroy_model_parallel():
     global _MPU_PIPELINE_MODEL_PARALLEL_RANK
     _MPU_PIPELINE_MODEL_PARALLEL_RANK = None
 
-    global _GLOBAL_MEMORY_BUFFER
-    _GLOBAL_MEMORY_BUFFER = None
+    destroy_global_memory_buffer()
 
     global _DATA_PARALLEL_GROUP_GLOO
     if (
