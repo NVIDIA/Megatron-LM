@@ -1609,7 +1609,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         linear = getattr(self, linear_name)
         data = scale = dtype = None
         for i in range(self.num_local_experts):
-            bf16 = _to_bf16(getattr(linear, f'weight{i}'))
+            bf16 = _to_bf16(getattr(linear, f"weight{i}"))
             quantized = MXFP8Tensor.from_bf16(bf16, backend=backend)
             if data is None:
                 data = quantized.data.new_empty(self.num_local_experts, *quantized.data.shape)

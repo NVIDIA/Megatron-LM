@@ -90,7 +90,7 @@ RECIPES = {
     ),
 }
 
-_MXFP8 = dict(fp8='hybrid', fp8_recipe='mxfp8', fp8_param=True)
+_MXFP8 = dict(fp8="hybrid", fp8_recipe="mxfp8", fp8_param=True)
 
 
 def _on_flashinfer_gpu(*fixtures):
@@ -194,7 +194,7 @@ def _allocate_dispatch_buffers(config, max_tokens):
     from megatron.core import parallel_state
 
     NCCLAllGatherDispatcher.allocate_buffers()
-    if config.inference_moe_token_dispatcher_type == 'nvls':
+    if config.inference_moe_token_dispatcher_type == "nvls":
         NVLSAllGatherVDispatcher.allocate_buffers(
             per_rank_worst_case_token_count=max_tokens,
             topk=config.moe_router_topk,
@@ -322,25 +322,25 @@ def _validated_config(**overrides):
         add_bias_linear=False,
         gated_linear_unit=False,
         activation_func=squared_relu,
-        transformer_impl='inference_optimized',
+        transformer_impl="inference_optimized",
         # Required by inference_optimized: a BF16 router would cost a per-decode
         # dtype conversion, and its expert module assumes RMSNorm. Unrelated to
         # what is tested here, but without them every test dies before reaching
         # its assertion.
-        moe_router_dtype='fp32',
-        normalization='RMSNorm',
-        inference_grouped_gemm_backend='flashinfer',
-        inference_moe_nvfp4_recipe='per_token',
+        moe_router_dtype="fp32",
+        normalization="RMSNorm",
+        inference_grouped_gemm_backend="flashinfer",
+        inference_moe_nvfp4_recipe="per_token",
         attention_backend=AttnBackend.flash,
         flash_attention_version=4,
         attention_dropout=0.0,
         batch_invariant_mode=True,
-        batch_invariant_backend='te_native',
+        batch_invariant_backend="te_native",
         moe_match_generation_forward=True,
         # The value pass stores no activations, so the backward has to come from
         # a recompute pass. Validated, not assumed.
-        recompute_granularity='selective',
-        recompute_modules=['moe'],
+        recompute_granularity="selective",
+        recompute_modules=["moe"],
         bf16=True,
         params_dtype=torch.bfloat16,
     )
@@ -349,13 +349,13 @@ def _validated_config(**overrides):
 
 
 class TestBackendAllowList:
-    @pytest.mark.parametrize("recipe", ['nvfp4', 'mxfp8'])
+    @pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
     def test_flashinfer_quantized_recipes_are_accepted(self, recipe):
         """MXFP8 needs no extra opt-in: its TE recompute is MXFP8 too."""
-        overrides = dict(inference_moe_nvfp4_recipe=None, **_MXFP8) if recipe == 'mxfp8' else {}
+        overrides = dict(inference_moe_nvfp4_recipe=None, **_MXFP8) if recipe == "mxfp8" else {}
         assert _validated_config(**overrides).moe_match_generation_forward
 
-    @pytest.mark.parametrize("backend", ['vllm', 'torch'])
+    @pytest.mark.parametrize("backend", ["vllm", "torch"])
     def test_backends_that_already_match_training_are_rejected(self, backend):
         """Under batch_invariant_mode their kernels already match TE training."""
         with pytest.raises(ValueError, match="supports only inference_grouped_gemm_backend"):
@@ -377,7 +377,7 @@ class TestBackendAllowList:
     def test_requires_the_inference_optimized_transformer_impl(self):
         """Only that spec builds the inference-capable expert module."""
         with pytest.raises(ValueError, match="inference_optimized"):
-            _validated_config(transformer_impl='transformer_engine')
+            _validated_config(transformer_impl="transformer_engine")
 
 
 class TestRecomputeRequirement:
@@ -386,14 +386,28 @@ class TestRecomputeRequirement:
         with pytest.raises(ValueError, match="recompute"):
             _validated_config(recompute_granularity=None, recompute_modules=None)
 
-    def test_moe_must_be_among_the_recomputed_modules(self):
+    @pytest.mark.parametrize("modules", [None, [], ["layernorm"]])
+    def test_moe_must_be_among_the_recomputed_modules(self, modules):
+        """None becomes ["core_attn"] later in construction, so it does not recompute MoE."""
         with pytest.raises(ValueError, match="recompute"):
-            _validated_config(recompute_modules=['layernorm'])
+            _validated_config(recompute_modules=modules)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            dict(recompute_modules=["moe", "layernorm"]),
+            dict(moe_layer_recompute=True, recompute_granularity=None, recompute_modules=None),
+        ],
+    )
+    def test_moe_recompute_is_accepted_in_every_supported_form(self, overrides):
+        config = _validated_config(**overrides)
+        assert config.recompute_granularity == "selective"
+        assert "moe" in config.recompute_modules
 
     def test_local_cuda_graphs_are_rejected(self):
         """They disable MoE-layer recompute, leaving the value pass with no backward."""
         with pytest.raises(ValueError, match="cuda_graph_impl"):
-            _validated_config(cuda_graph_impl='local')
+            _validated_config(cuda_graph_impl="local")
 
 
 class TestParityBreakingSettings:
@@ -424,7 +438,7 @@ class TestParityBreakingSettings:
     def test_expert_tensor_parallelism_is_rejected(self):
         with pytest.raises(ValueError, match="expert tensor parallelism"):
             _validated_config(
-                expert_tensor_parallel_size=2, inference_moe_token_dispatcher_type='nvls'
+                expert_tensor_parallel_size=2, inference_moe_token_dispatcher_type="nvls"
             )
 
 
@@ -468,12 +482,17 @@ class TestGenerationRouteOrder:
 class TestValuePassRuns:
     """(2) The path runs, and the value pass reaches the FlashInfer kernel."""
 
+    @pytest.mark.parametrize("mode", ["train", "eval"])
     @pytest.mark.parametrize("recipe", ["nvfp4-squared_relu", "nvfp4-swiglu"])
-    def test_forward_backward_runs(self, recipe):
-        """NVFP4 keeps BF16 parameters, so the TE recompute gives every weight a gradient."""
+    def test_forward_backward_runs(self, recipe, mode):
+        """NVFP4 keeps BF16 parameters, so the TE recompute gives every weight a gradient.
+
+        ``eval()`` disables training behavior, not autograd: a grad-enabled eval
+        forward still needs the recompute for its backward.
+        """
         _skip_unless_supported(recipe)
         config = _config(recipe, moe_match_generation_forward=True)
-        layer = _build_layer(config).train()
+        layer = _build_layer(config).train(mode == "train")
         seen = _spy_on_value_pass(layer.experts)
         hidden = _hidden(config, seed=0).requires_grad_(True)
 
@@ -647,6 +666,43 @@ class TestSymmetricHeapSizing:
             assert NVLSAllGatherVDispatcher._per_rank_worst_case_token_count == self.SMALL
             wide, _ = layer(hidden)
         assert _elements_that_differ(wide, chunked) == 0
+
+    def _heap_sized_layer(self):
+        _skip_unless_supported(self.RECIPE)
+        if _dispatcher() != "nvls":
+            pytest.skip("the symmetric heap is only used by the NVLS dispatcher (EP > 1)")
+        config = _config(self.RECIPE, moe_match_generation_forward=True)
+        return config, _build_layer(config, for_inference=True, max_tokens=self.SMALL).eval()
+
+    def test_a_layer_that_skips_the_metadata_sync_matches_one_that_runs_it(self):
+        """Generation refreshes dispatch metadata on its first MoE layer only.
+
+        A one-token tail chunk leaves that layer's metadata stale for the next pass,
+        so every launch of the value pass must refresh it.
+        """
+        config, layer = self._heap_sized_layer()
+        hidden = _hidden(config, seed=1, tokens=self.LARGE + 1)
+        dispatcher = layer._inference_token_dispatcher
+        with torch.no_grad():
+            want, _ = layer(hidden)
+            dispatcher._runs_metadata_sync = False
+            got, _ = layer(hidden)
+        assert _elements_that_differ(got, want) == 0
+
+    @pytest.mark.parametrize("real_tokens", [0, LOCAL_TOKENS // 2])
+    def test_generation_padding_count_masks_no_training_row(self, monkeypatch, real_tokens):
+        """A colocated context binds its real-token count to the NVLS dispatcher class."""
+        config, layer = self._heap_sized_layer()
+        hidden = _hidden(config, seed=2, tokens=self.LARGE)
+        with torch.no_grad():
+            want, _ = layer(hidden)
+            monkeypatch.setattr(
+                NVLSAllGatherVDispatcher,
+                "_real_token_count_tensor",
+                torch.tensor([real_tokens], dtype=torch.int32, device="cuda"),
+            )
+            got, _ = layer(hidden)
+        assert _elements_that_differ(got, want) == 0
 
 
 @_on_flashinfer_gpu("_batch_invariant")
@@ -964,7 +1020,7 @@ class TestForwardBackwardMismatch:
         for seed, outliers, errors in results:
             bound = (1 + ALPHA) * errors["te"][0]
             assert errors["value_pass"][0] <= bound, (
-                f"{recipe} seed {seed} {'outliers' if outliers else 'gaussian'}: the value "
+                f"{recipe} seed {seed} {"outliers" if outliers else "gaussian"}: the value "
                 f"pass's forward is farther from BF16 than the default TE recipe's by more "
                 f"than {ALPHA:.0%} ({describe(errors)})"
             )

@@ -583,7 +583,9 @@ class MoELayer(BaseMoELayer):
         """Dispatch, expert compute and combine in launches that fit the NVLS buffers.
 
         Every rank of the dispatcher's group runs the same number of launches, since
-        each one is collective.
+        each one is collective. Every launch refreshes the dispatch metadata, which
+        generation refreshes only on its first MoE layer, and none applies generation's
+        padding mask: every training row is real.
         """
         dispatcher = self.token_dispatcher
         capacity = NVLSAllGatherVDispatcher._per_rank_worst_case_token_count
@@ -593,15 +595,22 @@ class MoELayer(BaseMoELayer):
         torch.distributed.all_reduce(
             max_tokens, op=torch.distributed.ReduceOp.MAX, group=dispatcher.tp_ep_group
         )
+        real_token_count = NVLSAllGatherVDispatcher._real_token_count_tensor
+        NVLSAllGatherVDispatcher._real_token_count_tensor = None
         outputs, mlp_bias = [], None
-        for start in range(0, int(max_tokens.item()), capacity):
-            chunk = slice(min(start, num_tokens), min(start + capacity, num_tokens))
-            dispatcher.routing_map = routing_map[chunk]
-            dispatcher._local_tokens = chunk.stop - chunk.start
-            dispatched_input, chunk_probs = self.dispatch(hidden_states[chunk], probs[chunk])
-            output, mlp_bias = self.routed_experts_compute(dispatched_input, chunk_probs)
-            outputs.append(self.combine(output))
-        dispatcher._local_tokens = num_tokens
+        try:
+            for start in range(0, int(max_tokens.item()), capacity):
+                chunk = slice(min(start, num_tokens), min(start + capacity, num_tokens))
+                dispatcher.routing_map = routing_map[chunk]
+                dispatcher._local_tokens = chunk.stop - chunk.start
+                if not dispatcher._runs_metadata_sync:
+                    dispatcher.update_metadata(dispatcher._local_tokens)
+                dispatched_input, chunk_probs = self.dispatch(hidden_states[chunk], probs[chunk])
+                output, mlp_bias = self.routed_experts_compute(dispatched_input, chunk_probs)
+                outputs.append(self.combine(output))
+        finally:
+            NVLSAllGatherVDispatcher._real_token_count_tensor = real_token_count
+            dispatcher._local_tokens = num_tokens
         return torch.cat(outputs), mlp_bias
 
     def setup_delayed_wgrad_for_dispatch_backward_overlap(self):
@@ -954,7 +963,10 @@ class MoELayer(BaseMoELayer):
         # The first custom_forward call is the value pass; it clears this flag.
         self._inference_pass_is_value = self._inference_forward_applies()
 
-        if self.moe_layer_recompute and self.training:
+        # The value pass has no expert backward, so any grad-enabled forward needs the recompute.
+        if self.moe_layer_recompute and (
+            self.training or (self._inference_forward_applies() and torch.is_grad_enabled())
+        ):
             outputs = precision_aware_checkpoint(
                 custom_forward,
                 self.config,
