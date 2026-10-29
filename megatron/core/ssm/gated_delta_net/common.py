@@ -19,6 +19,7 @@ import torch.nn as nn
 from megatron.core import tensor_parallel
 from megatron.core.fp8_utils import get_fp8_align_size, get_fp8_disabled_context
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.symmetric_memory import skip_all_gather_barrier_after_reduce_scatter
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -359,6 +360,14 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         self._chunkwise_cp_context_cache: dict[tuple[int, int], tuple[torch.Tensor, object]] = {}
 
         self.reset_parameters()
+
+    def chain_tp_buffer_collectives(self, preceding_reduce_scatter):
+        """See chain_tp_buffer_collectives in megatron.core.inference.symmetric_memory.
+
+        in_proj's all-gather of the layer input comes first; out_proj's reduce-scatter comes last.
+        """
+        skip_all_gather_barrier_after_reduce_scatter(preceding_reduce_scatter, self.in_proj)
+        return self.out_proj
 
     def supports_two_stage_attention(self) -> bool:
         """Recomputation requires the original atomic forward path."""

@@ -214,18 +214,24 @@ def test_column_parallel_linear_gather_tensor_parallel_output_dispatch(
         assert default_gather.call_count == 3 and inference_gather.call_count == 0
         assert default_gather.call_args.kwargs == {"group": layer.tp_group}
 
-    # Omitting the argument keeps forward's gather barrier-free.
-    with (
-        mock.patch.object(InferenceMode, "_is_active", inference_active),
-        mock.patch(
-            "megatron.core.tensor_parallel.inference_layers."
-            "inference_all_gather_from_tensor_model_parallel_region",
-            return_value=gathered["inference"],
-        ) as inference_gather,
-    ):
-        layer(torch.zeros(2, 4), weight=torch.zeros(8, 4), runtime_gather_output=True)
-    if expected == "inference":
-        assert inference_gather.call_args.kwargs == {"barrier_before": False}
+    # By default the gather barriers, unless this forward's sequence-parallel input all-gather
+    # (NCCL, here stubbed out by _forward_impl) already synchronized the TP group.
+    for sequence_parallel in (False, True):
+        layer.sequence_parallel = sequence_parallel
+        with (
+            mock.patch.object(InferenceMode, "_is_active", inference_active),
+            mock.patch(
+                "megatron.core.tensor_parallel.inference_layers."
+                "inference_all_gather_from_tensor_model_parallel_region",
+                return_value=gathered["inference"],
+            ) as inference_gather,
+        ):
+            layer(torch.zeros(2, 4), weight=torch.zeros(8, 4), runtime_gather_output=True)
+            layer.gather_tensor_parallel_output(output_parallel)
+        if expected == "inference":
+            forward_call, direct_call = inference_gather.call_args_list
+            assert forward_call.kwargs == {"barrier_before": not sequence_parallel}
+            assert direct_call.kwargs == {"barrier_before": True}
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])

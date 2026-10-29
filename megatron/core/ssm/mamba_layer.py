@@ -19,6 +19,7 @@ except ImportError:
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.symmetric_memory import chain_tp_buffer_collectives
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -135,6 +136,10 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
     def mamba_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
         """Returns the Mamba conv and ssm states shapes per request."""
         return self.mixer.mamba_state_shapes_per_request()
+
+    def chain_tp_buffer_collectives(self, preceding_reduce_scatter):
+        """See chain_tp_buffer_collectives in megatron.core.inference.symmetric_memory."""
+        return chain_tp_buffer_collectives(self.mixer, preceding_reduce_scatter)
 
     def supports_two_stage_attention(self) -> bool:
         """Return whether the configured sequence mixer supports two-stage execution."""

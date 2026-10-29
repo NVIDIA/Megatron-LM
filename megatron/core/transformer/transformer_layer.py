@@ -25,6 +25,7 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.enums import Fp8Recipe
+from megatron.core.inference.symmetric_memory import chain_tp_buffer_collectives
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -500,6 +501,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
 
+        # Skip the all-gather barriers that this layer's own order of operations on the inference
+        # "tp" buffer makes redundant. A block also links the layer to the layer before it.
+        self.chain_tp_buffer_collectives(None)
+
         # Split Hybrid mHC runs these base-layer norms through the wrapper's recompute manager.
         self.mhc_checkpoint_input_layernorm = not isinstance(self.input_layernorm, IdentityOp)
         self.mhc_checkpoint_pre_mlp_layernorm = not isinstance(self.pre_mlp_layernorm, IdentityOp)
@@ -601,6 +606,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             if "_forward_post_mlp" in vars(klass):
                 self._legacy_forward_post_mlp = klass._forward_post_mlp
                 break
+
+    def chain_tp_buffer_collectives(self, preceding_reduce_scatter):
+        """See chain_tp_buffer_collectives in megatron.core.inference.symmetric_memory.
+
+        Self-attention, cross-attention and the MLP run in that order.
+        """
+        reduce_scatter = chain_tp_buffer_collectives(self.self_attention, preceding_reduce_scatter)
+        reduce_scatter = chain_tp_buffer_collectives(self.cross_attention, reduce_scatter)
+        return chain_tp_buffer_collectives(self.mlp, reduce_scatter)
 
     def get_inner_quantization_context(self) -> AbstractContextManager:
         """Return the quantization context for fine-grained layer execution."""

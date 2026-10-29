@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 from torch import Tensor
 
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.symmetric_memory import chain_tp_buffer_collectives
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
@@ -40,6 +41,13 @@ class HyperConnectionHybridLayer(MegatronModule):
             convert_module_to_dtype_except_fp32_marked(self.hyper_connection, config.params_dtype)
         if hasattr(layer, 'tp_group'):
             self.tp_group = layer.tp_group
+
+    def chain_tp_buffer_collectives(self, preceding_reduce_scatter):
+        """See chain_tp_buffer_collectives in megatron.core.inference.symmetric_memory.
+
+        The hyper connection mixes streams locally around the wrapped layer.
+        """
+        return chain_tp_buffer_collectives(self.inner_layer, preceding_reduce_scatter)
 
     def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
         """Delegate Mamba inference state shape requests to the wrapped layer."""

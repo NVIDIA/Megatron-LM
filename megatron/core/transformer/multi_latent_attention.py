@@ -20,6 +20,9 @@ from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_row_copy import contiguous_rows
+from megatron.core.inference.symmetric_memory import (
+    skip_all_gather_barrier_after_synchronizing_collective,
+)
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -30,7 +33,6 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.inference_layers import is_inference_column_parallel_linear
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
@@ -805,7 +807,6 @@ class MLASelfAttention(MultiLatentAttention):
             tp_group=pg_collection.tp,
             name=(name + ".linear_kv_up_proj") if name is not None else None,
         )
-        self._set_kv_up_proj_all_gather_barrier()
 
         if self.config.q_lora_rank is not None:
             self.q_layernorm = layer_classes["q_layernorm"](
@@ -826,23 +827,23 @@ class MLASelfAttention(MultiLatentAttention):
         """Resolve which Q/KV norm and up-projection implementations to build."""
         return QKNormConfigResolver(self.config, submodules).resolve()
 
-    def _set_kv_up_proj_all_gather_barrier(self) -> None:
-        """Make linear_kv_up_proj barrier before its input all-gather reuses the buffer.
+    def chain_tp_buffer_collectives(self, preceding_reduce_scatter):
+        """See chain_tp_buffer_collectives in megatron.core.inference.symmetric_memory.
 
-        Without latent caching, linear_kv_up_proj all-gathers its input right after the query
-        projection (linear_q_up_proj, or linear_q_proj without q_lora_rank) all-gathered its
-        own, with no reduce-scatter in between. Inference-optimized column-parallel linears
-        all-gather into the same "tp" symmetric buffer, so the second all-gather must not
-        overwrite it while a peer still reads the query projection's input there.
+        The query projection's all-gather (linear_q_up_proj, or linear_q_proj without
+        q_lora_rank) comes first. get_query_key_value_tensors runs it after gathering the RoPE
+        key or the whole KV latent across the TP group with NCCL, which inference-optimized
+        linears always do, since they require sequence parallelism at TP > 1. That gather
+        synchronizes the group, so the query projection needs no barrier, whatever its width.
+        linear_kv_up_proj's all-gather, without latent caching, directly follows the query
+        projection's and keeps its barrier. linear_proj's reduce-scatter comes last.
         """
-        if self.config.q_lora_rank is not None:
-            q_proj = self.linear_q_up_proj
-        else:
+        if self.config.q_lora_rank is None:
             q_proj = self.linear_q_proj
-        if is_inference_column_parallel_linear(q_proj) and is_inference_column_parallel_linear(
-            self.linear_kv_up_proj
-        ):
-            self.linear_kv_up_proj.set_barrier_before_all_gather(True)
+        else:
+            q_proj = self.linear_q_up_proj
+        skip_all_gather_barrier_after_synchronizing_collective(q_proj)
+        return self.linear_proj
 
     def _qkv_down_projection(self, hidden_states):
         """Unfused q/kv down projection path."""
@@ -1638,7 +1639,6 @@ class FusedMLASelfAttention(MLASelfAttention):
             tp_group=pg_collection.tp,
             name=(name + ".linear_kv_up_proj") if name is not None else None,
         )
-        self._set_kv_up_proj_all_gather_barrier()
 
         self.q_layernorm = layer_classes["q_layernorm"](
             hidden_size=self.config.q_lora_rank,

@@ -28,7 +28,8 @@ from megatron.core.ssm.gated_delta_net.common import (
     get_parameter_local_cp,
 )
 from megatron.core.ssm.kda_layer_config import KDALayerConfig
-from megatron.core.tensor_parallel.inference_layers import is_inference_column_parallel_linear
+from megatron.core.tensor_parallel.inference_layers import HAVE_TE as HAVE_INFERENCE_LINEARS
+from megatron.core.tensor_parallel.inference_layers import InferenceColumnParallelLinear
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -173,24 +174,11 @@ class KimiDeltaAttention(_GDNBase):
                     ),
                 )
 
-        self._set_projection_all_gather_barriers()
-
-    def _set_projection_all_gather_barriers(self) -> None:
-        """Make each projection barrier before its input all-gather reuses the buffer.
-
-        _forward_compute runs in_proj, beta_proj and, with two-stage gates, f_b_proj and
-        g_b_proj back to back, with no reduce-scatter in between. Inference-optimized
-        column-parallel linears all-gather into the same "tp" symmetric buffer, so each of
-        these all-gathers after the first must not overwrite it while a peer's GEMM still
-        reads the previous projection's input there. in_proj follows the previous layer's
-        reduce-scatter and needs no barrier.
-        """
-        projections = [self.in_proj, self.beta_proj]
-        if self.two_stage_gates:
-            projections += [self.f_b_proj, self.g_b_proj]
-        for previous, projection in zip(projections, projections[1:]):
-            if all(is_inference_column_parallel_linear(p) for p in (previous, projection)):
-                projection.set_barrier_before_all_gather(True)
+        # In inference, in_proj and beta_proj share one all-gather of their common input.
+        self._beta_proj_shares_in_proj_input = HAVE_INFERENCE_LINEARS and all(
+            isinstance(projection, InferenceColumnParallelLinear)
+            for projection in (self.in_proj, self.beta_proj)
+        )
 
     def _setup_variant_attrs(self) -> None:
         """Set KDA dimensions, projection checkpoint metadata, and kernel callable."""
@@ -474,8 +462,14 @@ class KimiDeltaAttention(_GDNBase):
 
         # Input projections. Beta intentionally remains a separate matrix.
         nvtx_range_push(suffix="in_proj")
-        qkvfg, _ = self._proj(self.in_proj, hidden_states)
-        beta, _ = self._proj(self.beta_proj, hidden_states)
+        if self._beta_proj_shares_in_proj_input:
+            (qkvfg, _), (beta, _) = self._proj(
+                partial(self.in_proj.forward_with_shared_input, others=(self.beta_proj,)),
+                hidden_states,
+            )
+        else:
+            qkvfg, _ = self._proj(self.in_proj, hidden_states)
+            beta, _ = self._proj(self.beta_proj, hidden_states)
         nvtx_range_pop(suffix="in_proj")
 
         qkvfg, thd_cp_a2a_inv = a2a_cp_to_hp(

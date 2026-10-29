@@ -62,6 +62,12 @@ from megatron.core.transformer.moe.router_replay import RouterReplay, RouterRepl
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from megatron.training.initialize import _set_random_seed
+from tests.unit_tests.inference.symmetric_buffer_test_utils import (
+    ALL_GATHER,
+    barrier_trace,
+    find_symmetric_buffer_races,
+    record_symmetric_buffer_ops,
+)
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 
@@ -4027,42 +4033,6 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
     # Symmetric-buffer all-gather barrier invariant (real inference-optimized MTP)
     # ──────────────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _assert_no_unbarriered_consecutive_all_gathers(events):
-        """Enforce the buffer-reuse invariant over a recorded collective trace.
-
-        ``events`` is an ordered list of ``(multicast_ptr, kind, barrier_before)``,
-        where ``kind`` is "AG" (plain multimem all-gather), "RS" (multimem
-        reduce-scatter), or "FUSED_RS_AG" (fused reduce-scatter+add+norm+all-gather).
-
-        A plain all-gather overwrites its symmetric buffer. If the previous op on the
-        same buffer also left it written by an all-gather (another plain AG, or the
-        all-gather tail of a fused RS+AG) with no reduce-scatter in between, the
-        all-gather must have requested ``barrier_before`` so peers finish reading the
-        previous contents before the overwrite. A reduce-scatter synchronizes ranks
-        inside its own kernel, so it clears the hazard for the next all-gather.
-        """
-        last_write = {}  # multicast_ptr -> "AG" | "RS"
-        violations = []
-        for idx, (ptr, kind, barrier_before) in enumerate(events):
-            if kind == "AG":
-                if last_write.get(ptr) == "AG" and not barrier_before:
-                    violations.append((idx, ptr))
-                last_write[ptr] = "AG"
-            elif kind == "RS":
-                last_write[ptr] = "RS"
-            elif kind == "FUSED_RS_AG":
-                # Its own reduce-scatter precedes its all-gather (internally safe), but
-                # it leaves the buffer written by an all-gather for whatever runs next.
-                last_write[ptr] = "AG"
-            else:
-                raise AssertionError(f"unexpected collective kind {kind!r}")
-        assert not violations, (
-            f"{len(violations)} all-gather(s) reused a symmetric buffer immediately after "
-            f"another all-gather without barrier_before or an intervening reduce-scatter "
-            f"(event indices/ptrs: {violations}).\nFull trace: {events}"
-        )
-
     def _run_serial_mtp_step(self, active_request_count=4):
         """Drive _compute_serial_mtp_and_sample with a valid SP hidden-state cache.
 
@@ -4103,45 +4073,8 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         ctrl._compute_serial_mtp_and_sample()
 
-    def _collect_symm_collective_trace(self):
-        """Run the serial-MTP inference step and record every symmetric collective.
-
-        The three buffer-writing collectives are instrumented at their call site
-        (megatron.core.tensor_parallel.inference_layers) so the real Triton kernels
-        still run; returns the ordered ``(ptr, kind, barrier_before)`` trace.
-        """
-        import megatron.core.tensor_parallel.inference_layers as il
-
-        real_ag = il.multimem_all_gather
-        real_rs = il.multimem_reduce_scatter
-        real_fused = il.fused_multimem_rs_add_norm_ag
-        events = []
-
-        def rec_ag(output_tensor, input_tensor, symm_mem_hdl, *args, **kwargs):
-            events.append(
-                (symm_mem_hdl.multicast_ptr, "AG", bool(kwargs.get("barrier_before", False)))
-            )
-            return real_ag(output_tensor, input_tensor, symm_mem_hdl, *args, **kwargs)
-
-        def rec_rs(output_tensor, input_tensor, symm_mem_hdl, *args, **kwargs):
-            events.append((symm_mem_hdl.multicast_ptr, "RS", False))
-            return real_rs(output_tensor, input_tensor, symm_mem_hdl, *args, **kwargs)
-
-        def rec_fused(residual, symm_buffer_tensor, symm_mem_hdl, *args, **kwargs):
-            events.append((symm_mem_hdl.multicast_ptr, "FUSED_RS_AG", False))
-            return real_fused(residual, symm_buffer_tensor, symm_mem_hdl, *args, **kwargs)
-
-        with (
-            mock.patch.object(il, "multimem_all_gather", rec_ag),
-            mock.patch.object(il, "multimem_reduce_scatter", rec_rs),
-            mock.patch.object(il, "fused_multimem_rs_add_norm_ag", rec_fused),
-        ):
-            self._run_serial_mtp_step()
-
-        return events
-
     def _check_mtp_all_gather_barrier_invariant(self):
-        """Skip unless the NVLS path engaged, then enforce the barrier invariant."""
+        """Skip unless the NVLS path engaged, then check the symmetric buffers for races."""
         from megatron.core.inference.communication.torch_symm_triton.utils import (
             is_device_nvls_capable,
         )
@@ -4151,17 +4084,19 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         if parallel_state.get_tensor_model_parallel_world_size() < 2:
             pytest.skip("requires a tensor-model-parallel world size >= 2")
 
-        events = self._collect_symm_collective_trace()
+        with record_symmetric_buffer_ops() as ops:
+            self._run_serial_mtp_step()
 
-        if not any(kind == "AG" for _, kind, _ in events):
+        all_gather_barriers = [
+            barrier for kind, barrier in barrier_trace(ops) if kind == ALL_GATHER
+        ]
+        if not all_gather_barriers:
             pytest.skip("NVLS all-gather path did not engage (symmetric memory unavailable)")
-        # The MTP path must request at least one buffer-reuse barrier (eh_proj, output
-        # projection, or the inner-block qkv) — otherwise the wiring silently regressed.
-        assert any(barrier for _, kind, barrier in events if kind == "AG"), (
-            "expected the MTP inference path to request barrier_before on at least one "
-            f"all-gather, but none did. Trace: {events}"
-        )
-        self._assert_no_unbarriered_consecutive_all_gathers(events)
+        # eh_proj's, the output projection's and the inner block's first all-gather follow
+        # other all-gathers and keep their default barrier.
+        assert any(all_gather_barriers), f"no all-gather barriered: {ops}"
+        races = find_symmetric_buffer_races(ops)
+        assert not races, f"{races}\nrecorded: {ops}"
 
     @pytest.mark.internal
     @pytest.mark.skipif(not is_fa_min_version("2.7.3"), reason="needs flash attn for MTP decode")
