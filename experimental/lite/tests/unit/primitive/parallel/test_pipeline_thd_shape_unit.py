@@ -89,6 +89,8 @@ def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8):
         pl._1f1b_schedule(
             forward_step_fn, model, iter([(b, None) for b in batches]),
             num_mb, SimpleNamespace(num_microbatches=num_mb), ps, fwd_shapes[0])
+        if not ps.pp_is_first:
+            assert model._input_tensor is None
     finally:
         pl._send_recv_pipeline = orig_srp
     return recorded_fwd, recorded_bwd, fwd_shapes
@@ -119,6 +121,57 @@ def test_pp2_recv_shapes_match_each_microbatch():
     assert rf == [] and rb == fs, (rf, rb, fs)
     rf2, rb2, _ = _run_schedule(2, 1, VARLEN)  # last stage
     assert rf2 == fs and rb2 == [], (rf2, rb2)
+
+
+@pytest.mark.parametrize("pp_rank", [0, 1, 3])
+def test_forward_only_vpp1_uses_gpipe_order_without_barriers(monkeypatch, pp_rank):
+    ps = _make_ps(4, pp_rank)
+    ps.pp_cpu_group = object()
+    model = _MockModel(hidden=8)
+    calls = []
+
+    def fake_srp(send_fwd, send_bwd, recv_fwd, recv_bwd, ps_, tensor_shape, **kwargs):
+        del send_bwd, recv_bwd, ps_, tensor_shape
+        assert kwargs["dynamic_shape"]
+        calls.append(("recv" if recv_fwd else "send", None if send_fwd is None else tuple(send_fwd.shape)))
+        if recv_fwd:
+            mb_idx = sum(kind == "recv" for kind, _ in calls) - 1
+            return torch.ones(VARLEN[mb_idx], 1, 8), None
+        return None, None
+
+    monkeypatch.setattr(pl, "_send_recv_pipeline", fake_srp)
+    monkeypatch.setattr(
+        pl,
+        "_pipeline_stage_barrier",
+        lambda _ps: pytest.fail("VPP1 forward-only GPipe must not use a global stage barrier"),
+    )
+
+    def forward_step_fn(m, batch):
+        if ps.pp_is_first:
+            hidden = torch.ones(batch["S"], 1, 8)
+        else:
+            hidden = m._input_tensor
+        out = {"hidden_states": hidden}
+        if ps.pp_is_last:
+            out["loss"] = hidden.sum()
+        return out
+
+    outputs = pl._forward_only_pipeline_schedule(
+        forward_step_fn,
+        [model],
+        iter({"S": s} for s in VARLEN),
+        len(VARLEN),
+        ps,
+        (1, 1, 8),
+    )
+
+    if ps.pp_is_first:
+        assert [kind for kind, _ in calls] == ["send"] * len(VARLEN)
+    elif ps.pp_is_last:
+        assert [kind for kind, _ in calls] == ["recv"] * len(VARLEN)
+        assert len(outputs) == len(VARLEN)
+    else:
+        assert [kind for kind, _ in calls] == ["recv", "send"] * len(VARLEN)
 
 
 # --- Tier-A: real gloo 2-process PP2, real _send_recv_pipeline, variable seq ---

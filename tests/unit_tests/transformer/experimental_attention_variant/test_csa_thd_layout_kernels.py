@@ -442,6 +442,27 @@ def test_sanitize_topk_compiles_once_across_score_widths():
     assert _compiled_triton_variants(kernel) == 1
 
 
+def test_sanitize_indexer_topk_uses_64_bit_row_offsets():
+    _require_triton_cuda()
+    score_width = 1 << 20
+    num_rows = (2**31 - 1) // score_width + 2
+    required_bytes = num_rows * score_width * torch.empty((), dtype=torch.float16).element_size()
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if free_bytes < required_bytes + 2**30:
+        pytest.skip(
+            "The 64-bit row-offset regression test requires about 5 GiB of free GPU memory."
+        )
+
+    scores = torch.empty((num_rows, score_width), dtype=torch.float16, device="cuda")
+    scores[:, 0] = 0
+    candidates = torch.zeros((num_rows, 1), dtype=torch.int32, device="cuda")
+    seq_lens = torch.ones((num_rows,), dtype=torch.int32, device="cuda")
+
+    sanitized, lengths = thd_indexer_kernels.sanitize_topk(candidates, scores, seq_lens)
+    assert torch.count_nonzero(sanitized) == 0
+    assert torch.all(lengths == 1)
+
+
 def test_compressor_input_compact_matches_native_forward_backward():
     _require_cute_cuda()
     cu = _make_e2e_like_cu_seqlens()
