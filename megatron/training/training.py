@@ -833,6 +833,7 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
 
 def num_floating_point_operations(
     args,
+    cfg,
     batch_size,
     seqlen_squared_sum_in_batch=None,
     total_real_tokens_in_batch=None,
@@ -1383,7 +1384,7 @@ def num_floating_point_operations(
                 + forward_backward_expansion_factor
                 * fma_expansion_factor
                 * args.hidden_size
-                * args.padded_vocab_size
+                * cfg.tokenizer.padded_vocab_size
                 * (mtp_num_layers + 1)  # MTP + final logit
             )
             # Self Attention (core L^2 part). For BSHD the default
@@ -1507,7 +1508,7 @@ def num_floating_point_operations(
             gdn_num_v_heads=args.linear_num_value_heads or 32,
             gdn_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             gdn_use_gdn2=(args.experimental_attention_variant == "gdn2"),
-            vocab_size=args.padded_vocab_size,
+            vocab_size=cfg.tokenizer.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
         ))
     else:
@@ -4064,6 +4065,7 @@ def training_log(
 
         throughput = num_floating_point_operations(
             args,
+            cfg,
             batch_size,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
@@ -4204,7 +4206,7 @@ def training_log(
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(
-                    args, num_microbatches=num_microbatches, verbose=True,
+                    cfg, args, num_microbatches=num_microbatches, verbose=True,
                     micro_batch_size=cfg.train.micro_batch_size,
                 )
             report_memory(
@@ -4704,6 +4706,22 @@ def checkpoint_and_decide_exit(
     return False
 
 
+def is_batch_size_transition(
+    num_microbatches: int, global_batch_size: int, has_step_batch_size_schedule: bool
+) -> bool:
+    """Return whether the last unchecked microbatch update moved to a new batch size.
+
+    With a step batch-size schedule, compare the global batch size too: the unchecked
+    update rounds the number of microbatches down, so a new batch size that the current
+    data-parallel size does not divide (e.g., 8192 -> 12288 at 8192 ranks) can leave it
+    unchanged. RL without sequence packing resizes the global batch every step, so the
+    comparison is limited to the schedule.
+    """
+    if get_num_microbatches() != num_microbatches:
+        return True
+    return has_step_batch_size_schedule and get_current_global_batch_size() != global_batch_size
+
+
 def train(
     forward_step_func,
     model,
@@ -4991,6 +5009,7 @@ def train(
     num_floating_point_operations_since_last_log_event = 0.0
 
     num_microbatches = get_num_microbatches()
+    global_batch_size = get_current_global_batch_size()
     eval_duration = 0.0
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
@@ -5169,23 +5188,25 @@ def train(
             # for the duration of timeout
             update_pg_timeout(timedelta(seconds=cfg.dist.distributed_timeout_seconds_after_init))
         # Update number of microbatches first without consistency check to decide if a
-        # checkpoint should be saved. If the number of microbatches is different
-        # from the previous iteration, save a checkpoint. Then run consistency check
+        # checkpoint should be saved. If the global batch size or the number of microbatches is
+        # different from the previous iteration, save a checkpoint. Then run consistency check
         # to make sure training configuration is still valid.
         # Standard microbatch update (sequence packing overrides this in rl_utils.py)
         update_num_microbatches(train_state.consumed_train_samples, consistency_check=False, verbose=True)
         # Skip automatic checkpoint on microbatch changes when sequence packing is active
         # as it intentionally reconfigures microbatches
-        if get_num_microbatches() != num_microbatches and iteration != 0:
+        if iteration != 0 and is_batch_size_transition(
+            num_microbatches, global_batch_size, cfg.train.step_batch_size_schedule is not None
+        ):
             if cfg.rl.rl_use_sequence_packing:
                 print_rank_0(
                     f"[Sequence Packing] Skipping automatic checkpoint at iteration {iteration} "
                     f"(microbatch change: {num_microbatches} -> {get_num_microbatches()})"
                 )
             else:
-                assert get_num_microbatches() > num_microbatches, (
-                    f"Number of microbatches should not decrease; "
-                    f"going from {num_microbatches} to {get_num_microbatches()}"
+                assert get_current_global_batch_size() > global_batch_size, (
+                    f"Global batch size should not decrease; "
+                    f"going from {global_batch_size} to {get_current_global_batch_size()}"
                 )
                 if args.save is not None:
                     print_rank_0("[StepBatchsizeNumMicroBatchesCalculator] Reached batch size "
@@ -5211,6 +5232,7 @@ def train(
                              "transition but --save is unset, so there is no checkpoint to "
                              "relaunch from; continuing at the new batch size.")
         num_microbatches = get_num_microbatches()
+        global_batch_size = get_current_global_batch_size()
         update_num_microbatches(train_state.consumed_train_samples, consistency_check=True, verbose=True)
 
         # Capture CUDA Graphs. One-off, at the warmup-step boundary -- the actual
@@ -5456,6 +5478,7 @@ def train(
             packed_sequence_stats = consume_packed_sequence_stats_in_iteration()
         num_floating_point_operations_in_batch = num_floating_point_operations(
             args,
+            cfg,
             batch_size,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
