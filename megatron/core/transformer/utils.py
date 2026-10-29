@@ -679,7 +679,8 @@ def precision_aware_checkpoint(
     Args:
         function: Callable to checkpoint.
         config: Transformer config whose ``fp8`` and ``fp4`` fields select the implementation.
-        tp_group: Tensor-parallel group for Transformer Engine's checkpoint.
+        tp_group: Tensor-parallel group of the checkpointed module. With
+            ``distribute_saved_activations``, the first input is saved split across it.
         *args: Positional arguments for ``function``.
         distribute_saved_activations: Passed through to the checkpoint implementation.
         **kwargs: Keyword arguments for ``function``.
@@ -701,4 +702,6 @@ def precision_aware_checkpoint(
         )
     if kwargs:
         function = functools.partial(function, **kwargs)
-    return tensor_parallel.checkpoint(function, distribute_saved_activations, *args)
+    return tensor_parallel.checkpoint(
+        function, distribute_saved_activations, *args, tp_group=tp_group
+    )

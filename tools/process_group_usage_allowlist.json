@@ -123,15 +123,14 @@
       "LLaVAModel.__init__:shim:use_mpu_process_groups"
     ],
     "megatron/core/optimizer/__init__.py": [
-      "get_megatron_optimizer:shim:use_mpu_process_groups"
+      "get_megatron_optimizer:guarded:resolve_process_groups"
     ],
     "megatron/core/optimizer/optimizer.py": [
       "MegatronOptimizer.get_grad_stats_parallel_group:accessor:parallel_state.get_model_parallel_group",
-      "_backfill_gtp_sharded_param_map:accessor:parallel_state.get_data_parallel_group",
-      "_backfill_gtp_sharded_param_map:accessor:parallel_state.get_tensor_model_parallel_group"
+      "_backfill_gtp_sharded_param_map:guarded:resolve_process_groups"
     ],
     "megatron/core/optimizer/qk_clip.py": [
-      "clip_qk:accessor:parallel_state.get_data_parallel_group"
+      "clip_qk:guarded:resolve_process_groups"
     ],
     "megatron/core/pipeline_parallel/schedules.py": [
       "_build_default_pg_collection:guarded:resolve_process_groups",
@@ -148,24 +147,13 @@
       "_VocabParallelCrossEntropy.forward:accessor:parallel_state.get_tensor_model_parallel_group"
     ],
     "megatron/core/tensor_parallel/generalized_tensor_parallelism.py": [
-      "gtp_replica_rank:accessor:parallel_state.get_data_parallel_rank",
-      "gtp_replica_rank:accessor:parallel_state.get_expert_data_parallel_rank"
+      "gtp_replica_rank:guarded:resolve_process_groups"
     ],
     "megatron/core/tensor_parallel/layers.py": [
-      "_initialize_affine_weight_cpu:accessor:parallel_state.get_tensor_model_parallel_rank",
-      "_initialize_affine_weight_cpu:accessor:parallel_state.get_tensor_model_parallel_world_size",
-      "param_is_not_gtp_duplicate:accessor:parallel_state.get_expert_gtp_weight_remat_rank",
-      "param_is_not_gtp_duplicate:accessor:parallel_state.get_gtp_weight_remat_rank",
-      "param_is_not_tensor_parallel_duplicate:accessor:parallel_state.get_tensor_model_parallel_rank"
+      "param_is_not_tensor_parallel_duplicate:guarded:resolve_process_groups"
     ],
     "megatron/core/tensor_parallel/random.py": [
-      "model_parallel_cuda_manual_seed:accessor:parallel_state.get_expert_gtp_weight_remat_rank",
-      "model_parallel_cuda_manual_seed:accessor:parallel_state.get_expert_gtp_weight_remat_world_size",
-      "model_parallel_cuda_manual_seed:accessor:parallel_state.get_expert_model_parallel_rank",
-      "model_parallel_cuda_manual_seed:accessor:parallel_state.get_expert_tensor_parallel_rank",
-      "model_parallel_cuda_manual_seed:accessor:parallel_state.get_gtp_weight_remat_rank",
-      "model_parallel_cuda_manual_seed:accessor:parallel_state.get_gtp_weight_remat_world_size",
-      "model_parallel_cuda_manual_seed:accessor:parallel_state.get_tensor_model_parallel_rank"
+      "model_parallel_cuda_manual_seed:guarded:resolve_process_groups"
     ],
     "megatron/core/transformer/attention.py": [
       "Attention.__init__:shim:use_mpu_process_groups"
@@ -255,5 +243,5 @@
       "make_tp_sharded_tensor_for_checkpoint:guarded:resolve_process_groups"
     ]
   },
-  "total": 153
+  "total": 141
 }

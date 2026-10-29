@@ -96,7 +96,6 @@ from megatron.core.optimizer_param_scheduler import (
 )
 from megatron.core.parallel_state import (
     create_all_gather_groups,
-    destroy_global_memory_buffer,
     destroy_model_parallel,
     update_pg_timeout,
 )
@@ -134,6 +133,7 @@ from megatron.core.utils import (
     StragglerDetector,
     check_param_hashes_across_dp_replicas,
     configure_nvtx_profiling,
+    destroy_global_memory_buffer,
     get_attr_wrapped_model,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -3083,9 +3083,17 @@ def setup_model_and_optimizer(
         )
 
         if getattr(args, 'gtp_remat_nccl_ub', False):
-            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=False))
+            register_gtp_symm_pool(
+                resolve_gtp_remat_group(
+                    pg_collection, is_expert=False, owner="setup_model_and_optimizer"
+                )
+            )
         if getattr(args, 'gtp_expert_remat_nccl_ub', False):
-            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=True))
+            register_gtp_symm_pool(
+                resolve_gtp_remat_group(
+                    pg_collection, is_expert=True, owner="setup_model_and_optimizer"
+                )
+            )
 
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
