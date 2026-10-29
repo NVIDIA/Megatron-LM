@@ -1926,10 +1926,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     # scores must replace rather than follow the partial scores.
                     req.prompt_log_probs = None
                     req.prompt_top_n_logprobs = None
+                    req.cached_prompt_log_probs.clear()
                     req.num_matched_prefix_blocks = 0
 
             # Reset the chunked prefill request id
-            self.chunked_prefill_request_id = -1
+            self.context.chunked_prefill_request_id = -1
         else:
             recompute_resident_ids = []
         self.resume_request_ids = [*recompute_resident_ids, *waiting_request_ids]
@@ -3008,6 +3009,139 @@ class DynamicInferenceEngine(AbstractEngine):
             deferred_image_embedding_count=deferred_embedding_count,
         )
 
+    def _place_cached_prompt_log_probs(self, request: DynamicInferenceRequest) -> None:
+        """Append the cached prompt log-probs that continue a request's prompt scores.
+
+        A chunk that skips cached tokens is given their rows at admission. Under
+        async scheduling that precedes post-processing of the previous chunk, so
+        each cached run is placed only once every score before it has arrived.
+
+        Args:
+            request (DynamicInferenceRequest): Request whose prompt scores to extend.
+        """
+        pending = request.cached_prompt_log_probs
+        while pending and pending[0][0] == len(request.prompt_log_probs or []):
+            _, log_probs, top_n_log_probs, top_n_token_ids = pending.pop(0)
+            if request.prompt_log_probs is None:
+                request.prompt_log_probs = []
+            request.prompt_log_probs.extend(log_probs.tolist())
+            if request.sampling_params.top_n_logprobs > 0:
+                if request.prompt_top_n_logprobs is None:
+                    request.prompt_top_n_logprobs = []
+                detokenize = self.controller.tokenizer.detokenize
+                for values, token_ids in zip(top_n_log_probs.tolist(), top_n_token_ids.tolist()):
+                    request.prompt_top_n_logprobs.append(
+                        {
+                            detokenize([token_id]): value
+                            for value, token_id in zip(values, token_ids)
+                        }
+                    )
+
+    def _promote_recomputed_prompt_scores(self, entry: RequestEntry) -> None:
+        """Restore the original prompt scores from the first complete recomputation.
+
+        A request checkpointed before its prompt scores arrive recomputes them into
+        a later record segment, but completion and streaming read them from the first.
+
+        Args:
+            entry (RequestEntry): Entry whose first record segment to repair.
+        """
+        record = entry.record
+        original_request = record[0]
+        expected_count = len(original_request.prompt_tokens) - 1
+        needs_top_n = original_request.sampling_params.top_n_logprobs > 0
+
+        def has_complete_prompt_scores(request: DynamicInferenceRequest) -> bool:
+            return len(request.prompt_log_probs or []) >= expected_count and (
+                not needs_top_n or len(request.prompt_top_n_logprobs or []) >= expected_count
+            )
+
+        if (
+            len(record.requests) == 1
+            or not original_request.sampling_params.return_log_probs
+            or original_request.sampling_params.skip_prompt_log_probs
+            or expected_count <= 0
+            or has_complete_prompt_scores(original_request)
+        ):
+            return
+
+        # A recomputation scores its whole prompt from position zero, with cached
+        # rows placed ahead of computed ones, so its leading rows are the originals.
+        for recomputed_request in record.requests[1:]:
+            if has_complete_prompt_scores(recomputed_request):
+                original_request.prompt_log_probs = list(
+                    recomputed_request.prompt_log_probs[:expected_count]
+                )
+                if needs_top_n:
+                    original_request.prompt_top_n_logprobs = list(
+                        recomputed_request.prompt_top_n_logprobs[:expected_count]
+                    )
+                return
+
+    @staticmethod
+    def _find_step_stop_match(
+        generated_tokens: List[int],
+        step_tokens: List[int],
+        stop_word_ids: Optional[List[List[int]]],
+    ) -> Optional[Tuple[int, int]]:
+        """Find the earliest stop-sequence match ending in the current burst.
+
+        Args:
+            generated_tokens: Tokens retained before the current burst.
+            step_tokens: Untrimmed tokens produced by the current step.
+            stop_word_ids: Configured tokenized stop sequences.
+
+        Returns:
+            The zero-based position in ``step_tokens`` of the stop sequence's
+            final token and the matched sequence length, or ``None`` when no
+            stop sequence ends in this burst.
+        """
+        if not stop_word_ids or not step_tokens:
+            return None
+
+        max_stop_length = max((len(stop_tokens) for stop_tokens in stop_word_ids), default=0)
+        history_length = max(0, max_stop_length - 1)
+        history = generated_tokens[-history_length:] if history_length else []
+        previous_count = len(history)
+        candidate_tokens = history + step_tokens
+        for step_position in range(len(step_tokens)):
+            end = previous_count + step_position + 1
+            for stop_tokens in stop_word_ids:
+                stop_length = len(stop_tokens)
+                if stop_length > 0 and end >= stop_length:
+                    if candidate_tokens[end - stop_length : end] == stop_tokens:
+                        return step_position, stop_length
+        return None
+
+    @staticmethod
+    def _get_usable_speculative_proposal_count(
+        num_speculative_tokens: int,
+        accepted_token_count: int,
+        terminal_token_position: Optional[int],
+    ) -> int:
+        """Count proposal positions usable before a semantic terminal boundary.
+
+        A terminal accepted draft makes only proposals through that draft usable.
+        A replacement-token boundary still required verification of the entire
+        speculative group, as did a step with no terminal boundary.
+
+        Args:
+            num_speculative_tokens: Configured proposals per decode request.
+            accepted_token_count: Accepted draft prefix length for this request.
+            terminal_token_position: Earliest logical output-burst boundary, ``-1``
+                for a boundary before this burst, or ``None`` for no boundary.
+
+        Returns:
+            Number of leading proposal positions to include in acceptance metrics.
+        """
+        if terminal_token_position is None:
+            return num_speculative_tokens
+        if terminal_token_position < 0:
+            return 0
+        if terminal_token_position < accepted_token_count:
+            return min(num_speculative_tokens, terminal_token_position + 1)
+        return num_speculative_tokens
+
     def _process_request_outputs(
         self,
         request_ids: torch.Tensor,
@@ -3131,6 +3265,35 @@ class DynamicInferenceEngine(AbstractEngine):
             num_stop_word_prompt_score_trim = 0
             eos_mid_block_hit = False
             is_prefill = len(request.generated_tokens) == 0
+            semantic_terminal_position = None
+            accepted_token_count = len(accepted_tokens_list) - accepted_tokens_list.count(-1)
+            if self.num_speculative_tokens > 0 and not is_prefill:
+                boundaries = []
+                eos_position = self._find_mid_block_eos(request, tokens)
+                if eos_position is not None:
+                    boundaries.append(eos_position)
+                remaining = request.sampling_params.num_tokens_to_generate - len(
+                    request.generated_tokens
+                )
+                if remaining <= len(tokens):
+                    boundaries.append(max(-1, remaining - 1))
+                if request.stop_word_ids:
+                    # Only the longest stop's suffix is needed, including tokens
+                    # retained in older checkpoint segments.
+                    history_length = max(map(len, request.stop_word_ids)) - 1
+                    history = []
+                    for segment in reversed(self.requests[request_id].record.requests):
+                        take = min(history_length - len(history), len(segment.generated_tokens))
+                        if take > 0:
+                            history[:0] = segment.generated_tokens[-take:]
+                        if len(history) == history_length:
+                            break
+                    stop_match = self._find_step_stop_match(history, tokens, request.stop_word_ids)
+                    if stop_match is not None:
+                        boundaries.append(stop_match[0])
+                semantic_terminal_position = min(boundaries) if boundaries else None
+                if request_id in self.stop_word_being_finished_ids:
+                    semantic_terminal_position = -1
             if request_id != consumed_chunked_prefill_request_id:
                 tokens, request_log_probs, eos_mid_block_hit = self._truncate_at_mid_block_eos(
                     request, tokens, request_log_probs, top_n_logprobs, req_idx
@@ -3255,17 +3418,18 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Skip prefill requests: MTP heads only propose speculative tokens
                 # for decode requests, so counting prefill requests would inflate
                 # the denominator and artificially deflate the acceptance rate.
-                if (
-                    not is_prefill
-                    and len(request.generated_tokens) > 0
-                    and self.num_speculative_tokens > 0
-                ):
-                    actual_proposed = max(0, self.num_speculative_tokens - num_stop_word_trim)
-                    self._spec_tokens_proposed_per_pos[:actual_proposed] += 1
-                    accepted_t = torch.tensor(accepted_tokens_list[:actual_proposed])
-                    self._spec_tokens_accepted_per_pos[:actual_proposed] += (
-                        accepted_t != -1
-                    ).long()
+                if not is_prefill and self.num_speculative_tokens > 0:
+                    actual_proposed = self._get_usable_speculative_proposal_count(
+                        self.num_speculative_tokens,
+                        accepted_token_count,
+                        semantic_terminal_position,
+                    )
+                    if actual_proposed > 0:
+                        self._spec_tokens_proposed_per_pos[:actual_proposed] += 1
+                        accepted_t = torch.tensor(accepted_tokens_list[:actual_proposed])
+                        self._spec_tokens_accepted_per_pos[:actual_proposed] += (
+                            accepted_t != -1
+                        ).long()
 
                 if (
                     stop_word_hit or eos_mid_block_hit
@@ -3325,6 +3489,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     request_log_probs = request_log_probs[:-num_stop_word_score_trim]
                 if top_n_logprobs is not None and req_idx in top_n_logprobs:
                     top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_score_trim]
+
+            # Cached rows that precede this step's rows go first.
+            self._place_cached_prompt_log_probs(request)
 
             # Process requested log_probs (unified for both regular and chunked prefill)
             # Skip for requests being finished due to stop words — tokens are not
@@ -3412,6 +3579,14 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.prompt_top_n_logprobs.append(logit_dict)
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
+
+            # Cached rows that follow this step's rows, i.e. the skipped start of
+            # the next chunk, go after them.
+            self._place_cached_prompt_log_probs(request)
+
+            # Both record.merge() and coordinator streaming read original prompt
+            # scores from record[0], so repair it as soon as recomputation completes.
+            self._promote_recomputed_prompt_scores(self.requests[request_id])
 
             # Merge only after the final token's scores and metadata have been applied.
             if finished_entry is not None:
@@ -3972,7 +4147,9 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             bool: Whether request, token, and KV-cache capacity permit a chunk.
         """
-        request_can_be_added, _, kv_cache_available = self.context.check_availability(req)
+        request_can_be_added, _, kv_cache_available = self.context.check_availability(
+            req, prefill_chunk_length=1
+        )
         is_continuing_chunk = self.context.chunked_prefill_request_id == req.request_id
         token_capacity_available = self.context.active_token_count < self.context.max_tokens
         return (
@@ -4219,6 +4396,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     pending_request_ids.append(  # pylint: disable=possibly-used-before-assignment
                         self.waiting_request_ids.popleft()
                     )
+                    can_schedule = True
                     continue
 
             # Use remaining prompt tokens for scheduling decisions
@@ -4291,6 +4469,26 @@ class DynamicInferenceEngine(AbstractEngine):
                     # than a block cannot be block-aligned; leave it unchanged).
                     if aligned_chunk_length > prefix_skip:
                         prefill_chunk_length = aligned_chunk_length
+
+                # A bypass must finish prefill now. Starting a partial request would
+                # keep it at the queue head after the earlier prefix conflict clears.
+                if (
+                    prefix_caching_enabled
+                    and pending_request_ids
+                    and prefill_chunk_length < remaining_len
+                ):
+                    break
+
+                request_available, tokens_available, kv_available = self.context.check_availability(
+                    req, prefill_chunk_length
+                )
+                if not (
+                    (is_continuing_chunked_prefill or request_available)
+                    and tokens_available
+                    and kv_available
+                ):
+                    can_schedule = False
+                    break
 
                 # Add hashes to pending set (prefix-caching bookkeeping).
                 if prefix_caching_enabled:
