@@ -478,8 +478,13 @@ class MoKMegakernel(MegakernelBackend):
         sharded over dp_cp, identical experts across the EP group). Mirror TE's fix here.
 
         The conversion can also replace parameter objects or their storage, so all derived state
-        is reset.
+        is reset first. While captured CUDA graphs reference the cached weight views, that reset
+        raises before this module converts any parameter. The check covers this module's own
+        conversion only: a containing model visits the native owners of these parameters first
+        (``MoELayer`` registers them before this module), so delete the graphs before converting
+        the model.
         """
+        self._reset_derived_state()
         snapshots = {
             name: (param, dict(param.__dict__))
             for name, param in self._parameters.items()
@@ -496,7 +501,6 @@ class MoKMegakernel(MegakernelBackend):
                 if isinstance(value, MethodType) and value.__self__ is old_param:
                     value = MethodType(value.__func__, new_param)
                 setattr(new_param, key, value)
-        self._reset_derived_state()
         return out
 
     def forward(
