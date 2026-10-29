@@ -483,8 +483,9 @@ def build_test_pg_collection(*, tp=1, pp=1, cp=1, ep=1, expt_tp=None, order="tp-
     groups, so they reuse them: dp_gtp_remat, dp_cp_gtp_remat, intra_dp_cp, expt_dp_gtp_remat,
     intra_expt_dp and tp_ep_pp_with_egtp_remat. The fields it does not build are set to None
     explicitly, so no resolver falls back to the global grid for an absent field: hcp, gtp_remat,
-    expt_gtp_remat, inter_dist_opt, dp_cp_ag and expt_dp_ag. dynamic_cp and dynamic_tp_cp are
-    empty, as they are without dynamic context parallelism.
+    expt_gtp_remat, inter_dist_opt, dp_cp_ag, expt_dp_ag, and the Gloo groups intra_dp_cp_gloo
+    and intra_expt_dp_gloo, as in a job built without Gloo groups. dynamic_cp and dynamic_tp_cp
+    are empty, as they are without dynamic context parallelism.
 
     Creating groups is collective: call this on every rank, and release the groups with
     destroy_test_pg_collection.
@@ -558,6 +559,8 @@ def build_test_pg_collection(*, tp=1, pp=1, cp=1, ep=1, expt_tp=None, order="tp-
         expt_dp=expt_dp,
         expt_dp_gtp_remat=expt_dp,
         intra_expt_dp=expt_dp,
+        intra_dp_cp_gloo=None,
+        intra_expt_dp_gloo=None,
         intra_dist_opt=grid.create_pg(dense_dims),
         hcp=None,
         gtp_remat=None,
