@@ -434,10 +434,14 @@ rejects `get_global_memory_buffer()`, `destroy_global_memory_buffer()` and
 and in the top-level scripts, even in a fallback. A stock run emits no
 `ParallelStateDeprecationWarning`.
 
-**Reviewing?** Flag new calls of the deprecated functions and of `use_mpu_process_groups()` in
-`megatron/core`. Allowed exceptions: `parallel_state.py` itself, `process_groups_config.py`,
-bootstrap code that materializes a collection from the globals, tests, and warned compatibility
-fallbacks.
+**Reviewing?** In `megatron/core`, flag a new call of a deprecated function, of
+`use_mpu_process_groups()` or `get_registered_process_groups()`, or of a guarded helper such as
+`resolve_process_groups()`, unless it replaces a read in the same function: a new fallback is a
+new read even when it warns. Only `parallel_state.py` and `process_groups_config.py` are exempt.
+Outside Megatron Core, flag a deprecated call in the code that the
+[guard](#the-ci-check) covers, including `megatron/training`, unless it is in a
+`global_process_group_fallback()` block or in bootstrap code that ignores
+`ParallelStateDeprecationWarning`. Tests may use the global grid.
 
 **Using Megatron Core with your own parallel grid?** Build a `ProcessGroupCollection` for that
 grid and pass it in. See
