@@ -2,7 +2,6 @@
 
 import logging
 import math
-import operator
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -40,10 +39,7 @@ from megatron.core.inference.unified_memory import (
 )
 from megatron.core.inference.utils import device_memory_summary, tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
-from megatron.core.models.hybrid.hybrid_layer_allocation import (
-    Symbols,
-    get_layer_maps_from_layer_type_list,
-)
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.ops.gdp.metadata import max_gdp_chunk_counts
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
@@ -518,22 +514,25 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     "boundaries are not rounded between decode chunks."
                 )
 
-            # Mamba and GDN use the same slot-indexed recurrent-state cache contract. Build
-            # one map in global layer order; independently generated per-symbol maps both
-            # start at zero and would alias if they were simply unioned.
-            attention_layer_map, dsa_layer_map = operator.itemgetter(
-                Symbols.ATTENTION, Symbols.DS_ATTENTION
-            )(get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list))
+            # Attention, DSA and MLA layers share the paged KV cache, and Mamba and GDN layers
+            # share the slot-indexed recurrent-state cache. Build one map per cache in global
+            # layer order; independently generated per-symbol maps all start at zero and would
+            # alias if they were simply unioned. Hybrid patterns reject standard attention
+            # alongside the MLA family, so all KV-cache layers take one buffer layout (MLA
+            # latents or per-head keys and values).
+            kv_layer_map = {}
             recurrent_layer_map = {}
             for global_layer_idx, layer_type in enumerate(
                 mamba_inference_state_config.layer_type_list
             ):
-                if layer_type in (Symbols.MAMBA, Symbols.GDN):
+                if layer_type in (Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MLA):
+                    kv_layer_map[global_layer_idx] = len(kv_layer_map)
+                elif layer_type in (Symbols.MAMBA, Symbols.GDN):
                     recurrent_layer_map[global_layer_idx] = len(recurrent_layer_map)
 
-            self.num_attention_layers = len(attention_layer_map) + len(dsa_layer_map)
+            self.num_attention_layers = len(kv_layer_map)
             self.num_mamba_layers = len(recurrent_layer_map)
-            self.layer_map = attention_layer_map | dsa_layer_map | recurrent_layer_map
+            self.layer_map = kv_layer_map | recurrent_layer_map
         else:
             # The layer map is the identity function for pure Transformer models.
             # Use the same per-PP-rank layer count as TransformerBlock (handles

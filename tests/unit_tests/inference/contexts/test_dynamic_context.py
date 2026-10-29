@@ -26,7 +26,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from tests.unit_tests.inference.paged_attention_test_utils import reference_paged_attention
 from tests.unit_tests.test_utilities import Utils
 
@@ -1987,6 +1987,74 @@ class TestDynamicContext:
         conv_state_layer3, ssm_state_layer3 = dynamic_context.mamba_states_cache(layer_number=3)
         assert torch.all(conv_state_layer3 == 30.0)
         assert torch.all(ssm_state_layer3 == 40.0)
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_hybrid_mla_layers_get_their_own_latent_kv_planes(self):
+        """Each MLA layer of a hybrid model maps to its own plane of the latent KV cache.
+
+        KV planes are numbered in layer order, apart from the Mamba state slots, so each MLA
+        layer's latents land in, and are read back from, that layer's plane.
+        """
+        kv_lora_rank, qk_pos_emb_head_dim = 32, 16
+        latent_dim = kv_lora_rank + qk_pos_emb_head_dim
+        layer_type_list = [Symbols.MAMBA, Symbols.MLA, Symbols.MLP] * 2
+        dynamic_context = DynamicInferenceContext(
+            model_config=MLATransformerConfig(
+                params_dtype=torch.float32,
+                num_layers=len(layer_type_list),
+                hidden_size=64,
+                num_attention_heads=4,
+                kv_lora_rank=kv_lora_rank,
+                qk_pos_emb_head_dim=qk_pos_emb_head_dim,
+                cache_mla_latents=True,
+            ),
+            inference_config=InferenceConfig(
+                max_sequence_length=512,
+                buffer_size_gb=0.03,
+                block_size_tokens=64,  # FlashMLA's block size, required with cached latents
+                mamba_inference_state_config=MambaInferenceStateConfig(
+                    layer_type_list, (544, 4), (8, 64, 16), torch.float32, torch.float32
+                ),
+                unified_memory_level=0,
+            ),
+        )
+
+        assert dynamic_context.layer_map == {0: 0, 1: 0, 3: 1, 4: 1}
+        assert dynamic_context.num_attention_layers == 2
+        assert dynamic_context.num_mamba_layers == 2
+        assert dynamic_context.memory_buffer.shape == (
+            2,
+            dynamic_context.kv_block_allocator.pool_size,
+            64,
+            latent_dim,
+        )
+
+        context_length = 10
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.arange(0, context_length, dtype=torch.long, device='cpu'),
+                sampling_params=SamplingParams(num_tokens_to_generate=10),
+            )
+        )
+        dynamic_context.initialize_attention_state()
+        block_idx = dynamic_context.gpu_view.token_to_block_idx[:context_length]
+        position = dynamic_context.gpu_view.token_to_local_position_within_kv_block[:context_length]
+
+        # Layer numbers are 1-based: the MLA layers are layers 2 and 5.
+        mla_layer_numbers = (2, 5)
+        for fill, layer_number in enumerate(mla_layer_numbers, start=1):
+            latents = torch.full(
+                (dynamic_context.padded_active_token_count, 1, latent_dim),
+                float(fill),
+                device="cuda",
+            )
+            dynamic_context.append_key_value_cache(layer_number, latents, None)
+        for fill, layer_number in enumerate(mla_layer_numbers, start=1):
+            kv_cache, value_cache, _ = dynamic_context.key_value_cache(layer_number)
+            assert value_cache is None
+            assert torch.all(kv_cache[block_idx, position] == fill)
 
     @pytest.mark.internal
     @rounder_override(64)
