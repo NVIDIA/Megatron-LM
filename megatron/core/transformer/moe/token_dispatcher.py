@@ -892,7 +892,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         This method un-permutes the tokens back to their original order,
         reshapes the tensor to its original shape, and adds the shared
-        expert output if enabled.
+        expert output if enabled. It then releases the router probabilities
+        stored by `dispatch_preprocess`, which this forward no longer needs.
 
         Args:
             permutated_local_input_tokens (torch.Tensor): Permuted hidden states from token combine.
