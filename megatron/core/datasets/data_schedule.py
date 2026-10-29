@@ -541,8 +541,8 @@ def wrap_data_iterator(
         metadata_capacity = getattr(config, "thd_max_packed_sequences", None)
         if metadata_capacity is not None:
             # Main's implicit MXFP8 alignment can append a dummy document too.
-            scheduler_kwargs['max_num_seqs'] = metadata_capacity - int(pad_enabled)
-            if scheduler_kwargs['max_num_seqs'] < 1:
+            scheduler_kwargs["max_num_seqs"] = metadata_capacity - int(pad_enabled)
+            if scheduler_kwargs["max_num_seqs"] < 1:
                 raise ValueError("THD metadata capacity must leave room for a real document.")
     if pad_enabled:
         capacity -= capacity % alignment
@@ -867,11 +867,11 @@ def get_batch_on_this_rank_for_sequence_packing(
             # the fixed max-seqlen bound through this new HybridModel return path.
             for layout, params in cp_batch.packed_seq_params_by_layout.items():
                 values = cp_batch.get_batch(layout)
-                params.cu_seqlens_q = params.cu_seqlens_kv = values['cu_seqlens'].squeeze(0)
+                params.cu_seqlens_q = params.cu_seqlens_kv = values["cu_seqlens"].squeeze(0)
                 bound = params.cu_seqlens_q_padded[-1].to(torch.int32)
                 params.max_seqlen_q = params.max_seqlen_kv = int(bound.item())
                 params.pad_between_seqs = True
-                values['max_seqlen'] = bound
+                values["max_seqlen"] = bound
         return cp_batch
 
     # Extract the data from batch after broadcasting.

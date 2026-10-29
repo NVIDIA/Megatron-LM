@@ -70,23 +70,23 @@ def test_packed_graph_tail_preserves_document_offsets():
             loss_mask=(~mask).float(),
         )
         if owns_tokens:
-            batch['tokens'] = torch.arange(12)
+            batch["tokens"] = torch.arange(12)
         config = SimpleNamespace(
-            pad_packed_seq_alignment='max', max_seqlen_per_dp_cp_rank=8, thd_max_packed_sequences=4
+            pad_packed_seq_alignment="max", max_seqlen_per_dp_cp_rank=8, thd_max_packed_sequences=4
         )
         pad_packed_batch_before_cp_slice(batch, config, cp_size=2, tp_size=1)
-        assert ('tokens' in batch) == owns_tokens
-        assert batch['cu_seqlens'].tolist() == [0, 3, 8, 8, 8]
-        assert batch['cu_seqlens_padded'].tolist() == [0, 4, 12, 16, 16]
-        assert batch['padding_mask'][12:].all()
-        assert batch['loss_mask'].sum() == 8
-        assert batch['max_seqlen'] == 16
+        assert ("tokens" in batch) == owns_tokens
+        assert batch["cu_seqlens"].tolist() == [0, 3, 8, 8, 8]
+        assert batch["cu_seqlens_padded"].tolist() == [0, 4, 12, 16, 16]
+        assert batch["padding_mask"][12:].all()
+        assert batch["loss_mask"].sum() == 8
+        assert batch["max_seqlen"] == 16
         previous = {key: value.clone() for key, value in batch.items()}
         pad_packed_batch_before_cp_slice(batch, config, cp_size=2, tp_size=1)
         for key in previous:
             torch.testing.assert_close(batch[key], previous[key])
         config.thd_max_packed_sequences = 2
-        with pytest.raises(ValueError, match='documents exceed'):
+        with pytest.raises(ValueError, match="documents exceed"):
             pad_packed_batch_before_cp_slice(batch, config, cp_size=2, tp_size=1)
 
 

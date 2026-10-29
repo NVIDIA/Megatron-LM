@@ -57,7 +57,7 @@ def _pad_packed_graph_metadata(batch: Dict, max_num_seqs: Optional[int]) -> None
     """Fix metadata shapes without treating physical padding as real tokens."""
     if max_num_seqs is None:
         return
-    for key in ('cu_seqlens', 'cu_seqlens_padded'):
+    for key in ("cu_seqlens", "cu_seqlens_padded"):
         offsets = batch[key]
         remaining = max_num_seqs + 1 - offsets.numel()
         if remaining < 0:
@@ -65,7 +65,7 @@ def _pad_packed_graph_metadata(batch: Dict, max_num_seqs: Optional[int]) -> None
         if remaining:
             batch[key] = torch.cat((offsets, offsets[-1:].expand(remaining)))
     # A stable upper bound is needed by TE capture even when document lengths vary.
-    batch['max_seqlen'] = batch['cu_seqlens_padded'][-1].to(torch.int32)
+    batch["max_seqlen"] = batch["cu_seqlens_padded"][-1].to(torch.int32)
 
 
 def pad_packed_batch_before_cp_slice(batch: Dict, config, cp_size: int, tp_size: int) -> None:
@@ -77,7 +77,7 @@ def pad_packed_batch_before_cp_slice(batch: Dict, config, cp_size: int, tp_size:
     has zero logical length; the ordinary main padding contract is unchanged.
     """
     alignment, enabled = get_packed_sequence_alignment(config, tp_size)
-    max_num_seqs = getattr(config, 'thd_max_packed_sequences', None)
+    max_num_seqs = getattr(config, "thd_max_packed_sequences", None)
     if not enabled:
         _pad_packed_graph_metadata(batch, max_num_seqs)
         return

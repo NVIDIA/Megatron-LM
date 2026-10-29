@@ -1751,10 +1751,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             )
             offsets[1:] = capacity
             for name in (
-                'cu_seqlens_q',
-                'cu_seqlens_kv',
-                'cu_seqlens_q_padded',
-                'cu_seqlens_kv_padded',
+                "cu_seqlens_q",
+                "cu_seqlens_kv",
+                "cu_seqlens_q_padded",
+                "cu_seqlens_kv_padded",
             ):
                 static_inputs[name] = offsets.clone()
         elif not isinstance(self.self_attention, IdentityOp) and (
@@ -1852,15 +1852,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
     def _reconstruct_packed_graph_inputs(self, kwargs):
         """Rebuild THD metadata inside capture using graph-static scalar capacities."""
-        if 'cu_seqlens_q' not in kwargs:
+        if "cu_seqlens_q" not in kwargs:
             return
         capacity = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
-        kwargs['packed_seq_params'] = PackedSeqParams(
-            qkv_format='thd',
-            cu_seqlens_q=kwargs.pop('cu_seqlens_q'),
-            cu_seqlens_kv=kwargs.pop('cu_seqlens_kv'),
-            cu_seqlens_q_padded=kwargs.pop('cu_seqlens_q_padded'),
-            cu_seqlens_kv_padded=kwargs.pop('cu_seqlens_kv_padded'),
+        kwargs["packed_seq_params"] = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=kwargs.pop("cu_seqlens_q"),
+            cu_seqlens_kv=kwargs.pop("cu_seqlens_kv"),
+            cu_seqlens_q_padded=kwargs.pop("cu_seqlens_q_padded"),
+            cu_seqlens_kv_padded=kwargs.pop("cu_seqlens_kv_padded"),
             max_seqlen_q=capacity,
             max_seqlen_kv=capacity,
             # Runtime packs can contain valid/physical gaps. A fixed True value
@@ -1954,15 +1954,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             if input_ids is not None:
                 kwargs["input_ids"] = input_ids
 
-        packed = kwargs.get('packed_seq_params')
+        packed = kwargs.get("packed_seq_params")
         if packed is not None and self.config.sequence_packing_scheduler is not None:
             kwargs = dict(kwargs)
-            kwargs.pop('packed_seq_params')
+            kwargs.pop("packed_seq_params")
             for name in (
-                'cu_seqlens_q',
-                'cu_seqlens_kv',
-                'cu_seqlens_q_padded',
-                'cu_seqlens_kv_padded',
+                "cu_seqlens_q",
+                "cu_seqlens_kv",
+                "cu_seqlens_q_padded",
+                "cu_seqlens_kv_padded",
             ):
                 offsets = getattr(packed, name)
                 if offsets is None or offsets.numel() != self.config.thd_max_packed_sequences + 1:
