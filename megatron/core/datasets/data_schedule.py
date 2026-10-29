@@ -448,6 +448,7 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
         super().__init__(*args, **kwargs)
         self.is_dynamic_cp = True
         self.total_dpxcp_ranks = self.dp_size * self.cp_size
+        _validate_dynamic_cp_max_size(max_cp_size, min_cp_size, self.total_dpxcp_ranks)
         valid_sizes = get_valid_dynamic_context_parallel_group_sizes(self.total_dpxcp_ranks)
         self.cp_group_sizes = tuple(
             sorted(set(valid_sizes if cp_group_sizes is None else cp_group_sizes))
@@ -463,7 +464,6 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
                 f"{self.total_dpxcp_ranks}; expected one of {list(self.cp_group_sizes)}"
             )
         self.min_cp_size = min_cp_size
-        _validate_dynamic_cp_max_size(max_cp_size, min_cp_size, self.total_dpxcp_ranks)
         self.max_cp_size = max_cp_size
 
     def get_groups_and_subsamples(self, sample_id_seqlens):

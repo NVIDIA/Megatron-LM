@@ -204,6 +204,7 @@ def test_a2a_config_defers_subclasses_before_they_resolve_layer_layouts():
         tensor_model_parallel_size=2,
         max_seqlen_per_dp_cp_rank=128,
         dynamic_context_parallel=True,
+        calculate_per_token_loss=True,
         max_cp_size=4,
         cp_comm_type="a2a",
     )
