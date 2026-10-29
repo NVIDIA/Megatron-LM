@@ -9,6 +9,7 @@ from megatron.core import parallel_state, process_groups_config
 from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
+    ProcessGroupFallbackWarning,
     require_process_groups,
     resolve_gtp_remat_group,
 )
@@ -252,19 +253,74 @@ class TestGlobalFallbackWarnings:
             resolve_gtp_remat_group(pgs, is_expert=True, owner="Owner")
 
     @pytest.mark.parametrize("size", [0, 1])
-    def test_a_global_grid_without_gtp_is_silent(self, mocker, size):
+    def test_a_global_grid_without_gtp_warns_as_well(self, mocker, size):
         # A missing or single-rank group leaves GTP off, as an absent field will once the
-        # fallback is removed, so the result does not depend on the global grid.
+        # fallback is removed, but the fallback still reads it from the global grid.
+        group = self._global_gtp_groups(mocker, size)
+        with pytest.warns(FutureWarning, match="Owner was called without `pg_collection`"):
+            assert resolve_gtp_remat_group(None, is_expert=False, owner="Owner") is group
+
+    @pytest.mark.parametrize("is_expert", [False, True])
+    def test_an_uninitialized_grid_warns_and_leaves_gtp_off(self, monkeypatch, is_expert):
+        monkeypatch.setattr(parallel_state, "_GTP_WEIGHT_REMAT_GROUP", None)
+        monkeypatch.setattr(parallel_state, "_EXPERT_GTP_WEIGHT_REMAT_GROUP", None)
+        with pytest.warns(FutureWarning, match="Owner was called without `pg_collection`"):
+            assert resolve_gtp_remat_group(None, is_expert, owner="Owner") is None
+
+    @staticmethod
+    def _forbid_global_grid(mocker):
+        """Make every read of the global GTP groups raise."""
+        return mocker.patch.object(
+            ProcessGroupCollection,
+            "use_mpu_process_groups",
+            side_effect=AssertionError("read the global grid"),
+        )
+
+    @pytest.mark.parametrize("is_expert", [False, True])
+    @pytest.mark.parametrize("passed", ["nothing", "collection", "multi_module"])
+    def test_strict_mode_raises_before_reading_the_grid(self, mocker, passed, is_expert):
+        read = self._forbid_global_grid(mocker)
+        pg_collection = None
+        if passed != "nothing":
+            pg_collection = ProcessGroupCollection(tp=mocker.Mock(spec=dist.ProcessGroup))
+        if passed == "multi_module":
+            pg_collection = MultiModuleProcessGroupCollection(
+                module_pgs={"llm": pg_collection}, language_model_module_name="llm"
+            )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", ProcessGroupFallbackWarning)
+            with pytest.raises(ProcessGroupFallbackWarning, match="Owner was called without"):
+                resolve_gtp_remat_group(pg_collection, is_expert, owner="Owner")
+        read.assert_not_called()
+
+    @pytest.mark.parametrize("is_expert", [False, True])
+    @pytest.mark.parametrize("gtp_on", [False, True])
+    def test_a_collection_with_the_field_neither_warns_nor_reads(self, mocker, is_expert, gtp_on):
+        # A collection sets the field to None when the axis is off.
+        read = self._forbid_global_grid(mocker)
+        group = mocker.Mock(spec=dist.ProcessGroup) if gtp_on else None
+        pgs = ProcessGroupCollection(gtp_remat=group, expt_gtp_remat=group)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert resolve_gtp_remat_group(pgs, is_expert, owner="Owner") is group
+        read.assert_not_called()
+
+    def test_a_rank_outside_the_language_model_neither_warns_nor_reads(self, mocker):
+        read = self._forbid_global_grid(mocker)
+        wrapper = MultiModuleProcessGroupCollection(
+            module_pgs={"encoder": ProcessGroupCollection()}, language_model_module_name=None
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert resolve_gtp_remat_group(wrapper, is_expert=False, owner="Owner") is None
+        read.assert_not_called()
+
+    @pytest.mark.parametrize("size", [0, 1, 2])
+    def test_owner_none_leaves_the_warning_to_the_caller(self, mocker, size):
         group = self._global_gtp_groups(mocker, size)
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            assert resolve_gtp_remat_group(None, is_expert=False, owner="Owner") is group
-
-    def test_owner_none_leaves_the_warning_to_the_caller(self, mocker):
-        self._global_gtp_groups(mocker, size=2)
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
-            resolve_gtp_remat_group(None, is_expert=False, owner=None)
+            assert resolve_gtp_remat_group(None, is_expert=False, owner=None) is group
 
     def test_ddp_without_a_collection_warns(self, mocker):
         sentinel = mocker.Mock(spec=dist.ProcessGroup)

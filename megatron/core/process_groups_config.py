@@ -939,10 +939,17 @@ def resolve_gtp_remat_group(
     pre-pg_collection callers working — a collection that does carry the field is always
     honored, including when it holds a custom (non-MPU) group.
 
-    The fallback is deprecated. It warns when the global group shards weights (more than one
-    rank), the only case in which the result differs from the axis being off. Every caller
-    treats a missing or single-rank group as GTP off, which is what an absent field will mean
-    once the fallback is removed.
+    The fallback is deprecated. When the caller names an ``owner``, the fallback warns before it
+    reads the grid, once per owner and argument like every other
+    ``warn_global_process_group_fallback`` call. Under an ``error`` filter on
+    ``ProcessGroupFallbackWarning`` the warning raises before the read and is not recorded, so
+    later fallbacks raise as well. An owner and argument that already warned in this process
+    before the filter was installed do not warn again, so their fallback still reads the grid
+    without raising. The fallback also warns when GTP is off or the grid is not initialized,
+    since the group then comes from the grid as well. With ``owner=None`` it reads the grid
+    without warning (see ``owner`` below). Every caller treats a missing or single-rank group as
+    GTP off, which is what an absent field will mean once the fallback is removed. A collection
+    that sets the field, to None when the axis is off, never reaches the fallback.
 
     A ``MultiModuleProcessGroupCollection`` is unwrapped to the language model's collection
     first: only the per-module collections carry the GTP axes, so the wrapper would
@@ -952,8 +959,10 @@ def resolve_gtp_remat_group(
     Args:
         pg_collection: Collection supplied by the caller, or None.
         is_expert: Select the expert axis (``expt_gtp_remat``) instead of the dense one.
-        owner: Name of the class or function the fallback warning names. None when the caller
-            has already warned about its own fallback.
+        owner: Name of the class or function the fallback warning names. None only for a
+            caller whose own fallback has already emitted a ``ProcessGroupFallbackWarning``
+            before this call, which covers this read; the fallback then reads the grid without
+            warning again.
     """
     attr = 'expt_gtp_remat' if is_expert else 'gtp_remat'
     if isinstance(pg_collection, MultiModuleProcessGroupCollection):
@@ -966,18 +975,18 @@ def resolve_gtp_remat_group(
     # would be unreachable.
     if pg_collection is not None and attr in vars(pg_collection):
         return getattr(pg_collection, attr)
-    mpu_pgs = ProcessGroupCollection.use_mpu_process_groups(
-        required_pgs=['gtp_remat', 'expt_gtp_remat']
-    )
-    group = getattr(mpu_pgs, attr)
-    if owner is not None and group is not None and group.size() > 1:
+    if owner is not None:
+        # Warn before reading the grid, so that an error filter raises without reading it.
         warn_global_process_group_fallback(
             owner,
             "pg_collection" if pg_collection is None else f"pg_collection.{attr}",
             deprecated_in="0.21",
             removed_in="0.23",
         )
-    return group
+    mpu_pgs = ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=['gtp_remat', 'expt_gtp_remat']
+    )
+    return getattr(mpu_pgs, attr)
 
 
 def amax_reduction_group(
