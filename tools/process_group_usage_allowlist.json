@@ -17,13 +17,8 @@
       "TEDotProductAttention.__init__:accessor:parallel_state.get_context_parallel_group",
       "TEDotProductAttention.__init__:accessor:parallel_state.get_hierarchical_context_parallel_groups",
       "TEDotProductAttention.__init__:accessor:parallel_state.get_tensor_model_parallel_group",
-      "TEFusedMLPWithGroupedLinear._make_fused_impl:accessor:parallel_state.get_tensor_model_parallel_world_size",
-      "TEFusedMLPWithGroupedLinear._register_hooks_on_fused_impl:accessor:parallel_state.get_tensor_model_parallel_world_size",
-      "TEFusedMLPWithGroupedLinear.forward:accessor:parallel_state.get_tensor_model_parallel_world_size",
       "TEGroupedLinear.__init__:shim:use_mpu_process_groups",
-      "_get_fp8_autocast_for_quant_recipe:guarded:resolve_process_groups",
-      "_get_te_ops_tensor_parallel_context:accessor:parallel_state.get_tensor_model_parallel_group",
-      "_get_te_ops_tensor_parallel_context:accessor:parallel_state.get_tensor_model_parallel_world_size"
+      "_get_fp8_autocast_for_quant_recipe:guarded:resolve_process_groups"
     ],
     "megatron/core/fp4_utils.py": [
       "get_fp4_context:guarded:resolve_process_groups"
@@ -180,5 +175,5 @@
       "make_tp_sharded_tensor_for_checkpoint:guarded:resolve_process_groups"
     ]
   },
-  "total": 86
+  "total": 81
 }
