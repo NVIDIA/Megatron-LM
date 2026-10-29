@@ -15,17 +15,20 @@ recent import of its name that precedes it in the same scope, even if the name i
 later; aliases created through assignments (``grid = parallel_state``) or dynamic attribute
 lookup are outside its scope.
 
-Each entry has one of three kinds:
+Each entry has one of four kinds:
 
 * ``accessor``: a ``parallel_state`` group, rank or size accessor;
+* ``function``: another deprecated ``parallel_state`` function: a pipeline-stage predicate, the
+  virtual-pipeline rank or size, ``get_all_ranks``, a rank or size override, a dynamic
+  context-parallel group map, or a memory-buffer alias;
 * ``shim``: ``ProcessGroupCollection.use_mpu_process_groups()``, which reads the same globals;
 * ``guarded``: ``resolve_process_groups()``, the warned fallback in ``process_groups_config.py``.
   It reads the globals only when the caller omits its groups, and warns first.
 
 A guarded call is still a read, so wrapping a fallback in ``resolve_process_groups()`` does not
-remove it from the allowlist. A guarded call that replaces a removed accessor or shim read in
-the same file and scope is a conversion, and ``--update`` swaps the entry. Any other new guarded
-call fails like a new read.
+remove it from the allowlist. A guarded call that replaces a removed accessor, function or shim
+read in the same file and scope is a conversion, and ``--update`` swaps the entry. Any other new
+guarded call fails like a new read.
 
 Usage::
 
@@ -49,28 +52,63 @@ ALLOWLIST = REPO_ROOT / "tools" / "process_group_usage_allowlist.json"
 # Everything else in megatron/core is subject to the ratchet, including existing fallbacks.
 EXEMPT = {"megatron/core/parallel_state.py", "megatron/core/process_groups_config.py"}
 
-# Accessors that read the global grid. Deliberately excludes initialize/destroy/is_initialized
-# (the intended long-term surface) and the virtual-pipeline and memory-buffer globals, which have
-# no replacement yet and are tracked separately.
+# Group, rank and size accessors that read the global grid. Deliberately excludes
+# initialize/destroy/is_initialized (the intended long-term surface).
 DEPRECATED_PREFIXES = ("get_",)
 # "_gloo" covers the Gloo group accessors (get_data_parallel_group_gloo,
 # get_expert_data_parallel_group_gloo), which also return groups of the global grid.
 DEPRECATED_SUFFIXES = ("_group", "_groups", "_gloo", "_rank", "_ranks", "_world_size", "_src_rank")
-NOT_DEPRECATED = {
+# Matched by the rules above, but not accessors: get_nccl_options is not deprecated, and the
+# others are counted with DEPRECATED_FUNCTIONS. The test helpers that forbid the global grid stub
+# the accessors only and expect these to keep working.
+NOT_ACCESSORS = {
     "get_nccl_options",
     "get_all_ranks",
     "get_global_memory_buffer",
     "get_virtual_pipeline_model_parallel_rank",
     "get_virtual_pipeline_model_parallel_world_size",
 }
+# The other deprecated functions of the global grid. A call of a setter writes the grid rather
+# than reads it, and counts the same way.
+DEPRECATED_FUNCTIONS = {
+    # Pipeline-stage predicates.
+    "is_pipeline_first_stage",
+    "is_pipeline_last_stage",
+    "is_rank_in_embedding_group",
+    "is_rank_in_position_embedding_group",
+    # Virtual-pipeline rank and size.
+    "get_virtual_pipeline_model_parallel_rank",
+    "set_virtual_pipeline_model_parallel_rank",
+    "get_virtual_pipeline_model_parallel_world_size",
+    "set_virtual_pipeline_model_parallel_world_size",
+    # The ranks of all groups, and the overrides of ranks and sizes.
+    "get_all_ranks",
+    "set_tensor_model_parallel_world_size",
+    "set_tensor_model_parallel_rank",
+    "set_pipeline_model_parallel_world_size",
+    "set_pipeline_model_parallel_rank",
+    "set_data_parallel_rank",
+    "set_expert_model_parallel_world_size",
+    "set_expert_model_parallel_rank",
+    "set_expert_tensor_parallel_world_size",
+    "set_expert_tensor_parallel_rank",
+    # Dynamic context-parallel group maps.
+    "get_dynamic_data_context_parallel_group_map",
+    "get_dynamic_tensor_data_context_parallel_group_map",
+    # Aliases of the memory-buffer functions of megatron.core.utils.
+    "get_global_memory_buffer",
+    "destroy_global_memory_buffer",
+    "_set_global_memory_buffer",
+}
 
-# Entry kinds in --stats order. Only "guarded" reads warn before they read the globals.
-KINDS = ("accessor", "shim", "guarded")
+# Entry kinds in --stats order. "guarded" calls always warn before they read the globals; a call
+# of another kind may follow a warning in a fallback too, which the kind does not record.
+KINDS = ("accessor", "function", "shim", "guarded")
 GUARDED = "guarded"
 
 
 def _is_deprecated_accessor(name: str) -> bool:
-    if name in NOT_DEPRECATED:
+    if name in NOT_ACCESSORS:
         return False
     return name.startswith(DEPRECATED_PREFIXES) and name.endswith(DEPRECATED_SUFFIXES)
 
@@ -227,6 +265,8 @@ def _violations_in(path: pathlib.Path):
             if module in ("megatron.core.parallel_state", "megatron.core.mpu"):
                 if _is_deprecated_accessor(accessor):
                     identity = f"accessor:parallel_state.{accessor}"
+                elif accessor in DEPRECATED_FUNCTIONS:
+                    identity = f"function:parallel_state.{accessor}"
             elif name == (
                 "megatron.core.process_groups_config.ProcessGroupCollection.use_mpu_process_groups"
             ):
@@ -284,7 +324,8 @@ def _split_conversions(added, removed):
     """Separate the guarded calls in ``added`` that replace a removed read of the same scope.
 
     Returns ``(new, converted)``. ``converted`` holds guarded calls matched one for one with
-    removed accessor or shim reads in the same file and scope; ``new`` holds every other call.
+    removed accessor, function or shim reads in the same file and scope; ``new`` holds every
+    other call.
     """
     new, converted = {}, {}
     for rel, hits in added.items():
