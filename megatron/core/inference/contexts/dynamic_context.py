@@ -64,6 +64,7 @@ from .kv_block_allocator import KVBlockAllocator
 from .mamba_slot_allocator import MAX_INTERMEDIATE_OFFSETS_PER_REQUEST, MambaSlotAllocator
 from .mtp_context_mixin import MTPContextMixin
 from .routing_metadata import RoutingMetadata
+from .zero_padding_rows_kernel import zero_padding_rows
 
 # These callbacks are currently consumed only by the Dynamo frontend.
 KVEventListener = Callable[[str, dict[str, Any]], None]
@@ -467,6 +468,21 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         else:
             self.expert_model_parallel_group = None
 
+        # Expert tensor-and-model-parallel (tp_ep) group: the group the inference MoE
+        # dispatchers gather/scatter tokens over. Equals the EP group when ETP == 1.
+        if pg_collection is not None:
+            # getattr: callers may build a pg_collection without tp_ep; fall back to the EP
+            # group (identical when ETP == 1), matching the engine's fallback.
+            self.expert_tensor_and_model_parallel_group = getattr(
+                pg_collection, "tp_ep", self.expert_model_parallel_group
+            )
+        else:
+            # Migration fallback for callers that do not pass a pg_collection; mirrors
+            # the EP fallback above. None (size 1) when MPU is not initialized.
+            self.expert_tensor_and_model_parallel_group = (
+                parallel_state.get_expert_tensor_and_model_parallel_group(check_initialized=False)
+            )
+
         # Optional CPU-side collective for EP batch-dimension sync. Populated by
         # the engine via set_ep_zmq_communicator() when available. When set,
         # match_graph_config() uses this to perform the MAX reduction on the
@@ -858,8 +874,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
 
         # are we using the inference_optimized nvls ep dispatcher for MoEs?
+        # The NVLS dispatcher gathers over the tp_ep group, so it is also active
+        # for EP == 1 with expert tensor parallelism (ETP > 1).
         self._nvls_dispatcher = (
-            get_pg_size(self.expert_model_parallel_group) > 1
+            get_pg_size(self.expert_tensor_and_model_parallel_group) > 1
             and model_config.inference_moe_token_dispatcher_type == 'nvls'
         )
 
@@ -926,7 +944,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens) // tp_size,
                 topk=model_config.moe_router_topk,
                 hidden_size=moe_hidden_size,
-                ep_group=self.expert_model_parallel_group,
+                tp_ep_group=self.expert_tensor_and_model_parallel_group,
             )
 
         # Pre-allocate the vLLM fused-MoE intermediates so no allocation happens
@@ -938,16 +956,20 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             and model_config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM
         ):
             ep_size = get_pg_size(self.expert_model_parallel_group)
+            tp_ep_size = get_pg_size(self.expert_tensor_and_model_parallel_group)
+            etp_size = max(1, tp_ep_size // ep_size)
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
             # Worst-case rows entering the MoE: the fixed NVLS AGV buffer height
-            # (per-rank worst case * ep_size); max_tokens covers the EP=1 / NCCL paths.
+            # (per-rank worst case * tp_ep_size); max_tokens covers the EP=1 / NCCL paths.
             moe_max_rows = max(
-                self.max_tokens, self.round_up_tokens(self.max_tokens) // tp_size * ep_size
+                self.max_tokens, self.round_up_tokens(self.max_tokens) // tp_size * tp_ep_size
             )
             VllmFusedMoeBuffers.allocate_buffers(
                 max_tokens=moe_max_rows,
                 topk=model_config.moe_router_topk,
+                # Expert weights are sharded along the FFN dim across expert-TP ranks.
                 fc1_output_size=model_config.moe_ffn_hidden_size
+                // etp_size
                 * (2 if model_config.gated_linear_unit else 1),
                 hidden_size=moe_hidden_size,
                 num_local_experts=model_config.num_moe_experts // ep_size,
@@ -1819,6 +1841,28 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     def using_cuda_graph_this_step(self) -> bool:
         """Returns True if cuda graphs are being used for this step."""
         return self._using_cuda_graph_this_step
+
+    def zero_padding_tokens(self, tensor: Tensor, sequence_parallel_rank: int = 0) -> None:
+        """Zero, in place, the rows of a token-major activation that belong to padding tokens.
+
+        Rows at or past this step's real token count are padding. Their values still reach
+        the amax of FP8/FP4 GEMMs, so callers zero them before quantized layers. The count is
+        read on device from ``gpu_view.real_token_count`` rather than taken from
+        ``padding_slice``: a Python slice is frozen when a CUDA graph is captured, and capture
+        fills the graph with dummy tokens, so slice-based zeroing would be empty on every
+        replay.
+
+        Args:
+            tensor: Activation whose first dimension is the padded token dimension.
+            sequence_parallel_rank: If ``tensor`` is this rank's sequence-parallel shard, the
+                rank's index in the tensor-parallel group, so that local row ``i`` is treated
+                as token ``i + sequence_parallel_rank * tensor.shape[0]``.
+        """
+        zero_padding_rows(
+            tensor,
+            self.gpu_view.real_token_count,
+            first_token_idx=sequence_parallel_rank * tensor.shape[0],
+        )
 
     def has_unfinished_requests(self) -> bool:
         """Test if any requests remain."""
