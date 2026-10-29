@@ -86,6 +86,15 @@ class TransformerConfig(ModelParallelConfig):
     which serves as an additional training objective.
     """
 
+    mtp_ce_loss_weight: float = 1.0
+    """Nonnegative weight of the MTP cross-entropy objective."""
+
+    mtp_kl_loss_weight: float = 0.0
+    """Nonnegative weight of training-only KL(main-model teacher || MTP student)."""
+
+    mtp_kd_logit_temperature: float = 1.0
+    """Positive temperature for MTP distillation; KL is multiplied by temperature squared."""
+
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
@@ -1793,6 +1802,15 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
         self._validate_cp_layouts()
+
+        for name in ("mtp_ce_loss_weight", "mtp_kl_loss_weight"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+        if not math.isfinite(self.mtp_kd_logit_temperature) or self.mtp_kd_logit_temperature <= 0:
+            raise ValueError("MTP KD temperature must be finite and positive")
+        if self.mtp_kl_loss_weight > 0 and not (self.mtp_num_layers and self.mtp_num_layers > 0):
+            raise ValueError("MTP KL loss requires positive mtp_num_layers")
 
         if self.attn_logit_softcapping is not None and not (
             math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0
