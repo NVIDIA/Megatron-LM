@@ -32,9 +32,11 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection_transformer_layer import (
+    HyperConnectionTransformerLayer,
+)
 from megatron.core.transformer.module import convert_module_to_dtype_except_fp32_marked
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import HyperConnectionTransformerLayer
 from megatron.core.utils import get_batch_on_this_cp_rank
 from tests.unit_tests.test_utilities import Utils
 
