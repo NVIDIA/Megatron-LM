@@ -33,10 +33,11 @@ class TestGatedDeltaNet(GatedDeltaNetModuleTestCases):
 
 @pytest.mark.skipif(not HAVE_FLA_GDN2, reason="FLA with GDN2 support is not installed.")
 @pytest.mark.internal
-def test_gdn2_single_token_sequences_in_cuda_graph():
+@pytest.mark.parametrize("backend", ["fla", "torch"])
+def test_gdn2_single_token_sequences_match_each_token_alone(backend):
     """In inference, packed sequences of one token each, as an MTP draft step without a context
-    packs its requests, run without host syncs, so a CUDA graph captures them, and give every
-    token the output it has as a sequence of its own."""
+    packs its requests, give every token the output it has as a sequence of its own, on either
+    kernel backend. On FLA's, they run without host syncs, so a CUDA graph captures them."""
     Utils.initialize_model_parallel(1, 1)
     try:
         model_parallel_cuda_manual_seed(123)
@@ -54,6 +55,7 @@ def test_gdn2_single_token_sequences_in_cuda_graph():
             activation_func=F.silu,
             bf16=True,
             experimental_attention_variant="gdn2",
+            gdn_kernel_backend=backend,
             linear_attention_freq=[1],
             transformer_impl="transformer_engine",
         )
@@ -75,24 +77,37 @@ def test_gdn2_single_token_sequences_in_cuda_graph():
             device=torch.cuda.current_device(),
             dtype=torch.bfloat16,
         )
-        packed_seq_params = PackedSeqParams.single_token_sequences(
-            num_tokens, device=hidden_states.device
+        cu_seqlens = torch.arange(num_tokens + 1, dtype=torch.int32, device=hidden_states.device)
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=1,
+            max_seqlen_kv=1,
         )
 
         with torch.inference_mode(), InferenceMode.active():
             alone_output = torch.cat(
                 [gdn2(hidden_states[i : i + 1], None)[0] for i in range(num_tokens)]
             )
-            # Warm up, then capture the packed forward.
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                gdn2(hidden_states, None, packed_seq_params=packed_seq_params)
-            torch.cuda.current_stream().wait_stream(stream)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            if backend == "torch":
+                # The torch backend is the deterministic reference, not an inference kernel: it
+                # builds its zero state on the host, which a CUDA graph cannot capture, and GDN's
+                # graphed inference accepts only the FLA kernels. Run it eagerly.
                 packed_output, _ = gdn2(hidden_states, None, packed_seq_params=packed_seq_params)
-            graph.replay()
+            else:
+                # Warm up, then capture the packed forward.
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    gdn2(hidden_states, None, packed_seq_params=packed_seq_params)
+                torch.cuda.current_stream().wait_stream(stream)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    packed_output, _ = gdn2(
+                        hidden_states, None, packed_seq_params=packed_seq_params
+                    )
+                graph.replay()
 
         # The recurrent and chunked kernels round their bf16 intermediates differently.
         torch.testing.assert_close(

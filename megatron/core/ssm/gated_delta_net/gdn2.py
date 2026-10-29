@@ -14,7 +14,6 @@ import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gated_delta_net.common import (
@@ -24,6 +23,7 @@ from megatron.core.ssm.gated_delta_net.common import (
     get_parameter_local_cp,
     l2norm,
 )
+from megatron.core.ssm.ssm_inference import steps_from_zero_state
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 try:
@@ -103,6 +103,8 @@ class GatedDeltaNet2(_GDNBase):
         if backend == "torch":
             self.gdn_backend = "torch"
             self.gated_delta_rule = torch_chunk_gdn2
+            # The torch kernel runs sequences of one token each like any other batch.
+            self.single_token_gated_delta_rule = torch_chunk_gdn2
             return
 
         assert (
@@ -110,6 +112,9 @@ class GatedDeltaNet2(_GDNBase):
         ), "GDN2 requires flash-linear-attention >= 0.5.1 with the fla.ops.gdn2 kernel."
         self.gdn_backend = "fla"
         self.gated_delta_rule = chunk_gdn2
+        # FLA's recurrent kernel takes one step per sequence of one token without the chunked
+        # kernel's per-sequence chunk state. It has no backward.
+        self.single_token_gated_delta_rule = fused_recurrent_gdn2
 
     def _reset_dt_bias(self):
         """Softplus-inverse init of dt_bias.
@@ -192,11 +197,7 @@ class GatedDeltaNet2(_GDNBase):
             # TODO: support inference
             raise NotImplementedError("GDN2 does not support inference for now.")
 
-        if (
-            InferenceMode.is_active()
-            and packed_seq_params is not None
-            and packed_seq_params.has_single_token_sequences()
-        ):
+        if steps_from_zero_state(packed_seq_params):
             return self._single_token_sequences_pre_attn_and_core_attn(hidden_states)
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
@@ -355,22 +356,21 @@ class GatedDeltaNet2(_GDNBase):
         return kernel_inputs, gate
 
     def _single_token_sequences_pre_attn_and_core_attn(self, hidden_states):
-        """Run packed sequences of one token each, as a context-free MTP draft step packs them.
+        """Run packed sequences of one token each, one step each from a zero state.
 
-        The packed tokens [t, 1, x] are already the bshd batch of t length-1 sequences, all
-        starting from a zero state: the conv sees each token alone, and the recurrent kernel
-        takes one step per sequence without reading or storing a state. Unlike the chunked
-        kernel, it needs no varlen metadata and keeps no per-sequence chunk state. Inference
-        only: the kernel has no backward.
+        See ``steps_from_zero_state``. The in_proj output [t, 1, x] is already the bshd batch of
+        t length-1 sequences: the conv sees each token alone, and the kernel takes one step per
+        sequence, without the chunked kernel's varlen metadata.
         """
         assert self.cp_size == 1, "GDN2 single-token sequences do not support CP."
-        assert (
-            fused_recurrent_gdn2 is not None
-        ), "GDN2 inference requires flash-linear-attention >= 0.5.1 with fla.ops.gdn2."
+        nvtx_range_push(suffix="in_proj")
         qkvzfbw, _ = self.in_proj(hidden_states)
+        nvtx_range_pop(suffix="in_proj")
         num_tokens = qkvzfbw.size(0)
         kernel_inputs, gate = self._conv_and_prepare_kernel_inputs(qkvzfbw, num_tokens, 1, None)
-        core_attn_out, _ = fused_recurrent_gdn2(**kernel_inputs, use_qk_l2norm_in_kernel=False)
+        core_attn_out, _ = self.single_token_gated_delta_rule(
+            **kernel_inputs, use_qk_l2norm_in_kernel=False
+        )
         return self._apply_gated_norm(core_attn_out, gate).reshape(num_tokens, 1, -1)
 
 

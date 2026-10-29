@@ -544,8 +544,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_ssm_kernels.py. Dynamic-inference prefill runs the GDP chunk scan with a single "
         "Householder update, replayed with M=1 by test_chunk_gated_delta_product_varlen_replays. "
         "In inference, KDA and GDN2 run packed single-token sequences (a context-free MTP draft "
-        "step) on FLA's fused_recurrent_kda / fused_recurrent_gdn2, one step from a zero state, "
-        "replayed by test_fla_fused_recurrent_single_step_replays.",
+        "step) one step each from a zero state: on FLA's fused_recurrent_kda / "
+        "fused_recurrent_gdn2, replayed by test_fla_fused_recurrent_single_step_replays, or on "
+        "the chunked kernel of GDN2's torch backend.",
     ),
     KernelEntry(
         name="gdn_pre_gated_delta_rule_fusion",
@@ -734,9 +735,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/inference/engines/test_batch_invariant_mamba_prefix_caching.py",
         ),
         kind="dispatch",
-        notes="The unfused path (_static_prefill) isolates packed sequences with seq_idx in "
-        "causal_conv1d_fn and mamba_chunk_scan_combined, replayed by "
-        "test_packed_unfused_mixer_replays_bit_exactly. "
+        notes="In inference the unfused path (_static_prefill) runs packed single-token "
+        "sequences (a context-free MTP draft step) with the conv over each token alone and "
+        "seq_idx in mamba_chunk_scan_combined, replayed by "
+        "test_single_token_sequences_unfused_mixer_replays_bit_exactly. "
         "Selects the pip causal_conv1d / mamba_ssm kernels (causal_conv1d_fn, "
         "mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined, causal_conv1d_update_cuda) or "
         "the Megatron forks (ops/common, ops/mamba2: varlen scan, causal_conv1d_update, "
@@ -755,8 +757,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "where causal_conv1d_update and the fused recurrence take several draft tokens per step and "
         "fill the conv / SSM rollback snapshot buffers; both are replayed there with the snapshots "
         "as outputs. Without state caches (packed single-token sequences in inference, as a "
-        "context-free MTP draft step packs them) ssm_decode runs causal_conv1d_fn over each token "
-        "and the fused recurrence from a zero state, replayed by the stateless case of "
+        "context-free MTP draft step packs them) ssm_decode runs the training path's conv "
+        "(causal_conv1d_fn or its fallback) over each token and the fused recurrence from a zero "
+        "state, replayed by the stateless case of "
         "test_fused_recurrent_gated_delta_rule_update_replays. No module-level replay yet "
         "(HYBRID_CONFIGS has no GDP cell).",
     ),

@@ -65,6 +65,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_specs import gated_delta_product_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.ssm import gated_delta_product as gdp_module
 from megatron.core.ssm import ssm_inference
 from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
 from megatron.core.ssm.ops.gdp.chunk import chunk_gated_delta_product_varlen
@@ -576,21 +577,41 @@ class TestGDPSingleTokenSequences:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def test_each_token_matches_its_own_sequence(self):
-        """Every token's output equals that of the chunked kernel on a sequence of its own."""
+    @pytest.mark.parametrize("pip_conv", [True, False], ids=["causal_conv1d", "conv_fallback"])
+    def test_each_token_matches_its_own_sequence_in_cuda_graph(self, pip_conv, monkeypatch):
+        """They run without host syncs, so a CUDA graph captures them, and every token's output
+        equals that of the chunked kernel on a sequence of its own, with or without pip
+        causal_conv1d."""
+        if not pip_conv:
+            monkeypatch.setattr(gdp_module, "causal_conv1d_fn", None)
         mixer = _build_model(tp=1).decoder.layers[0].mixer
         assert isinstance(mixer, GatedDeltaProductMixer)
         num_tokens = 6
         hidden_states = torch.randn(
             num_tokens, 1, mixer.config.hidden_size, device="cuda", dtype=torch.bfloat16
         )
-        packed_seq_params = PackedSeqParams.single_token_sequences(
-            num_tokens, device=hidden_states.device
+        cu_seqlens = torch.arange(num_tokens + 1, dtype=torch.int32, device="cuda")
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=1,
+            max_seqlen_kv=1,
+            seq_idx=cu_seqlens[:-1].unsqueeze(0),
         )
 
         with torch.inference_mode(), InferenceMode.active():
-            packed, _ = mixer(hidden_states, packed_seq_params=packed_seq_params)
             alone = torch.cat([mixer(hidden_states[i : i + 1])[0] for i in range(num_tokens)])
+            # Warm up, then capture the packed forward.
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                mixer(hidden_states, packed_seq_params=packed_seq_params)
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                packed, _ = mixer(hidden_states, packed_seq_params=packed_seq_params)
+            graph.replay()
         # The recurrent and chunked kernels round their bf16 intermediates differently.
         torch.testing.assert_close(packed, alone, rtol=0, atol=2e-2 * alone.abs().max().item())
 

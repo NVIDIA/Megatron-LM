@@ -22,7 +22,6 @@ from megatron.core.inference.contexts import BaseInferenceContext, DynamicInfere
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
 )
-from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -33,7 +32,7 @@ from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadat
 from megatron.core.ssm.context_parallel.gdp_common import gdp_chunkwise_context_parallel
 from megatron.core.ssm.gdp_context_parallel import GDPContextParallel
 from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support, get_cu_seqlens
-from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
+from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin, steps_from_zero_state
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
@@ -585,15 +584,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             if inference_context.seqlen_offset > 0:
                 # The states are updated in place.
                 return self._static_decode(hidden_states, conv_state, ssm_state)
-        elif (
-            InferenceMode.is_active()
-            and packed_seq_params is not None
-            and packed_seq_params.has_single_token_sequences()
-        ):
-            # Sequences of one token each, as a context-free MTP draft step packs its requests.
-            # [t, 1, proj_dim] is also the decode layout of t requests with one token each, all
-            # starting from a zero state: decode them without state caches. That reads and
-            # stores no state, and needs neither a chunked scan nor its varlen metadata.
+        elif steps_from_zero_state(packed_seq_params):
+            # [t, 1, proj_dim] is also the decode layout of t requests with one token each:
+            # decode them without state caches, so each starts from a zero state.
             assert self.cp.cp_size == 1, "Context parallel not supported for GDP inference decode"
             zVKQba, _ = self.in_proj(hidden_states)
             return self.out_proj(self.ssm_decode(zVKQba, conv_state=None, ssm_state=None))
@@ -1191,7 +1184,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         # padding, zeroing that row's output without touching the cache, which is
         # what makes a replayed CUDA graph with a partially filled batch match an
         # eager run. `batch_indices=None` is static batching, where the cache is
-        # already in request order.
+        # already in request order. Without a cache, the training path's conv runs
+        # each request from an empty window instead.
         x_conv = self._decode_conv(VKQ, conv_state, batch_indices, intermediate_conv_state)
 
         # Everything between the conv and the recurrence is one kernel: the

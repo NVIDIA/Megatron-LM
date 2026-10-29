@@ -13,7 +13,6 @@ import torch.nn.functional as F
 from megatron.core import tensor_parallel
 from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -29,6 +28,7 @@ from megatron.core.ssm.gated_delta_net.common import (
     get_parameter_local_cp,
 )
 from megatron.core.ssm.kda_layer_config import KDALayerConfig
+from megatron.core.ssm.ssm_inference import steps_from_zero_state
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -256,6 +256,27 @@ class KimiDeltaAttention(_GDNBase):
         x = self.out_norm(x)
         return (x * torch.sigmoid(gate.float())).to(x_dtype)
 
+    def _input_projections(self, hidden_states):
+        """Project the layer input: qkvfg and beta, and with two-stage gates raw_g and gate.
+
+        Beta intentionally remains a separate matrix.
+
+        Returns:
+            (qkvfg, beta, raw_g, gate); raw_g and gate are None without two-stage gates.
+        """
+        nvtx_range_push(suffix="in_proj")
+        qkvfg, _ = self._proj(self.in_proj, hidden_states)
+        beta, _ = self._proj(self.beta_proj, hidden_states)
+        nvtx_range_pop(suffix="in_proj")
+
+        raw_g = gate = None
+        if self.two_stage_gates:
+            f_a, _ = self._proj(self.f_a_proj, hidden_states)
+            raw_g, _ = self._proj(self.f_b_proj, f_a)
+            g_a, _ = self._proj(self.g_a_proj, hidden_states)
+            gate, _ = self._proj(self.g_b_proj, g_a)
+        return qkvfg, beta, raw_g, gate
+
     def _proj(self, proj, x):
         """Apply a projection GEMM, forcing BF16 when kda_disable_fp8 is set.
 
@@ -324,13 +345,9 @@ class KimiDeltaAttention(_GDNBase):
             assert not self.config.sequence_parallel
             raise NotImplementedError("KimiDeltaAttention does not support inference for now.")
 
-        if (
-            InferenceMode.is_active()
-            and packed_seq_params is not None
-            and packed_seq_params.has_single_token_sequences()
-        ):
+        if steps_from_zero_state(packed_seq_params):
             assert cp_size_runtime == 1, "KDA single-token sequences do not support CP."
-            return self._forward_single_token_sequences(hidden_states)
+            return self._forward_single_token_sequences(hidden_states, packed_seq_params)
 
         if cp_size_headwise > 1 and self.config.linear_cp_layout != "zigzag":
             raise ValueError(
@@ -446,27 +463,20 @@ class KimiDeltaAttention(_GDNBase):
 
         return out, out_bias
 
-    def _forward_single_token_sequences(self, hidden_states):
-        """Run packed sequences of one token each, as a context-free MTP draft step packs them.
+    def _forward_single_token_sequences(self, hidden_states, packed_seq_params):
+        """Run packed sequences of one token each, one step each from a zero state.
 
-        The packed tokens are a batch of length-1 sequences that all start from a zero state:
-        the conv sees each token alone, and the recurrent kernel takes one step per sequence
-        without reading or storing a state. Unlike the chunked kernel, it needs no varlen
-        metadata and keeps no per-sequence chunk state. Inference only: the kernel has no
-        backward.
+        See ``steps_from_zero_state``. The tokens run as a batch of length-1 sequences: the conv
+        sees each token alone, and FLA's recurrent kernel takes one step per sequence, without
+        the chunked kernel's varlen metadata or per-sequence chunk state. Inference only: the
+        recurrent kernel has no backward.
         """
-        qkvfg, _ = self._proj(self.in_proj, hidden_states)
-        beta, _ = self._proj(self.beta_proj, hidden_states)
-        raw_g = gate = None
-        if self.two_stage_gates:
-            f_a, _ = self._proj(self.f_a_proj, hidden_states)
-            raw_g, _ = self._proj(self.f_b_proj, f_a)
-            g_a, _ = self._proj(self.g_a_proj, hidden_states)
-            gate, _ = self._proj(self.g_b_proj, g_a)
-            raw_g, gate = raw_g.transpose(0, 1), gate.transpose(0, 1)
+        qkvfg, beta, raw_g, gate = self._input_projections(hidden_states)
 
         # pre_gated_delta_rule reads (seq, batch) input, so [1, t] is t sequences of one token.
         num_tokens = qkvfg.size(0)
+        if self.two_stage_gates:
+            raw_g, gate = raw_g.transpose(0, 1), gate.transpose(0, 1)
         query, key, value, gate, beta, raw_g, A_log, dt_bias = self.pre_gated_delta_rule(
             qkvfg.transpose(0, 1),
             beta.transpose(0, 1),
@@ -474,6 +484,7 @@ class KimiDeltaAttention(_GDNBase):
             seq_len=1,
             cp_size_headwise=1,
             cp_group_headwise=None,
+            packed_seq_params=packed_seq_params,
             raw_g=raw_g,
             gate=gate,
         )
@@ -507,11 +518,7 @@ class KimiDeltaAttention(_GDNBase):
     ):
         """Core KDA computation (in_proj -> conv1d -> gated_delta_rule -> norm -> out_proj)."""
 
-        # Input projections. Beta intentionally remains a separate matrix.
-        nvtx_range_push(suffix="in_proj")
-        qkvfg, _ = self._proj(self.in_proj, hidden_states)
-        beta, _ = self._proj(self.beta_proj, hidden_states)
-        nvtx_range_pop(suffix="in_proj")
+        qkvfg, beta, raw_g, gate = self._input_projections(hidden_states)
 
         qkvfg, thd_cp_a2a_inv = a2a_cp_to_hp(
             qkvfg,
@@ -532,12 +539,7 @@ class KimiDeltaAttention(_GDNBase):
             packed_seq_params,
         )
 
-        raw_g = gate = None
         if self.two_stage_gates:
-            f_a, _ = self._proj(self.f_a_proj, hidden_states)
-            raw_g, _ = self._proj(self.f_b_proj, f_a)
-            g_a, _ = self._proj(self.g_a_proj, hidden_states)
-            gate, _ = self._proj(self.g_b_proj, g_a)
             raw_g, _ = a2a_cp_to_hp(
                 raw_g,
                 (self.qk_dim_local_tp,),
@@ -753,7 +755,7 @@ class KimiDeltaAttention(_GDNBase):
             conv_cu_seqlens = cu_seqlens_q
             conv_cp_context = chunkwise_cp_context
             if self.config.gdn_conv_pad_alignment is not None:
-                if packed_seq_params is None or cu_seqlens_q is None:
+                if packed_seq_params is None:
                     raise ValueError(
                         "gdn_conv_pad_alignment is only supported with packed sequence "
                         "parameters in THD format. SBHD inputs do not need causal-conv padding."
@@ -763,7 +765,10 @@ class KimiDeltaAttention(_GDNBase):
                         "gdn_conv_pad_alignment is incompatible with KDA chunkwise CP. Padding "
                         "chunk-local causal-conv inputs can change later chunk numerics."
                     )
-                pad_n = -orig_seq % self.config.gdn_conv_pad_alignment
+                # Sequences of one token each reach the conv as rows of their own, without
+                # cu_seqlens, and need no padding.
+                if cu_seqlens_q is not None:
+                    pad_n = -orig_seq % self.config.gdn_conv_pad_alignment
             if pad_n > 0:
                 conv_input = torch.nn.functional.pad(conv_input, (0, 0, 0, pad_n))
                 conv_cu_seqlens = cu_seqlens_q.clone()

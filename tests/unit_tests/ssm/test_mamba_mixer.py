@@ -1,5 +1,7 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
+from contextlib import nullcontext
+
 import pytest
 import torch
 
@@ -9,6 +11,7 @@ from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm import mamba_mixer as mamba_mixer_module
 from megatron.core.ssm.mamba_layer import MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -125,16 +128,26 @@ class TestMambaMixer:
         assert mixer._A_neg_exp_cache.data_ptr() == cache_ptr
         assert not mixer._A_neg_exp_cache_stale
 
+    @pytest.mark.parametrize("pip_conv", [True, False], ids=["causal_conv1d", "conv_fallback"])
     @pytest.mark.parametrize("graphed", [False, True], ids=["eager", "cuda_graph"])
-    def test_single_token_sequences_match_each_token_alone(self, graphed):
+    def test_single_token_sequences_match_each_token_alone(self, graphed, pip_conv, monkeypatch):
         """In inference, packed sequences of one token each, as an MTP draft step without a
         context packs its requests, give every token the output it has as a sequence of its
-        own. They run without host syncs, so a CUDA graph captures them."""
+        own, with or without pip causal_conv1d. They run without host syncs, so a CUDA graph
+        captures them."""
+        if not pip_conv:
+            monkeypatch.setattr(mamba_mixer_module, "causal_conv1d_fn", None)
         mixer = self.get_mixer()
         num_tokens = 6
         hidden_states = torch.randn((num_tokens, 1, mixer.config.hidden_size), device="cuda")
-        packed_seq_params = PackedSeqParams.single_token_sequences(
-            num_tokens, device=hidden_states.device
+        cu_seqlens = torch.arange(num_tokens + 1, dtype=torch.int32, device="cuda")
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=1,
+            max_seqlen_kv=1,
+            seq_idx=cu_seqlens[:-1].unsqueeze(0),
         )
 
         def packed_forward():
@@ -155,6 +168,32 @@ class TestMambaMixer:
                 graph.replay()
         # Different GEMM shapes and scan tiles: fp32 rounding only.
         torch.testing.assert_close(packed, alone, rtol=0, atol=1e-3 * alone.abs().max().item())
+
+    @pytest.mark.parametrize("inference", [False, True], ids=["training", "inference"])
+    @pytest.mark.parametrize("seqlens", [[3, 5], [1, 1, 1, 1]], ids=["sequences", "single_tokens"])
+    def test_unfused_path_takes_packed_input_only_as_single_tokens_in_inference(
+        self, inference, seqlens
+    ):
+        """The unfused (non-memory-efficient) path takes packed input only as sequences of one
+        token each in inference. Packed training runs the memory-efficient path, which also
+        lays packed sequences out for context parallelism."""
+        mixer = self.get_mixer(use_mem_eff_path=False)
+        cu_seqlens = torch.tensor([0] + seqlens, dtype=torch.int32, device="cuda").cumsum(0)
+        max_seqlen = max(seqlens)
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens.int(),
+            cu_seqlens_kv=cu_seqlens.int(),
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+        )
+        hidden_states = torch.randn((sum(seqlens), 1, mixer.config.hidden_size), device="cuda")
+        with torch.no_grad(), InferenceMode.active() if inference else nullcontext():
+            if inference and max_seqlen == 1:
+                mixer(hidden_states, packed_seq_params=packed_seq_params)
+            else:
+                with pytest.raises(AssertionError, match="non-memory-efficient"):
+                    mixer(hidden_states, packed_seq_params=packed_seq_params)
 
 
 class TestMambaMixerErrorChecks:

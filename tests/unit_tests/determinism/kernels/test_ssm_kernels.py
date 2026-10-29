@@ -21,6 +21,7 @@ Each kernel is replayed in that mode, including with Triton's autotune cache ena
 import pytest
 import torch
 
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm import mamba_mixer as mamba_mixer_module
 from megatron.core.ssm.ops.common import determinism as ssm_determinism
@@ -903,33 +904,34 @@ def test_unfused_mixer_applies_the_gate_exactly_once(monkeypatch, batch_invarian
 
 
 @requires_deterministic_conv1d
-def test_packed_unfused_mixer_replays_bit_exactly(monkeypatch):
-    """The unfused path restarts the conv and the scan at packed-sequence boundaries through
-    ``seq_idx``. Forward and backward replay bitwise."""
+def test_single_token_sequences_unfused_mixer_replays_bit_exactly(monkeypatch):
+    """In inference, packed sequences of one token each (a context-free MTP draft step packs
+    its requests so) run one step each from a zero state: the conv over each token alone and
+    the chunked scan restarted at every token through ``seq_idx``. The forward replays bitwise."""
     monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
     monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
     mixer = _build_mixer()
     try:
-        mixer.use_mem_eff_path = False  # dispatch to _static_prefill
-        # As in the replay below: the gate goes into the scan, whose backward replays bitwise.
-        mixer.config.batch_invariant_mode = True
-        cu_seqlens = torch.tensor([0, 1, 300, 301, 1024], dtype=torch.int32, device="cuda")
+        num_tokens = 256
+        cu_seqlens = torch.arange(num_tokens + 1, dtype=torch.int32, device="cuda")
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
-            max_seqlen_q=723,
-            max_seqlen_kv=723,
+            max_seqlen_q=1,
+            max_seqlen_kv=1,
+            seq_idx=cu_seqlens[:-1].unsqueeze(0),
         )
-        hidden_states = torch.randn(1024, 1, mixer.config.hidden_size, device="cuda")
-        hidden_states.requires_grad_()
-        assert_module_replays_bit_exact(
-            mixer,
-            dict(hidden_states=hidden_states, packed_seq_params=packed_seq_params),
-            replays=3,
-            contention=True,
-            what="packed Mamba mixer (_static_prefill)",
-        )
+        hidden_states = torch.randn(num_tokens, 1, mixer.config.hidden_size, device="cuda")
+        with torch.no_grad(), InferenceMode.active():
+            assert_module_replays_bit_exact(
+                mixer,
+                dict(hidden_states=hidden_states, packed_seq_params=packed_seq_params),
+                replays=3,
+                backward=False,
+                contention=True,
+                what="Mamba mixer on single-token sequences (_static_prefill)",
+            )
     finally:
         Utils.destroy_model_parallel()
 

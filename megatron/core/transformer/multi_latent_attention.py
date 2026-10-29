@@ -198,11 +198,9 @@ def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_s
     """Prepare value tensor for MLA core attention THD execution."""
     orig_v_dim = value.shape[-1] if value is not None else None
     padded_v_dim = orig_v_dim
-    # Single-token sequences run as an sbhd batch, which takes V's own head dim.
     need_v_pad = (
         packed_seq_params is not None
         and packed_seq_params.qkv_format == "thd"
-        and not packed_seq_params.has_single_token_sequences()
         and parallel_attention.config.experimental_attention_variant is None
         and value is not None
         and query.shape[-1] != orig_v_dim
@@ -492,6 +490,11 @@ class MultiLatentAttention(Attention):
             self.training and self.cache_mla_latents
         ), "cache_mla_latents conflicts with training."
 
+        # Up to core attention, sequences of one token each run as one unpacked sequence.
+        tokens_as_batch = self._runs_tokens_as_batch(packed_seq_params)
+        if tokens_as_batch:
+            packed_seq_params = None
+
         # hidden_states: [sq, b, h]
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -535,6 +538,10 @@ class MultiLatentAttention(Attention):
         # Value is none during decode for absorption
         if value is not None:
             value = value.contiguous()
+
+        if tokens_as_batch:
+            # Core attention runs the tokens as a batch of length-1 sequences.
+            query, key, value = (self._swap_tokens_and_batch(x) for x in (query, key, value))
 
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
 
@@ -633,6 +640,9 @@ class MultiLatentAttention(Attention):
             core_attn_out = _trim_mla_core_attention_output(
                 core_attn_out, need_v_pad, orig_v_dim, padded_v_dim
             )
+
+        if tokens_as_batch:
+            core_attn_out = self._swap_tokens_and_batch(core_attn_out)
 
         if thd_packed_seq:
             # reshape to same output shape as unpacked case

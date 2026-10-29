@@ -158,21 +158,10 @@ class DotProductAttention(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """Forward."""
-        if packed_seq_params is not None:
-            assert packed_seq_params.has_single_token_sequences(), (
-                "DotProductAttention supports packed sequences only of a single token each. "
-                "Please use TEDotProductAttention instead."
-            )
-            # Single-token sequences [t, np, hn] are the sbhd batch [1, t, np, hn]; return the
-            # packed output layout [t, hp].
-            return self.forward(
-                query.unsqueeze(0),
-                key.unsqueeze(0),
-                value.unsqueeze(0),
-                attention_mask,
-                attn_mask_type=attn_mask_type,
-                attention_bias=attention_bias,
-            ).squeeze(0)
+        assert packed_seq_params is None, (
+            "Packed sequence is not supported by DotProductAttention."
+            "Please use TEDotProductAttention instead."
+        )
         assert attention_bias is None, "Attention bias is not supported for DotProductAttention."
 
         # ===================================

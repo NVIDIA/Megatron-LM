@@ -241,29 +241,41 @@ def test_kda_packed_matches_unpacked_cp1(two_stage_gates):
 
 @pytest.mark.internal
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.parametrize("conv", ["fla", "fallback", "pad_alignment"])
 @pytest.mark.parametrize("two_stage_gates", [False, True])
-def test_kda_single_token_sequences_in_cuda_graph(two_stage_gates):
+def test_kda_single_token_sequences_in_cuda_graph(monkeypatch, two_stage_gates, conv):
     """In inference, packed sequences of one token each, as an MTP draft step without a context
     packs its requests, run without host syncs, so a CUDA graph captures them, and give every
-    token the output it has as a sequence of its own."""
+    token the output it has as a sequence of its own. That holds with the fallback convolution
+    and with the packed-input conv padding, which single tokens do not need."""
     Utils.initialize_model_parallel(1, 1)
     try:
         model_parallel_cuda_manual_seed(321)
         kda = _build_kda(_make_config(two_stage_gates=two_stage_gates))
+        if conv == "fallback":
+            monkeypatch.setattr("megatron.core.ssm.gated_delta_net.kda.causal_conv1d", None)
         num_tokens = 6
         hidden_states = torch.randn(
             (num_tokens, 1, kda.config.hidden_size),
             device=torch.cuda.current_device(),
             dtype=torch.bfloat16,
         )
-        packed_seq_params = PackedSeqParams.single_token_sequences(
-            num_tokens, device=hidden_states.device
+        cu_seqlens = torch.arange(num_tokens + 1, dtype=torch.int32, device=hidden_states.device)
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=1,
+            max_seqlen_kv=1,
         )
 
         with torch.inference_mode(), InferenceMode.active():
             alone_output = torch.cat(
                 [kda(hidden_states[i : i + 1], None)[0] for i in range(num_tokens)]
             )
+            if conv == "pad_alignment":
+                # Applies to packed input only, so set after the unpacked reference.
+                monkeypatch.setattr(kda.config, "gdn_conv_pad_alignment", 64)
             packed_output = _replay_in_cuda_graph(
                 lambda: kda(hidden_states, None, packed_seq_params=packed_seq_params)[0]
             )

@@ -32,12 +32,14 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.gated_delta_net import HAVE_FLA_GDN2, HAVE_FLA_KDA
 from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
 from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_checkpoint
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import multi_token_prediction as mtp_module
+from megatron.core.transformer.experimental_attention_variant.dsa_layer_specs import dsa_stack_spec
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.multi_token_prediction import (
@@ -5006,8 +5008,9 @@ class TestMTPDraftStepRequestIsolation:
 
     Without an MTP draft KV plane, speculative decoding runs `compute_mtp_single_step` with no
     inference context, one row per request. Each request's draft must depend only on its own
-    inputs, at every depth, whatever the head's sequence mixers: GQA or MLA attention, Mamba or
-    Gated Delta Product. The draft step must also stay capturable in a CUDA graph.
+    inputs, at every depth, whatever the head's sequence mixers: GQA, MLA or DSA-over-GQA
+    attention, Mamba, Gated Delta Product, KDA or GDN2. The draft step must also stay
+    capturable in a CUDA graph.
     """
 
     NUM_REQUESTS = 4
@@ -5017,6 +5020,16 @@ class TestMTPDraftStepRequestIsolation:
     # The assertion fix/n7-mla-mtp-draft removes: without it, MLA with cached latents cannot
     # run a forward without an inference context, so it cannot draft at all.
     MLA_CACHED_LATENTS_ERROR = "Caching MLA latents only works with dynamic backend inference"
+    # Linear-attention dimensions for the KDA and GDN2 heads.
+    LINEAR_ATTENTION = dict(
+        activation_func=torch.nn.functional.silu,
+        normalization="RMSNorm",
+        linear_conv_kernel_dim=4,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_num_key_heads=4,
+        linear_num_value_heads=4,
+    )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -5025,7 +5038,6 @@ class TestMTPDraftStepRequestIsolation:
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
         model_parallel_cuda_manual_seed(_SEED)
         settings = dict(
-            num_layers=2 if model_type in ("mamba", "gdp") else 1,
             hidden_size=self.HIDDEN_SIZE,
             num_attention_heads=4,
             ffn_hidden_size=512,
@@ -5049,6 +5061,7 @@ class TestMTPDraftStepRequestIsolation:
                 settings["use_cpu_initialization"] = False
                 config = MLATransformerConfig(
                     **settings,
+                    num_layers=1,
                     q_lora_rank=64,
                     kv_lora_rank=64,
                     qk_head_dim=128,
@@ -5061,7 +5074,7 @@ class TestMTPDraftStepRequestIsolation:
                     cache_mla_latents=model_type == "mla_cached_latents",
                 )
             else:
-                config = TransformerConfig(**settings, num_query_groups=2)
+                config = TransformerConfig(**settings, num_layers=1, num_query_groups=2)
             layer_spec = get_gpt_layer_with_transformer_engine_spec(
                 multi_latent_attention=multi_latent_attention, qk_layernorm=multi_latent_attention
             )
@@ -5075,30 +5088,56 @@ class TestMTPDraftStepRequestIsolation:
                 ),
                 position_embedding_type="rope",
             )
-        else:
+            return model.cuda().eval()
+
+        # Each MTP depth is a recurrent layer, if any, followed by an attention layer.
+        stack_spec = hybrid_stack_spec
+        settings.update(num_query_groups=2)
+        if model_type == "mamba":
             pytest.importorskip("mamba_ssm")
-            if model_type == "gdp":
-                pytest.importorskip("fla")
-                # The mixer of each "M" layer is Gated Delta Product rather than Mamba.
-                stack_spec = gated_delta_product_stack_spec
-                settings.update(
-                    mamba_num_heads=16,
-                    mamba_head_dim=16,
-                    mamba_num_groups=4,
-                    mamba_state_dim=16,
-                    gdp_num_householder=2,
-                )
-            else:
-                stack_spec = hybrid_stack_spec
-            # Each MTP depth is a recurrent layer followed by an attention layer.
-            model = HybridModel(
-                config=TransformerConfig(**settings, num_query_groups=2),
-                hybrid_stack_spec=stack_spec,
-                vocab_size=self.VOCAB_SIZE,
-                max_sequence_length=64,
-                hybrid_layer_pattern="M*" + "/M*" * self.MTP_DEPTHS,
-                position_embedding_type="none",
+            mixer = "M"
+        elif model_type == "gdp":
+            pytest.importorskip("mamba_ssm")
+            pytest.importorskip("fla")
+            # The mixer of each "M" layer is Gated Delta Product rather than Mamba.
+            mixer, stack_spec = "M", gated_delta_product_stack_spec
+            settings.update(
+                mamba_num_heads=16,
+                mamba_head_dim=16,
+                mamba_num_groups=4,
+                mamba_state_dim=16,
+                gdp_num_householder=2,
             )
+        elif model_type == "kda":
+            if not HAVE_FLA_KDA:
+                pytest.skip("FLA with KDA support is not installed")
+            mixer = "K"
+            settings.update(self.LINEAR_ATTENTION)
+        elif model_type == "gdn2":
+            if not HAVE_FLA_GDN2:
+                pytest.skip("FLA with GDN2 support is not installed")
+            mixer = "G"
+            settings.update(self.LINEAR_ATTENTION, experimental_attention_variant="gdn2")
+        else:
+            assert model_type == "dsa_gqa", model_type
+            # Attention only: each "*" layer runs DSA over GQA.
+            mixer, stack_spec = "", dsa_stack_spec
+            settings.update(
+                num_query_groups=1,
+                add_bias_linear=False,
+                experimental_attention_variant="dsa",
+                dsa_indexer_mode="simplified",
+                dsa_indexer_topk=4,
+                dsa_kernel_backend="reference",
+            )
+        model = HybridModel(
+            config=TransformerConfig(**settings, num_layers=len(mixer) + 1),
+            hybrid_stack_spec=stack_spec,
+            vocab_size=self.VOCAB_SIZE,
+            max_sequence_length=64,
+            hybrid_layer_pattern=f"{mixer}*" + f"/{mixer}*" * self.MTP_DEPTHS,
+            position_embedding_type="none",
+        )
         return model.cuda().eval()
 
     def _inputs(self, seed):
@@ -5144,6 +5183,25 @@ class TestMTPDraftStepRequestIsolation:
             logits_per_depth.append(logits[:num_requests, 0].float())
         return logits_per_depth
 
+    def _draft_alone(self, model, hidden, tokens, monkeypatch):
+        """Draft each request alone, as the one real token of an ordinary unpacked sequence.
+
+        The reference is independent of how a batch runs single-token sequences: the draft step
+        gets no packing, so every layer takes its ordinary path, where one request (followed by
+        TP padding) cannot see another. Returns each request's drafts, as `_draft` does.
+        """
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                PackedSeqParams,
+                "single_token_sequences",
+                staticmethod(lambda *args, **kwargs: None),
+                raising=False,
+            )
+            return [
+                self._draft(model, hidden[i : i + 1], tokens[:, i : i + 1])
+                for i in range(hidden.size(0))
+            ]
+
     def _assert_last_request_unmoved(self, batched, replaced):
         last = self.NUM_REQUESTS - 1
         for depth in range(self.MTP_DEPTHS):
@@ -5156,10 +5214,14 @@ class TestMTPDraftStepRequestIsolation:
             )
 
     @pytest.mark.parametrize("tp", [1, 2])
-    @pytest.mark.parametrize("model_type", ["gpt", "mla", "mla_cached_latents", "mamba", "gdp"])
-    def test_draft_logits_do_not_depend_on_other_requests(self, model_type, tp):
+    @pytest.mark.parametrize(
+        "model_type", ["gpt", "mla", "mla_cached_latents", "mamba", "gdp", "kda", "gdn2", "dsa_gqa"]
+    )
+    def test_draft_logits_do_not_depend_on_other_requests(self, model_type, tp, monkeypatch):
         if Utils.world_size < tp:
             pytest.skip(f"TP={tp} requires at least {tp} ranks")
+        if model_type == "dsa_gqa" and tp > 1:
+            pytest.skip("DSA over GQA does not support sequence parallelism")
         model = self._build_model(model_type, tp)
         (hidden, tokens), (other_hidden, other_tokens) = self._inputs_with_others_replaced()
 
@@ -5175,28 +5237,26 @@ class TestMTPDraftStepRequestIsolation:
                 )
             # Every request but the last replaced: the last request's drafts must not move.
             replaced = self._draft(model, other_hidden, other_tokens)
-            alone = [
-                self._draft(model, hidden[i : i + 1], tokens[:, i : i + 1])
-                for i in range(self.NUM_REQUESTS)
-            ]
+            alone = self._draft_alone(model, hidden, tokens, monkeypatch)
 
         self._assert_last_request_unmoved(batched, replaced)
         for depth in range(self.MTP_DEPTHS):
-            # Batch size changes only the GEMM shapes, hence the bf16 rounding.
+            # Different GEMM shapes and kernels round bf16 differently.
             atol = 2e-2 * batched[depth].abs().max().item()
             for i in range(self.NUM_REQUESTS):
                 torch.testing.assert_close(
-                    alone[i][depth][0],
                     batched[depth][i],
+                    alone[i][depth][0],
                     rtol=0,
                     atol=atol,
                     msg=lambda m: f"depth {depth}, request {i}: batched != alone\n{m}",
                 )
 
-    @pytest.mark.parametrize("model_type", ["gpt", "mla", "mamba", "gdp"])
+    @pytest.mark.parametrize("model_type", ["gpt", "mla", "mamba", "gdp", "kda", "gdn2", "dsa_gqa"])
     def test_graphed_draft_step(self, model_type):
         """The draft steps capture into a CUDA graph, as the engine captures them, which needs
-        them to be free of host syncs. A replay drafts each request on its own."""
+        them to be free of host syncs. A replay drafts each request on its own, from the inputs
+        it is given."""
         model = self._build_model(model_type, tp=1)
         (hidden, tokens), (other_hidden, other_tokens) = self._inputs_with_others_replaced()
         static_hidden, static_tokens = hidden.clone(), tokens.clone()
@@ -5221,6 +5281,7 @@ class TestMTPDraftStepRequestIsolation:
             graph.replay()
             replaced = [logits.clone() for logits in graphed]
 
+        last = self.NUM_REQUESTS - 1
         for depth in range(self.MTP_DEPTHS):
             torch.testing.assert_close(
                 batched[depth],
@@ -5228,5 +5289,11 @@ class TestMTPDraftStepRequestIsolation:
                 rtol=0,
                 atol=2e-2 * eager[depth].abs().max().item(),
                 msg=lambda m: f"depth {depth}: the replay differs from the eager draft\n{m}",
+            )
+            # The replay read the replaced inputs: every replaced request's drafts moved.
+            moved = (replaced[depth][:last] != batched[depth][:last]).any(dim=-1)
+            assert moved.all(), (
+                f"depth {depth}: replaying with replaced inputs left the drafts of requests "
+                f"{(~moved).nonzero().flatten().tolist()} unchanged"
             )
         self._assert_last_request_unmoved(batched, replaced)

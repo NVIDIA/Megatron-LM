@@ -577,6 +577,7 @@ class DSGQACoreAttention(MegatronModule):
     ):
         """Run DSA over the grouped-query Q/K/V, returning attention output and indexer loss."""
         assert attention_bias is None, "attention_bias is not supported for DSA-GQA."
+        assert packed_seq_params is None, "Packed sequence is not supported for DSA-GQA."
         if key.size(0) != hidden_states.size(0):
             if self.config.sequence_parallel:
                 raise NotImplementedError(
@@ -586,20 +587,6 @@ class DSGQACoreAttention(MegatronModule):
                 "DSA-GQA currently supports full-sequence attention only. Decode-time "
                 "indexer caching is not implemented yet."
             )
-        if packed_seq_params is not None and packed_seq_params.has_single_token_sequences():
-            # Single-token sequences [t, np, hn] are the sbhd batch [1, t, np, hn]. Run them as
-            # one and return the packed output layout [t, hp].
-            return self.forward(
-                query.unsqueeze(0),
-                key.unsqueeze(0),
-                value.unsqueeze(0),
-                attention_mask,
-                hidden_states.transpose(0, 1),
-                use_indexer_rope=use_indexer_rope,
-                indexer_input_norm=indexer_input_norm,
-                attn_mask_type=attn_mask_type,
-            ).squeeze(0)
-        assert packed_seq_params is None, "Packed sequence is not supported for DSA-GQA."
 
         sq, b, _, _ = query.size()
         skv = key.size(0)

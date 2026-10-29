@@ -290,15 +290,17 @@ class DSv4HybridAttention(Attention):
         ), "Inference is not supported for DSv4HybridAttention."
 
         if packed_seq_params is not None and packed_seq_params.has_single_token_sequences():
-            # TP is 1, so no rank splits the tokens: single-token sequences [t, 1, h] are the sbhd
-            # batch [1, t, h] of length-1 sequences. Run them as one.
+            # Sequences of one token each, which core attention runs as a batch of length-1
+            # sequences (see _runs_tokens_as_batch). Its compression and window also read the
+            # layer input, which no rank splits, since DSv4 runs at TP 1: run the whole layer on
+            # that batch.
             output, bias = self.forward(
-                hidden_states.transpose(0, 1),
+                self._swap_tokens_and_batch(hidden_states),
                 attention_mask,
                 key_value_states=key_value_states,
                 position_ids=position_ids,
             )
-            return output.transpose(0, 1), bias
+            return self._swap_tokens_and_batch(output), bias
 
         cp_group = self.pg_collection.cp
         cp_size = cp_group.size()
