@@ -2398,8 +2398,9 @@ class MultiTokenPredictionBlock(MegatronModule):
         if pg_collection is None:
             warn_global_process_group_fallback(type(self).__name__)
             # hcp feeds TEDotProductAttention's a2a+p2p path in the MTP layers. tp_cp and tp_dp_cp
-            # are the FP8/FP4 amax reduction groups of the MTP layers.
-            required_pgs = ['cp', 'hcp', 'tp', 'pp', 'tp_cp', 'tp_dp_cp'] + (
+            # are the FP8/FP4 amax reduction groups of the MTP layers, and gtp_remat the GTP
+            # weight-remat group of their linear layers, which would otherwise warn again.
+            required_pgs = ['cp', 'hcp', 'tp', 'pp', 'tp_cp', 'tp_dp_cp', 'gtp_remat'] + (
                 ['dp'] if self.config.mtp_hsm else []
             )
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
