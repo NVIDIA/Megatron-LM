@@ -19,6 +19,7 @@ import torch
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.hybrid.hybrid_layer_specs import gdp_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm import causal_conv1d, gated_delta_product
 from megatron.core.ssm.gated_delta_product import (
     HAVE_CUTEDSL_GDP,
     HAVE_CUTEDSL_GDP_CP,
@@ -297,6 +298,74 @@ def test_in_proj_recompute_preserves_norm_gate_view(
         )
         _assert_replay_matches(baseline_result, recomputed_result)
         norm_hook.remove()
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not HAVE_GDP_DEPS, reason="requires mamba-ssm, einops, causal-conv1d and FLA")
+@pytest.mark.parametrize("num_householder", [2, 3])
+@pytest.mark.parametrize("cp_size", [1, 2])
+def test_conv_reads_vkq_at_any_projection_width(monkeypatch, num_householder, cp_size):
+    """The causal conv must run whatever the in_proj width, and copy VKQ only when it must.
+
+    VKQ is a slice of the fused in_proj output, so its channels-last conv view has the
+    projection width as its token stride, and causal_conv1d requires a multiple of 8. Four
+    heads give a width of 516 * (num_householder + 1): 2064 with three reflections, read in
+    place, and 1548 with two, which has to be copied first. Either way the mixer must match,
+    bit for bit, a mixer whose conv always reads a dense copy.
+    """
+    if Utils.world_size < cp_size:
+        pytest.skip(f"requires at least {cp_size} distributed ranks")
+    if cp_size > 1:
+        if not is_causal_conv1d_min_version("1.7.0"):
+            pytest.skip("chunkwise CP requires causal-conv1d >= 1.7.0")
+        if not (HAVE_FLA_GDP_CP if HAVE_FLA else HAVE_CUTEDSL_GDP_CP):
+            pytest.skip("the selected GDP backend does not support chunkwise CP")
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp_size)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        config = _make_config([])
+        config.gdp_num_householder = num_householder
+        config.gdp_cutedsl_kernel = not HAVE_FLA
+        if cp_size > 1:
+            config.context_parallel_size = cp_size
+            config.linear_cp_mode = "chunkwise"
+            config.linear_cp_layout = "contiguous"
+        dense = _build_mixer(config)
+        mixer = _build_mixer(config, state_dict=dense.state_dict())
+        aligned = mixer.in_proj.weight.shape[0] % 8 == 0
+        assert aligned == (num_householder == 3)
+
+        dense_prepare_qkv = dense._prepare_qkv
+        monkeypatch.setattr(
+            dense, "_prepare_qkv", lambda x, **kwargs: dense_prepare_qkv(x.contiguous(), **kwargs)
+        )
+
+        hidden_states = torch.randn((256, 1, HIDDEN_SIZE), dtype=torch.bfloat16, device="cuda")
+        grads = torch.randn_like(hidden_states)
+        expected = _run(dense, hidden_states, grads)
+
+        # Record the storage of VKQ and of the tensor the conv kernel reads.
+        vkq_storages, conv_storages = [], []
+        prepare_qkv = mixer._prepare_qkv
+
+        def tracked_prepare_qkv(x, **kwargs):
+            vkq_storages.append(x.untyped_storage().data_ptr())
+            return prepare_qkv(x, **kwargs)
+
+        def tracked_causal_conv1d_fn(x, **kwargs):
+            conv_storages.append(x.untyped_storage().data_ptr())
+            return causal_conv1d_fn(x=x, **kwargs)
+
+        monkeypatch.setattr(mixer, "_prepare_qkv", tracked_prepare_qkv)
+        for module in (gated_delta_product, causal_conv1d):
+            monkeypatch.setattr(module, "causal_conv1d_fn", tracked_causal_conv1d_fn)
+
+        actual = _run(mixer, hidden_states, grads)
+        assert len(vkq_storages) == len(conv_storages) == 1
+        assert (conv_storages[0] == vkq_storages[0]) == aligned
+        _assert_replay_matches(expected, actual)
     finally:
         Utils.destroy_model_parallel()
 

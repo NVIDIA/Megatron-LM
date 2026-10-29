@@ -879,6 +879,16 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         every caller whose kernel normalizes internally must set, such as the CuTeDSL
         path (``use_qk_l2norm_in_kernel``).
         """
+        # Both conv paths below read ``x`` through its channels-last [B, D, L] transpose.
+        # causal_conv1d loads 8-element vectors along the channels, so the slice's offset
+        # and its batch and token strides must all be multiples of 8 elements. ``x`` is a
+        # view into ``zVKQba``, whose token stride is the full local projection width; that
+        # width is not a multiple of 8 when ``nheads_local_cp * (num_householder + 1)`` is
+        # not, so copy VKQ out in that case. ``clone`` rather than ``contiguous``: the
+        # latter keeps the stride of a size-1 batch or token dimension.
+        if x.storage_offset() % 8 or x.stride(0) % 8 or x.stride(1) % 8:
+            x = x.clone(memory_format=torch.contiguous_format)
+
         if self.chunkwise_context_parallel:
             assert (
                 conv_state is None
@@ -894,9 +904,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         else:
             assert self.cp is not None
             # ``causal_conv1d_fn`` expects a ``[B, D, L]`` tensor in channels-last memory,
-            # which is also what it requires when ``seq_idx`` is set. ``x`` is a view into
-            # the channels-last ``zVKQba``, so the transpose alone already gives
-            # stride(1) == 1 and no copy is needed on either path.
+            # which is also what it requires when ``seq_idx`` is set. ``x`` is channels-last
+            # (a view into ``zVKQba`` or the copy above), so the transpose alone already
+            # gives stride(1) == 1 and no further copy is needed on either path.
             x = rearrange(x, "b l d -> b d l")
             if conv_state is not None:
                 # Static-batching prefill: seed the conv state from the prompt's tail.
