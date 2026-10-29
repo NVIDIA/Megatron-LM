@@ -2,7 +2,7 @@
 
 import logging
 from contextlib import nullcontext
-from typing import Literal, Optional, Sequence
+from typing import Any, Callable, Literal, Optional, Sequence
 
 import torch
 from torch import Tensor
@@ -647,6 +647,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             delta_offload_bytes_across_pp_ranks=self.config.delta_offload_bytes_across_pp_ranks,
             activation_offload_fraction=self.config.activation_offload_fraction,
             max_inflight_offloads=self.config.fine_grained_offloading_max_inflight_offloads,
+            buffer_size_gib=self.config.fine_grained_offloading_buffer_size_gib,
         )
         if self.disable_param_offloading:
             for param in self.decoder.parameters():
@@ -718,7 +719,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         padding_mask: Optional[Tensor] = None,
         compute_mtp_loss: bool = True,
         cp_batch: ContextParallelBatch | None = None,
-    ) -> Tensor:
+        output_processor: Optional[Callable[..., Any]] = None,
+        output_processor_context: Optional[Any] = None,
+    ) -> Any:
         """Forward function of the Hybrid model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
         processing layer (optional).
@@ -732,6 +735,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 ``labels`` still determine whether the model returns loss or logits.
                 Defaults to True.
             cp_batch: Input tensors and packed metadata keyed by CP layout.
+            output_processor (Callable, optional): Caller-provided post-decoder hook. When set,
+                it receives the decoder output and output-layer/loss helpers, and its return
+                value is returned directly. The default output projection, logits/loss
+                computation, and inference postprocessing are skipped.
+            output_processor_context (Any, optional): Opaque caller-owned context passed to
+                ``output_processor`` as ``context``.
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -1013,6 +1022,26 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     ),
                     main_hidden_states=hidden_states,
                 )
+        # Give callers a post-decoder hook before the default output projection and loss path.
+        if output_processor is not None:
+            return output_processor(
+                hidden_states=hidden_states,
+                output_layer=self.output_layer,
+                output_weight=output_weight,
+                labels=labels,
+                loss_mask=loss_mask,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                decoder_input=decoder_input,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+                runtime_gather_output=runtime_gather_output,
+                context=output_processor_context,
+                compute_language_model_loss=self.compute_language_model_loss,
+                scale_logits=self._scale_logits,
+                config=self.config,
+            )
         sequence_parallel_override = False
         if (
             in_inference_mode

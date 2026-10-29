@@ -5,6 +5,7 @@ from collections.abc import Callable, Sequence
 from torch import Tensor
 
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
+from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
@@ -22,6 +23,7 @@ class Symbols:
 
     MAMBA = "M"
     GDN = 'G'
+    KDA = 'K'
     ATTENTION = "*"
     DS_ATTENTION = "D"
     CSA = "C"  # DSv4 Compressed Sparse Attention (compress_ratio=4)
@@ -35,6 +37,7 @@ class Symbols:
     LAYER_CONFIG_MAP = {
         MAMBA: MambaLayerConfig,
         GDN: GDNLayerConfig,
+        KDA: KDALayerConfig,
         ATTENTION: AttentionLayerConfig,
         DS_ATTENTION: DSALayerConfig,
         CSA: CSALayerConfig,
