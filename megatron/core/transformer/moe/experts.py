@@ -1471,6 +1471,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # The value pass's kernel weights, kept until the parameters may have moved:
         # MegatronModule.set_is_first_microbatch drops them at the first microbatch of
         # every forward-backward call, when TE refreshes its quantized weights.
+        # MegatronModule.release_match_generation_weights frees them earlier.
         self._match_generation_weights = None
         if self._match_generation_forward:
             self.register_load_state_dict_post_hook(

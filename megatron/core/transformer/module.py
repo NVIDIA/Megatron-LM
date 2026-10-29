@@ -163,6 +163,15 @@ class MegatronModule(torch.nn.Module):
                         self.modules_with_is_first_microbatch.append(m)
             for m in self.modules_with_is_first_microbatch:
                 m.is_first_microbatch = True
+        self.release_match_generation_weights()
+
+    def release_match_generation_weights(self):
+        """Drops the MoE value pass's cached kernel weights (moe_match_generation_forward).
+
+        set_is_first_microbatch calls this. A caller that needs the memory between
+        forward-backward calls, for example for colocated generation, can call it after
+        a call; the next value pass rebuilds the weights from the parameters.
+        """
         if getattr(self.config, "moe_match_generation_forward", False):
             if not hasattr(self, "modules_with_match_generation_weights"):
                 self.modules_with_match_generation_weights = [
