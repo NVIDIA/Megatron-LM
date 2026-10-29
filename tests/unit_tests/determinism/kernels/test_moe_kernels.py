@@ -35,7 +35,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.moe import moe_utils
+from megatron.core.transformer.moe import batch_invariant, moe_utils
 from megatron.core.transformer.moe.experts import (
     SequentialMLP,
     TEGroupedMLP,
@@ -1626,3 +1626,39 @@ class TestMoEModules:
         counts = outputs["out[2]"]
         assert int(counts.sum()) == config.moe_router_topk * int(module.multiplicities.sum())
         assert layer._shared_prefix_token_multiplicities is None
+
+
+@pytest.mark.parametrize("collective", ["ordered", "multimem"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_batch_invariant_unpermute_replays(monkeypatch, collective, dtype):
+    """The fused batch-invariant unpermute (``probs=None``) and its backward replay bit-exactly."""
+    if not batch_invariant.HAVE_TRITON:
+        pytest.skip("requires Triton")
+    seeded()
+    monkeypatch.setattr(batch_invariant, "get_batch_invariant_collective", lambda: collective)
+    monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: 2)
+    num_tokens, hidden = 4096, 520
+    rows = torch.randn(2 * num_tokens, hidden, device="cuda", dtype=dtype, requires_grad=True)
+    # Two experts on two EP ranks, one slot each: every token sums one row per rank.
+    inverse_map = torch.stack(
+        (
+            torch.arange(2 * num_tokens, device="cuda").view(2, num_tokens).T,
+            torch.tensor([0, 1], device="cuda").expand(num_tokens, 2),
+        )
+    )
+    grad = torch.randn(num_tokens, hidden, device="cuda", dtype=dtype)
+    grad.view(-1)[::7] = -0.0
+
+    def combine(x):
+        return batch_invariant.unpermute(
+            x, torch.Size((num_tokens, hidden)), probs=None, num_experts=2, inverse_map=inverse_map
+        )
+
+    assert_replays_bit_exact(
+        combine,
+        (rows,),
+        replays=3,
+        contention=True,
+        grad_outputs={"out": grad},
+        what=f"batch-invariant unpermute[{collective=}, {dtype=}]",
+    )
