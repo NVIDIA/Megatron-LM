@@ -909,6 +909,19 @@ def _get_megatron_emerging_optimizer(
             "then forces ddp_config.use_distributed_optimizer=True regardless of the "
             "layout flag)."
         )
+    # The precision-aware flag reaches the scalar (Adam) DistributedOptimizer below. The emerging
+    # optimizer keeps FP32 main params and reads ``.grad``, so it and its LayerWise / Float16
+    # wrappers get a config with the flag off.
+    emerging_config = config
+    if config.use_precision_aware_optimizer:
+        if not use_separate_distributed_optimizer:
+            raise ValueError(
+                "--use-precision-aware-optimizer with an emerging optimizer requires the "
+                "layer-wise path with a separate DistributedOptimizer for the scalar params "
+                "(--optimizer muon --use-distributed-optimizer)."
+            )
+        emerging_config = config.without_precision_aware_optimizer()
+
     if use_separate_distributed_optimizer and any(
         # A separate DistributedOptimizer with byte-level sharding handles any group
         # whose optimizer is not the primary emerging optimizer (stored in ``eopt_name``,
@@ -963,17 +976,17 @@ def _get_megatron_emerging_optimizer(
         # in ``_EMERGING_OPTIMIZERS`` (e.g., Lion) fall through to the standard fallback path.
         if opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS:
             optimizer, init_state_fn = _create_emerging_optimizer(
-                config, groups, eopt_name, model_chunks, pg_collection
+                emerging_config, groups, eopt_name, model_chunks, pg_collection
             )
             if use_layer_wise:
                 layer_wise_base_results.append((optimizer, init_state_fn))
                 continue
-            if config.bf16:
+            if emerging_config.bf16:
                 optimizer = Float16OptimizerWithFloat16Params(
-                    optimizer, config, None, init_state_fn
+                    optimizer, emerging_config, None, init_state_fn
                 )
             else:
-                optimizer = FP32Optimizer(optimizer, config, init_state_fn)
+                optimizer = FP32Optimizer(optimizer, emerging_config, init_state_fn)
             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
             tp_group = pg_collection.tp
             expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
@@ -1042,8 +1055,9 @@ def _get_megatron_emerging_optimizer(
                         skip_megatron_wrapping=False,
                     )
                     # TODO(deyuf): ChainedOptimizer currently asserts all sub-optimizers
-                    # share the same config. Reset to the top-level config so the
-                    # assertion holds when DistOpt+LayerWise are chained.
+                    # share the same config (up to the precision-aware fields). Reset to the
+                    # top-level config so the assertion holds when DistOpt+LayerWise are
+                    # chained; it keeps the precision-aware flag that LayerWise drops.
                     if hasattr(result, 'config'):
                         result.config = config
                     results.append(result)
@@ -1078,7 +1092,7 @@ def _get_megatron_emerging_optimizer(
             base_optimizers, init_fns = zip(*layer_wise_base_results)
         layer_wise_optimizer = LayerWiseDistributedOptimizer(
             list(base_optimizers),
-            config,
+            emerging_config,
             pg_collection,
             init_state_fn_list=list(init_fns),
             model_chunks=model_chunks,

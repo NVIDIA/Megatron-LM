@@ -1503,6 +1503,15 @@ class ProxyDict:
                 yield (idx, inner_key), value
 
 
+def _same_config_up_to_precision_aware(
+    config: Optional[OptimizerConfig], other: Optional[OptimizerConfig]
+) -> bool:
+    """Whether two optimizer configs are equal apart from the precision-aware optimizer fields."""
+    if config is None or other is None:
+        return config is other
+    return config.without_precision_aware_optimizer() == other.without_precision_aware_optimizer()
+
+
 class ChainedOptimizer(MegatronOptimizer):
     """ChainedOptimizer is designed for a collection of optimizers.
 
@@ -1524,7 +1533,12 @@ class ChainedOptimizer(MegatronOptimizer):
                     for model_chunk in optimizer.model_chunks:
                         if model_chunk not in self.model_chunks:
                             self.model_chunks.append(model_chunk)
-                assert self.config == getattr(optimizer, 'config', None)
+                # Children may differ in the precision-aware fields only: a Muon chain pairs
+                # a precision-aware scalar Adam with a plain FP32 LayerWise optimizer. Those
+                # fields are read per child (``optimizer.config``), never from the chain's.
+                assert _same_config_up_to_precision_aware(
+                    self.config, getattr(optimizer, 'config', None)
+                )
             # If all optimizers are stub optimizers, the ChainedOptimizer is also a stub optimizer
             self.is_stub_optimizer = all(
                 getattr(optimizer, 'is_stub_optimizer', False) for optimizer in chained_optimizers
@@ -1892,7 +1906,18 @@ class ChainedOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def count_zeros(self):
-        if self.grads_states_parallel_group_is_shared():
+        # One fused count needs one grad source (``.grad`` vs ``.decoupled_grad``); a chain that
+        # mixes precision-aware and plain children counts per child instead.
+        uniform_grad_source = (
+            len(
+                {
+                    optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+                    for optimizer in self.chained_optimizers
+                }
+            )
+            <= 1
+        )
+        if self.grads_states_parallel_group_is_shared() and uniform_grad_source:
             params = []
             for optimizer in self.chained_optimizers:
                 params += optimizer.get_parameters()
