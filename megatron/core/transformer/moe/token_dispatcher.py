@@ -919,6 +919,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         if self.shared_experts is not None:
             shared_expert_output = self.shared_experts.get_output()
             output += shared_expert_output
+        # combine_preprocess is the last consumer of router probs. Retaining them
+        # here pins the recomputed MoE forward graph until the next iteration.
+        self.probs = None
         return output
 
     def _maybe_update_cuda_sync_point(self, point: str):
@@ -2037,7 +2040,9 @@ class _NCCLEPManager(_DispatchManager):
             topk_idx,
             topk_weights,
             recv_tokens=_NCCLEPManager._zc_fwd_token_buf if self._zc_quant else None,
-            recv_topk_weights=_NCCLEPManager._zc_recv_topk_weights_buf,
+            recv_topk_weights=(
+                _NCCLEPManager._zc_recv_topk_weights_buf if self._zc_quant else None
+            ),
         )
         self.tokens_per_expert = tokens_per_expert.to(torch.int64)
         if not self.eager:

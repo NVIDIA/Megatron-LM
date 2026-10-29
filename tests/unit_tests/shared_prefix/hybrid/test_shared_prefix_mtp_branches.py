@@ -240,6 +240,25 @@ class TestSharedPrefixMTPModel:
             input_ids, None, None, loss_mask=loss_mask, shared_prefix_layout=layout, **kwargs
         )
 
+    def test_shared_prefix_forward_rejects_output_processor(self):
+        """The post-decoder hook would see the shared-prefix token layout, not dense rows."""
+        model = self._model()
+        layout = _star(16, (9, 23))
+        input_ids, loss_mask = self._inputs(layout)
+        with patch(
+            "megatron.core.models.hybrid.shared_prefix.forward_hybrid_stack_shared_prefix",
+            side_effect=_ReachedBackbone,
+        ):
+            with pytest.raises(NotImplementedError, match="output_processor"):
+                model(
+                    input_ids,
+                    None,
+                    None,
+                    loss_mask=loss_mask,
+                    shared_prefix_layout=layout,
+                    output_processor=lambda **kwargs: None,
+                )
+
     @pytest.mark.parametrize("ignored_input", ["mtp_input_mask", "decoder_input"])
     def test_training_mtp_rejects_inputs_it_would_ignore(self, ignored_input):
         model = self._model()
