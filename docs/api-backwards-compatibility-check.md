@@ -161,7 +161,9 @@ Bootstrap, teardown and the registry are not deprecated: `initialize_model_paral
   function outside `parallel_state.py` and `process_groups_config.py`: the group, rank and size
   accessors, the stage predicates, the rank and size overrides, the virtual-pipeline getters and
   setters, `get_all_ranks()`, the dynamic context-parallel group maps, the memory-buffer
-  aliases and `use_mpu_process_groups()`. A new call of any of them fails the check. Its
+  aliases and `use_mpu_process_groups()`. It also counts `get_registered_process_groups()`,
+  which is not deprecated but returns the same global groups: Megatron Core takes its groups
+  from its caller. A new call of any of them fails the check. Its
   allowlist of the existing calls records which ones are warned: preceded, in the same function,
   by a `warn_global_process_group_fallback()` call in their block or in a block that contains
   it, or inside a `with global_process_group_fallback(...)` block. A warned call that loses its

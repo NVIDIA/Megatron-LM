@@ -21,7 +21,10 @@ Each entry has one of four kinds:
 * ``function``: another deprecated ``parallel_state`` function: a pipeline-stage predicate, the
   virtual-pipeline rank or size, ``get_all_ranks``, a rank or size override, a dynamic
   context-parallel group map, or a memory-buffer alias;
-* ``shim``: ``ProcessGroupCollection.use_mpu_process_groups()``, which reads the same globals;
+* ``shim``: a collection of the global grid: ``ProcessGroupCollection.use_mpu_process_groups()``,
+  which reads the same globals, or ``parallel_state.get_registered_process_groups()``, which
+  returns the collection registered for the run. The registry is not deprecated, but Megatron
+  Core takes its groups from the caller;
 * ``guarded``: ``resolve_process_groups()``, the warned fallback in ``process_groups_config.py``.
   It reads the globals only when the caller omits its groups, and warns first.
 
@@ -68,15 +71,21 @@ DEPRECATED_PREFIXES = ("get_",)
 # get_expert_data_parallel_group_gloo), which also return groups of the global grid.
 DEPRECATED_SUFFIXES = ("_group", "_groups", "_gloo", "_rank", "_ranks", "_world_size", "_src_rank")
 # get_ functions that are not accessors, whether or not the suffixes above match them:
-# get_nccl_options is not deprecated, and the others are counted with DEPRECATED_FUNCTIONS. The
-# test helpers that forbid the global grid stub the accessors only and expect these to keep working.
+# get_nccl_options is not deprecated, get_registered_process_groups is the registry that replaces
+# the accessors outside Megatron Core (REGISTRY_GETTERS), and the others are counted with
+# DEPRECATED_FUNCTIONS.
 NOT_ACCESSORS = {
     "get_nccl_options",
+    "get_registered_process_groups",
     "get_all_ranks",
     "get_global_memory_buffer",
     "get_virtual_pipeline_model_parallel_rank",
     "get_virtual_pipeline_model_parallel_world_size",
 }
+# Registry getters: not deprecated, but they return the groups of the global grid that the run
+# registered, so a core call counts as a shim. The test helpers that forbid the global grid stub
+# them with the accessors (_returns_global_groups).
+REGISTRY_GETTERS = {"get_registered_process_groups"}
 # The other deprecated functions of the global grid. A call of a setter writes the grid rather
 # than reads it, and counts the same way.
 DEPRECATED_FUNCTIONS = {
@@ -126,6 +135,12 @@ def _is_deprecated_accessor(name: str) -> bool:
     if name in NOT_ACCESSORS:
         return False
     return name.startswith(DEPRECATED_PREFIXES) and name.endswith(DEPRECATED_SUFFIXES)
+
+
+def _returns_global_groups(name: str) -> bool:
+    """True for a parallel_state accessor or registry getter: the functions that return groups of
+    the global grid, which the test helpers that forbid the global grid stub."""
+    return _is_deprecated_accessor(name) or name in REGISTRY_GETTERS
 
 
 def _qualified_name(node):
@@ -340,6 +355,8 @@ def _violations_in(path: pathlib.Path):
                     identity = f"accessor:parallel_state.{accessor}"
                 elif accessor in DEPRECATED_FUNCTIONS:
                     identity = f"function:parallel_state.{accessor}"
+                elif accessor in REGISTRY_GETTERS:
+                    identity = f"shim:parallel_state.{accessor}"
             elif name == (
                 "megatron.core.process_groups_config.ProcessGroupCollection.use_mpu_process_groups"
             ):
@@ -516,8 +533,9 @@ def main(argv=None) -> int:
                 "for the memory buffer."
             )
         print(
-            "Note that ProcessGroupCollection.use_mpu_process_groups() is NOT a valid "
-            "replacement -- it reads the same global state.\n"
+            "Note that neither ProcessGroupCollection.use_mpu_process_groups() nor "
+            "parallel_state.get_registered_process_groups() is a valid replacement -- they "
+            "return the same global groups.\n"
             "resolve_process_groups() is counted too: it may only replace a read in the same "
             "function, for callers that do not pass their groups yet.\n"
             "See https://github.com/NVIDIA/Megatron-LM/issues/6307\n"
