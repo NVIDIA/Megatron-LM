@@ -12,11 +12,12 @@ import torch
 
 from megatron.core import parallel_state
 
-# Removal follows the N+2 policy in docs/api-backwards-compatibility-check.md. These are the
-# defaults for fallbacks deprecated in 0.20; a fallback that starts to warn in a later release
-# passes its own versions to warn_global_process_group_fallback or resolve_process_groups.
-_FALLBACK_DEPRECATED_IN = "0.20"
-_FALLBACK_REMOVED_IN = "0.22"
+# The fallbacks first warn in Megatron Core 0.21, so the N+2 policy in
+# docs/api-backwards-compatibility-check.md removes them in 0.23. These are the defaults; a
+# fallback that starts to warn in a later release passes its own versions to
+# warn_global_process_group_fallback or resolve_process_groups.
+_FALLBACK_DEPRECATED_IN = "0.21"
+_FALLBACK_REMOVED_IN = "0.23"
 
 # The fallback is reached through subclass constructors, build_module, nn.Module calls and
 # autograd functions, so no fixed stacklevel finds the caller. Skipping Megatron Core and torch

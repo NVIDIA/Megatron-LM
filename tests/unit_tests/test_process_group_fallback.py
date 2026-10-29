@@ -64,8 +64,7 @@ def test_fallback_warning_is_emitted_once_per_owner():
     with pytest.warns(FutureWarning) as record:
         warn_global_process_group_fallback("Owner", "cp_group")
     message = str(_fallback_warning(record, "Owner", "cp_group").message)
-    assert f"since Megatron Core {process_groups_config._FALLBACK_DEPRECATED_IN}" in message
-    assert f"removed in {process_groups_config._FALLBACK_REMOVED_IN}" in message
+    assert "deprecated since Megatron Core 0.21 and will be removed in 0.23" in message
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         warn_global_process_group_fallback("Owner", "cp_group")
