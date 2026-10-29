@@ -1465,6 +1465,16 @@ class MegatronFSDP(torch.nn.Module):
         # Reset the microbatch count to zero after the gradient sync is complete.
         self.microbatch_count = 0
 
+    def distributed_named_parameters(self) -> List[Tuple[str, torch.nn.Parameter]]:
+        """Return the module's parameter names with their distributed (DTensor) parameters.
+
+        Unlike `synchronize_param_gather` followed by `named_parameters`, this neither waits
+        for nor releases in-flight parameter all-gathers, and it does not swap the module's
+        parameters, so it can be called between the optimizer step and the next forward.
+        """
+        fsdp_params = dict(self.param_and_grad_buffer.optimizer_named_parameters)
+        return [(name, fsdp_params[name]) for name, _ in self.module.named_parameters()]
+
     def _replace_param_with_distributed_if_needed(self):
         if self.is_param_fsdp_distributed:
             return
