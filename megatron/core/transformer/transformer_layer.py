@@ -60,7 +60,10 @@ from megatron.core.utils import (
 
 if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
-    from megatron.core.tensor_parallel.inference_layers import FusedTPHandoff
+    from megatron.core.tensor_parallel.inference_layers import (
+        FusedTPHandoff,
+        InferenceLayerNormColumnParallelLinear,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -1676,12 +1679,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             qkv_fused_tp_handoff (Optional[FusedTPHandoff]): Previous layer's MLP FC2
                 handoff, which records whether it applied linear_qkv's norm and all-gather.
             fc2_next_layer_norm_weights (Optional[Tensor]): Next layer's QKV norm weights
-                for current layer's MLP FC2.
+                for current layer's MLP FC2, or None if nothing after FC2 can take its
+                input from the fused kernel (last layer, or a next layer without a fusable
+                linear_qkv, such as MLA). FC2 then reduce-scatters and adds the residual.
         """
-        # Only a linear_qkv that applies the input norm can take it over from the previous
-        # layer's FC2. Otherwise (e.g. MLA) get_qkv_layer_norm_weights gives that FC2 no
-        # weights and this layer applies its own input norm.
-        linear_qkv = self._get_layer_norm_linear_qkv()
+        # Only a fusable linear_qkv can take its input norm and all-gather over from the
+        # previous layer's FC2. Otherwise (e.g. MLA) get_qkv_layer_norm_weights gives that
+        # FC2 no weights and this layer applies its own input norm.
+        linear_qkv = self._get_fusable_linear_qkv()
         if linear_qkv is not None:
             linear_qkv.fused_tp_handoff = qkv_fused_tp_handoff
 
@@ -1715,11 +1720,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         self.self_attention.linear_proj._set_next_layer_norm_weights(weights)
 
     def _set_fc2_next_layer_norm_weights(self, weights: Optional[Tensor]):
-        """Set next layer norm weights for MLP FC2."""
-        if weights is None:
-            # Create dummy tensor for the last layer, or when the next layer applies its own
-            # input norm (same shape as fc1 norm weights)
-            weights = torch.empty_like(self.get_mlp_layer_norm_weights())
+        """Set next layer norm weights for MLP FC2 (None: reduce-scatter and residual add)."""
         self.mlp.linear_fc2._set_next_layer_norm_weights(weights)
 
     def _set_proj_residual(self, residual: Tensor):
@@ -1744,25 +1745,34 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         Get the QKV layer norm weights.
 
         Returns:
-            Optional[Tensor]: The layer norm weight data, or None if the attention input
-                norm is not applied by linear_qkv (see _get_layer_norm_linear_qkv).
+            Optional[Tensor]: The layer norm weight data, or None if the previous layer's
+                FC2 cannot apply this layer's input norm (see _get_fusable_linear_qkv).
         """
-        linear_qkv = self._get_layer_norm_linear_qkv()
+        linear_qkv = self._get_fusable_linear_qkv()
         return linear_qkv.layer_norm_weight.data if linear_qkv is not None else None
 
-    def _get_layer_norm_linear_qkv(self) -> Optional[torch.nn.Module]:
+    def _get_fusable_linear_qkv(self) -> Optional[InferenceLayerNormColumnParallelLinear]:
         """
-        Get the attention's linear_qkv if it applies the input norm itself. Only that norm,
-        with the all-gather after it, can be fused into the previous layer's FC2.
+        Get the attention's linear_qkv if the previous layer's FC2 can fuse its input norm
+        and all-gather. That holds only for an InferenceLayerNormColumnParallelLinear: in
+        inference it applies the same RMSNorm (layer_norm_weight, layernorm_epsilon) as the
+        fused kernel, and reads its input from symmetric memory when its fused_tp_handoff
+        says the kernel ran.
 
-        MLA has no linear_qkv: its input_layernorm is a separate module, and its down
-        projections take the normalized sequence-parallel shard, not the all-gathered input.
+        Other attention inputs apply their own norm. For example, MLA has no linear_qkv: its
+        input_layernorm is a separate module, and its down projections take the normalized
+        sequence-parallel shard, not the all-gathered input.
 
         Returns:
-            Optional[torch.nn.Module]: linear_qkv, or None.
+            Optional[InferenceLayerNormColumnParallelLinear]: linear_qkv, or None.
         """
+        # Import here to avoid a circular import.
+        from megatron.core.tensor_parallel import inference_layers
+
         linear_qkv = getattr(self.self_attention, "linear_qkv", None)
-        return linear_qkv if hasattr(linear_qkv, "layer_norm_weight") else None
+        if isinstance(linear_qkv, inference_layers.InferenceLayerNormColumnParallelLinear):
+            return linear_qkv
+        return None
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """

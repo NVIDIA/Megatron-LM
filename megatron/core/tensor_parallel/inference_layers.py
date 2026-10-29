@@ -549,9 +549,10 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             x, _ = reduce_scatter_along_first_dim(x, tp_group=self.tp_group)
         return x
 
-    def _set_next_layer_norm_weights(self, weights: torch.Tensor):
+    def _set_next_layer_norm_weights(self, weights: Optional[torch.Tensor]):
         """
         Set next layer norm weights for fused reduce-scatter + add + rms-norm + all-gather.
+        None when no next layer takes its input from the fused all-gather.
         """
         self.next_layer_norm_weights = weights
 

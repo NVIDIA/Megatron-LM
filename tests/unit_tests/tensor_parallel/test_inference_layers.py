@@ -224,9 +224,10 @@ class TestFusedTPCommunication:
             ("tp2_nccl", False, 0, 2 * _NUM_LAYERS),
             # NCCL reduce-scatter because batch-invariant mode forces it.
             ("tp2_nvls", True, 0, 2 * _NUM_LAYERS),
-            # The fused kernel runs in every linear_proj / linear_fc2 and leaves the next
-            # layer's input in symmetric memory; only layer 0's linear_qkv applies its norm.
-            ("tp2_nvls", False, 2 * _NUM_LAYERS, 1),
+            # The fused kernel runs in every linear_proj and in each linear_fc2 but the last
+            # layer's, which no next layer reads, and leaves the next layer's input in
+            # symmetric memory; only layer 0's linear_qkv applies its norm.
+            ("tp2_nvls", False, 2 * _NUM_LAYERS - 1, 1),
         ],
         ids=["tp1", "tp2_nccl", "tp2_batch_invariant", "tp2_nvls"],
     )
