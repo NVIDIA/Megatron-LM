@@ -8,6 +8,7 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.context_parallel.utils import ContextParallelBatch
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
@@ -26,6 +27,7 @@ from megatron.core.transformer.multi_token_prediction import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.utils import WrappedTensor
 
 
 class RecordingTransformerLayer(TransformerLayer):
@@ -124,7 +126,8 @@ class RecordingDecoder:
 
     def __call__(self, **kwargs):
         self.kwargs = kwargs
-        return kwargs['hidden_states']
+        hidden_states = kwargs['hidden_states']
+        return hidden_states.unwrap() if isinstance(hidden_states, WrappedTensor) else hidden_states
 
 
 class RecordingMoE(torch.nn.Module):
@@ -317,6 +320,8 @@ def test_hybrid_model_passes_ids_to_decoder_only_for_hash_routing(
         mtp_process=False,
         vocab_size=128,
     )
+    model._preprocess = HybridModel._preprocess.__get__(model)
+    model._postprocess = HybridModel._postprocess.__get__(model)
     input_ids = torch.arange(8).reshape(2, 4)
     hidden_states = torch.randn(4, 2, 8)
 
@@ -335,7 +340,10 @@ def test_hybrid_model_passes_ids_to_decoder_only_for_hash_routing(
 
 
 @pytest.mark.parametrize("pre_process", [True, False])
-def test_hybrid_model_sequence_shards_hash_ids_with_decoder_input(monkeypatch, pre_process):
+@pytest.mark.parametrize("inference", [False, True])
+def test_hybrid_model_sequence_shards_hash_ids_with_decoder_input(
+    monkeypatch, pre_process, inference
+):
     decoder = RecordingDecoder()
     tp_group = object()
     scattered = []
@@ -368,6 +376,9 @@ def test_hybrid_model_sequence_shards_hash_ids_with_decoder_input(monkeypatch, p
         vocab_size=128,
         pg_collection=SimpleNamespace(tp=tp_group),
     )
+    model._preprocess = HybridModel._preprocess.__get__(model)
+    model._postprocess = HybridModel._postprocess.__get__(model)
+    monkeypatch.setattr(InferenceMode, 'is_active', lambda: inference)
     input_ids = torch.arange(8).reshape(2, 4)
     padding_mask = torch.tensor([[False, True, False, True], [True, False, True, False]])
     hidden_states = torch.randn(2, 2, 8)
@@ -380,6 +391,7 @@ def test_hybrid_model_sequence_shards_hash_ids_with_decoder_input(monkeypatch, p
         attention_mask=None,
         decoder_input=hidden_states if pre_process else None,
         padding_mask=padding_mask,
+        runtime_gather_output=inference,
     )
 
     assert len(scattered) == (2 if pre_process else 1)
@@ -431,6 +443,8 @@ def test_hybrid_model_scatters_embedding_for_sequence_parallel(monkeypatch):
             moe_num_hash_layers=0,
             sequence_parallel=True,
             freeze_base_model_for_mtp=False,
+            cuda_graph_impl="none",
+            flash_decode=False,
         ),
         decoder=decoder,
         embedding=embedding,
@@ -442,6 +456,8 @@ def test_hybrid_model_scatters_embedding_for_sequence_parallel(monkeypatch):
         vocab_size=128,
         pg_collection=SimpleNamespace(tp=tp_group),
     )
+    model._preprocess = HybridModel._preprocess.__get__(model)
+    model._postprocess = HybridModel._postprocess.__get__(model)
     input_ids = torch.arange(8).reshape(2, 4)
     position_ids = torch.arange(4).repeat(2, 1)
 
@@ -458,8 +474,8 @@ def test_hybrid_model_scatters_embedding_for_sequence_parallel(monkeypatch):
     inference_context.zero_padding_tokens.assert_called_once_with(
         local_embeddings, sequence_parallel_rank=3
     )
-    assert output is decoder.kwargs["hidden_states"]
-    assert output.unwrap() is local_embeddings
+    assert isinstance(decoder.kwargs["hidden_states"], WrappedTensor)
+    assert output is local_embeddings
 
 
 @pytest.mark.parametrize("pre_process", [True, False])
@@ -508,6 +524,8 @@ def test_hybrid_model_shards_each_layout_padding_mask(
         mtp_process=False,
         pg_collection=SimpleNamespace(tp=tp_group),
     )
+    model._preprocess = HybridModel._preprocess.__get__(model)
+    model._postprocess = HybridModel._postprocess.__get__(model)
     hidden_states = torch.randn(4 if sequence_parallel else 8, 1, 8)
     decoder.input_tensor = hidden_states
     HybridModel.forward(
@@ -524,6 +542,34 @@ def test_hybrid_model_shards_each_layout_padding_mask(
         torch.testing.assert_close(decoder.kwargs["padding_mask_by_layout"][layout], expected)
         # MTP and other consumers still need the original CP-only views.
         assert cp_batch.get_batch(layout)["padding_mask"] is mask
+
+
+@pytest.mark.parametrize("pre_process", [True, False])
+@pytest.mark.parametrize("cuda_graph_impl,flash_decode", [("local", False), ("none", True)])
+def test_hybrid_preprocess_static_inference_without_token_ids(
+    pre_process, cuda_graph_impl, flash_decode
+):
+    hidden_states = torch.randn(4, 2, 8)
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            sequence_parallel=False, cuda_graph_impl=cuda_graph_impl, flash_decode=flash_decode
+        ),
+        pre_process=pre_process,
+        position_embedding_type="none",
+        decoder=SimpleNamespace(input_tensor=hidden_states),
+    )
+    inference_context = SimpleNamespace(is_static_batching=lambda: True, sequence_len_offset=7)
+
+    with InferenceMode.active():
+        *_, sequence_len_offset, _ = HybridModel._preprocess(
+            model,
+            input_ids=None,
+            position_ids=None,
+            decoder_input=hidden_states if pre_process else None,
+            inference_context=inference_context,
+        )
+
+    torch.testing.assert_close(sequence_len_offset, torch.tensor([7, 7], dtype=torch.int32))
 
 
 def test_chunked_hash_moe_keeps_ids_and_padding_aligned():
@@ -614,6 +660,22 @@ def test_hybrid_hash_moe_pp_does_not_require_explicit_pipeline_layout():
 
 def test_hash_moe_threshold_counts_only_moe_positions():
     assert _get_hash_moe_layer_threshold("-E-E-E-E", 3) == 6
+
+
+def test_hash_moe_threshold_counts_group_members_as_physical_layers():
+    assert _get_hash_moe_layer_threshold("[M*E]|[M*E]", 1) == 3
+    assert _get_hash_moe_layer_threshold("[M*E]|[M*E]", 2) == 6
+
+
+def test_hash_moe_pipeline_placement_checks_grouped_moe_members():
+    grouped_layers = [(LayerSymbols.MAMBA, LayerSymbols.ATTENTION, LayerSymbols.MOE)]
+    with pytest.raises(ValueError, match=r"hash MoE layer\(s\) \[6\]"):
+        _validate_hash_moe_pipeline_placement(
+            grouped_layers, layer_offset=3, hash_moe_layer_threshold=6, pre_process=False
+        )
+    _validate_hash_moe_pipeline_placement(
+        grouped_layers, layer_offset=3, hash_moe_layer_threshold=3, pre_process=False
+    )
 
 
 def test_hash_moe_threshold_rejects_count_larger_than_pattern():
