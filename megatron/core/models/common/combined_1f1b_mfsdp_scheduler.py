@@ -28,6 +28,11 @@ def _make_unshard_backward_hook(owner: FsdpModule):
 
 def _module_post_backward_hook(module: FsdpModule) -> None:
     module.reshard()
+    # FsdpModule.pre_backward forks the reduce-scatter stream into any active CUDA-graph
+    # capture, but combined 1F1B bypasses it. Without this edge, the first reduction
+    # allocates on a stream outside the capture, which is illegal during capture.
+    context = module.context
+    context.reduce_scatter_stream.wait_stream(context.current_stream())
     module._reduce_gradient_groups()
 
 

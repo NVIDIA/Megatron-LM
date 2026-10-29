@@ -16,6 +16,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard,
     fully_shard_context,
 )
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
 
 logger = logging.getLogger(__name__)
 
@@ -50,15 +51,19 @@ def _default_placements() -> Placements:
 # across capture and replay. Mark only that case flaky until the required PyTorch allocator and
 # buffer-registration support is available.
 @pytest.mark.parametrize(
-    "use_symmetric_memory",
+    "use_symmetric_memory,combined_1f1b",
     [
-        pytest.param(False, id="default"),
+        pytest.param(False, False, id="default"),
         pytest.param(
-            True, id="symmetric_memory", marks=[pytest.mark.flaky, pytest.mark.flaky_in_dev]
+            True,
+            False,
+            id="symmetric_memory",
+            marks=[pytest.mark.flaky, pytest.mark.flaky_in_dev],
         ),
+        pytest.param(False, True, id="combined_1f1b"),
     ],
 )
-def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
+def test_captures_full_iteration(distributed_setup, use_symmetric_memory, combined_1f1b):
     """A full training iteration should be CUDA-graphable, with and without symmetric memory.
 
     With ``use_symmetric_memory=True`` the FSDP collective path changes: unshard allocates the
@@ -68,6 +73,10 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
     illegal inside CUDA-graph capture, so this confirms the warmup establishes reusable,
     already-rendezvoused buffers that capture and replay cleanly -- reproducing the
     non-symmetric-memory loss trajectory exactly.
+
+    With ``combined_1f1b=True`` MCore's EP-overlap schedule drives FSDP through
+    ``register_combined_1f1b_hooks`` instead of the automatic hooks, so ``pre_backward``
+    never forks the reduce-scatter stream into the capture.
     """
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -83,10 +92,16 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
     static_target = torch.zeros_like(static_input)
 
     placements = _default_placements()
-    with fully_shard_context(device=device, use_symmetric_memory=use_symmetric_memory):
+    with fully_shard_context(
+        device=device,
+        use_symmetric_memory=use_symmetric_memory,
+        caller_managed_grad_sync=combined_1f1b,
+    ):
         for layer in model.layers:
-            fully_shard(layer, mesh=mesh, placements=placements)
-        fully_shard(model, mesh=mesh, placements=placements)
+            fully_shard(layer, mesh=mesh, placements=placements, register_hooks=not combined_1f1b)
+        fully_shard(model, mesh=mesh, placements=placements, register_hooks=not combined_1f1b)
+    if combined_1f1b:
+        register_combined_1f1b_hooks(model)
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.25, foreach=False)
 
@@ -95,6 +110,8 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
         output = model(static_input)
         loss = torch.nn.functional.mse_loss(output, static_target)
         loss.backward()
+        if combined_1f1b:
+            model.context.finish_grad_sync()
         optimizer.step()
         return loss.detach()
 
