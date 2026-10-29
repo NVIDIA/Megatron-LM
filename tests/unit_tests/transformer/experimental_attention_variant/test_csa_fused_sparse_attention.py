@@ -751,8 +751,9 @@ def test_real_sbhd_teacher_lse_kernel_matches_bounded_reference():
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=1e-2)
 
 
-# Disabled in dev (flaky_in_dev) and LTS (flaky) CI because the CI image builds
-# flash_mla with FLASH_MLA_DISABLE_SM90=1. Re-enable once SM90 kernels are included.
+# Disabled in dev (flaky_in_dev) and LTS (flaky) CI. With FlashMLA's SM90 kernels in the image it
+# runs on H100, but the fused forward and backward differ from the native reference beyond the
+# tolerance there (up to 3% of elements, max abs difference 0.56). Not yet verified on SM100.
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 @pytest.mark.parametrize("num_heads", [1, 2])

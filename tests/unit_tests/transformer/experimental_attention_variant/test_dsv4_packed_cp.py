@@ -237,9 +237,11 @@ def test_packed_cp_matches_full_attention_and_gradients(
         pytest.skip(f"requires {cp_size} ranks")
     pytest.importorskip("flash_mla")
     pytest.importorskip("cudnn.deepseek_sparse_attention")
-    # CI builds FlashMLA with FLASH_MLA_DISABLE_SM90=1.
-    if torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("Fused CSA CP tests require the SM100 kernels included in the CI image")
+    capability = torch.cuda.get_device_capability()[0]
+    if capability < 9:
+        pytest.skip("Fused CSA CP tests require SM90+")
+    if capability == 9 and ratio == 4 and coeff > 0 and not sparse:
+        pytest.skip("TransformerConfig rejects dense indexer loss with the ratio-4 indexer on SM90")
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=cp_size
     )

@@ -135,11 +135,14 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS}-cudnn-fe-1.32,targ
     test -n "$TMS_CUDA_MAJOR"
     # flash-mla (no_pypi_wheels group) has no PyPI wheel and is built from source by uv. Point the
     # compilers at the CCCL/libcu++ headers (under cccl/ in this base image, not the default CUDA
-    # include path) and scope the build to the target archs. Skipped for the LTS image.
+    # include path) and scope the build to the target archs (NVTE_CUDA_ARCHS): FlashMLA builds
+    # SM90 and SM100 kernels unless told not to. Skipped for the LTS image.
     FLASH_MLA_GROUP=""
     if [ "$IMAGE_TYPE" != "lts" ]; then
         FLASH_MLA_GROUP="--group no_pypi_wheels"
-        export FLASH_MLA_DISABLE_SM90=1 NVCC_THREADS=16 \
+        case ";${NVTE_CUDA_ARCHS};" in *";90;"* | *";90a;"*) ;; *) export FLASH_MLA_DISABLE_SM90=1 ;; esac
+        case ";${NVTE_CUDA_ARCHS};" in *";100;"* | *";100a;"*) ;; *) export FLASH_MLA_DISABLE_SM100=1 ;; esac
+        export NVCC_THREADS=16 \
             CFLAGS="-I/usr/local/cuda/include/cccl" CXXFLAGS="-I/usr/local/cuda/include/cccl"
     fi
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
