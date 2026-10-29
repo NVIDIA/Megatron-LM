@@ -12,6 +12,7 @@ from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
 suppress_duplicate_logs_off_rank0()
 
 import argparse
+from contextlib import ExitStack
 from functools import partial
 
 from examples.mimo.model_providers import resolve_provider
@@ -22,7 +23,7 @@ from examples.mimo.training.args import (
     validate_hetero_grid_args,
 )
 from examples.mimo.training.builder import MimoBuildConfig
-from examples.mimo.training.data import add_mock_data_args, build_train_valid_test_data_loaders
+from examples.mimo.training.data import add_mimo_data_args, build_train_valid_test_data_loaders
 from examples.mimo.training.distributed import initialize_distributed, shutdown_distributed
 from examples.mimo.training.encoder_prefetch import (
     EncoderPrefetchLoader,
@@ -42,10 +43,10 @@ from megatron.training.vocab_utils import calculate_padded_vocab_size
 
 
 def extra_args_provider(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """Register model-provider, heterogeneous-grid, and mock-data arguments."""
+    """Register model, heterogeneous-grid, mock and opt-in Energon arguments."""
     parser = add_model_provider_args(parser)
     parser = add_hetero_grid_args(parser)
-    parser = add_mock_data_args(parser)
+    parser = add_mimo_data_args(parser)
     parser = add_encoder_prefetch_args(parser)
     return parser
 
@@ -64,6 +65,10 @@ def _parse_and_validate() -> argparse.Namespace:
     args = parse_args(extra_args_provider)
     _, llm_size = validate_hetero_grid_args(args, args.world_size)
     _set_stock_parallel_args(args)
+    if args.dataset_provider == "energon":
+        from examples.mimo.data.energon_provider import configure_energon_data
+
+        configure_energon_data(args)
     physical_world_size = args.world_size
     args.world_size = llm_size
     try:
@@ -78,7 +83,7 @@ def _parse_and_validate() -> argparse.Namespace:
         raise ValueError("Other optimizer paths have not been tested with heterogeneous MIMO")
     validate_encoder_prefetch_args(args)
 
-    if getattr(args, "padded_vocab_size", None) is None:
+    if args.dataset_provider != "energon" and getattr(args, "padded_vocab_size", None) is None:
         args.padded_vocab_size = calculate_padded_vocab_size(
             args.vocab_size,
             args.make_vocab_size_divisible_by,
@@ -95,9 +100,14 @@ def main() -> None:
     model_cfg = MimoBuildConfig()
     cfg = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(cfg)
+    if args.dataset_provider == "energon":
+        from examples.mimo.data.energon_provider import initialize_energon_tokenizer
+
+        initialize_energon_tokenizer(cfg, args)
     provider = resolve_provider(args)
 
     prefetch_loader = None
+    energon_loaders = []
     initialize_distributed()
     # The grid/rank-layout args model a single encoder region; the builder itself is
     # generic over any number of encoder grids in the topology.
@@ -128,6 +138,8 @@ def main() -> None:
     def train_valid_test_data_provider(_train_val_test_num_samples):
         nonlocal prefetch_loader
         loaders = build_train_valid_test_data_loaders(args, topology)
+        if args.dataset_provider == "energon":
+            energon_loaders.extend(loader for loader in loaders if loader is not None)
         iterators = tuple(iter(loader) if loader is not None else None for loader in loaders)
         if not args.mimo_encoder_prefetch or loaders[0] is None:
             return iterators
@@ -150,22 +162,26 @@ def main() -> None:
         return (prefetch_loader, *iterators[1:])
 
     train_valid_test_data_provider.is_distributed = True
-    pretrain(
-        cfg,
-        train_valid_test_data_provider,
-        ModelType.encoder_or_decoder,
-        mimo_forward_step,
-        model_provider=None,
-        skip_model_parallel_init=True,
-        p2p_communicator=communicator,
-        pg_collection=topology.schedule_pg_collection,
-        build_tokenizer=False,
-    )
-
-    if prefetch_loader is not None:
-        prefetch_loader.close()
-    topology.destroy()
-    shutdown_distributed()
+    try:
+        pretrain(
+            cfg,
+            train_valid_test_data_provider,
+            ModelType.encoder_or_decoder,
+            mimo_forward_step,
+            model_provider=None,
+            skip_model_parallel_init=True,
+            p2p_communicator=communicator,
+            pg_collection=topology.schedule_pg_collection,
+            build_tokenizer=False,
+        )
+    finally:
+        with ExitStack() as cleanup:
+            cleanup.callback(shutdown_distributed)
+            cleanup.callback(topology.destroy)
+            if prefetch_loader is not None:
+                cleanup.callback(prefetch_loader.close)
+            for loader in energon_loaders:
+                cleanup.callback(loader.close)
 
 
 if __name__ == "__main__":

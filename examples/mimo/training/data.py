@@ -11,10 +11,10 @@ from typing import Optional
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from examples.mimo.training.batch import collate_encoder_inputs
 from examples.mimo.training.topology import HeteroTopology
 from examples.mimo.utils.hetero import get_data_lane_rank, get_language_batch_parallel_size
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.training.global_vars import get_run_config
 
@@ -23,13 +23,66 @@ _LANGUAGE_SEED_OFFSET = 20_000
 _SPLIT_SEED_OFFSETS = (0, 100_000, 200_000)
 
 
-def add_mock_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+def add_mock_data_args(
+    parser: argparse.ArgumentParser, *, dataset_providers=("mock",)
+) -> argparse.ArgumentParser:
     """Register the mock-dataset arguments consumed by this module's loaders."""
     group = parser.add_argument_group("mimo mock data")
-    group.add_argument("--dataset-provider", choices=("mock",), default="mock")
+    group.add_argument("--dataset-provider", choices=dataset_providers, default="mock")
     group.add_argument("--image-token-id", type=int, default=511)
     group.add_argument("--image-seq-length", type=int, default=None)
     group.add_argument("--mock-dataset-size", type=int, default=10_000)
+    return parser
+
+
+def add_mimo_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Add opt-in prepared Energon data while retaining the original mock defaults."""
+    add_mock_data_args(parser, dataset_providers=("mock", "energon"))
+    group = parser.add_argument_group(
+        "mimo prepared Energon data", "Used only with --dataset-provider energon."
+    )
+    group.add_argument(
+        "--multimodal-interleaved-min-image-patches",
+        type=int,
+        default=4,
+        help="Minimum total input patches per image, before 2x2 pixel shuffle "
+        "(default: %(default)s).",
+    )
+    group.add_argument(
+        "--multimodal-interleaved-max-image-patches",
+        type=int,
+        default=4096,
+        help="Maximum total input patches per image, before 2x2 pixel shuffle "
+        "(default: %(default)s).",
+    )
+    group.add_argument(
+        "--multimodal-interleaved-shuffle-buffer-documents",
+        type=int,
+        default=0,
+        help="Documents buffered per worker before packing; 0 disables the shuffle buffer.",
+    )
+    group.add_argument(
+        "--multimodal-interleaved-dataloader-checkpoint-root",
+        default=None,
+        metavar="ROOT",
+        help="Dataloader checkpoint root containing iter_XXXXXXX/rank directories; "
+        "defaults to --load. "
+        "Pass the root, not an iteration directory or a .pt file.",
+    )
+    group.add_argument(
+        "--dataloader-save",
+        default=None,
+        metavar="ROOT",
+        help="Dataloader checkpoint output root; defaults to model --save. "
+        "Language lanes save state.",
+    )
+    group.add_argument(
+        "--tokenizer-prompt-format",
+        default="chatml",
+        metavar="FORMAT",
+        help="Multimodal tokenizer vocabulary configuration (default: %(default)s). "
+        "Prepared BinIdx IDs are preserved; no conversation rendering or text tokenization occurs.",
+    )
     return parser
 
 
@@ -249,38 +302,9 @@ def _collate_mock_batch(batch: list[dict[str, object]]) -> dict[str, object]:
         collated["modality_inputs"][modality_name] = {}
         for encoder_name in encoders:
             encoder_items = [item["modality_inputs"][modality_name][encoder_name] for item in batch]
-            x = encoder_items[0]["x"]
-            encoder_batch = {
-                "x": torch.cat([item["x"] for item in encoder_items], dim=1 if x.ndim == 3 else 0)
-            }
-            if "imgs_sizes" in encoder_items[0]:
-                imgs_sizes = torch.cat([item["imgs_sizes"] for item in encoder_items])
-                patch_dim = isqrt(x.shape[-1] // 3)
-                if 3 * patch_dim**2 != x.shape[-1]:
-                    raise ValueError(
-                        f"dynamic encoder feature size ({x.shape[-1]}) is not 3 * patch_dim^2"
-                    )
-                seq_lens = torch.prod(imgs_sizes // patch_dim, dim=-1, dtype=torch.int32)
-                cu_seqlens = torch.cat(
-                    (
-                        torch.zeros(1, dtype=torch.int32),
-                        torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
-                    )
-                )
-                max_seqlen = int(seq_lens.max().item())
-                encoder_batch.update(
-                    {
-                        "imgs_sizes": imgs_sizes,
-                        "packed_seq_params": PackedSeqParams(
-                            qkv_format="thd",
-                            cu_seqlens_q=cu_seqlens,
-                            cu_seqlens_kv=cu_seqlens.clone(),
-                            max_seqlen_q=max_seqlen,
-                            max_seqlen_kv=max_seqlen,
-                        ),
-                    }
-                )
-            collated["modality_inputs"][modality_name][encoder_name] = encoder_batch
+            collated["modality_inputs"][modality_name][encoder_name] = collate_encoder_inputs(
+                encoder_items
+            )
     return collated
 
 
@@ -288,6 +312,10 @@ def build_train_valid_test_data_loaders(
     args: argparse.Namespace, topology: HeteroTopology
 ) -> tuple[Optional[DataLoader], Optional[DataLoader], Optional[DataLoader]]:
     """Build independent mock DataLoaders for the data-consuming rank role."""
+    if getattr(args, "dataset_provider", "mock") == "energon":
+        from examples.mimo.data.energon_provider import build_energon_data_loaders
+
+        return build_energon_data_loaders(args, topology)
     if getattr(args, "dataset_provider", "mock") != "mock":
         raise ValueError(f"unsupported dataset provider: {args.dataset_provider}")
 
