@@ -82,6 +82,18 @@ class TestInferenceConfig:
         with pytest.raises(ValueError, match="mixing Mamba and GDN"):
             MambaInferenceStateConfig.from_model(model)
 
+    def test_mamba_inference_state_config_rejects_mixed_recurrent_layers_in_groups(self):
+        """Bracketed groups are tuples of symbols; their members still count."""
+        model = self._hybrid_model(
+            [
+                (Symbols.MAMBA, Symbols.ATTENTION, Symbols.MOE),
+                (Symbols.GDN, Symbols.ATTENTION, Symbols.MOE),
+            ]
+        )
+
+        with pytest.raises(ValueError, match="mixing Mamba and GDN"):
+            MambaInferenceStateConfig.from_model(model)
+
     def test_mamba_inference_state_config_rejects_gdn2(self):
         """GDN2 should fail explicitly instead of missing the GDN inference hooks."""
         model = self._hybrid_model([Symbols.GDN], experimental_attention_variant="gdn2")

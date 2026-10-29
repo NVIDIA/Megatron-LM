@@ -4,7 +4,12 @@
 
 import math
 
-from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, parse_hybrid_pattern
+from megatron.core.models.hybrid.hybrid_layer_allocation import (
+    Symbols,
+    flatten_layer_type_list,
+    parse_hybrid_pattern,
+    parse_segment_layers,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import is_dsa_skip_topk_layer
 
 
@@ -321,7 +326,10 @@ def dsa_indexer_flops(
         # the main pattern numbers layers sequentially across pipes, and
         # each hybrid MTP depth restarts at 1 (``pp_layer_offset=0``).
         parsed_pattern = parse_hybrid_pattern(hybrid_layer_pattern)
-        main_layer_types = (parsed_pattern.main_pattern or "").replace(Symbols.PIPE, "")
+        # Bracketed groups keep the numbering of the pattern without brackets.
+        main_layer_types = flatten_layer_type_list(
+            parse_segment_layers((parsed_pattern.main_pattern or "").replace(Symbols.PIPE, ""))
+        )
         num_indexer_layers = _num_dsa_indexer_layers_in_pattern(
             main_layer_types,
             Symbols.DS_ATTENTION,
