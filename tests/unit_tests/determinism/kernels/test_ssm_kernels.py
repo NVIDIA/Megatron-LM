@@ -32,6 +32,7 @@ from tests.unit_tests.determinism.correctness.test_ssm_conv1d import (
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
+    bytes_equal,
     seeded,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -649,6 +650,80 @@ def test_gdn_torch_l2norm_matches_fla_and_replays(dtype, head_dim, compiled):
     assert_replays_bit_exact(
         normalize, (x.requires_grad_(True),), replays=3, contention=True, what="GDN torch L2 norm"
     )
+
+
+def test_gdn_compiled_input_preparation_matches_across_grad_modes():
+    """The compiled GDN input preparation gives the same bits with grad disabled and enabled.
+
+    RL scores tokens without grad and then trains on them, so at unchanged weights the training
+    forward must reproduce the scoring forward. FLA's l2norm buckets its launch by row count;
+    traced inside the compiled helper, every bucket was another variant, the no-grad calls used
+    up Dynamo's default recompile limit, and the grad-enabled calls fell back to eager execution.
+    """
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+        get_experimental_attention_variant_module_spec,
+    )
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+    from megatron.core.ssm.gated_delta_net.common import HAVE_FLA
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer import TransformerConfig
+
+    if not HAVE_FLA:
+        pytest.skip("needs FLA")
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            hidden_size=256,
+            linear_conv_kernel_dim=2,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
+            # q and k give 32 rows per token: the l2norm bucket changes every 2048 tokens.
+            linear_num_key_heads=16,
+            linear_num_value_heads=16,
+            num_layers=1,
+            normalization="RMSNorm",
+            use_cpu_initialization=True,
+            num_attention_heads=8,
+            activation_func=torch.nn.functional.silu,
+            bf16=True,
+            experimental_attention_variant="gated_delta_net",
+            linear_attention_freq=[1],
+            transformer_impl="transformer_engine",
+        )
+        gdn = GatedDeltaNet(
+            config,
+            submodules=get_experimental_attention_variant_module_spec(config=config).submodules,
+            layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+        )
+        gdn = gdn.cuda().bfloat16()
+
+        def prepare(seq_len, requires_grad):
+            seeded(seq_len)
+            kw = dict(device="cuda", dtype=torch.bfloat16, requires_grad=requires_grad)
+            heads = gdn.num_v_heads_local_tp
+            qkv = torch.randn(1, seq_len, 2 * gdn.qk_dim_local_tp + gdn.v_dim_local_tp, **kw)
+            gate = torch.randn(1, seq_len, heads, gdn.value_head_dim, **kw)
+            beta = torch.randn(1, seq_len, heads, **kw)
+            alpha = torch.randn(1, seq_len, heads, **kw)
+            return gdn._prepare_input_for_gated_delta_rule(
+                qkv, gate, gdn.A_log, gdn.dt_bias, 1, seq_len, beta, alpha
+            )
+
+        torch._dynamo.reset()
+        seq_lens = [2048 * n - 1024 for n in range(1, 7)]  # one length in each of six buckets
+        with torch.no_grad():
+            reference = {seq_len: prepare(seq_len, requires_grad=False) for seq_len in seq_lens}
+        mismatches = []
+        for seq_len in seq_lens:
+            for name, value in prepare(seq_len, requires_grad=True).items():
+                if not bytes_equal(value, reference[seq_len][name]):
+                    mismatches.append(f"{name} at {seq_len} tokens")
+        assert not mismatches, "grad-enabled forward differs from no-grad: " + ", ".join(mismatches)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
