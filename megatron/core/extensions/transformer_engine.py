@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import copy
@@ -76,8 +76,14 @@ try:
     import transformer_engine as te
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast, fp8_model_init
 
+    try:
+        from transformer_engine.pytorch.utils import mark_grouped_tensor as _te_mark_grouped_tensor
+    except ImportError:
+        _te_mark_grouped_tensor = None
+
     HAVE_TE = True
 except ImportError:
+    _te_mark_grouped_tensor = None
     if TYPE_CHECKING:
         # For type checking, treat transformer_engine as always available.
         import transformer_engine as te
@@ -108,6 +114,30 @@ HAVE_TE_GDN = _TE_LINEAR_ATTENTION is not None
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 _EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
+
+
+def mark_grouped_tensor(*tensors: torch.Tensor | None) -> None:
+    """Mark dynamic grouped tensors through TE, ignoring absent optional operands."""
+    tensors_to_mark = tuple(tensor for tensor in tensors if tensor is not None)
+    if not tensors_to_mark:
+        return
+    if _te_mark_grouped_tensor is None:
+        raise RuntimeError(
+            "Paged stashing requires Transformer Engine's mark_grouped_tensor utility."
+        )
+    _te_mark_grouped_tensor(*tensors_to_mark)
+
+
+def is_grouped_tensor_marked(tensor: Any) -> bool:
+    """Return whether a tensor carries Transformer Engine's grouped-tensor marker."""
+    return hasattr(tensor, "grouped_tensor_scale_inv")
+
+
+def propagate_te_grouped_tensor_marker(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Preserve TE's grouped-tensor marker across view/cast operations."""
+    if is_grouped_tensor_marked(source):
+        mark_grouped_tensor(target)
+    return target
 
 
 def _set_expert_parameter_attributes(
@@ -4097,18 +4127,33 @@ if HAVE_TE and is_te_min_version("2.7.0.dev"):
     )
 
     try:
+        from transformer_engine.pytorch.router import (  # pylint: disable=unused-import
+            mark_qb_bin_bounds_validated,
+        )
+    except ImportError:
+        mark_qb_bin_bounds_validated = None
+
+    try:
         _fused_topk_sig = inspect.signature(fused_topk_with_score_function)
+        fused_topk_with_score_function_supports_qb = {
+            "qb_histogram",
+            "qb_bin_bounds",
+            "qb_histogram_mode",
+        }.issubset(_fused_topk_sig.parameters)
         fused_topk_with_score_function_supports_topk_indices = (
             "topk_indices" in _fused_topk_sig.parameters
         )
         del _fused_topk_sig
     except (TypeError, ValueError):
+        fused_topk_with_score_function_supports_qb = False
         fused_topk_with_score_function_supports_topk_indices = False
 
 else:
     fused_topk_with_score_function = None
     fused_compute_score_for_moe_aux_loss = None
     fused_moe_aux_loss = None
+    fused_topk_with_score_function_supports_qb = False
+    mark_qb_bin_bounds_validated = None
     fused_topk_with_score_function_supports_topk_indices = False
 
 
