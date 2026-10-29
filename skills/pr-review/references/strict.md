@@ -70,20 +70,30 @@ caller for diff analysis.
 
 ### Megatron Core process group usage
 
-- In `megatron/core` production code, treat new direct reads of global process
-  groups from `parallel_state` as review findings unless they are clearly
-  compatibility-only.
-- Flag added calls to `parallel_state.get_*_group()` or directly imported
-  `get_*_group()` helpers when the surrounding code could instead receive a
-  `ProcessGroupCollection` or explicit `torch.distributed.ProcessGroup` from its
-  caller.
+The rules are in the "Megatron Core Process Groups" section of `AGENTS.md` and
+in `docs/developer/parallel-state-deprecation.md`.
+
+- In `megatron/core` production code, treat new reads of the global parallel
+  grid as findings: added calls of the deprecated `parallel_state` functions,
+  of `ProcessGroupCollection.use_mpu_process_groups()` or
+  `parallel_state.get_registered_process_groups()`, and of the guarded helpers
+  of `process_groups_config.py`, such as `resolve_process_groups()`. A new
+  fallback is a finding even when it warns, unless it replaces an existing
+  read in the same function. The code should receive a
+  `ProcessGroupCollection` or explicit `torch.distributed.ProcessGroup` from
+  its caller.
+- Outside `megatron/core`, in `megatron/training` and the rest of `megatron/`,
+  `examples/`, `tools/`, `tasks/`, `scripts/`, `docs/` and the top-level
+  scripts, flag a call of a deprecated function or of `use_mpu_process_groups()`
+  that is not in a `global_process_group_fallback()` block or in bootstrap code
+  that ignores `ParallelStateDeprecationWarning` in a
+  `warnings.catch_warnings()` block.
+- A fallback reads the grid only through the warned helpers of
+  `process_groups_config.py`, dated 0.21 and 0.23 by default; a comment does
+  not make a read a fallback.
 - Do not flag `megatron/core/parallel_state.py`,
-  `megatron/core/process_groups_config.py`, tests, docs, initialization/bootstrap
-  code that materializes a `ProcessGroupCollection` from MPU globals, or
-  explicitly documented migration fallbacks.
-- This guidance is advisory and targets Megatron Core library code; do not apply
-  it to `megatron/training` or other training-loop code unless the PR opts into
-  that migration.
+  `megatron/core/process_groups_config.py`, or tests, which may use the global
+  grid.
 
 ### Mandatory check: unused new variables / arguments
 
