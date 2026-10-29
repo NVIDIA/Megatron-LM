@@ -1862,7 +1862,7 @@ def apply_flextron_elasticity_to_model(model, config):
                 managers.append(manager)
 
     # Also add hooks to HybridStack if present
-    if hasattr(model, 'decoder') and hasattr(model.decoder, 'final_norm'):
+    if hasattr(model, 'decoder') and getattr(model.decoder, 'final_norm', None) is not None:
         stack_manager = add_flextron_stack_elasticity(model.decoder, config)
         managers.append(stack_manager)
 
