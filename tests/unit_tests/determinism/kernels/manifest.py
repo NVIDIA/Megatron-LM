@@ -106,7 +106,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="masked_router_replay",
         sources=("megatron/core/transformer/moe/router_replay.py",),
-        tests=(K + "test_router_replay_mask.py",),
+        tests=(K + "test_router_replay_mask_determinism.py",),
         kind="torch-op",
         notes="Masked route selection and gathered-score backward retain exact forward choices.",
     ),
