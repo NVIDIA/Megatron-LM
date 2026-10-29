@@ -3,6 +3,7 @@
 from functools import partial
 from typing import Protocol, cast
 
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import (
@@ -23,6 +24,20 @@ from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+if HAVE_TE:
+    import transformer_engine as te  # type: ignore[import-untyped]
+
+
+def get_dsv4_o_group_proj_spec() -> type | None:
+    """Return TE's ``BatchedLinear`` for the grouped output projection, if available.
+
+    ``None`` makes ``DSv4HybridAttention`` fall back to ``torch.einsum``. Shared by the
+    config-aware spec below and HybridModel's static stack spec so both select the same op.
+    """
+    if not HAVE_TE:
+        return None
+    return getattr(getattr(te.pytorch, "ops", None), "BatchedLinear", None)
 
 
 class _DSv4BackendSpecProvider(BackendSpecProvider, Protocol):
@@ -69,6 +84,8 @@ def get_dsv4_hybrid_module_spec_for_backend(
         ),
     )
 
+    linear_o_group_proj = get_dsv4_o_group_proj_spec()
+
     return ModuleSpec(
         module=DSv4HybridSelfAttention,
         params={"attn_mask_type": AttnMaskType.causal},
@@ -77,6 +94,7 @@ def get_dsv4_hybrid_module_spec_for_backend(
             linear_q_up_proj=backend.column_parallel_linear(),
             linear_kv_proj=backend.column_parallel_linear(),
             core_attention=core_attention,
+            linear_o_group_proj=linear_o_group_proj,
             linear_proj=backend.row_parallel_linear(),
             q_layernorm=qk_norm,
             kv_layernorm=qk_norm,
