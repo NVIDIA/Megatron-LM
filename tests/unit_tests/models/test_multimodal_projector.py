@@ -78,6 +78,76 @@ class TestMultimodalProjector:
 
         self.affine.load_state_dict(torch.load(path))
 
+    def test_nemotron_fast_gelu_recipe_forward_backward(self):
+        """The decoder-width recipe matches explicit two-linear math and all gradients."""
+        from examples.mimo.model_providers.nemotron_moe_vlm import _nemotron_projection_spec
+        from megatron.core.transformer.spec_utils import build_module
+
+        args = SimpleNamespace(hidden_size=96, vision_projection_type="mlp2")
+        config = TransformerConfig(
+            num_layers=1, hidden_size=96, num_attention_heads=4, use_cpu_initialization=True
+        )
+        projector = build_module(_nemotron_projection_spec(args, 64, 1, None, config)).cuda()
+        fc1 = projector.encoder.linear_fc1.weight
+        fc2 = projector.encoder.linear_fc2.weight
+        assert fc1.shape == (96, 64) and fc2.shape == (96, 96)
+        assert sum(parameter.numel() for parameter in projector.parameters()) == 64 * 96 + 96 * 96
+
+        for tokens in (5, 13):
+            x = torch.randn(tokens, 64, device="cuda", requires_grad=True)
+            upstream = torch.randn(tokens, 96, device="cuda")
+            reference_x = x.detach().clone().requires_grad_(True)
+            reference_fc1 = fc1.detach().clone().requires_grad_(True)
+            reference_fc2 = fc2.detach().clone().requires_grad_(True)
+            hidden = torch.nn.functional.linear(reference_x, reference_fc1)
+            hidden = (
+                0.5
+                * hidden
+                * (1.0 + torch.tanh(hidden * 0.7978845608 * (1.0 + 0.044715 * hidden * hidden)))
+            )
+            expected = torch.nn.functional.linear(hidden, reference_fc2)
+            actual = projector(x)
+            actual_grads = torch.autograd.grad(actual, (x, fc1, fc2), upstream)
+            expected_grads = torch.autograd.grad(
+                expected, (reference_x, reference_fc1, reference_fc2), upstream
+            )
+            torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+            for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+                assert torch.isfinite(actual_grad).all() and torch.count_nonzero(actual_grad) > 0
+                torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
+
+    @pytest.mark.parametrize(
+        ("saved_recipe", "restored_recipe"),
+        [
+            ("mlp", "mlp_squared_relu_4x_encoder_output_width"),
+            ("mlp_squared_relu_4x_encoder_output_width", "mlp"),
+            ("mlp2", "mlp_fast_gelu_1x_decoder_hidden_width"),
+            ("mlp_fast_gelu_1x_decoder_hidden_width", "mlp2"),
+        ],
+    )
+    def test_nemotron_recipe_alias_checkpoint(self, tmp_path, saved_recipe, restored_recipe):
+        """Both spellings strictly restore identical weights and outputs within a recipe."""
+        from examples.mimo.model_providers.nemotron_moe_vlm import _nemotron_projection_spec
+        from megatron.core.transformer.spec_utils import build_module
+
+        args = SimpleNamespace(hidden_size=96, vision_projection_type=saved_recipe)
+        config = TransformerConfig(
+            num_layers=1, hidden_size=96, num_attention_heads=4, use_cpu_initialization=True
+        )
+        original = build_module(_nemotron_projection_spec(args, 64, 1, None, config)).cuda()
+        path = tmp_path / "projection.pt"
+        torch.save({"args": args, "model": original.state_dict()}, path)
+        saved = torch.load(path, weights_only=False)
+        assert saved["args"].vision_projection_type == saved_recipe
+        args.vision_projection_type = restored_recipe
+        restored = build_module(_nemotron_projection_spec(args, 64, 1, None, config)).cuda()
+        restored.load_state_dict(saved["model"], strict=True)
+        assert args.vision_projection_type == restored_recipe
+        assert original.state_dict().keys() == restored.state_dict().keys()
+        for tokens in (5, 13):
+            x = torch.randn(tokens, 64, device="cuda")
+            torch.testing.assert_close(restored(x), original(x), rtol=0, atol=0)
+
     def test_zero_token_gtp_lane_uses_zero_padding(self, monkeypatch):
         class RecordingEncoder(torch.nn.Module):
             def forward(self, hidden_states):

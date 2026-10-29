@@ -615,6 +615,100 @@ def test_projection_input_size_tracks_pixel_shuffle(pixel_shuffle, expected_proj
     assert projection.params["config"].ffn_hidden_size == 4 * expected_projection_input_size
 
 
+@pytest.mark.parametrize(
+    ("recipe", "decoder_width"),
+    [
+        ("affine", False),
+        ("mlp", False),
+        ("mlp_squared_relu_4x_encoder_output_width", False),
+        ("mlp2", True),
+        ("mlp_fast_gelu_1x_decoder_hidden_width", True),
+    ],
+)
+@pytest.mark.parametrize("on_language_ranks", [False, True])
+@pytest.mark.parametrize("pixel_shuffle", [False, True])
+def test_projection_recipes_and_aliases(recipe, decoder_width, on_language_ranks, pixel_shuffle):
+    """Recipe spellings preserve saved args and select matching configs on either placement."""
+    from examples.mimo.model_providers.nemotron_moe_vlm import (
+        language_input_projection_spec,
+        vision_submodules_spec,
+    )
+    from megatron.core.activations import squared_relu, unfused_fast_gelu
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelLinear,
+        TERowParallelLinear,
+    )
+    from megatron.core.tensor_parallel import ColumnParallelLinear
+    from megatron.core.transformer.spec_utils import ModuleSpec
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    argv = _build_argv(*_PRESET_20L) + ["--vision-projection-type", recipe]
+    if not pixel_shuffle:
+        argv = _without_flag(argv, "--pixel-shuffle")
+    args = _parse_validate(argv)
+    args.mimo_run_input_projections_on_llm_ranks = on_language_ranks
+    original = vars(args).copy()
+    vision = vision_submodules_spec(args, pg_collection=None, encoder_grid=None)
+    language_config = TransformerConfig(
+        num_layers=1, hidden_size=args.hidden_size, num_attention_heads=1
+    )
+    language = language_input_projection_spec(
+        args, None, None, ModuleSpec(module=object, params={"config": language_config})
+    )
+    if on_language_ranks:
+        assert vision.submodules["input_projections"] == []
+        projection = language
+    else:
+        assert language is None
+        projection = vision.submodules["input_projections"][0]
+
+    assert vars(args) == original
+    input_width = 5120 if pixel_shuffle else 1280
+    config = projection.params["config"]
+    linears = projection.params["submodules"]
+    assert projection.params["input_size"] == input_width
+    assert projection.params["projector_type"] == ("affine" if recipe == "affine" else "mlp")
+    assert config.hidden_size == args.hidden_size
+    assert config.ffn_hidden_size == (args.hidden_size if decoder_width else 4 * input_width)
+    assert config.activation_func is (unfused_fast_gelu if decoder_width else squared_relu)
+    assert not config.add_bias_linear and not config.gated_linear_unit
+    assert not config.bias_activation_fusion
+    assert linears.linear_fc1 is (TEColumnParallelLinear if decoder_width else ColumnParallelLinear)
+    assert linears.linear_fc2 is TERowParallelLinear
+
+
+def test_projection_factory_defaults_and_invalid_recipes():
+    """Existing direct callers may omit the recipe; explicit invalid names fail early."""
+    from examples.mimo.model_providers.nemotron_moe_vlm import (
+        _nemotron_projection_spec,
+        nemotron_projection_config,
+        nemotron_projection_layer_spec,
+    )
+    from megatron.core.activations import squared_relu
+    from megatron.core.tensor_parallel import ColumnParallelLinear
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    assert _parse([]).vision_projection_type == "affine"
+    assert nemotron_projection_layer_spec().submodules.linear_fc1 is ColumnParallelLinear
+    base = TransformerConfig(num_layers=1, hidden_size=96, num_attention_heads=4)
+    args = SimpleNamespace(hidden_size=96)
+    config = nemotron_projection_config(args, 1, 64, base)
+    assert config.ffn_hidden_size == 256
+    assert config.activation_func is squared_relu
+    assert not hasattr(args, "vision_projection_type")
+
+    with pytest.raises(SystemExit):
+        _parse(["--vision-projection-type", "unknown"])
+    args.vision_projection_type = "unknown"
+    with pytest.raises(ValueError, match="unsupported vision projection type"):
+        nemotron_projection_layer_spec("unknown")
+    with pytest.raises(ValueError, match="unsupported vision projection type"):
+        nemotron_projection_config(args, 1, 64, base)
+    with pytest.raises(ValueError, match="unsupported vision projection type"):
+        _nemotron_projection_spec(args, 64, 1, None, base)
+    assert args.vision_projection_type == "unknown"
+
+
 def test_language_rank_placement_uses_language_parallelism():
     from examples.mimo.model_providers import resolve_provider
     from examples.mimo.model_providers.nemotron_moe_vlm import (

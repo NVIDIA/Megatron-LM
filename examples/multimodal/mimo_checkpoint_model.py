@@ -12,6 +12,7 @@ from dataclasses import replace
 
 import torch
 
+from megatron.core.activations import unfused_fast_gelu as _unfused_fast_gelu
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
@@ -34,15 +35,6 @@ _VISION_SIZE_FIELDS = (
     "num_query_groups",
     "kv_channels",
 )
-
-
-def _unfused_fast_gelu(x: torch.Tensor) -> torch.Tensor:
-    """Fast GELU without the global MCore torch.compile decorator.
-
-    The projection input's token count varies with the number and size of images, so a compiled
-    activation would recompile for each new shape.
-    """
-    return 0.5 * x * (1.0 + torch.tanh(x * 0.7978845608 * (1.0 + 0.044715 * x * x)))
 
 
 _PROJECTION_ACTIVATIONS = {"gelu": torch.nn.functional.gelu, "fast_gelu": _unfused_fast_gelu}
