@@ -561,6 +561,17 @@ class TestDetection(unittest.TestCase):
             "an assignment expression": (
                 IMPORT + "if (grid := parallel_state):\n    grid.get_tensor_model_parallel_group()"
             ),
+            "an assignment expression in a comprehension": (
+                IMPORT + "[(grid := parallel_state) for _ in range(1)]\n"
+                "grid.get_tensor_model_parallel_group()"
+            ),
+            "a conditional expression": (
+                IMPORT + "grid = None if lazy else parallel_state\n"
+                "grid.get_tensor_model_parallel_group()"
+            ),
+            "an operand of or": (
+                IMPORT + "grid = None or parallel_state\ngrid.get_tensor_model_parallel_group()"
+            ),
             "tuple unpacking": (
                 IMPORT + "grid, size = parallel_state, 1\ngrid.get_tensor_model_parallel_group()"
             ),
@@ -604,6 +615,46 @@ class TestDetection(unittest.TestCase):
             ),
             [],
         )
+
+    def test_names_declared_global_or_nonlocal(self):
+        call = "grid.get_tensor_model_parallel_group()"
+        cases = {
+            "a global alias": (
+                IMPORT + "grid = None\ndef init():\n    global grid\n    grid = parallel_state\n"
+                f"def use():\n    return {call}\n",
+                ["use"],
+            ),
+            "a global import": (
+                "def init():\n    global grid\n"
+                "    from megatron.core import parallel_state as grid\n"
+                f"def use():\n    return {call}\n",
+                ["use"],
+            ),
+            "a global alias read where it is assigned": (
+                IMPORT + f"def init():\n    global grid\n    grid = parallel_state\n    {call}\n",
+                ["init"],
+            ),
+            "a nonlocal alias": (
+                IMPORT + "def outer():\n    grid = None\n"
+                "    def init():\n        nonlocal grid\n        grid = parallel_state\n"
+                f"    def use():\n        return {call}\n",
+                ["outer.use"],
+            ),
+            "a local alias beside a global declaration": (
+                IMPORT + "def init():\n    global other\n    grid = parallel_state\n"
+                f"def use():\n    return {call}\n",
+                [],
+            ),
+        }
+        for case, (source, scopes) in cases.items():
+            with self.subTest(case=case):
+                self.assertEqual(
+                    self.hits(source),
+                    [
+                        f"{scope}:accessor:parallel_state.get_tensor_model_parallel_group"
+                        for scope in scopes
+                    ],
+                )
 
     def test_many_reassignments_of_a_name_resolve_quickly(self):
         # Each binding is resolved once. Resolving the earlier ones again for each later one took
@@ -695,6 +746,18 @@ class TestDetection(unittest.TestCase):
             ["<module>:shim:use_mpu_process_groups"],
         )
 
+    def test_setattr_and_delattr_with_a_constant_name(self):
+        # Replacing or deleting a counted function counts like an assignment to the attribute.
+        for call in (
+            "setattr(parallel_state, 'get_tensor_model_parallel_group', None)",
+            "delattr(parallel_state, 'get_tensor_model_parallel_group')",
+        ):
+            with self.subTest(call=call):
+                self.assertEqual(
+                    self.hits(IMPORT + call),
+                    ["<module>:accessor:parallel_state.get_tensor_model_parallel_group"],
+                )
+
     def test_references_that_are_not_called(self):
         cases = {
             "a function stored at module level": (
@@ -745,6 +808,18 @@ class TestDetection(unittest.TestCase):
                 "from importlib import import_module\ndef f():\n"
                 "    return import_module('megatron.core').mpu.get_tensor_model_parallel_group()\n"
             ),
+            "a name given by keyword": (
+                "import importlib\ndef f():\n    return importlib.import_module("
+                "name='megatron.core.parallel_state').get_tensor_model_parallel_group()\n"
+            ),
+            "a relative name and its package": (
+                "import importlib\ndef f():\n    return importlib.import_module("
+                "'.parallel_state', 'megatron.core').get_tensor_model_parallel_group()\n"
+            ),
+            "a relative name and its package by keyword": (
+                "import importlib\ndef f():\n    return importlib.import_module("
+                "'..core.mpu', package='megatron.training').get_tensor_model_parallel_group()\n"
+            ),
             "an alias of a looked-up module": (
                 "import importlib\ngrid = importlib.import_module('megatron.core.parallel_state')\n"
                 "def f():\n    return grid.get_tensor_model_parallel_group()\n"
@@ -778,6 +853,19 @@ class TestDetection(unittest.TestCase):
             ),
             ["f:guarded:resolve_process_groups"],
         )
+        # megatron.core exports parallel_state, but not mpu.
+        self.assertEqual(
+            self.hits("from megatron.core import *\ndef f():\n    return " + CALL + "\n"),
+            ["f:accessor:parallel_state.get_tensor_model_parallel_group"],
+        )
+        self.assertEqual(
+            self.hits(
+                "from megatron.core import *\n"
+                "def f(grids):\n"
+                "    return [mpu.get_tensor_model_parallel_group() for mpu in grids]\n"
+            ),
+            [],
+        )
 
     def test_flags_private_attributes_and_never_warns_them(self):
         cases = {
@@ -788,6 +876,11 @@ class TestDetection(unittest.TestCase):
                 "from megatron.core import mpu\n"
                 "def f():\n    return getattr(mpu, '_DATA_PARALLEL_GROUP', None)\n"
             ),
+            "setattr": (
+                "from megatron.core import mpu\n"
+                "def f():\n    setattr(mpu, '_DATA_PARALLEL_GROUP', None)\n"
+            ),
+            "delattr": IMPORT + "def f():\n    delattr(parallel_state, '_DATA_PARALLEL_GROUP')\n",
             "a direct import": (
                 "from megatron.core.parallel_state import _DATA_PARALLEL_GROUP\n"
                 "def f():\n    return _DATA_PARALLEL_GROUP\n"
@@ -833,14 +926,22 @@ class TestDetection(unittest.TestCase):
                 "class Model:\n    def __init__(self, grid):\n        self.grid = grid\n"
                 "    def rank(self):\n        return self.grid.get_tensor_model_parallel_group()\n"
             ),
+            "a conditional expression of other values": (
+                IMPORT + "grid = config if lazy else None\ngrid.get_tensor_model_parallel_group()"
+            ),
             "getattr with a name built at run time": IMPORT + "getattr(parallel_state, name)()",
             "getattr of another object": "getattr(config, 'get_tensor_model_parallel_group')()",
+            "setattr of another object": IMPORT + "setattr(config, '_DATA_PARALLEL_GROUP', None)",
             "a local function named import_module": (
                 "def import_module(path):\n    return path\n"
                 "import_module('megatron.core.parallel_state').get_tensor_model_parallel_group()"
             ),
-            "a relative module name": (
-                "import importlib\nimportlib.import_module('.parallel_state', 'megatron.core')"
+            "a relative module name in another package": (
+                "import importlib\nimportlib.import_module('.parallel_state', 'other')"
+                ".get_tensor_model_parallel_group()"
+            ),
+            "a relative module name without a package": (
+                "import importlib\nimportlib.import_module('.parallel_state')"
                 ".get_tensor_model_parallel_group()"
             ),
             "another module looked up": (

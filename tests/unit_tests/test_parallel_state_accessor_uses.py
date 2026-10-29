@@ -83,6 +83,13 @@ def _called_name(node):
     return _last_name(node.func) if isinstance(node, ast.Call) else None
 
 
+def _constant_string(node):
+    """Return the value of a string constant, or None."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
 def _fallback_helpers(tree):
     """Return the module's functions whose body returns ``global_process_group_fallback(...)``."""
     helpers = set()
@@ -94,32 +101,39 @@ def _fallback_helpers(tree):
     return helpers
 
 
-def _attribute(node):
-    """Return ``(owner, name)`` for ``owner.name`` or ``getattr(owner, "name"[, default])``."""
+def _attribute(node, functions=("getattr",)):
+    """Return ``(owner, name)`` for ``owner.name``, or for a call of one of ``functions`` that
+    names the attribute with a constant, such as ``getattr(owner, "name"[, default])``."""
     if isinstance(node, ast.Attribute):
         return node.value, node.attr
     if (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id == "getattr"
+        and node.func.id in functions
         and len(node.args) in (2, 3)
-        and isinstance(node.args[1], ast.Constant)
-        and isinstance(node.args[1].value, str)
+        and _constant_string(node.args[1])
     ):
         return node.args[0], node.args[1].value
     return None
 
 
 def _looked_up_module(node):
-    """Return the module that ``importlib.import_module("...")`` or ``sys.modules["..."]`` names
-    with a constant, if it is one of MODULE_NAMES."""
-    if _called_name(node) == "import_module" and node.args:
-        name = node.args[0]
+    """Return the module that ``importlib.import_module(name[, package])`` or
+    ``sys.modules["..."]`` names with constants, if it is one of MODULE_NAMES."""
+    if _called_name(node) == "import_module":
+        keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+        name = _constant_string(node.args[0] if node.args else keywords.get("name"))
+        package = node.args[1] if len(node.args) > 1 else keywords.get("package")
+        try:
+            name = importlib.util.resolve_name(name, _constant_string(package)) if name else None
+        except ImportError:
+            # A relative name without a package, or beyond the top-level package.
+            return None
     elif isinstance(node, ast.Subscript) and ast.unparse(node.value) == "sys.modules":
-        name = node.slice
+        name = _constant_string(node.slice)
     else:
         return None
-    return MODULE_NAMES.get(name.value) if isinstance(name, ast.Constant) else None
+    return MODULE_NAMES.get(name)
 
 
 def _assigned_pairs(target, value):
@@ -144,14 +158,18 @@ def _module_references(tree, package):
     A name or attribute refers to a module when an import anywhere in the file binds it to the
     module, or when an assignment binds it to an expression that refers to the module, such as
     ``grid = parallel_state``, ``self.mpu = megatron.core.parallel_state``,
-    ``grid = getattr(megatron.core, "mpu")``, ``grid, size = mpu, 1`` or
+    ``grid = getattr(megatron.core, "mpu")``, ``grid, size = mpu, 1``,
+    ``grid = mpu if lazy else None`` or
     ``grid = importlib.import_module("megatron.core.parallel_state")``. An assignment in a class
     body also binds the attribute through ``self``, ``cls`` and the class name. The name
-    ``megatron`` always refers to the package.
+    ``megatron`` always refers to the package, and after a star import of ``megatron.core`` the
+    name ``parallel_state`` refers to the module (``megatron.core.__all__`` does not export
+    ``mpu``).
 
-    Not followed: a module passed as an argument, returned by a function, stored in a container
-    or bound to an attribute of another object, and a module that ``__import__()`` or a name
-    built at run time looks up.
+    Not followed: a module passed as an argument (a parameter default included), returned by a
+    function, stored in a container, bound by ``for`` or ``with ... as``, or bound to an attribute
+    of another object, an import in a class body that methods reach through ``self``, and a module
+    that ``__import__()`` or a name built at run time looks up.
     """
     bound = {"megatron": {"megatron"}, CORE: set(), PARALLEL_STATE: set()}
     for node in ast.walk(tree):
@@ -165,6 +183,8 @@ def _module_references(tree, package):
                 module = importlib.util.resolve_name("." * node.level + module, package)
             for alias in node.names:
                 name = f"{module}.{alias.name}"
+                if module == CORE and alias.name == "*":
+                    bound[PARALLEL_STATE].add("parallel_state")
                 if module == CORE and alias.name in PARALLEL_STATE_NAMES:
                     name = PARALLEL_STATE
                 if name in bound:
@@ -176,6 +196,11 @@ def _module_references(tree, package):
             for module, spellings in bound.items():
                 if spelling in spellings:
                     return module
+        # Either side of a conditional expression, and any operand of ``and`` and ``or``, can be
+        # its value.
+        if isinstance(node, (ast.IfExp, ast.BoolOp)):
+            options = (node.body, node.orelse) if isinstance(node, ast.IfExp) else node.values
+            return next(filter(None, map(refers_to, options)), None)
         looked_up = _looked_up_module(node)
         if looked_up:
             return looked_up
@@ -272,7 +297,8 @@ def uncovered_uses(source, package, deprecated):
     name bound to the parallel_state module, by an import or an assignment, or to one of its
     deprecated functions, anywhere in the file counts in every scope. An attribute counts
     through any chain that reaches the module, such as ``megatron.core.mpu``, and so does
-    ``getattr()`` with a constant name. _module_references lists the aliases it does not follow.
+    ``getattr()``, ``setattr()`` or ``delattr()`` with a constant name. _module_references lists
+    the aliases it does not follow.
     """
     tree = ast.parse(source)
     refers_to = _module_references(tree, package)
@@ -294,7 +320,8 @@ def uncovered_uses(source, package, deprecated):
                 if module == "warnings" and alias.name == "warn":
                     warn_functions.add(alias.asname or alias.name)
                 elif module == PARALLEL_STATE and alias.name == "*":
-                    functions.update(deprecated)
+                    # parallel_state has no __all__, so a star import binds its public names only.
+                    functions.update(name for name in deprecated if not _is_private(name))
                 elif module == PARALLEL_STATE and alias.name in deprecated:
                     # A deprecated function is one even if private: _set_global_memory_buffer.
                     functions.add(alias.asname or alias.name)
@@ -350,8 +377,8 @@ def uncovered_uses(source, package, deprecated):
 
         visit_FunctionDef = visit_AsyncFunctionDef = visit_Lambda = _visit_deferred
 
-        def _visit_attribute(self, node):
-            owner, name = _attribute(node)
+        def _visit_attribute(self, node, attribute):
+            owner, name = attribute
             module = refers_to(owner)
             if module == PARALLEL_STATE and _is_private(name) and name not in deprecated:
                 # The private state of parallel_state is not an interface, even in a fallback.
@@ -362,11 +389,14 @@ def uncovered_uses(source, package, deprecated):
                 lines.append(node.lineno)
             self.generic_visit(node)
 
-        visit_Attribute = _visit_attribute
+        def visit_Attribute(self, node):
+            self._visit_attribute(node, _attribute(node))
 
         def visit_Call(self, node):
-            if _attribute(node):
-                self._visit_attribute(node)
+            # getattr(), setattr() and delattr() with a constant name use the attribute.
+            attribute = _attribute(node, ("getattr", "setattr", "delattr"))
+            if attribute:
+                self._visit_attribute(node, attribute)
             else:
                 self.generic_visit(node)
 
@@ -502,8 +532,26 @@ class TestUncoveredUses(unittest.TestCase):
                 [3],
             ),
             ("getattr(ProcessGroupCollection, 'use_mpu_process_groups')()\n", [1]),
-            # A star import binds every deprecated function.
+            # setattr() and delattr() with a constant name.
+            (
+                "from megatron.core import mpu\n"
+                "setattr(mpu, 'set_tensor_model_parallel_rank', f)\n",
+                [2],
+            ),
+            # A star import binds every public deprecated function, and megatron.core's binds
+            # parallel_state.
             ("from megatron.core.parallel_state import *\nget_tensor_model_parallel_rank()\n", [2]),
+            ("from megatron.core import *\nparallel_state.get_tensor_model_parallel_rank()\n", [2]),
+            # Either side of a conditional expression, and any operand of ``and`` and ``or``.
+            (
+                "from megatron.core import mpu\ngrid = mpu if lazy else None\n"
+                "grid.get_tensor_model_parallel_rank()\n",
+                [3],
+            ),
+            (
+                "from megatron.core import mpu\n(None or mpu).set_tensor_model_parallel_rank(0)\n",
+                [2],
+            ),
             # Class-body aliases, through self, cls and the class.
             (
                 "from megatron.core import mpu\nclass Model:\n    grid = mpu\n"
@@ -530,6 +578,16 @@ class TestUncoveredUses(unittest.TestCase):
             (
                 "from importlib import import_module\n"
                 "import_module('megatron.core').mpu.get_tensor_model_parallel_rank()\n",
+                [2],
+            ),
+            (
+                "import importlib\nimportlib.import_module(name='megatron.core.parallel_state')"
+                ".get_tensor_model_parallel_rank()\n",
+                [2],
+            ),
+            (
+                "import importlib\nimportlib.import_module('.parallel_state', 'megatron.core')"
+                ".get_tensor_model_parallel_rank()\n",
                 [2],
             ),
             (
@@ -560,11 +618,29 @@ class TestUncoveredUses(unittest.TestCase):
             "    def rank(self):\n        return self.grid.get_tensor_model_parallel_rank()\n",
             "import importlib\n"
             "importlib.import_module('megatron.core.utils').get_tensor_model_parallel_rank()\n",
+            "import importlib\nimportlib.import_module('.parallel_state', 'other')"
+            ".get_tensor_model_parallel_rank()\n",
             "import sys\nsys.modules['other.parallel_state'].get_tensor_model_parallel_rank()\n",
+            "from other import *\nparallel_state.get_tensor_model_parallel_rank()\n",
+            # megatron.core.__all__ exports parallel_state but not mpu.
+            "from megatron.core import *\ndef f(mpu):\n    mpu.get_tensor_model_parallel_rank()\n",
+            "from megatron.core import mpu\ngrid = config if lazy else None\n"
+            "grid.get_tensor_model_parallel_rank()\n",
         ]
         for source in cases:
             with self.subTest(source=source):
                 self.assertEqual(self.uses(source), [])
+
+    def test_star_import_binds_only_public_names(self):
+        deprecated = self.DEPRECATED | {"_set_global_memory_buffer"}
+        # parallel_state has no __all__, so the star import does not bind the private function.
+        source = (
+            "from megatron.core.parallel_state import *\n"
+            "def f(_set_global_memory_buffer):\n    _set_global_memory_buffer()\n"
+        )
+        self.assertEqual(uncovered_uses(source, self.PACKAGE, deprecated), [])
+        source = "from megatron.core.parallel_state import *\nget_tensor_model_parallel_rank()\n"
+        self.assertEqual(uncovered_uses(source, self.PACKAGE, deprecated), [2])
 
     def test_allows_warned_fallbacks_and_bootstrap(self):
         cases = [
@@ -679,6 +755,8 @@ class TestUncoveredUses(unittest.TestCase):
             ("from megatron.core import parallel_state\nparallel_state._MPU_X = 0\n", [2]),
             ("from megatron.core import mpu\ndel mpu._DATA_PARALLEL_GROUP\n", [2]),
             ("from megatron.core import mpu\ngetattr(mpu, '_DATA_PARALLEL_GROUP', None)\n", [2]),
+            ("from megatron.core import mpu\nsetattr(mpu, '_DATA_PARALLEL_GROUP', None)\n", [2]),
+            ("from megatron.core import parallel_state\ndelattr(parallel_state, '_MPU_X')\n", [2]),
             (
                 "import megatron.core\ngrid = megatron.core.parallel_state\n"
                 "grid._DATA_PARALLEL_GROUP = None\n",
