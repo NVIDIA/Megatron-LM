@@ -169,11 +169,14 @@ with a `pg_collection`; without one, it falls back to the global grid with a
   from its caller. It counts the calls of the fallbacks of `process_groups_config.py`, which
   read the grid when the caller omits its groups, as guarded: `resolve_process_groups()`,
   `resolve_gtp_remat_group()`, and `ProcessGroupCollection.setup_process_groups_for_ddp()` and
-  `setup_process_groups_for_optimizer()`. A new call of any of them makes the check exit with
-  an error. Its allowlist of the existing calls records which ones are warned: preceded, in the
-  same function, by a `warn_global_process_group_fallback()` call in their block or in a block
-  that contains it, or inside a `with global_process_group_fallback(...)` block. A warned call
-  that loses its warning is an error too.
+  `setup_process_groups_for_optimizer()`, and any read or write of a private attribute of
+  `parallel_state`. It counts a reference whether or not the code calls it, through imports,
+  assigned aliases, `getattr()` with a constant name, `importlib.import_module()` and
+  `sys.modules`. A new call of any of them makes the check exit with an error. Its allowlist of
+  the existing calls records which ones are warned: preceded, in the same function, by a
+  `warn_global_process_group_fallback()` call in their block or in a block that contains it, or
+  inside a `with global_process_group_fallback(...)` block. A warned call that loses its warning
+  is an error too.
 - **A fallback outside Megatron Core** reads the grid inside
   `with global_process_group_fallback(owner, argument, deprecated_in=..., removed_in=...):`
   from `megatron.core.process_groups_config`. It emits one `ProcessGroupFallbackWarning` for the

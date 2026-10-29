@@ -452,7 +452,10 @@ Two checks report new reads of the global grid. CI runs both.
 - the helpers of `process_groups_config.py` that read the grid when the caller omits its groups
   and warn for that fallback: `resolve_process_groups()`, `resolve_gtp_remat_group()`,
   `ProcessGroupCollection.setup_process_groups_for_ddp()` and
-  `setup_process_groups_for_optimizer()` (kind `guarded`).
+  `setup_process_groups_for_optimizer()` (kind `guarded`);
+- reads and writes of the private attributes of `parallel_state`, such as
+  `_DATA_PARALLEL_GROUP` or an `_MPU_*` override (kind `private`). That state is not an
+  interface, so a fallback warning does not make such an entry warned.
 
 `tools/process_group_usage_allowlist.json` records the existing calls. An entry records the
 file, the enclosing function or class, and the function called, but not the line number, so code
@@ -464,10 +467,14 @@ call earlier in the same function, in its block or in a block that contains it, 
 finds a call that the allowlist does not hold, a warned call that lost its warning, or an entry
 whose call is gone.
 
-The check is syntactic. It follows calls made through `parallel_state`, `mpu`, an
-`import ... as` alias, or a direct `from megatron.core.parallel_state import ...`, but not
-through an assigned alias (`grid = parallel_state`) or a dynamic lookup
-(`getattr(parallel_state, name)`). Reviewers still look for reads it cannot see.
+The check is syntactic. It counts every reference, called or not (a function passed as a
+callback counts too), made through `parallel_state`, `mpu`, an import (`import ... as`,
+`from megatron.core.parallel_state import ...` or a star import), an assigned alias
+(`grid = parallel_state`, `self.grid = parallel_state`, or a class attribute reached through
+`self`, `cls` or the class), `getattr()` with a constant name, `importlib.import_module()` or
+`sys.modules`. It does not follow a module passed as an argument, returned by a function or
+stored in a container, or a name built at run time (`getattr(parallel_state, name)`). Reviewers
+still look for reads it cannot see.
 
 `tests/unit_tests/test_parallel_state_accessor_uses.py` guards the code outside Megatron Core:
 the non-test code under `megatron/`, `examples/`, `tools/`, `tasks/`, `scripts/` and `docs/`, and

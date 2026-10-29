@@ -13,6 +13,7 @@ import io
 import json
 import pathlib
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -538,6 +539,324 @@ class TestDetection(unittest.TestCase):
             [],
         )
 
+    def test_assigned_module_aliases(self):
+        hit = "<module>:accessor:parallel_state.get_tensor_model_parallel_group"
+        cases = {
+            "an alias": IMPORT + "grid = parallel_state\ngrid.get_tensor_model_parallel_group()",
+            "an alias of an alias": (
+                "from megatron.core import mpu\ngrid = mpu\nalias = grid\n"
+                "alias.get_tensor_model_parallel_group()"
+            ),
+            "an alias of an attribute chain": (
+                "import megatron.core\ngrid = megatron.core.parallel_state\n"
+                "grid.get_tensor_model_parallel_group()"
+            ),
+            "an alias of a package": (
+                "import megatron\ncore = megatron.core\n"
+                "core.mpu.get_tensor_model_parallel_group()"
+            ),
+            "an annotated alias": (
+                IMPORT + "grid: object = parallel_state\ngrid.get_tensor_model_parallel_group()"
+            ),
+            "an assignment expression": (
+                IMPORT + "if (grid := parallel_state):\n    grid.get_tensor_model_parallel_group()"
+            ),
+            "tuple unpacking": (
+                IMPORT + "grid, size = parallel_state, 1\ngrid.get_tensor_model_parallel_group()"
+            ),
+            "an alias that names itself": (
+                IMPORT + "parallel_state = parallel_state\n"
+                "parallel_state.get_tensor_model_parallel_group()"
+            ),
+            "an alias reassigned to another value": (
+                IMPORT + "grid = parallel_state\ngrid = make_grid()\n"
+                "grid.get_tensor_model_parallel_group()"
+            ),
+        }
+        for case, source in cases.items():
+            with self.subTest(case=case):
+                self.assertEqual(self.hits(source), [hit])
+
+    def test_assigned_aliases_follow_the_scopes_of_imports(self):
+        self.assertEqual(
+            self.hits(
+                IMPORT + "grid = parallel_state\n"
+                "def f():\n    return grid.get_tensor_model_parallel_group()\n"
+                "def g():\n    alias = grid\n    return alias.get_tensor_model_parallel_group()\n"
+            ),
+            [
+                "f:accessor:parallel_state.get_tensor_model_parallel_group",
+                "g:accessor:parallel_state.get_tensor_model_parallel_group",
+            ],
+        )
+        self.assertEqual(
+            self.hits(
+                IMPORT + "def local():\n    grid = parallel_state\n"
+                "def model(grid):\n    return grid.get_tensor_model_parallel_group()\n"
+            ),
+            [],
+        )
+        # The alias takes effect after its own statement.
+        self.assertEqual(
+            self.hits(
+                "def f(grid):\n    grid.get_tensor_model_parallel_group()\n"
+                "    from megatron.core import parallel_state\n    grid = parallel_state\n"
+            ),
+            [],
+        )
+
+    def test_many_reassignments_of_a_name_resolve_quickly(self):
+        # Each binding is resolved once. Resolving the earlier ones again for each later one took
+        # time exponential in their number: 22 took 24 s.
+        self.path.write_text(
+            "def f(x):\n" + "    x = x.module\n    x = x['key']\n" * 30 + "    return x\n",
+            encoding="utf-8",
+        )
+        hits = []
+        worker = threading.Thread(
+            target=lambda: hits.append(checker._violations_in(self.path)), daemon=True
+        )
+        worker.start()
+        worker.join(timeout=10)
+        self.assertEqual(hits, [[]], "resolving 60 reassignments took more than 10 s")
+
+    def test_attribute_aliases_through_self_cls_and_the_class(self):
+        hit = "Model.rank:accessor:parallel_state.get_tensor_model_parallel_group"
+        cases = {
+            "an attribute of the instance, assigned after its use": (
+                "from megatron.core import mpu\nclass Model:\n"
+                "    def rank(self):\n        return self.grid.get_tensor_model_parallel_group()\n"
+                "    def __init__(self):\n        self.grid = mpu\n"
+            ),
+            "an alias of an attribute alias": (
+                "from megatron.core import mpu\nclass Model:\n"
+                "    def __init__(self):\n"
+                "        self.other = mpu\n        self.grid = self.other\n"
+                "    def rank(self):\n        return self.grid.get_tensor_model_parallel_group()\n"
+            ),
+            "a class attribute through self": (
+                "from megatron.core import mpu\nclass Model:\n    grid = mpu\n"
+                "    def rank(self):\n        return self.grid.get_tensor_model_parallel_group()\n"
+            ),
+            "a class attribute through cls": (
+                "from megatron.core import mpu\nclass Model:\n    grid: object = mpu\n"
+                "    def rank(cls):\n        return cls.grid.get_tensor_model_parallel_group()\n"
+            ),
+            "a class attribute through the class": (
+                "from megatron.core import mpu\nclass Model:\n    grid = mpu\n"
+                "    def rank(self):\n        return Model.grid.get_tensor_model_parallel_group()\n"
+            ),
+        }
+        for case, source in cases.items():
+            with self.subTest(case=case):
+                self.assertEqual(self.hits(source), [hit])
+
+    def test_aliases_of_the_other_counted_modules_and_class(self):
+        self.assertEqual(
+            self.hits(
+                IMPORT
+                + SHIM_IMPORT
+                + "PGC = ProcessGroupCollection\nPGC.use_mpu_process_groups()\n"
+                "import megatron.core.process_groups_config as module\npgc = module\n"
+                "pgc.resolve_process_groups" + GUARDED_ARGS + "\n"
+                f"def f():\n    pgc.{WARN}\n    {CALL}\n"
+            ),
+            [
+                "<module>:shim:use_mpu_process_groups",
+                "<module>:guarded:resolve_process_groups",
+                WARNED_HIT,
+            ],
+        )
+
+    def test_getattr_with_a_constant_name(self):
+        cases = [
+            (IMPORT, "getattr(parallel_state, 'get_tensor_model_parallel_group')()"),
+            (
+                "from megatron.core import mpu\n",
+                "getattr(mpu, 'get_tensor_model_parallel_group', None)",
+            ),
+            (
+                "import megatron.core\n",
+                "getattr(megatron.core, 'parallel_state').get_tensor_model_parallel_group()",
+            ),
+            (
+                "import megatron\n",
+                "getattr(megatron.core, 'mpu').get_tensor_model_parallel_group()",
+            ),
+        ]
+        for prefix, call in cases:
+            with self.subTest(call=call):
+                self.assertEqual(
+                    self.hits(prefix + call),
+                    ["<module>:accessor:parallel_state.get_tensor_model_parallel_group"],
+                )
+        self.assertEqual(
+            self.hits(SHIM_IMPORT + "getattr(ProcessGroupCollection, 'use_mpu_process_groups')()"),
+            ["<module>:shim:use_mpu_process_groups"],
+        )
+
+    def test_references_that_are_not_called(self):
+        cases = {
+            "a function stored at module level": (
+                IMPORT + "GET = parallel_state.get_tensor_model_parallel_group\n",
+                "<module>",
+            ),
+            "a fallback default": (
+                IMPORT + "def f(get=None):\n"
+                "    return (get or parallel_state.get_tensor_model_parallel_group)()\n",
+                "f",
+            ),
+            "a callback": (
+                "from megatron.core.parallel_state import get_tensor_model_parallel_group\n"
+                "def f():\n    return functools.partial(get_tensor_model_parallel_group)\n",
+                "f",
+            ),
+            "a default argument": (
+                IMPORT + "def f(get=parallel_state.get_tensor_model_parallel_group):\n"
+                "    return get()\n",
+                "<module>",
+            ),
+        }
+        for case, (source, scope) in cases.items():
+            with self.subTest(case=case):
+                self.assertEqual(
+                    self.hits(source),
+                    [f"{scope}:accessor:parallel_state.get_tensor_model_parallel_group"],
+                )
+
+    def test_an_alias_of_a_function_counts_once(self):
+        # The assignment is the reference; calls through the alias are not counted again.
+        self.assertEqual(
+            self.hits(
+                IMPORT + "GET = parallel_state.get_tensor_model_parallel_group\n"
+                "def f():\n    return GET()\n"
+            ),
+            ["<module>:accessor:parallel_state.get_tensor_model_parallel_group"],
+        )
+
+    def test_module_lookups_by_name(self):
+        hit = "f:accessor:parallel_state.get_tensor_model_parallel_group"
+        cases = {
+            "importlib.import_module": (
+                "import importlib\ndef f():\n    return importlib.import_module("
+                "'megatron.core.parallel_state').get_tensor_model_parallel_group()\n"
+            ),
+            "a direct import of import_module": (
+                "from importlib import import_module\ndef f():\n"
+                "    return import_module('megatron.core').mpu.get_tensor_model_parallel_group()\n"
+            ),
+            "an alias of a looked-up module": (
+                "import importlib\ngrid = importlib.import_module('megatron.core.parallel_state')\n"
+                "def f():\n    return grid.get_tensor_model_parallel_group()\n"
+            ),
+            "sys.modules": (
+                "import sys\ndef f():\n    return sys.modules["
+                "'megatron.core.parallel_state'].get_tensor_model_parallel_group()\n"
+            ),
+            "an alias of sys.modules": (
+                "import sys\nmodules = sys.modules\ndef f():\n"
+                "    return modules['megatron.core.parallel_state']"
+                ".get_tensor_model_parallel_group()\n"
+            ),
+        }
+        for case, source in cases.items():
+            with self.subTest(case=case):
+                self.assertEqual(self.hits(source), [hit])
+
+    def test_star_import(self):
+        self.assertEqual(
+            self.hits(
+                "from megatron.core.parallel_state import *\n"
+                "def f():\n    return get_tensor_model_parallel_group(), getattr(x, 'y'), len(y)\n"
+            ),
+            ["f:accessor:parallel_state.get_tensor_model_parallel_group"],
+        )
+        self.assertEqual(
+            self.hits(
+                "from ..process_groups_config import *\n"
+                "def f():\n    return resolve_process_groups" + GUARDED_ARGS + "\n"
+            ),
+            ["f:guarded:resolve_process_groups"],
+        )
+
+    def test_flags_private_attributes_and_never_warns_them(self):
+        cases = {
+            "a read": IMPORT + "def f():\n    return parallel_state._DATA_PARALLEL_GROUP\n",
+            "a write": IMPORT + "def f():\n    parallel_state._DATA_PARALLEL_GROUP = None\n",
+            "a deletion": IMPORT + "def f():\n    del parallel_state._DATA_PARALLEL_GROUP\n",
+            "getattr": (
+                "from megatron.core import mpu\n"
+                "def f():\n    return getattr(mpu, '_DATA_PARALLEL_GROUP', None)\n"
+            ),
+            "a direct import": (
+                "from megatron.core.parallel_state import _DATA_PARALLEL_GROUP\n"
+                "def f():\n    return _DATA_PARALLEL_GROUP\n"
+            ),
+            "after a fallback warning": (
+                IMPORT + WARN_IMPORT + f"def f():\n    {WARN}\n"
+                "    return parallel_state._DATA_PARALLEL_GROUP\n"
+            ),
+            "in a fallback block": (
+                IMPORT
+                + "from megatron.core.process_groups_config import global_process_group_fallback\n"
+                "def f():\n    with global_process_group_fallback('f'):\n"
+                "        return parallel_state._DATA_PARALLEL_GROUP\n"
+            ),
+        }
+        for case, source in cases.items():
+            with self.subTest(case=case):
+                self.assertEqual(
+                    self.hits(source), ["f:private:parallel_state._DATA_PARALLEL_GROUP"]
+                )
+        # A private deprecated function keeps its own kind.
+        self.assertEqual(
+            self.hits(IMPORT + "parallel_state._set_global_memory_buffer()"),
+            ["<module>:function:parallel_state._set_global_memory_buffer"],
+        )
+
+    def test_ignores_other_aliases_lookups_and_attributes(self):
+        cases = {
+            "a dunder": IMPORT + "parallel_state.__name__",
+            "a public attribute that is not counted": IMPORT + "parallel_state.RankGenerator",
+            "a private attribute of another module": (
+                "from megatron.core import utils\nutils._GLOBAL_MEMORY_BUFFER"
+            ),
+            "an alias of another module": (
+                "from other import parallel_state\ngrid = parallel_state\n"
+                "grid.get_tensor_model_parallel_group()"
+            ),
+            "an alias of a parameter": (
+                IMPORT + "def f(config):\n    grid = config\n"
+                "    return grid.get_tensor_model_parallel_group()\n"
+            ),
+            "an attribute alias of another module": (
+                "class Model:\n    def __init__(self, grid):\n        self.grid = grid\n"
+                "    def rank(self):\n        return self.grid.get_tensor_model_parallel_group()\n"
+            ),
+            "getattr with a name built at run time": IMPORT + "getattr(parallel_state, name)()",
+            "getattr of another object": "getattr(config, 'get_tensor_model_parallel_group')()",
+            "a local function named import_module": (
+                "def import_module(path):\n    return path\n"
+                "import_module('megatron.core.parallel_state').get_tensor_model_parallel_group()"
+            ),
+            "a relative module name": (
+                "import importlib\nimportlib.import_module('.parallel_state', 'megatron.core')"
+                ".get_tensor_model_parallel_group()"
+            ),
+            "another module looked up": (
+                "import sys\nsys.modules['other.parallel_state'].get_tensor_model_parallel_group()"
+            ),
+            "a star import of another module": (
+                "from other import *\nget_tensor_model_parallel_group()"
+            ),
+            "aliases that refer to each other only": (
+                "a = b\nb = a\ndef f():\n    return a.get_tensor_model_parallel_group()\n"
+            ),
+        }
+        for case, source in cases.items():
+            with self.subTest(case=case):
+                self.assertEqual(self.hits(source), [])
+
     def test_line_shifts_do_not_change_identity(self):
         source = IMPORT + "def f():\n    " + CALL + "\n"
         self.assertEqual(self.hits(source), self.hits("# inserted comment\n\n" + source))
@@ -681,7 +1000,8 @@ class TestRatchet(unittest.TestCase):
             + SHIM_IMPORT
             + GUARDED_IMPORT
             + WARN_IMPORT
-            + f"{CALL}\n{GUARDED_CALL}\ndef f():\n    {WARN}\n    {CALL}; {SHIM_CALL}\n",
+            + f"{CALL}\n{GUARDED_CALL}\ndef f():\n    {WARN}\n    {CALL}; {SHIM_CALL}\n"
+            + "    parallel_state._DATA_PARALLEL_GROUP = None\n",
             encoding="utf-8",
         )
         output = io.StringIO()
@@ -689,17 +1009,55 @@ class TestRatchet(unittest.TestCase):
             self.assertEqual(checker.main(["--stats"]), 0)
         lines = output.getvalue().splitlines()
         self.assertEqual(
-            lines[0], "4 use(s) of global parallel_state across 1 file(s) in megatron/core"
+            lines[0], "5 use(s) of global parallel_state across 1 file(s) in megatron/core"
         )
         self.assertEqual(
-            [line.split() for line in lines[1:5]],
-            [["accessor", "2"], ["function", "0"], ["shim", "1"], ["guarded", "1"]],
+            [line.split() for line in lines[1:6]],
+            [
+                ["accessor", "2"],
+                ["function", "0"],
+                ["shim", "1"],
+                ["guarded", "1"],
+                ["private", "1"],
+            ],
         )
         self.assertEqual(
-            lines[5],
-            "3 accessor, function and shim use(s), by whether a fallback warning precedes them",
+            lines[6],
+            "4 accessor, function, shim and private use(s), by whether a fallback warning "
+            "precedes them",
         )
-        self.assertEqual([line.split() for line in lines[6:]], [["warned", "2"], ["unwarned", "1"]])
+        self.assertEqual([line.split() for line in lines[7:]], [["warned", "2"], ["unwarned", "2"]])
+
+    def test_new_private_use_fails_with_its_own_hint(self):
+        hint = "A 'private' use reads or writes the internal state of parallel_state"
+        for call, has_hint in {
+            "parallel_state._DATA_PARALLEL_GROUP = None": True,
+            CALL: False,
+        }.items():
+            with self.subTest(call=call):
+                self.write_baseline("")
+                self.source.write_text(IMPORT + WARN_IMPORT + f"{WARN}\n{call}", encoding="utf-8")
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(checker.main([]), 1)
+                self.assertIn("1 new use(s) of global parallel_state", output.getvalue())
+                self.assertEqual(hint in output.getvalue(), has_hint)
+
+    def test_new_read_forms_fail_the_ratchet(self):
+        # Reads that the check did not see before: an assigned alias, getattr() with a constant
+        # name, an uncalled reference, a module looked up by name, and a private attribute.
+        for read in (
+            "grid = parallel_state\ngrid.get_tensor_model_parallel_group()",
+            "getattr(parallel_state, 'get_tensor_model_parallel_group')()",
+            "GET = parallel_state.get_tensor_model_parallel_group",
+            "import sys\nsys.modules['megatron.core.parallel_state'].get_data_parallel_group()",
+            "parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = 0",
+        ):
+            with self.subTest(read=read):
+                self.write_baseline(IMPORT)
+                self.source.write_text(IMPORT + read, encoding="utf-8")
+                self.assertEqual(self.run_check(), 1)
+                self.assertEqual(self.run_check("--update"), 1)
 
     def test_read_that_loses_its_warning_fails(self):
         self.write_baseline(IMPORT + WARN_IMPORT + f"def f():\n    {WARN}\n    {CALL}\n")
