@@ -519,6 +519,11 @@ class TransformerConfig(ModelParallelConfig):
     """Fuse GatedDeltaNet output RMSNorm and SiLU gating. Unsupported configurations and
     layouts raise on every forward; see docs/developer/gdn_ew_fusion.md for requirements."""
 
+    gdn_conv_pad_alignment: Optional[int] = None
+    """When set, pad packed GDN causal-conv inputs to this token alignment.
+    This is only valid without chunkwise CP: padding a chunk-local causal-conv input changes
+    the sequence seen by later chunks and therefore changes the GDN recurrence numerics."""
+
     ####################
     # initialization
     ####################
@@ -699,7 +704,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-    "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
+    "shared_experts", "gdn", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
     "shortcut_pre_mlp_layernorm", "residual_stream", "dsa_simple_routing",
     "dsa_indexer_k", "dsa_selected_scores".
     default: ["core_attn"].
@@ -710,6 +715,7 @@ class TransformerConfig(ModelParallelConfig):
     "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
+    "gdn": recompute the full GDN-family layer, including gated norm.
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
     "gdp_in_proj": recompute the GatedDeltaProduct input projection and its CP gather/split
     preprocessing.
@@ -734,7 +740,7 @@ class TransformerConfig(ModelParallelConfig):
             dsa_indexer_use_sparse_loss.
     "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
     "shortcut_pre_mlp_layernorm", and "residual_stream" use output-discarding checkpointing;
-    "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
+    "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
     """
 
     ####################
@@ -1527,9 +1533,10 @@ class TransformerConfig(ModelParallelConfig):
     inference_grouped_gemm_backend: Literal['flashinfer', 'torch', 'vllm'] = "vllm"
     """Specifies the backend to use for grouped GEMM operations during inference.
     Options:
-    - 'flashinfer': Uses FlashInfer cutlass_fused_moe for BF16 and TRT-LLM routed
-      block-scale MoE for MXFP8. The MXFP8 path retains canonical expert weights
-      for refit and also stores a padded TRT-LLM Major-K copy, increasing
+    - 'flashinfer': Uses FlashInfer cutlass_fused_moe for BF16 and tanh-clamped
+      squared-ReLU MXFP8, and TRT-LLM routed block-scale MoE for unclamped MXFP8.
+      The MXFP8 paths retain canonical expert weights
+      for refit and also store a derived execution copy, increasing
       expert-weight memory relative to the torch backend.
     - 'torch': Uses torch.nn.functional.grouped_mm (mcore_fused_moe with Triton kernels).
       Supports both BF16 and MXFP8.
@@ -2270,6 +2277,52 @@ class TransformerConfig(ModelParallelConfig):
                     f"got '{self.inference_grouped_gemm_backend}'."
                 )
 
+            if (
+                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+                and (mxfp8_enabled or self.activation_func_tanh_clamp_scale is not None)
+                and self.activation_func != squared_relu
+            ):
+                raise ValueError(
+                    "FlashInfer MXFP8 or tanh-clamped MoE supports only non-gated squared-ReLU "
+                    "experts."
+                )
+
+            if (
+                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+                and self.activation_func_tanh_clamp_scale is not None
+            ):
+                if not math.isfinite(self.activation_func_tanh_clamp_scale):
+                    raise ValueError("FlashInfer ClampedRelu2 requires a finite clamp scale.")
+                if mxfp8_enabled:
+                    expert_hidden = (
+                        self.moe_latent_size
+                        if self.moe_latent_size is not None
+                        else self.hidden_size
+                    )
+                    expert_ffn = (
+                        self.moe_ffn_hidden_size
+                        if self.moe_ffn_hidden_size is not None
+                        else self.ffn_hidden_size
+                    )
+                    if expert_hidden % 128 or expert_ffn % 128:
+                        raise ValueError(
+                            "FlashInfer CUTLASS MXFP8 requires expert hidden and FFN "
+                            f"dimensions divisible by 128; got ({expert_hidden}, {expert_ffn})."
+                        )
+                if self.add_bias_linear:
+                    raise ValueError(
+                        "FlashInfer CUTLASS ClampedRelu2 requires add_bias_linear=False."
+                    )
+                if self.batch_invariant_mode:
+                    raise ValueError(
+                        "FlashInfer CUTLASS ClampedRelu2 does not support batch_invariant_mode."
+                    )
+                if self.inference_flashinfer_mxfp8_token_capacity is not None:
+                    raise ValueError(
+                        "inference_flashinfer_mxfp8_token_capacity is supported only by the "
+                        "unclamped routed backend, not CUTLASS ClampedRelu2."
+                    )
+
             if mxfp8_enabled:
                 if not self.fp8_param:
                     raise ValueError(
@@ -2277,18 +2330,6 @@ class TransformerConfig(ModelParallelConfig):
                         "--transformer-impl='inference_optimized' with --fp8-recipe='mxfp8'. "
                         "Please set --fp8-param-gather."
                     )
-
-            if (
-                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
-                and mxfp8_enabled
-                and (self.gated_linear_unit or self.activation_func != squared_relu)
-            ):
-                raise ValueError(
-                    "FlashInfer routed MXFP8 MoE currently supports only non-gated "
-                    "squared-ReLU experts. Set activation_func=squared_relu and "
-                    "gated_linear_unit=False, or select inference_grouped_gemm_backend "
-                    "'torch' or 'vllm'."
-                )
 
             if self.inference_flashinfer_mxfp8_token_capacity is not None:
                 if self.inference_flashinfer_mxfp8_token_capacity <= 0:
@@ -2918,6 +2959,11 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_modules = ["core_attn"]
 
         if self.recompute_granularity == "selective":
+            from megatron.core.ssm.kda_layer_config import KDALayerConfig
+
+            is_kda_variant = isinstance(self, KDALayerConfig) or (
+                self.experimental_attention_variant == "kda"
+            )
             if len(self.recompute_modules) > 0:
                 allowed_modules = {
                     "core_attn",
@@ -2927,6 +2973,7 @@ class TransformerConfig(ModelParallelConfig):
                     "mlp",
                     "moe",
                     "shared_experts",
+                    "gdn",
                     "gdn_norm_out",
                     "gdp_in_proj",
                     "gdp_qkv",
@@ -2954,12 +3001,32 @@ class TransformerConfig(ModelParallelConfig):
                     "multi_latent_attention."
                 )
 
-            if "gdn_norm_out" in self.recompute_modules and (
-                not is_gated_delta_net_variant(self.experimental_attention_variant)
+            if (
+                "gdn_norm_out" in self.recompute_modules
+                and not self.is_hybrid_model
+                and not is_kda_variant
+                and not is_gated_delta_net_variant(self.experimental_attention_variant)
             ):
                 raise ValueError(
                     "gdn_norm_out in recompute_modules is only supported with "
-                    "experimental_attention_variant='gdn' or 'gdn2'."
+                    f"GDN-family layers, but got {self.experimental_attention_variant=}."
+                )
+
+            if (
+                "gdn" in self.recompute_modules
+                and not self.is_hybrid_model
+                and not is_kda_variant
+                and not is_gated_delta_net_variant(self.experimental_attention_variant)
+            ):
+                raise ValueError(
+                    "gdn in recompute_modules is only supported with GDN-family layers, but got "
+                    f"{self.experimental_attention_variant=} and {self.is_hybrid_model=}."
+                )
+
+            if "gdn" in self.recompute_modules and "gdn_norm_out" in self.recompute_modules:
+                raise ValueError(
+                    "'gdn' and 'gdn_norm_out' in recompute_modules cannot be used together. "
+                    "'gdn' recomputes the full GDN-family layer, including gated norm."
                 )
 
             if "core_attn" in self.recompute_modules:
