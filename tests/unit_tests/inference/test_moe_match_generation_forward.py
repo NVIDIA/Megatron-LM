@@ -530,6 +530,31 @@ class TestValuePassRuns:
             layer(_hidden(train_config, seed=0))
         assert len(seen) == 1, "the eval forward did not take the FlashInfer kernel"
 
+    @pytest.mark.parametrize("recipe", list(RECIPES))
+    def test_kernel_weights_are_built_once_per_forward_backward_call(self, recipe):
+        """Later microbatches reuse the kernel weights; the next call rebuilds them.
+
+        Each build first runs the expert linears' pre-forward hooks, which is where DDP
+        finishes an overlapped parameter all-gather before the weights are read.
+        """
+        _skip_unless_supported(recipe)
+        gen_config, train_config = _generation_and_training_configs(recipe)
+        _, layer = _layer_pair(recipe, gen_config, train_config, max_tokens=HEAP_TOKENS)
+        experts = layer.experts
+        builds, hook_calls = [], []
+        build = experts._build_match_generation_weights
+        experts._build_match_generation_weights = lambda: builds.append(1) or build()
+        experts.linear_fc1.register_forward_pre_hook(lambda *_: hook_calls.append(1))
+        hidden = _hidden(train_config, seed=0)
+        with torch.no_grad(), _fp8_context(train_config):
+            layer.set_is_first_microbatch()
+            layer(hidden)
+            layer(hidden)
+            layer.set_is_first_microbatch()
+            layer(hidden)
+        assert len(builds) == 2
+        assert len(hook_calls) == 2
+
 
 @_on_flashinfer_gpu("_batch_invariant")
 class TestTrainGenParity:

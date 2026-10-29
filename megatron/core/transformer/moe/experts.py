@@ -1469,13 +1469,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # Set by MoELayer: True on the recompute pass, which takes the TE path.
         self._in_inference_recompute = False
         # The value pass's kernel weights, kept until the parameters may have moved:
-        # MegatronModule.set_is_first_microbatch sets is_first_microbatch at the first
-        # microbatch of every forward-backward call, as for TE's weight cache.
+        # MegatronModule.set_is_first_microbatch drops them at the first microbatch of
+        # every forward-backward call, when TE refreshes its quantized weights.
         self._match_generation_weights = None
         if self._match_generation_forward:
-            self.is_first_microbatch = True
             self.register_load_state_dict_post_hook(
-                lambda module, _: setattr(module, "is_first_microbatch", True)
+                lambda module, _: setattr(module, "_match_generation_weights", None)
             )
 
     @torch.inference_mode(False)
@@ -1969,10 +1968,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         next one, and reused for the rest of it.
         """
         assert routing_map is not None, "routing_map is required for the training forward."
-        if self.is_first_microbatch or self._match_generation_weights is None:
-            self._match_generation_weights = None
+        if self._match_generation_weights is None:
             self._match_generation_weights = self._build_match_generation_weights()
-            self.is_first_microbatch = False
         mxfp8_weights, nvfp4_weights = self._match_generation_weights
         output = self._flashinfer_routed_forward(
             hidden_states,
@@ -1985,6 +1982,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
     def _build_match_generation_weights(self):
         """The value pass's (MXFP8, NVFP4) kernel weights, one of them None, from the parameters."""
+        # The weights are read without running linear_fc1 or linear_fc2, so their
+        # pre-forward hooks, which finish DDP's overlapped parameter all-gather, run here.
+        for submodule in chain(self.linear_fc1.modules(), self.linear_fc2.modules()):
+            for hook in submodule._forward_pre_hooks.values():
+                hook(submodule, None)
         mxfp8_weights = nvfp4_weights = None
         with torch.no_grad():
             if self._nvfp4_recipe is not None:

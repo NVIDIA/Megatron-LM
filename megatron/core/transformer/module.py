@@ -152,12 +152,10 @@ class MegatronModule(torch.nn.Module):
         When this flag is set, TE modules will update their fp8 parameter cache.
         If kitchen is being used, kitchen controls quantization level.
         A quant_recipe (e.g. from --te-precision-config-file) also enables the flag.
-        So does moe_match_generation_forward, whose MoE value pass rebuilds its kernel
-        weights on it; TE ignores the flag when no quantization tracks it.
+        With moe_match_generation_forward, this also drops the MoE value pass's cached
+        kernel weights, which its next forward rebuilds from the parameters.
         """
-        if is_first_microbatch_tracked(self.config) or getattr(
-            self.config, "moe_match_generation_forward", False
-        ):
+        if is_first_microbatch_tracked(self.config):
             if not hasattr(self, "modules_with_is_first_microbatch"):
                 self.modules_with_is_first_microbatch = []
                 for m in self.modules():
@@ -165,6 +163,13 @@ class MegatronModule(torch.nn.Module):
                         self.modules_with_is_first_microbatch.append(m)
             for m in self.modules_with_is_first_microbatch:
                 m.is_first_microbatch = True
+        if getattr(self.config, "moe_match_generation_forward", False):
+            if not hasattr(self, "modules_with_match_generation_weights"):
+                self.modules_with_match_generation_weights = [
+                    m for m in self.modules() if hasattr(m, "_match_generation_weights")
+                ]
+            for m in self.modules_with_match_generation_weights:
+                m._match_generation_weights = None
 
     def set_symmetric_ar(self, set_to: Optional[str] = None) -> None:
         """
