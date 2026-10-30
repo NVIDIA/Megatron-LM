@@ -65,13 +65,14 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
 )
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.multi_latent_attention import (
     FusedMLASelfAttention,
     MLASelfAttention,
     MLASelfAttentionSubmodules,
 )
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
-from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from tests.unit_tests.test_utilities import (
@@ -454,6 +455,18 @@ def _build_mtp_block():
     return MultiTokenPredictionBlock(config=config, spec=spec)
 
 
+def _build_moe_layer(**overrides):
+    config = _transformer_config(
+        num_moe_experts=4,
+        moe_ffn_hidden_size=64,
+        moe_router_topk=2,
+        add_bias_linear=False,
+        **overrides,
+    )
+    layer = get_gpt_layer_local_submodules(num_experts=4, moe_grouped_gemm=False)
+    return MoELayer(config, get_submodules(layer.mlp))
+
+
 def _owners_without_collection():
     """Owners built without a collection, and the owner that their fallback warning names."""
     local = _local_owners()
@@ -468,6 +481,11 @@ def _owners_without_collection():
             "SimplifiedDSGQAIndexer",
         ),
         "mtp_block": (_build_mtp_block, "MultiTokenPredictionBlock"),
+        "moe_layer": (_build_moe_layer, "MoELayer"),
+        "moe_layer_with_shared_experts": (
+            partial(_build_moe_layer, moe_shared_expert_intermediate_size=64),
+            "MoELayer",
+        ),
     }
 
 
@@ -526,8 +544,9 @@ def test_owner_without_collection_warns_once(global_grid, owner):
     [
         ("self_attention", attrgetter("pg_collection"), ("gtp_remat",)),
         ("mtp_block", attrgetter("layers.0.pg_collection"), ("gtp_remat",)),
+        ("moe_layer", attrgetter("experts.pg_collection"), ("gtp_remat", "expt_gtp_remat")),
     ],
-    ids=["self_attention", "mtp_block"],
+    ids=["self_attention", "mtp_block", "moe_layer"],
 )
 def test_owner_fallback_collection_holds_the_global_gtp_groups(
     global_grid, owner, fallback_collection, fields
