@@ -14,6 +14,7 @@ from megatron.core.inference.communication.torch_symm_triton.utils import (
     is_device_nvls_capable,
     sync_threads,
 )
+from megatron.core.inference.moe.activations import GLUOptions, glu_columns, glu_inputs
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     grouped_gemm_batch_invariant,
     grouped_gemm_batch_invariant_alignment,
@@ -69,6 +70,7 @@ def _squared_relu_with_probs_kernel(
     max_rows,
     clamp_scale,
     CLAMP: tl.constexpr,
+    APPLY_PROBS: tl.constexpr,
     ZERO_PADDING: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
@@ -78,7 +80,8 @@ def _squared_relu_with_probs_kernel(
     Matches the training fused weighted-squared-relu rounding, clamped (CLAMP) and
     unclamped alike: the square and the routing probability are applied in FP32 with a
     single BF16 round at the end. Rounding the square first, as the BF16 input dtype
-    invites, costs a routed element its last bit.
+    invites, costs a routed element its last bit. Without APPLY_PROBS the probability
+    is 1 (it was applied to the expert input), which the multiply would leave exact.
     """
     pid = tl.program_id(0)
     n_used = tl.load(n_used_ptr)
@@ -90,7 +93,8 @@ def _squared_relu_with_probs_kernel(
         if row < n_used:
             row_i64 = row.to(tl.int64)
             if tl.load(permutation_map_ptr + row_i64) >= 0:
-                prob = tl.load(probs_ptr + row_i64)
+                if APPLY_PROBS:
+                    prob = tl.load(probs_ptr + row_i64)
                 for offset in tl.range(0, hidden_size, BLOCK_SIZE):
                     cols = offset + tl.arange(0, BLOCK_SIZE)
                     mask = cols < hidden_size
@@ -101,7 +105,9 @@ def _squared_relu_with_probs_kernel(
                     if CLAMP:
                         value = clamp_scale * libdevice.tanh(value / clamp_scale)
                     value = value * value
-                    value = (value * prob).to(tl.bfloat16)
+                    if APPLY_PROBS:
+                        value = value * prob
+                    value = value.to(tl.bfloat16)
                     tl.store(output_ptr + row_i64 * hidden_size + cols, value, mask=mask)
             elif ZERO_PADDING:
                 for offset in tl.range(0, hidden_size, BLOCK_SIZE):
@@ -120,6 +126,11 @@ def _swiglu_with_probs_kernel(
     probs_ptr,
     ffn_size,  # output width; input row width is 2*ffn_size (gate | up)
     max_rows,
+    clamp_value,
+    linear_offset,
+    CLAMP: tl.constexpr,
+    OFFSET: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
     ZERO_PADDING: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
@@ -127,9 +138,11 @@ def _swiglu_with_probs_kernel(
     """Apply gated SiLU (SwiGLU) and router probabilities in training order.
 
     Matches the training fused weighted-swiglu rounding: SiLU(gate)*up*prob is
-    computed in FP32 with a single BF16 round at the end. Input row width is
-    2*ffn_size: gate = first half, up = second half (megatron chunk
-    convention). Fixed NUM_BLOCKS CTAs iterating rows -> CUDA-graph safe.
+    computed in FP32 with a single BF16 round at the end. The hard clamp (CLAMP)
+    precedes it in FP32, as in training's fused clamped weighted-swiglu. Input row
+    width is 2*ffn_size: gate = first half, up = second half (megatron chunk
+    convention), or interleaved blocks (see glu_columns). Fixed NUM_BLOCKS CTAs
+    iterating rows -> CUDA-graph safe.
     """
     pid = tl.program_id(0)
     n_used = tl.load(n_used_ptr)
@@ -146,10 +159,12 @@ def _swiglu_with_probs_kernel(
                 for offset in tl.range(0, ffn_size, BLOCK_SIZE):
                     cols = offset + tl.arange(0, BLOCK_SIZE)
                     mask = cols < ffn_size
-                    gate = tl.load(input_ptr + row_i64 * two_n + cols, mask=mask).to(tl.float32)
-                    up = tl.load(input_ptr + row_i64 * two_n + ffn_size + cols, mask=mask).to(
+                    gate_cols, up_cols = glu_columns(cols, ffn_size, INTERLEAVE)
+                    gate = tl.load(input_ptr + row_i64 * two_n + gate_cols, mask=mask).to(
                         tl.float32
                     )
+                    up = tl.load(input_ptr + row_i64 * two_n + up_cols, mask=mask).to(tl.float32)
+                    gate, up = glu_inputs(gate, up, clamp_value, linear_offset, CLAMP, OFFSET)
                     # Match training's fused SiLU instruction order. Multiplying
                     # by sigmoid can round differently before MXFP8 quantization.
                     value = (gate / (1.0 + libdevice.exp(-gate))) * up * prob
@@ -168,11 +183,15 @@ def swiglu_with_probs(
     n_used: torch.Tensor,
     probs: torch.Tensor,
     zero_padding: bool = False,
+    glu_options: GLUOptions = GLUOptions(),
 ) -> torch.Tensor:
     """Gated-SiLU counterpart of squared_relu_with_probs (SwiGLU models).
 
     ``zero_padding`` initializes aligned dummy rows because MXFP8 quantization and
-    grouped GEMM have no permutation map with which to skip them.
+    grouped GEMM have no permutation map with which to skip them. ``glu_options``
+    holds the clamp, linear offset and FC1 interleaving of the gated activation; ``x``
+    stays in the FC1 layout (gate | up, or interleaved blocks), which the kernel reads
+    directly.
     """
     num_rows, two_ffn = x.shape
     ffn_size = two_ffn // 2
@@ -187,6 +206,7 @@ def swiglu_with_probs(
         probs,
         ffn_size,
         num_rows,
+        **glu_options.kernel_args(ffn_size),
         ZERO_PADDING=zero_padding,
         BLOCK_SIZE=block_size,
         NUM_BLOCKS=num_blocks,
@@ -196,7 +216,19 @@ def swiglu_with_probs(
 
 @triton.jit
 def _weighted_silu_mul_bounded_kernel(
-    in_ptr0, in_ptr1, out_ptr0, bound_ptr, xnumel, HALF_N: tl.constexpr, XBLOCK: tl.constexpr
+    in_ptr0,
+    in_ptr1,
+    out_ptr0,
+    bound_ptr,
+    xnumel,
+    clamp_value,
+    linear_offset,
+    CLAMP: tl.constexpr,
+    OFFSET: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
+    APPLY_WEIGHTS: tl.constexpr,
+    HALF_N: tl.constexpr,
+    XBLOCK: tl.constexpr,
 ):
     """Device-bounded weighted SwiGLU with training-parity rounding.
 
@@ -209,6 +241,11 @@ def _weighted_silu_mul_bounded_kernel(
     CUDA-graph-safe) striding while xoffset < a DEVICE element bound
     (= valid_tokens * topk * HALF_N — the live prefix of the flat token-major
     layout). Rows beyond the bound are neither read nor written.
+
+    The GLU options (glu_columns, glu_inputs) only select and transform the FP32
+    inputs of that sequence, as training's fused clamped weighted-swiglu does. Without
+    APPLY_WEIGHTS the weight is 1 (it was applied to the expert input), which the
+    multiply would leave exact.
     """
     xbound = tl.load(bound_ptr)
     num_progs = tl.num_programs(0)
@@ -218,9 +255,10 @@ def _weighted_silu_mul_bounded_kernel(
         xmask = (xindex < xbound) & (xindex < xnumel)
         x0 = xindex % HALF_N
         x1 = xindex // HALF_N
-        tmp0 = tl.load(in_ptr0 + (x0 + 2 * HALF_N * x1), xmask).to(tl.float32)
-        tmp8 = tl.load(in_ptr0 + (HALF_N + x0 + 2 * HALF_N * x1), xmask).to(tl.float32)
-        tmp11 = tl.load(in_ptr1 + (x1), xmask, eviction_policy='evict_last')
+        gate_cols, up_cols = glu_columns(x0, HALF_N, INTERLEAVE)
+        tmp0 = tl.load(in_ptr0 + (gate_cols + 2 * HALF_N * x1), xmask).to(tl.float32)
+        tmp8 = tl.load(in_ptr0 + (up_cols + 2 * HALF_N * x1), xmask).to(tl.float32)
+        tmp0, tmp8 = glu_inputs(tmp0, tmp8, clamp_value, linear_offset, CLAMP, OFFSET)
         tmp1 = tmp0.to(tl.float32)
         tmp2 = -tmp1
         tmp3 = libdevice.exp(tmp2)
@@ -230,7 +268,11 @@ def _weighted_silu_mul_bounded_kernel(
         tmp7 = tmp6.to(tl.float32)
         tmp9 = tmp7 * tmp8
         tmp10 = tmp9.to(tl.float32)
-        tmp12 = tmp10 * tmp11
+        if APPLY_WEIGHTS:
+            tmp11 = tl.load(in_ptr1 + (x1), xmask, eviction_policy='evict_last')
+            tmp12 = tmp10 * tmp11
+        else:
+            tmp12 = tmp10
         tmp13 = tmp12.to(tl.float32)
         tl.store(out_ptr0 + xindex, tmp13, xmask)
         xoffset += num_progs * XBLOCK
@@ -238,15 +280,20 @@ def _weighted_silu_mul_bounded_kernel(
 
 def weighted_silu_mul_bounded(
     y: torch.Tensor,
-    weights_flat: torch.Tensor,
+    weights_flat: Optional[torch.Tensor],
     bound_elems: torch.Tensor,
     num_programs: Optional[int] = None,
     xblock: int = 1024,
+    glu_options: GLUOptions = GLUOptions(),
 ) -> torch.Tensor:
     """SwiGLU with routing weights applied at the activation (training parity).
 
-    y: [rows, 2*half_n] bf16 (gate | up); weights_flat: [rows] fp32 routing
-    probabilities; bound_elems: device scalar = live_rows * half_n.
+    y: [rows, 2*half_n] bf16, laid out as (gate | up) or, with
+    glu_options.interleave_size, as interleaved gate and up blocks (see glu_columns;
+    the kernel reads either layout directly, so do not de-interleave beforehand);
+    weights_flat: [rows] fp32 routing probabilities, or None when they were applied to
+    the expert input; bound_elems: device scalar = live_rows * half_n; glu_options:
+    clamp, linear offset and FC1 interleaving of the gated activation.
     Returns [rows, half_n] bf16; rows beyond the live bound are untouched.
 
     num_programs defaults to SMs * 8 waves (Inductor's persistent-grid sizing;
@@ -263,7 +310,16 @@ def weighted_silu_mul_bounded(
         num_programs = _get_num_sms(y.device) * 8
     out = torch.empty(rows, half_n, dtype=y.dtype, device=y.device)
     _weighted_silu_mul_bounded_kernel[(num_programs,)](
-        y, weights_flat, out, bound_elems, rows * half_n, HALF_N=half_n, XBLOCK=xblock
+        y,
+        # Unread without weights; any device tensor fills the pointer argument.
+        y if weights_flat is None else weights_flat,
+        out,
+        bound_elems,
+        rows * half_n,
+        **glu_options.kernel_args(half_n),
+        APPLY_WEIGHTS=weights_flat is not None,
+        HALF_N=half_n,
+        XBLOCK=xblock,
     )
     return out
 
@@ -272,13 +328,15 @@ def squared_relu_with_probs(
     x: torch.Tensor,
     permutation_map: torch.Tensor,
     n_used: torch.Tensor,
-    probs: torch.Tensor,
+    probs: Optional[torch.Tensor],
     clamp_scale: Optional[float] = None,
     zero_padding: bool = False,
 ) -> torch.Tensor:
     """Match training's BF16 squared-ReLU rounding before the FP32 probability multiply.
 
     Args:
+        probs: per-row FP32 routing probabilities, or None when they were applied to the
+            expert input.
         clamp_scale: config.activation_func_tanh_clamp_scale. If set, precondition the
             input with the tanh soft clamp ``s * tanh(x / s)``.
         zero_padding: initialize aligned dummy rows because MXFP8 quantization and
@@ -293,11 +351,13 @@ def squared_relu_with_probs(
         out,
         permutation_map,
         n_used,
-        probs,
+        # Unread without probabilities; any device tensor fills the pointer argument.
+        x if probs is None else probs,
         hidden_size,
         num_rows,
         clamp_scale if clamp_scale is not None else 0.0,
         CLAMP=clamp_scale is not None,
+        APPLY_PROBS=probs is not None,
         ZERO_PADDING=zero_padding,
         BLOCK_SIZE=block_size,
         NUM_BLOCKS=num_blocks,

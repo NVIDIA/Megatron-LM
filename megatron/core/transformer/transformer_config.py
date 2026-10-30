@@ -2258,6 +2258,17 @@ class TransformerConfig(ModelParallelConfig):
                         "cannot be combined with FP8 inference or fp4_param."
                     )
 
+            if (
+                self.moe_apply_probs_on_input
+                and self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+            ):
+                raise ValueError(
+                    "moe_apply_probs_on_input is not supported with "
+                    "inference_grouped_gemm_backend='flashinfer': the FlashInfer MoE kernels "
+                    "apply routing probabilities only to the expert output. Select "
+                    "inference_grouped_gemm_backend 'torch' or 'vllm'."
+                )
+
             # Gated linear units (SwiGLU/GeGLU) are supported by the torch and vLLM
             # grouped-GEMM backends, and SwiGLU by FlashInfer per-token NVFP4.
             if (
@@ -3685,6 +3696,26 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "use_te_activation_func must be False "
                     "when activation_func_clamp_value is not None for SwiGLU"
+                )
+
+        # The Transformer Engine GLU activations have no linear offset, so the paths that use
+        # them would train without glu_linear_offset while every other path applies it.
+        if self.gated_linear_unit and self.glu_linear_offset != 0.0:
+            if self.use_te_activation_func:
+                raise ValueError(
+                    "glu_linear_offset is not supported with use_te_activation_func: the "
+                    "Transformer Engine GLU activations have no linear offset. Set "
+                    "use_te_activation_func=False."
+                )
+            if (
+                self.use_transformer_engine_op_fuser
+                and self.moe_grouped_gemm
+                and self.activation_func == F.silu
+            ):
+                raise ValueError(
+                    "glu_linear_offset with SwiGLU experts is not supported with "
+                    "use_transformer_engine_op_fuser: the fused grouped-MLP SwiGLU has no "
+                    "linear offset. Unset use_transformer_engine_op_fuser."
                 )
 
         if self.apply_rope_fusion:

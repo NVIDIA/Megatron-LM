@@ -893,6 +893,35 @@ class TestPermuteAndQuantizeMxfp8:
             rtol=0,
         )
 
+    @pytest.mark.parametrize("zero_padding", [False, True])
+    def test_scale_by_probs_matches_pytorch_ref(self, zero_padding):
+        """moe_apply_probs_on_input: each row quantizes BF16(prob * token), as training's
+        scaled expert input does, and its permuted probability becomes 1."""
+        from megatron.core.inference.moe.permute import permute_and_quantize_mxfp8
+
+        num_tokens, K, num_experts = 64, 256, 8
+        hidden, probs, routing_map = self._make_inputs(num_tokens, K, 1, num_experts)
+
+        fused_mxfp8, permuted_probs, perm_map, offs = permute_and_quantize_mxfp8(
+            hidden,
+            probs,
+            routing_map,
+            0,
+            num_experts,
+            _vt(num_tokens),
+            alignment=128,
+            zero_padding=zero_padding,
+            scale_by_probs=True,
+        )
+
+        real = (perm_map[: offs[-1].item()] >= 0).nonzero(as_tuple=True)[0]
+        src = perm_map[real].long()
+        _, ref_data = ref_to_mxfp((hidden[src].float() * probs[src]).to(torch.bfloat16))
+        torch.testing.assert_close(
+            fused_mxfp8.data[real].view(torch.uint8), ref_data.view(torch.uint8), atol=0, rtol=0
+        )
+        torch.testing.assert_close(permuted_probs[real], torch.ones_like(permuted_probs[real]))
+
     @pytest.mark.parametrize(
         "num_tokens,K,topk,num_experts", [(16, 128, 2, 8), (32, 256, 4, 8), (64, 2688, 8, 128)]
     )

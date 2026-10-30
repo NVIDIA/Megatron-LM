@@ -126,6 +126,16 @@ def test_config_accepts_mxfp8_batch_invariant_backends(backend, gated_linear_uni
     assert config.batch_invariant_mode
 
 
+def test_config_rejects_flashinfer_probs_on_input():
+    """FlashInfer applies routing probabilities only to the expert output."""
+    with pytest.raises(ValueError, match="moe_apply_probs_on_input"):
+        _make_base_config(
+            inference_grouped_gemm_backend="flashinfer",
+            moe_router_topk=1,
+            moe_apply_probs_on_input=True,
+        )
+
+
 @pytest.mark.parametrize("grouped_tensor", [False, True])
 def test_config_batch_invariant_device_metadata_gemm(monkeypatch, grouped_tensor):
     monkeypatch.setenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "0" if grouped_tensor else "1")
@@ -1159,6 +1169,155 @@ class TestNVLSAllGatherVDispatcher:
             base_local_tokens=500,
             outlier_tokens=True,
         )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# InferenceGroupedMLP expert options (parity with training)
+# ──────────────────────────────────────────────────────────────────────
+
+# Expert options that TEGroupedMLP applies in training, each with a value that moves the
+# output far beyond BF16 noise. moe_apply_probs_on_input requires top-1 routing.
+_EXPERT_OPTIONS = {
+    "swiglu": {},
+    "activation_func_clamp_value": {"activation_func_clamp_value": 0.5},
+    "glu_linear_offset": {"glu_linear_offset": 1.0},
+    "moe_mlp_glu_interleave_size": {"moe_mlp_glu_interleave_size": 32},
+    "moe_apply_probs_on_input": {"moe_apply_probs_on_input": True, "moe_router_topk": 1},
+}
+
+
+def _skip_unless_inference_backend(backend, batch_invariant=False):
+    if backend == "torch":
+        from megatron.core.inference.moe.fused_moe import HAVE_GROUPED_MM
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            HAVE_DEEPGEMM_BF16,
+        )
+
+        if not HAVE_GROUPED_MM or torch.cuda.get_device_capability()[0] < 9:
+            pytest.skip("The torch grouped-GEMM backend needs torch grouped_mm and SM90+")
+        if batch_invariant and not HAVE_DEEPGEMM_BF16:
+            pytest.skip("Batch-invariant torch MoE path requires DeepGEMM bf16 grouped kernels.")
+
+
+@pytest.mark.internal
+@requires_te
+class TestInferenceGroupedMLPMatchesTraining:
+    """InferenceGroupedMLP applies the expert options of the training path.
+
+    One expert module runs its inference path (InferenceMode) and its training path
+    (TEGroupedMLP) on the same weights and the same hand-built routing, so the router
+    does not take part.
+    """
+
+    num_tokens = 64
+    # Normwise relative error. The two paths round differently in BF16 by about 5e-3;
+    # every option moves the training output by more than 0.2.
+    tol = 2e-2
+    min_option_effect = 0.2
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(1, 1)
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    @pytest.fixture(autouse=True)
+    def _all_tokens_valid(self):
+        """Set the valid-token count that the dynamic context provides in production."""
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            InferenceAllGatherDispatcherBase as dispatcher,
+        )
+
+        saved = (dispatcher._valid_tokens_tensor, dispatcher._host_valid_tokens_estimate)
+        dispatcher.allocate_valid_tokens_tensor()
+        dispatcher._valid_tokens_tensor.fill_(self.num_tokens)
+        dispatcher._host_valid_tokens_estimate = self.num_tokens
+        yield
+        dispatcher._valid_tokens_tensor, dispatcher._host_valid_tokens_estimate = saved
+
+    def _make_experts(self, backend, **overrides):
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+
+        config = _make_base_config(
+            **{
+                "inference_grouped_gemm_backend": backend,
+                "inference_moe_token_dispatcher_type": "nccl",
+                "activation_func": torch.nn.functional.silu,
+                "gated_linear_unit": True,
+                "moe_router_topk": 2,
+                "moe_shared_expert_intermediate_size": None,
+                # FC1 pre-activations of std ~1, so that every option changes the output.
+                "init_method_std": 0.1,
+                **overrides,
+            }
+        )
+        return get_inference_optimized_moe_spec()(config=config).cuda().eval().experts
+
+    def _inputs(self, num_experts, topk):
+        hidden = torch.randn(
+            self.num_tokens, NANOV3_BASE["hidden_size"], device="cuda", dtype=torch.bfloat16
+        )
+        probs = torch.rand(self.num_tokens, topk, device="cuda")
+        routing_map = torch.rand(self.num_tokens, num_experts, device="cuda").argsort(dim=1)
+        return hidden, probs, routing_map[:, :topk].contiguous()
+
+    @staticmethod
+    def _training_forward(experts, hidden, probs, routing_map):
+        """TEGroupedMLP on the expert-sorted (token, slot) pairs, summed back per token."""
+        num_tokens, topk = routing_map.shape
+        pairs = routing_map.flatten().argsort(stable=True)
+        tokens_per_expert = torch.bincount(
+            routing_map.flatten(), minlength=experts.num_local_experts
+        )
+        with torch.no_grad():
+            output, _ = experts(hidden[pairs // topk], tokens_per_expert, probs.flatten()[pairs])
+        per_pair = torch.empty(num_tokens * topk, hidden.shape[1], device="cuda")
+        per_pair[pairs] = output.float()
+        return per_pair.view(num_tokens, topk, -1).sum(dim=1)
+
+    @staticmethod
+    def _inference_forward(experts, hidden, probs, routing_map):
+        with torch.no_grad(), InferenceMode.active():
+            output, _ = experts(hidden, None, probs, routing_map=routing_map)
+        return output.float()
+
+    @staticmethod
+    def _rel_err(actual, expected):
+        return ((actual - expected).norm() / expected.norm()).item()
+
+    @pytest.mark.parametrize("batch_invariant", [False, True], ids=["default", "batch_invariant"])
+    @pytest.mark.parametrize("option", list(_EXPERT_OPTIONS))
+    @pytest.mark.parametrize("backend", ["vllm", "torch"])
+    def test_inference_matches_training(self, backend, option, batch_invariant):
+        """With batch_invariant, inference runs the batch-invariant kernels. Training applies
+        the linear offset and the interleave in its unfused GLU, whose BF16 roundings those
+        kernels do not reproduce, so the comparison stays a tolerance check."""
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+
+        _skip_unless_inference_backend(backend, batch_invariant)
+        overrides = _EXPERT_OPTIONS[option]
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        experts = self._make_experts(backend, **overrides)
+        hidden, probs, routing_map = self._inputs(
+            experts.num_local_experts, overrides.get("moe_router_topk", 2)
+        )
+
+        expected = self._training_forward(experts, hidden, probs, routing_map)
+        with set_batch_invariant_mode(batch_invariant):
+            actual = self._inference_forward(experts, hidden, probs, routing_map)
+
+        assert actual.shape == expected.shape
+        assert self._rel_err(actual, expected) <= self.tol
+        if overrides:
+            # The comparison only discriminates if the option matters at this scale.
+            plain = self._make_experts(backend, moe_router_topk=overrides.get("moe_router_topk", 2))
+            plain.load_state_dict(experts.state_dict())
+            plain_expected = self._training_forward(plain, hidden, probs, routing_map)
+            assert self._rel_err(plain_expected, expected) >= self.min_option_effect
 
 
 # ──────────────────────────────────────────────────────────────────────
