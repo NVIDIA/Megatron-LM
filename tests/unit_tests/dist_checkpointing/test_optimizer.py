@@ -1011,7 +1011,7 @@ class TestDistributedOptimizer:
         [((2, 2), (2, 4), False), ((1, 8), (4, 1), True), ((2, 4), (4, 2), False)],
     )
     def test_finetune_doesnt_load_optimizer(
-        self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_glu
+        self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_glu, run_config
     ):
         """Test finetuning doesn't try to load the optimizer."""
         Utils.initialize_model_parallel(*src_tp_pp)
@@ -1031,6 +1031,7 @@ class TestDistributedOptimizer:
                     initialize_fn=partial(initialize_gpt_model, use_glu=use_glu),
                 )
 
+                run_config.model.transformer = model[0].config
                 save_checkpoint(10, model, optimizer, None, 0)
                 Utils.destroy_model_parallel()
 
@@ -1043,6 +1044,7 @@ class TestDistributedOptimizer:
                     pp=dest_tp_pp[1],
                     initialize_fn=partial(initialize_gpt_model, use_glu=use_glu),
                 )
+                run_config.model.transformer = model[0].config
                 model_unloaded_state_dict = deepcopy(model[0].state_dict())
                 optim_unloaded_state_dict = deepcopy(optimizer.state_dict())
 
