@@ -579,14 +579,11 @@ if __name__ == "__main__":
     model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
-    dataset_provider = partial(
-        train_valid_test_dataloaders_provider, sequence_length=args.dataloader_seq_length
-    )
-    dataset_provider.is_distributed = True
-    dataset_provider.supports_train_full_dataset = True
+    train_valid_test_dataloaders_provider.is_distributed = True
+    train_valid_test_dataloaders_provider.supports_train_full_dataset = True
     pretrain(
         full_config,
-        dataset_provider,
+        train_valid_test_dataloaders_provider,
         ModelType.encoder_or_decoder,
         forward_step,
         model_provider,

@@ -127,11 +127,7 @@ def is_dataloader_rank(
 
 
 def train_valid_test_dataloaders_provider(
-    train_val_test_num_samples,
-    task_encoder=None,
-    *,
-    restore_dataloader_state=True,
-    sequence_length: int | None = None,
+    train_val_test_num_samples, task_encoder=None, *, restore_dataloader_state=True
 ):
     """Build dataloaders, optionally skipping state restoration for a length-only probe."""
     args = get_args()
@@ -143,6 +139,7 @@ def train_valid_test_dataloaders_provider(
             f"got {dataloader_prefetch_factor}"
         )
 
+    sequence_length = args.dataloader_seq_length
     if task_encoder is None:
         task_encoder = TaskEncoder(sequence_length=sequence_length)
 
