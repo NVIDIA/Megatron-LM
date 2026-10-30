@@ -23,6 +23,7 @@ from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.initialize import _set_random_seed
+from tests.unit_tests.amax_reduction_group_utils import global_amax_groups
 from tests.unit_tests.test_utilities import Utils
 
 # Reusable skip decorators
@@ -926,9 +927,12 @@ class TestNVLSAllGatherVDispatcher:
         backend = "te_native" if mxfp8_swiglu or inference_grouped_gemm_backend == "vllm" else None
         with torch.no_grad(), set_batch_invariant_mode(True, backend=backend):
             if mxfp8_swiglu:
-                with get_fp8_context(training_config, 0):
+                with get_fp8_context(training_config, 0, pg_collection=global_amax_groups()):
                     training_output, _ = training_layer(hidden_states.clone())
-                with get_fp8_context(config, 0), InferenceMode.active():
+                with (
+                    get_fp8_context(config, 0, pg_collection=global_amax_groups()),
+                    InferenceMode.active(),
+                ):
                     inference_output, _ = layer(hidden_states.clone())
             else:
                 training_output, _ = layer(hidden_states.clone())
@@ -1116,7 +1120,7 @@ class TestNVLSAllGatherVDispatcher:
         )
         with torch.no_grad():
             bf16_output, _ = training_layer(hidden_states.clone())
-            with fp4_utils.get_fp4_context(training_config, 0):
+            with fp4_utils.get_fp4_context(training_config, 0, pg_collection=global_amax_groups()):
                 training_output, _ = training_layer(hidden_states.clone())
             with set_batch_invariant_mode(True), InferenceMode.active():
                 inference_output, _ = layer(hidden_states.clone())

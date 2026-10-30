@@ -38,6 +38,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS, ChainedOptimizer
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer, get_legacy_grad_dtypes
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
@@ -501,6 +502,7 @@ def initialize_real_model(
         pre_process=pre_process,
         post_process=post_process,
         vp_stage=vp_stage,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     return this_model
@@ -1571,14 +1573,21 @@ class TestDistributedOptimizer:
     @pytest.mark.skipif(
         not is_torch_min_version("2.6a0"), reason="dp_reshardable requires PyTorch 2.6a0 or later"
     )
-    @pytest.mark.parametrize('sharding_type', ['dp_reshardable', 'fully_reshardable'])
-    def test_lion_optimizer_checkpoint_round_trip(self, tmp_path_dist_ckpt, sharding_type):
+    @pytest.mark.parametrize(
+        ('sharding_type', 'mem_efficient'),
+        [('dp_reshardable', False), ('fully_reshardable', False), ('fully_reshardable', True)],
+    )
+    def test_lion_optimizer_checkpoint_round_trip(
+        self, tmp_path_dist_ckpt, sharding_type, mem_efficient
+    ):
         """Test DistributedOptimizer checkpoint save/load with Lion (single-moment optimizer).
 
         Lion is used as the scalar optimizer for Muon (muon_scalar_optimizer='lion'),
         which is the natural path where Lion ends up inside a DistributedOptimizer.
         This exercises the dynamic optimizer_state_keys logic with Lion's single
         moment ('exp_avg') instead of Adam's two ('exp_avg', 'exp_avg_sq').
+        The memory-efficient fully reshardable format gathers optimizer state over the
+        DistributedOptimizer's Gloo group, which the layer-wise path must pass through.
         """
         Utils.initialize_model_parallel(2, 1, order='tp-pp-dp')
 
@@ -1617,7 +1626,10 @@ class TestDistributedOptimizer:
             assert lion_distopt_A.optimizer_state_keys == ("exp_avg",)
             _seed_random_optimizer_state(lion_distopt_A, seed=100)
 
-            metadata = {'distrib_optim_sharding_type': sharding_type}
+            metadata = {
+                'distrib_optim_sharding_type': sharding_type,
+                'distrib_optim_fully_reshardable_mem_efficient': mem_efficient,
+            }
 
             model_sharded_sd = model_A[0].sharded_state_dict()
             optim_sd = optimizer_A.sharded_state_dict(model_sharded_sd, metadata=metadata)
