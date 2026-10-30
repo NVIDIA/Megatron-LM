@@ -1521,7 +1521,9 @@ class TransformerConfig(ModelParallelConfig):
     """If True, use inference optimized transformer layers during inference."""
 
     inference_fuse_tp_communication: bool = False
-    """ If true, uses a fused reduce-scatter-residual-norm-allgather kernel during inference. """
+    """ If true, uses a fused reduce-scatter-residual-norm-allgather kernel during inference.
+    Where the kernel cannot run (e.g. TP=1, NVLS unavailable, batch-invariant mode), the
+    layers fall back to the unfused path with the same result. """
 
     inference_disable_triton_nvls_kernels: bool = False
     """ If true, disables the use of Triton NVLS kernels during inference. """
