@@ -22,6 +22,7 @@ this interface's supported scope.
 | `comm.pack_bridge.PackFeatureBridge` | Gather features to each pack leader using P2P, broadcast within that CP group, and return gradients along the saved reverse route. |
 | `packing.prepare_mimo_step()` | Reuse the scheduler and THD pack builder, place positions at final physical offsets, and select explicit runtime groups. |
 | `runtime.MimoStepRuntime` | Own one source step's encoder graph, pending transfer and FP32 gradient accumulation. |
+| `runtime.LazyMimoStepRuntime` | Encode independent media chunks on first use and release each graph after its last consumer. |
 
 Use module-level imports for planning, packing and runtime. Importing the base
 model does not load the packing/data-scheduler implementation.
@@ -64,8 +65,10 @@ may be inferred from the number of decoder rounds.
 ## Explicit forward/backward lifetime
 
 ```python
+import torch
+
 from megatron.core.models.mimo.packing import prepare_mimo_step
-from megatron.core.models.mimo.runtime import MimoStepRuntime
+from megatron.core.models.mimo.runtime import LazyMimoStepRuntime
 
 # Construct MimoModel(..., external_feature_transport=True) with the encoder's
 # own process groups. The caller supplies media processing and source acquisition.
@@ -78,9 +81,15 @@ plan = prepare_mimo_step(
     config=model.config,
     device=device,
 )
-runtime = MimoStepRuntime(transport_group)
-features = model.encode_modalities(encoder_inputs)[modality_name]
-runtime.begin_step(features, len(plan.rounds), forward_only=False)
+runtime = LazyMimoStepRuntime(transport_group)
+runtime.begin_lazy_step(
+    [item.feature_plans for item in plan.rounds],
+    feature_slices,
+    # Materialize only these media IDs, returning projected rows in their order.
+    lambda media_ids: model.encode_modalities(prepare_media(media_ids))[modality_name],
+    torch.empty((0, hidden_size), device=device, dtype=feature_dtype),
+    forward_only=False,
+)
 
 for item in plan.rounds:
     transfer = runtime.route(item.feature_plans, item.cp_group)
@@ -96,6 +105,20 @@ runtime.finish_backward()
 host_finalize_model_grads()
 ```
 
+Media sharing a producer and first/last consumer rounds form one encoder chunk.
+The runtime invokes its callback at first use, accumulates feature gradients in
+FP32, and runs encoder backward immediately after the final consumer. Media
+reused across rounds retain their own graph until then. The packing plan and
+producer assignments do not change. Each callback must create an independent
+graph and preserve media boundaries; chunking assumes media can be encoded
+independently. Exact slice aliases share computation; partially overlapping
+media slices are rejected.
+
+Shared media can make chunk backward order differ from forward order. The
+encoder must accumulate parameter gradients in completion order; first-forward
+flags must not overwrite earlier contributions. Quantized encoder weight caches
+and gradient-overwrite flags require host-specific handling and validation.
+
 Empty producers supply `[0, hidden]` in the common device/dtype. They still call
 the same rounds. For evaluation, pass `forward_only=True`, complete each round
 after forward, then call `finish_forward()`. Execution mode is explicit;
@@ -106,15 +129,21 @@ and finishing before all declared rounds have completed.
 Ordinary P2P does not connect autograd graphs. The transport returns detached
 decoder leaves and explicitly applies the transpose of its forward route:
 CP contributions are **summed**, repeated producer slices are added, and the
-runtime accumulates rounds in FP32 before one encoder backward. There is no
-extra CP/DP/token averaging at the feature boundary. The host performs normal
+runtime accumulates contributions in FP32 before each chunk's encoder backward.
+There is no extra CP/DP/token averaging at the feature boundary. The host performs normal
 parameter-gradient reduction and loss normalization afterward.
+
+`MimoStepRuntime.begin_step(features, num_rounds, forward_only=...)` remains
+available for callers that already encoded a whole source step. It retains that
+graph and runs one encoder backward at `finish_backward()`.
 
 ## Megatron training adapter
 
 `examples/mimo/training/packed_step.py` provides `PackedMimoStep`. Its
-`prepare_source` callback returns samples, feature slices and local encoder
-inputs; the callback owns dataset/model-specific policies. Call `install()`
+`prepare_source` callback returns samples, feature slices and a callable mapping
+ordered media IDs to local encoder inputs. The adapter uses lazy execution for
+this contract; returning an input dictionary retains whole-step encoding.
+The callback owns dataset/model-specific policies. Call `install()`
 explicitly to register the packing adapter and gradient-finalization wrapper.
 The adapter defaults to the caller's process-group collection for runtime CP
 groups; an explicit `cp_groups` mapping remains supported. The public core
@@ -123,8 +152,10 @@ runtime itself never installs hooks. External source iterators use
 CP sizes before the data adapter prepares model inputs.
 
 The adapter uses the existing native PP1 schedule: the next forward callback
-completes the previous decoder backward, and the finalizer completes the last
-round before encoder backward and native gradient finalization. Evaluation
+returns the previous round's visual gradients and completes any finished encoder
+chunks. The finalizer completes the last round before native gradient
+finalization. Parameter gradients accumulate across all chunks, with one normal
+optimizer update per source step. Evaluation
 cleans up after the final forward rather than relying on a loss closure.
 `examples/mimo/data/source_batch.py` supplies a deterministic replicated-source
 iterator whose resume position is derived from consumed source samples.

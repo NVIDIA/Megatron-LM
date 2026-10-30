@@ -90,7 +90,7 @@ class _NormalizationModel(torch.nn.Module):
         )
 
     def encode_modalities(self, inputs):
-        return {'images': inputs['rows'] * self.encoder_weight} if inputs else {}
+        return {'images': inputs['rows'] @ self.encoder_weight[None, :]} if inputs else {}
 
     def forward(self, input_ids, labels, loss_mask, modality_embeddings, **kwargs):
         embeddings = (input_ids.float()[..., None] / 8).expand(-1, -1, _WIDTH).clone()
@@ -206,16 +206,20 @@ def test_packed_step_distributed_adam_normalization(layout, mask_kind):
         optimizer = get_megatron_optimizer(
             opt_config, [ddp], config_overrides={}, pg_collection=pg, use_gloo_process_groups=False
         )
+
         def prepare_source(source):
             tasks, slices = assign_media_to_producers(
                 [MediaTask(item["image_id"], item["length"]) for item in source["media"]],
                 dist.get_process_group_ranks(pg.dp_cp),
             )
-            return (
-                source["samples"],
-                slices,
-                _normalization_vision_inputs(tasks[dist.get_rank()], torch.device("cuda")),
-            )
+            local = {task.media_id: task for task in tasks[dist.get_rank()]}
+
+            def encoder_inputs(media_ids):
+                return _normalization_vision_inputs(
+                    [local[media_id] for media_id in media_ids], torch.device("cuda")
+                )
+
+            return (source["samples"], slices, encoder_inputs)
 
         coordinator = PackedMimoStep(module, pg, prepare_source, modality_name="images")
         coordinator.install()
@@ -234,7 +238,10 @@ def test_packed_step_distributed_adam_normalization(layout, mask_kind):
         for _ in range(rounds):
             item = next(iterator)
             runtime_sizes.append(item.cp_group.size())
-            output, loss_fn = coordinator.forward(item, ddp)
+            # Encoder precision must not inherit decoder-only autocast when its
+            # execution moves from source preparation to the forward callback.
+            with torch.autocast('cuda', dtype=torch.bfloat16):
+                output, loss_fn = coordinator.forward(item, ddp)
             raw_loss, tokens, _ = loss_fn(output)
             raw_loss.backward()
             local_tokens += tokens
