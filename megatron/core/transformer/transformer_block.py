@@ -91,7 +91,7 @@ def get_num_layers_to_build(
     # return the number of decoders in the layout array.
     if config.pipeline_model_parallel_layout is not None:
         return config.pipeline_model_parallel_layout.get_num_layers_to_build(
-            layer_type=LayerType.decoder, vp_stage=vp_stage
+            layer_type=LayerType.decoder, vp_stage=vp_stage, pp_rank=pp_rank
         )
 
     # Fallback for legacy tests.
