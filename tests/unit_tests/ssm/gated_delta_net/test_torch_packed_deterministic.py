@@ -23,6 +23,18 @@ HEADS, DK, DV = 2, 16, 32
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+@pytest.fixture(autouse=True)
+def full_fp32_matmuls():
+    """The packed run chunks a document at different offsets than the per-document run, and
+    the chunked recurrence is not associativity-exact: under TF32 that alone moves outputs by
+    ~2e-4 (the same as re-chunking one document with chunk_size 16 instead of 64). Compare
+    in full fp32 so the tolerance below tests the masking, not the rounding."""
+    previous = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    yield
+    torch.backends.cuda.matmul.allow_tf32 = previous
+
+
 def _cu_seqlens():
     cu = torch.tensor([0] + LENGTHS + [PAD]).cumsum(0).to(torch.int32)
     return cu.to(DEVICE)
