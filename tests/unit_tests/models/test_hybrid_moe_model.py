@@ -395,6 +395,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "dynamic_context_parallel": False,
     "min_dynamic_context_parallel_size": 1,
     "max_seqlen_per_dp_cp_rank": None,
+    "max_seq_length_per_sample": 1024,
     "inference_cuda_graph_scope": {
         "__objclass__": "megatron.core.transformer.enums.InferenceCudaGraphScope",
         "_name_": "none",

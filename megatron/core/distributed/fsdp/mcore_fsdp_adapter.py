@@ -56,6 +56,7 @@ try:
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
         Placements,
+        RuntimePolicy,
         SchedulePolicy,
         ShardLayout,
         fully_shard,
@@ -705,14 +706,15 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if active_context is None:
             construction_context = fully_shard_context(
                 device=device,
-                use_symmetric_memory=ddp_config.nccl_ub,
-                caller_managed_grad_sync=True,
+                runtime_policy=RuntimePolicy(
+                    use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True
+                ),
             )
         else:
             if not active_context.caller_managed_grad_sync:
                 raise ValueError(
                     "MCore MFSDP v2 requires shared contexts to be constructed with "
-                    "caller_managed_grad_sync=True."
+                    "RuntimePolicy(caller_managed_grad_sync=True)."
                 )
             construction_context = nullcontext(active_context)
         with construction_context:
