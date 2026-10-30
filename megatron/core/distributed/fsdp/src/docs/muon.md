@@ -87,8 +87,9 @@ parameter group, after gradient reduction:
 1. Update local momentum and construct the orthogonalization inputs.
 2. Gather each split matrix's input to one compute owner.
 3. Run full-matrix Newton–Schulz once on that owner.
-4. Scatter update slices back, apply them to local weight shards, and
-   refresh model weights.
+4. Scatter update slices back and apply them to local main weight shards.
+   `fully_shard_optimizer` (with `precision_aware=True`) or MCore's
+   `FullyShardedOptimizer` then refreshes the model weights.
 
 The [owner planner](../megatron_fsdp/experimental/owner_planning.py)
 balances estimated compute across groups, choosing owners from ranks that
@@ -96,6 +97,18 @@ already hold a fragment. [P2P gather/scatter](../megatron_fsdp/experimental/gath
 moves only remote fragments. In the example, `P0`, `P3`, and `P4` require
 no optimizer-step network traffic. Persistent ownership stays unchanged;
 full inputs and updates exist temporarily on compute owners.
+
+Gathers and scatters return their P2P works instead of waiting, so communication
+overlaps Newton–Schulz. After a group is orthogonalized, the gathers of the next
+`lookahead` groups that need communication are posted, and such a group's updates are
+applied once `lookahead` later ones have been scattered, so each scatter overlaps their
+Newton–Schulz. The groups whose tensors all sit on one rank (no communication) are split
+evenly between both ends, with the other groups in between. They compute their momentum
+when their turn comes and apply their updates right after, so they hold no buffers
+meanwhile, and their Newton–Schulz hides the first gathers and the last scatters.
+Each group in flight holds its momentum inputs, full tensors, and received
+updates, so `lookahead` trades memory for overlap; zero gives the
+non-overlapped order.
 
 A simpler alternative in [issue #5533](https://github.com/NVIDIA/Megatron-LM/issues/5533)
 all-gathers boundary-matrix inputs and duplicates orthogonalization. The
@@ -140,11 +153,9 @@ and [collectives](../megatron_fsdp/experimental/dbuffer.py) for this.
 
 ## Next step
 
-1. **Integrate `FsdpMuon` with `MegatronOptimizer`**, including chaining
-   with an optimizer for excluded parameters.
-2. **Optimize performance.** Overlap communication with Muon computation
-   and make parameter placement aware of hardware topology to keep traffic
-   on fast links, as discussed in [#6368](https://github.com/NVIDIA/Megatron-LM/issues/6368).
-3. **Evaluate TensorAtomic at larger scale.** Compare it with gather/scatter
+1. **Optimize performance.** Batch Newton–Schulz across FSDP units (it
+   currently runs one unit at a time), and make parameter placement aware of
+   hardware topology to keep traffic on fast links, as discussed in [#6368](https://github.com/NVIDIA/Megatron-LM/issues/6368).
+2. **Evaluate TensorAtomic at larger scale.** Compare it with gather/scatter
    on larger models across multiple nodes, measuring forward/backward time,
    full-step time, and peak memory.

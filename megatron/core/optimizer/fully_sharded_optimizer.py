@@ -54,6 +54,10 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     MFSDP-specific storage operations explicit.
     """
 
+    # DTensor replication must be counted by this wrapper even when chained
+    # optimizers share the same final reduction group.
+    requires_individual_grad_stats = True
+
     @override
     def __init__(
         self,
@@ -250,11 +254,13 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         :meth:`DistributedOptimizer.load_state_dict`.
         """
         param_groups = self._param_groups_from_group_meta(state_dict["param_to_group_meta"])
-        state = state_dict["state"]
-        if not is_te_min_version("2.18.0"):
-            # Empty-shard placeholders are not owned by the older TE optimizer.
-            owned_fqns = {fqn for group in param_groups for fqn in group["params"]}
-            state = {fqn: param_state for fqn, param_state in state.items() if fqn in owned_fqns}
+        # A chain shares one FQN-keyed checkpoint, so select only this optimizer's parameters.
+        owned_fqns = {fqn for group in param_groups for fqn in group["params"]}
+        state = {
+            fqn: param_state
+            for fqn, param_state in state_dict["state"].items()
+            if fqn in owned_fqns
+        }
         self.optimizer.load_state_dict({"state": state, "param_groups": param_groups})
 
     @override
@@ -320,19 +326,26 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         ``get_data_parallel_group_if_dtensor`` always sees plain tensors, returns None,
         and the layout is gone by the time the norm is taken.
         """
-        total_norm_squared = torch.zeros(
-            (), dtype=torch.float32, device=torch.cuda.current_device()
-        )
+        # Group the local gradients by replication, so that each group takes one foreach norm
+        # instead of several small kernels per parameter.
+        grads_by_replication: dict[int, list[torch.Tensor]] = {}
         for parameter in self.get_parameters():
             # MFSDP v2 reduces into parameter.grad; it never populates decoupled_grad,
             # which is a v1 param-and-grad-buffer concept.
             grad = parameter.grad
             if grad is None:
                 continue
-            replication = count_replication(grad)
             local_grad = grad.to_local()
             if local_grad.numel() > 0:
-                total_norm_squared += local_grad.float().pow(2).sum() / replication
+                grads_by_replication.setdefault(count_replication(grad), []).append(
+                    local_grad.float()
+                )
+        total_norm_squared = torch.zeros(
+            (), dtype=torch.float32, device=torch.cuda.current_device()
+        )
+        for replication, local_grads in grads_by_replication.items():
+            norms = torch.stack(torch._foreach_norm(local_grads))
+            total_norm_squared += norms.square().sum() / replication
 
         torch.distributed.all_reduce(
             total_norm_squared,
@@ -399,15 +412,14 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
 
         assert not self._casted_grads
         for parameter in self.get_parameters():
-            if parameter.grad is None:
-                continue
-            if parameter.grad.dtype == parameter.data.dtype:
+            original_grad = parameter.grad
+            # parameter.data would dispatch through DTensor on every call.
+            if original_grad is None or original_grad.dtype == parameter.dtype:
                 continue
 
-            original_grad = parameter.grad
             parameter.grad = None
-            parameter.grad_dtype = parameter.data.dtype
-            parameter.grad = original_grad.to(dtype=parameter.data.dtype)
+            parameter.grad_dtype = parameter.dtype
+            parameter.grad = original_grad.to(dtype=parameter.dtype)
             self._casted_grads.append((parameter, original_grad))
 
     @override

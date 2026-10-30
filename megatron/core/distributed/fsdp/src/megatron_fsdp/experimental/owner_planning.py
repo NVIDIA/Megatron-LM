@@ -9,6 +9,8 @@ Owner assignments use global process ranks.
 import dataclasses
 from collections.abc import Iterable
 
+from torch.distributed.device_mesh import DeviceMesh
+
 from .dbuffer import DBuffer
 from .layout import non_leading_numel
 from .range import intersect_ranges
@@ -30,7 +32,10 @@ def assign_owner_work(buffers: Iterable[DBuffer]) -> list[dict[int, int]]:
     Account for single-candidate tensors across all buffers first, then assign the remaining
     tensors in descending cost order across buffers. Each tensor goes to its least-loaded
     holder. Equal-cost tensors follow input buffer order and tensor index; equal-load holders
-    follow buffer offset order. Inputs must be identical across ranks.
+    follow buffer offset order. Buffers on one mesh must be identical across its ranks.
+
+    Each mesh is planned independently, because a joint plan would depend on buffers a rank
+    cannot see, such as another expert data-parallel group's experts.
 
     Costs estimate five Newton-Schulz iterations from each tensor's full shape. View the
     tensor as `(rows, cols) = (shape[0], shape[1:].numel())`. After normalization and
@@ -45,26 +50,36 @@ def assign_owner_work(buffers: Iterable[DBuffer]) -> list[dict[int, int]]:
     and adding a linear term for normalization and elementwise work.
 
     Args:
-        buffers: Distributed buffers on the same DP mesh.
+        buffers: Distributed buffers, which may be on different DP meshes.
 
     Returns:
         One tensor-index-to-owner mapping per buffer, in input order. Buffers with no
         eligible tensors have an empty mapping.
     """
     buffers = list(buffers)
-    if not buffers:
-        return []
+
+    # Step 1: group the buffers by mesh, remembering each buffer's position in the input.
+    positions_by_mesh: dict[DeviceMesh, list[int]] = {}
+    for position, buffer in enumerate(buffers):
+        positions_by_mesh.setdefault(buffer.mesh, []).append(position)
+
+    # Step 2: assign owners within each mesh, then put the results back in input order.
+    assignments: list[dict[int, int]] = [{} for _ in buffers]
+    for positions in positions_by_mesh.values():
+        mesh_buffers = [buffers[position] for position in positions]
+        mesh_assignments = _assign_owner_work_on_mesh(mesh_buffers)
+        for position, tensor_to_owner in zip(positions, mesh_assignments, strict=True):
+            assignments[position] = tensor_to_owner
+    return assignments
+
+
+def _assign_owner_work_on_mesh(buffers: list[DBuffer]) -> list[dict[int, int]]:
+    """Jointly assign the tensors of buffers that share one mesh."""
     mesh = buffers[0].mesh
     ranks = mesh.mesh.flatten().tolist()
     assignments: list[dict[int, int]] = [{} for _ in buffers]
     work_items: list[_OwnerWork] = []
     for buffer_index, buffer in enumerate(buffers):
-        if buffer.mesh != mesh:
-            raise ValueError(
-                "`assign_owner_work` requires every buffer to share the same DP mesh; "
-                f"buffer {buffer_index}'s mesh differs from buffer 0's. "
-                "Balance buffers per mesh."
-            )
         layout = buffer.layout
         rank_ranges = {rank: layout.get_rank_range(mesh, buffer.placements, rank) for rank in ranks}
         # Offset order, rather than global rank order, determines load-balancing ties.

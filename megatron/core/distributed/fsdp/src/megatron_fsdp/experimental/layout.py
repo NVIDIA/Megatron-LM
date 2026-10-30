@@ -181,8 +181,30 @@ class GlobalLayout:
         coordinates = (mesh.mesh == rank).nonzero(as_tuple=False)
         if coordinates.size(0) == 0:
             raise ValueError(f"Global rank {rank} is not in the device mesh.")
-        coordinate = coordinates[0].tolist()
         placements = tuple(placements)
+        axis_sizes = [mesh.size(axis) for axis in range(len(placements))]
+        return self._get_coordinate_range(placements, axis_sizes, coordinates[0].tolist())
+
+    def get_rank_ranges(
+        self, mesh: DeviceMesh, placements: Iterable[Placement]
+    ) -> dict[int, Range]:
+        """Return the global buffer element range of every rank in ``mesh``, keyed by global rank.
+
+        This reads the mesh once, unlike calling `get_rank_range` for each rank.
+        """
+        placements = tuple(placements)
+        mesh_tensor = mesh.mesh
+        axis_sizes = [mesh.size(axis) for axis in range(len(placements))]
+        coordinates = itertools.product(*(range(size) for size in mesh_tensor.shape))
+        return {
+            rank: self._get_coordinate_range(placements, axis_sizes, list(coordinate))
+            for rank, coordinate in zip(mesh_tensor.flatten().tolist(), coordinates)
+        }
+
+    def _get_coordinate_range(
+        self, placements: tuple[Placement, ...], axis_sizes: list[int], coordinate: list[int]
+    ) -> Range:
+        """Return the element range of the rank at ``coordinate`` of the mesh."""
         # Innermost Shard axis is the most significant digit of the shard index.
         shard_index = 0
         num_shards = 1
@@ -191,8 +213,8 @@ class GlobalLayout:
             if not isinstance(placements[axis], Shard):
                 continue
             shard_axes.append(axis)
-            shard_index = shard_index * mesh.size(axis) + coordinate[axis]
-            num_shards *= mesh.size(axis)
+            shard_index = shard_index * axis_sizes[axis] + coordinate[axis]
+            num_shards *= axis_sizes[axis]
         if self.dp_size % num_shards != 0:
             raise ValueError(
                 f"Layout was built for {self.dp_size} shards, which cannot be split evenly "

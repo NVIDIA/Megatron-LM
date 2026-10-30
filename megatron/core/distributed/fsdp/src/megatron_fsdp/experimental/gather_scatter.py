@@ -13,7 +13,9 @@ Both operations support one-dimensional meshes with sharded placements.
 Each tensor's owner holds a shard, so any peer pair shares at most one tensor across their
 disjoint buffer ranges. Tensor traversal order therefore need not match across ranks.
 
-Operations run on the current CUDA stream. Multiple parameter groups can be pipelined by
+Operations are posted on the current CUDA stream and return their P2P works without waiting.
+Waiting on a work orders the stream it is called on after the transfer, so the caller decides
+when to wait. Multiple parameter groups can be pipelined by posting several before waiting, or by
 executing the functions in different streams. Callers explicitly wait for inputs to be ready on
 each stream and for results to be ready before consuming them on another stream.
 """
@@ -31,16 +33,28 @@ def _get_sorted_rank_ranges(buffer: DBuffer) -> dict[int, Range]:
     mesh = buffer.mesh
     if mesh.ndim != 1 or not isinstance(buffer.placements[0], Shard):
         raise NotImplementedError("Owner gather/scatter requires a 1-D sharded DBuffer.")
-    rank_ranges = [
-        (rank, buffer.layout.get_rank_range(mesh, buffer.placements, rank))
-        for rank in mesh.mesh.tolist()
-    ]
-    return dict(sorted(rank_ranges, key=lambda item: item[1].start))
+    rank_ranges = buffer.layout.get_rank_ranges(mesh, buffer.placements)
+    return dict(sorted(rank_ranges.items(), key=lambda item: item[1].start))
+
+
+def find_split_tensors(buffer: DBuffer) -> frozenset[int]:
+    """Return the indices of tensors whose elements span more than one rank.
+
+    Gather and scatter post P2P only for these tensors. The result depends only on the layout,
+    so every rank of the mesh computes the same set.
+    """
+    rank_ranges = _get_sorted_rank_ranges(buffer).values()
+    layout = buffer.layout
+    return frozenset(
+        i
+        for i in range(len(layout.tensor_shapes))
+        if sum(intersect_ranges(layout.get_tensor_range(i), r).numel > 0 for r in rank_ranges) > 1
+    )
 
 
 def gather(
     source: DBuffer, destination: dict[int, torch.Tensor], *, tensor_to_owner: dict[int, int]
-) -> None:
+) -> list[dist.Work]:
     """Gather full tensors from local chunks to their owners via P2P.
 
     The source buffers must share dtype and device type across ranks.
@@ -60,6 +74,10 @@ def gather(
             does not own are never written to.
         tensor_to_owner: Participating tensor index to owner global rank. Each owner must
             hold a nonempty shard of its tensor; see `assign_owner_work`.
+
+    Returns:
+        The posted P2P works, empty if this rank has none. Wait on each before using the
+        destination, and keep the buffers alive until then.
     """
     mesh = source.mesh
     this_rank = mesh.get_rank()
@@ -99,14 +117,12 @@ def gather(
             else:
                 ops.append(dist.P2POp(dist.irecv, chunk, peer=src_rank, group=group))
 
-    works = dist.batch_isend_irecv(ops) if ops else []
-    for work in works:
-        work.wait()
+    return dist.batch_isend_irecv(ops) if ops else []
 
 
 def scatter(
     source: dict[int, torch.Tensor], destination: DBuffer, *, tensor_to_owner: dict[int, int]
-) -> None:
+) -> list[dist.Work]:
     """Scatter full result tensors from the owners to the other ranks via P2P.
 
     All source tensors and destination buffers must share dtype and device type across ranks.
@@ -127,6 +143,10 @@ def scatter(
             be a separate scratch DBuffer for updates the caller will apply later.
         tensor_to_owner: Participating tensor index to owner global rank. Each owner must
             hold a nonempty shard of its tensor; see `assign_owner_work`.
+
+    Returns:
+        The posted P2P works, empty if this rank has none. Wait on each before using the
+        destination, and keep the buffers alive until then.
     """
     mesh = destination.mesh
     this_rank = mesh.get_rank()
@@ -166,6 +186,4 @@ def scatter(
                 dist.P2POp(dist.isend, flat[offset : offset + numel], peer=dest, group=group)
             )
 
-    works = dist.batch_isend_irecv(ops) if ops else []
-    for work in works:
-        work.wait()
+    return dist.batch_isend_irecv(ops) if ops else []
