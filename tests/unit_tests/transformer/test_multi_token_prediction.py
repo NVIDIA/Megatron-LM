@@ -14,6 +14,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE, _resolve_is_fir
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
+    get_gpt_layer_with_inference_spec,
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
 )
@@ -30,6 +31,7 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
+from megatron.core.tensor_parallel.inference_layers import InferenceColumnParallelLinear
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_checkpoint
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -170,8 +172,20 @@ class TestMultiTokenPredictionLayer:
         destroy_global_vars()
         destroy_num_microbatches_calculator()
 
-    def _create_config_and_mtp_block_spec(self, tp, cp, use_te=False, use_repeated_layer=False):
+    def _create_config_and_mtp_block_spec(
+        self, tp, cp, use_te=False, use_repeated_layer=False, inference_optimized=False
+    ):
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+        # Inference-optimized layers require RMSNorm and no linear biases.
+        inference_kwargs = (
+            dict(
+                transformer_impl="inference_optimized",
+                normalization="RMSNorm",
+                add_bias_linear=False,
+            )
+            if inference_optimized
+            else {}
+        )
         config = TransformerConfig(
             mtp_num_layers=2,
             num_layers=4,
@@ -182,8 +196,11 @@ class TestMultiTokenPredictionLayer:
             sequence_parallel=True if tp > 1 else False,
             context_parallel_size=cp,  # Enable CP for MTP testing
             mtp_use_repeated_layer=use_repeated_layer,
+            **inference_kwargs,
         )
-        if use_te:
+        if inference_optimized:
+            transformer_layer_spec = get_gpt_layer_with_inference_spec()
+        elif use_te:
             transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec()
         else:
             transformer_layer_spec = get_gpt_layer_local_spec()
@@ -736,6 +753,27 @@ class TestMultiTokenPredictionLayer:
             assert num_weights == 29664 * config.mtp_num_layers
         elif tp == 4:
             assert num_weights == 15216 * config.mtp_num_layers
+
+    @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
+    @pytest.mark.parametrize('tp', [1, 2])
+    def test_constructor_inference_optimized(self, tp):
+        """The MTP head comes from the inference backend, like the layers it wraps.
+
+        Inference-optimized layers require sequence parallelism at TP > 1, which the local
+        backend's torch norm rejects.
+        """
+        if Utils.world_size < tp:
+            pytest.skip(f"TP={tp} requires at least {tp} ranks")
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(
+            tp, cp=1, inference_optimized=True
+        )
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+
+        assert len(mtp.layers) == config.mtp_num_layers
+        for layer in mtp.layers:
+            assert isinstance(layer.eh_proj, InferenceColumnParallelLinear)
+            # Its input all-gather follows another all-gather on the shared symmetric buffer.
+            assert layer.eh_proj.barrier_before_all_gather
 
     @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
     @pytest.mark.parametrize('repeated', [False, True])
