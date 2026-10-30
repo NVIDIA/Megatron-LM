@@ -27,6 +27,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.multi_token_prediction import (
@@ -97,6 +98,9 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
     Returns:
         HybridModel: The returned model
     """
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
     args = get_args()
     if has_nvidia_modelopt:
 
@@ -145,7 +149,8 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
         position_embedding_type=args.position_embedding_type,
         rotary_percent=args.rotary_percent,
         rotary_base=args.rotary_base,
-        vp_stage=vp_stage
+        vp_stage=vp_stage,
+        pg_collection=pg_collection,
     )
     from megatron.elastification.flextron_utils import (
         inject_flextron_forward_logic,
@@ -191,6 +196,8 @@ def get_batch(data_iterator, vp_stage=None):
         mtp_num_layers=config.mtp_num_layers,
         ignore_virtual=False,
         vp_stage=vp_stage,
+        pp_group=mpu.get_pipeline_model_parallel_group(),
+        vp_size=config.virtual_pipeline_model_parallel_size or 1,
     )
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank and not has_cu_seqlens:

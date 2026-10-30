@@ -139,6 +139,7 @@ def get_batch(
         mtp_num_layers=config.mtp_num_layers,
         ignore_virtual=False,
         vp_stage=vp_stage,
+        pp_group=mpu.get_pipeline_model_parallel_group(),
     )
     # Dynamic CP always uses the sequence-packing path above.
     assert not args.dynamic_context_parallel
@@ -452,6 +453,8 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
         mtp_num_layers=config.mtp_num_layers,
         ignore_virtual=False,
         vp_stage=vp_stage,
+        pp_group=mpu.get_pipeline_model_parallel_group(),
+        vp_size=config.virtual_pipeline_model_parallel_size or 1,
     )
 
 
