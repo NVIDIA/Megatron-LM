@@ -269,6 +269,7 @@ class AbsorbedMLASelfAttention(Attention):
                 is_expert=False,
                 tp_comm_buffer_name=linear_proj_buffer,
                 tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
                 name=(name + ".linear_proj") if name is not None else None,
             )
 
@@ -304,6 +305,7 @@ class AbsorbedMLASelfAttention(Attention):
                     skip_bias_add=False,
                     is_expert=False,
                     tp_comm_buffer_name='q_proj',
+                    pg_collection=pg_collection,
                     name=(name + ".linear_q_proj") if name is not None else None,
                 )
         else:
@@ -336,6 +338,7 @@ class AbsorbedMLASelfAttention(Attention):
                         if q_down_proj_kwargs.get('parallel_mode') != 'duplicated'
                         else None
                     ),
+                    pg_collection=pg_collection,
                     name=(name + ".linear_q_down_proj") if name is not None else None,
                     **q_down_proj_kwargs,
                 )
@@ -352,6 +355,7 @@ class AbsorbedMLASelfAttention(Attention):
                     is_expert=False,
                     tp_comm_buffer_name='q_up_proj',
                     tp_group=pg_collection.tp,
+                    pg_collection=pg_collection,
                     name=(name + ".linear_q_up_proj") if name is not None else None,
                 )
 
@@ -384,6 +388,7 @@ class AbsorbedMLASelfAttention(Attention):
                     if kv_down_proj_kwargs.get('parallel_mode') != 'duplicated'
                     else None
                 ),
+                pg_collection=pg_collection,
                 name=(name + ".linear_kv_down_proj") if name is not None else None,
                 **kv_down_proj_kwargs,
             )
@@ -402,6 +407,7 @@ class AbsorbedMLASelfAttention(Attention):
                 is_expert=False,
                 tp_comm_buffer_name='kv_up_proj',
                 tp_group=pg_collection.tp,
+                pg_collection=pg_collection,
                 name=(name + ".linear_kv_up_proj") if name is not None else None,
             )
 
