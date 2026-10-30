@@ -78,7 +78,7 @@ def test_recorded_prefetch_replays_interleaved_occurrences(budget):
         for index, event in enumerate(events):
             prefetched.clear()
             event.module.phase = event.phase
-            FsdpModule._prefetch_parameter_groups(event.module, order, budget)
+            FsdpModule._prefetch_parameter_groups(event.module, order, budget, event.phase)
             count = 1 if budget is None else budget
             assert prefetched == events[index + 1 : index + 1 + count]
         assert order.position == 0
@@ -94,13 +94,13 @@ def test_recorded_prefetch_rejects_divergence_without_consuming(wrong_phase):
     phase = Phase.BACKWARD if wrong_phase else Phase.FORWARD
     module.phase = phase
     with pytest.raises(RuntimeError, match="diverged.*position 0"):
-        FsdpModule._prefetch_parameter_groups(module, order, None)
+        FsdpModule._prefetch_parameter_groups(module, order, None, phase)
     assert order.peek() == events[0]
     assert order.position == 0
     first._unshard_parameter_groups.assert_not_called()
     second._unshard_parameter_groups.assert_not_called()
     first.phase = Phase.FORWARD
-    FsdpModule._prefetch_parameter_groups(first, order, 0)
+    FsdpModule._prefetch_parameter_groups(first, order, 0, Phase.FORWARD)
     assert order.peek() == events[1]
 
 

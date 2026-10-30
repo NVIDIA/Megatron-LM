@@ -80,10 +80,11 @@ class FsdpContext:
                 ignored. Tensors are packed by owner without changing logical parameter order.
             prefetch_order: ``REGISTRATION`` expects a forward/backward pass matching module
                 registration order. ``RECORDED`` gathers parameters on demand and records
-                module calls until the first ``post_backward()``. Subsequent passes must
-                repeat the complete sequence consistently across data-parallel ranks.
-                Recording currently requires the ordinary module hooks; combined 1F1B
-                bypasses them. Discard the context if the recorded pass raises.
+                module calls until the first ``post_backward()``. With caller-managed
+                gradient synchronization, recording spans the full schedule until
+                ``finish_grad_sync()`` instead. Subsequent
+                schedules must repeat the trace consistently across data-parallel ranks.
+                Discard the context if recording fails.
         """
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -96,6 +97,7 @@ class FsdpContext:
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
         self.unify_communication_stream = runtime_policy.unify_communication_stream
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
+        self.prefetch_order = prefetch_order
         self.execution_order = ExecutionOrder()
         self._recording_execution_order = prefetch_order is PrefetchOrder.RECORDED
         self._post_backward_hook_registered = False
@@ -218,11 +220,23 @@ class FsdpContext:
         it does not block the CPU or wait for reductions that have not yet been launched.
         """
         self.current_stream().wait_stream(self.reduce_scatter_stream)
+        if self.caller_managed_grad_sync:
+            self._finish_execution_order()
+
+    def _finish_execution_order(self) -> None:
+        """Finish recording or validate replay at the execution-window boundary."""
+        if self._recording_execution_order:
+            # A synchronization before any compute must not end recording.
+            if self.execution_order.peek() is not None:
+                self._recording_execution_order = False
+        elif self.execution_order.position != 0:
+            raise RuntimeError("FSDP execution ended before the recorded order was complete.")
 
     def post_backward(self) -> None:
         """Finish backward cleanup and automatically synchronize the last microbatch."""
         self._run_delayed_post_backward_callbacks()
-        self._recording_execution_order = False
+        if not self.caller_managed_grad_sync:
+            self._finish_execution_order()
         # Standalone training can call optimizer.step() immediately after backward.
         # Wait for reductions on the last microbatch; earlier microbatches keep
         # overlapping reduction with compute. MCore calls finish_grad_sync() itself
