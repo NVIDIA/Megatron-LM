@@ -4384,6 +4384,30 @@ def save_checkpoint_and_time(
             _exposed_save_span.end()
 
 
+def _check_gpu_sniff_test_pg_collection(
+    pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection],
+    gpu_sniff_test_interval: Optional[int],
+) -> None:
+    """Reject the GPU sniff test for a multi-module collection.
+
+    The sniff test gathers every metric over all ranks, and how many metrics a rank reports
+    depends on the sizes of its EP, DP and TP groups. Each module of a multi-module run sizes
+    these groups on its own, so ranks of different modules would issue different numbers of
+    gathers. Passing no collection instead tests the global grid, whose groups are not the
+    modules' groups and which heterogeneous MiMo does not build.
+
+    Raises:
+        ValueError: if the sniff test is enabled and ``pg_collection`` is multi-module.
+    """
+    if gpu_sniff_test_interval is not None and isinstance(
+        pg_collection, MultiModuleProcessGroupCollection
+    ):
+        raise ValueError(
+            "--gpu-sniff-test-interval is not supported with a multi-module process-group "
+            "collection: the sniff test needs groups of the same size on every rank"
+        )
+
+
 def _run_gpu_sniff_test(tag, span_name='megatron.train.sniff_test', pg_collection=None):
     """Run the GPU sniff test over the EP, DP and TP groups of ``pg_collection``.
 
@@ -4659,7 +4683,10 @@ def train(
     pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
         preserves the default behavior. A single-grid collection also sizes the batch
         accounting and runs the sequence statistics, the skipped-iteration batches and the
-        GPU sniff test.
+        GPU sniff test. A multi-module collection rejects the GPU sniff test.
+
+    Raises:
+        ValueError: if ``--gpu-sniff-test-interval`` is set with a multi-module collection.
     """
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
@@ -4743,7 +4770,8 @@ def train(
 
     # A single-grid run keeps its batch accounting, statistics and diagnostics on its own
     # collection. A multi-module run counts samples on its language model's groups and leaves
-    # the rest on the global parallel state.
+    # the rest on the global parallel state, except for the GPU sniff test, which it rejects.
+    _check_gpu_sniff_test_pg_collection(pg_collection, cfg.train.gpu_sniff_test_interval)
     if isinstance(pg_collection, MultiModuleProcessGroupCollection):
         grid_pg_collection = None
         sample_pg_collection = (

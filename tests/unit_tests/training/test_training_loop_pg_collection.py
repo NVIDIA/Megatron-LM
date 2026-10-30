@@ -15,7 +15,10 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.training import gpu_sniff_test, training
 from megatron.training.config import ValidationConfig
 from megatron.training.logging import packed_sequence_stats
@@ -342,6 +345,56 @@ class TestTrainingLoopPgCollection:
         )
 
         assert sniffed == [pg_collection, pg_collection]
+
+    def test_sniff_test_rejects_a_multi_module_collection(self, monkeypatch):
+        module_pg_collection = ProcessGroupCollection()
+        multi_module_pg_collection = MultiModuleProcessGroupCollection(
+            module_pgs={"language": module_pg_collection}, language_model_module_name="language"
+        )
+        _forbid_global_reads(monkeypatch, training)
+
+        with pytest.raises(ValueError, match="gpu-sniff-test-interval"):
+            training._check_gpu_sniff_test_pg_collection(multi_module_pg_collection, 1)
+        # Without the sniff test, or on a single grid, the collection is accepted.
+        training._check_gpu_sniff_test_pg_collection(multi_module_pg_collection, None)
+        training._check_gpu_sniff_test_pg_collection(module_pg_collection, 1)
+        training._check_gpu_sniff_test_pg_collection(None, 1)
+
+    def test_train_rejects_the_sniff_test_for_a_multi_module_collection(
+        self, monkeypatch, run_config
+    ):
+        # An encoder rank of heterogeneous MiMo: one module and no language model.
+        multi_module_pg_collection = MultiModuleProcessGroupCollection(
+            module_pgs={"encoder": ProcessGroupCollection()}
+        )
+        run_config.train.gpu_sniff_test_interval = 1
+        sniffed = []
+        monkeypatch.setattr(
+            gpu_sniff_test,
+            "run_gpu_sniff_test",
+            lambda tag, pg_collection=None: sniffed.append(pg_collection),
+        )
+        monkeypatch.setattr(training, "get_args", SimpleNamespace)
+        monkeypatch.setattr(training, "get_timers", lambda: MagicMock())
+        monkeypatch.setattr(training, "get_train_state", TrainState)
+        _forbid_global_reads(monkeypatch, training)
+
+        with pytest.raises(ValueError, match="gpu-sniff-test-interval"):
+            training.train(
+                None,
+                [],
+                None,
+                None,
+                None,
+                None,
+                None,
+                SimpleNamespace(),
+                None,
+                None,
+                pg_collection=multi_module_pg_collection,
+            )
+
+        assert sniffed == []
 
     @_needs_4_ranks
     def test_packed_sequence_stats_count_the_collection_last_stage(self, monkeypatch):
