@@ -1195,6 +1195,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     causal=True,
                     window_size=window_size,
                     num_splits=self._fa4_num_splits(q.device),
+                    return_lse=need_lse,
                     **softcap_kwargs,
                 )
             elif use_fa3:
@@ -1342,6 +1343,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         causal=True,
                         window_size=window_size,
                         num_splits=self._fa4_num_splits(q.device),
+                        return_lse=need_lse,
                         **softcap_kwargs,
                     )
                     if need_lse:
@@ -1379,9 +1381,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         ), "Batch invariant mode is not supported for flash attention 2"
                         kvcache_ret = flash_attn_with_kvcache(**flash_attn_args)
                     if need_lse:
-                        # FA2/FA3 *_with_kvcache return (out, softmax_lse) when
-                        # return_softmax_lse=True.
-                        output_total, softmax_lse = kvcache_ret
+                        # FA3 may append kernel metadata after (out, softmax_lse),
+                        # while FA2 returns exactly those two values.
+                        output_total, softmax_lse, *_ = kvcache_ret
                         # output_total: (B, S, H, D); softmax_lse: (B, H, S)
                         output_total = self._apply_sink_softmax_correction_bshd(
                             output_total, softmax_lse, softmax_offset
