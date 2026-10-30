@@ -9,6 +9,7 @@ import traceback
 import pytest
 import torch
 
+from megatron.core.enums import ModelType
 from megatron.core.fp4_utils import is_grouped_nvfp4tensor
 from megatron.core.fp8_utils import (
     is_grouped_mxfp8tensor,
@@ -369,7 +370,9 @@ class TestMoESingleGroupedWeightNumerics:
         )
 
         batch = self.get_batch()
-        model, optimizer, _ = setup_model_and_optimizer(model_provider_func=self.model_provider)
+        model, optimizer, _ = setup_model_and_optimizer(
+            model_type=ModelType.encoder_or_decoder, model_provider_func=self.model_provider
+        )
         assert len(model) == 1
         self.assert_storage_path_is_exercised(
             model[0], precision, primary_param_gather, single_weight
@@ -479,7 +482,7 @@ class TestMoESingleGroupedWeightNumerics:
         )
 
         model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            model_provider_func=self.model_provider
+            model_type=ModelType.encoder_or_decoder, model_provider_func=self.model_provider
         )
         assert len(model) == 1
         self.assert_storage_path_is_exercised(model[0], "mxfp8", True, single_weight)
@@ -621,7 +624,9 @@ class TestMoESingleGroupedWeightNumerics:
                 expert_model_parallel_size=args.expert_model_parallel_size,
             )
 
-            model, optimizer, _ = setup_model_and_optimizer(model_provider_func=self.model_provider)
+            model, optimizer, _ = setup_model_and_optimizer(
+                model_type=ModelType.encoder_or_decoder, model_provider_func=self.model_provider
+            )
             assert len(model) == 1
             self.assert_storage_path_is_exercised(
                 model[0], precision, primary_param_gather, single_weight=True

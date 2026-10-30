@@ -235,7 +235,7 @@ def validate_at_pretrain(monkeypatch, run_config):
         run_config.train = TrainingConfig(**train)
         run_config.scheduler = scheduler
         with pytest.raises(BeforeInitialization):
-            training.pretrain(run_config, Mock(), Mock())
+            training.pretrain(run_config, Mock(), None, Mock())
 
     return validate
 
@@ -250,7 +250,7 @@ def test_pretrain_validates_scheduler_before_initialization(validate_at_pretrain
     run_config.optimizer.weight_decay = 0.0
     run_config.train = TrainingConfig(train_iters=10)
     with pytest.raises(AssertionError):
-        training.pretrain(run_config, Mock(), Mock())
+        training.pretrain(run_config, Mock(), None, Mock())
 
 
 @pytest.fixture

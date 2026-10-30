@@ -7,6 +7,7 @@ import torch
 import torch.distributed
 
 from megatron.core import mpu
+from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -198,7 +199,10 @@ class TestGPTModel:
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            model_provider, cfg_container=cfg_container, pg_collection=pg_collection
+            ModelType.encoder_or_decoder,
+            model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
         )
         data = list(range(args.seq_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).cuda()
@@ -268,7 +272,9 @@ class TestGPTModel:
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
 
-        dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(model_provider)
+        dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+            ModelType.encoder_or_decoder, model_provider
+        )
         dense_model = unwrap_model(dense_model)
         set_bias_value(dense_model)
 
@@ -277,7 +283,7 @@ class TestGPTModel:
             tensor_model_parallel_size=tp, expert_model_parallel_size=ep
         )
         set_upcycling_args(ep, granularity, num_experts=2)
-        moe_model = unwrap_model(get_model(model_provider))
+        moe_model = unwrap_model(get_model(model_provider, ModelType.encoder_or_decoder))
 
         # Emulate multiple model chunks by repeating the single chunk; this drives the
         # ``len(moe_model) > 1`` branch, which previously crashed with an ``AttributeError``
@@ -336,7 +342,10 @@ class TestGPTModel:
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            model_provider, cfg_container=cfg_container, pg_collection=pg_collection
+            ModelType.encoder_or_decoder,
+            model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
         )
         data = list(range(args.seq_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).cuda()

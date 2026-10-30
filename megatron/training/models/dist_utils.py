@@ -58,6 +58,7 @@ def unimodal_build_distributed_models(
     data_parallel_random_init: bool = False,
     mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
     pre_wrap_hook: Callable[[list[MegatronModule]], list[MegatronModule]] | None = None,
+    model_type: ModelType = ModelType.encoder_or_decoder,
     use_layer_wise_distributed_optimizer: bool = False,
     use_layer_wise_param_layout: bool = True,
 ) -> list[MegatronModule]:
@@ -87,6 +88,7 @@ def unimodal_build_distributed_models(
         mixed_precision_wrapper: Mixed precision wrapper applied per model stage, e.g. ``Float16Module``.
             Pass ``None`` to skip.
         pre_wrap_hook: Hook applied to the model stage list before any wrapping.
+        model_type: Deprecated flag, only used for backwards compatibility.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
             controls whether to compute and supply a shard-aligned param layout to DDP.
@@ -101,9 +103,9 @@ def unimodal_build_distributed_models(
     init_model_with_meta_device = transformer_config.init_model_with_meta_device
     if init_model_with_meta_device:
         with torch.device("meta"):
-            model_list = build_virtual_pipeline_stages(build_model_func, pg_collection, vp_size)
+            model_list = build_virtual_pipeline_stages(build_model_func, pg_collection, vp_size, model_type)
     else:
-        model_list = build_virtual_pipeline_stages(build_model_func, pg_collection, vp_size)
+        model_list = build_virtual_pipeline_stages(build_model_func, pg_collection, vp_size, model_type)
 
     # Apply pre wrap hooks
     if pre_wrap_hook is not None:
@@ -462,15 +464,15 @@ def build_virtual_pipeline_stages(
     build_model_func: Callable,
     pg_collection: ProcessGroupCollection,
     vp_size: int | None,
+    model_type: ModelType = ModelType.encoder_or_decoder,
 ) -> list[MegatronModule]:
     """Build virtual pipeline stages if using virtual pipeline parallelism.
-
-    Keep the fixed ``model_type`` attribute for Core pipeline compatibility.
 
     Args:
         build_model_func: Function from ``ModelBuilder`` that builds a single stage of the model.
         pg_collection: Model communication process groups.
         vp_size: Virtual pipeline parallel size. If ``None`` or PP size is 1, a single stage is built.
+        model_type: Deprecated flag, only used for backwards compatibility.
 
     Returns:
         List of model stages. Contains one entry per VP rank, or a single entry if VP is not enabled.
@@ -495,14 +497,14 @@ def build_virtual_pipeline_stages(
                 post_process=post_process,
                 vp_stage=i,
             )
-            model.model_type = ModelType.encoder_or_decoder
+            model.model_type = model_type
             model_list.append(model)
     else:
         # Single stage, no VP
         pre_process = is_pp_first_stage(pp_group)
         post_process = is_pp_last_stage(pp_group)
         model = build_model_func(pg_collection, pre_process=pre_process, post_process=post_process)
-        model.model_type = ModelType.encoder_or_decoder
+        model.model_type = model_type
         model_list = [model]
 
     return model_list

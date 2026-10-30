@@ -7,6 +7,7 @@ from typing import Any, Callable, ClassVar, Literal, override
 import torch
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
@@ -228,6 +229,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         mixed_precision_wrapper: (
             Callable[[Any, MegatronModule], MegatronModule] | None
         ) = Float16Module,
+        model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
     ) -> list[HybridModel]:
@@ -243,6 +245,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             wrap_with_ddp: Set to False to skip the DDP/FSDP wrapper.
             data_parallel_random_init: Whether to use data parallel random initialization
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
+            model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
             use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
                 controls whether to compute and supply a shard-aligned param layout to DDP.
@@ -264,6 +267,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             data_parallel_random_init,
             mixed_precision_wrapper,
             composed_pre_wrap_hook,
+            model_type,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
             use_layer_wise_param_layout=use_layer_wise_param_layout,
         )

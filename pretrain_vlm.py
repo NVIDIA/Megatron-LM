@@ -16,6 +16,7 @@ import torch
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.multimodal_dataset import MockMultimodalDataset, MultimodalDatasetConfig
+from megatron.core.enums import ModelType
 from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX, LLaVAModel
 from megatron.core.models.multimodal.llava_spec import (
@@ -542,6 +543,7 @@ if __name__ == "__main__":
     pretrain(
         full_config,
         train_valid_test_datasets_provider,
+        ModelType.encoder_or_decoder,
         forward_step,
         model_provider,
         get_embedding_ranks=llava_embedding_ranks,

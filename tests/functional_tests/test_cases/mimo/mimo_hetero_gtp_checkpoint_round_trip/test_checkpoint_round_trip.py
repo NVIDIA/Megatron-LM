@@ -186,9 +186,10 @@ def _install_checkpoint_resave_hook() -> None:
     original = training.setup_model_and_optimizer
 
     def setup_model_and_optimizer(
-        model_provider_func=None, checkpointing_context=None, **kwargs
+        model_type, model_provider_func=None, checkpointing_context=None, **kwargs
     ):
         model, optimizer, opt_param_scheduler = original(
+            model_type,
             model_provider_func=model_provider_func,
             checkpointing_context=checkpointing_context,
             **kwargs,

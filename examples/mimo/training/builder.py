@@ -122,6 +122,7 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         mixed_precision_wrapper: (
             Callable[[Any, MegatronModule], MegatronModule] | None
         ) = Float16Module,
+        model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
     ) -> list[MimoModel]:
@@ -150,7 +151,7 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         else:
             mimo_model = self.build_model(pg_collection)
 
-        mimo_model.model_type = ModelType.encoder_or_decoder
+        mimo_model.model_type = model_type
         model_list = compose_hooks(self._model_config.pre_wrap_hooks)([mimo_model])
         if len(model_list) != 1:
             raise ValueError(

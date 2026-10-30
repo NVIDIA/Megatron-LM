@@ -152,7 +152,7 @@ def test_native_builder_uses_dist_and_ddp_configs(monkeypatch, run_config, fsdp2
 
     builder.build_distributed_models.side_effect = ReachedBuilder
     with pytest.raises(ReachedBuilder):
-        training.setup_model_and_optimizer(cfg_container=run_config)
+        training.setup_model_and_optimizer(Mock(), cfg_container=run_config)
     kwargs = builder.build_distributed_models.call_args.kwargs
     assert kwargs["ddp_config"] is run_config.ddp
     assert kwargs["use_torch_fsdp2"] is fsdp2
@@ -283,7 +283,7 @@ class TestTraining:
         monkeypatch.setattr(training, "save_checkpoint", save)
 
         with pytest.raises(SystemExit):
-            training.setup_model_and_optimizer(lambda: None, cfg_container=run_config)
+            training.setup_model_and_optimizer(None, lambda: None, cfg_container=run_config)
         load.assert_called_once()
         save.assert_called_once()
 

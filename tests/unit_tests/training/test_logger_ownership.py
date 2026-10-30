@@ -368,7 +368,7 @@ def test_native_builder_keeps_core_metric_settings(monkeypatch, model_kind, enab
 
     monkeypatch.setattr(config_cls, 'get_builder_cls', lambda self: construct)
     with pytest.raises(ObservedModel):
-        training.setup_model_and_optimizer(cfg_container=run_config)
+        training.setup_model_and_optimizer(Mock(), cfg_container=run_config)
 
 
 @pytest.mark.parametrize('enabled', [False, True])

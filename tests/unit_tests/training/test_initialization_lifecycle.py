@@ -837,7 +837,9 @@ def test_callback_upcycling_uses_temporary_dense_config(monkeypatch, run_config)
 
     monkeypatch.setattr(training, "get_model", build)
     with pytest.raises(ReachedDenseModel):
-        training.setup_model_and_optimizer(model_provider_func=Mock(), cfg_container=run_config)
+        training.setup_model_and_optimizer(
+            Mock(), model_provider_func=Mock(), cfg_container=run_config
+        )
     assert built_configs[0] is run_config.model.transformer
     assert built_configs[1].num_moe_experts is None
     assert built_configs[1].expert_model_parallel_size == 1

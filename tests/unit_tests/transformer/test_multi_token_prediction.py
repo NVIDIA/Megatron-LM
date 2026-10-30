@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_this_cp_rank
+from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import HAVE_TE, _resolve_is_first_microbatch
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -2729,7 +2730,7 @@ class TestMultiTokenPrediction:
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
         gpt_model_ref, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider
+            ModelType.encoder_or_decoder, self.model_provider
         )
         output_ref = gpt_model_ref[0].forward(
             input_ids=tokens,
@@ -2776,7 +2777,7 @@ class TestMultiTokenPrediction:
             torch.manual_seed(_SEED)
             Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
             gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-                self.model_provider
+                ModelType.encoder_or_decoder, self.model_provider
             )
             load_checkpoint(
                 gpt_model, optimizer, opt_param_scheduler, strict=False, restore_training_state=True
@@ -2837,7 +2838,9 @@ class TestMultiTokenPrediction:
         Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
         model_parallel_cuda_manual_seed(_SEED)
 
-        gpt_model, optimizer, _ = setup_model_and_optimizer(self.model_provider)
+        gpt_model, optimizer, _ = setup_model_and_optimizer(
+            ModelType.encoder_or_decoder, self.model_provider
+        )
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         output = gpt_model[0].forward(
             input_ids=batch['tokens'],
@@ -2908,7 +2911,9 @@ class TestMultiTokenPrediction:
         batch = get_batch_on_this_cp_rank(
             batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
         )
-        gpt_model, _, _ = setup_model_and_optimizer(self.model_provider)
+        gpt_model, _, _ = setup_model_and_optimizer(
+            ModelType.encoder_or_decoder, self.model_provider
+        )
         assert unwrap_model(gpt_model[0]).mtp.config.mtp_hsm
         assert gpt_model[0].training, "HSM only runs in training mode"
 
@@ -2954,7 +2959,9 @@ class TestMultiTokenPrediction:
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
-        gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(self.model_provider)
+        gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+            ModelType.encoder_or_decoder, self.model_provider
+        )
 
         output = gpt_model[0].forward(
             input_ids=tokens,
@@ -3002,7 +3009,10 @@ class TestMultiTokenPrediction:
         cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider, cfg_container=cfg_container, pg_collection=pg_collection
+            ModelType.encoder_or_decoder,
+            self.model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
         )
 
         # Forward pass with packed sequences
@@ -3067,7 +3077,10 @@ class TestMultiTokenPrediction:
         cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         gpt_model, _, _ = setup_model_and_optimizer(
-            self.model_provider, cfg_container=cfg_container, pg_collection=pg_collection
+            ModelType.encoder_or_decoder,
+            self.model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
         )
 
         output = gpt_model[0].forward(
@@ -4184,7 +4197,10 @@ class TestMultiTokenPredictionHybrid:
         cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         model, _, _ = setup_model_and_optimizer(
-            self.model_provider, cfg_container=cfg_container, pg_collection=pg_collection
+            ModelType.encoder_or_decoder,
+            self.model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
         )
 
         mtp_layers = [
@@ -4712,7 +4728,10 @@ class TestMultiTokenPredictionHybrid:
         cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         mamba_model_ref, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider, cfg_container=cfg_container, pg_collection=pg_collection
+            ModelType.encoder_or_decoder,
+            self.model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
         )
 
         output_ref = mamba_model_ref[0].forward(
@@ -4759,7 +4778,10 @@ class TestMultiTokenPredictionHybrid:
             cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
             mamba_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-                self.model_provider, cfg_container=cfg_container, pg_collection=pg_collection
+                ModelType.encoder_or_decoder,
+                self.model_provider,
+                cfg_container=cfg_container,
+                pg_collection=pg_collection,
             )
             load_checkpoint(
                 mamba_model,

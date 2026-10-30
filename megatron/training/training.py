@@ -401,7 +401,7 @@ def _otel_telemetry_active():
     return handle is not None and bool(getattr(handle, 'is_exporting', False))
 
 
-def _start_otel_job_spans(model_config, program_start):
+def _start_otel_job_spans(model_type, program_start):
     """Emit pre_startup and open this incarnation's megatron.startup trace.
 
     See the module comment above for the full picture. There are no run-long
@@ -489,7 +489,9 @@ def _start_otel_job_spans(model_config, program_start):
         "megatron.startup", context=_OtelContext(), start_time=_startup_start_ns
     )
     _otel_mark_goodput(_otel_startup_span)
-    _otel_set_attrs(_otel_startup_span, {'megatron.model_type': type(model_config).__name__})
+    # model_type used to ride on megatron.pretrain; keep it on the startup root now that
+    # the umbrella is gone, so it is still queryable per incarnation.
+    _otel_set_attrs(_otel_startup_span, {'megatron.model_type': str(model_type)})
     try:
         _otel_startup_span_ctx = _otel_startup_span.get_span_context()
     except Exception:  # noqa: BLE001 -- telemetry must never break training
@@ -1656,6 +1658,7 @@ def _get_train_full_dataset_sample_count(args, dataset_provider):
 def pretrain(
     cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
+    model_type,
     forward_step_func,
     model_provider=None,
     process_non_loss_data_func=None,
@@ -1692,6 +1695,7 @@ def pretrain(
             evaluate), and --train-full-dataset (which samples the provider) raises.
         model_provider: a function that returns a vanilla version of the
             model. By vanilla we mean a simple model on cpu with no fp16 or ddp.
+        model_type: an enum that specifies the type of model being trained.
         forward_step_func: a function that takes a `data iterator` and `model`,
             and returns a `loss` scalar with a dictionary with key:values being
             the info we would like to monitor during training, for example
@@ -1845,7 +1849,7 @@ def pretrain(
     # managed_span). The megatron.startup.* spans below then nest inside that trace.
     # The per-interval megatron.train blocks are separate traces again, chained by
     # Links -- see _end_otel_startup_span(), called right before train()'s loop.
-    _start_otel_job_spans(cfg_container.model, program_start)
+    _start_otel_job_spans(model_type, program_start)
 
     _backdated_otel_span('megatron.startup.imports', program_start, main_entry)
     _backdated_otel_span('megatron.startup.arg_parse', main_entry, pretrain_entry)
@@ -2045,6 +2049,7 @@ def pretrain(
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     with _otel_managed_span('model_init', 'megatron.startup.model_init', is_goodput_span=True):
         model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+            model_type,
             model_provider_func=model_provider,
             checkpointing_context=checkpointing_context,
             cfg_container=cfg_container,
@@ -2549,12 +2554,13 @@ def _forward_backward_grad_context(args):
     return grad_context, forward_only
 
 
-def get_model(model_provider_func, wrap_with_ddp=True, config=None, pg_collection=None, ddp_config=None):
+def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None, ddp_config=None):
     """Build the model using a finalized DDP config, or legacy args if omitted."""
     cfg = get_run_config()
     args = get_args()
     if config is None:
         config = cfg.model.transformer
+    args.model_type = model_type
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
@@ -2574,7 +2580,7 @@ def get_model(model_provider_func, wrap_with_ddp=True, config=None, pg_collectio
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
 
-    # Core pipeline schedules still read the fixed model_type compatibility attribute.
+    # Build model.
     def build_model():
         if (
             get_pg_size(pg_collection.pp) > 1
@@ -2597,7 +2603,7 @@ def get_model(model_provider_func, wrap_with_ddp=True, config=None, pg_collectio
                     config=config,
                     pg_collection=pg_collection,
                 )
-                this_model.model_type = ModelType.encoder_or_decoder
+                this_model.model_type = model_type
                 this_model.vp_stage = i
                 model.append(this_model)
         else:
@@ -2609,7 +2615,7 @@ def get_model(model_provider_func, wrap_with_ddp=True, config=None, pg_collectio
                 config=config,
                 pg_collection=pg_collection,
             )
-            model.model_type = ModelType.encoder_or_decoder
+            model.model_type = model_type
         return model
 
 
@@ -2858,6 +2864,7 @@ def get_megatron_ddp_config(
 
 
 def setup_model_and_optimizer(
+    model_type,
     model_provider_func=None,
     checkpointing_context=None,
     *,
@@ -2920,6 +2927,7 @@ def setup_model_and_optimizer(
             assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."
             return get_model(
                 model_provider_func,
+                model_type,
                 wrap_with_ddp=wrap_with_ddp,
                 pg_collection=pg_collection,
                 config=transformer_config if transformer_config is not None else cfg.model.transformer,

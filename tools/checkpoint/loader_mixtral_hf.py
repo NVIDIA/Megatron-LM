@@ -178,6 +178,7 @@ def _load_checkpoint(queue, args):
 
     try:
         from megatron.core import mpu
+        from megatron.core.enums import ModelType
         from megatron.core.models.common.language_module.language_module import LanguageModule
         from megatron.training.argument_utils import inference_cfg_container_from_args
         from megatron.training.arguments import parse_args, validate_args
@@ -242,6 +243,7 @@ def _load_checkpoint(queue, args):
 
     # Determine how to make our models.
     assert args.model_type == 'GPT', 'Llama-2 is a GPT model.'
+    margs.model_type = ModelType.encoder_or_decoder
 
     # Suppress warning about torch.distributed not being initialized.
     LanguageModule.embedding_warning_printed = True 

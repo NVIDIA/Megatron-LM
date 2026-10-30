@@ -462,6 +462,7 @@ class TestHybridModelBuilderBuildDistributedModels:
     @patch("megatron.training.models.hybrid.compose_hooks")
     @patch("megatron.training.models.hybrid.unimodal_build_distributed_models")
     def test_default_parameters_forwarded(self, mock_unimodal, mock_compose):
+        from megatron.core.enums import ModelType
         from megatron.core.transformer.module import Float16Module
 
         model_list = [Mock()]
@@ -474,7 +475,7 @@ class TestHybridModelBuilderBuildDistributedModels:
         # build_model, transformer_config, pg_collection, ddp_config,
         # overlap_param_gather_with_optimizer_step, use_megatron_fsdp, use_torch_fsdp2,
         # wrap_with_ddp, data_parallel_random_init, mixed_precision_wrapper,
-        # composed_pre_wrap_hook
+        # composed_pre_wrap_hook, model_type
         args = mock_unimodal.call_args.args
         assert args[0] == self.builder.build_model
         assert args[1] is self.config.transformer
@@ -483,3 +484,4 @@ class TestHybridModelBuilderBuildDistributedModels:
         assert args[7] is True  # wrap_with_ddp
         assert args[8] is False  # data_parallel_random_init
         assert args[9] is Float16Module  # mixed_precision_wrapper
+        assert args[11] is ModelType.encoder_or_decoder  # model_type

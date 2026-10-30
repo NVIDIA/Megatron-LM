@@ -9,6 +9,7 @@ import torch
 
 from gpt_builders import gpt_builder
 from hybrid_builders import hybrid_builder
+from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import is_pipeline_last_stage
@@ -435,7 +436,7 @@ if __name__ == "__main__":
     rl_model_provider = partial(model_provider, _model_builder)
 
     rl_setup = RLSetupCallback(
-        rl_cfg, model_provider=rl_model_provider
+        rl_cfg, model_provider=rl_model_provider, model_type=ModelType.encoder_or_decoder
     )
 
     def next_train_iterator(iteration, current_iterator):
@@ -462,6 +463,7 @@ if __name__ == "__main__":
         pretrain(
             full_config,
             None,  # we don't need to build any datasets for RL training
+            ModelType.encoder_or_decoder,
             forward_step,
             rl_model_provider,
             next_train_iterator=next_train_iterator,

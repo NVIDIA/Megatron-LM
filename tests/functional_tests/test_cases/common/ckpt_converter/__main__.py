@@ -17,6 +17,7 @@ from tqdm import tqdm
 from gpt_builders import gpt_builder
 from megatron.core import parallel_state
 from megatron.core.datasets.gpt_dataset import _get_ltor_masks_and_position_ids
+from megatron.core.enums import ModelType
 from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
@@ -225,7 +226,7 @@ class Pipeline:
     def build_model():
         model_provider_func = partial(model_provider, gpt_builder)
         models = get_model(
-            model_provider_func=model_provider_func
+            model_provider_func=model_provider_func, model_type=ModelType.encoder_or_decoder
         )
         [m.eval() for m in models]
 
@@ -745,7 +746,7 @@ class LLaVAPipeline(Pipeline):
         from examples.multimodal.model import model_provider
 
         models = get_model(
-            model_provider_func=model_provider
+            model_provider_func=model_provider, model_type=ModelType.encoder_or_decoder
         )
         [m.eval() for m in models]
 

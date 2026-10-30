@@ -16,6 +16,7 @@ from megatron.core.datasets.t5_dataset import (
     T5MaskedWordPieceDatasetConfig,
 )
 from megatron.core.datasets.utils import get_blend_from_list
+from megatron.core.enums import ModelType
 from megatron.core.models.T5 import T5Model
 from megatron.core.models.T5.t5_spec import (
     get_t5_decoder_with_local_block_spec,
@@ -290,6 +291,7 @@ if __name__ == "__main__":
     pretrain(
         full_config,
         train_valid_test_datasets_provider,
+        ModelType.encoder_or_decoder,
         forward_step,
         model_provider,
         get_embedding_ranks=t5_embedding_ranks,
