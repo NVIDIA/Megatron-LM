@@ -283,6 +283,8 @@ def test_get_gpt_modelopt_spec_interface():
         "real_quant_cfg": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "qk_l2_norm": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "use_arbitrary_attention_mask": inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        "vp_stage": inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        "pp_rank": inspect.Parameter.POSITIONAL_OR_KEYWORD,
     }
 
     expected_defaults = {
@@ -291,6 +293,8 @@ def test_get_gpt_modelopt_spec_interface():
         "real_quant_cfg": "None",
         "qk_l2_norm": False,
         "use_arbitrary_attention_mask": False,
+        "vp_stage": None,
+        "pp_rank": None,
     }
 
     # Check expected parameters are in function signature

@@ -51,8 +51,15 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 
 
-def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
-    """Determine the most appropriate layer specification based on availability."""
+def default_layer_spec(config: "GPTModelConfig", vp_stage: int, pp_rank: int | None = None) -> ModuleSpec:
+    """Determine the most appropriate layer specification based on availability.
+
+    Args:
+        config: full model config
+        vp_stage: virtual pipeline stage
+        pp_rank: pipeline rank from the model process group. Block specs keep only the
+            layers of this stage; if None, they use the global pipeline rank.
+    """
     transformer_cfg = config.transformer
     use_te = transformer_cfg.transformer_impl == "transformer_engine"
     if (
@@ -84,6 +91,8 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
             remap_te_layernorm=True,
             real_quant_cfg="None",
             use_arbitrary_attention_mask=use_arbitrary_attention_mask,
+            vp_stage=vp_stage,
+            pp_rank=pp_rank,
         )
     elif transformer_cfg.experimental_attention_variant is not None:
         return get_transformer_block_with_experimental_attention_variant_spec(config=transformer_cfg, vp_stage=vp_stage)
@@ -284,9 +293,10 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         Returns:
             The constructed model
         """
+        pp_rank = pg_collection.pp.rank()
         transformer_layer_spec = self._model_config.transformer_layer_spec
         if transformer_layer_spec is None:
-            transformer_layer_spec = default_layer_spec(self._model_config, vp_stage)
+            transformer_layer_spec = default_layer_spec(self._model_config, vp_stage, pp_rank)
         elif not isinstance(transformer_layer_spec, ModuleSpec) and callable(transformer_layer_spec):
             # Check if the transformer_layer_spec function accepts vp_stage parameter
             if "vp_stage" in inspect.signature(transformer_layer_spec).parameters:
@@ -308,7 +318,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             self._model_config,
             transformer_layer_spec,
             vp_stage=vp_stage,
-            pp_rank=pg_collection.pp.rank(),
+            pp_rank=pp_rank,
         )
 
         # override spec with local backend if configured
