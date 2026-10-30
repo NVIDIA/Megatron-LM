@@ -909,6 +909,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             and model_config.transformer_impl == "transformer_engine"
         )
 
+        # The FlashInfer MXFP8 token bound (inference_flashinfer_mxfp8_token_capacity) covers
+        # the tokens of all EP ranks, so it is safe only when every EP rank is decoding. The
+        # NVLS dispatcher it requires does not sync that across EP, so sync it per step.
+        self._sync_ep_decode_only = (
+            model_config.inference_flashinfer_mxfp8_token_capacity is not None
+        )
+        self._ep_decode_only = False
+
         # We only allow non-decode cuda graphs for the nvls dispatcher
         force_disable_non_decode_cuda_graphs = (
             self._nccl_ep_dispatcher or self._training_ep_dispatcher
@@ -1874,6 +1882,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             return self.padded_batch_dimensions.prefill_req_count == 0
         return self.num_prefill_requests == 0
 
+    def is_ep_decode_only(self) -> bool:
+        """Return whether every expert-parallel rank runs a decode-only step."""
+        return self._ep_decode_only and self.is_decode_only()
+
     def using_cuda_graph_this_step(self) -> bool:
         """Returns True if cuda graphs are being used for this step."""
         return self._using_cuda_graph_this_step
@@ -2701,6 +2713,20 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
             ep_zmq_communicator=self._ep_zmq_communicator,
         )
+        if self._sync_ep_decode_only:
+            self._ep_decode_only = (
+                InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(
+                    batch_dimensions,
+                    ep_group=self.expert_model_parallel_group,
+                    ep_zmq_communicator=self._ep_zmq_communicator,
+                )
+                is not None
+            )
+            # Decode graphs may have been captured with the token bound, so a decode-only
+            # rank must not replay one while another EP rank is prefilling.
+            if not self._ep_decode_only and best_graph is not None:
+                if best_graph.prefill_req_count == 0:
+                    best_graph = None
         self._using_cuda_graph_this_step = best_graph is not None
 
         if construct_graph_dimensions is not None:

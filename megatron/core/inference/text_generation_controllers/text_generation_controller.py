@@ -936,8 +936,9 @@ class TextGenerationController(MTPControllerMixin):
             * (self.num_speculative_tokens + 1)
             * self.model_config.expert_model_parallel_size
         )
+        # The bound covers the tokens of all EP ranks, so every EP rank must be decoding.
         InferenceMode.set_bounded_mxfp8_rows(
-            context.is_decode_only()
+            context.is_ep_decode_only()
             and token_capacity is not None
             and decode_token_upper_bound <= token_capacity
         )
