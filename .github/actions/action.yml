@@ -67,7 +67,7 @@ inputs:
     required: false
     default: ""
   unit_testmon_mode:
-    description: "Unit-test mode: full, enforce, preselected (CPU plan), or baseline (main producer only)."
+    description: "Unit-test mode: full, enforce, preselected (saved GPU selection), or baseline (main producer only)."
     required: false
     default: "full"
   unit_testmon_target_branch:
@@ -79,7 +79,7 @@ inputs:
     required: false
     default: ""
   unit_testmon_plan_artifact:
-    description: "Artifact containing the CPU-selected plan.json for this bucket."
+    description: "Artifact containing the saved GPU selection plan.json for this bucket."
     required: false
     default: ""
 runs:
@@ -172,7 +172,7 @@ runs:
           --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" --image-id "$IMAGE_ID" \
           --output "$RUNNER_TEMP/unit-testmon-identity.json" | tee -a "$GITHUB_OUTPUT"
 
-    - name: Download CPU unit Testmon plan
+    - name: Download unit Testmon selection plan
       id: download-unit-testmon-plan
       if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'preselected' && inputs.unit_testmon_plan_artifact != ''
       uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
@@ -180,7 +180,7 @@ runs:
         name: ${{ inputs.unit_testmon_plan_artifact }}
         path: assets_dir/testmon
 
-    - name: Validate CPU unit Testmon plan
+    - name: Validate unit Testmon selection plan
       id: validate-unit-testmon-plan
       if: steps.download-unit-testmon-plan.outcome == 'success'
       shell: bash -e -u -o pipefail {0}

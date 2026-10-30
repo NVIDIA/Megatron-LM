@@ -928,7 +928,6 @@ def test_grouped_native_gpu_selection(
     for script in (
         "testmon_cache.py",
         "testmon_selector.py",
-        "testmon_plan.py",
         "testmon_mandatory.py",
         "find_test_cases.py",
     ):

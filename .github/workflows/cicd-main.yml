@@ -1538,7 +1538,7 @@ jobs:
         with:
           pattern: coverage-${{ matrix.flag }}-*
 
-      - name: Download CPU selection evidence
+      - name: Download unit-test selection evidence
         if: needs.configure.outputs.unit_testmon_eligible == 'true'
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
@@ -1582,7 +1582,7 @@ jobs:
                       raise SystemExit(f"Invalid empty-selection evidence: {path}")
                   observed.add(identity)
               if not expected or observed != expected:
-                  raise SystemExit("Missing CPU selection evidence for unit-test buckets")
+                  raise SystemExit("Missing selection evidence for unit-test buckets")
               print("Every unit-test bucket has a verified empty selection; no coverage expected.")
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"has_coverage={str(has_coverage).lower()}\n")
