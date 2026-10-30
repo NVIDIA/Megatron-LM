@@ -1940,6 +1940,175 @@ class TestTEGroupedMLP:
             overridden = override_pattern in ("*experts*", f"*{name}")
             assert linear.will_execute_quantized(True) is not overridden
 
+    @staticmethod
+    def _mxfp8_override_recipe(pattern):
+        """A te-precision-config recipe keeping `pattern` quantized, but with MXFP8."""
+        return RecipeConfig.from_config_dict(
+            {
+                "configs": {
+                    "mxfp8": {
+                        "transformer_engine_config_type": "TEQuantizationParams",
+                        "training_recipe": {"fp8_quantization_recipe": "mxfp8"},
+                    }
+                },
+                "matchers": {
+                    "experts_mxfp8": {
+                        "type": "glob",
+                        "enabled": True,
+                        "pattern": pattern,
+                        "config": "mxfp8",
+                    }
+                },
+            }
+        )
+
+    def _build_quantized_override_layer(self, quant_recipe, *, hidden, ffn):
+        """Build the weighted squared-ReLU expert path with MXFP8-compatible dimensions."""
+        tf_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=hidden,
+            ffn_hidden_size=ffn,
+            num_attention_heads=4,
+            num_moe_experts=self.num_experts,
+            use_cpu_initialization=False,
+            add_bias_linear=False,
+            gated_linear_unit=False,
+            activation_func=squared_relu,
+            use_fused_weighted_squared_relu=True,
+            bias_activation_fusion=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            moe_router_load_balancing_type="sinkhorn",
+            moe_router_topk=1,
+            moe_grouped_gemm=True,
+            use_transformer_engine_op_fuser=True,
+            quant_recipe=quant_recipe,
+        )
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        submodules = get_submodules(
+            get_gpt_layer_with_transformer_engine_submodules(
+                self.num_experts, moe_grouped_gemm=True
+            ).mlp
+        )
+        # The override is resolved by module path, so the layer needs its name populated.
+        layer = MoELayer(tf_config, submodules, name="mlp")
+        layer = Float16Module(layer.config, layer).module
+        return layer.cuda()
+
+    def _skip_unless_quantized_override_testable(self, monkeypatch):
+        try:
+            import transformer_engine.pytorch as te
+            from transformer_engine.pytorch.ops import GroupedLinear  # noqa: F401
+        except ImportError:
+            pytest.skip("TE op fuser API not available")
+        for probe in (te.is_mxfp8_available, te.is_nvfp4_available):
+            available, reason = probe(return_reason=True)
+            if not available:
+                pytest.skip(reason)
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    def test_gpu_quantized_precision_override_runs_fused_with_module_recipe(self, monkeypatch):
+        """MXFP8 experts under NVFP4 autocast match a global-MXFP8 reference exactly.
+
+        Check the recipe at the real TE sequence boundary, its selected fused kernel and
+        quantizers, and the resulting output and gradients.
+        """
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import MXFP8BlockScaling, NVFP4BlockScaling
+        from transformer_engine.pytorch import MXFP8Quantizer
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+        self._skip_unless_quantized_override_testable(monkeypatch)
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(1, 1)
+        hidden, ffn = 128, 256
+
+        overridden = self._build_quantized_override_layer(
+            self._mxfp8_override_recipe("*experts*"), hidden=hidden, ffn=ffn
+        )
+        reference = self._build_quantized_override_layer(None, hidden=hidden, ffn=ffn)
+        self._copy_params(dst=reference, src=overridden)
+        for layer in (overridden, reference):
+            assert isinstance(layer.experts, TEGroupedMLP)
+            assert layer.experts._with_fused_impl, "a quantized override must retain TE ops"
+
+        def record_execution_recipe(experts):
+            contexts = []
+            make_ops = experts._make_fused_ops
+
+            def record_context(_ops, _inputs):
+                contexts.append(
+                    (
+                        FP8GlobalStateManager.is_fp8_enabled(),
+                        type(FP8GlobalStateManager.get_fp8_recipe()),
+                    )
+                )
+
+            def make_ops_with_precision_probe():
+                ops = make_ops()
+                ops.register_forward_pre_hook(record_context)
+                return ops
+
+            monkeypatch.setattr(experts, "_make_fused_ops", make_ops_with_precision_probe)
+            return contexts
+
+        override_contexts = record_execution_recipe(overridden.experts)
+        reference_contexts = record_execution_recipe(reference.experts)
+        torch.manual_seed(1234)
+        hidden_states = torch.randn((64, 2, hidden), dtype=torch.bfloat16, device="cuda")
+
+        def run(layer, recipe):
+            x = hidden_states.clone().requires_grad_(True)
+            with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+                out, _ = layer(x)
+                assert FP8GlobalStateManager.is_fp8_enabled()
+                assert FP8GlobalStateManager.get_fp8_recipe() is recipe
+            out.float().sum().backward()
+            grads = [p.grad.detach().clone() for p in layer.experts.parameters()]
+            return out.detach(), x.grad.detach(), grads
+
+        out, dx, grads = run(overridden, NVFP4BlockScaling())
+        ref_out, ref_dx, ref_grads = run(reference, MXFP8BlockScaling())
+        assert override_contexts == [(True, MXFP8BlockScaling)]
+        assert reference_contexts == [(True, MXFP8BlockScaling)]
+        for layer in (overridden, reference):
+            self._assert_fused_op_selected(layer.experts)
+
+        # The overridden fused op quantized with MXFP8, not the ambient NVFP4.
+        (sequential,) = overridden.experts._fused_ops
+        fused_op = sequential._module_groups[0]._forward_ops[0][0]
+        for fc in (fused_op.basic_ops[0], fused_op.basic_ops[-1]):
+            assert isinstance(fc.get_quantizer("forward", 1), MXFP8Quantizer)
+        torch.testing.assert_close(out, ref_out, rtol=0, atol=0)
+        torch.testing.assert_close(dx, ref_dx, rtol=0, atol=0)
+        assert len(grads) == len(ref_grads)
+        for got, want in zip(grads, ref_grads):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    def test_gpu_quantized_precision_override_must_cover_fc1_and_fc2(self, monkeypatch):
+        """The TE sequence rejects a quantized override matching only one of its linears."""
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import NVFP4BlockScaling
+
+        self._skip_unless_quantized_override_testable(monkeypatch)
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(1, 1)
+
+        layer = self._build_quantized_override_layer(
+            self._mxfp8_override_recipe("*linear_fc2"), hidden=128, ffn=256
+        )
+        assert layer.experts._with_fused_impl
+        x = torch.randn((64, 2, 128), dtype=torch.bfloat16, device="cuda")
+        with te.fp8_autocast(enabled=True, fp8_recipe=NVFP4BlockScaling()):
+            with pytest.raises(ValueError, match="same precision override"):
+                layer(x)
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.parametrize(
