@@ -82,6 +82,8 @@ def get_gpt_layer_with_inference_submodules(
         moe_grouped_gemm=moe_grouped_gemm,
         use_te_activation_func=False,
     )
+    # A dense MLP normalizes its input inside its layer-norm-fused linear_fc1; MoE experts do not.
+    pre_mlp_layernorm = backend.layer_norm(has_residual=True) if num_experts else IdentityOp
 
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
@@ -113,7 +115,7 @@ def get_gpt_layer_with_inference_submodules(
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=IdentityOp,
+            pre_mlp_layernorm=pre_mlp_layernorm,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
         )
@@ -136,7 +138,7 @@ def get_gpt_layer_with_inference_submodules(
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
+            pre_mlp_layernorm=pre_mlp_layernorm,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
             sharded_state_dict_keys_map={
