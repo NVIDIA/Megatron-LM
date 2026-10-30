@@ -33,7 +33,10 @@ from tests.unit_tests.test_utilities import Utils
 
 # Tolerance for memory expectation check (GPU allocator jitter etc).
 EPSILON = 0.30
-EPSILON_A2A = 0.30
+# The EP-overlap schedule saves more than the recorded bytes of the requested groups (about
+# 1.3x for the all-module cases): offloading most activations moves the peak and shrinks
+# allocator fragments, and combined requests are recorded under the fused group.
+EPSILON_A2A = 0.35
 DELTA = 20  # MiB
 
 
