@@ -10,7 +10,6 @@ import torch
 from megatron.core import mpu, parallel_state
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
-from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import (
@@ -589,7 +588,6 @@ if __name__ == "__main__":
     set_run_config(full_config)
     pretrain(full_config,
              train_valid_test_datasets_provider,
-             ModelType.encoder_or_decoder,
              forward_step,
              model_provider,
              store=store,

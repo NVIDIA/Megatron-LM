@@ -174,7 +174,7 @@ def validate_at_pretrain(monkeypatch, run_config):
         setup.reset_mock()
         try:
             with pytest.raises(BeforeInitialization):
-                training.pretrain(run_config, Mock(), None, Mock())
+                training.pretrain(run_config, Mock(), Mock())
         except ValueError:
             initialize.assert_not_called()
             setup.assert_not_called()

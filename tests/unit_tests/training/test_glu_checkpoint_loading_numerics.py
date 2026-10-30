@@ -11,7 +11,6 @@ from torch.distributed.distributed_c10d import _world
 
 from megatron.core import dist_checkpointing
 from megatron.core.distributed import DistributedDataParallel
-from megatron.core.enums import ModelType
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.training import checkpointing
@@ -123,9 +122,7 @@ def _setup_model(
     set_args(args)
     torch.manual_seed(1234)
     Utils.initialize_model_parallel()
-    model, optimizer, scheduler = setup_model_and_optimizer(
-        model_type=ModelType.encoder_or_decoder, model_provider_func=case.model_provider
-    )
+    model, optimizer, scheduler = setup_model_and_optimizer(model_provider_func=case.model_provider)
     assert isinstance(model[0], DistributedDataParallel)
     experts = [module for module in model[0].modules() if isinstance(module, TEGroupedMLP)]
     assert len(experts) == 1

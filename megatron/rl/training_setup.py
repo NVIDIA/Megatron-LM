@@ -31,7 +31,7 @@ except ImportError:
 
 
 def build_rl_inference_model(
-    rl_config: Any, args: Any, config: Any, model_provider: Any, model_type: Any
+    rl_config: Any, args: Any, config: Any, model_provider: Any
 ) -> Optional[list]:
     """Build a separate inference model with custom parallelism, if requested."""
     cfg_container = get_run_config()
@@ -51,7 +51,6 @@ def build_rl_inference_model(
         # the shard process groups maintained by the per-pool refit path.
         return build_disagg_inference_model(
             args,
-            model_type,
             config,
             cfg_container=cfg_container,
             model_alloc_ctx=inference_model_alloc_context(),
@@ -102,7 +101,6 @@ def build_rl_inference_model(
     with inference_model_alloc_context():
         inference_model = get_model(
             model_provider,
-            model_type,
             wrap_with_ddp=False,
             pg_collection=inference_pg_collection,
             config=inference_config,
@@ -183,10 +181,9 @@ def reinitialize_grpo_microbatch_calculator(args: Any, data_parallel_size: int) 
 class RLSetupCallback(Callback):
     """Builds the RL loop's state at `on_data_init_start` and keeps it for the rollout hooks."""
 
-    def __init__(self, rl_config: Any, *, model_provider: Any, model_type: Any) -> None:
+    def __init__(self, rl_config: Any, *, model_provider: Any) -> None:
         self._rl_config = rl_config
         self._model_provider = model_provider
-        self._model_type = model_type
         self.model: Optional[list] = None
         self.optimizer: Any = None
         self.inference_model: Optional[list] = None
@@ -202,7 +199,6 @@ class RLSetupCallback(Callback):
             args,
             get_model_config(self.model[0]),
             self._model_provider,
-            self._model_type,
         )
         if not cfg.validation.skip_train:
             # GRPO loop state; eval-only runs (--skip-train) evaluate the loaded weights directly.

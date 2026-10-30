@@ -11,7 +11,6 @@ from transformer_engine.pytorch.fp8 import check_nvfp4_support
 
 import megatron.core.parallel_state as ps
 from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.enums import ModelType
 from megatron.core.fp4_utils import is_nvfp4tensor
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -216,15 +215,11 @@ class TestFP4Param:
             self.seq_length, self.micro_batch_size
         )
         if inference:
-            gpt_model = get_model(
-                self.model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=False
-            )
+            gpt_model = get_model(self.model_provider, wrap_with_ddp=False)
             gpt_model[0].eval()
             optimizer = None
         else:
-            gpt_model, optimizer, _ = setup_model_and_optimizer(
-                ModelType.encoder_or_decoder, self.model_provider
-            )
+            gpt_model, optimizer, _ = setup_model_and_optimizer(self.model_provider)
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 
         num_fp4_params = 0
@@ -461,9 +456,7 @@ class TestFP4Param:
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
         model_parallel_cuda_manual_seed(_SEED)
-        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder, self.model_provider
-        )
+        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(self.model_provider)
         assert len(model) == 1
         return args, model, optimizer, opt_param_scheduler
 
@@ -616,9 +609,7 @@ class TestFP4Param:
                 torch.manual_seed(_SEED)
                 Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
                 model_parallel_cuda_manual_seed(_SEED)
-                model, _, _ = setup_model_and_optimizer(
-                    ModelType.encoder_or_decoder, self.model_provider
-                )
+                model, _, _ = setup_model_and_optimizer(self.model_provider)
                 args.load = str(ckpt_dir)
                 try:
                     iteration, _ = load_checkpoint(model, None, None, strict=True)
