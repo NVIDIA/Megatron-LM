@@ -659,7 +659,19 @@ class TestPagedStashingOverBudget:
         # This does the stashing needed for the test.
         paged_stash_reset(True, config=container.config)
         paged_stash_init_chunk_handler(1, 0)
+        routing_maps = {}
+
+        def capture_routing_map(router, _args, output):
+            _probs, routing_map = output
+            routing_maps[router] = routing_map
+
+        handles = [
+            layer.router.register_forward_hook(capture_routing_map)
+            for layer in container.moe_layers
+        ]
         _forward_backward_all_layers(container, hidden_states)
+        for handle in handles:
+            handle.remove()
 
         overflow = check_paged_stash_overflow()
         num_layers = len(container.moe_layers)
@@ -669,8 +681,7 @@ class TestPagedStashingOverBudget:
 
         total_tokens = 0
         for layer_idx, layer in enumerate(container.moe_layers):
-            comm = getattr(layer.token_dispatcher, "_comm_manager", None)
-            routing_map = getattr(comm, "routing_map", None) if comm is not None else None
+            routing_map = routing_maps.get(layer.router)
             over_budget_tensor = (
                 layer.token_dispatcher.check_over_budget()
                 if hasattr(layer.token_dispatcher, "check_over_budget")
