@@ -14,7 +14,11 @@ _SHARDING_STRATEGIES = ("no_shard", "optim", "optim_grads", "optim_grads_params"
 
 @dataclass
 class DistributedDataParallelConfig:
-    """Configuration for DistributedDataParallel."""
+    """Configuration for DistributedDataParallel.
+
+    FSDP fields remain for compatibility with existing callers and saved configs.
+    New FSDP integrations should use ``FullyShardedDataParallelConfig`` instead.
+    """
 
     grad_reduce_in_fp32: bool = False
     """If true, reduce grads in fp32."""

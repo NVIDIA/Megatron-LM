@@ -11,7 +11,7 @@ from torch.distributed.tensor import DTensor
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import DistributedDataParallelConfig, FullyShardedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
@@ -455,7 +455,8 @@ def test_delayed_wgrad_matches_immediate(process_group_collection, distributed_s
     torch.testing.assert_close(delayed_losses, immediate_losses, rtol=0, atol=0)
 
 
-def test_build_train_and_step(process_group_collection):
+@pytest.mark.parametrize("legacy_config", [False, True], ids=["fsdp_config", "ddp_config"])
+def test_build_train_and_step(process_group_collection, legacy_config):
     """Match eager training against an MFSDP v2 train-and-step sequence."""
     config = TransformerConfig(
         num_layers=2,
@@ -478,17 +479,24 @@ def test_build_train_and_step(process_group_collection):
     # requires DDP/FSDP buffer metadata, but the optimizer factory still expects
     # every model chunk to expose ddp_config.
     reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
-    model = FullyShardedDataParallel(
-        config=config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            use_distributed_optimizer=False,
-            data_parallel_sharding_strategy="optim_grads_params",
-        ),
-        module=model,
-        pg_collection=process_group_collection,
+    fsdp_config = FullyShardedDataParallelConfig(
+        version=2, data_parallel_sharding_strategy="optim_grads_params"
     )
+    config_kwargs = (
+        {
+            "ddp_config": DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                data_parallel_sharding_strategy="optim_grads_params",
+            )
+        }
+        if legacy_config
+        else {"fsdp_config": fsdp_config}
+    )
+    model = FullyShardedDataParallel(
+        config=config, module=model, pg_collection=process_group_collection, **config_kwargs
+    )
+    assert model.fsdp_config == fsdp_config.resolved()
 
     reference_optimizer_config = OptimizerConfig(
         optimizer="adam",
