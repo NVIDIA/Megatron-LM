@@ -311,12 +311,13 @@ class TestTEWrappers:
     @pytest.mark.parametrize(
         "backend", ["te", "torch"], ids=["te-general-gemm", "torch-mm-fallback"]
     )
-    def test_dsa_indexer_fp32_weights_projection_replays_fwd_bwd(self, backend):
+    @pytest.mark.parametrize("n_heads", [32, 64])
+    def test_dsa_indexer_fp32_weights_projection_replays_fwd_bwd(self, backend, n_heads):
         """Replay the DSA BF16-operand/FP32-output projection and its custom backward."""
         seeded()
         x = torch.randn(4096, 2, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        weight = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        grad_output = torch.randn(4096, 2, 64, device="cuda", dtype=torch.float32)
+        weight = torch.randn(n_heads, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        grad_output = torch.randn(4096, 2, n_heads, device="cuda", dtype=torch.float32)
         linear = SimpleNamespace()
 
         te_gemm_supported = False
