@@ -1,16 +1,16 @@
-# Colocated MIMO with dynamic context parallelism
+# MIMO with dynamic context parallelism
 
-MIMO can encode media independently across the decoder's data/context-parallel
-domain, then route projected features into packs selected by the existing
+MIMO can encode media independently on colocated or disjoint encoder ranks,
+then route projected features into packs selected by the existing
 sequence-packing scheduler. The encoder and decoder need not share a data
 partition. An image is encoded on one producer; its projected rows can be
 consumed by several context-parallel ranks.
 
-The initial execution contract is colocated, TP=PP=1, no GTP or expert GTP
-weight sharding, packed THD input, per-token loss, and non-overlapped DDP.
-Each decoder round partitions the entire transport domain into disjoint CP
-packs. Pipeline parallelism, rerun, and disaggregated execution are outside
-this interface's supported scope.
+The execution contract uses TP=PP=1, no GTP or expert GTP weight sharding,
+packed THD input, per-token loss, and non-overlapped DDP.
+Each decoder round partitions the decoder domain into disjoint CP packs.
+The transport domain also includes encoder ranks; colocated execution uses the
+same ranks for both roles. Pipeline parallelism and rerun are not supported.
 
 ## Public components
 
@@ -29,10 +29,12 @@ model does not load the packing/data-scheduler implementation.
 
 ## Source ownership and metadata
 
-Every transport rank currently receives the same ordered mapping of source
-samples and media descriptors. Source token tensors must be available on each
-rank before preparation. This replicated-source contract is separate from
-encoder execution: only assigned media are decoded/processed/encoded locally.
+Every transport rank currently receives the same ordered CPU mapping of source
+samples and media descriptors. Only decoder ranks call `prepare_mimo_step()`
+and materialize token tensors and THD packs on GPU. This replicated-source
+contract is separate from encoder execution: each producer encodes only its
+assigned media. CPU media preprocessing and materialization remain the caller's
+responsibility; the current source adapter repeats them across both roles.
 Rank-local datasets such as Energon need an acquisition/materialization adapter
 before calling these APIs. The text-only reroute schema cannot carry arbitrary
 media tensors or descriptors.
@@ -63,6 +65,8 @@ and resume progress. Neither source global-batch size nor consumed input bins
 may be inferred from the number of decoder rounds.
 
 ## Explicit forward/backward lifetime
+
+The following shows the colocated host lifecycle:
 
 ```python
 import torch
@@ -170,14 +174,71 @@ encoder graphs are transient and are not checkpoint state. Native MTP and MoE
 auxiliary objectives retain their existing semantics; changing pack composition
 does not promise identical auxiliary losses.
 
+## Disaggregated native training
+
+`examples/mimo/pretrain_mimo.py --mimo-packed` uses disjoint encoder and decoder
+pools. The model provider supplies source-batch loading, media preparation and
+optional weight initialization through `MimoProvider` callbacks. The packed entry
+builds the configured native tokenizer and saves its assets with checkpoints;
+use `NullTokenizer` for synthetic pretokenized fixtures.
+
+Let **E** be the encoder ranks, **D** the decoder ranks, and **T = E ∪ D** the
+transport domain. The encoder/projector runs on E with independent DP; only D
+owns the decoder, its EP groups and its runtime CP groups. Construct the core
+bridge/runtime with explicit `producer_ranks=E` and `decoder_ranks=D`;
+omitting these arguments retains colocated behavior. Packs cover D exactly.
+Producer-only transfers have no local decoder plan, features or CP operations.
+
+For example, launch **20 GPU processes** with E on ranks 0–3 and D on ranks 4–19.
+Add the following to the model provider, dataset, tokenizer, optimizer and
+recomputation flags, using `pretrain_mimo.py` as the entry:
+
+```bash
+--mimo-packed --mimo-encoder-tp 1 --mimo-encoder-dp 4 \
+--mimo-llm-offset 4 --mimo-llm-tp 1 --mimo-llm-pp 1 \
+--mimo-llm-dp 2 --mimo-llm-cp 8 --mimo-llm-ep 16 --mimo-llm-expt-tp 1 \
+--bf16 --use-distributed-optimizer --optimizer adam \
+--calculate-per-token-loss --dataloader-type external \
+--dynamic-context-parallel --sequence-packing-scheduler default_dynamic_cp \
+--max-seqlen-per-dp-cp-rank 8192 --rerun-mode disabled
+```
+
+CP8 is the decoder's base layout; dynamic CP schedules across all 16 decoder
+ranks. The 8192-token limit constrains each decoder rank, not the whole sample
+or the encoder. Use `dp_balanced` without `--dynamic-context-parallel` for a
+static-CP packing configuration. Native MoE auxiliary losses and MTP remain
+enabled through their usual model flags and keep their existing semantics.
+
+The supported disaggregated path requires BF16, encoder TP=CP=PP=1, decoder
+TP=PP=1, distributed Adam, and no GTP rematerialization. DDP/parameter-gather
+overlap, MoE communication overlap, encoder prefetch, and rerun are disabled.
+Projectors stay on E. The encoder retains one source step's activation graph
+until all decoder rounds return their gradients, then executes backward once.
+Each pack's complete features are gathered to its leader and replicated within
+that CP group; this is not selective transmission to individual token owners.
+
+The adapter preserves native DDP, optimizer and checkpoint handling. Encoder
+and decoder parameter gradients use SUM reductions over their own domains,
+then both divide by the same global decoder supervision-token count. There is
+no active-encoder averaging. Save/resume is supported at idle source-step
+boundaries; in-flight transfers and activation graphs are not checkpointed.
+
 ## Validation
 
 Run distributed tests using the repository's standard torch distributed runner.
 The model, partition, transport, runtime and packed-step tests run on four ranks.
-`test_multisample_multiimage_cp8.py` additionally requires **16 ranks**, covering
+`test_multisample_multiimage_cp8.py` additionally requires **16 colocated ranks**
+or **20 disjoint ranks (E4/D16)**, covering
 multi-image samples sharing CP8 alongside CP4 packs, with producers outside the
 consumer group and image rows crossing CP ranks. Smaller allocations skip that
 case and do not constitute its validation.
+
+The runtime test additionally uses eight ranks for disjoint E4/D4, static and
+dynamic CP, multi-image packs, empty producers and text-only steps. The native
+fixture at `tests/functional_tests/test_cases/mimo/disagg_dcp/run.py` exercises
+the complete `pretrain_mimo.py` loop with a small ViT, MoE/MTP decoder and native
+checkpoint restoration. These are validation targets, not a claim that every
+listed configuration has passed end-to-end testing.
 
 The functional runner at
 `tests/functional_tests/test_cases/mimo/colocated_dcp/run.py` exercises a small

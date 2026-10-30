@@ -139,6 +139,65 @@ def test_high_priority_options_are_wired_to_each_module_grid(monkeypatch, mock_n
         assert all(options.is_high_priority_stream for _, _, options in grid.calls if options)
 
 
+def test_packed_decoder_groups_exclude_encoders_and_include_singleton():
+    Utils.initialize_distributed()
+    topology = None
+    try:
+        if dist.get_world_size() != 8:
+            pytest.skip("Requires 4 encoder and 4 decoder ranks")
+        for axis in ("gtp_remat", "expt_gtp_remat"):
+            with pytest.raises(ValueError, match="no GTP or expert GTP"):
+                create_topology(
+                    [
+                        ModuleGridSpec(name=ENCODER, num_ranks=4),
+                        ModuleGridSpec(
+                            name=MIMO_LANGUAGE_MODULE_KEY,
+                            num_ranks=4,
+                            cp=2,
+                            rank_offset=4,
+                            **{axis: 2},
+                        ),
+                    ],
+                    packed=True,
+                )
+        topology = create_topology(
+            [
+                ModuleGridSpec(name=ENCODER, num_ranks=4),
+                ModuleGridSpec(name=MIMO_LANGUAGE_MODULE_KEY, num_ranks=4, cp=2, rank_offset=4),
+            ],
+            packed=True,
+            min_cp_size=2,
+        )
+        rank = dist.get_rank()
+        active_name = ENCODER if rank < 4 else MIMO_LANGUAGE_MODULE_KEY
+        pg = topology.module_pgs[active_name]
+        assert topology.schedule_pg_collection.module_pgs[active_name].dynamic_cp is pg.dynamic_cp
+        assert pg.dynamic_tp_cp is pg.dynamic_cp
+        if rank < 4:
+            assert topology.cp_groups == {}
+            assert pg.dynamic_cp == {1: pg.cp}
+            assert dist.get_process_group_ranks(pg.dynamic_cp[1]) == [rank]
+            assert not topology._dynamic_groups
+        else:
+            assert set(topology.cp_groups) == {1, 2, 4}
+            assert pg.dynamic_cp is topology.cp_groups
+            assert topology.cp_groups[4] is pg.dp_cp
+            assert {group.size() for group in topology._dynamic_groups} == {1, 2}
+            assert all(
+                group is not pg.dp_cp and group is not pg.cp for group in topology._dynamic_groups
+            )
+            for size, group in topology.cp_groups.items():
+                start = 4 + ((rank - 4) // size) * size
+                assert dist.get_process_group_ranks(group) == list(range(start, start + size))
+                value = torch.tensor(float(rank), device="cuda")
+                dist.all_reduce(value, group=group)
+                assert value.item() == sum(range(start, start + size))
+    finally:
+        if topology is not None:
+            topology.destroy()
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason="requires 8 GPUs")
 class TestHeteroTopology:
     def setup_method(self, method):

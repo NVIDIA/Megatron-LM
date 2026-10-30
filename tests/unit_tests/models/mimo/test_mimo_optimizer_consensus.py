@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
-from megatron.core.models.mimo.optimizer import MimoOptimizer
+from megatron.core.models.mimo.optimizer import MimoOptimizer, ModuleOptimizerInfo
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -23,6 +23,34 @@ def test_step_success_is_world_min():
         opt.step_with_ready_grads = lambda: torch.distributed.get_rank() != last_rank
         success, _, _ = opt.step()
         assert success is False
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("bad_norm", [float("nan"), float("inf")])
+def test_nonfinite_module_norm_skips_all_roles_before_update(bad_norm):
+    """BF16 prepare_grads may return False; a nonfinite module norm still stops all updates."""
+    Utils.initialize_distributed()
+    try:
+        rank = torch.distributed.get_rank()
+        if torch.distributed.get_world_size() < 2:
+            pytest.skip("Requires at least two ranks")
+        leaf = SimpleNamespace(
+            prepare_grads=lambda: False, get_grad_norm=lambda: bad_norm if rank == 0 else 3.0
+        )
+        infos = {
+            "encoder": ModuleOptimizerInfo(leaf if rank == 0 else None, None, None, rank == 0),
+            "decoder": ModuleOptimizerInfo(leaf if rank != 0 else None, None, None, rank != 0),
+        }
+        opt = MimoOptimizer(infos, OptimizerConfig())
+
+        def unexpected_update():
+            pytest.fail("A role updated parameters after another role reported a nonfinite norm")
+
+        opt.step_with_ready_grads = unexpected_update
+        success, norm, _ = opt.step()
+        assert success is False
+        assert norm == float("inf")
     finally:
         Utils.destroy_model_parallel()
 

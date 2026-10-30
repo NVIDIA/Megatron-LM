@@ -261,6 +261,13 @@ class ModelParallelConfig:
        dimensions.
     """
 
+    forward_backward_func: Optional[Callable] = field(default=None, init=False, repr=False)
+    """Optional host schedule for models whose roles use disjoint process groups.
+
+    The callable has the native forward/backward schedule signature. Optimizer,
+    checkpointing and the outer training/evaluation loops remain unchanged.
+    """
+
     grad_scale_func: Optional[Callable] = None
     """If using loss scaling, this function should take the loss and return the scaled loss. If
        None, no function is called on the loss.

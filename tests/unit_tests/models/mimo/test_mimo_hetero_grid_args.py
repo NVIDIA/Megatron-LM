@@ -64,6 +64,7 @@ def test_parser_uses_mimo_prefixed_destinations():
     )
 
     assert vars(args) == {
+        "mimo_packed": False,
         "mimo_encoder_tp": 3,
         "mimo_encoder_dp": 4,
         "mimo_llm_offset": 5,
@@ -199,6 +200,41 @@ def test_non_covering_spans_raise():
 def test_fanout_divisibility_raises():
     # mbs(1) * mimo_llm_dp(2) = 2 not divisible by mimo_encoder_dp(3).
     args = _layout_8gpu_20l(mimo_encoder_dp=3, micro_batch_size=1, mimo_llm_dp=2)
+    with pytest.raises(ValueError, match="divisible by --mimo-encoder-dp"):
+        validate_hetero_grid_args(args, WORLD_SIZE_8)
+
+
+def test_packed_mode_bypasses_only_legacy_fanout_divisibility():
+    args = _layout_8gpu_20l(
+        mimo_packed=True,
+        mimo_encoder_tp=1,
+        mimo_encoder_dp=4,
+        mimo_llm_tp=1,
+        mimo_llm_cp=2,
+        bf16=True,
+        use_distributed_optimizer=True,
+        calculate_per_token_loss=True,
+        dataloader_type="external",
+        sequence_packing_scheduler="default_dynamic_cp",
+        rerun_mode="disabled",
+    )
+    assert validate_hetero_grid_args(args, WORLD_SIZE_8) == (4, 4)
+    for name, value in (
+        ("mimo_encoder_tp", 2),
+        ("bf16", False),
+        ("use_distributed_optimizer", False),
+        ("overlap_grad_reduce", True),
+        ("mimo_encoder_prefetch", True),
+        ("correct_encoder_grad_for_partial_participation", True),
+        ("freeze_all_layers", True),
+        ("rerun_mode", "validate_results"),
+    ):
+        invalid = argparse.Namespace(**(vars(args) | {name: value}))
+        with pytest.raises(ValueError, match="mimo-packed"):
+            validate_hetero_grid_args(invalid, WORLD_SIZE_8)
+    with pytest.raises(ValueError, match="cover every torchrun rank"):
+        validate_hetero_grid_args(args, WORLD_SIZE_8 + 1)
+    args.mimo_packed = False
     with pytest.raises(ValueError, match="divisible by --mimo-encoder-dp"):
         validate_hetero_grid_args(args, WORLD_SIZE_8)
 

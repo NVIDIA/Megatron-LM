@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -74,6 +75,9 @@ class MimoOptimizer(MegatronOptimizer):
                     ).reshape(())
                     norm_sq[i].copy_(module_norm.square())
 
+        # Preserve any module's nonfinite norm across MAX, whose NaN handling varies by
+        # backend. This also covers BF16 optimizers without a dynamic loss scaler.
+        norm_sq.masked_fill_(~torch.isfinite(norm_sq), float("inf"))
         torch.distributed.all_reduce(norm_sq, op=torch.distributed.ReduceOp.MAX)
         return torch.sqrt(norm_sq.sum()).item()
 
@@ -91,6 +95,8 @@ class MimoOptimizer(MegatronOptimizer):
             return False, None, None
 
         grad_norm = self.get_grad_norm()
+        if not math.isfinite(grad_norm):
+            return False, grad_norm, None
 
         # Clip with global norm
         for opt in self._active_optimizers:

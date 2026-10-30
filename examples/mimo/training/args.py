@@ -32,6 +32,11 @@ def add_mimo_dcp_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
 def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Register hetero parallelism args for the single-encoder MIMO example."""
     grid = parser.add_argument_group("hetero module grids")
+    grid.add_argument(
+        "--mimo-packed",
+        action="store_true",
+        help="Route source-step media into THD decoder packs on disjoint encoder/decoder grids.",
+    )
 
     # Single encoder grid; CP/PP stay fixed at 1.
     grid.add_argument(
@@ -115,6 +120,9 @@ def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
 
 def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
     """Validate the disjoint hetero grid layout; returns ``(encoder_size, llm_size)``."""
+    packed = getattr(args, "mimo_packed", False)
+    if packed:
+        _validate_packed_args(args)
     if args.mimo_llm_cp < 1:
         raise ValueError("--mimo-llm-cp must be positive")
     llm_data_parallel_size = get_language_batch_parallel_size(args)
@@ -165,7 +173,7 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
 
     # Fan-out divisibility: the bridge splits every LLM data lane across
     # mimo_encoder_dp encoder lanes; the split must be exact.
-    if (args.micro_batch_size * llm_data_parallel_size) % args.mimo_encoder_dp != 0:
+    if not packed and (args.micro_batch_size * llm_data_parallel_size) % args.mimo_encoder_dp != 0:
         raise ValueError(
             "--micro-batch-size * language sample lanes must be divisible by "
             "--mimo-encoder-dp "
@@ -191,6 +199,58 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
 
     args.mimo_llm_world_size = llm_size
     return encoder_size, llm_size
+
+
+def _validate_packed_args(args: argparse.Namespace) -> None:
+    """Keep the first packed disaggregated path on its tested sequential contract."""
+    if (
+        args.mimo_encoder_tp != 1
+        or args.mimo_llm_tp != 1
+        or args.mimo_llm_pp != 1
+        or (args.mimo_llm_expt_tp or 1) != 1
+        or resolve_hetero_gtp_degrees(args) != (1, 1)
+    ):
+        raise ValueError(
+            "--mimo-packed requires encoder/decoder TP=PP=1 and no GTP rematerialization"
+        )
+    if (
+        not getattr(args, "bf16", False)
+        or getattr(args, "fp16", False)
+        or getattr(args, "fp8", None)
+    ):
+        raise ValueError("--mimo-packed requires BF16")
+    if (
+        not getattr(args, "use_distributed_optimizer", False)
+        or getattr(args, "optimizer", "adam") != "adam"
+    ):
+        raise ValueError("--mimo-packed requires the distributed Adam optimizer")
+    if (
+        not getattr(args, "calculate_per_token_loss", False)
+        or getattr(args, "dataloader_type", None) != "external"
+        or not getattr(args, "sequence_packing_scheduler", None)
+    ):
+        raise ValueError(
+            "--mimo-packed requires per-token loss, external data and a packing scheduler"
+        )
+    unsupported = (
+        "mimo_llm_only",
+        "mimo_run_input_projections_on_llm_ranks",
+        "mimo_encoder_prefetch",
+        "mimo_encoder_ddp_overlap",
+        "overlap_grad_reduce",
+        "overlap_param_gather",
+        "overlap_param_gather_with_optimizer_step",
+        "overlap_moe_expert_parallel_comm",
+        "correct_encoder_grad_for_partial_participation",
+        "ddp_average_in_collective",
+        "use_layer_wise_distributed_optimizer",
+        "freeze_all_layers",
+    )
+    enabled = [name for name in unsupported if getattr(args, name, False)]
+    if enabled:
+        raise ValueError(f"--mimo-packed does not support {', '.join(enabled)}")
+    if getattr(args, "rerun_mode", "disabled") != "disabled":
+        raise ValueError("--mimo-packed requires --rerun-mode disabled")
 
 
 def build_module_grid_specs(

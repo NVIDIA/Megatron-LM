@@ -30,6 +30,7 @@ from examples.mimo.training.encoder_prefetch import (
     prefetch_frozen_features,
     validate_encoder_prefetch_args,
 )
+from examples.mimo.training.packed_step import forward_step as packed_forward_step
 from examples.mimo.training.step import mimo_forward_step
 from examples.mimo.training.topology import create_topology
 from megatron.core.enums import ModelType
@@ -102,9 +103,14 @@ def main() -> None:
     # generic over any number of encoder grids in the topology.
     encoder_name = provider.encoder_module_names[0] if provider.encoder_module_names else None
     specs = build_module_grid_specs(args, args.world_size, encoder_name)
-    topology = create_topology(specs, cfg.dist.high_priority_stream_groups)
+    topology = create_topology(
+        specs,
+        cfg.dist.high_priority_stream_groups,
+        packed=args.mimo_packed,
+        min_cp_size=args.min_dynamic_context_parallel_size,
+    )
 
-    communicator = provider.build_communicator(args, topology)
+    communicator = None if args.mimo_packed else provider.build_communicator(args, topology)
 
     if args.mimo_encoder_prefetch and len(provider.encoder_module_names) != 1:
         raise ValueError("encoder prefetch requires exactly one encoder")
@@ -126,6 +132,10 @@ def main() -> None:
 
     def train_valid_test_data_provider(_train_val_test_num_samples):
         nonlocal prefetch_loader
+        if args.mimo_packed:
+            if provider.train_valid_test_data_provider is None:
+                raise ValueError("This provider has no packed source-global-batch dataset")
+            return provider.train_valid_test_data_provider(args, topology)
         loaders = build_train_valid_test_data_loaders(args, topology)
         iterators = tuple(iter(loader) if loader is not None else None for loader in loaders)
         if not args.mimo_encoder_prefetch or loaders[0] is None:
@@ -153,12 +163,12 @@ def main() -> None:
         cfg,
         train_valid_test_data_provider,
         ModelType.encoder_or_decoder,
-        mimo_forward_step,
+        packed_forward_step if args.mimo_packed else mimo_forward_step,
         model_provider=None,
         skip_model_parallel_init=True,
         p2p_communicator=communicator,
         pg_collection=topology.schedule_pg_collection,
-        build_tokenizer=False,
+        build_tokenizer=args.mimo_packed,
     )
 
     if prefetch_loader is not None:

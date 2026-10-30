@@ -7,11 +7,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+import torch
 import torch.distributed as dist
 
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
-from megatron.core.parallel_state import default_embedding_ranks, default_position_embedding_ranks
+from megatron.core.parallel_state import (
+    create_dynamic_dp_cp_groups,
+    default_embedding_ranks,
+    default_position_embedding_ranks,
+    get_valid_dynamic_context_parallel_group_sizes,
+)
 from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
@@ -82,10 +88,18 @@ class HeteroTopology:
     grids: dict[str, HyperCommGrid]
     module_pgs: dict[str, ProcessGroupCollection]
     schedule_pg_collection: MultiModuleProcessGroupCollection
+    cp_groups: dict[int, dist.ProcessGroup] = field(default_factory=dict)
+    _dynamic_groups: list[dist.ProcessGroup] = field(default_factory=list, repr=False)
 
     def destroy(self) -> None:
         """Destroy every process group owned by this topology."""
         destroyed: set[int] = set()
+        for pg in self._dynamic_groups:
+            if id(pg) not in destroyed and _is_process_group_member(pg):
+                dist.destroy_process_group(pg)
+                destroyed.add(id(pg))
+        self._dynamic_groups.clear()
+        self.cp_groups.clear()
         for pgc in self.module_pgs.values():
             for pg in (pgc.embd, pgc.pos_embd):
                 if pg is None or id(pg) in destroyed or not _is_process_group_member(pg):
@@ -97,7 +111,11 @@ class HeteroTopology:
 
 
 def create_topology(
-    specs: list[ModuleGridSpec], high_priority_stream_groups: Optional[list[str]] = None
+    specs: list[ModuleGridSpec],
+    high_priority_stream_groups: Optional[list[str]] = None,
+    *,
+    packed: bool = False,
+    min_cp_size: int = 1,
 ) -> HeteroTopology:
     """Build every module's grid, PGC, and embedding groups.
 
@@ -113,9 +131,23 @@ def create_topology(
             f"(the language module), got {len(language_specs)}"
         )
     language_name = MIMO_LANGUAGE_MODULE_KEY
+    language_spec = language_specs[0]
+    if packed:
+        if any(
+            spec.tp != 1 or spec.pp != 1 or spec.gtp_remat != 1 or spec.expt_gtp_remat != 1
+            for spec in specs
+        ):
+            raise ValueError(
+                "Packed MIMO topology requires TP=PP=1 and no GTP or expert GTP rematerialization"
+            )
+        if min_cp_size not in get_valid_dynamic_context_parallel_group_sizes(language_spec.size):
+            raise ValueError(
+                f"Invalid minimum CP size {min_cp_size} for decoder size {language_spec.size}"
+            )
 
     grids: dict[str, HyperCommGrid] = {}
     module_pgs: dict[str, ProcessGroupCollection] = {}
+    topology = HeteroTopology(grids=grids, module_pgs=module_pgs, schedule_pg_collection=None)
     try:
         for spec in specs:
             grids[spec.name] = _build_grid(spec, high_priority_stream_groups)
@@ -128,12 +160,44 @@ def create_topology(
                 high_priority_stream_groups=high_priority_stream_groups,
             )
 
-        schedule_pg_collection = build_schedule_pg_collection(grids, module_pgs, language_name)
-        return HeteroTopology(
-            grids=grids, module_pgs=module_pgs, schedule_pg_collection=schedule_pg_collection
+        topology.schedule_pg_collection = build_schedule_pg_collection(
+            grids, module_pgs, language_name
         )
+        if packed:
+            for name, grid in grids.items():
+                if name != language_name and grid.is_current_rank_in_grid():
+                    pg = module_pgs[name]
+                    # The host constructs an unused encoder-local scheduler before
+                    # the packed adapter services the decoder's published routes.
+                    pg.dynamic_cp = {1: pg.cp}
+                    pg.dynamic_tp_cp = pg.dynamic_cp
+            ranks = list(
+                range(language_spec.rank_offset, language_spec.rank_offset + language_spec.size)
+            )
+            # All world ranks create groups in the same order. CP1 remains available for eval,
+            # even when the training scheduler has a larger minimum CP size.
+            topology.cp_groups = create_dynamic_dp_cp_groups(
+                dist.get_rank(), ranks, _get_pg_options("cp", high_priority_stream_groups)
+            )
+            # Only newly created groups belong here; grid-owned aliases are destroyed
+            # by their HyperCommGrid, not by the dynamic-group cleanup above.
+            topology._dynamic_groups = list(topology.cp_groups.values())
+            if dist.get_rank() in ranks:
+                language_pg = module_pgs[language_name]
+                topology.cp_groups[language_spec.size] = language_pg.dp_cp
+                topology.cp_groups.setdefault(language_spec.cp, language_pg.cp)
+                language_pg.dynamic_cp = topology.cp_groups
+                language_pg.dynamic_tp_cp = topology.cp_groups
+                # Match native DCP initialization: avoid lazy communicator creation while
+                # different CP packs enter decoder/EP collectives at different times.
+                for size in sorted(topology.cp_groups):
+                    dist.barrier(
+                        group=topology.cp_groups[size], device_ids=[torch.cuda.current_device()]
+                    )
+                    torch.cuda.synchronize()
+        return topology
     except Exception:
-        HeteroTopology(grids=grids, module_pgs=module_pgs, schedule_pg_collection=None).destroy()
+        topology.destroy()
         raise
 
 

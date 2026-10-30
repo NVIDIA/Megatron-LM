@@ -5013,7 +5013,7 @@ def train(
     eval_duration = 0.0
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
-    forward_backward_func = get_forward_backward_func(
+    forward_backward_func = config.forward_backward_func or get_forward_backward_func(
         schedule_pg_collection=pg_collection
     )
     if args.cuda_graph_impl == "full_iteration":
@@ -5790,7 +5790,9 @@ def evaluate(
     eval_num_microbatches = eval_batch_size // (
         eval_micro_batch_size * get_batch_parallel_size(args)
     )
-    forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
+    forward_backward_func = config.forward_backward_func or get_forward_backward_func(
+        schedule_pg_collection=pg_collection
+    )
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
     eval_pgc = get_attr_wrapped_model(model[0], "pg_collection")
     if eval_pgc is None:

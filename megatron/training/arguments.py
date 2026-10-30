@@ -2361,6 +2361,7 @@ def _add_network_size_args(parser):
         # cannot provide callables over CLI
         "timers",
         "finalize_model_grads_func",
+        "forward_backward_func",
         "grad_scale_func",
         "moe_grad_scale_func",
         "mtp_grad_scale_func",

@@ -23,6 +23,7 @@ _RUNTIME_FIELDS = frozenset(
         "timers",
         "finalize_model_grads_func",
         "sequence_packing_data_adapter",
+        "forward_backward_func",
         "grad_scale_func",
         "moe_grad_scale_func",
         "mtp_grad_scale_func",

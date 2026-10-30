@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Callable, ClassVar, Optional
 
 import torch
@@ -115,12 +116,14 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
             language_model_input_projections_spec=language_input_projections,
             special_token_ids=special_token_ids,
             module_to_grid_map=topology.grids,
+            kv_format="thd" if getattr(args, "mimo_packed", False) else "sbhd",
         )
         return MimoModel(
             mimo_config,
             cp_group=active_pg.cp if is_language else None,
             tp_group=active_pg.tp if is_language else None,
             tp_cp_group=active_pg.tp_cp if is_language else None,
+            external_feature_transport=getattr(args, "mimo_packed", False),
         )
 
     def build_distributed_models(
@@ -165,6 +168,9 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
             mimo_model = self.build_model(pg_collection)
 
         mimo_model.model_type = model_type
+        provider = resolve_provider(args)
+        if provider.initialize_model is not None:
+            provider.initialize_model(mimo_model, args)
         model_list = compose_hooks(self._model_config.pre_wrap_hooks)([mimo_model])
         if len(model_list) != 1:
             raise ValueError(
@@ -184,6 +190,25 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         configure_grad_sync(args, mimo_model, topology)
         mimo_model.pg_collection = module_pg
         mimo_model.rng_state_key_prefix = rng_state_key_prefix
+
+        if getattr(args, "mimo_packed", False):
+            from examples.mimo.training.disagg_step import PackedDisaggMimoStep
+
+            if len(provider.encoder_module_names) != 1 or provider.prepare_source is None:
+                raise ValueError(
+                    "Packed MIMO requires one encoder and a source preparation adapter"
+                )
+            adapter = PackedDisaggMimoStep(
+                mimo_model,
+                topology,
+                partial(provider.prepare_source, args=args, topology=topology),
+                modality_name=provider.encoder_module_names[0],
+            )
+            adapter.install(
+                overlap_grad_reduce=args.overlap_grad_reduce,
+                overlap_param_gather=args.overlap_param_gather,
+                rerun_mode=args.rerun_mode,
+            )
 
         model_list = compose_hooks(self._model_config.post_wrap_hooks)([mimo_model])
         if len(model_list) != 1:
