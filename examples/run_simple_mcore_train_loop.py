@@ -1,28 +1,27 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 import os
+from functools import partial
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterator, Tuple
+
 import torch
 from torch.optim import Adam
 from torch.utils.data import DataLoader
-from functools import partial
-from pathlib import Path
-from typing import Any, Callable, Dict, Tuple, Iterator
-from megatron.core import parallel_state
-from megatron.core import dist_checkpointing
-from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-from megatron.core.datasets.utils import compile_helpers
-from megatron.core.datasets.blended_megatron_dataset_builder import (
-    BlendedMegatronDatasetBuilder,
-)
+
+from megatron.core import dist_checkpointing, parallel_state
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
-from megatron.core.distributed import DistributedDataParallel
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.datasets.utils import compile_helpers
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 _SEQUENCE_LENGTH: int = 64
 
@@ -74,6 +73,7 @@ def model_provider() -> GPTModel:
         transformer_layer_spec=get_gpt_layer_local_spec(),
         vocab_size=100,
         max_sequence_length=_SEQUENCE_LENGTH,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     return gpt_model
