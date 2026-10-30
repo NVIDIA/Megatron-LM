@@ -1,9 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import importlib
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -11,7 +12,12 @@ import torch
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training import training
 from megatron.training.checkpointing import save_grads
-from megatron.training.config import CheckpointConfig, TrainingConfig, ValidationConfig
+from megatron.training.config import (
+    CheckpointConfig,
+    StragglerDetectionConfig,
+    TrainingConfig,
+    ValidationConfig,
+)
 from megatron.training.global_vars import (
     _set_train_state,
     destroy_global_vars,
@@ -32,6 +38,63 @@ from tests.unit_tests.test_utilities import Utils
 
 def mock_train_valid_test_datasets_provider(train_val_test_num_samples):
     return iter([1]), iter([2]), iter([3])
+
+
+@pytest.mark.parametrize("enabled", [None, False, True])
+@pytest.mark.parametrize("iteration", [2, 3])
+def test_straggler_reporting_uses_config_and_logger_cadence(
+    monkeypatch, run_config, enabled, iteration
+):
+    # Deliberately no straggler args: the native config owns detector policy.
+    monkeypatch.setattr(training, "get_args", lambda: SimpleNamespace(adlr_autoresume=False))
+    detector = Mock()
+    monkeypatch.setattr(training, "stimer", detector)
+    run_config.straggler = (
+        None if enabled is None else StragglerDetectionConfig(log_straggler=enabled)
+    )
+    run_config.logger.log_interval = 3
+    flops = training.post_training_step_callbacks(None, None, None, iteration, None, 123.0)
+    if enabled and iteration == 3:
+        detector.report.assert_called_once_with(123.0, 3)
+        assert flops == 0.0
+    else:
+        detector.report.assert_not_called()
+        assert flops == 123.0
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    ["pretrain_gpt", "pretrain_hybrid", "megatron.elastification.pretrain_hybrid_flex", "train_rl"],
+)
+@pytest.mark.parametrize("nan_check,spiky_check", [(False, False), (True, False), (False, True)])
+def test_entrypoint_loss_checks_read_rerun_config(
+    monkeypatch, run_config, module_name, nan_check, spiky_check
+):
+    with patch("logging.basicConfig"):
+        entrypoint = importlib.import_module(module_name)
+    # Unmigrated application inputs only; there are no rerun fields in args.
+    monkeypatch.setattr(
+        entrypoint, "get_args", lambda: SimpleNamespace(logits_load_dir=None, loss_alpha=1)
+    )
+    if hasattr(entrypoint, "has_nvidia_modelopt"):
+        monkeypatch.setattr(entrypoint, "has_nvidia_modelopt", False)
+    machine = Mock()
+    monkeypatch.setattr(entrypoint, "get_rerun_state_machine", lambda: machine)
+    run_config.rerun_state_machine.check_for_nan_in_loss = nan_check
+    run_config.rerun_state_machine.check_for_spiky_loss = spiky_check
+    values = torch.ones(2, device="cuda")
+    if module_name == "train_rl":
+        result = entrypoint.loss_func(values, values, values, values, values, values, 1, values)
+        expected_nan_checks = 1
+    else:
+        output = (values, (None, {})) if module_name.endswith("_flex") else values
+        result = entrypoint.loss_func(values, output)
+        expected_nan_checks = 2
+    assert result[0].item() == 2
+    assert machine.validate_result.call_count == expected_nan_checks * nan_check + spiky_check
+    for call in machine.validate_result.call_args_list:
+        assert call.kwargs["tolerance"] == 0
+        assert call.kwargs["fatal"] == (call.kwargs["message"] != "Spiky loss")
 
 
 class _LenDataloader:

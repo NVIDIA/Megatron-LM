@@ -32,7 +32,6 @@ def _args(**overrides):
         "freeze_vit": True,
         "freeze_projection": False,
         "mimo_encoder_tp": 1,
-        "rerun_mode": "disabled",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -53,7 +52,10 @@ def _args(**overrides):
 )
 def test_prefetch_validation(field, value, match):
     with pytest.raises(ValueError, match=match):
-        validate_encoder_prefetch_args(_args(**{field: value}))
+        validate_encoder_prefetch_args(
+            _args(**({field: value} if field != "rerun_mode" else {})),
+            rerun_mode=value if field == "rerun_mode" else "disabled",
+        )
 
 
 class _LinearEncoder(nn.Module):
