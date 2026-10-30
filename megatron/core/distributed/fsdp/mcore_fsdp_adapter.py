@@ -20,8 +20,8 @@ import torch
 
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-from megatron.core.distributed.fsdp.mfsdp_v1 import FullyShardedDataParallelV1
-from megatron.core.distributed.fsdp.mfsdp_v2 import FullyShardedDataParallelV2
+from megatron.core.distributed.fsdp.mcore_adapter_v1 import FullyShardedDataParallelV1
+from megatron.core.distributed.fsdp.mcore_adapter_v2 import FullyShardedDataParallelV2
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 

@@ -1368,7 +1368,7 @@ class TestFsdpNonUnitBucketPreservation:
 
         # bucket_size=4096 forces conv1d.weight into a separate non-unit bucket
         # from MambaMixer's recurse=False params; fsdp_unit_modules=[TransformerLayer]
-        # matches the production default in mfsdp_v1.py.
+        # matches the production default in mcore_adapter_v1.py.
         fsdp_model = FullyShardedDataParallel(
             config=config,
             ddp_config=DistributedDataParallelConfig(

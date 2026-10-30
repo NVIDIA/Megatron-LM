@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MFSDP v2 integration with MCore models, process groups, and training schedules."""
+"""MCore adapter for the Megatron-FSDP v2 implementation."""
 
 import contextlib
 import logging
@@ -36,7 +36,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import log_single_rank
 
 __all__ = ["FullyShardedDataParallelV2"]

@@ -10,7 +10,7 @@ import transformer_engine.pytorch as te
 from torch.distributed.tensor import DTensor
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
-import megatron.core.distributed.fsdp.mfsdp_v2 as mfsdp_v2
+import megatron.core.distributed.fsdp.mcore_adapter_v2 as mcore_adapter_v2
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
@@ -224,13 +224,13 @@ def test_nccl_ub_enables_symmetric_memory(process_group_collection, monkeypatch)
         device="cuda", dtype=config.params_dtype
     )
     fully_shard_context_calls = []
-    original_fully_shard_context = mfsdp_v2.fully_shard_context
+    original_fully_shard_context = mcore_adapter_v2.fully_shard_context
 
     def record_fully_shard_context(context):
         fully_shard_context_calls.append(context.use_symmetric_memory)
         return original_fully_shard_context(context)
 
-    monkeypatch.setattr(mfsdp_v2, "fully_shard_context", record_fully_shard_context)
+    monkeypatch.setattr(mcore_adapter_v2, "fully_shard_context", record_fully_shard_context)
     FullyShardedDataParallel(
         config=config,
         ddp_config=DistributedDataParallelConfig(
