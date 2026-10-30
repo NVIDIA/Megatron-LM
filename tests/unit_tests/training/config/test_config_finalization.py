@@ -43,8 +43,8 @@ def test_validation_is_read_only_and_finalization_runs_once(monkeypatch, run_con
         assert not cfg._finalized
 
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=1))
-    rng_finalize = Mock(wraps=cfg._finalize_rng)
-    monkeypatch.setattr(cfg, "_finalize_rng", rng_finalize)
+    finalize = Mock(wraps=cfg._finalize)
+    monkeypatch.setattr(cfg, "_finalize", finalize)
     cfg.finalize()
     assert cfg._finalized
     assert cfg.rng.te_rng_tracker
@@ -55,7 +55,7 @@ def test_validation_is_read_only_and_finalization_runs_once(monkeypatch, run_con
     cfg.validate()
     cfg.finalize()
     assert cfg.to_dict() == after
-    rng_finalize.assert_called_once_with()
+    finalize.assert_called_once_with()
     assert "_finalized" not in after
     assert copy.deepcopy(cfg)._finalized
 

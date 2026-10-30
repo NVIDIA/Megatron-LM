@@ -82,17 +82,13 @@ class ConfigContainerBase:
 
     def _finalize(self) -> None:
         """Apply shared cross-section derivations before runtime initialization."""
-        if getattr(self, "rng", None) is not None:
-            self._finalize_rng()
-
-    def _finalize_rng(self) -> None:
-        """Derive the model's tracker settings from the run's RNG policy."""
         from megatron.core.transformer import TransformerConfig
 
         model = getattr(self, "model", None)
         transformer = getattr(model, "transformer", model)
-        if not isinstance(transformer, TransformerConfig):
+        if getattr(self, "rng", None) is None or not isinstance(transformer, TransformerConfig):
             return
+        # RNG policy and model implementation jointly determine the runtime tracker.
         if transformer.cuda_graph_impl != "none" and "transformer_engine" in (
             transformer.transformer_impl, transformer.cuda_graph_impl
         ):
@@ -365,42 +361,6 @@ class PretrainConfigContainer(ConfigContainerBase):
             )
         return global_batch_size, eval_global_batch_size, eval_micro_batch_size
 
-    def _resolve_scheduler_step_fields(self):
-        """Calculate user-unspecified scheduler configuration arguments from configurable fields."""
-
-        # Without a training horizon there is nothing to resolve; building the optimizer param
-        # scheduler (get_optimizer_param_scheduler) is what requires one.
-        if self.train.train_iters is None and self.train.train_samples is None:
-            return
-        # Iteration-based training.
-        if self.train.train_iters:
-            if self.scheduler.lr_decay_iters is None:
-                self.scheduler.lr_decay_iters = self.train.train_iters
-            self.scheduler.lr_decay_steps = self.scheduler.lr_decay_iters * self.train.global_batch_size
-            self.scheduler.wd_incr_steps = self.train.train_iters * self.train.global_batch_size
-            self.scheduler.wsd_decay_steps = None
-            if self.scheduler.lr_wsd_decay_iters is not None:
-                self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_iters * self.train.global_batch_size
-            if self.scheduler.lr_warmup_fraction is not None:
-                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
-            else:
-                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_iters * self.train.global_batch_size
-        # Sample-based training.
-        elif self.train.train_samples:
-            # We need to set training iters for later use. Technically
-            # we need to adjust the training samples too (due to last
-            # batch being incomplete) but we leave it as is for now.
-            update_train_iters(self.train)
-            if self.scheduler.lr_decay_samples is None:
-                self.scheduler.lr_decay_samples = self.train.train_samples
-            self.scheduler.lr_decay_steps = self.scheduler.lr_decay_samples
-            self.scheduler.wd_incr_steps = self.train.train_samples
-            self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_samples
-            if self.scheduler.lr_warmup_fraction is not None:
-                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
-            else:
-                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
-
 
     def validate(self) -> None:
         """Validate sections, then cross-section consistency without mutation."""
@@ -550,15 +510,41 @@ class PretrainConfigContainer(ConfigContainerBase):
         if self.scheduler.weight_decay_incr_style == "constant":
             self.scheduler.start_weight_decay = self.optimizer.weight_decay
             self.scheduler.end_weight_decay = self.optimizer.weight_decay
-        self._resolve_scheduler_step_fields()
-        if self.rl.perform_rl_step:
-            self._finalize_rl_ddp()
+        # Resolve scheduler steps after the effective batch sizes and weight decay.
+        # Iteration-based training.
+        if self.train.train_iters:
+            if self.scheduler.lr_decay_iters is None:
+                self.scheduler.lr_decay_iters = self.train.train_iters
+            self.scheduler.lr_decay_steps = self.scheduler.lr_decay_iters * self.train.global_batch_size
+            self.scheduler.wd_incr_steps = self.train.train_iters * self.train.global_batch_size
+            self.scheduler.wsd_decay_steps = None
+            if self.scheduler.lr_wsd_decay_iters is not None:
+                self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_iters * self.train.global_batch_size
+            if self.scheduler.lr_warmup_fraction is not None:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
+            else:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_iters * self.train.global_batch_size
+        # Sample-based training.
+        elif self.train.train_samples:
+            # We need to set training iters for later use. Technically
+            # we need to adjust the training samples too (due to last
+            # batch being incomplete) but we leave it as is for now.
+            update_train_iters(self.train)
+            if self.scheduler.lr_decay_samples is None:
+                self.scheduler.lr_decay_samples = self.train.train_samples
+            self.scheduler.lr_decay_steps = self.scheduler.lr_decay_samples
+            self.scheduler.wd_incr_steps = self.train.train_samples
+            self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_samples
+            if self.scheduler.lr_warmup_fraction is not None:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
+            else:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
 
-    def _finalize_rl_ddp(self) -> None:
-        """Apply the RL-required layout before DDP allocates its buffers."""
-        self._validate_rl_ddp()
-        if self.rl.requires_grad_buffer_offload:
-            self.ddp.grad_buffer_offload = True
+        # Apply the RL-required layout before DDP allocates its buffers.
+        if self.rl.perform_rl_step:
+            self._validate_rl_ddp()
+            if self.rl.requires_grad_buffer_offload:
+                self.ddp.grad_buffer_offload = True
 
 
 def update_train_iters(train: TrainingConfig) -> None:
