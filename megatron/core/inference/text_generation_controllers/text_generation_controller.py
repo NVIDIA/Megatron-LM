@@ -15,7 +15,6 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
 
-from megatron.core import parallel_state
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
@@ -304,11 +303,9 @@ class TextGenerationController(MTPControllerMixin):
 
         # The wrapper resolves the pipeline-parallel group and rejects an unset one.
         self.pp_group = self.inference_wrapped_model.pp_group
-        pg_collection = inference_config.pg_collection
-        if pg_collection is not None:
-            self.dp_group = vars(pg_collection).get("dp")
-        else:
-            self.dp_group = parallel_state.get_data_parallel_group()
+        # The collection that the wrapper resolved from the same config.
+        pg_collection = inference_config.resolve_pg_collection(self.inference_wrapped_model.model)
+        self.dp_group = vars(pg_collection).get("dp")
 
         self.model_is_pipeline_parallel = self.model_config.pipeline_model_parallel_size > 1
 
