@@ -20,6 +20,7 @@ from megatron.core.activations import squared_relu
 from megatron.core.inference.communication.torch_symm_triton import are_tensors_nvls_eligible
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
+from megatron.core.transformer.moe.moe_utils import fused_topk_with_score_function
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.initialize import _set_random_seed
@@ -33,6 +34,10 @@ requires_torch_grouped_mm = pytest.mark.skipif(
     not is_torch_min_version("2.10") or not hasattr(torch, '_grouped_mm'),
     reason="Requires PyTorch >= 2.10 with torch._grouped_mm",
 )
+requires_te_fused_router = pytest.mark.skipif(
+    fused_topk_with_score_function is None, reason="Requires the transformer-engine fused router"
+)
+ROUTER_FUSION = [False, pytest.param(True, marks=requires_te_fused_router)]
 
 
 _NVFP4_ACTIVATIONS = {
@@ -167,6 +172,12 @@ class TestInferenceTopKRouter:
     def teardown_class(cls):
         Utils.destroy_model_parallel()
 
+    @pytest.fixture(autouse=True)
+    def _compile_every_routing_variant(self, monkeypatch):
+        # These tests compile more routing variants (top-k, fusion, bias, token-count shapes)
+        # than Dynamo's default recompile limit; past it the router silently runs eagerly.
+        monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 64)
+
     def _make_router(self, **config_overrides):
         from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
         from megatron.core.transformer.moe.router import InferenceTopKRouter
@@ -253,6 +264,219 @@ class TestInferenceTopKRouter:
 
         # Same expert selections
         assert training_experts == inference_experts
+
+    @pytest.mark.parametrize("batch", [1, 2])
+    @pytest.mark.parametrize("batch_invariant", [False, True], ids=["compiled", "eager"])
+    @pytest.mark.parametrize("topk", [1, 2])
+    @pytest.mark.parametrize("fusion", ROUTER_FUSION)
+    def test_inference_routing_is_dense_topk(
+        self, monkeypatch, fusion, topk, batch_invariant, batch
+    ):
+        """Inference routing is [num_tokens, topk] fp32 probs and int64 expert IDs for every
+        router fusion setting, top-k and [seq, batch] layout, and selects the training
+        routing's experts and probs."""
+        import megatron.core.transformer.moe.router as router_module
+
+        # Batch-invariant mode routes eagerly instead of through the compiled routing function.
+        monkeypatch.setattr(
+            router_module, "is_batch_invariant_mode_enabled", lambda: batch_invariant
+        )
+        router = self._make_router(moe_router_topk=topk, moe_router_fusion=fusion)
+        num_tokens = 16
+        hidden = torch.randn(
+            num_tokens // batch,
+            batch,
+            NANOV3_BASE["hidden_size"],
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        with torch.no_grad():
+            # Nonzero expert bias, so selection (scores + bias) differs from the probs (scores).
+            router.expert_bias.copy_(0.05 * torch.randn_like(router.expert_bias))
+            training_probs, training_map = router(hidden)
+        with torch.inference_mode(), InferenceMode.active():
+            probs, top_indices = router(hidden)
+
+        assert probs.shape == top_indices.shape == (num_tokens, topk)
+        assert probs.dtype == torch.float32 and top_indices.dtype == torch.int64
+        inference_map = torch.zeros_like(training_map).scatter(1, top_indices, True)
+        assert torch.equal(inference_map, training_map)
+        torch.testing.assert_close(probs, training_probs.gather(1, top_indices))
+
+    @requires_te_fused_router
+    def test_fusion_without_dense_te_indices_warns_and_routes_unfused(self, monkeypatch):
+        """A TE fused router that cannot write dense indices cannot serve inference routing:
+        the router says so once and routes unfused, still [num_tokens, topk]."""
+        import megatron.core.transformer.moe.moe_utils as moe_utils
+        import megatron.core.transformer.moe.router as router_module
+
+        for module in (moe_utils, router_module):
+            monkeypatch.setattr(
+                module, "fused_topk_with_score_function_supports_topk_indices", False
+            )
+        with pytest.warns(UserWarning, match="InferenceTopKRouter routes unfused"):
+            router = self._make_router(moe_router_topk=2, moe_router_fusion=True)
+        hidden = torch.randn(16, 1, NANOV3_BASE["hidden_size"], device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            _, training_map = router(hidden)
+        with torch.inference_mode(), InferenceMode.active():
+            probs, top_indices = router(hidden)
+
+        assert probs.shape == top_indices.shape == (16, 2)
+        inference_map = torch.zeros_like(training_map).scatter(1, top_indices, True)
+        assert torch.equal(inference_map, training_map)
+
+    @requires_te_fused_router
+    @pytest.mark.parametrize("topk,expert_bias", [(1, False), (2, False), (4, False), (1, True)])
+    def test_fused_matches_unfused_across_token_counts(self, topk, expert_bias):
+        """Sigmoid routing over the token counts of an engine run, which drive the compiled
+        router through static, dynamic and size-1 shapes: the fused and unfused routers pick
+        the same experts with the same probs. Without expert bias and scaling, this is how the
+        inference config-matrix models route."""
+        router = self._make_router(
+            moe_router_topk=topk,
+            moe_router_enable_expert_bias=expert_bias,
+            moe_router_topk_scaling_factor=2.5 if expert_bias else None,
+            init_method_std=0.1,
+        )
+        hidden_size = NANOV3_BASE["hidden_size"]
+        with torch.no_grad():
+            # A training forward keeps the expert bias in fp32, as the fused router requires.
+            router(torch.randn(4, 1, hidden_size, device="cuda", dtype=torch.bfloat16))
+            if expert_bias:
+                router.expert_bias.copy_(0.05 * torch.randn_like(router.expert_bias))
+        for num_tokens in (320, 7, 520, 1):
+            hidden = torch.randn(num_tokens, 1, hidden_size, device="cuda", dtype=torch.bfloat16)
+            routes = {}
+            for fusion in (True, False):
+                router.config.moe_router_fusion = fusion
+                with torch.inference_mode(), InferenceMode.active():
+                    probs, top_indices = router(hidden)
+                order = top_indices.argsort(dim=1)
+                routes[fusion] = (top_indices.gather(1, order), probs.gather(1, order))
+            assert torch.equal(routes[True][0], routes[False][0]), f"{num_tokens} tokens"
+            torch.testing.assert_close(routes[True][1], routes[False][1])
+
+    @requires_te
+    @pytest.mark.parametrize(
+        "backend", ["vllm", pytest.param("torch", marks=requires_torch_grouped_mm)]
+    )
+    @pytest.mark.parametrize("expert_bias", [False, True], ids=["plain", "bias_scaled"])
+    @pytest.mark.parametrize("topk", [1, 2, 4])
+    @pytest.mark.parametrize("fusion", ROUTER_FUSION)
+    def test_moe_layer_matches_training(self, fusion, topk, expert_bias, backend):
+        """The inference MoE layer consumes the inference routing for every router fusion
+        setting, top-k and sigmoid variant (plain, or expert bias and scaling): at EP=1 its
+        output matches the same layer's training path."""
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            InferenceAllGatherDispatcherBase,
+            NVLSAllGatherVDispatcher,
+        )
+
+        if backend == "torch" and torch.cuda.get_device_capability()[0] < 9:
+            pytest.skip("BF16 torch grouped_mm requires SM90+")
+        config = _make_base_config(
+            moe_router_topk=topk,
+            moe_router_fusion=fusion,
+            moe_router_enable_expert_bias=expert_bias,
+            moe_router_topk_scaling_factor=2.5 if expert_bias else None,
+            moe_shared_expert_intermediate_size=None,
+            inference_grouped_gemm_backend=backend,
+        )
+        layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        if expert_bias:
+            layer.router.expert_bias.copy_(0.05 * torch.randn_like(layer.router.expert_bias))
+        # Standalone layer without a dynamic context: no symmetric buffers or padding mask.
+        NVLSAllGatherVDispatcher._delete_buffers()
+        InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
+        hidden = torch.randn(16, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            training_output, _ = layer(hidden.clone())
+        with torch.inference_mode(), InferenceMode.active():
+            inference_output, _ = layer(hidden.clone())
+
+        error = (inference_output.float() - training_output.float()).norm()
+        assert error <= 2e-2 * training_output.float().norm()
+
+
+@pytest.mark.internal
+@requires_te
+class TestInferenceRoutingExpertParallel:
+    """The inference dispatchers and experts consume the router's dense routing across EP ranks."""
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=Utils.world_size)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+
+    @classmethod
+    def teardown_class(cls):
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        NVLSAllGatherVDispatcher._delete_buffers()
+        SymmetricMemoryManager.destroy()
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        "backend", ["vllm", pytest.param("torch", marks=requires_torch_grouped_mm)]
+    )
+    @pytest.mark.parametrize("dispatcher", ["nccl", "nvls"])
+    @pytest.mark.parametrize("topk", [1, 2])
+    @pytest.mark.parametrize("fusion", ROUTER_FUSION)
+    def test_moe_layer_matches_training(self, monkeypatch, fusion, topk, dispatcher, backend):
+        """With expert parallelism, the inference MoE layer matches the same layer's training
+        path for every router fusion setting and top-k, with either inference dispatcher."""
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            InferenceAllGatherDispatcherBase,
+            NCCLAllGatherDispatcher,
+            NVLSAllGatherVDispatcher,
+        )
+
+        ep_size = Utils.world_size
+        if ep_size < 2:
+            pytest.skip("Expert parallelism requires world_size > 1.")
+        if dispatcher == "nvls" and ep_size & (ep_size - 1):
+            pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
+        if backend == "torch" and torch.cuda.get_device_capability()[0] < 9:
+            pytest.skip("BF16 torch grouped_mm requires SM90+")
+        config = _make_base_config(
+            moe_router_topk=topk,
+            moe_router_fusion=fusion,
+            moe_shared_expert_intermediate_size=None,
+            expert_model_parallel_size=ep_size,
+            inference_moe_token_dispatcher_type=dispatcher,
+            inference_grouped_gemm_backend=backend,
+        )
+        layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        # Dispatcher state for this top-k, without a dynamic context: every row is real, and
+        # equal per-rank token counts take the NCCL dispatcher's fixed-count path.
+        NVLSAllGatherVDispatcher._delete_buffers()
+        InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
+        monkeypatch.setattr(NCCLAllGatherDispatcher, "_use_allgather_v", False)
+        if dispatcher == "nvls":
+            for key in ("ep_agv_h", "ep_agv_r", "ep_agv_p", "ep_rsv", "ep_meta"):
+                SymmetricMemoryManager.destroy(key)
+            NVLSAllGatherVDispatcher.allocate_buffers(
+                per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+                topk=topk,
+                hidden_size=config.hidden_size,
+                ep_group=get_expert_model_parallel_group(),
+            )
+        hidden = torch.randn(16, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            training_output, _ = layer(hidden.clone())
+        with torch.inference_mode(), InferenceMode.active():
+            inference_output, _ = layer(hidden.clone())
+
+        error = (inference_output.float() - training_output.float()).norm()
+        assert error <= 2e-2 * training_output.float().norm()
 
 
 # ──────────────────────────────────────────────────────────────────────
