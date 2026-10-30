@@ -427,8 +427,19 @@ class ProcessGroupCollection:
     @classmethod
     @parallel_state._deprecated_outside_megatron_core(_USE_MPU_PROCESS_GROUPS_DEPRECATION)
     def use_mpu_process_groups(cls, required_pgs: Optional[List[str]] = None):
-        """
-        Use the default process groups from parallel_state.
+        """Build a collection from the global process groups in ``parallel_state``.
+
+        .. warning::
+            **This is a backward-compatibility shim, not a migration target.** It reads the
+            single global parallel grid from :mod:`megatron.core.parallel_state`, so it carries
+            the same global dependency as calling ``parallel_state.get_*_group()`` directly.
+            It does not construct or select an independent model's parallel grid.
+
+            New model components should accept a ``ProcessGroupCollection`` from their caller.
+            Keep this shim at bootstrap boundaries. A fallback for existing callers uses
+            ``resolve_process_groups()`` in Megatron Core, or a
+            ``global_process_group_fallback()`` block outside it. See
+            ``docs/developer/parallel-state-deprecation.md``.
 
         These are the groups registered with parallel_state.register_process_groups(), which
         initialize_model_parallel() calls. Each call returns a new collection; dp_cp_ag and
