@@ -44,7 +44,6 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 from wandb import wandb_run
 
-from megatron.core import mpu
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
@@ -60,6 +59,7 @@ from megatron.core.num_microbatches_calculator import reconfigure_num_microbatch
 from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import get_pp_last_rank, is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
@@ -79,6 +79,7 @@ from megatron.core.transformer.utils import (
 from megatron.core.utils import (
     get_asyncio_loop,
     get_attr_wrapped_model,
+    get_model_config,
     get_pg_rank,
     get_pg_size,
     log_single_rank,
@@ -467,7 +468,7 @@ def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iter
         if cfg.rl.rl_use_sequence_packing:
             runtime_state = get_rl_runtime_state()
             if runtime_state.packing_context is not None:
-                dp_world_size = mpu.get_data_parallel_world_size()
+                dp_world_size = runtime_state.packing_context.dp_group.size()
 
                 compute_tokens = get_packing_compute_tokens(runtime_state.packing_context)
                 all_ranks_compute_tokens = compute_tokens * dp_world_size
@@ -654,25 +655,27 @@ def get_agent(env_config_path):
 _INFERENCE_INTERFACE = None
 
 
-def _eager_train_comm_warmup():
-    """Run one tiny allreduce per training process group to initialize NCCL communicators."""
-    group_getters = {
-        'dp': partial(mpu.get_data_parallel_group),
-        'dp_cp': partial(mpu.get_data_parallel_group, with_context_parallel=True),
-        'cp': mpu.get_context_parallel_group,
-        'mp': mpu.get_model_parallel_group,
-        'tp_dp_cp': partial(mpu.get_tensor_and_data_parallel_group, with_context_parallel=True),
-        'expert_dp': mpu.get_expert_data_parallel_group,
-        'expert_tp': mpu.get_expert_tensor_parallel_group,
-        'expert_mp': mpu.get_expert_model_parallel_group,
-    }
+def _eager_train_comm_warmup(pg_collection: ProcessGroupCollection):
+    """Run one tiny allreduce per training process group to initialize NCCL communicators.
+
+    Args:
+        pg_collection: Process groups of the model being trained. Groups it does not hold are
+            skipped.
+    """
+    group_names = (
+        'dp_gtp_remat',
+        'dp_cp_gtp_remat',
+        'cp',
+        'mp',
+        'tp_dp_cp',
+        'expt_dp_gtp_remat',
+        'expt_tp',
+        'ep',
+    )
     warmed = []
     start = time.perf_counter()
-    for name, getter in group_getters.items():
-        try:
-            group = getter()
-        except AssertionError:
-            continue
+    for name in group_names:
+        group = getattr(pg_collection, name)
         if group is None:
             continue
         group_start = time.perf_counter()
@@ -687,10 +690,19 @@ def _eager_train_comm_warmup():
     )
 
 
-def get_inference_interface(args, loop, model):
+def get_inference_interface(args, loop, model, training_model):
+    """Return the inference interface serving ``model``, launching it on the first call.
+
+    Args:
+        args: Megatron arguments.
+        loop: Event loop that runs the interface.
+        model: Model chunks that serve inference.
+        training_model: Model chunks being trained; ``model`` itself when no separate inference
+            model is used. The first call warms up the communicators of its process groups.
+    """
     global _INFERENCE_INTERFACE
     if _INFERENCE_INTERFACE is None:
-        _eager_train_comm_warmup()
+        _eager_train_comm_warmup(get_attr_wrapped_model(training_model[0], "pg_collection"))
         _INFERENCE_INTERFACE = loop.run_until_complete(
             MegatronLocal.launch(
                 model[0],
@@ -2483,6 +2495,9 @@ def compute_logprobs_batch(
     """Compute logprobs for all batches in the data loader."""
     logprobs_list = []
     data_iterator = iter(data_loader)
+    # The schedule runs on the process groups of the model, with stages linked over pp_group.
+    pg_collection = get_attr_wrapped_model(model, "pg_collection")
+    p2p_communicator = P2PCommunicator(pp_group=pp_group, config=get_model_config(model))
     for i in range(len(data_loader)):
         output_tensor = forward_backward_func(
             forward_step_func=partial(logprobs_forward_step, is_correction=is_correction, packing_context=packing_context),
@@ -2495,6 +2510,8 @@ def compute_logprobs_batch(
             forward_only=True,
             adjust_tensor_shapes_fn=None,
             collect_non_loss_data=collect_non_loss_data,
+            p2p_communicator=p2p_communicator,
+            pg_collection=pg_collection,
         )
         if is_pp_last_stage(pp_group):
             logprobs_list.append(output_tensor[0].detach())
@@ -2552,6 +2569,10 @@ def prepare_data_for_update(
 
     model = model[0]
     dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
+    # The rollouts are split and packed over the process groups of the model being trained,
+    # which can differ from those of a separate inference model.
+    pg_collection = get_attr_wrapped_model(model, "pg_collection")
+    dp_group = pg_collection.dp_gtp_remat
 
     with nvtx_range("rl/prepare-data-for-update", time=True):
         with nvtx_range("rl/compute-group-stats", time=True):
@@ -2598,7 +2619,7 @@ def prepare_data_for_update(
         # TODO(vitalyk): why do we need global_advantages here? go inside packing
         advantages = global_advantages = torch.tensor(row_advantages, dtype=dtype).cuda()
 
-        data_parallel_world_size = mpu.get_data_parallel_world_size()
+        data_parallel_world_size = dp_group.size()
         # The rollout count is data-dependent (oversampling, group filtering), so it need not
         # divide evenly across ranks and microbatches. Pad to the next multiple of
         # (DP size * micro_batch_size) with inert rows (zero advantage, no loss contribution).
@@ -2615,8 +2636,8 @@ def prepare_data_for_update(
         if data_parallel_world_size > 0:
             data_split_size = len(rows) // data_parallel_world_size
             data_split_range = (
-                mpu.get_data_parallel_rank() * data_split_size,
-                (mpu.get_data_parallel_rank() + 1) * data_split_size,
+                dp_group.rank() * data_split_size,
+                (dp_group.rank() + 1) * data_split_size,
             )
             rows = rows[data_split_range[0] : data_split_range[1]]
             advantages = advantages[data_split_range[0] : data_split_range[1]]
@@ -2645,7 +2666,9 @@ def prepare_data_for_update(
                     global_advantages,
                     args.seq_length,
                     cfg.rl.rl_sequence_packing_max_sequences_per_bin,
-                    cfg.rl.rl_sequence_packing_algo
+                    cfg.rl.rl_sequence_packing_algo,
+                    dp_group=dp_group,
+                    cp_group=pg_collection.cp,
                     )
 
                 compute_trajs = packing_context.packed_trajs
@@ -2683,7 +2706,11 @@ def prepare_data_for_update(
         with torch.no_grad(), nvtx_range("rl/compute-logprobs", time=True):
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
 
-            forward_backward_func = get_forward_backward_func()
+            pp_group = pg_collection.pp
+            forward_backward_func = get_forward_backward_func(
+                pp_size=pp_group.size(),
+                vp_size=get_model_config(model).virtual_pipeline_model_parallel_size,
+            )
             if args.cuda_graph_impl == "full_iteration":
                 forward_backward_func = FullCudaGraphWrapper(
                     forward_backward_func,
@@ -2697,9 +2724,6 @@ def prepare_data_for_update(
                 dtype = (
                     torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
                 )
-
-            pg_collection = get_attr_wrapped_model(model, "pg_collection")
-            pp_group = pg_collection.pp
 
             with torch.no_grad(), nvtx_range("rl/compute-old-logprobs", time=True):
                 old_logprobs = compute_logprobs_batch(
@@ -2789,6 +2813,7 @@ def prepare_data_for_update(
                     global_batch_size=cfg.train.global_batch_size,
                     micro_batch_size=cfg.train.micro_batch_size,
                     decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
+                    dp_group=dp_group,
                )
                 loader = get_microbatch_dataloader(len(packing_context.packed_trajs), cfg.train.micro_batch_size)
         else:
@@ -2815,7 +2840,7 @@ def prepare_data_for_update(
                     global_batch_size=math.ceil(samples_ratio_per_step*total_rows),
                     micro_batch_size=cfg.train.micro_batch_size,
                     decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
-                    data_parallel_size=mpu.get_data_parallel_world_size(),
+                    data_parallel_size=dp_group.size(),
                 )
 
                 dataset_tensors = [
@@ -3238,7 +3263,9 @@ def megatron_rl_inference_mode(
         if cuda_graph_impl != "none" and not cfg.rl.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, cuda_graph_impl)
 
-        inference_interface = get_inference_interface(args, loop, model)
+        inference_interface = get_inference_interface(
+            args, loop, model, training_model if training_model is not None else model
+        )
         inference_interface.set_generation_epoch(train_state.iteration)
         loop.run_until_complete(inference_interface.resume())
 
