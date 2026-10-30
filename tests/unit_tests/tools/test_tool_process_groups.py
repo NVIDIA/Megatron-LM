@@ -3,14 +3,16 @@
 """The inference and embedding tools take their process groups from the model they run."""
 
 import importlib
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
-from megatron.core import parallel_state
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core import parallel_state, process_groups_config
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from tests.unit_tests.test_utilities import Utils
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -124,3 +126,71 @@ def test_disk_embedder_splits_blocks_over_the_model_data_parallel_group(monkeypa
 
     assert len(block_split_calls) == 1
     assert block_split_calls[0].get("process_group") is data_parallel_group
+
+
+@pytest.mark.usefixtures("run_config")
+def test_bert_embedder_builds_its_model_on_the_collection_of_the_registered_grid(monkeypatch):
+    """The embedder builds its model on the collection that pretrain() builds from the registered
+    grid, so setup_model_and_optimizer() does not fall back to the global grid."""
+    pytest.importorskip("h5py")
+    pytest.importorskip("transformers")
+    # The embedding tool imports the BERT example's model provider as a top-level module.
+    monkeypatch.syspath_prepend(str(_REPO_ROOT / "examples" / "bert"))
+    embed = importlib.import_module("tools.bert_embedding.embed")
+
+    registered = ProcessGroupCollection(
+        dp=object(),
+        dp_gtp_remat=object(),
+        dp_cp=object(),
+        dp_cp_gtp_remat=object(),
+        intra_dp_cp=object(),
+    )
+    monkeypatch.setattr(parallel_state, "_REGISTERED_PROCESS_GROUPS", registered)
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+    args = SimpleNamespace(output_bert_embeddings=True, create_all_gather_group=False)
+    monkeypatch.setattr(embed, "get_args", lambda: args)
+    setup = Mock(return_value=([Mock()], None, None))
+    monkeypatch.setattr(embed, "setup_model_and_optimizer", setup)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ProcessGroupFallbackWarning)
+        embed.BertEmbedder(1, 8, "megatron", warmup=False)
+
+    pg_collection = setup.call_args.kwargs["pg_collection"]
+    assert pg_collection is not registered
+    assert all(getattr(pg_collection, name) is group for name, group in vars(registered).items())
+
+
+@pytest.mark.usefixtures("run_config")
+def test_bert_embedder_on_an_unregistered_grid_warns_as_setup_model_and_optimizer_did(monkeypatch):
+    """On a grid set up without registering a collection, the embedder builds its model on the
+    global grid with the single warning that setup_model_and_optimizer() gave before: the
+    embedder takes no pg_collection, so a warning that named it would point at an argument it
+    lacks."""
+    pytest.importorskip("h5py")
+    pytest.importorskip("transformers")
+    # The embedding tool imports the BERT example's model provider as a top-level module.
+    monkeypatch.syspath_prepend(str(_REPO_ROOT / "examples" / "bert"))
+    embed = importlib.import_module("tools.bert_embedding.embed")
+
+    monkeypatch.setattr(parallel_state, "_REGISTERED_PROCESS_GROUPS", None)
+    global_groups = ProcessGroupCollection(dp=object())
+    monkeypatch.setattr(
+        ProcessGroupCollection, "use_mpu_process_groups", Mock(return_value=global_groups)
+    )
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+    args = SimpleNamespace(output_bert_embeddings=True, create_all_gather_group=False)
+    monkeypatch.setattr(embed, "get_args", lambda: args)
+    setup = Mock(return_value=([Mock()], None, None))
+    monkeypatch.setattr(embed, "setup_model_and_optimizer", setup)
+
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        embed.BertEmbedder(1, 8, "megatron", warmup=False)
+
+    assert setup.call_args.kwargs["pg_collection"] is global_groups
+    assert [
+        str(warning.message).split(" was called")[0]
+        for warning in record
+        if issubclass(warning.category, ProcessGroupFallbackWarning)
+    ] == ["setup_model_and_optimizer"]
