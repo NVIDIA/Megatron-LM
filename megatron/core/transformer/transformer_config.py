@@ -738,9 +738,10 @@ class TransformerConfig(ModelParallelConfig):
             instead of saving roughly O(batch * seq_len * dsa_indexer_topk) of them. Only the
             sparse KL objective materializes these, so this has no effect without
             dsa_indexer_use_sparse_loss.
-    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
-    "shortcut_pre_mlp_layernorm", and "residual_stream" use output-discarding checkpointing;
-    "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
+    "core_attn", "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj",
+    "gdp_qkv", "mhc", "shortcut_pre_mlp_layernorm", and "residual_stream" use
+    output-discarding checkpointing.
+    "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
     """
 
     ####################
@@ -3016,14 +3017,6 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "'gdn' and 'gdn_norm_out' in recompute_modules cannot be used together. "
                     "'gdn' recomputes the full GDN-family layer, including gated norm."
-                )
-
-            if "core_attn" in self.recompute_modules:
-                warnings.warn(
-                    "If you are using transformer_engine as the transformer implementation, "
-                    "the core_attn is from transformer_engine and may be the fused version. "
-                    "For fused attention, you have no need to set 'core_attn' to recompute. "
-                    "Please check that the core_attn recompute is really needed."
                 )
 
             if "shared_experts" in self.recompute_modules:
