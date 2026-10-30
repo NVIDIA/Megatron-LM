@@ -59,11 +59,7 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
-from megatron.training.global_vars import (
-    get_run_config,
-    get_tokenizer,
-    set_run_config,
-)
+from megatron.training.global_vars import get_run_config, get_tokenizer, set_run_config
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from model_provider import model_provider
@@ -161,6 +157,7 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         not is_first_or_last_pipeline_stage(vp_stage)
         and not mtp_on_this_rank
         and not has_cu_seqlens
+        and not config.moe_aux_loss_masking
     ):
         return ContextParallelBatch(
             boundary_layout=config.linear_cp_layout,
@@ -168,9 +165,17 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
             packed_seq_params_by_layout={config.linear_cp_layout: None},
         )
 
+    if is_sft and config.num_moe_experts is not None:
+        tokenizer = get_tokenizer()
+        if tokenizer.pad == tokenizer.eod:
+            raise ValueError("SFT MoE padding requires distinct PAD and EOD IDs.")
     batch = {}
     if tp_rank == 0:
         batch = next(data_iterator)
+        if config.moe_aux_loss_masking:
+            mask = batch["loss_mask"]
+            if not bool(((mask == 0) | (mask == 1)).all()):
+                raise ValueError("--moe-aux-loss-masking requires a binary main loss mask")
         for key in BATCH_KEYS:
             batch[key] = (
                 batch[key].cuda(non_blocking=True)
@@ -193,11 +198,20 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+        broadcast_moe_metadata=(is_sft and config.num_moe_experts is not None)
+        or config.moe_aux_loss_masking,
     )
 
     batch = flatten_batch_for_packed_sequences(batch)
+    if is_sft and config.num_moe_experts is not None:
+        batch["padding_mask"] = batch["tokens"].eq(get_tokenizer().pad)
 
-    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
+    if (
+        not is_first_or_last_pipeline_stage(vp_stage)
+        and not mtp_on_this_rank
+        and not (is_sft and config.num_moe_experts is not None)
+        and not config.moe_aux_loss_masking
+    ):
         assert has_cu_seqlens
         batch = {
             **dict.fromkeys(BATCH_KEYS),
@@ -233,12 +247,7 @@ SPIKY_LOSS_FACTOR = 10
 
 @lru_cache(maxsize=1)
 def _build_cached_logits_loss_func(
-    logprobs_dir,
-    decode_threads,
-    msc_prefetch_depth,
-    kd_loss_alpha,
-    ignore_errors,
-    ignore_hash,
+    logprobs_dir, decode_threads, msc_prefetch_depth, kd_loss_alpha, ignore_errors, ignore_hash
 ):
     """Build (once) the offline knowledge-distillation loss callable for cached logits.
 
@@ -390,13 +399,20 @@ def forward_step(data_iterator, model: HybridModel):
     return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
+forward_step.supports_moe_token_normalization = True
+
+
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     """Whether the dataset should be built on the current rank."""
     args = get_args()
     config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
-    elif is_packed_sequence or args.sequence_packing_scheduler is not None:
+    elif (
+        is_packed_sequence
+        or args.sequence_packing_scheduler is not None
+        or args.moe_aux_loss_masking
+    ):
         # The sequence-packing scheduler runs on every PP stage and reads its input there.
         return True
     return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank_func(
@@ -545,8 +561,8 @@ if __name__ == "__main__":
     # so its mere presence is a compatible fallback signal for an agent that predates NVRX_CYCLE.
     _NVRX_CYCLE_START = _env_float('NVRX_CYCLE_START_TIME')
     _IS_NVRX_RESTART = (
-        (_NVRX_CYCLE not in ('', '0') and _NVRX_CYCLE.isdigit()) or _NVRX_CYCLE_START is not None
-    )
+        _NVRX_CYCLE not in ('', '0') and _NVRX_CYCLE.isdigit()
+    ) or _NVRX_CYCLE_START is not None
     if _NVRX_LAUNCH_TIME is not None:
         _LAUNCH_SCRIPT_PRESRUN_TIME = None
         if _IS_NVRX_RESTART:

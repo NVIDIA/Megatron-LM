@@ -368,7 +368,11 @@ def test_seq_aux_loss_restores_batch_size_for_per_token_scaling(monkeypatch):
     router = TopKRouter.__new__(TopKRouter)
     object.__setattr__(router, "topk", 2)
     object.__setattr__(
-        router, "config", SimpleNamespace(num_moe_experts=2, moe_router_aux_loss_fusion=False)
+        router,
+        "config",
+        SimpleNamespace(
+            num_moe_experts=2, moe_router_aux_loss_fusion=False, moe_aux_loss_masking=False
+        ),
     )
     object.__setattr__(router, "get_aux_loss_coeff", lambda _name: 1.0)
     object.__setattr__(
@@ -861,15 +865,16 @@ class TestTop2Router:
             add_bias_linear=False,
         )
         losses = []
-        compute_aux_loss = router_mod.switch_load_balancing_loss_func
-
-        def record_aux_loss(*args, **kwargs):
-            loss = compute_aux_loss(*args, **kwargs)
-            losses.append(loss.detach())
-            return loss
-
-        monkeypatch.setattr(router_mod, "switch_load_balancing_loss_func", record_aux_loss)
         router = TopKRouter(config, pg_collection=get_default_pg_collection()).cuda()
+        attach_aux_loss = router.attach_and_log_load_balancing_loss
+
+        def record_aux_loss(activation, aux_loss_coeff, aux_loss, *args, **kwargs):
+            losses.append(aux_loss.detach())
+            return attach_aux_loss(activation, aux_loss_coeff, aux_loss, *args, **kwargs)
+
+        # Observe the actual attached objective, independent of whether sequence
+        # normalization uses the fused Switch helper or a masked per-sequence mean.
+        monkeypatch.setattr(router, "attach_and_log_load_balancing_loss", record_aux_loss)
         hidden_states = torch.randn(8, 2, 16, device="cuda", requires_grad=True)
         if with_history:
             probs, _ = router(hidden_states)

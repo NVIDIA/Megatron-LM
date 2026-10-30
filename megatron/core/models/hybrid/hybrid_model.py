@@ -29,6 +29,7 @@ from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
 from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.moe.moe_utils import get_moe_aux_loss_mask
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
@@ -867,6 +868,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             else rotary_pos_emb
         )
 
+        moe_aux_loss_mask = None
+        moe_aux_loss_mask_by_layout = None
+        if self.config.moe_aux_loss_masking:
+            moe_aux_loss_mask = get_moe_aux_loss_mask(
+                loss_mask, self.config.sequence_parallel, self.pg_collection.tp
+            )
+            if cp_batch is not None:
+                moe_aux_loss_mask_by_layout = {
+                    layout: get_moe_aux_loss_mask(
+                        batch.get("loss_mask"), self.config.sequence_parallel, self.pg_collection.tp
+                    )
+                    for layout, batch in cp_batch.batches_by_layout.items()
+                }
+
         # Run decoder.
         backbone_context = (
             torch.no_grad()
@@ -885,6 +900,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
                 input_ids=hash_input_ids,
+                moe_aux_loss_mask=moe_aux_loss_mask,
+                moe_aux_loss_mask_by_layout=moe_aux_loss_mask_by_layout,
             )
         if isinstance(decoder_output, tuple):
             hidden_states, mhc_multistream = decoder_output

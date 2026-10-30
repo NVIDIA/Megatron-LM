@@ -2309,6 +2309,7 @@ def get_batch_on_this_tp_rank(
     pipeline_model_parallel_size: int = 1,
     is_pipeline_first_stage: bool = False,
     is_pipeline_last_stage: bool = False,
+    broadcast_moe_metadata: bool = False,
 ):
     """Broadcast batch tensors from TP rank 0 to all other ranks in the TP group.
 
@@ -2349,6 +2350,8 @@ def get_batch_on_this_tp_rank(
         pipeline_model_parallel_size (int): Number of pipeline-parallel stages.
         is_pipeline_first_stage (bool): Whether this rank is on the first PP stage.
         is_pipeline_last_stage (bool): Whether this rank is on the last PP stage.
+        broadcast_moe_metadata (bool): Keep token IDs and loss masks on every SFT
+            pipeline stage for router padding/auxiliary masks.
 
     Returns:
         dict[str, torch.Tensor]: The batch dict with all tensors populated on
@@ -2384,7 +2387,7 @@ def get_batch_on_this_tp_rank(
             )
             _broadcast(dynamic_cp_seq_length)
 
-        if pipeline_model_parallel_size == 1 or mtp_on_this_rank:
+        if pipeline_model_parallel_size == 1 or mtp_on_this_rank or broadcast_moe_metadata:
             _broadcast(batch['tokens'])
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
@@ -2505,7 +2508,7 @@ def get_batch_on_this_tp_rank(
             ), f"Expected cu_seqlens to be of type torch.int32, got {cu_seqlens.dtype}"
             return cu_seqlens
 
-        if pipeline_model_parallel_size == 1 or mtp_on_this_rank:
+        if pipeline_model_parallel_size == 1 or mtp_on_this_rank or broadcast_moe_metadata:
             _broadcast(tokens)
             _broadcast(labels)
             _broadcast(loss_mask)

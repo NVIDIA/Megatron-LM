@@ -1316,9 +1316,7 @@ def validate_args(args, defaults={}):
                 "--sequence-packing-scheduler default_dynamic_cp"
             )
         dp_cp_size = args.data_parallel_size * args.context_parallel_size
-        from megatron.core.parallel_state import (
-            get_valid_dynamic_context_parallel_group_sizes,
-        )
+        from megatron.core.parallel_state import get_valid_dynamic_context_parallel_group_sizes
 
         valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(dp_cp_size)
         if args.min_dynamic_context_parallel_size not in valid_group_sizes:
@@ -1648,6 +1646,21 @@ def validate_args(args, defaults={}):
         "Transformer Engine cross entropy loss fusion is disabled due to stability issues. "
         "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
     )
+
+    if args.moe_aux_loss_masking:
+        assert (
+            args.sequence_packing_scheduler is None
+        ), "Auxiliary target masking is not yet wired through sequence packing schedulers"
+        assert (
+            not args.overlap_moe_expert_parallel_comm
+        ), "Auxiliary target masking is not yet wired through overlap schedule plans"
+        assert (
+            not args.enable_mhc_connections
+        ), "Auxiliary target masking is not yet wired through mHC wrappers"
+        assert not args.mtp_num_layers, "MoE auxiliary masking does not yet support MTP"
+        assert (
+            args.cuda_graph_impl == "none"
+        ), "MoE auxiliary masking does not yet register target masks as CUDA graph inputs"
 
     # Deterministic mode — env vars + config overrides + torch global state.
     # Implementation lives in ``megatron/training/determinism.py`` so the

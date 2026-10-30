@@ -785,6 +785,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
         *,
         inference_params: Optional[Any] = None,
+        moe_aux_loss_mask: Optional[Tensor] = None,
     ):
         """
         Perform a forward pass through the attention layer and the layernorms before and after
@@ -1143,6 +1144,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                     "padding_mask": kwargs.get("padding_mask", None),
                     "packed_seq_params": kwargs.get("packed_seq_params", None),
                 }
+                if kwargs.get("moe_aux_loss_mask") is not None:
+                    mlp_kwargs["moe_aux_loss_mask"] = kwargs["moe_aux_loss_mask"]
                 if residual_stream_recompute_context is not None:
                     mlp_kwargs["residual_stream_recompute_context"] = (
                         residual_stream_recompute_context
@@ -1309,6 +1312,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         packed_seq_params=None,
         input_ids: Optional[Tensor] = None,
         mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
+        moe_aux_loss_mask: Optional[Tensor] = None,
     ) -> tuple[tuple[Tensor, Tensor | None], Tensor]:
         """Run pre-MLP norm and MLP/MoE, returning the raw output before BDA."""
         pre_mlp_layernorm_output, residual, mlp_state = self._pre_mlp_layernorm_and_residual(
@@ -1333,6 +1337,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             inference_context,
             input_ids=input_ids,
             packed_seq_params=packed_seq_params,
+            moe_aux_loss_mask=moe_aux_loss_mask,
         )
 
         if moe_unflatten_mbs is not None:
@@ -1352,6 +1357,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         packed_seq_params=None,
         input_ids: Optional[Tensor] = None,
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+        moe_aux_loss_mask: Optional[Tensor] = None,
     ) -> Tensor | list[Tensor | None]:
         """
         Perform a forward pass through the feed-forward layer.
@@ -1395,6 +1401,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             inference_context,
             input_ids=input_ids,
             packed_seq_params=packed_seq_params,
+            moe_aux_loss_mask=moe_aux_loss_mask,
         )
 
         if moe_unflatten_mbs is not None:
@@ -1437,6 +1444,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         inference_context: BaseInferenceContext | None,
         input_ids: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        moe_aux_loss_mask: Optional[Tensor] = None,
     ):
         """Execute the MLP submodule with the appropriate variant.
 
@@ -1472,6 +1480,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             moe_kwargs["input_ids"] = input_ids
         if self.is_moe_layer:
             moe_kwargs["packed_seq_params"] = packed_seq_params
+            if moe_aux_loss_mask is not None:
+                moe_aux_loss_mask = moe_aux_loss_mask.reshape(
+                    pre_mlp_layernorm_output.shape[1], pre_mlp_layernorm_output.shape[0]
+                )
+                moe_kwargs["moe_aux_loss_mask"] = moe_aux_loss_mask
 
         if self.recompute_mlp:
             mlp_output_with_bias = precision_aware_checkpoint(
@@ -1505,14 +1518,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 else (None,) * num_chunks
             )
 
+            aux_mask_chunks = (
+                moe_aux_loss_mask.chunk(num_chunks, dim=1)
+                if moe_aux_loss_mask is not None
+                else (None,) * num_chunks
+            )
             # Compute outputs for each chunk, preserving sequence-aligned MoE metadata.
             outputs = []
-            for chunk, padding_mask_chunk, input_id_chunk in zip(
-                chunks, padding_mask_chunks, input_id_chunks
+            for chunk, padding_mask_chunk, input_id_chunk, aux_mask_chunk in zip(
+                chunks, padding_mask_chunks, input_id_chunks, aux_mask_chunks
             ):
                 chunk_moe_kwargs = {}
                 if input_id_chunk is not None:
                     chunk_moe_kwargs["input_ids"] = input_id_chunk
+                if aux_mask_chunk is not None:
+                    chunk_moe_kwargs["moe_aux_loss_mask"] = aux_mask_chunk
                 if self.is_moe_layer:
                     chunk_moe_kwargs["packed_seq_params"] = packed_seq_params
                 outputs.append(
@@ -2449,6 +2469,7 @@ class MoETransformerLayer(TransformerLayer):
         padding_mask=None,
         packed_seq_params=None,
         input_ids=None,
+        moe_aux_loss_mask=None,
     ):
         """
         Orchestrates the MLP forward pass, handling partial CUDA graph execution logic.
@@ -2519,6 +2540,7 @@ class MoETransformerLayer(TransformerLayer):
                 padding_mask=padding_mask,
                 packed_seq_params=packed_seq_params,
                 input_ids=input_ids,
+                moe_aux_loss_mask=moe_aux_loss_mask,
             )
 
 

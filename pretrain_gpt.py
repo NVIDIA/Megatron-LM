@@ -59,11 +59,7 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
-from megatron.training.global_vars import (
-    get_run_config,
-    get_tokenizer,
-    set_run_config,
-)
+from megatron.training.global_vars import get_run_config, get_tokenizer, set_run_config
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from model_provider import model_provider
@@ -164,12 +160,21 @@ def get_batch(
         not is_first_or_last_pipeline_stage(vp_stage)
         and not mtp_on_this_rank
         and not has_cu_seqlens
+        and not config.moe_aux_loss_masking
     ):
         return [None for _ in BATCH_KEYS]
 
+    if is_sft and config.num_moe_experts is not None:
+        tokenizer = get_tokenizer()
+        if tokenizer.pad == tokenizer.eod:
+            raise ValueError("SFT MoE padding requires distinct PAD and EOD IDs.")
     batch = {}
     if tp_rank == 0:
         batch = next(data_iterator)
+        if config.moe_aux_loss_masking:
+            mask = batch["loss_mask"]
+            if not bool(((mask == 0) | (mask == 1)).all()):
+                raise ValueError("--moe-aux-loss-masking requires a binary main loss mask")
         for key in BATCH_KEYS:
             batch[key] = (
                 batch[key].cuda(non_blocking=True)
@@ -192,11 +197,18 @@ def get_batch(
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+        broadcast_moe_metadata=(is_sft and config.num_moe_experts is not None)
+        or config.moe_aux_loss_masking,
     )
 
     batch = flatten_batch_for_packed_sequences(batch)
 
-    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
+    if (
+        not is_first_or_last_pipeline_stage(vp_stage)
+        and not mtp_on_this_rank
+        and not (is_sft and config.num_moe_experts is not None)
+        and not config.moe_aux_loss_masking
+    ):
         assert has_cu_seqlens
         return (
             None,
@@ -233,12 +245,7 @@ SPIKY_LOSS_FACTOR = 10
 
 @lru_cache(maxsize=1)
 def _build_cached_logits_loss_func(
-    logprobs_dir,
-    decode_threads,
-    msc_prefetch_depth,
-    kd_loss_alpha,
-    ignore_errors,
-    ignore_hash,
+    logprobs_dir, decode_threads, msc_prefetch_depth, kd_loss_alpha, ignore_errors, ignore_hash
 ):
     """Build (once) the offline knowledge-distillation loss callable for cached logits.
 
@@ -420,6 +427,11 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
             )
 
+    if args.sft and _get_transformer_config(args).num_moe_experts is not None:
+        # Prompts are real routed tokens even though their target loss is masked.
+        # Exclude only padding from router statistics and auxiliary gradients.
+        padding_mask = tokens.eq(get_tokenizer().pad)
+
     timers('batch-generator').stop()
 
     with stimer:
@@ -452,13 +464,20 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
+forward_step.supports_moe_token_normalization = True
+
+
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     """Whether the dataset should be built on the current rank."""
     args = get_args()
     config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
-    elif is_packed_sequence or args.sequence_packing_scheduler is not None:
+    elif (
+        is_packed_sequence
+        or args.sequence_packing_scheduler is not None
+        or args.moe_aux_loss_masking
+    ):
         # The sequence-packing scheduler runs on every PP stage and reads its input there.
         return True
     return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank_func(

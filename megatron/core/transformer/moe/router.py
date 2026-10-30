@@ -259,9 +259,14 @@ class TopKRouter(Router):
                 'global_tokens_per_expert',
                 torch.zeros(
                     self.config.num_moe_experts,
-                    dtype=torch.float32,
+                    dtype=torch.int64,
                     device=torch.cuda.current_device(),
                 ),
+                persistent=False,
+            )
+            self.register_buffer(
+                'global_num_tokens',
+                torch.zeros((), dtype=torch.int64, device=torch.cuda.current_device()),
                 persistent=False,
             )
             self.register_buffer(
@@ -271,6 +276,7 @@ class TopKRouter(Router):
             )
         else:
             self.global_tokens_per_expert = None
+            self.global_num_tokens = None
             self.ga_steps = None
 
         if self.routing_type == "quantile_balancing" and self.qb_estimation_scope == "global_batch":
@@ -654,6 +660,11 @@ class TopKRouter(Router):
         if seq_aux_loss_coeff == 0:
             return probs
 
+        if with_padding_mask or self.config.moe_aux_loss_masking:
+            return self._apply_masked_seq_aux_loss(
+                probs, scores_for_aux_loss, routing_map, seq_length, bsz, packed_seq_params
+            )
+
         scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
         routing_map = routing_map.reshape(seq_length, -1)
 
@@ -698,6 +709,46 @@ class TopKRouter(Router):
         )
         return probs
 
+    def _apply_masked_seq_aux_loss(
+        self,
+        probs: torch.Tensor,
+        scores: torch.Tensor,
+        routing_map: torch.Tensor,
+        seq_length: int,
+        bsz: int,
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> torch.Tensor:
+        """Normalize each sequence using its selected tokens, omitting empty ones."""
+        groups = self._get_aux_loss_groups(packed_seq_params)
+        routes = routing_map.reshape(seq_length, bsz, self.config.num_moe_experts)
+        expert_counts = routes.sum(dim=0)
+        for group in groups.loss_reduce_groups:
+            torch.distributed.all_reduce(expert_counts, group=group)
+        token_counts = expert_counts.sum(dim=-1) / self.topk
+        score_sums = scores.reshape(seq_length, bsz, self.config.num_moe_experts).sum(dim=0)
+        coeff = self.get_aux_loss_coeff("seq_aux_loss")
+        sequence_losses = (
+            (score_sums * expert_counts).sum(dim=-1)
+            * (self.config.num_moe_experts * coeff / self.topk)
+            / token_counts.clamp_min(1).square()
+        )
+        if self.calculate_per_token_loss:
+            aux_loss = (sequence_losses * token_counts).sum() / token_counts.sum().clamp_min(1)
+        else:
+            aux_loss = sequence_losses.sum() / (token_counts > 0).sum().clamp_min(1)
+        return self.attach_and_log_load_balancing_loss(
+            probs,
+            coeff,
+            aux_loss,
+            "seq_load_balancing_loss",
+            groups.metric_reduce_group,
+            avg_group=groups.metric_avg_group,
+            needs_dp_avg=groups.metric_needs_dp_avg,
+            valid_token_count=routes.sum() // self.topk,
+            aux_loss_logging_reduce_groups=groups.metric_pre_reduce_groups,
+            aux_loss_scale_reduce_groups=groups.loss_reduce_groups,
+        )
+
     def _apply_global_aux_loss(
         self,
         probs: torch.Tensor,
@@ -722,11 +773,16 @@ class TopKRouter(Router):
 
         self.global_tokens_per_expert += global_tokens_per_expert
         self.ga_steps += 1
-        averated_tokens_per_expert = self.global_tokens_per_expert / self.ga_steps
+        self.global_num_tokens += total_num_tokens
+        # Express the cumulative expert distribution on the current token domain.
+        # Dividing by microbatch count is wrong for uneven or empty target sets.
+        averaged_tokens_per_expert = (
+            self.global_tokens_per_expert * total_num_tokens / self.global_num_tokens.clamp_min(1)
+        )
 
         global_aux_loss = switch_load_balancing_loss_func(
             probs=scores_for_aux_loss,
-            tokens_per_expert=averated_tokens_per_expert,
+            tokens_per_expert=averaged_tokens_per_expert,
             total_num_tokens=total_num_tokens,
             topk=self.topk,
             num_experts=self.config.num_moe_experts,
@@ -741,7 +797,15 @@ class TopKRouter(Router):
             self.tp_dp_cp_group,
             needs_dp_avg=False,
             valid_token_count=local_num_tokens,
-            aux_loss_scale_reduce_groups=(self.tp_cp_group,),
+            # This objective already aggregates statistics across DP. Its summed
+            # gradient uses the global domain count; a DP mean must be undone in
+            # legacy mode. Keep the logging value independent of backward scaling.
+            aux_loss_scale_num_tokens=total_num_tokens,
+            aux_backward_scale=(
+                self.tp_dp_cp_group.size() / self.tp_cp_group.size()
+                if not self.calculate_per_token_loss
+                else 1.0
+            ),
         )
         return probs
 
@@ -784,6 +848,7 @@ class TopKRouter(Router):
         aux_loss_logging_reduce_groups: Optional[Sequence[torch.distributed.ProcessGroup]] = None,
         aux_loss_scale_reduce_groups: Optional[Sequence[torch.distributed.ProcessGroup]] = None,
         aux_loss_scale_num_tokens: Optional[Union[int, torch.Tensor]] = None,
+        aux_backward_scale: float = 1.0,
     ):
         """Attach aux loss function to activation and add to logging.
 
@@ -807,6 +872,8 @@ class TopKRouter(Router):
             aux_loss_scale_num_tokens (int or torch.Tensor, optional): Already-reduced token
                 count used directly as the per-token-loss scale, skipping the reduction above.
                 Only used when calculate_per_token_loss is set. Defaults to None.
+            aux_backward_scale (float): Additional backward-only factor; logging retains
+                the original objective value. Defaults to 1.0.
         """
         # When using repeated MTP layers, the loss is counted "mtp_num_layers" times.
         # To avoid accumulating the load balancing loss multiple times, we scale it by
@@ -843,6 +910,7 @@ class TopKRouter(Router):
             avg_group=avg_group,
             needs_dp_avg=needs_dp_avg,
         )
+        aux_loss = aux_loss * aux_backward_scale
         if self.calculate_per_token_loss:
             # Finalize-model-grads divides by the global valid-token count. Weight
             # each aux-loss domain by its exact reduced token count; local_count *
@@ -902,25 +970,21 @@ class TopKRouter(Router):
             # Skip Z loss calculations when using torch.no_grad() or checkpointing.
             moe_z_loss_coeff = self.config.moe_z_loss_coeff / self.tp_cp_group.size()
             z_loss = z_loss_func(logits, moe_z_loss_coeff, padding_mask=padding_mask)
+            if padding_mask is not None:
+                num_local_tokens = (~padding_mask).sum()
+                global_num_tokens = num_local_tokens.clone()
+                torch.distributed.all_reduce(global_num_tokens, group=self.tp_cp_group)
+                # Use a token mean across TP/CP, not a mean of local masked means.
+                z_loss = (
+                    z_loss
+                    * num_local_tokens
+                    * self.tp_cp_group.size()
+                    / global_num_tokens.clamp_min(1)
+                )
+            else:
+                global_num_tokens = logits.shape[0] * self.tp_cp_group.size()
             if self.calculate_per_token_loss:
-                # Same derivation as in attach_and_log_load_balancing_loss:
-                #   - Target final scaling on z_loss gradients: 1 / (num_micro_batches * dp_size).
-                #   - In terms of the router's `num_local_tokens`, the total_global_tokens
-                #     divisor that finalize_model_grads applies factors as
-                #         num_micro_batches * dp_size * (num_local_tokens * tp_cp_group.size()).
-                #   - Pre-multiplying z_loss by num_local_tokens * tp_cp_group.size() cancels
-                #     that same factor in total_global_tokens, leaving
-                #     1 / (num_micro_batches * dp_size) as the effective scaling — the target.
-                # The /tp_cp_group.size() on moe_z_loss_coeff above is a separate forward-side
-                # correction: z_loss is computed independently on each TP+CP rank's local
-                # logits and must be averaged across TP+CP rather than summed.
-                # Count valid tokens: sum of inverted mask (False -> True = valid)
-                num_local_tokens = (
-                    (~padding_mask).sum() if padding_mask is not None else logits.shape[0]
-                )
-                logits = MoEAuxLossAutoScaler.apply(
-                    logits, z_loss * num_local_tokens * self.tp_cp_group.size()
-                )
+                logits = MoEAuxLossAutoScaler.apply(logits, z_loss * global_num_tokens)
             else:
                 logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
 
@@ -1083,6 +1147,7 @@ class TopKRouter(Router):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        moe_aux_loss_mask: Optional[torch.Tensor] = None,
     ):
         """Top-k routing function
 
@@ -1123,8 +1188,27 @@ class TopKRouter(Router):
         if padding_mask is not None:
             padding_mask = padding_mask.reshape(-1)
 
-        # Apply Z-Loss
-        logits = self.apply_z_loss(logits, padding_mask=padding_mask)
+        if (
+            self.config.moe_aux_loss_masking
+            and self.training
+            and torch.is_grad_enabled()
+            and moe_aux_loss_mask is None
+        ):
+            raise ValueError("moe_aux_loss_mask is required when moe_aux_loss_masking is enabled")
+        aux_padding_mask = padding_mask
+        if moe_aux_loss_mask is not None:
+            if moe_aux_loss_mask.dtype != torch.bool:
+                raise TypeError("moe_aux_loss_mask must be boolean (True means scored)")
+            moe_aux_loss_mask = moe_aux_loss_mask.reshape(-1)
+            if moe_aux_loss_mask.numel() != logits.shape[0]:
+                raise ValueError("moe_aux_loss_mask must match the router's token positions")
+            aux_padding_mask = ~moe_aux_loss_mask
+            if padding_mask is not None:
+                aux_padding_mask = aux_padding_mask | padding_mask
+
+        # Only the regularizer sees target masking. Expert dispatch, bias updates,
+        # and routing diagnostics retain the actual padding mask.
+        logits = self.apply_z_loss(logits, padding_mask=aux_padding_mask)
 
         # Calculate probs and routing_map for token dispatching
         topk_indices_dtype = self._dense_route_indices_dtype()
@@ -1243,11 +1327,15 @@ class TopKRouter(Router):
                     batch_dim=0,
                 )
             if apply_aux_loss:
+                if moe_aux_loss_mask is not None:
+                    selected = moe_aux_loss_mask.unsqueeze(-1)
+                    routing_map_for_aux_loss = routing_map_for_aux_loss & selected
+                    scores_for_aux_loss = scores_for_aux_loss * selected
                 probs = self._apply_aux_loss(
                     probs,
                     scores_for_aux_loss,
                     routing_map_for_aux_loss,
-                    with_padding_mask=padding_mask is not None,
+                    with_padding_mask=aux_padding_mask is not None,
                     packed_seq_params=packed_seq_params,
                 )
                 probs = self._apply_seq_aux_loss(
@@ -1256,14 +1344,14 @@ class TopKRouter(Router):
                     routing_map_for_aux_loss,
                     seq_length,
                     bsz,
-                    with_padding_mask=padding_mask is not None,
+                    with_padding_mask=aux_padding_mask is not None,
                     packed_seq_params=packed_seq_params,
                 )
                 probs = self._apply_global_aux_loss(
                     probs,
                     scores_for_aux_loss,
                     routing_map_for_aux_loss,
-                    with_padding_mask=padding_mask is not None,
+                    with_padding_mask=aux_padding_mask is not None,
                 )
 
         # Optionally apply expert bias
@@ -1275,6 +1363,7 @@ class TopKRouter(Router):
         """Reset the global aux loss tracker."""
         if self.global_tokens_per_expert is not None:
             self.global_tokens_per_expert.zero_()
+            self.global_num_tokens.zero_()
             self.ga_steps.zero_()
 
     def forward(
@@ -1283,6 +1372,7 @@ class TopKRouter(Router):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        moe_aux_loss_mask: Optional[torch.Tensor] = None,
     ):
         """
         Forward pass of the router.
@@ -1351,6 +1441,7 @@ class TopKRouter(Router):
             padding_mask=padding_mask,
             input_ids=input_ids,
             packed_seq_params=packed_seq_params,
+            moe_aux_loss_mask=moe_aux_loss_mask,
         )
 
         return probs, routing_map
@@ -1495,6 +1586,7 @@ class InferenceTopKRouter(TopKRouter):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        moe_aux_loss_mask: Optional[torch.Tensor] = None,
     ):
         """Simplified forward pass for inference - returns dense tensors only.
 
@@ -1511,7 +1603,11 @@ class InferenceTopKRouter(TopKRouter):
 
         if not InferenceMode.is_active():
             return super().forward(
-                input, padding_mask, input_ids, packed_seq_params=packed_seq_params
+                input,
+                padding_mask,
+                input_ids,
+                packed_seq_params=packed_seq_params,
+                moe_aux_loss_mask=moe_aux_loss_mask,
             )
 
         return self._forward(input, padding_mask, input_ids)

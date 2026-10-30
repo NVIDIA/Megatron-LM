@@ -315,6 +315,26 @@ def get_tokens_per_expert_and_token_count(
     return global_tokens_per_expert, local_num_tokens, total_num_tokens
 
 
+def get_moe_aux_loss_mask(
+    loss_mask: Optional[torch.Tensor],
+    sequence_parallel: bool,
+    tp_group: torch.distributed.ProcessGroup,
+) -> Optional[torch.Tensor]:
+    """Align a binary, prediction-position target mask with router hidden states."""
+    if loss_mask is None:
+        return None
+    mask = loss_mask.bool()
+    if sequence_parallel:
+        from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
+
+        mask = (
+            scatter_to_sequence_parallel_region(mask.transpose(0, 1).contiguous(), group=tp_group)
+            .transpose(0, 1)
+            .contiguous()
+        )
+    return mask
+
+
 class MoEAuxLossAutoScaler(torch.autograd.Function):
     """An AutoScaler that triggers the backward pass and scales the grad for auxiliary loss."""
 

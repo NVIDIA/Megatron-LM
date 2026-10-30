@@ -32,6 +32,7 @@ from megatron.core.tensor_observation import observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
 from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.moe.moe_utils import get_moe_aux_loss_mask
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
@@ -674,6 +675,23 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
+        moe_kwargs = {}
+        if self.config.moe_aux_loss_masking and loss_mask is not None:
+            aux_mask = get_moe_aux_loss_mask(
+                loss_mask, self.config.sequence_parallel, self.pg_collection.tp
+            )
+            moe_kwargs["moe_aux_loss_mask"] = aux_mask
+
+        # Later PP stages receive SP activations rather than running embeddings.
+        if not self.pre_process and padding_mask is not None and self.config.sequence_parallel:
+            padding_mask = (
+                tensor_parallel.scatter_to_sequence_parallel_region(
+                    padding_mask.transpose(0, 1).contiguous(), group=self.pg_collection.tp
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
+
         # Run decoder.
         backbone_context = (
             torch.no_grad()
@@ -693,6 +711,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 padding_mask=padding_mask,
                 **(extra_block_kwargs or {}),
+                **moe_kwargs,
             )
 
         return self._postprocess(

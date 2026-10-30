@@ -33,6 +33,8 @@ def checkpointed_forward(
     cp_layout_state: Optional[ContextParallelLayoutState] = None,
     packed_sequence_cp_metadata: object | None = None,
     input_ids: Optional[Tensor] = None,
+    moe_aux_loss_mask: Optional[Tensor] = None,
+    moe_aux_loss_mask_by_layout: Optional[dict[CPLayout, Tensor | None]] = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -124,6 +126,13 @@ def checkpointed_forward(
                     packed_seq_params=layer_packed_seq_params,
                     padding_mask=layer_padding_mask,
                 )
+                layer_aux_mask = moe_aux_loss_mask
+                if cp_layout_state is not None:
+                    layer_aux_mask = cp_layout_state.get_layer_padding_mask(
+                        index, moe_aux_loss_mask, moe_aux_loss_mask_by_layout
+                    )
+                if layer_aux_mask is not None and isinstance(layer, TransformerLayer):
+                    layer_kwargs["moe_aux_loss_mask"] = layer_aux_mask
                 inner_layer = getattr(layer, "inner_layer", layer)
                 router = getattr(getattr(inner_layer, "mlp", None), "router", None)
                 if input_ids is not None and getattr(router, "is_hash_layer", False):
