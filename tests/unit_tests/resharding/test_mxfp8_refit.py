@@ -18,7 +18,12 @@ try:
 except ImportError:
     _HAVE_FLASHINFER = False
 
-from megatron.core.inference.moe.flashinfer_mxfp8 import HAVE_FLASHINFER_ROUTED_MXFP8
+from megatron.core.inference.moe.flashinfer_mxfp8 import (
+    HAVE_FLASHINFER_CUTLASS_MXFP8,
+    HAVE_FLASHINFER_ROUTED_MXFP8,
+    prepare_cutlass_mxfp8_weights,
+    prepare_routed_mxfp8_weights,
+)
 
 pytestmark = pytest.mark.skipif(
     not _IS_BLACKWELL, reason="MXFP8 tests require Blackwell GPU (SM >= 10)"
@@ -279,16 +284,36 @@ class TestMXFP8ReshardTransform:
             assert buf.scale.data_ptr() == scale_ptr
             assert buf.backend == "triton"
 
-    @pytest.mark.skipif(
-        not HAVE_FLASHINFER_ROUTED_MXFP8, reason="test requires FlashInfer routed MXFP8"
+    @pytest.mark.parametrize(
+        ("clamp_scale", "rows", "prepare_weights"),
+        [
+            pytest.param(
+                None,
+                256,
+                prepare_routed_mxfp8_weights,
+                marks=pytest.mark.skipif(
+                    not HAVE_FLASHINFER_ROUTED_MXFP8, reason="test requires FlashInfer routed MXFP8"
+                ),
+                id="routed",
+            ),
+            pytest.param(
+                16.0,
+                128,
+                prepare_cutlass_mxfp8_weights,
+                marks=pytest.mark.skipif(
+                    not HAVE_FLASHINFER_CUTLASS_MXFP8,
+                    reason="test requires FlashInfer CUTLASS MXFP8",
+                ),
+                id="cutlass-clamped",
+            ),
+        ],
     )
-    def test_flashinfer_routed_moe_buffers_refresh_in_place(self):
-        """Refit refreshes derived Major-K weights without changing graph addresses."""
+    def test_flashinfer_moe_buffers_refresh_in_place(
+        self, clamp_scale, rows, prepare_weights, monkeypatch
+    ):
+        """Refit refreshes derived FlashInfer weights without changing graph addresses."""
         from megatron.core.inference.moe import InferenceGroupedGemmBackend
-        from megatron.core.inference.moe.flashinfer_mxfp8 import (
-            flashinfer_routed_mxfp8_moe,
-            prepare_routed_mxfp8_weights,
-        )
+        from megatron.core.inference.moe.flashinfer_mxfp8 import flashinfer_routed_mxfp8_moe
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
         from megatron.core.resharding.transforms import MXFP8ReshardTransform
         from megatron.core.transformer.moe.experts import InferenceGroupedMLP
@@ -301,10 +326,10 @@ class TestMXFP8ReshardTransform:
         # The SM100 runner has no tuning configuration for the earlier compact
         # 96x128/16-token synthetic shape.
         num_experts, num_local_experts = 8, 2
-        shapes = {"linear_fc1": (256, 256), "linear_fc2": (256, 256)}
         grouped_mlp = Namespace()
         grouped_mlp.num_local_experts = num_local_experts
         grouped_mlp.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.FLASHINFER
+        grouped_mlp._activation_clamp_scale = clamp_scale
         grouped_mlp._concatenated_weights_built = False
         buffers = {}
         for linear_name in ("linear_fc1", "linear_fc2"):
@@ -312,8 +337,7 @@ class TestMXFP8ReshardTransform:
             setattr(grouped_mlp, linear_name, linear)
             for expert_idx in range(num_local_experts):
                 tensor = MXFP8Tensor.from_bf16(
-                    torch.randn(*shapes[linear_name], dtype=torch.bfloat16, device="cuda"),
-                    backend="triton",
+                    torch.randn(rows, rows, dtype=torch.bfloat16, device="cuda"), backend="triton"
                 )
                 setattr(linear, f"weight{expert_idx}", tensor)
                 buffers[f"{linear_name}.weight{expert_idx}"] = tensor
@@ -328,19 +352,28 @@ class TestMXFP8ReshardTransform:
             grouped_mlp._fc1_weight.scale.data_ptr(),
             grouped_mlp._fc2_weight.scale.data_ptr(),
         )
-        hidden = torch.randn(512, 256, dtype=torch.bfloat16, device="cuda")
-        routing_map = torch.tensor([0, 1], device="cuda").expand(512, -1)
-        probs = torch.full((512, 2), 0.5, dtype=torch.float32, device="cuda")
-        before = flashinfer_routed_mxfp8_moe(
-            hidden,
-            routing_map,
-            probs,
-            grouped_mlp._fc1_weight,
-            grouped_mlp._fc2_weight,
-            num_experts=num_experts,
-            local_expert_offset=0,
-            activation_type=6,
-        )
+        if clamp_scale is None:
+            hidden = torch.randn(512, rows, dtype=torch.bfloat16, device="cuda")
+            routing_map = torch.tensor([0, 1], device="cuda").expand(512, -1)
+            probs = torch.full((512, 2), 0.5, dtype=torch.float32, device="cuda")
+            before = flashinfer_routed_mxfp8_moe(
+                hidden,
+                routing_map,
+                probs,
+                grouped_mlp._fc1_weight,
+                grouped_mlp._fc2_weight,
+                num_experts=num_experts,
+                local_expert_offset=0,
+                activation_type=6,
+            )
+        else:
+            for linear_name, buf_name in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS:
+                stack = getattr(grouped_mlp, buf_name)
+                for i in range(num_local_experts):
+                    canonical = buffers[f"{linear_name}.weight{i}"]
+                    assert getattr(getattr(grouped_mlp, linear_name), f"weight{i}") is canonical
+                    assert canonical.data.data_ptr() == stack.data[i].data_ptr()
+                    assert canonical.scale.data_ptr() == stack.scale[i].data_ptr()
 
         transform = MXFP8ReshardTransform(
             convertible_params=set(buffers), persistent_buffers=buffers, backend="triton"
@@ -384,44 +417,66 @@ class TestMXFP8ReshardTransform:
             reference = MXFP8Tensor.from_bf16(source_parameters[name], backend="triton")
             assert torch.equal(buffer.data, reference.data)
             assert torch.equal(buffer.scale, reference.scale)
+            if clamp_scale is not None:
+                linear_name, expert_name = name.split(".")
+                stack = getattr(
+                    grouped_mlp, "_fc1_weight" if linear_name == "linear_fc1" else "_fc2_weight"
+                )
+                expert_idx = int(expert_name.removeprefix("weight"))
+                assert torch.equal(stack.data[expert_idx], reference.data)
+                assert torch.equal(
+                    stack.scale[expert_idx].view(torch.uint8).reshape(-1),
+                    reference.scale.view(torch.uint8),
+                )
 
-        assert InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp) is True
+        # CUTLASS refits must be visible immediately, without restacking or refresh copies.
+        with monkeypatch.context() as patch:
+            if clamp_scale is not None:
+
+                def forbidden_stack(*args, **kwargs):
+                    pytest.fail("CUTLASS refit must not restack shared weights")
+
+                patch.setattr(grouped_mlp, "_stack_mxfp8_linear_weight", forbidden_stack)
+            assert InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp) is (
+                clamp_scale is None
+            )
 
         references = {}
-        for linear_name, routed_weight in (
+        for linear_name, flashinfer_weight in (
             ("linear_fc1", grouped_mlp._fc1_weight),
             ("linear_fc2", grouped_mlp._fc2_weight),
         ):
             canonical = InferenceGroupedMLP._stack_mxfp8_linear_weight(
                 grouped_mlp, linear_name, "triton"
             )
-            expected = prepare_routed_mxfp8_weights(canonical)
+            expected = prepare_weights(canonical)
             references[linear_name] = expected
-            assert torch.equal(routed_weight.data, expected.data)
-            assert torch.equal(routed_weight.scale, expected.scale)
+            assert torch.equal(flashinfer_weight.data, expected.data)
+            assert torch.equal(flashinfer_weight.scale, expected.scale)
 
-        actual = flashinfer_routed_mxfp8_moe(
-            hidden,
-            routing_map,
-            probs,
-            grouped_mlp._fc1_weight,
-            grouped_mlp._fc2_weight,
-            num_experts=num_experts,
-            local_expert_offset=0,
-            activation_type=6,
-        )
-        expected = flashinfer_routed_mxfp8_moe(
-            hidden,
-            routing_map,
-            probs,
-            references["linear_fc1"],
-            references["linear_fc2"],
-            num_experts=num_experts,
-            local_expert_offset=0,
-            activation_type=6,
-        )
-        assert not torch.equal(actual, before)
-        assert torch.equal(actual, expected)
+        if clamp_scale is None:
+            actual = flashinfer_routed_mxfp8_moe(
+                hidden,
+                routing_map,
+                probs,
+                grouped_mlp._fc1_weight,
+                grouped_mlp._fc2_weight,
+                num_experts=num_experts,
+                local_expert_offset=0,
+                activation_type=6,
+            )
+            expected = flashinfer_routed_mxfp8_moe(
+                hidden,
+                routing_map,
+                probs,
+                references["linear_fc1"],
+                references["linear_fc2"],
+                num_experts=num_experts,
+                local_expert_offset=0,
+                activation_type=6,
+            )
+            assert not torch.equal(actual, before)
+            assert torch.equal(actual, expected)
 
         assert data_ptrs == (
             grouped_mlp._fc1_weight.data.data_ptr(),
