@@ -1583,6 +1583,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         # TODO: For backward compatibility, remove in v0.15.
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
+        self._pg_collection = pg_collection
 
         # TE returns a zero length Tensor when bias=False and
         # return_bias=True, but we prefer None.  So in that case we
@@ -1768,7 +1769,12 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        # Guard for cases metadata is not provided. A layer built with a collection supplies its
+        # GTP-inclusive DP x CP group, the group the global default stands for.
+        dp_cp_group = None
+        if self._pg_collection is not None:
+            dp_cp_group = self._pg_collection.dp_cp_gtp_remat or self._pg_collection.dp_cp
+        metadata = ensure_metadata_has_dp_cp_group(metadata, dp_cp_group)
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
             state_dict,
