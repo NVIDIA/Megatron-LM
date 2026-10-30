@@ -13,7 +13,7 @@ import torch
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
-from megatron.core.datasets.utils import Split
+from megatron.core.datasets.utils import Split, atomic_save, atomic_write_text
 from megatron.core.safe_globals import safe_numpy_load
 from megatron.core.utils import log_single_rank
 
@@ -191,10 +191,6 @@ class MaskedWordPieceDataset(MegatronDataset):
 
             os.makedirs(path_to_cache, exist_ok=True)
 
-            # Write the description
-            with open(path_to_description, "wt") as writer:
-                writer.write(self.unique_description)
-
             # Build the sample index
             log_single_rank(
                 logger,
@@ -218,7 +214,9 @@ class MaskedWordPieceDataset(MegatronDataset):
                 False,
                 min_sentences_per_sample,
             )
-            numpy.save(path_to_sample_index, sample_index, allow_pickle=True)
+            atomic_save(path_to_sample_index, sample_index, allow_pickle=True)
+            # Write the description atomically as the commit marker
+            atomic_write_text(path_to_description, self.unique_description)
             t_end = time.time()
             log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
