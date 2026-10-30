@@ -6359,8 +6359,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 sampling_params=SamplingParams(num_tokens_to_generate=8, termination_id=-1),
             )
         )
-        # A prefill and two decode steps generate 3 of the 8 tokens.
-        for _ in range(3):
+        # Generate 3 of the 8 tokens. Async scheduling's first step only launches a forward.
+        for _ in range(6):
+            if len(engine.get_request(0).generated_tokens) == 3:
+                break
             assert engine.step_modern()["finished_requests"] == []
         generated = list(engine.get_request(0).generated_tokens)
         assert len(generated) == 3
