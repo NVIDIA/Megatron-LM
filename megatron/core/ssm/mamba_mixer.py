@@ -582,11 +582,14 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
 
         assert self.cp.cp_size == 1, "Context parallel not supported for Mamba inference decode"
 
+        # The decode kernels are batch-first: (1, b, proj_dim) -> (b, 1, proj_dim).
         # Static batching has no slot remapping, so batch_indices is None.
-        y = self.ssm_decode(zxBCdt, conv_state=conv_state, ssm_state=ssm_state, batch_indices=None)
+        y = self.ssm_decode(
+            zxBCdt.transpose(0, 1), conv_state=conv_state, ssm_state=ssm_state, batch_indices=None
+        )
 
-        # y has shape (1, b, d_inner), which is what out_proj expects
-        out, out_bias = self.out_proj(y)
+        # (b, 1, d_inner) -> (1, b, d_inner), which is what out_proj expects.
+        out, out_bias = self.out_proj(y.transpose(0, 1))
 
         return out, out_bias
 
@@ -1123,6 +1126,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             conv_state: The convolution state tensor for inference.
             ssm_state: The selective scan state tensor for inference.
             batch_indices: A map from batch id to position in the Mamba state tensors.
+                If None, request i uses state slot i, so the state tensors must hold
+                exactly one slot per request.
             intermediate_conv_state: Optional buffer for storing conv state at each
                 sequence step (for speculative decoding rollback).
             intermediate_ssm_state: Optional buffer for storing SSM state at each
@@ -1133,6 +1138,14 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         """
         batch_size, seq_len, _ = zxBCdt.shape
         dtype = zxBCdt.dtype
+        if batch_indices is None:
+            # A mismatch here usually means a sequence-first (s, b, d) input, which the
+            # kernels would otherwise decode as one request with b tokens.
+            assert batch_size == conv_state.shape[0] == ssm_state.shape[0], (
+                f"ssm_decode expects batch-first input with one state slot per request; got "
+                f"{batch_size} requests for {conv_state.shape[0]} conv and "
+                f"{ssm_state.shape[0]} SSM state slots"
+            )
 
         z, xBC, dt = torch.split(
             zxBCdt,

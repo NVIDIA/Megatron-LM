@@ -872,3 +872,44 @@ def test_batch_invariant_unfused_mixer_replays_bit_exactly(monkeypatch):
         )
     finally:
         Utils.destroy_model_parallel()
+
+
+# --- Mamba mixer: static-batching decode (_static_decode) -----------------------------------
+
+
+@pytest.mark.skipif(
+    not mamba_mixer_module.HAVE_MAMBA_SSM,
+    reason="the decode step's gated RMSNorm comes from mamba_ssm",
+)
+def test_mixer_static_decode_replays():
+    """A static-batching decode step (one token for each of 64 requests) replays bitwise.
+
+    Determinism only: tests/unit_tests/ssm/test_mamba_mixer.py checks that each request decodes
+    on its own state slot.
+    """
+    mixer = _build_mixer(deterministic_mode=False)
+    try:
+        seeded()
+        batch = 64
+        conv_shape, ssm_shape = mixer.mamba_state_shapes_per_request()
+        hidden_states = torch.randn(
+            1, batch, mixer.config.hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        conv_state = torch.randn(batch, *conv_shape, device="cuda", dtype=mixer.conv1d_weight.dtype)
+        ssm_state = torch.randn(batch, *ssm_shape, device="cuda", dtype=mixer.in_proj.weight.dtype)
+
+        def fn(hidden_states, conv_state, ssm_state):
+            with torch.no_grad():
+                out, _ = mixer._static_decode(hidden_states, conv_state, ssm_state)
+            return out, conv_state, ssm_state
+
+        assert_replays_bit_exact(
+            fn,
+            (hidden_states, conv_state, ssm_state),
+            replays=4,
+            backward=False,
+            contention=True,
+            what="Mamba mixer static-batching decode",
+        )
+    finally:
+        Utils.destroy_model_parallel()
