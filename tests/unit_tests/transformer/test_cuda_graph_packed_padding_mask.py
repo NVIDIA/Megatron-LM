@@ -64,3 +64,17 @@ def test_rebuilt_packed_seq_params_carry_the_mask(sp):
         assert params.padding_mask is mask
     # The layer-level kwarg stays for the MoE router.
     assert kwargs["padding_mask"] is mask
+
+
+def test_input_layouts_are_recorded_once_from_any_path():
+    """The hybrid hyper-connection wrapper calls the layer's raw branch directly; it records
+    the graph-input layouts through the same method as _forward_attention."""
+    layer = SimpleNamespace(training=True, _padding_mask_shape_seen=None, _rotary_pos_emb_seen=None)
+    rotary = torch.zeros(3, 1, 64, 16, dtype=torch.float32)
+    mask = torch.zeros(1, 64, dtype=torch.bool)
+    TransformerLayer._record_cuda_graph_input_layouts(layer, rotary, mask)
+    assert layer._rotary_pos_emb_seen == ((3, 1, 64, 16), torch.float32)
+    assert layer._padding_mask_shape_seen == (1, 64)
+    # Later calls do not overwrite the first layouts.
+    TransformerLayer._record_cuda_graph_input_layouts(layer, torch.zeros(2, 2), None)
+    assert layer._rotary_pos_emb_seen == ((3, 1, 64, 16), torch.float32)

@@ -671,6 +671,12 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         if has_cross_attention or has_attention == has_mlp:
             return None
 
+        # This path bypasses TransformerLayer._forward_attention, where the layer records the
+        # optional graph inputs (rotary embedding, padding mask) its TE CUDA graph must reserve.
+        layer._record_cuda_graph_input_layouts(
+            rotary_pos_emb if has_attention else None, padding_mask
+        )
+
         if has_attention:
             output_with_bias, attn_norm_manager, residual = (
                 layer._forward_self_attention_output_with_bias(

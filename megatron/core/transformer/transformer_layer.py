@@ -700,6 +700,27 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             output_with_bias, forced_released_tensors=forced_released_tensors
         )
 
+    def _record_cuda_graph_input_layouts(
+        self, rotary_pos_emb: Optional[Tensor], padding_mask: Optional[Tensor]
+    ) -> None:
+        """Record the layouts of the optional inputs that TE CUDA graph capture must reserve.
+
+        Called on every forward path into the layer (``_forward_attention`` and the raw-branch
+        calls of the hybrid hyper-connection wrapper), so the eager warmup steps see them
+        whichever path runs.
+        """
+        if padding_mask is not None and self._padding_mask_shape_seen is None:
+            # Whole-layer batch-first mask shape, taken before MLP chunking splits the mask, so TE
+            # CUDA graph capture reserves (and replay passes) a mask of the layer's input shape.
+            self._padding_mask_shape_seen = tuple(padding_mask.shape)
+        if (
+            self.training
+            and isinstance(rotary_pos_emb, Tensor)
+            and self._rotary_pos_emb_seen is None
+        ):
+            # TE CUDA graph capture reserves a rotary_pos_emb input of this layout and dtype.
+            self._rotary_pos_emb_seen = (tuple(rotary_pos_emb.shape), rotary_pos_emb.dtype)
+
     def _forward_self_attention_output_with_bias(
         self,
         hidden_states: Tensor,
@@ -853,23 +874,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 otherwise None.
         """
         inference_context = deprecate_inference_params(inference_context, inference_params)
-        if padding_mask is not None and self._padding_mask_shape_seen is None:
-            # Whole-layer batch-first mask shape, taken before MLP chunking splits the mask, so TE
-            # CUDA graph capture reserves (and replay passes) a mask of the layer's input shape.
-            self._padding_mask_shape_seen = tuple(padding_mask.shape)
+        self._record_cuda_graph_input_layouts(rotary_pos_emb, padding_mask)
 
         if not skip_engram:
             # skip_engram=True means an outer hyper-connection wrapper already added the memory
             # residual to the n-stream tensor, before its read gate.
             hidden_states = self._maybe_apply_engram(hidden_states, input_ids, packed_seq_params)
 
-        if (
-            self.training
-            and isinstance(rotary_pos_emb, Tensor)
-            and self._rotary_pos_emb_seen is None
-        ):
-            # TE CUDA graph capture reserves a rotary_pos_emb input of this layout and dtype.
-            self._rotary_pos_emb_seen = (tuple(rotary_pos_emb.shape), rotary_pos_emb.dtype)
         if residual_stream_recompute_context is None:
             input_layernorm_output, residual, attn_state = self._run_input_layernorm(hidden_states)
         else:
