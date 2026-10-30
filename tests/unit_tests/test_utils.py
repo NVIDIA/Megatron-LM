@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 import os
 import time
 import urllib.request as req
@@ -755,3 +756,36 @@ class TestTrainStepReductionThreading:
             torch.testing.assert_close(val.cpu(), expected)
         finally:
             grid.destroy()
+
+
+def test_experimental_fn_eol_warning_across_major_version(caplog):
+    """An experimental function introduced before a major bump must be flagged EOL."""
+    with caplog.at_level(logging.WARNING), patch.object(util, "mcore_version", "1.0.0"):
+
+        @util.experimental_fn(introduced_with_version="0.18.0")
+        def eol_function():
+            return success_string
+
+    assert "has reached end of life" in caplog.text
+
+
+def test_experimental_cls_eol_warning_across_major_version(caplog):
+    """An experimental class introduced before a major bump must be flagged EOL."""
+    with caplog.at_level(logging.WARNING), patch.object(util, "mcore_version", "1.0.0"):
+
+        @util.experimental_cls(introduced_with_version="0.18.0")
+        class EolClass:
+            pass
+
+    assert "has reached end of life" in caplog.text
+
+
+def test_experimental_fn_no_eol_warning_within_major_version(caplog):
+    """A still-valid experimental function must not be flagged EOL."""
+    with caplog.at_level(logging.WARNING), patch.object(util, "mcore_version", "0.20.0"):
+
+        @util.experimental_fn(introduced_with_version="0.18.0")
+        def fresh_function():
+            return success_string
+
+    assert "has reached end of life" not in caplog.text
