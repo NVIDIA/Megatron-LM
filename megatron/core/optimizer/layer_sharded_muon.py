@@ -517,13 +517,18 @@ class LayerShardedMuon(TensorParallelMuon):
         multiply-add in the promoted
         precision and downcasts once on store, so casting here first would give
         bf16 params different rounding on the layer-sharded paths than on the
-        fallback and than TensorParallelMuon's duplicated mode. TODO: forward
-        the ``weight_update_hook`` constructor parameter once the
-        emerging-optimizers pin moves past EO #224.
+        fallback and than TensorParallelMuon's duplicated mode.
         """
         self.pre_weight_update_fn_inplace(p, update)
+        # EO 0.5 also brackets the update with a state-carrying hook object.
+        # Older releases only provide the subclass methods above and below.
+        hook = getattr(self, "_weight_update_hook", None)
+        if hook is not None:
+            hook_state = hook.pre_weight_update_inplace(p, update)
         p.add_(update, alpha=-lr)
         self.post_weight_update_fn_inplace(p)
+        if hook is not None:
+            hook.post_weight_update_inplace(p, hook_state)
 
     def _run_ns(self, full_by_k: dict) -> dict:
         """Full-matrix Newton-Schulz per home-owned matrix, batched by shape.

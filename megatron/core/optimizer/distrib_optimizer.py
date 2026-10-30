@@ -964,11 +964,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         inner_state_dict = self.optimizer.state_dict()
         state_dict = {}
 
-        # Extract 'step', for non-Apex/TE support.
-        if not HAVE_APEX_OR_TE:
-            steps = list(set([s["step"].item() for s in inner_state_dict["state"].values()]))
-            assert len(steps) == 1
-            step = steps[0]
+        # Some optimizers (including EO Lion >= 0.5) keep a per-parameter step
+        # even when TE/Apex is installed. Preserve its type as well as its value.
+        common_step = self._extract_common_per_param_step(inner_state_dict)
+        step = None
+        if common_step is not None:
+            step = common_step.item() if torch.is_tensor(common_step) else common_step
         elif isinstance(self.optimizer, HybridDeviceOptimizer):
             step = None
             for optimizer in self.optimizer.sub_optimizers:
@@ -995,16 +996,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Optimizer state (do not store parameter state here).
         state_dict['optimizer'] = {k: v for k, v in inner_state_dict.items() if k != "state"}
+        if common_step is not None:
+            state_dict['optimizer']['common_step'] = common_step
         for param_group in state_dict["optimizer"]["param_groups"]:
             del param_group["params"]
-            if not HAVE_APEX_OR_TE:
-                # Native PyTorch param group requires step (i.e., iteration).
-                param_group["step"] = step
-            elif (
-                USING_TE_OPTIMIZER
-                or USING_APEX_OPTIMIZER
-                or isinstance(self.optimizer, HybridDeviceOptimizer)
-            ) and step is not None:
+            if step is not None:
                 # TE FusedAdam will not accumulate step for empty param groups, so we need to
                 # align the step across param groups.
                 param_group["step"] = int(step)
@@ -1152,8 +1148,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Retrieve existing optimizer state.
             state_dict_state = inner_state_dict["state"]
 
-        # Extract 'step', for non-Apex/TE support.
-        if not HAVE_APEX_OR_TE:
+        if "common_step" in state_dict["optimizer"]:
+            self._restore_common_per_param_step(
+                {"state": state_dict_state}, state_dict["optimizer"]["common_step"]
+            )
+        # Compatibility with checkpoints written before common_step was stored.
+        elif not HAVE_APEX_OR_TE:
             steps = list(set([g["step"] for g in state_dict["optimizer"]["param_groups"]]))
             assert len(steps) == 1
             step = torch.tensor(steps[0], dtype=torch.float)

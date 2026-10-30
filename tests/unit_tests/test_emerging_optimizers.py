@@ -1,7 +1,12 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import builtins
+import copy
+import importlib.util
 import inspect
 import os
+import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -17,6 +22,8 @@ from megatron.core.optimizer import get_megatron_optimizer
 from megatron.core.optimizer.emerging_optimizers import (
     _PROFILES,
     HAVE_EMERGING_OPTIMIZERS,
+    SOAP,
+    Lion,
     TensorParallelAdaptiveMuon,
     TensorParallelMuon,
     _get_qkv_split_shapes,
@@ -30,13 +37,8 @@ from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 if HAVE_EMERGING_OPTIMIZERS:
-    from emerging_optimizers.scalar_optimizers import Lion
-    from emerging_optimizers.soap import SOAP
-
     from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
 else:
-    SOAP = None
-    Lion = None
     LayerShardedMuon = None
 
 # Skip all tests in this file for LTS versions or when emerging_optimizers is missing
@@ -49,6 +51,84 @@ pytestmark = [
         not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers package is not installed"
     ),
 ]
+
+
+@pytest.mark.parametrize("soap_module", ["legacy_soap", "soap", "missing", "broken"])
+def test_soap_import_is_independent_of_muon(monkeypatch, soap_module):
+    """Both SOAP layouts and an unusable SOAP must leave the Muon adapter available."""
+    original_import = builtins.__import__
+    soap_cls = type("SOAP", (), {})
+    attempted = []
+
+    def import_with_soap_layout(name, *args, **kwargs):
+        if name in ("emerging_optimizers.legacy_soap", "emerging_optimizers.soap"):
+            attempted.append(name)
+            if soap_module == "broken":
+                raise ImportError("SOAP dependency is unavailable")
+            if name == f"emerging_optimizers.{soap_module}":
+                return SimpleNamespace(SOAP=soap_cls)
+            raise ModuleNotFoundError(f"No module named '{name}'", name=name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_with_soap_layout)
+    name = f"{eo_mod.__package__}._test_emerging_optimizers"
+    spec = importlib.util.spec_from_file_location(name, eo_mod.__file__)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+
+    assert module.HAVE_EMERGING_OPTIMIZERS
+    assert module.Lion is Lion
+    assert module.SOAP is (soap_cls if soap_module in ("legacy_soap", "soap") else None)
+    assert attempted == ["emerging_optimizers.legacy_soap"] + (
+        ["emerging_optimizers.soap"] if soap_module in ("soap", "missing") else []
+    )
+    param = nn.Parameter(torch.randn(4, 6, device="cpu"))
+    optimizer = module.TensorParallelMuon([param], fp32_matmul_prec="highest")
+    param.grad = torch.ones_like(param)
+    optimizer.step()
+    assert "momentum_buffer" in optimizer.state[param]
+
+
+@pytest.mark.parametrize("name", ["soap", "signum", "scion", "polargrad", "laprop"])
+def test_default_emerging_optimizer_kwargs_match_signature(name):
+    if name not in eo_mod._EMERGING_OPTIMIZERS:
+        pytest.skip(f"{name} is unavailable in this emerging_optimizers release")
+    config = OptimizerConfig(optimizer=name, lr=0.01, adam_beta1=0.85, adam_beta2=0.97)
+    kwargs = eo_mod._default_adam_based_eopt_config_to_kwargs(name, config, [], None)
+    optimizer_cls = eo_mod._EMERGING_OPTIMIZERS[name].optimizer_cls
+    signature = inspect.signature(optimizer_cls.__init__)
+    signature.bind(None, [nn.Parameter(torch.randn(4, 6, device="cpu"))], **kwargs)
+    if "betas" in signature.parameters:
+        assert kwargs["betas"] == (0.85, 0.97)
+    else:
+        assert "betas" not in kwargs
+
+
+@pytest.mark.parametrize("name", ["muon", "adaptive_muon", "soap"])
+def test_emerging_optimizer_init_and_resume(name):
+    """Checkpoint initialization must allocate complete state before any gradients exist."""
+    if name == "soap" and SOAP is None:
+        pytest.skip("SOAP is unavailable")
+    config = OptimizerConfig(optimizer=name, lr=0.01, muon_split_qkv=False)
+    param = nn.Parameter(torch.randn(4, 6, device="cpu"))
+    optimizer, init_state_fn = eo_mod._create_emerging_optimizer(
+        config, [param], name, [_DispatchChunk()], None
+    )
+    init_state_fn(optimizer)
+    assert optimizer.state[param]
+    param.grad = torch.randn_like(param)
+    optimizer.step()
+
+    restored_param = nn.Parameter(param.detach().clone())
+    restored, _ = eo_mod._create_emerging_optimizer(
+        config, [restored_param], name, [_DispatchChunk()], None
+    )
+    restored.load_state_dict(copy.deepcopy(optimizer.state_dict()))
+    restored_param.grad = param.grad.clone()
+    optimizer.step()
+    restored.step()
+    torch.testing.assert_close(restored_param, param, atol=0, rtol=0)
 
 
 class Net(nn.Module):
@@ -1750,9 +1830,7 @@ class TestAdaptiveMuonOptimizerMultiRankTP:
 # SOAP optimizer tests
 # ===========================================================================
 
-skip_no_soap = pytest.mark.skipif(
-    not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers package not installed"
-)
+skip_no_soap = pytest.mark.skipif(SOAP is None, reason="SOAP is unavailable in emerging_optimizers")
 
 
 @skip_no_soap
@@ -1891,6 +1969,7 @@ def test_soap_optimizer_shampoo_beta(shampoo_beta):
 @pytest.mark.skipif(
     int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
 )
+@skip_no_soap
 class TestSoapOptimizerMultiRank:
     """Test class for SOAP optimizer with multi-rank setup."""
 

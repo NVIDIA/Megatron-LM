@@ -27,6 +27,8 @@ from megatron.core.utils import (
 
 from .optimizer_config import ParamKey, ParamPredicate
 
+logger = logging.getLogger(__name__)
+
 try:
     from emerging_optimizers import registry
     from emerging_optimizers.orthogonalized_optimizers import (
@@ -38,16 +40,27 @@ try:
 
     # It is necessary to import optimizers for the registry to work.
     from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
-    from emerging_optimizers.soap import SOAP  # pylint: disable=unused-import
 
     HAVE_EMERGING_OPTIMIZERS = True
 except ImportError:
     HAVE_EMERGING_OPTIMIZERS = False
     OrthogonalizedOptimizer = object
     AdaptiveMuon = object
+    Lion = None
 
-
-logger = logging.getLogger(__name__)
+SOAP = None
+if HAVE_EMERGING_OPTIMIZERS:
+    # SOAP moved in 0.5. Keep support for the pinned 0.3 release, and do not
+    # disable Muon or Lion when this optional optimizer cannot be imported.
+    try:
+        try:
+            from emerging_optimizers.legacy_soap import SOAP as SOAP
+        except ModuleNotFoundError as exc:
+            if exc.name != "emerging_optimizers.legacy_soap":
+                raise
+            from emerging_optimizers.soap import SOAP as SOAP
+    except ImportError as exc:
+        logger.warning("SOAP is unavailable in emerging_optimizers: %s", exc)
 
 # newton_schulz_tp() gained the use_syrk kwarg in emerging_optimizers 0.4.0. Earlier releases
 # expose use_syrk on the non-TP newton_schulz() only, so 0.3.x still rejects it here. Spelled
@@ -813,8 +826,10 @@ def _default_adam_based_eopt_config_to_kwargs(
     eopt_name, config, model_chunks, pg_collection
 ) -> Dict[str, Any]:
     """Convert OptimizerConfig to default emerging optimizer constructor kwargs."""
-    kwargs = _kwargs_from_config(registry.get_optimizer_cls(eopt_name), eopt_name, config)
-    kwargs["betas"] = (config.adam_beta1, config.adam_beta2)
+    optimizer_cls = registry.get_optimizer_cls(eopt_name)
+    kwargs = _kwargs_from_config(optimizer_cls, eopt_name, config)
+    if "betas" in inspect.signature(optimizer_cls.__init__).parameters:
+        kwargs["betas"] = (config.adam_beta1, config.adam_beta2)
     return kwargs
 
 

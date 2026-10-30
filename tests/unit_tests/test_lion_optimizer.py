@@ -6,6 +6,7 @@ Tests that require emerging_optimizers are skipped when the package is not insta
 Tests that verify Megatron-only behavior (config, error handling) always run.
 """
 
+import copy
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -20,6 +21,7 @@ from megatron.core.optimizer import (
     _get_param_groups,
 )
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.emerging_optimizers import _eopt_init_state_fn
 from megatron.core.optimizer.optimizer import FP32Optimizer
 
 requires_emerging_optimizers = pytest.mark.skipif(
@@ -142,8 +144,10 @@ class TestLionOptimizerExactness:
             assert group["lr"] == 3e-4
             assert group["weight_decay"] == 0.01
 
-    def test_lion_init_state_fn_creates_exp_avg(self):
-        """init_state_fn should pre-initialize exp_avg state for all params."""
+    def test_lion_init_state_fn_creates_complete_state(self):
+        """Use the installed Lion's complete state, including step in EO >= 0.5."""
+        from emerging_optimizers.scalar_optimizers import Lion
+
         model = SimpleModel()
         config = OptimizerConfig(optimizer="lion", lr=1e-4)
 
@@ -156,21 +160,30 @@ class TestLionOptimizerExactness:
 
         # Call init_state_fn (stored on the FP32Optimizer wrapper).
         optimizer.init_state_fn(inner_opt)
+        reference = Lion(model.parameters(), lr=config.lr)
+        for group in reference.param_groups:
+            reference._init_group(group, skip_non_grad_params=False)
 
         # State should now have exp_avg for each param, exactly zero.
         for p in model.parameters():
+            assert inner_opt.state[p].keys() == reference.state[p].keys()
             assert "exp_avg" in inner_opt.state[p]
             assert inner_opt.state[p]["exp_avg"].shape == p.shape
             assert inner_opt.state[p]["exp_avg"].dtype == p.dtype
             torch.testing.assert_close(
                 inner_opt.state[p]["exp_avg"], torch.zeros_like(p.data), atol=0, rtol=0
             )
+            if "step" in reference.state[p]:
+                assert inner_opt.state[p]["step"] == reference.state[p]["step"] == 0
 
     @pytest.mark.parametrize(
         "lr,beta1,beta2,weight_decay",
         [(1e-3, 0.95, 0.98, 0.0), (3e-4, 0.9, 0.99, 0.01), (1e-4, 0.85, 0.95, 0.1)],
     )
-    def test_megatron_lion_exact_match_with_standalone(self, lr, beta1, beta2, weight_decay):
+    @pytest.mark.parametrize("initialize_state", [False, True])
+    def test_megatron_lion_exact_match_with_standalone(
+        self, lr, beta1, beta2, weight_decay, initialize_state
+    ):
         """Megatron-plumbed Lion must produce bit-for-bit identical results to standalone Lion.
 
         This is the core correctness test: we run the same forward-backward-step on two
@@ -203,6 +216,8 @@ class TestLionOptimizerExactness:
         )
         megatron_optimizer = _create_lion_optimizer(model_megatron, config)
         opt_megatron = megatron_optimizer.optimizer
+        if initialize_state:
+            megatron_optimizer.init_state_fn(opt_megatron)
 
         # Run multiple steps to accumulate momentum differences if any.
         for step in range(3):
@@ -254,6 +269,80 @@ class TestLionOptimizerExactness:
                         rtol=0,
                         msg=f"Step {step}, state '{key}': optimizer states differ",
                     )
+
+
+@requires_emerging_optimizers
+@pytest.mark.parametrize("optimizer_name", ["lion", "adam"])
+@pytest.mark.parametrize("have_te", [False, True])
+@pytest.mark.parametrize("steps", [0, 2])
+@pytest.mark.parametrize("preallocate", [False, True])
+def test_distributed_optimizer_preserves_per_param_step(
+    monkeypatch, optimizer_name, have_te, steps, preallocate
+):
+    """The common checkpoint state preserves EO's integer and torch's tensor steps."""
+    from emerging_optimizers.scalar_optimizers import Lion
+
+    from megatron.core.optimizer import distrib_optimizer as distopt_module
+
+    monkeypatch.setattr(distopt_module, "HAVE_APEX_OR_TE", have_te)
+    monkeypatch.setattr(distopt_module, "USING_TE_OPTIMIZER", have_te)
+    monkeypatch.setattr(distopt_module, "USING_APEX_OPTIMIZER", False)
+    # Exercise the cold-load allocation branch using CPU shards.
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+    optimizer_cls = Lion if optimizer_name == "lion" else torch.optim.AdamW
+    params = [nn.Parameter(torch.randn(8, device="cpu")) for _ in range(2)]
+    optimizer = optimizer_cls(params, lr=0.01)
+    if optimizer_name == "lion":
+        _eopt_init_state_fn(optimizer)
+        if "step" not in optimizer.state[params[0]]:
+            pytest.skip("This Lion release has no per-parameter step")
+    else:
+        # Initialize torch AdamW's tensor state without retaining an update.
+        for param in params:
+            param.grad = torch.zeros_like(param)
+        optimizer.step()
+        for state in optimizer.state.values():
+            state["step"].zero_()
+    for _ in range(steps):
+        for param in params:
+            param.grad = torch.ones_like(param)
+        optimizer.step()
+
+    def wrap(inner, inner_params):
+        wrapper = object.__new__(DistributedOptimizer)
+        wrapper.optimizer = inner
+        wrapper.config = OptimizerConfig(optimizer=optimizer_name, lr=0.01)
+        wrapper.ddp_config = SimpleNamespace(use_megatron_fsdp=False)
+        wrapper.grad_scaler = None
+        wrapper.gbuf_ranges = [
+            {"buffer": [{"param_map": {p: {"gbuf_world": range(p.numel())} for p in inner_params}}]}
+        ]
+        wrapper.model_param_group_index_map = {p: (0, i) for i, p in enumerate(inner_params)}
+        return wrapper
+
+    checkpoint = copy.deepcopy(wrap(optimizer, params).state_dict())
+    assert checkpoint["optimizer"]["common_step"] == steps
+    restored_params = [nn.Parameter(p.detach().clone()) for p in params]
+    restored = optimizer_cls(restored_params, lr=0.01)
+    if preallocate:
+        for source, target in zip(params, restored_params):
+            restored.state[target] = copy.deepcopy(optimizer.state[source])
+            restored.state[target]["step"] = 0 if optimizer_name == "lion" else torch.tensor(0.0)
+    wrap(restored, restored_params).load_state_dict(checkpoint)
+    for source, target in zip(params, restored_params):
+        source_state, target_state = optimizer.state[source], restored.state[target]
+        assert type(target_state["step"]) is type(source_state["step"])
+        assert target_state["step"] == steps
+        # Parameter-dependent state is restored separately from the common state.
+        for key in source_state.keys() - {"step"}:
+            target_state[key].copy_(source_state[key])
+        source.grad = torch.ones_like(source)
+        target.grad = source.grad.clone()
+    optimizer.step()
+    restored.step()
+    for source, target in zip(params, restored_params):
+        torch.testing.assert_close(target, source, atol=0, rtol=0)
+        assert restored.state[target]["step"] == steps + 1
 
 
 class TestDistributedOptimizerStateKeys:
