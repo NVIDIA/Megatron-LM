@@ -803,7 +803,6 @@ class TestGPTModelBuilderBuildDistributedModels:
     @patch("megatron.training.models.gpt.compose_hooks")
     @patch("megatron.training.models.gpt.unimodal_build_distributed_models")
     def test_default_parameters_forwarded(self, mock_unimodal, mock_compose):
-        from megatron.core.enums import ModelType
         from megatron.core.transformer.module import Float16Module
 
         mock_unimodal.return_value = [Mock()]
@@ -819,7 +818,6 @@ class TestGPTModelBuilderBuildDistributedModels:
         assert args[7] is True  # wrap_with_ddp
         assert args[8] is True  # data_parallel_random_init
         assert args[9] is Float16Module  # mixed_precision_wrapper
-        assert args[11] is ModelType.encoder_or_decoder  # model_type
 
 
 # =============================================================================

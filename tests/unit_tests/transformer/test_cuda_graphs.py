@@ -11,7 +11,6 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 import megatron.core.transformer.cuda_graphs as cuda_graphs_module
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
@@ -1683,9 +1682,7 @@ class TestPartialCudaGraph:
         if padding_mask is not None:
             loss_mask = loss_mask * (~padding_mask).to(loss_mask.dtype)
 
-        gpt_model, optimizer, _ = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder, self.model_provider
-        )
+        gpt_model, optimizer, _ = setup_model_and_optimizer(self.model_provider)
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
         if mlp_chunks_for_training > 1:
             # Not a training argument; the layers read it from the shared TransformerConfig.

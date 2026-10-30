@@ -13,7 +13,6 @@ from examples.mimo.training.grad_sync import configure_grad_sync
 from examples.mimo.training.runtime import configure_module_rng, wrap_active_modules_with_ddp
 from examples.mimo.training.topology import HeteroTopology
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.enums import ModelType
 from megatron.core.models.mimo.config.base_configs import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
@@ -122,7 +121,6 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         mixed_precision_wrapper: (
             Callable[[Any, MegatronModule], MegatronModule] | None
         ) = Float16Module,
-        model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
     ) -> list[MimoModel]:
@@ -151,7 +149,6 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         else:
             mimo_model = self.build_model(pg_collection)
 
-        mimo_model.model_type = model_type
         model_list = compose_hooks(self._model_config.pre_wrap_hooks)([mimo_model])
         if len(model_list) != 1:
             raise ValueError(

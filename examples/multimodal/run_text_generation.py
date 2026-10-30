@@ -20,7 +20,6 @@ from model import model_provider
 from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import parallel_state
-from megatron.core.enums import ModelType
 from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.inference.text_generation.api import generate_and_post_process
@@ -864,7 +863,7 @@ def eval_tasks():
                               parallel_output=False)
 
     # Set up model and load checkpoint.
-    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=False)
+    model = get_model(wrapped_model_provider, wrap_with_ddp=False)
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None)

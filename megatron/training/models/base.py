@@ -7,7 +7,6 @@ from dataclasses import fields as dataclass_fields
 from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar, runtime_checkable
 
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
@@ -220,7 +219,6 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
         wrap_with_ddp: bool = True,
         data_parallel_random_init: bool = False,
         mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
-        model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
     ) -> list[ModelT]:
@@ -235,7 +233,6 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
             wrap_with_ddp: Set to False to skip DDP wrapper
             data_parallel_random_init: Whether to use data parallel random initialization
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
-            model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
             use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
                 controls whether to compute and supply a shard-aligned param layout to DDP.

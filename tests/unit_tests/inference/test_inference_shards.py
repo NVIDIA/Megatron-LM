@@ -9,7 +9,6 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from megatron.core.enums import ModelType
 from megatron.core.inference import shards as shards_module
 from megatron.core.inference.disaggregation.coordinator_setup import validate_disaggregation_shards
 from megatron.core.inference.shards_spec import (
@@ -70,7 +69,6 @@ def test_serving_and_rl_build_shard_models_with_global_parallel_args(monkeypatch
         )
         rl = disagg.build_disagg_inference_model(
             args,
-            ModelType.encoder_or_decoder,
             training_config.transformer,
             cfg_container=SimpleNamespace(model=training_config, rl=RLConfig()),
             model_alloc_ctx=nullcontext(),
@@ -116,7 +114,7 @@ def test_disagg_rl_rejects_ignored_overrides(field):
     setattr(config, field, value)
     with pytest.raises(ValueError, match=field.replace("_", "-")):
         build_disagg_inference_model(
-            None, None, None, cfg_container=SimpleNamespace(rl=config), model_alloc_ctx=None
+            None, None, cfg_container=SimpleNamespace(rl=config), model_alloc_ctx=None
         )
 
 

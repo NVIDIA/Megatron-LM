@@ -7,7 +7,6 @@ from typing import Any, Callable, ClassVar, Literal, override
 import torch
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-from megatron.core.enums import ModelType
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
 )
@@ -352,7 +351,6 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         wrap_with_ddp: bool = True,
         data_parallel_random_init: bool = True,
         mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
-        model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
     ) -> list[GPTModel]:
@@ -368,7 +366,6 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             wrap_with_ddp: Set to False to skip the DDP/FSDP wrapper.
             data_parallel_random_init: Whether to use data parallel random initialization
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
-            model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
             use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
                 controls whether to compute and supply a shard-aligned param layout to DDP.
@@ -390,7 +387,6 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             data_parallel_random_init,
             mixed_precision_wrapper,
             composed_pre_wrap_hook,
-            model_type,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
             use_layer_wise_param_layout=use_layer_wise_param_layout,
         )

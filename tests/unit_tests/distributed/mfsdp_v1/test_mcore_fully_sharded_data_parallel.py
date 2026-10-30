@@ -1070,7 +1070,6 @@ class TestMegatronFSDPE2E:
         from torch.optim.optimizer import register_optimizer_step_pre_hook
 
         import pretrain_gpt as _pretrain_gpt
-        from megatron.core.enums import ModelType
         from megatron.core.rerun_state_machine import destroy_rerun_state_machine
         from megatron.core.transformer.enums import CudaGraphScope
         from megatron.training import pretrain
@@ -1191,7 +1190,6 @@ class TestMegatronFSDPE2E:
             pretrain(
                 cfg,
                 _pretrain_gpt.train_valid_test_datasets_provider,
-                ModelType.encoder_or_decoder,
                 wrapped_forward_step,
                 get_embedding_ranks=_pretrain_gpt.get_embedding_ranks,
             )

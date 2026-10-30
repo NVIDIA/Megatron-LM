@@ -6,7 +6,6 @@ import sys
 import pytest
 import torch
 
-from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_mtp_block_spec,
@@ -266,9 +265,7 @@ class TestPartialCudaGraphedA2AOverlap:
             self.seq_length, self.micro_batch_size
         )
 
-        gpt_model, optimizer, _ = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder, self.model_provider
-        )
+        gpt_model, optimizer, _ = setup_model_and_optimizer(self.model_provider)
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 
         loss_list = []

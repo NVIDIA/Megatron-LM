@@ -543,5 +543,5 @@ def test_model_setup_uses_owned_ddp_config(
     run_config.finalize()
     with pytest.raises(ReachedConstruction):
         training.setup_model_and_optimizer(
-            Mock(), model_provider_func=None if native_builder else Mock(), cfg_container=run_config
+            model_provider_func=None if native_builder else Mock(), cfg_container=run_config
         )

@@ -124,7 +124,7 @@ def test_resume_updates_microbatches_before_setup_validation(
     monkeypatch.setattr(training, "update_num_microbatches", update)
     monkeypatch.setattr(training, "get_num_microbatches", validate)
     with pytest.raises(ReachedBatchValidation):
-        training.setup_model_and_optimizer(Mock(), model_provider_func=Mock())
+        training.setup_model_and_optimizer(model_provider_func=Mock())
 
 
 @pytest.mark.parametrize("build_tokenizer", [False, True])
