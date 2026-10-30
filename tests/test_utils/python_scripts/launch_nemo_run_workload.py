@@ -153,6 +153,13 @@ def _collect_failure_logs(workdir: pathlib.Path) -> list[str]:
     help="Selective unit-test mode.",
 )
 @click.option(
+    "--unit-testmon-selection-gpus",
+    type=click.Choice(["1", "recipe"]),
+    default="1",
+    show_default=True,
+    help="Selection-only worker count; 'recipe' retains the recipe topology.",
+)
+@click.option(
     "--enable-lightweight-mode",
     is_flag=True,
     show_default=True,
@@ -183,6 +190,7 @@ def main(
     hf_home: Optional[str] = None,
     tag: Optional[str] = None,
     unit_testmon_mode: str = "full",
+    unit_testmon_selection_gpus: str = "1",
     enable_lightweight_mode: Optional[bool] = False,
     cadence: Optional[str] = None,
 ):
@@ -232,6 +240,7 @@ def main(
         env_vars={
             "PYTHONUNBUFFERED": "1",
             "UNIT_TESTMON_MODE": unit_testmon_mode,
+            "UNIT_TESTMON_SELECTION_GPUS": unit_testmon_selection_gpus,
             "FORCE_COLOR": "1",
             "TERM": "xterm-256color",
             "OUTPUT_PATH": os.getcwd(),

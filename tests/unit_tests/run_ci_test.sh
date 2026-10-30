@@ -149,6 +149,23 @@ MASTER_PORT=${MASTER_PORT:-29500}
 NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
+if [[ "$UNIT_TESTMON_MODE" == "select-only" ]]; then
+    case "${UNIT_TESTMON_SELECTION_GPUS:-1}" in
+    1)
+        # Keep all devices visible for hardware-dependent collection while
+        # starting only one real worker. Execution retains the recipe topology.
+        GPUS_PER_NODE=1
+        NUM_NODES=1
+        NODE_RANK=0
+        ;;
+    recipe)
+        ;;
+    *)
+        echo "UNIT_TESTMON_SELECTION_GPUS must be '1' or 'recipe'."
+        exit 1
+        ;;
+    esac
+fi
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
     --nnodes $NUM_NODES

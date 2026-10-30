@@ -42,7 +42,8 @@ jobs:
     # Only main has a supported Testmon baseline. Other targets run full buckets.
     if: inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_target_branch == 'main'
     runs-on: ${{ fromJSON(inputs.runner) }}
-    timeout-minutes: 90
+    # Validation collects both worker configurations; fast-only selection keeps the usual limit.
+    timeout-minutes: ${{ vars.UNIT_TESTMON_COMPARE_SELECTIONS == 'false' && 90 || 180 }}
     permissions:
       contents: read
     outputs:
@@ -121,6 +122,9 @@ jobs:
           SOURCE_SHA: ${{ inputs.sha }}
           TARGET_BRANCH: ${{ inputs.unit_testmon_target_branch }}
           PR_FILES_DIR: ${{ steps.pr-files-directory.outputs.path }}
+          # Keep comparison enabled until rank-dependent collection has been reviewed.
+          UNIT_TESTMON_COMPARE_SELECTIONS: ${{ vars.UNIT_TESTMON_COMPARE_SELECTIONS || 'true' }}
+          UNIT_TESTMON_MULTI_RANK_BUCKETS: ${{ vars.UNIT_TESTMON_MULTI_RANK_BUCKETS || '{}' }}
           PATH: ${{ steps.cache-compression.outputs.path }}
         with:
           script: |

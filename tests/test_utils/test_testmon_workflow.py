@@ -778,6 +778,9 @@ def test_unit_tests_share_gpu_selection_before_the_existing_bucket_runners(
     assert "strategy" not in selection
     planning = _step("_unit-tests.yml", "select", "plan")
     assert planning["env"]["CONTAINER_IMAGE"] == "${{ inputs.container-image }}"
+    assert planning["env"]["UNIT_TESTMON_COMPARE_SELECTIONS"] == (
+        "${{ vars.UNIT_TESTMON_COMPARE_SELECTIONS || 'true' }}"
+    )
     assert "'uv', ['run', '--no-sync', 'python'" in planning["with"]["script"]
     job = workflow["jobs"]["run"]
     assert job["needs"] == "select"
@@ -819,6 +822,16 @@ def test_unit_tests_share_gpu_selection_before_the_existing_bucket_runners(
     assert json.loads(parsed[output]) == [
         {"bucket": case} for product in recipe["products"] for case in product["test_case"]
     ]
+
+
+@pytest.mark.parametrize("setting,expected", [("", 180), ("true", 180), ("false", 90)])
+def test_gpu_selection_timeout_allows_both_worker_configurations(setting, expected):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
+    expression = workflow["jobs"]["select"]["timeout-minutes"]
+    expression = expression.removeprefix("${{").removesuffix("}}")
+    expression = expression.replace("&&", "and").replace("||", "or")
+    variables = SimpleNamespace(UNIT_TESTMON_COMPARE_SELECTIONS=setting)
+    assert eval(expression, {"__builtins__": {}}, {"vars": variables}) == expected
 
 
 @pytest.mark.parametrize("mode", ["enforce", "full"])
@@ -1040,7 +1053,8 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
 
     launches = []
 
-    def launch(bucket):
+    def launch(bucket, selection_gpus="1"):
+        shutil.rmtree(Path("assets_dir/testmon/.testmon-work"), ignore_errors=True)
         launches.append(bucket)
         if scenario == "selector-error" and "/selected/" in bucket:
             raise subprocess.CalledProcessError(1, ["native-gpu-collection"])
@@ -1177,8 +1191,99 @@ def test_grouped_selector_launches_native_selection_without_execution(
         "tests/test_utils/python_scripts/launch_nemo_run_workload.py",
     ]
     assert command[command.index("--unit-testmon-mode") + 1] == "select-only"
+    assert command[command.index("--unit-testmon-selection-gpus") + 1] == "1"
     assert command[command.index("--test-case") + 1] == bucket
     assert command[command.index("--container-image") + 1] == "existing-ci-image"
     assert command[command.index("--platform") + 1] == platform
     assert options["check"] is True
     assert options["env"]["PYTHONPATH"] == str(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "single",
+        "match",
+        "different",
+        "mandatory-different",
+        "single-fails",
+        "reference-fails",
+        "exception",
+        "default-validation",
+        "invalid-config",
+    ],
+)
+def test_single_worker_selection_is_compared_and_can_retain_recipe_ranks(
+    tmp_path, monkeypatch, scenario
+):
+    spec = importlib.util.spec_from_file_location(
+        "select_unit_tests", ROOT / ".github/scripts/select_unit_tests.py"
+    )
+    selector = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(selector)
+    bucket = "tests/unit_tests/example/**/*.py"
+    monkeypatch.setenv("RECIPE_PLATFORM", "dgx_h100")
+    if scenario == "default-validation":
+        monkeypatch.delenv("UNIT_TESTMON_COMPARE_SELECTIONS", raising=False)
+    elif scenario == "invalid-config":
+        monkeypatch.setenv("UNIT_TESTMON_COMPARE_SELECTIONS", "ture")
+    else:
+        monkeypatch.setenv(
+            "UNIT_TESTMON_COMPARE_SELECTIONS",
+            "false" if scenario in {"single", "single-fails", "exception"} else "true",
+        )
+    monkeypatch.setenv(
+        "UNIT_TESTMON_MULTI_RANK_BUCKETS",
+        json.dumps({"dgx_h100": [bucket]} if scenario == "exception" else {}),
+    )
+    calls = []
+
+    def collect(name, directory, workers):
+        assert name == bucket and directory == tmp_path
+        calls.append(workers)
+        if (scenario == "single-fails" and workers == "1") or (
+            scenario == "reference-fails" and workers == "recipe"
+        ):
+            raise subprocess.CalledProcessError(1, ["native-collection"])
+        selected = ["tests/unit_tests/example/test_case.py::test_common"]
+        mandatory = []
+        if scenario == "different" and workers == "recipe":
+            selected.append("tests/unit_tests/example/test_case.py::test_other_rank")
+        if scenario == "mandatory-different" and workers == "recipe":
+            mandatory.append("tests/unit_tests/example/test_required.py")
+        return {
+            "mode": "selected",
+            "selection_gpus": workers,
+            "phases": {"prod": selected, "experimental": []},
+            "mandatory_files": mandatory,
+        }
+
+    monkeypatch.setattr(selector, "_collect_gpu_selection", collect)
+    if scenario == "invalid-config":
+        with pytest.raises(ValueError, match="UNIT_TESTMON_COMPARE_SELECTIONS"):
+            selector._collect_for_bucket(bucket, tmp_path)
+        assert calls == []
+        return
+    if scenario == "reference-fails":
+        with pytest.raises(subprocess.CalledProcessError):
+            selector._collect_for_bucket(bucket, tmp_path)
+        return
+    plan = selector._collect_for_bucket(bucket, tmp_path)
+    if scenario in {"different", "mandatory-different", "single-fails", "exception"}:
+        assert plan["selection_gpus"] == "recipe"
+    else:
+        assert plan["selection_gpus"] == "1"
+    assert calls == (
+        ["recipe"]
+        if scenario == "exception"
+        else ["1"] if scenario == "single" else ["1", "recipe"]
+    )
+    if scenario in {"match", "different", "mandatory-different", "default-validation"}:
+        assert plan["rank_comparison"]["equivalent"] == (
+            scenario in {"match", "default-validation"}
+        )
+    if scenario == "different":
+        assert plan["rank_comparison"]["differences"]["prod"]["recipe_only"] == [
+            "tests/unit_tests/example/test_case.py::test_other_rank"
+        ]
+        assert "tests/unit_tests/example/test_case.py::test_other_rank" in plan["phases"]["prod"]

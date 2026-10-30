@@ -36,7 +36,9 @@ def _function(source: str, name: str) -> str:
     return source.split(f"{name}() {{", 1)[1].split("\n}\n", 1)[0]
 
 
-def _invoke(project, cache, mode, phase="prod", rank=0, pytest_args=(), target="tests"):
+def _invoke(
+    project, cache, mode, phase="prod", rank=0, pytest_args=(), target="tests", world_size=4
+):
     return subprocess.run(
         [
             sys.executable,
@@ -58,7 +60,7 @@ def _invoke(project, cache, mode, phase="prod", rank=0, pytest_args=(), target="
         env={
             **os.environ,
             "RANK": str(rank),
-            "WORLD_SIZE": "4",
+            "WORLD_SIZE": str(world_size),
             "PYTHONPATH": str(project),
             "PYTHONDONTWRITEBYTECODE": "1",
         },
@@ -235,6 +237,35 @@ def test_new_case_in_existing_file_is_discovered_from_old_baseline(project, cach
     assert _snapshot(cache / "prod") == before
 
 
+def test_single_worker_selection_can_differ_from_recipe_rank_union(project, cache):
+    before = _snapshot(cache / "prod")
+    (project / "tests/test_ranked.py").write_text(
+        "import os\nimport pytest\n\n"
+        "rank = int(os.environ['RANK'])\n"
+        "world_size = int(os.environ['WORLD_SIZE'])\n\n"
+        "@pytest.mark.parametrize('value', range(rank + 1),\n"
+        "    ids=lambda value: f'world-{world_size}-rank-{rank}-value-{value}')\n"
+        "def test_ranked(value):\n"
+        "    raise AssertionError('selection must not execute tests')\n"
+    )
+    result = _invoke(project, cache, "select", world_size=1)
+    assert result.returncode == 0, result.stdout + result.stderr
+    phase = cache / ".testmon-work/prod"
+    single = set((phase / "rank-0/selected-tests").read_text().splitlines())
+    recipe = set()
+    for rank in range(2):
+        result = _invoke(project, cache, "select", rank=rank, world_size=2)
+        assert result.returncode == 0, result.stdout + result.stderr
+        recipe.update((phase / f"rank-{rank}/selected-tests").read_text().splitlines())
+    assert single == {"tests/test_ranked.py::test_ranked[world-1-rank-0-value-0]"}
+    assert recipe == {
+        "tests/test_ranked.py::test_ranked[world-2-rank-0-value-0]",
+        "tests/test_ranked.py::test_ranked[world-2-rank-1-value-0]",
+        "tests/test_ranked.py::test_ranked[world-2-rank-1-value-1]",
+    }
+    assert _snapshot(cache / "prod") == before
+
+
 def test_changed_function_selects_and_runs_only_affected_cases_in_same_file(project, tmp_path):
     parameter_ids = ["space value", 'quote " and $value']
     (project / "tests/test_app.py").write_text(
@@ -394,6 +425,65 @@ def test_empty_phase_does_not_launch_pytest(tmp_path):
     assert "UNEXPECTED_EXECUTION" not in result.stdout
 
 
+@pytest.mark.parametrize("recipe_gpus", [2, 4, 8])
+@pytest.mark.parametrize("selection_gpus", [None, "1", "recipe"])
+@pytest.mark.parametrize("mode", ["select-only", "full", "enforce", "preselected", "baseline"])
+def test_single_worker_override_only_applies_to_selection(mode, selection_gpus, recipe_gpus):
+    runner = _source("tests/unit_tests/run_ci_test.sh")
+    start = runner.index("MASTER_ADDR=${MASTER_ADDR:-localhost}")
+    end = runner.index("export ONE_LOGGER_JOB_CATEGORY=test", start)
+    environment = {
+        **os.environ,
+        "UNIT_TESTMON_MODE": mode,
+        "GPUS_PER_NODE": str(recipe_gpus),
+        "NUM_NODES": "2",
+        "SLURM_NODEID": "1",
+        "LOG_DIR": "/tmp/unit-test-logs",
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+    }
+    environment.pop("UNIT_TESTMON_SELECTION_GPUS", None)
+    if selection_gpus is not None:
+        environment["UNIT_TESTMON_SELECTION_GPUS"] = selection_gpus
+    result = subprocess.run(
+        ["bash", "-e", "-u", "-o", "pipefail"],
+        input=runner[start:end]
+        + '\nprintf "%s\\n" "${DISTRIBUTED_ARGS[@]}" "$CUDA_VISIBLE_DEVICES"\n',
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    arguments = result.stdout.splitlines()
+    single = mode == "select-only" and selection_gpus != "recipe"
+    assert arguments[arguments.index("--nproc_per_node") + 1] == (
+        "1" if single else str(recipe_gpus)
+    )
+    assert arguments[arguments.index("--nnodes") + 1] == ("1" if single else "2")
+    assert arguments[arguments.index("--node_rank") + 1] == ("0" if single else "1")
+    assert arguments[-1] == environment["CUDA_VISIBLE_DEVICES"]
+
+
+@pytest.mark.parametrize("selection_gpus", ["0", "2", "all"])
+def test_selection_worker_override_rejects_unsupported_values(selection_gpus):
+    runner = _source("tests/unit_tests/run_ci_test.sh")
+    start = runner.index("MASTER_ADDR=${MASTER_ADDR:-localhost}")
+    end = runner.index("export ONE_LOGGER_JOB_CATEGORY=test", start)
+    result = subprocess.run(
+        ["bash", "-e", "-u", "-o", "pipefail"],
+        input=runner[start:end],
+        env={
+            **os.environ,
+            "UNIT_TESTMON_MODE": "select-only",
+            "UNIT_TESTMON_SELECTION_GPUS": selection_gpus,
+            "LOG_DIR": "/tmp/unit-test-logs",
+        },
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "must be '1' or 'recipe'" in result.stdout
+
+
 @pytest.mark.parametrize(
     "failed_step",
     [
@@ -551,6 +641,8 @@ def test_mode_is_passed_as_container_environment():
     gb200_recipe = _source("tests/test_utils/recipes/gb200/unit-tests.yaml")
 
     assert '"UNIT_TESTMON_MODE": unit_testmon_mode' in launcher
+    assert '"UNIT_TESTMON_SELECTION_GPUS": unit_testmon_selection_gpus' in launcher
+    assert 'click.Choice(["1", "recipe"])' in launcher
     assert '["full", "enforce", "preselected", "baseline", "select-only"]' in launcher
     assert "{unit_testmon_mode}" not in h100_recipe + gb200_recipe
 
