@@ -376,7 +376,8 @@ def test_mxfp8_quantize_replays():
 
 @pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
 def test_mxfp8_quantize_rows_replays():
-    """Live-row MXFP8 quantization replays and matches the whole-buffer kernel on live rows."""
+    """Live-row MXFP8 quantization replays and matches the whole-buffer kernel on live rows,
+    and on every row when the count exceeds the buffer height."""
     from megatron.core.inference.quantization.mxfp8_quantize import (
         mxfp8_quantize,
         mxfp8_quantize_rows,
@@ -397,6 +398,28 @@ def test_mxfp8_quantize_rows_replays():
     ref_data, ref_scale = mxfp8_quantize(x)
     assert torch.equal(data, ref_data[:n_rows].view(torch.uint8))
     assert torch.equal(scale, ref_scale.view(torch.uint8)[:n_scale_bytes])
+
+    # A count past the buffer height is clamped to it. x is the head of a buffer of ones and
+    # the count ends in its last 128-row scale tile, so a kernel that ran past the height
+    # would turn padding scales nonzero and fail the comparison without leaving its
+    # allocations: base holds the rows it would read, and the 2 * 128 bytes it would write
+    # past out_data fit the allocator's 512-byte rounding.
+    height, K, count = 16382, 128, 16384
+    base = torch.ones(count, K, device="cuda", dtype=torch.bfloat16)
+    base[:height] = torch.randn(height, K, device="cuda", dtype=torch.bfloat16)
+    count_t = _dev_scalar(count)
+
+    def fn_past_height(base):
+        data, scale = mxfp8_quantize_rows(base[:height], count_t)
+        return data.view(torch.uint8), scale.view(torch.uint8)
+
+    assert_replays_bit_exact(
+        fn_past_height, (base,), backward=False, what="mxfp8_quantize_rows (count past height)"
+    )
+    data, scale = fn_past_height(base)
+    ref_data, ref_scale = mxfp8_quantize(base[:height])
+    assert torch.equal(data, ref_data.view(torch.uint8))
+    assert torch.equal(scale, ref_scale.view(torch.uint8))
 
 
 @pytest.mark.skipif(

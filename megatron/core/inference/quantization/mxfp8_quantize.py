@@ -230,7 +230,8 @@ def _mxfp8_quant_swizzle_rows_kernel(
     out_ptr,
     scale_ptr,
     src_ptr,
-    n_rows_ptr,  # scalar int32/int64 CUDA tensor: rows [0, n_rows) are quantized
+    n_rows_ptr,  # scalar int32/int64 CUDA tensor: rows [0, min(n_rows, M)) are quantized
+    M,  # number of rows in src/out (the buffer height)
     K,
     n_col_blocks,
     REAL_GROUPS: tl.constexpr,
@@ -243,9 +244,10 @@ def _mxfp8_quant_swizzle_rows_kernel(
     The row count is read on device, so the launch is CUDA-graph safe while the work
     scales with the live rows instead of the worst-case buffer. Each row runs the same
     code as ``_mxfp8_quant_swizzle_kernel``, so the quantized rows are bitwise equal.
+    The count is clamped to ``M`` so that it can never index past the buffers.
     """
     pid = tl.program_id(0)
-    n_rows = tl.load(n_rows_ptr).to(tl.int64)
+    n_rows = tl.minimum(tl.load(n_rows_ptr).to(tl.int64), M)
     for row in tl.range(pid, n_rows, NUM_PROGRAMS):
         _mxfp8_quant_swizzle_row(
             row.to(tl.int64),
@@ -268,9 +270,11 @@ def mxfp8_quantize_rows(
     ``n_rows`` is a 1-element CUDA tensor (device-side count, CUDA-graph safe). Data rows
     at or beyond ``n_rows`` are left uninitialized and their scales are zero; callers
     must not read them (grouped GEMMs bounded by expert offsets ending at ``n_rows``).
-    Quantized rows are bitwise identical to ``mxfp8_quantize``.
+    Quantized rows are bitwise identical to ``mxfp8_quantize``. A count above ``M`` is
+    clamped to ``M`` on device, so the result is then exactly ``mxfp8_quantize(x)``.
     """
     assert x.is_cuda and x.dim() == 2
+    assert x.is_contiguous(), "x must be contiguous: the kernel addresses row r at r * K"
     assert x.dtype in (torch.bfloat16, torch.float16, torch.float32)
     assert n_rows.is_cuda and n_rows.numel() == 1
     M, K = x.shape
@@ -288,6 +292,7 @@ def mxfp8_quantize_rows(
         out_scale,
         x,
         n_rows,
+        M,
         K,
         n_col_blocks,
         REAL_GROUPS=scale_cols,
