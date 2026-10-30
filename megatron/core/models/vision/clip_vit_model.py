@@ -87,6 +87,8 @@ class CLIPViTModel(VisionModule):
         self.ln_pre = None
         self.ln_post = None
         self.pg_collection = pg_collection
+        if pg_collection is not None:
+            self.tp_group = pg_collection.tp
         self.vp_stage = vp_stage
         if model_subtype == "clip":
             self.ln_pre = build_module(
