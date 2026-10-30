@@ -798,7 +798,9 @@ def _get_megatron_emerging_optimizer(
         eopt_name = bare_name
         use_layer_wise = True
 
-    if isinstance(model_chunks[0], FullyShardedDataParallelV2):
+    if any(isinstance(chunk, FullyShardedDataParallelV2) for chunk in model_chunks):
+        if not all(isinstance(chunk, FullyShardedDataParallelV2) for chunk in model_chunks):
+            raise ValueError("MFSDP v2 requires every model chunk to be wrapped with MFSDP v2.")
         return _get_megatron_fsdp_emerging_optimizer(
             config, model_chunks, config_overrides, pg_collection, param_group_process_group
         )
