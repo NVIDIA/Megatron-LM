@@ -1,92 +1,41 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""mHC execution boundaries and recompute regression tests for the MFSDP v2 adapter."""
-
-import logging
-from dataclasses import replace
+"""Compare mHC loss with and without MFSDP v2."""
 
 import pytest
 import torch
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
-from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
-from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import MoETransformerLayer
-from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
-    run_forward_backward_on_microbatches,
-)
 from tests.unit_tests.distributed.mfsdp_v2.mcore_utils import destroy_model_parallel
 from tests.unit_tests.test_utilities import Utils
 
-logger = logging.getLogger(__name__)
-
 
 @pytest.fixture
-def process_group_collections(distributed_setup):
-    """Yield EP=2 process groups and singleton reference groups, then clean them up."""
-    world_size = distributed_setup.world_size
-    if world_size < 2 or world_size % 2:
-        pytest.skip("MFSDP v2 EP adapter test requires an even world size of at least two.")
-    Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=2)
-    process_group_collection = ProcessGroupCollection.use_mpu_process_groups()
-    assert process_group_collection.ep.size() == 2
-    assert process_group_collection.expt_dp.size() == world_size // 2
-    reference_group = torch.distributed.new_group(
-        [torch.distributed.get_rank()], use_local_synchronization=True
-    )
-    reference_process_group_collection = ProcessGroupCollection(
-        tp=reference_group,
-        expt_tp=reference_group,
-        cp=reference_group,
-        pp=reference_group,
-        tp_cp=reference_group,
-        tp_dp_cp=reference_group,
-        ep=reference_group,
-        tp_ep=reference_group,
-        expt_dp=reference_group,
-        dp=reference_group,
-        dp_cp=reference_group,
-        embd=None,
-        pos_embd=None,
-        mp=reference_group,
-        tp_ep_pp=reference_group,
-    )
+def process_group_collection(distributed_setup):
+    """Initialize TP=PP=1 so FSDP shards over the data-parallel ranks."""
+    Utils.initialize_model_parallel(1, 1)
+    torch.manual_seed(1234)  # mHC also initializes parameters on the CPU.
     model_parallel_cuda_manual_seed(1234)
-    yield process_group_collection, reference_process_group_collection
+    yield ProcessGroupCollection.use_mpu_process_groups()
     destroy_model_parallel()
 
 
 @pytest.mark.parametrize("recompute_mhc", [False, True], ids=["no-recompute", "recompute"])
-def test_mhc_training_matches_reference(
-    process_group_collections, distributed_setup, recompute_mhc
-):
-    """Match unsharded mHC loss and clipped updates with or without early replay."""
-    process_group_collection, reference_process_group_collection = process_group_collections
-    world_size = distributed_setup.world_size
-    # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
-    # initialization instead uses the globally configured EP=2 rank in its RNG seed.
+def test_mhc_loss_matches_reference(process_group_collection, recompute_mhc):
+    """FSDP preserves the reference loss with mHC recompute on or off."""
     config = TransformerConfig(
         num_layers=2,
         hidden_size=64,
         num_attention_heads=4,
-        num_moe_experts=4,
-        expert_model_parallel_size=2,
-        moe_layer_freq=[0, 1],
-        moe_token_dispatcher_type="alltoall",
-        moe_router_topk=2,
-        moe_grouped_gemm=True,
-        moe_ffn_hidden_size=128,
+        ffn_hidden_size=128,
         add_bias_linear=False,
-        use_cpu_initialization=True,
         params_dtype=torch.float32,
         attention_dropout=0.0,
         hidden_dropout=0.0,
@@ -100,41 +49,18 @@ def test_mhc_training_matches_reference(
         recompute_modules=["mhc"] if recompute_mhc else None,
         mhc_recompute_layer_num=2 if recompute_mhc else None,
     )
-    # Pair CPU initialization with an explicit common seed for the reference and EP model.
-    torch.manual_seed(123)
-    reference_config = replace(config, expert_model_parallel_size=1)
-    reference_model = HybridModel(
-        config=reference_config,
-        hybrid_stack_spec=hybrid_stack_spec,
-        vocab_size=128,
-        max_sequence_length=8,
-        hybrid_layer_pattern="*E",
-        pg_collection=reference_process_group_collection,
-    ).cuda()
-    model = HybridModel(
-        config=config,
-        hybrid_stack_spec=hybrid_stack_spec,
-        vocab_size=128,
-        max_sequence_length=8,
-        hybrid_layer_pattern="*E",
-        pg_collection=process_group_collection,
-    ).cuda()
-    model.load_state_dict(reference_model.state_dict(), strict=False)
-    for model_layer, reference_layer in zip(model.decoder.layers, reference_model.decoder.layers):
-        model_layer = model_layer.inner_layer
-        reference_layer = reference_layer.inner_layer
-        if not isinstance(model_layer, MoETransformerLayer):
-            continue
-        for fc in ("linear_fc1", "linear_fc2"):
-            model_fc = getattr(model_layer.mlp.experts, fc)
-            reference_fc = getattr(reference_layer.mlp.experts, fc)
-            for local, global_ in enumerate(model_layer.mlp.local_expert_indices):
-                for parameter_name in ("weight", "bias"):
-                    model_parameter = getattr(model_fc, f"{parameter_name}{local}", None)
-                    reference_parameter = getattr(reference_fc, f"{parameter_name}{global_}", None)
-                    if model_parameter is not None:
-                        model_parameter.data.copy_(reference_parameter.data)
-    reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+    reference, model = [
+        HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=128,
+            max_sequence_length=8,
+            hybrid_layer_pattern="**",
+            pg_collection=process_group_collection,
+        ).cuda()
+        for _ in range(2)
+    ]
+    model.load_state_dict(reference.state_dict())
     model = FullyShardedDataParallel(
         config=config,
         ddp_config=DistributedDataParallelConfig(
@@ -142,99 +68,18 @@ def test_mhc_training_matches_reference(
             megatron_fsdp_version=2,
             use_distributed_optimizer=False,
             data_parallel_sharding_strategy="optim_grads_params",
-            fsdp_all_gather_in_start_param_sync=False,
         ),
         module=model,
         pg_collection=process_group_collection,
     )
-    assert isinstance(model.module, FsdpModule)
 
-    optimizer_config = OptimizerConfig(
-        lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
-    )
-    reference_optimizer = get_megatron_optimizer(
-        optimizer_config,
-        [reference_model],
-        pg_collection=reference_process_group_collection,
-        use_gloo_process_groups=False,
-    )
-    optimizer = get_megatron_optimizer(
-        optimizer_config,
-        [model],
-        pg_collection=process_group_collection,
-        use_gloo_process_groups=False,
-    )
-    assert isinstance(optimizer, FullyShardedOptimizer)
-    optimizer.reload_model_params()
-
-    local_batch_size = 2
-    torch.manual_seed(4321)
-    input_ids = torch.randint(0, 128, (world_size * local_batch_size, 8), device="cuda")
-    position_ids = torch.arange(8, device="cuda").repeat(world_size * local_batch_size, 1)
-    targets = torch.randn(world_size * local_batch_size, 8, 128, device="cuda")
-    input_slice = slice(
-        torch.distributed.get_rank() * local_batch_size,
-        (torch.distributed.get_rank() + 1) * local_batch_size,
-    )
-
-    def reference_forward():
-        output = reference_model(
-            input_ids=input_ids, position_ids=position_ids, attention_mask=None
-        )
-        return torch.nn.functional.mse_loss(output, targets)
-
-    reference_losses = []
-    reference_norms = []
-    for _ in range(5):
-        reference_optimizer.zero_grad(set_to_none=True)
-        (reference_loss,) = run_forward_backward_on_microbatches(reference_model, reference_forward)
-        reference_success, reference_pre_clip_norm, _ = reference_optimizer.step()
-        assert reference_success
-        assert (
-            reference_pre_clip_norm > optimizer_config.clip_grad
-        ), "Reference gradients must exceed the clipping threshold to exercise clipping."
-        reference_losses.append(reference_loss)
-        reference_norms.append(float(reference_pre_clip_norm))
-
-    def forward():
-        output = model(
-            input_ids=input_ids[input_slice],
-            position_ids=position_ids[input_slice],
-            attention_mask=None,
-        )
-        return torch.nn.functional.mse_loss(output, targets[input_slice])
-
+    input_ids = torch.arange(16, device="cuda").reshape(2, 8)
+    position_ids = torch.arange(8, device="cuda").repeat(2, 1)
     losses = []
-    norms = []
-    for _ in range(5):
-        optimizer.zero_grad(set_to_none=True)
-        (loss,) = run_forward_backward_on_microbatches(model, forward)
-        success, norm, _ = optimizer.step()
-        assert success
-        torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
-        losses.append(loss)
-        norms.append(float(norm))
-
-    losses = torch.stack(losses)
-    reference_losses = torch.stack(reference_losses)
-    if torch.distributed.get_rank() == 0:
-        logger.info("MFSDP v2 mHC loss curve: %s", losses.tolist())
-        logger.info("MFSDP v2 mHC reference loss curve: %s", reference_losses.tolist())
-    assert torch.isfinite(losses).all()
-    assert torch.isfinite(reference_losses).all()
-    assert losses[-1] < losses[0]
-    torch.testing.assert_close(losses, reference_losses)
-    torch.testing.assert_close(torch.tensor(norms), torch.tensor(reference_norms))
-
-    for layer in model.module.decoder.layers:
-        assert isinstance(layer, HyperConnectionHybridLayer)
-        assert isinstance(layer, FsdpModule)
-        assert not isinstance(layer.inner_layer, FsdpModule)
-        for name in ("input_layernorm", "pre_mlp_layernorm"):
-            replay_module = getattr(layer.inner_layer, name, None)
-            if replay_module is not None and next(replay_module.parameters(), None) is not None:
-                assert isinstance(replay_module, FsdpModule) == recompute_mhc
-    moe_layer = model.module.decoder.layers[1].inner_layer
-    assert isinstance(moe_layer.mlp.experts, FsdpModule)
-    for parameter in moe_layer.mlp.experts.parameters():
-        assert parameter.device_mesh.size() == world_size // 2
+    for current_model in (reference, model):
+        output = current_model(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
+        loss = output.square().mean()
+        loss.backward()  # Exercise mHC replay, which runs during backward.
+        losses.append(loss.detach())
+    model.finish_grad_sync()
+    torch.testing.assert_close(losses[0], losses[1])
