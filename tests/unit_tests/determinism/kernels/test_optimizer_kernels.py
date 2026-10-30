@@ -11,6 +11,12 @@ import torch
 
 from megatron.core.optimizer import Adam
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32, get_grad_norm_fp32
+from megatron.core.optimizer.emerging_optimizers import (
+    HAVE_EMERGING_OPTIMIZERS,
+    TensorParallelMuonH,
+    TensorParallelMuonHT,
+)
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.training.tensor_metrics.definitions import L2NormMetric, _fused_l2_norm_impl
 from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
@@ -139,3 +145,49 @@ def test_fused_adam_step_replays():
         assert len(got) == len(ref)
         for j, (a, b) in enumerate(zip(ref, got)):
             assert bytes_equal(a, b), f"Adam tensor {j} differs on replay {i}"
+
+
+@pytest.mark.skipif(
+    not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers package is not installed"
+)
+@pytest.mark.parametrize("optimizer_cls", [TensorParallelMuonH, TensorParallelMuonHT])
+def test_hyperball_muon_update_replays(optimizer_cls):
+    """MuonH/HT projection, normalization, update, and retraction are bit-exact."""
+    seeded()
+    radius = 2.5
+    parameter = torch.randn(2048, 1024, device="cuda", dtype=torch.float32)
+    parameter.mul_(radius / parameter.norm())
+    update = torch.randn_like(parameter)
+    pg_collection = ProcessGroupCollection(
+        tp=None, expt_tp=None, gtp_remat=None, expt_gtp_remat=None
+    )
+    optimizer = optimizer_cls(
+        params=[torch.nn.Parameter(parameter.clone())],
+        lr=0.1,
+        momentum=0.0,
+        nesterov=False,
+        weight_decay=0.0,
+        hyperball_radius=radius,
+        pg_collection=pg_collection,
+        tp_mode="duplicated",
+    )
+
+    def hyperball_update(weight, raw_update):
+        if optimizer_cls is TensorParallelMuonHT:
+            raw_update = optimizer._project_gradient_to_tangent(weight, raw_update)
+        optimizer.pre_weight_update_fn_inplace(weight, raw_update)
+        weight.add_(raw_update, alpha=-optimizer.param_groups[0]["lr"])
+        optimizer.post_weight_update_fn_inplace(weight)
+        return weight, raw_update
+
+    outputs, _ = assert_replays_bit_exact(
+        hyperball_update,
+        (parameter, update),
+        replays=4,
+        backward=False,
+        contention=True,
+        what=optimizer_cls.__name__,
+    )
+    torch.testing.assert_close(
+        outputs["out[0]"].norm(), torch.tensor(radius, device="cuda"), rtol=1e-6, atol=1e-6
+    )
