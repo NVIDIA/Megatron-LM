@@ -1836,6 +1836,9 @@ def get_batch_invariant_backend() -> str:
 def enable_batch_invariant_mode(backend: str = "te_native", collective: str = "ordered"):
     """Enable global batch-invariant mode and patch Aten/TE kernels.
 
+    If enabling fails partway, the previous state is restored before the error
+    propagates, so the mode is never left half on.
+
     Args:
         backend: which kernel to dispatch `aten::mm`/`aten::addmm` through.
             "te_native" (default) keeps the native cuBLASLt kernels and obtains
@@ -1852,7 +1855,6 @@ def enable_batch_invariant_mode(backend: str = "te_native", collective: str = "o
     if _batch_invariant_MODE:
         return
     assert collective in ("ordered", "multimem"), f"Unknown collective {collective!r}"
-    _BATCH_INVARIANT_COLLECTIVE = collective
     if backend not in _BATCH_INVARIANT_BACKENDS:
         raise ValueError(
             f"Unknown batch-invariant backend {backend!r}; "
@@ -1863,40 +1865,49 @@ def enable_batch_invariant_mode(backend: str = "te_native", collective: str = "o
             "The DeepGEMM batch-invariant backend requires DeepGEMM with "
             "bf16 bindings. Install DeepGEMM or use backend='triton'."
         )
+    prev_backend, prev_collective = _BATCH_INVARIANT_BACKEND, _BATCH_INVARIANT_COLLECTIVE
     _BATCH_INVARIANT_BACKEND = backend
+    _BATCH_INVARIANT_COLLECTIVE = collective
     dispatch_key = getattr(torch.accelerator.current_accelerator(), "type", "cpu").upper()
     _batch_invariant_MODE = True
-    _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
-    if backend == "te_native":
-        # Keep the NATIVE cuBLASLt kernels for every dense GEMM (aten and TE);
-        # batch invariance comes from workspace starvation (split-K
-        # disqualified => fixed K-reduction recipe at every M) instead of
-        # kernel substitution — native speed, verified bitwise-identical to
-        # the training forward in NeMo-RL true on-policy GRPO (gen_kl == 0.0).
-        _enable_te_native_workspace_starvation()
-    else:
-        _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
-        _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
-    _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key)
-    _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
-    # Also patch Transformer Engine kernels when available. Under te_native
-    # BOTH skips are set, so no TE kernel is substituted: dense GEMMs stay
-    # native under the starved workspace, device-metadata grouped GEMMs keep
-    # their required full workspace only on validated GPU/library versions, and norms
-    # stay native under the 64-multiple alignment discipline. (The TE attention
-    # version gate is a separate standalone assert, not part of this patch.)
-    if backend == "te_native":
-        # te_native also keeps TE's NATIVE RMSNorm: its M%32 reduction
-        # bit-class is held constant by the 64-multiple alignment discipline
-        # (CUDA-graph bucket floor + eager TOKEN_ROUNDER + scoring-side
-        # sequence-length rounding), so no kernel substitution is needed.
-        _te_patch_for_batch_invariant(skip_gemm=True, skip_rmsnorm=True)
-    else:
-        _te_patch_for_batch_invariant()
-    # Pin the Mamba autotuners so rollout and training processes can't end
-    # up on different tile configs (and therefore different fp32 reduction
-    # orders) through autotune timing noise.
-    _pin_mamba_autotuners()
+    try:
+        _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
+        if backend == "te_native":
+            # Keep the NATIVE cuBLASLt kernels for every dense GEMM (aten and TE);
+            # batch invariance comes from workspace starvation (split-K
+            # disqualified => fixed K-reduction recipe at every M) instead of
+            # kernel substitution — native speed, verified bitwise-identical to
+            # the training forward in NeMo-RL true on-policy GRPO (gen_kl == 0.0).
+            _enable_te_native_workspace_starvation()
+        else:
+            _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
+            _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
+        _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key)
+        _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
+        # Also patch Transformer Engine kernels when available. Under te_native
+        # BOTH skips are set, so no TE kernel is substituted: dense GEMMs stay
+        # native under the starved workspace, device-metadata grouped GEMMs keep
+        # their required full workspace only on validated GPU/library versions, and norms
+        # stay native under the 64-multiple alignment discipline. (The TE attention
+        # version gate is a separate standalone assert, not part of this patch.)
+        if backend == "te_native":
+            # te_native also keeps TE's NATIVE RMSNorm: its M%32 reduction
+            # bit-class is held constant by the 64-multiple alignment discipline
+            # (CUDA-graph bucket floor + eager TOKEN_ROUNDER + scoring-side
+            # sequence-length rounding), so no kernel substitution is needed.
+            _te_patch_for_batch_invariant(skip_gemm=True, skip_rmsnorm=True)
+        else:
+            _te_patch_for_batch_invariant()
+        # Pin the Mamba autotuners so rollout and training processes can't end
+        # up on different tile configs (and therefore different fp32 reduction
+        # orders) through autotune timing noise.
+        _pin_mamba_autotuners()
+    except BaseException:
+        # Undo the steps that already ran and restore the previous configuration.
+        disable_batch_invariant_mode()
+        _BATCH_INVARIANT_BACKEND = prev_backend
+        _BATCH_INVARIANT_COLLECTIVE = prev_collective
+        raise
 
 
 def disable_batch_invariant_mode():
@@ -2004,27 +2015,48 @@ def _unpin_mamba_autotuners():
 
 
 @contextlib.contextmanager
-def set_batch_invariant_mode(enabled: bool = True, backend: Optional[str] = None):
+def set_batch_invariant_mode(
+    enabled: bool = True, backend: Optional[str] = None, collective: Optional[str] = None
+):
     """Context manager to toggle global batch-invariant mode.
 
     When `enabled` is True, batch-invariant kernels are enabled for the duration of
     the context; when False, they are disabled for the duration. This implementation
-    is re-entrant and correctly restores the previous state even under nesting.
-    The helper default remains "triton" for tests that exercise non-bf16 operators.
+    is re-entrant and correctly restores the previous state (mode, backend and
+    collective) even under nesting.
+
+    Args:
+        enabled: whether batch-invariant mode is on inside the context.
+        backend: GEMM backend to enable when the mode is off on entry. The helper
+            default remains "triton" for tests that exercise non-bf16 operators.
+            Inside an active context it must match the active backend.
+        collective: cross-rank combine collective to enable when the mode is off
+            on entry. Defaults to the collective the process last enabled the
+            mode with (initially "ordered"), so re-entering does not switch it.
+            Inside an active context it must match the active collective.
     """
-    global _batch_invariant_MODE, _batch_invariant_LIB
-    # Save the previous on/off state so we can correctly restore it, even under
-    # nested usage or when toggling from True->False inside an outer True scope.
+    global _batch_invariant_MODE, _batch_invariant_LIB, _BATCH_INVARIANT_BACKEND
+    global _BATCH_INVARIANT_COLLECTIVE
+    # Save the previous state so we can correctly restore it, even under nested
+    # usage or when toggling from True->False inside an outer True scope.
     prev_enabled = _batch_invariant_MODE
     prev_backend = _BATCH_INVARIANT_BACKEND
+    prev_collective = _BATCH_INVARIANT_COLLECTIVE
 
     # Apply the requested state only if it differs from the current one.
     if enabled and not prev_enabled:
-        enable_batch_invariant_mode(backend=backend or "triton")
+        enable_batch_invariant_mode(
+            backend=backend or "triton", collective=collective or prev_collective
+        )
     elif enabled and prev_enabled and backend is not None and backend != prev_backend:
         raise RuntimeError(
             "Cannot switch batch-invariant backend inside an active context "
             f"(active={prev_backend!r}, requested={backend!r})."
+        )
+    elif enabled and prev_enabled and collective is not None and collective != prev_collective:
+        raise RuntimeError(
+            "Cannot switch batch-invariant collective inside an active context "
+            f"(active={prev_collective!r}, requested={collective!r})."
         )
     elif not enabled and prev_enabled:
         disable_batch_invariant_mode()
@@ -2033,9 +2065,12 @@ def set_batch_invariant_mode(enabled: bool = True, backend: Optional[str] = None
         yield
     finally:
         # Restore the previous state. If we turned batch-invariant mode on at
-        # entry, turn it off here. If we turned it off at entry (inside an
-        # outer True scope), turn it back on.
+        # entry, turn it off here and restore the backend and collective it
+        # replaced. If we turned it off at entry (inside an outer True scope),
+        # turn it back on with the outer scope's backend and collective.
         if enabled and not prev_enabled:
             disable_batch_invariant_mode()
+            _BATCH_INVARIANT_BACKEND = prev_backend
+            _BATCH_INVARIANT_COLLECTIVE = prev_collective
         elif not enabled and prev_enabled:
-            enable_batch_invariant_mode(backend=prev_backend)
+            enable_batch_invariant_mode(backend=prev_backend, collective=prev_collective)
