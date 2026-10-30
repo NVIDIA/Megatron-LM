@@ -78,6 +78,31 @@ def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
     return sharded_buffer
 
 
+def _foreach_mul_same_dtype_(
+    tensors: List[torch.Tensor], scaling_factor: torch.Tensor
+) -> List[torch.Tensor]:
+    """Scale the tensors that share a 0-D CUDA `scaling_factor`'s dtype and device in place.
+
+    Returns the tensors that were not scaled. For a matching tensor, `tensor *= scaling_factor`
+    runs PyTorch's broadcasting elementwise kernel, which reaches only a fraction of HBM
+    bandwidth; `torch._foreach_mul_` computes bitwise identical values in one fused kernel that
+    reads the factor on the device. `torch._foreach_mul_` only fuses a factor of the tensors'
+    own dtype: for other tensors it falls back to `mul_` with the factor rounded to the tensor's
+    dtype, so they are left to the caller.
+    """
+    if not (scaling_factor.is_cuda and scaling_factor.ndim == 0):
+        return tensors
+    matching, others = [], []
+    for tensor in tensors:
+        if tensor.dtype == scaling_factor.dtype and tensor.device == scaling_factor.device:
+            matching.append(tensor)
+        else:
+            others.append(tensor)
+    if matching:
+        torch._foreach_mul_(matching, scaling_factor)
+    return others
+
+
 def _param_uses_quantized_storage(param: torch.nn.Parameter) -> bool:
     """Return whether the parameter owns TE quantized storage instead of plain tensor storage."""
     # In TE2, is_float8tensor() checks QuantizedTensor, so it includes plain MXFP8Tensor.
@@ -1634,9 +1659,9 @@ class _ParamAndGradBuffer:
             # A scalar tensor does not promote the buffer's dtype. Keep the factor's
             # precision during multiplication; only the stored gradient is rounded.
             buffer_scale = buffer_scale.reshape(1)
-        self.grad_data *= buffer_scale
-        for grad in self.extra_main_grads:
-            grad *= scaling_factor
+        grads = [self.grad_data, *self.extra_main_grads]
+        for grad in _foreach_mul_same_dtype_(grads, scaling_factor):
+            grad *= buffer_scale if grad is self.grad_data else scaling_factor
 
     def _get(self, shape: torch.Size, start_index: int, buffer_type: BufferType) -> torch.Tensor:
         """
