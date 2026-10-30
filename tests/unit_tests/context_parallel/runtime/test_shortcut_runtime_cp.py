@@ -19,6 +19,7 @@ def test_shortcut_router_receives_runtime_cp_metadata():
     mask = torch.tensor([[False, True, False, False]])
     packed = PackedSeqParams(local_cp_size=2, cp_group=SimpleNamespace(size=lambda: 2))
     calls = []
+    missing = object()
 
     def unflatten(value, padding_mask, input_ids, packed_seq_params):
         assert input_ids is None
@@ -30,12 +31,19 @@ def test_shortcut_router_receives_runtime_cp_metadata():
         calls.append(packed_seq_params)
         return value, value
 
+    def preprocess(value, probs, routing_map, padding_mask, *, packed_seq_params=missing):
+        assert value is hidden and probs is hidden and routing_map is hidden
+        assert padding_mask is mask
+        # Newer MoE interfaces also pass the packed metadata to preprocessing.
+        assert packed_seq_params is missing or packed_seq_params is packed
+        return value, value
+
     block = SimpleNamespace(
         recompute_shortcut_pre_mlp_layernorm=False,
         shortcut_pre_mlp_layernorm=torch.nn.Identity(),
         moe_layer=SimpleNamespace(
             _maybe_unflatten_for_moe=unflatten,
-            mlp=SimpleNamespace(route=route, preprocess=lambda value, *args: (value, value)),
+            mlp=SimpleNamespace(route=route, preprocess=preprocess),
         ),
     )
     result, _ = ShortcutMoEBlock._moe_router_preprocess(block, hidden, mask, packed)
