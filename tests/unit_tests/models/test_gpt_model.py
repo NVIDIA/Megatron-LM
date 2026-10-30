@@ -797,6 +797,7 @@ def test_get_transformer_layer_spec_forwards_use_te_activation_func():
     """
     mock_config = MagicMock()
     mock_config.use_te_activation_func = True
+    mock_config.use_liger = False
     mock_config.use_kitchen = False
     mock_config.use_kitchen_attention = False
     mock_config.kitchen_attention_backend = "sdpa"
@@ -835,6 +836,7 @@ def test_gpt_builder_forwards_rope_scaling_factor(run_config):
     """
     run_config.tokenizer.padded_vocab_size = 512
     mock_config = MagicMock()
+    mock_config.use_liger = False
 
     mock_args = MagicMock()
     mock_args.spec = None

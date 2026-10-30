@@ -29,3 +29,6 @@ megatron_rl
 offline_logits_distillation
 ../../mcore-inference-user-guide
 ```
+
+[Liger RMSNorm](../../../megatron/core/ops/README.md#liger-rmsnorm) is available
+as an opt-in backend for standard local GPT training.
