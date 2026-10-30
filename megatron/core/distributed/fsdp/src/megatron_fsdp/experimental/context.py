@@ -21,7 +21,8 @@ from weakref import WeakKeyDictionary
 import torch
 from torch import nn
 
-from .execution_order import ExecutionOrder
+from .execution_order import ExecutionEvent, ExecutionOrder
+from .phase import Phase
 from .runtime_policy import RuntimePolicy
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
@@ -39,11 +40,8 @@ class FsdpContext:
     use_symmetric_memory: bool
     unify_communication_stream: bool
     caller_managed_grad_sync: bool
-    # Static orders used to drive all-gather prefetch. We may want to switch to
-    # capturing runtime order if static module order proves too fragile. Each
-    # parameter group tracks readiness alongside its gathered weight storage.
-    forward_order: ExecutionOrder[nn.Module]
-    backward_order: ExecutionOrder[nn.Module]
+    # Phase-tagged preset forward/backward execution order.
+    execution_order: ExecutionOrder
     # Topology metadata must not keep modules alive after construction.
     _roots: WeakKeyDictionary[nn.Module, None]
     # Names are relative to each FSDP root and absent until finalization.
@@ -83,8 +81,7 @@ class FsdpContext:
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
         self.unify_communication_stream = runtime_policy.unify_communication_stream
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
-        self.forward_order = ExecutionOrder()
-        self.backward_order = ExecutionOrder()
+        self.execution_order = ExecutionOrder()
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
@@ -149,10 +146,17 @@ class FsdpContext:
                 if module not in registered_modules:
                     continue
                 self._module_names[module] = name
-                self.forward_order.append(module)
+                self.execution_order.append(ExecutionEvent(module=module, phase=Phase.FORWARD))
 
         for root in reversed(list(self._roots)):
-            _collect_backward_order(root, registered_modules, self.backward_order)
+            _collect_backward_order(root, registered_modules, self.execution_order)
+
+        if all(
+            module._schedule_policy.forward_prefetch_size == 0
+            and module._schedule_policy.backward_prefetch_size == 0
+            for module in registered_modules
+        ):
+            self.execution_order = ExecutionOrder()
 
         self._registered_modules.clear()
         self.parameter_to_owner = None
@@ -250,11 +254,11 @@ def current_fully_shard_context() -> FsdpContext | None:
 
 
 def _collect_backward_order(
-    module: nn.Module, registered_modules: set[nn.Module], order: ExecutionOrder[nn.Module]
+    module: nn.Module, registered_modules: set[nn.Module], order: ExecutionOrder
 ) -> None:
-    """Collect one root's static backward prefetch order."""
+    """Collect one root's preset backward prefetch order."""
     if module in registered_modules:
-        order.append(module)
+        order.append(ExecutionEvent(module=module, phase=Phase.BACKWARD))
 
     for child in reversed(list(module.children())):
         _collect_backward_order(child, registered_modules, order)

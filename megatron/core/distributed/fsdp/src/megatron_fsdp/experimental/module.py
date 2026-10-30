@@ -31,7 +31,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .execution_order import ExecutionOrder
+from .execution_order import ExecutionEvent, ExecutionOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import (
     FsdpParameter,
@@ -286,6 +286,10 @@ class FsdpModule:
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
 
         if self.is_root():
+            order = context.execution_order
+            # Later roots continue the shared order rather than starting a new pass.
+            if not is_recomputing and order and order[0].module is self:
+                order.reset_cursor()
             context.allgather_stream.wait_stream(context.current_stream())
 
         # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
@@ -322,41 +326,49 @@ class FsdpModule:
             match phase:
                 case Phase.FORWARD:
                     self._prefetch_parameter_groups(
-                        context.forward_order, self._schedule_policy.forward_prefetch_size
+                        context.execution_order, self._schedule_policy.forward_prefetch_size
                     )
                 case Phase.BACKWARD:
                     self._prefetch_parameter_groups(
-                        context.backward_order, self._schedule_policy.backward_prefetch_size
+                        context.execution_order, self._schedule_policy.backward_prefetch_size
                     )
                 case _:
                     raise ValueError(
                         f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}."
                     )
 
-    def _prefetch_parameter_groups(
-        self, order: ExecutionOrder[nn.Module], prefetch_size: int | None
-    ) -> None:
+    def _prefetch_parameter_groups(self, order: ExecutionOrder, prefetch_size: int | None) -> None:
         """Prefetch successors from ``order`` according to this module's budget.
 
         Successors are unsharded for this module's phase, which is the compute they
         run next in ``order``.
         """
-        module = cast(nn.Module, self)
-        order.advance(module)
-        next_module = order.next_item()
-        if prefetch_size is None:
-            if next_module is not None:
-                cast(FsdpModule, next_module)._unshard_parameter_groups(self.phase)
+        if not order:
             return
+        last_event = None if order.position == 0 else order[order.position - 1]
+        event = ExecutionEvent(module=cast(nn.Module, self), phase=self.phase)
 
+        # NOTE: This 'event != last_event' guard skips consecutive duplicate execution
+        # events emitted by MTP. It is a temporary workaround and should be removed
+        # once execution capture is implemented and enabled for MTP.
+        if event != last_event:
+            if order.position >= len(order) or order[order.position] != event:
+                raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
+            order.advance()
+
+        if prefetch_size == 0:
+            return
         prefetched_size = 0
-        offset = 1
-        while next_module is not None and prefetched_size < prefetch_size:
-            fsdp_module = cast(FsdpModule, next_module)
+        for index in range(order.position, len(order)):
+            event = order[index]
+            # Forward and backward retain their separate prefetch boundaries.
+            if event.phase is not self.phase:
+                break
+            fsdp_module = cast(FsdpModule, event.module)
             fsdp_module._unshard_parameter_groups(self.phase)
             prefetched_size += fsdp_module.num_parameter_elements
-            offset += 1
-            next_module = order.next_item(offset)
+            if prefetch_size is None or prefetched_size >= prefetch_size:
+                break
 
     def _unshard_parameter_groups(self, phase: Phase | None) -> None:
         """Ask each group to gather missing weights on the all-gather stream."""

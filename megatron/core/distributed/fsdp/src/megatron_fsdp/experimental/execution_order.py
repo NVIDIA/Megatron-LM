@@ -15,57 +15,65 @@
 """Weakly held construction or recorded module execution sequences."""
 
 from collections.abc import Iterable, Iterator
-from typing import Generic, TypeVar
-from weakref import WeakKeyDictionary, ref
+from typing import NamedTuple
+from weakref import ref
 
-T = TypeVar("T")
+from torch import nn
+
+from .phase import Phase
 
 
-class ExecutionOrder(Generic[T]):
-    """Look up unique modules and validate repeated module-call occurrences.
+class ExecutionEvent(NamedTuple):
+    """A module and its compute phase."""
 
-    A module appearing once can unambiguously select its position, preserving
-    construction-order prefetch for reordered or repeated demand calls. Modules
-    appearing more than once must match the next occurrence at the cursor.
-    Prefetch lookahead never advances that cursor.
-    """
+    module: nn.Module
+    phase: Phase
 
-    def __init__(self, items: Iterable[T] = ()) -> None:
-        """Create a weak execution sequence, preserving repeated occurrences."""
-        self._items: list[ref[T]] = []
-        # An index identifies a unique item; None marks an ambiguous repeated item.
-        self._unique_index: WeakKeyDictionary[T, int | None] = WeakKeyDictionary()
+
+class ExecutionOrder:
+    """An ordered sequence of module/phase occurrences."""
+
+    def __init__(self, items: Iterable[ExecutionEvent] = ()) -> None:
+        """Create an execution sequence, preserving repeated occurrences."""
+        self._items: list[tuple[ref[nn.Module], Phase]] = []
         self._position = 0
         for item in items:
             self.append(item)
 
-    def append(self, item: T) -> None:
-        """Append an occurrence and mark previously seen items as repeated."""
-        self._unique_index[item] = None if item in self._unique_index else len(self._items)
-        self._items.append(ref(item))
+    def append(self, item: ExecutionEvent) -> None:
+        """Append an occurrence."""
+        key = (ref(item.module), item.phase)
+        self._items.append(key)
 
-    def __iter__(self) -> Iterator[T]:
-        """Iterate over live occurrences in execution order."""
-        for item_ref in self._items:
-            item = item_ref()
-            if item is not None:
-                yield item
+    def __iter__(self) -> Iterator[ExecutionEvent]:
+        """Iterate over occurrences in execution order."""
+        for index in range(len(self)):
+            yield self[index]
 
-    def advance(self, item: T) -> None:
-        """Locate a unique demand call or consume the next expected repeated call."""
-        index = self._unique_index.get(item)
-        if index is None:
-            if not self._items or self._items[self._position]() is not item:
-                raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
-            index = self._position
-        self._position = (index + 1) % len(self._items)
+    def reset_cursor(self) -> None:
+        """Reset traversal without changing the recorded sequence."""
+        self._position = 0
 
-    def next_item(self, offset: int = 1) -> T | None:
-        """Look ahead from the last consumed occurrence without moving the cursor."""
-        if not self._items:
-            return None
-        index = (self._position - 1) % len(self._items)
-        next_index = index + offset
-        if next_index >= len(self._items):
-            return None
-        return self._items[next_index]()
+    def __len__(self) -> int:
+        return len(self._items)
+
+    @property
+    def position(self) -> int:
+        """Index of the next occurrence; len(order) means traversal is exhausted."""
+        return self._position
+
+    def __getitem__(self, index: int) -> ExecutionEvent:
+        """Read an occurrence without advancing the cursor."""
+        module_ref, phase = self._items[index]
+        module = module_ref()
+        if module is None:
+            raise RuntimeError("A module in the FSDP execution order was destroyed.")
+        return ExecutionEvent(module=module, phase=phase)
+
+    def advance(self) -> ExecutionEvent:
+        """Consume the next occurrence."""
+        if self._position >= len(self._items):
+            raise RuntimeError("Calls exceeded the execution order; reset its cursor first.")
+        result = self[self._position]
+        self._position += 1
+        return result

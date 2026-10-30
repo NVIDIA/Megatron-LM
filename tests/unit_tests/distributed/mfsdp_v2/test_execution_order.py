@@ -10,87 +10,85 @@ import pytest
 from torch import nn
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    ExecutionEvent,
     ExecutionOrder,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 
 
 @pytest.mark.parametrize(
     'budget, expected',
-    [
-        (None, [[1], [0], [0], [2], []]),
-        (0, [[], [], [], [], []]),
-        (2, [[1, 0], [0, 0], [0, 2], [2], []]),
-    ],
+    [(None, [[1], [2], [2], []]), (0, [[], [], [], []]), (2, [[1, 2], [2], [2], []])],
 )
-def test_prefetch_replays_occurrences(budget, expected):
-    """Reused modules have occurrence-specific successors under every prefetch budget."""
+@pytest.mark.parametrize("phase", [Phase.FORWARD, Phase.BACKWARD])
+def test_prefetch_reuses_adjacent_shared_calls(budget, expected, phase):
+    """Construction-order prefetch reuses a shared MTP block's cursor and successors."""
     modules = [Mock(spec=FsdpModule, num_parameter_elements=1) for _ in range(3)]
     prefetched = []
     for module in modules:
+        module.phase = phase
         # Prefetch passes the successor's compute phase; record only which module it targets.
         module._unshard_parameter_groups.side_effect = (
             lambda _phase, target=module: prefetched.append(target)
         )
-    sequence = [modules[index] for index in (0, 1, 0, 0, 2)]
-    order = ExecutionOrder()
-    for module in sequence:
-        order.append(module)
-    # A second cycle checks cursor reset; each lookahead must leave demand calls intact.
+    sequence = [modules[index] for index in (0, 1, 1, 2)]
+    order = ExecutionOrder(ExecutionEvent(module=module, phase=phase) for module in modules)
+    # Root entry starts a new pass through the construction order.
     for _ in range(2):
-        for module, targets, successor in zip(sequence, expected, sequence[1:] + [None]):
+        order.reset_cursor()
+        for module, targets, position in zip(sequence, expected, (1, 2, 2, 3)):
             prefetched.clear()
             FsdpModule._prefetch_parameter_groups(module, order, budget)
             assert prefetched == [modules[index] for index in targets]
-            assert order.next_item() is successor
-
-
-def test_unique_calls_resynchronize_and_repeated_calls_validate():
-    """Unique VPP chunk calls select their position; ambiguous repeats stay strict."""
-    chunk0, layer0, chunk1, layer1 = (nn.Module() for _ in range(4))
-    order = ExecutionOrder([chunk0, layer0, chunk1, layer1])
-    # Grouped VPP repeats chunk 0 before switching to chunk 1, in one shared order.
-    for chunk in (chunk0, chunk0, chunk0, chunk1, chunk1, chunk0):
-        layer = layer0 if chunk is chunk0 else layer1
-        order.advance(chunk)
-        assert order.next_item() is layer
-        order.advance(layer)
-        assert order.next_item() is (chunk1 if chunk is chunk0 else None)
-
-    order = ExecutionOrder([chunk0, layer0, chunk0])
-    order.advance(chunk0)
-    assert order.next_item() is layer0
-    with pytest.raises(RuntimeError, match='diverged'):
-        order.advance(chunk0)
-    # A rejected repeated call must not consume the expected occurrence.
-    order.advance(layer0)
-    assert order.next_item() is chunk0
-    order.advance(chunk0)
-    assert order.next_item() is None
-    # Unique calls remain valid anchors even when the sequence also has repeats.
-    order.advance(layer0)
-    order.advance(chunk0)
-    assert order.next_item() is None
-
-    empty = ExecutionOrder()
-    assert empty.next_item() is None
-    with pytest.raises(RuntimeError, match='diverged'):
-        empty.advance(chunk0)
+            assert order.position == position
 
 
 def test_iteration_and_weak_references():
     """Traversal preserves repeated occurrences without retaining deleted modules."""
     first, second = nn.Module(), nn.Module()
-    order = ExecutionOrder([first, second, first, second])
-    assert list(order) == [first, second, first, second]
+    order = ExecutionOrder(
+        ExecutionEvent(module=module, phase=Phase.FORWARD)
+        for module in [first, second, first, second]
+    )
+    assert [event.module for event in order] == [first, second, first, second]
 
     second_ref = ref(second)
     del second
     gc.collect()
     assert second_ref() is None
-    assert list(order) == [first, first]
-    order.advance(first)
-    assert order.next_item() is None
-    # Traversal skips dead references, but the demand cursor must not skip a call.
-    with pytest.raises(RuntimeError, match='diverged'):
-        order.advance(first)
+    order.advance()
+    with pytest.raises(RuntimeError, match="destroyed"):
+        order[order.position]
+    order.reset_cursor()
+    first.phase = Phase.FORWARD
+    with pytest.raises(RuntimeError, match="destroyed"):
+        FsdpModule._prefetch_parameter_groups(first, order, None)
+    assert order.position == 1
+
+
+def test_explicit_reset_and_exhaustion():
+    """Sequential traversal requires reset before replay."""
+    module = nn.Module()
+    a = ExecutionEvent(module=module, phase=Phase.FORWARD)
+    b = ExecutionEvent(module=module, phase=Phase.BACKWARD)
+    order = ExecutionOrder([a, b, a, a])
+    for _ in range(2):
+        order.reset_cursor()
+        assert order.advance() == a
+        assert order[order.position] == b
+        assert order.position == 1
+        assert list(order) == [a, b, a, a]
+        assert order.advance() == b
+        assert order.advance() == a
+        assert order.advance() == a
+        assert list(order)[order.position :] == []
+        with pytest.raises(RuntimeError, match='exceeded'):
+            order.advance()
+    order.reset_cursor()
+    assert order.advance() == a
+    assert order.advance() == b
+    empty = ExecutionOrder()
+    assert list(empty) == []
+    with pytest.raises(RuntimeError, match='exceeded'):
+        empty.advance()
