@@ -61,7 +61,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     RuntimePolicy,
     fully_shard_context,
 )
-from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
@@ -2574,7 +2573,7 @@ def get_model(model_provider_func, wrap_with_ddp=True, config=None, pg_collectio
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
 
-    # Core pipeline schedules still read the fixed model_type compatibility attribute.
+    # Build model.
     def build_model():
         if (
             get_pg_size(pg_collection.pp) > 1
@@ -2597,7 +2596,6 @@ def get_model(model_provider_func, wrap_with_ddp=True, config=None, pg_collectio
                     config=config,
                     pg_collection=pg_collection,
                 )
-                this_model.model_type = ModelType.encoder_or_decoder
                 this_model.vp_stage = i
                 model.append(this_model)
         else:
@@ -2609,7 +2607,6 @@ def get_model(model_provider_func, wrap_with_ddp=True, config=None, pg_collectio
                 config=config,
                 pg_collection=pg_collection,
             )
-            model.model_type = ModelType.encoder_or_decoder
         return model
 
 

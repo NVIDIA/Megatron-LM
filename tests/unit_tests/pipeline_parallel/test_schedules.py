@@ -358,7 +358,6 @@ def test_forward_backward_func_without_pipeline_parallel(mocker):
         return model(dummy_data), loss_func
 
     model = torch.nn.Linear(4, 1)
-    model.model_type = 'unit-test'
 
     def set_input_tensor(input_tensor):
         return None
@@ -529,7 +528,6 @@ def test_forward_backward_func_with_pipeline_parallel(mocker):
         return torch.rand(512, 8, 256).cuda(), loss_func
 
     model = torch.nn.Linear(4, 1)
-    model.model_type = 'unit-test'
 
     def set_input_tensor(input_tensor):
         return None
@@ -576,7 +574,6 @@ def test_forward_backward_func_with_pipeline_parallel(mocker):
 
 @pytest.mark.internal
 def test_forward_backward_func_with_interleaving(mocker):
-    from megatron.core.enums import ModelType
     from megatron.core.pipeline_parallel import get_forward_backward_func
 
     Utils.initialize_model_parallel(
@@ -630,7 +627,6 @@ def test_forward_backward_func_with_interleaving(mocker):
         {'loss_reduced': rank},
     ]
 
-    model.model_type = ModelType.encoder_or_decoder
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=[range(0, 100), range(0, 100)],
@@ -647,7 +643,6 @@ def test_forward_backward_func_with_interleaving(mocker):
         assert i['loss_reduced'] == j['loss_reduced']
 
     with pytest.raises(RuntimeError):
-        model.model_type = ModelType.encoder_or_decoder
         forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=[range(0, 100), range(0, 100)],
@@ -659,7 +654,6 @@ def test_forward_backward_func_with_interleaving(mocker):
             forward_only=True,
         )
 
-    model.model_type = ModelType.encoder_or_decoder
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=[range(0, 100), range(0, 100)],
@@ -680,7 +674,6 @@ def test_forward_backward_func_with_interleaving(mocker):
 
 @pytest.mark.internal
 def test_forward_backward_func_with_uneven_interleaving(mocker):
-    from megatron.core.enums import ModelType
     from megatron.core.pipeline_parallel import get_forward_backward_func
 
     Utils.initialize_model_parallel(
@@ -739,8 +732,6 @@ def test_forward_backward_func_with_uneven_interleaving(mocker):
         {'loss_reduced': rank},
     ]
 
-    model_a.model_type = ModelType.encoder_or_decoder
-    model_b.model_type = ModelType.encoder_or_decoder
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=[range(0, 100), range(0, 100)],
@@ -757,8 +748,6 @@ def test_forward_backward_func_with_uneven_interleaving(mocker):
         assert i['loss_reduced'] == j['loss_reduced']
 
     with pytest.raises(RuntimeError):
-        model_a.model_type = ModelType.encoder_or_decoder
-        model_b.model_type = ModelType.encoder_or_decoder
         forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=[range(0, 100)],
@@ -770,8 +759,6 @@ def test_forward_backward_func_with_uneven_interleaving(mocker):
             forward_only=True,
         )
 
-    model_a.model_type = ModelType.encoder_or_decoder
-    model_b.model_type = ModelType.encoder_or_decoder
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=[range(0, 100), range(0, 100)],
@@ -812,7 +799,6 @@ def test_forward_backward_pipelining_without_interleaving_with_custom_pgs(mocker
 
     # Create model
     model = torch.nn.Linear(4, 1)
-    model.model_type = 'unit-test'
 
     def return_none(input_tensor):
         return None
@@ -892,7 +878,6 @@ def test_forward_backward_pipelining_with_interleaving_with_custom_pgs(mocker):
     """Test that forward_backward_pipelining_with_interleaving produces the same output
     with and without explicit process group parameters."""
 
-    from megatron.core.enums import ModelType
     from megatron.core.pipeline_parallel import get_forward_backward_func
 
     Utils.initialize_model_parallel(
@@ -961,7 +946,6 @@ def test_forward_backward_pipelining_with_interleaving_with_custom_pgs(mocker):
     pg_collection.pos_embd = pos_embd_pg
     pg_collection.dp_cp = grid.create_pg(["dp", "cp"])
 
-    model.model_type = ModelType.encoder_or_decoder
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=[range(0, 100), range(0, 100)],
@@ -1002,7 +986,6 @@ def test_forward_backward_no_pipelining_with_custom_pgs(mocker):
 
     # Simple model.
     model = torch.nn.Linear(4, 1)
-    model.model_type = 'unit-test'
     model.set_input_tensor = lambda _tensor: None  # type: ignore[assignment]
 
     # Minimal config.

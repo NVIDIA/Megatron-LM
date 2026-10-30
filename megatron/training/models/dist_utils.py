@@ -27,7 +27,6 @@ try:
 except ImportError:
     HAVE_FSDP2 = False
 
-from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.transformer.module import Float16Module
@@ -465,8 +464,6 @@ def build_virtual_pipeline_stages(
 ) -> list[MegatronModule]:
     """Build virtual pipeline stages if using virtual pipeline parallelism.
 
-    Keep the fixed ``model_type`` attribute for Core pipeline compatibility.
-
     Args:
         build_model_func: Function from ``ModelBuilder`` that builds a single stage of the model.
         pg_collection: Model communication process groups.
@@ -495,14 +492,12 @@ def build_virtual_pipeline_stages(
                 post_process=post_process,
                 vp_stage=i,
             )
-            model.model_type = ModelType.encoder_or_decoder
             model_list.append(model)
     else:
         # Single stage, no VP
         pre_process = is_pp_first_stage(pp_group)
         post_process = is_pp_last_stage(pp_group)
         model = build_model_func(pg_collection, pre_process=pre_process, post_process=post_process)
-        model.model_type = ModelType.encoder_or_decoder
         model_list = [model]
 
     return model_list
