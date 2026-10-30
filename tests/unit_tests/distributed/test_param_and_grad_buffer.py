@@ -1090,3 +1090,104 @@ def test_expert_parallel_params_get_separate_buffers(use_distributed_optimizer: 
             )
 
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("backend", ["gloo", "nccl"])
+def test_nccl_ub_warmup_syncs_only_the_data_parallel_group(backend: str):
+    """The NCCL user-buffer warmup must only synchronize the buffer's data-parallel group.
+
+    Ranks outside that group, such as other pipeline stages or other MIMO modules, can own a
+    different number of buffers. Each half of the world is its own data-parallel group here:
+    the first half builds two buffers and the second half builds one. A WORLD barrier in the
+    warmup would be entered twice as often by the first half, so it would hang or pair with an
+    unrelated collective. The NCCL allocator is mocked; the warmup collectives on each rank's
+    own group run for real.
+    """
+    if backend == "nccl" and not torch.cuda.is_available():
+        pytest.skip("The NCCL backend needs CUDA.")
+    Utils.initialize_distributed()
+    world_size = torch.distributed.get_world_size()
+    if world_size % 2 != 0:
+        pytest.skip("Needs an even number of ranks.")
+
+    rank = torch.distributed.get_rank()
+    half = world_size // 2
+    # new_group is collective over WORLD, so every rank creates both groups in the same order.
+    half_groups = [
+        torch.distributed.new_group(ranks=list(range(half)), backend=backend),
+        torch.distributed.new_group(ranks=list(range(half, world_size)), backend=backend),
+    ]
+    dp_group = half_groups[0] if rank < half else half_groups[1]
+    num_buffers = 2 if rank < half else 1
+
+    calls = []
+
+    def run_on_dp_group_only(name, real_fn):
+        def wrapper(*args, **kwargs):
+            group = kwargs.get("group")
+            calls.append((name, group))
+            # A collective on any other group would wait for ranks that never reach it, so
+            # record it and skip it instead of hanging the test.
+            if group is dp_group:
+                return real_fn(*args, **kwargs)
+            return None
+
+        return wrapper
+
+    patches = [
+        mock.patch("megatron.core.distributed.param_and_grad_buffer.nccl_allocator"),
+        mock.patch(
+            "torch.distributed.barrier",
+            side_effect=run_on_dp_group_only("barrier", torch.distributed.barrier),
+        ),
+        mock.patch(
+            "torch.distributed.all_reduce",
+            side_effect=run_on_dp_group_only("all_reduce", torch.distributed.all_reduce),
+        ),
+    ]
+    device = "cuda"
+    if backend == "gloo":
+        device = "cpu"
+        real_zeros = torch.zeros
+
+        def zeros_on_cpu(*args, **kwargs):
+            kwargs["device"] = "cpu"
+            return real_zeros(*args, **kwargs)
+
+        patches += [
+            mock.patch("torch.cuda.current_device", return_value="cpu"),
+            mock.patch("torch.zeros", side_effect=zeros_on_cpu),
+        ]
+
+    ddp_config = DistributedDataParallelConfig(
+        nccl_ub=True,
+        use_distributed_optimizer=False,
+        overlap_grad_reduce=False,
+        bucket_size=None,
+        average_in_collective=False,
+    )
+    with contextlib.ExitStack() as stack:
+        for patch in patches:
+            stack.enter_context(patch)
+        for buffer_index in range(num_buffers):
+            param = torch.nn.Parameter(torch.randn(8, 8, dtype=torch.bfloat16, device=device))
+            name = f"layer{buffer_index}.weight"
+            _ParamAndGradBuffer(
+                ddp_config=ddp_config,
+                param_dtype=torch.bfloat16,
+                grad_dtype=torch.bfloat16,
+                params_with_names=[(param, name)],
+                data_parallel_group=dp_group,
+                bucket_size=None,
+                param_to_name={param: name},
+                gradient_scaling_factor=1.0,
+                param_indices=[0],
+                nccl_ub=True,
+                pg_collection=mock.MagicMock(),
+            )
+
+    assert any(name == "all_reduce" for name, _ in calls), "The warmup did not run"
+    off_group = [name for name, group in calls if group is not dp_group]
+    assert (
+        not off_group
+    ), f"NCCL user-buffer warmup issued {off_group} outside the buffer's data-parallel group"
