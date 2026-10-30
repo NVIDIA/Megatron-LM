@@ -16,7 +16,7 @@
 
 from collections.abc import Callable
 from contextvars import ContextVar, Token
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, WeakSet
 
 import torch
 from torch import nn
@@ -44,6 +44,9 @@ class FsdpContext:
     # parameter group tracks readiness alongside its gathered weight storage.
     forward_order: ExecutionOrder[nn.Module]
     backward_order: ExecutionOrder[nn.Module]
+    # Modules whose post_backward() ran in the current backward pass. Static orders can
+    # still predict them, but nothing would release a gather prefetched for them.
+    finished_backward_modules: WeakSet[nn.Module]
     # Topology metadata must not keep modules alive after construction.
     _roots: WeakKeyDictionary[nn.Module, None]
     # Names are relative to each FSDP root and absent until finalization.
@@ -85,6 +88,7 @@ class FsdpContext:
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
         self.forward_order = ExecutionOrder()
         self.backward_order = ExecutionOrder()
+        self.finished_backward_modules = WeakSet()
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
@@ -230,6 +234,9 @@ class FsdpContext:
             # Another root sharing this context already queued the completion wait.
             return
         self._post_backward_hook_registered = True
+        # The first root entering backward starts a new pass. Clear here rather than at
+        # completion, which delayed weight-gradient post_backward() calls can follow.
+        self.finished_backward_modules.clear()
 
         # TODO(wujingyue): Switch to torch.autograd.graph.queue_callback() when Megatron-LM
         # requires a PyTorch version that includes it:
