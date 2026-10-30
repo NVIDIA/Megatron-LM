@@ -682,15 +682,17 @@ class ProcessGroupCollection:
             if hasattr(pg_collection, 'expt_dp') and pg_collection.expt_dp is not None:
                 result['expt_dp_group'] = pg_collection.expt_dp
             else:
-                # Create a new group with just the current rank for DDP
+                # Without an expert data-parallel group, that axis runs at size 1. Creating
+                # groups is collective, so every rank creates the same single-rank groups in the
+                # same order and keeps the one that holds it.
                 log_single_rank(
                     logger,
                     logging.WARNING,
                     "No expert data parallel group provided in pg_collection, "
                     "creating a new one with just the current rank",
                 )
-                result['expt_dp_group'] = torch.distributed.new_group(
-                    ranks=[torch.distributed.get_rank()]
+                result['expt_dp_group'], _ = torch.distributed.new_subgroups_by_enumeration(
+                    [[rank] for rank in range(torch.distributed.get_world_size())]
                 )
 
             # 4. Handle intra groups based on optimizer instances
