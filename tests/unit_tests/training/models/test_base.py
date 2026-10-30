@@ -164,6 +164,8 @@ class TestModelConfigToDict:
         runtime_fields = [
             "timers",
             "finalize_model_grads_func",
+            "forward_backward_func",
+            "sequence_packing_data_adapter",
             "grad_scale_func",
             "moe_grad_scale_func",
             "mtp_grad_scale_func",

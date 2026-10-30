@@ -20,6 +20,9 @@ class MimoProvider:
     language_input_projection_specs: optional projector factories for the first language stage.
     special_token_ids: ``(args) -> {module_name: token_id}``.
     build_communicator: ``(args, topology) -> MultiModulePipelineCommunicator``.
+    train_valid_test_data_provider: optional ``(args, topology) -> iterators`` for packed input.
+    prepare_source: optional ``(source, args, topology) -> (samples, slices, inputs)``.
+    initialize_model: optional ``(model, args)`` callback before DDP wrapping.
     """
 
     encoder_module_names: Sequence[str]
@@ -28,6 +31,9 @@ class MimoProvider:
     special_token_ids: Callable
     build_communicator: Callable
     language_input_projection_specs: Mapping[str, Callable] = field(default_factory=dict)
+    train_valid_test_data_provider: Callable | None = None
+    prepare_source: Callable | None = None
+    initialize_model: Callable | None = None
 
 
 def resolve_provider(args: "argparse.Namespace") -> MimoProvider:
@@ -37,7 +43,6 @@ def resolve_provider(args: "argparse.Namespace") -> MimoProvider:
         NEMOTRON_MODEL_PROVIDER,
         nemotron_provider,
     )
-
     providers = {NEMOTRON_MODEL_PROVIDER: nemotron_provider}
     name = getattr(args, "model_provider", NEMOTRON_MODEL_PROVIDER)
     if name not in providers:
