@@ -184,8 +184,10 @@ def test_build_train_step_and_clip(
         moe_layer = moe_layer.inner_layer
     assert isinstance(moe_layer.mlp.experts, FsdpModule)
 
+    # SGD keeps update comparisons well-conditioned for near-zero gradients from
+    # different local/global GEMM batch shapes.
     optimizer_config = OptimizerConfig(
-        lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
+        optimizer="sgd", lr=0.1, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-2
     )
     reference_optimizer = get_megatron_optimizer(optimizer_config, [reference_model])
     optimizer = get_megatron_optimizer(optimizer_config, [model])
