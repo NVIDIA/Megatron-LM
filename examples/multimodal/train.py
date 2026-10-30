@@ -58,16 +58,24 @@ def get_batch(data_iterator, image_token_index, img_seq_len, pg_collection=None)
         pg_collection: Process groups of the model. The batch is read on the first rank of
             its tensor-parallel group (or of its TP x CP group with a dataloader deduplicated
             across context parallelism) and broadcast over that group; its pipeline-parallel
-            group gives the stage. None falls back to the global parallel state with a
-            ProcessGroupFallbackWarning; that fallback is deprecated.
+            group gives the stage. With --log-packed-sequence-stats, the batch is counted on
+            the last pipeline stage at tensor- and context-parallel rank 0 of the collection.
+            None falls back to the global parallel state with a ProcessGroupFallbackWarning;
+            that fallback is deprecated.
     """
     args = get_args()
     deduplicate_across_context_parallel = _deduplicates_dataloader_across_context_parallel(args)
+    required = ("tp", "pp")
+    # The TP x CP group carries the batch only when the dataloader is deduplicated across CP.
+    if deduplicate_across_context_parallel:
+        required += ("tp_cp",)
+    # The packed-sequence statistics count the batch only on context-parallel rank 0.
+    if args.log_packed_sequence_stats:
+        required += ("cp",)
     pg_collection = resolve_process_groups(
         pg_collection,
         owner="examples.multimodal.train.get_batch",
-        # The TP x CP group carries the batch only when the dataloader is deduplicated across CP.
-        required=("tp", "pp", "tp_cp") if deduplicate_across_context_parallel else ("tp", "pp"),
+        required=required,
         deprecated_in="0.21",
         removed_in="0.23",
     )
@@ -264,7 +272,7 @@ def get_batch(data_iterator, image_token_index, img_seq_len, pg_collection=None)
     nvtx_range_pop("get_ltor_masks_and_position_ids")
 
     if args.log_packed_sequence_stats and packed_seq_params is not None:
-        update_packed_sequence_stats(sample_lengths, loss_mask)
+        update_packed_sequence_stats(sample_lengths, loss_mask, pg_collection=pg_collection)
 
     return (
         tokens,

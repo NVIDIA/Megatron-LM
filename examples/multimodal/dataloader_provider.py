@@ -168,9 +168,10 @@ def train_valid_test_dataloaders_provider(
         pg_collection: Process groups of the run. Its tensor-, context- and pipeline-parallel
             ranks select the dataloader ranks, and the loaders shard samples over its
             data-parallel group including the GTP weight-remat axis (dp_gtp_remat), or over its
-            data-parallel group (dp) when the collection has no dp_gtp_remat. None falls back to
-            the global parallel state with a ProcessGroupFallbackWarning; that fallback is
-            deprecated.
+            data-parallel group (dp) when the collection has no dp_gtp_remat. Its
+            pipeline-parallel size picks the checkpoint directory the dataloader state is
+            restored from. None falls back to the global parallel state with a
+            ProcessGroupFallbackWarning; that fallback is deprecated.
     """
     args = get_args()
 
@@ -254,11 +255,16 @@ def train_valid_test_dataloaders_provider(
             iteration = get_train_state().iteration
             dp_rank = data_parallel_group.rank()
             strict_load = should_strictly_load_dataloader_state(args)
+            # Read from the directory maybe_save_dataloader_state writes to: the canonical
+            # TP0/PP0 directory of the model's pipeline layout.
             data_save_name = get_checkpoint_name(
                 args.dataloader_save,
                 iteration,
+                pipeline_parallel=pg_collection.pp.size() > 1,
+                tensor_rank=0,
+                pipeline_rank=0,
                 expert_parallel=False,
-                pipeline_rank=0,  # Only the first pipeline parallel rank stores the dataloader checkpoint.
+                expert_rank=0,
                 basename=f"train_dataloader_dprank{dp_rank:03d}.pt",
             )
             if not os.path.exists(data_save_name):

@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import sys
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
@@ -244,6 +245,68 @@ def test_loaders_shard_over_the_collection_data_parallel_group(monkeypatch, stri
     assert worker_config["data_parallel_group"] is pg_collection.dp_gtp_remat
     # The dataloader state is saved per data-parallel rank of the collection.
     assert checkpoint_name.call_args.kwargs["basename"] == "train_dataloader_dprank003.pt"
+
+
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_restore_reads_the_state_file_the_checkpoint_writes(monkeypatch, tmp_path, pp_size):
+    """The provider restores from the file maybe_save_dataloader_state wrote on the same groups.
+
+    Both sides name the file with the real get_checkpoint_name, under strict process-group
+    fallbacks and with every read of the global grid forbidden.
+    """
+    from megatron.training import checkpointing
+
+    args = SimpleNamespace(
+        load="/checkpoints/model",
+        dataloader_save=str(tmp_path),
+        strict_dataloader_state_load=True,
+        num_workers=0,
+        dataloader_seed=0,
+        packing_buffer_size=10000,
+    )
+    loader = MagicMock()
+    monkeypatch.setattr(dataloader_provider, "get_args", lambda: args)
+    monkeypatch.setattr(
+        dataloader_provider, "get_train_state", lambda: SimpleNamespace(iteration=100)
+    )
+    monkeypatch.setattr(dataloader_provider, "is_dataloader_rank", lambda *a, **kw: True)
+    monkeypatch.setattr(dataloader_provider, "WorkerConfig", lambda **kw: kw)
+    monkeypatch.setattr(dataloader_provider, "datasets_provider", lambda *a: (object(), None, None))
+    monkeypatch.setattr(dataloader_provider, "use_new_dataloader_path", lambda: True)
+    monkeypatch.setattr(dataloader_provider, "FileStoreCachePool", lambda **kw: None)
+    monkeypatch.setattr(dataloader_provider, "get_savable_loader", lambda *a, **kw: loader)
+    # The writer reads ranks through these helpers, which ignore the stand-in groups when
+    # torch.distributed is not initialized. Its barriers need real groups.
+    monkeypatch.setattr(checkpointing, "get_pg_rank", lambda group: group.rank())
+    monkeypatch.setattr(checkpointing, "get_pg_size", lambda group: group.size())
+    monkeypatch.setattr(checkpointing.torch.distributed, "barrier", lambda **kwargs: None)
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+
+    with warnings.catch_warnings():
+        process_groups_config.enable_strict_process_group_fallbacks()
+        with forbid_global_process_groups():
+            # Data rank 0 creates the iteration directory. Data rank 3 writes its own file,
+            # then restores from it below.
+            for dp_rank in (0, 3):
+                pg_collection = _pg_collection(pp_size=pp_size, dp_rank=dp_rank, dp_size=4)
+                iterable = SimpleNamespace(save_state=lambda dp_rank=dp_rank: {"dp": dp_rank})
+                checkpointing.maybe_save_dataloader_state(
+                    SimpleNamespace(iterable=iterable),
+                    100,
+                    args.dataloader_save,
+                    tp_group=pg_collection.tp,
+                    pp_group=pg_collection.pp,
+                    dp_group=pg_collection.dp_gtp_remat,
+                    cp_group=pg_collection.cp,
+                )
+            dataloader_provider.train_valid_test_dataloaders_provider(
+                None, task_encoder=object(), pg_collection=pg_collection
+            )
+
+    model_parallel_dir = "mp_rank_00_000" if pp_size > 1 else "mp_rank_00"
+    saved = tmp_path / "iter_0000100" / model_parallel_dir / "train_dataloader_dprank003.pt"
+    assert saved.is_file()
+    loader.restore_state_rank.assert_called_once_with({"dp": 3})
 
 
 def test_loaders_shard_over_the_data_parallel_group_without_gtp_fields(
