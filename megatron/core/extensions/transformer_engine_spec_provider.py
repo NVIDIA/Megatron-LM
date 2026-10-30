@@ -16,17 +16,14 @@ from megatron.core.extensions.transformer_engine import (
     TERowParallelGroupedLinear,
     TERowParallelLinear,
 )
-from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-from megatron.core.models.backends import (
-    BackendSpecProvider,
-    CrossEntropyTarget,
-    select_cross_entropy,
-)
+from megatron.core.models.backends import BackendSpecProvider
+from megatron.core.ops.loss.backends import CrossEntropyTarget, select_cross_entropy
+from megatron.core.ops.norm.fused_layer_norm import FusedLayerNorm
+from megatron.core.ops.norm.torch_norm import LayerNormBuilder
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
 from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import ExpertsBuilder
-from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.utils import get_te_version, is_te_min_version
 
 

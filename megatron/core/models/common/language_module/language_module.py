@@ -7,11 +7,8 @@ import torch
 from torch import Tensor
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.models.backends import (
-    backend_slot,
-    get_backend_from_config,
-    select_cross_entropy,
-)
+from megatron.core.models.backends import backend_slot, get_backend_from_config
+from megatron.core.ops.loss.backends import select_cross_entropy
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,

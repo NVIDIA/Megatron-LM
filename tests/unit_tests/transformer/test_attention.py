@@ -783,7 +783,7 @@ def test_qk_l2_norm_from_config_fallback():
     pytest.importorskip("transformer_engine.pytorch")
     from dataclasses import replace
 
-    from megatron.core.transformer.torch_norm import L2Norm
+    from megatron.core.ops.norm.torch_norm import L2Norm
 
     Utils.initialize_model_parallel(1, 1)
     model_parallel_cuda_manual_seed(123)
@@ -809,7 +809,7 @@ def test_qk_layernorm_spec_config_mismatch_raises():
     pytest.importorskip("transformer_engine")
     from dataclasses import replace
 
-    from megatron.core.transformer.torch_norm import L2Norm
+    from megatron.core.ops.norm.torch_norm import L2Norm
 
     Utils.initialize_model_parallel(1, 1)
     model_parallel_cuda_manual_seed(123)

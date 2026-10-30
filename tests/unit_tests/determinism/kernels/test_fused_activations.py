@@ -4,7 +4,7 @@
 
 Covers every compiled function under ``megatron/core/fusions/`` that is not a Triton or CUDA
 kernel, plus the compiled activations and helpers scattered through ``megatron/core``
-(``activations.py``, ``transformer/utils.py``, ``transformer/torch_norm.py``,
+(``activations.py``, ``transformer/utils.py``, ``ops/norm/torch_norm.py``,
 ``transformer/attention.py``). Inductor picks reduction tilings per shape; the row
 reductions in the weighted backward passes (``torch.sum(weights_grad, dim=-1)``) are the
 only non-elementwise math, so shapes are sized to make those reductions wide.
@@ -23,11 +23,11 @@ from megatron.core.fusions.fused_bias_dropout import (
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
-from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
-from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
+from megatron.core.ops.loss.cross_entropy import vocab_parallel_cross_entropy
+from megatron.core.ops.loss.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+from megatron.core.ops.norm.torch_norm import L2Norm
 from megatron.core.transformer.attention import Attention
-from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.utils import erf_gelu, gelu_impl
 from tests.unit_tests.determinism.kernels.harness import (
     CONTENTION_TOKENS,

@@ -9,7 +9,9 @@ files the PR changes relative to its base:
 1. A changed file that bears a kernel -- it lives in one of ``KERNEL_DIRECTORIES``, matches
    one of ``KERNEL_CONTENT_PATTERNS``, or is already registered -- must be registered in
    the manifest with a bit-exact test (or an explicit ``exempt_reason``). Not overridable:
-   this is the "every kernel has a determinism test" invariant.
+   this is the "every kernel has a determinism test" invariant. A deprecated import path
+   left in a kernel directory by a move only forwards to the module that now holds the
+   kernel, and is not kernel-bearing itself.
 2. When a registered kernel source changes, at least one of its determinism tests must
    change in the same PR, so the test is revisited together with the kernel. Override by
    adding the ``EXEMPT_LABEL`` label to the PR (refactors, comment-only edits) or, locally,
@@ -22,6 +24,7 @@ so importing it does not pull in ``tests.unit_tests``.
 from __future__ import annotations
 
 import argparse
+import ast
 import importlib.util
 import io
 import logging
@@ -73,6 +76,33 @@ def in_kernel_directory(path: str, kernel_directories: tuple[str, ...]) -> bool:
     return any(path.startswith(directory.rstrip("/") + "/") for directory in kernel_directories)
 
 
+def is_deprecated_forwarder(text: str) -> bool:
+    """Return True for a module that only forwards a moved import path to its new module.
+
+    Such a module consists of a docstring, the ``megatron.core.ops._compat`` import and the
+    ``deprecated_module(...)`` call; anything else beside them makes it an ordinary module.
+    """
+    try:
+        body = ast.parse(text).body
+    except SyntaxError:
+        return False
+    forwards = False
+    for node in body:
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+            continue
+        if isinstance(node, ast.ImportFrom) and node.module == "megatron.core.ops._compat":
+            continue
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and getattr(node.value.func, "id", None) == "deprecated_module"
+        ):
+            forwards = True
+            continue
+        return False
+    return forwards
+
+
 def strip_comments_and_strings(text: str) -> str:
     """Blank out comments and string literals of Python source, preserving layout.
 
@@ -118,14 +148,15 @@ def is_kernel_bearing(path: str, manifest: ModuleType, repo_root: Path = REPO_RO
         return ""
     if path.endswith("__init__.py"):
         return ""
-    if in_kernel_directory(path, manifest.KERNEL_DIRECTORIES):
-        return "lives in a kernel directory"
     file = repo_root / path
-    if not file.is_file():
-        return ""
     try:
-        text = file.read_text(errors="replace")
+        text = file.read_text(errors="replace") if file.is_file() else None
     except OSError:
+        text = None
+    if in_kernel_directory(path, manifest.KERNEL_DIRECTORIES):
+        if text is None or not is_deprecated_forwarder(text):
+            return "lives in a kernel directory"
+    if text is None:
         return ""
     if path.endswith((".cu", ".cuh")):
         return "is a CUDA source"

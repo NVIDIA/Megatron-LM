@@ -855,7 +855,7 @@ class TestHybridQKLayernorm:
 
     def test_qk_l2_norm_from_config(self):
         """config.qk_l2_norm=True creates L2Norm q/k layernorm."""
-        from megatron.core.transformer.torch_norm import L2Norm
+        from megatron.core.ops.norm.torch_norm import L2Norm
 
         model = self._build_model(qk_l2_norm=True)
         attn = self._get_attention_layer(model)

@@ -351,12 +351,12 @@ def test_linear_with_grad_accumulation_supports_fp32_output_and_bf16_backward():
 @pytest.mark.parametrize("cross_entropy_fusion", [False, True])
 def test_fp32_linear_output_is_an_inplace_safe_ce_workspace(frozen_weight, cross_entropy_fusion):
     """FP32 output logits should be one owning allocation reusable by cross entropy."""
-    from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
-    from megatron.core.parallel_state import get_tensor_model_parallel_group
-    from megatron.core.tensor_parallel.cross_entropy import (
+    from megatron.core.ops.loss.cross_entropy import (
         VocabParallelCrossEntropy,
         vocab_parallel_cross_entropy,
     )
+    from megatron.core.ops.loss.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+    from megatron.core.parallel_state import get_tensor_model_parallel_group
 
     Utils.initialize_model_parallel(1, 1)
 
