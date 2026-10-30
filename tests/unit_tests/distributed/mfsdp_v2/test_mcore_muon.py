@@ -8,6 +8,7 @@ from torch import nn
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.muon import FsdpMuon
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.optimizer import ChainedOptimizer, MegatronOptimizer
@@ -22,9 +23,6 @@ from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
 )
 from tests.unit_tests.distributed.mfsdp_v2.mcore_utils import destroy_model_parallel
 from tests.unit_tests.test_utilities import Utils
-
-pytest.importorskip("emerging_optimizers")
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.muon import FsdpMuon
 
 
 class TinyModel(MegatronModule):

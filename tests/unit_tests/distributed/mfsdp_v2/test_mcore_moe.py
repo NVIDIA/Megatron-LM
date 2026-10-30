@@ -81,8 +81,6 @@ def test_standard_moe_training_and_clipping(
 ):
     """Compare ordinary MoE training and clipping against an EP=1 reference."""
     process_group_collection, reference_process_group_collection = process_group_collections
-    if optimizer_name == "muon":
-        pytest.importorskip("emerging_optimizers")
     config = TransformerConfig(
         num_layers=len(layer_pattern),
         hidden_size=64,
