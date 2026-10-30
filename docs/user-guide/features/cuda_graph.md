@@ -105,9 +105,8 @@ For scheduler-produced THD batches, use `--use-varlen-dataset`,
 reserved dummy document for token padding. `--max-seqlen-per-dp-cp-rank` sets the
 fixed local token capacity; the source global batch size and micro-batch size 1
 must stay fixed. PP/VPP automatically keeps graph inputs alive until their
-corresponding backward even when packing reduces the number of microbatches;
-`--cuda-graph-dynamic-microbatches` is retained only for compatibility and is no
-longer required. Source-batch ramp-up is unsupported: `--step-batch-size-schedule`
+corresponding backward even when packing reduces the number of microbatches.
+Source-batch ramp-up is unsupported: `--step-batch-size-schedule`
 is rejected for this path, and the deprecated `--rampup-batch-size` is ignored by
 the microbatch calculator. Increasing the source batch would require recapturing
 the graphs with a new capacity. Dynamic CP, EP communication overlap, delayed

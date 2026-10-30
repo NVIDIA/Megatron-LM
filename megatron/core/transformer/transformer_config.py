@@ -1341,13 +1341,6 @@ class TransformerConfig(ModelParallelConfig):
     shapes in eager and TE graph execution. Padding reserves one document slot.
     """
 
-    cuda_graph_dynamic_microbatches: bool = False
-    """Deprecated compatibility flag; packed TE graphs infer microbatch handling.
-
-    No longer required for PP/VPP. Retained for existing configs and CLI recipes;
-    explicitly enabling it still validates the original supported combinations.
-    """
-
     cuda_graph_modules: Union[str, CudaGraphModule, List[str], List[CudaGraphModule]] = "full"
     """Selects training capture coverage within per-layer CUDA graphs (local and
     transformer_engine implementations).
@@ -4045,12 +4038,7 @@ class TransformerConfig(ModelParallelConfig):
             self.sequence_packing_scheduler is not None
             and self.cuda_graph_impl == "transformer_engine"
         )
-        if self.cuda_graph_dynamic_microbatches:
-            assert self.cuda_graph_impl == "transformer_engine"
-            assert self.sequence_packing_scheduler == "dp_balanced"
-        if self.cuda_graph_dynamic_microbatches or (
-            scheduler_te_graphs and self.pipeline_model_parallel_size > 1
-        ):
+        if scheduler_te_graphs and self.pipeline_model_parallel_size > 1:
             assert not self.overlap_moe_expert_parallel_comm and not self.delay_wgrad_compute
             assert not self.moe_paged_stash
         if scheduler_te_graphs:
