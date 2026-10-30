@@ -14,6 +14,7 @@
 
 """Shared runtime state for Megatron-FSDP modules."""
 
+import enum
 from collections.abc import Callable
 from weakref import WeakKeyDictionary
 
@@ -22,6 +23,13 @@ from torch import nn
 
 from .execution_order import ExecutionOrder
 from .runtime_policy import RuntimePolicy
+
+
+class PrefetchOrder(enum.Enum):
+    """How to choose the module order used for prefetching."""
+
+    REGISTRATION = enum.auto()
+    RECORDED = enum.auto()
 
 
 class FsdpContext:
@@ -36,9 +44,7 @@ class FsdpContext:
     use_symmetric_memory: bool
     unify_communication_stream: bool
     caller_managed_grad_sync: bool
-    # Static orders used to drive all-gather prefetch. We may want to switch to
-    # capturing runtime order if static module order proves too fragile. Each
-    # parameter group tracks readiness alongside its gathered weight storage.
+    # Prefetch uses construction order unless execution-order recording is enabled.
     forward_order: ExecutionOrder[nn.Module]
     backward_order: ExecutionOrder[nn.Module]
     # Topology metadata must not keep modules alive after construction.
@@ -55,6 +61,7 @@ class FsdpContext:
         device: torch.device | None = None,
         runtime_policy: RuntimePolicy = RuntimePolicy(),
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
+        prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -68,6 +75,12 @@ class FsdpContext:
                 ranks in each parameter group's 1-D data-parallel mesh and must agree across
                 that mesh. Every TensorAtomic parameter needs an entry; other entries are
                 ignored. Tensors are packed by owner without changing logical parameter order.
+            prefetch_order: ``REGISTRATION`` uses module registration order. ``RECORDED``
+                gathers parameters on demand and records module calls until the first
+                ``post_backward()``. Subsequent passes prefetch using those orders and must
+                repeat them consistently across data-parallel ranks. Recording currently
+                requires the ordinary module hooks; combined 1F1B bypasses them. Discard
+                the context if the recorded pass raises.
         """
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -80,6 +93,7 @@ class FsdpContext:
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
         self.forward_order = ExecutionOrder()
         self.backward_order = ExecutionOrder()
+        self._recording_execution_order = prefetch_order is PrefetchOrder.RECORDED
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
@@ -102,6 +116,11 @@ class FsdpContext:
     def is_finalized(self) -> bool:
         """Whether construction has completed for this context."""
         return self._is_finalized
+
+    @property
+    def is_recording_execution_order(self) -> bool:
+        """Whether module calls are being recorded for subsequent prefetching."""
+        return self._recording_execution_order
 
     def register_module(self, module: nn.Module) -> None:
         """Register a module after its FSDP initialization completes in this context."""
@@ -129,10 +148,12 @@ class FsdpContext:
                 if module not in registered_modules:
                     continue
                 self._module_names[module] = name
-                self.forward_order.append(module)
+                if not self._recording_execution_order:
+                    self.forward_order.append(module)
 
-        for root in reversed(list(self._roots)):
-            _collect_backward_order(root, registered_modules, self.backward_order)
+        if not self._recording_execution_order:
+            for root in reversed(list(self._roots)):
+                _collect_backward_order(root, registered_modules, self.backward_order)
 
         self._registered_modules.clear()
         self.parameter_to_owner = None
@@ -182,6 +203,7 @@ class FsdpContext:
     def post_backward(self) -> None:
         """Finish backward cleanup and automatically synchronize the last microbatch."""
         self._run_delayed_post_backward_callbacks()
+        self._recording_execution_order = False
         # Standalone training can call optimizer.step() immediately after backward.
         # Wait for reductions on the last microbatch; earlier microbatches keep
         # overlapping reduction with compute. MCore calls finish_grad_sync() itself
