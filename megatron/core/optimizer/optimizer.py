@@ -47,6 +47,7 @@ from ..dist_checkpointing.optimizer import (
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..optimizer_param_scheduler import ParamGroupOverride as _ParamGroupOverride
+from ..process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
@@ -184,6 +185,38 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tenso
         setattr(destination, GRAD_NORM_GROUP_ATTR, getattr(source, GRAD_NORM_GROUP_ATTR))
 
 
+def set_duplicate_filter_groups(optimizer, pg_collection: ProcessGroupCollection) -> None:
+    """Set the groups over which ``optimizer`` counts a replicated gradient once.
+
+    Gradient norms and zero counts include a parameter replicated along the tensor-parallel or
+    GTP axis on one rank of that axis only. The groups come from ``pg_collection``, and a field
+    set to ``None`` marks an axis that is off, so no parameter is replicated along it.
+    ``expt_tp`` defaults to ``tp`` when the collection does not set it. An unset ``gtp_remat``
+    or ``expt_gtp_remat`` resolves as the model's layers resolve it
+    (``resolve_gtp_remat_group``), so the filter matches how the weights were sharded.
+
+    An optimizer whose groups are not set this way filters duplicates by the global grid.
+
+    Args:
+        optimizer: The optimizer, or a child optimizer that runs the filters itself.
+        pg_collection: The collection of the model whose parameters ``optimizer`` updates.
+
+    Raises:
+        ValueError: If ``pg_collection`` does not set ``tp``.
+    """
+    groups = vars(pg_collection)
+    if 'tp' not in groups:
+        raise ValueError(
+            "pg_collection must set tp, the tensor-parallel group of the optimizer's "
+            "parameters; set it to None only if tensor parallelism is off"
+        )
+    optimizer.tp_group = groups['tp']
+    optimizer.expert_tp_group = groups.get('expt_tp', optimizer.tp_group)
+    optimizer.gtp_group = resolve_gtp_remat_group(pg_collection, is_expert=False)
+    optimizer.expert_gtp_group = resolve_gtp_remat_group(pg_collection, is_expert=True)
+    optimizer.duplicate_filter_groups_from_collection = True
+
+
 class MegatronOptimizer(ABC):
     """
     Base class for all Megatron optimizers.
@@ -273,6 +306,7 @@ class MegatronOptimizer(ABC):
           - should not be a replica due to (expert) generalized tensor parallelism.
         """
         grads_for_norm = []
+        use_global_fallback = not getattr(self, 'duplicate_filter_groups_from_collection', False)
         for param in params:
             if param_filter is not None and not param_filter(param):
                 continue
@@ -300,11 +334,13 @@ class MegatronOptimizer(ABC):
                 param,
                 tp_group=getattr(self, 'tp_group', None),
                 expert_tp_group=getattr(self, 'expert_tp_group', None),
+                use_global_fallback=use_global_fallback,
             )
             is_not_gtp_duplicate = tensor_parallel.param_is_not_gtp_duplicate(
                 param,
                 gtp_group=getattr(self, 'gtp_group', None),
                 expert_gtp_group=getattr(self, 'expert_gtp_group', None),
+                use_global_fallback=use_global_fallback,
             )
             if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
                 grads_for_norm.append(grad)
@@ -470,6 +506,7 @@ class MegatronOptimizer(ABC):
             expert_tp_group=getattr(self, 'expert_tp_group', None),
             gtp_group=getattr(self, 'gtp_group', None),
             expert_gtp_group=getattr(self, 'expert_gtp_group', None),
+            use_global_fallback=not getattr(self, 'duplicate_filter_groups_from_collection', False),
         )
 
     @abstractmethod
@@ -1909,6 +1946,9 @@ class ChainedOptimizer(MegatronOptimizer):
                 expert_tp_group=getattr(self.chained_optimizers[0], 'expert_tp_group', None),
                 gtp_group=getattr(self.chained_optimizers[0], 'gtp_group', None),
                 expert_gtp_group=getattr(self.chained_optimizers[0], 'expert_gtp_group', None),
+                use_global_fallback=not getattr(
+                    self.chained_optimizers[0], 'duplicate_filter_groups_from_collection', False
+                ),
             )
         else:
             num_zeros_in_grad = 0
