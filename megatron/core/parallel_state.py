@@ -14,7 +14,7 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -36,7 +36,10 @@ except ImportError:
     HAVE_EINOPS = False
 
 if TYPE_CHECKING:
-    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.process_groups_config import (
+        MultiModuleProcessGroupCollection,
+        ProcessGroupCollection,
+    )
 
 # The accessors of the global grid, its rank and size overrides, the virtual-pipeline state and
 # the memory-buffer aliases are deprecated in Megatron Core 0.21 and removed two releases later,
@@ -407,15 +410,29 @@ def get_nccl_options(pg_name, nccl_comm_cfgs):
 
 
 def update_pg_timeout(
-    timeout: timedelta, pg: Optional[torch._C._distributed_c10d.ProcessGroup] = None
+    timeout: timedelta,
+    pg: Optional[torch._C._distributed_c10d.ProcessGroup] = None,
+    pg_collection: Optional[
+        Union["ProcessGroupCollection", "MultiModuleProcessGroupCollection"]
+    ] = None,
 ):
     """Update the timeout for all process groups or a specific process group.
        Synchronize the process groups before updating the timeout.
+
+    With create_group() and destroy_model_parallel(), this function manages the lifetime of the
+    process groups that this module creates. It reads no parallel grid and is not deprecated.
+
     Args:
         timeout(datetime.timedelta): The timeout to set for the process group(s)
         pg(Optional[torch._C._distributed_c10d.ProcessGroup], default=None):
             The process group to update the timeout for.
-            If None, all process groups are updated.
+            If None, all process groups are updated: the default process group and every group
+            created with create_group(), which include the groups that
+            initialize_model_parallel() and build_process_group_collection() build.
+        pg_collection (ProcessGroupCollection or MultiModuleProcessGroupCollection, optional):
+            When pg is None, the groups of this collection are updated as well, including those
+            that were not created with create_group(), such as the groups of a grid that a
+            framework built itself. Each group is updated once.
     """
     if hasattr(torch.distributed.distributed_c10d, "_set_pg_timeout"):
         torch.distributed.barrier(pg)
@@ -423,7 +440,12 @@ def update_pg_timeout(
         try:
             if pg is None:
                 global _global_process_group_list
-                for group in _global_process_group_list:
+                # None stands for the default process group, which create_group() records first;
+                # a run whose groups a framework built may not have called create_group() at all.
+                created_groups = _global_process_group_list or [None]
+                for group in created_groups:
+                    torch.distributed.distributed_c10d._set_pg_timeout(timeout, group)
+                for group in _other_process_groups(pg_collection, created_groups):
                     torch.distributed.distributed_c10d._set_pg_timeout(timeout, group)
             else:
                 torch.distributed.distributed_c10d._set_pg_timeout(timeout, pg)
@@ -435,6 +457,38 @@ def update_pg_timeout(
             raise e
 
 
+def _other_process_groups(pg_collection, known_groups):
+    """Return each process group of pg_collection that is not in known_groups, once.
+
+    The groups are the collection's fields, the groups of its list and dictionary fields, and,
+    for a MultiModuleProcessGroupCollection, those of each module's collection.
+    """
+    # Imported here because process_groups_config imports this module.
+    from megatron.core.process_groups_config import MultiModuleProcessGroupCollection
+
+    if pg_collection is None:
+        return []
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        collections = list(pg_collection.values())
+    else:
+        collections = [pg_collection]
+    seen = {id(group) for group in known_groups}
+    groups = []
+    for collection in collections:
+        for value in vars(collection).values():
+            if isinstance(value, dict):
+                members = list(value.values())
+            elif isinstance(value, list):
+                members = value
+            else:
+                members = [value]
+            for group in members:
+                if isinstance(group, torch.distributed.ProcessGroup) and id(group) not in seen:
+                    seen.add(id(group))
+                    groups.append(group)
+    return groups
+
+
 def create_group(
     ranks=None,
     timeout=None,
@@ -443,7 +497,13 @@ def create_group(
     use_local_synchronization=False,
     group_desc=None,
 ):
-    """Creates a ProcessGroup."""
+    """Create a process group and record it for update_pg_timeout() and destroy_model_parallel().
+
+    Every group that this module builds is created with this function, which passes its
+    arguments to torch.distributed.new_group(). With update_pg_timeout() and
+    destroy_model_parallel(), it manages the lifetime of the process groups that this module
+    creates. It reads no parallel grid and is not deprecated.
+    """
     kwargs = {
         "ranks": ranks,
         "timeout": timeout,
@@ -2291,34 +2351,57 @@ def initialize_model_parallel(
     return pg_collection
 
 
-def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_comm_cfgs=None):
+def create_all_gather_groups(
+    for_expert_parallelism=False, timeout=None, nccl_comm_cfgs=None, pg_collection=None
+):
     """
     Helper function to create all-gather process groups for AG/RS overlap.
 
     Creates separate communicators with the same ranks as data parallel groups
     to enable overlapping all-gather operations with reduce-scatter operations.
 
+    Group creation is collective: every rank of the default process group calls this function,
+    with its own pg_collection. A rank whose collection has no data-parallel group, such as a
+    rank outside the window of a grid built with a rank offset, gets None for that group.
+
     Args:
         for_expert_parallelism (bool): If True, also creates AG group for expert parameters.
         timeout (timedelta): Timeout for distributed collectives.
         nccl_comm_cfgs (dict): NCCL communicator configurations.
+        pg_collection (ProcessGroupCollection): The process groups that the all-gather groups
+            mirror: each all-gather group has the ranks of a ``dp_cp`` group, or, for expert
+            parameters with expert parallelism (``ep`` larger than one rank), of an ``expt_dp``
+            group, so any rank order is supported. Those groups of all ranks' collections must
+            partition the ranks that have one, as a parallel grid's do. Omitting it is
+            deprecated: the groups then come from the global parallel state, with a
+            ProcessGroupFallbackWarning, and the expert groups support only the default
+            tp-cp-ep-dp-pp rank order without a rank offset.
 
     Returns:
         tuple: (dp_cp_ag_group, expt_dp_ag_group) where expt_dp_ag_group is None
                if for_expert_parallelism=False.
 
     Example:
-        # After pg_collection = initialize_model_parallel(...):
-        dp_cp_ag, expt_dp_ag = parallel_state.create_all_gather_groups(
-            for_expert_parallelism=True
-        )
-
+        pg_collection = initialize_model_parallel(...)
         # initialize_model_parallel() returns the registered collection itself, so add the
         # groups to a copy:
         pg_collection = copy.copy(pg_collection)
-        pg_collection.dp_cp_ag = dp_cp_ag
-        pg_collection.expt_dp_ag = expt_dp_ag
+        pg_collection.dp_cp_ag, pg_collection.expt_dp_ag = (
+            parallel_state.create_all_gather_groups(
+                for_expert_parallelism=True, pg_collection=pg_collection
+            )
+        )
     """
+    if pg_collection is not None:
+        return _create_all_gather_groups_from_collection(
+            pg_collection, for_expert_parallelism, timeout, nccl_comm_cfgs
+        )
+    # Imported here because process_groups_config imports this module.
+    from megatron.core.process_groups_config import warn_global_process_group_fallback
+
+    warn_global_process_group_fallback(
+        "create_all_gather_groups", deprecated_in="0.21", removed_in="0.23"
+    )
     if not is_initialized():
         raise RuntimeError(
             "create_all_gather_groups() requires parallel state to be initialized. "
@@ -2371,6 +2454,59 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
                 expt_dp_ag_group = expert_dp_ag
 
     return dp_cp_ag_group, expt_dp_ag_group
+
+
+def _create_all_gather_groups_from_collection(
+    pg_collection, for_expert_parallelism, timeout, nccl_comm_cfgs
+):
+    """Create the all-gather groups of create_all_gather_groups() from pg_collection's groups.
+
+    The ``dp_cp`` groups of the ranks' collections, and their ``expt_dp`` groups, must each
+    partition the ranks that have one, as the groups of a parallel grid do.
+    """
+
+    def global_ranks(group):
+        return None if group is None else torch.distributed.get_process_group_ranks(group)
+
+    with_experts = (
+        for_expert_parallelism and pg_collection.ep is not None and pg_collection.ep.size() > 1
+    )
+    own_ranks = (
+        global_ranks(pg_collection.dp_cp),
+        global_ranks(pg_collection.expt_dp) if with_experts else None,
+    )
+    own_leaders = tuple(None if ranks is None else min(ranks) for ranks in own_ranks)
+    # Each rank knows only its own groups, but every rank creates every group, in the same
+    # order. The groups partition the ranks, so a group is the ranks that share its lowest
+    # rank: gather that rank of each rank's groups, a constant amount of data per rank.
+    all_leaders = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(all_leaders, own_leaders)
+
+    all_gather_groups = []
+    for index, pg_name, group_desc in (
+        (0, "dp_cp", "DATA_PARALLEL_GROUP_WITH_CP_AG"),
+        (1, "ep_dp", "EXPERT_DATA_PARALLEL_GROUP_AG"),
+    ):
+        members = {}
+        for rank, leaders in enumerate(all_leaders):
+            if leaders[index] is not None:
+                members.setdefault(leaders[index], []).append(rank)
+        all_gather_group = None
+        for leader in sorted(members):
+            # A rank's own group takes the ranks of the group it mirrors. They equal
+            # members[leader], except with the fake backend, whose all-gather returns the
+            # rank's own entry from every rank.
+            own = leader == own_leaders[index]
+            group = create_group(
+                own_ranks[index] if own else members[leader],
+                timeout=timeout,
+                pg_options=get_nccl_options(pg_name, nccl_comm_cfgs or {}),
+                group_desc=group_desc,
+            )
+            if own:
+                all_gather_group = group
+        all_gather_groups.append(all_gather_group)
+    return tuple(all_gather_groups)
 
 
 def is_initialized():
