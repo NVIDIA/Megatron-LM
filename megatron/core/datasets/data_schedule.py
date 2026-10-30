@@ -553,6 +553,10 @@ def wrap_data_iterator(
         **scheduler_kwargs,
     )
 
+    adapter = getattr(config, "sequence_packing_data_adapter", None)
+    if adapter is not None:
+        return adapter(data_iterator, num_microbatches, scheduler, pg_collection)
+
     (
         new_data_iterator,
         num_micro_batches,

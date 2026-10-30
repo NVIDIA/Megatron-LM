@@ -2,13 +2,17 @@
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Callable, ContextManager, Literal, Optional
+from typing import TYPE_CHECKING, Any, Callable, ContextManager, Iterator, Literal, Optional
 
 import torch
 
 from megatron.core.tensor_parallel.gtp_parallel_layout import (
     resolve_tensor_parallel_sequence_shards,
 )
+
+if TYPE_CHECKING:
+    from megatron.core.datasets.data_schedule import BasePackingScheduler
+    from megatron.core.process_groups_config import ProcessGroupCollection
 
 
 def resolve_tensor_parallel_weight_shards(
@@ -164,6 +168,21 @@ class ModelParallelConfig:
     Scheduler for sequence packing and dynamic context parallel.
     dp_balanced: DP-balanced scheduler for sequence packing.
     default_dynamic_cp: Packing-aware scheduler with per-microbatch CP group sizes.
+    """
+
+    sequence_packing_data_adapter: Optional[
+        Callable[
+            [Iterator, int, "BasePackingScheduler", Optional["ProcessGroupCollection"]],
+            tuple[Any, int, float, float],
+        ]
+    ] = field(default=None, init=False, repr=False)
+    """Optional host adapter for source batches outside the text-only reroute schema.
+
+    Receives the source iterator, requested input microbatch count, configured
+    scheduler, and process groups. Returns a prepared iterator, actual decoder
+    round count, source token sum, and sum of squared source lengths. The host
+    owns input-bin/sample accounting separately from the returned round count.
+    Register explicitly; the default uses the normal text scheduler unchanged.
     """
 
     pad_packed_seq_alignment: int | Literal['max'] | None = None

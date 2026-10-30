@@ -4,8 +4,9 @@ import abc
 import functools
 import importlib
 import inspect
-from dataclasses import dataclass, field, is_dataclass
+from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
+from dataclasses import is_dataclass
 from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar, runtime_checkable
 
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -21,6 +22,7 @@ _RUNTIME_FIELDS = frozenset(
         "post_wrap_hooks",
         "timers",
         "finalize_model_grads_func",
+        "sequence_packing_data_adapter",
         "grad_scale_func",
         "moe_grad_scale_func",
         "mtp_grad_scale_func",

@@ -1307,7 +1307,9 @@ def validate_args(args, defaults={}):
 
     if args.dynamic_context_parallel:
         assert not args.use_megatron_fsdp, 'Dynamic context parallelism not supported with Megatron FSDP'
-        assert args.dataloader_type == 'single', 'Dynamic context parallelism only supported with single dataloader type'
+        assert args.dataloader_type in ('single', 'external'), (
+            'Dynamic context parallelism requires a single or externally provided dataloader'
+        )
         if args.sequence_packing_scheduler is None:
             args.sequence_packing_scheduler = 'default_dynamic_cp'
         if args.sequence_packing_scheduler != 'default_dynamic_cp':
