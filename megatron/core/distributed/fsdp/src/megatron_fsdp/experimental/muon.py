@@ -23,7 +23,7 @@ from emerging_optimizers import utils as eo_utils
 from emerging_optimizers.orthogonalized_optimizers.muon import Muon
 
 from .dbuffer import DBuffer
-from .gather_scatter import gather, scatter
+from .gather_scatter import find_split_tensors, gather, scatter
 from .owner_planning import assign_owner_work
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 
@@ -82,9 +82,11 @@ class FsdpMuon(Muon):
     Momentum remains sharded. Owner assignments balance orthogonalization across a
     fixed set of buffers and are computed during initialization. Each step gathers,
     orthogonalizes, and scatters each buffer on the caller's CUDA stream. Transfers are
-    asynchronous: the gathers of the next ``lookahead`` buffers are posted before the current one
-    is orthogonalized, and a buffer's updates are applied after ``lookahead`` later buffers have
-    been scattered, so each scatter overlaps their Newton-Schulz.
+    asynchronous: after a buffer is orthogonalized, the gathers of the next ``lookahead`` buffers
+    that need communication are posted, and such a buffer's updates are applied after
+    ``lookahead`` later ones have been scattered, so each scatter overlaps their Newton-Schulz.
+    A buffer whose tensors all sit on one rank needs no communication and is handled when its
+    turn comes.
     Full matrices exist only on their assigned owners.
     The FSDP groups may use different meshes; owners are planned separately for each mesh.
     Parameters and optimizer groups must have the same order on every DP rank, and
@@ -103,10 +105,10 @@ class FsdpMuon(Muon):
 
     Args:
         *args: Positional arguments passed unchanged to EO's ``Muon``.
-        lookahead: Number of buffers whose gathers are posted ahead of the one being
-            orthogonalized, and whose scatters are posted before a buffer's updates are applied.
-            Each buffer in flight adds its momentum inputs, full tensors, and received updates to
-            the peak memory. Zero gives the non-overlapped order.
+        lookahead: Number of buffers that need communication whose gathers are posted ahead of
+            the one being orthogonalized, and whose scatters are posted before a buffer's updates
+            are applied. Each buffer in flight adds its momentum inputs, full tensors, and received
+            updates to the peak memory. Zero gives the non-overlapped order.
         **kwargs: Keyword arguments passed unchanged to EO's ``Muon``.
     """
 
@@ -147,6 +149,11 @@ class FsdpMuon(Muon):
                 )
             )
         self._validate_parameter_groups()
+        # Tensors that span ranks need communication; a group with none of them has none.
+        self._split_tensors: dict[FsdpParameterGroup, frozenset[int]] = {
+            a.fsdp_group: find_split_tensors(a.fsdp_group.main_weight)
+            for a in self._fsdp_group_assignments
+        }
 
     def _validate_parameter_groups(self) -> None:
         """Validate optimizer parameters and the FSDP buffers that contain them."""
@@ -165,6 +172,7 @@ class FsdpMuon(Muon):
             raise ValueError("closure is not supported")
 
         groups: list[tuple[FsdpParameterGroup, dict[int, int], dict[int, int]]] = []
+        has_comm: list[bool] = []
         for assignment in self._fsdp_group_assignments:
             fsdp_group: FsdpParameterGroup = assignment.fsdp_group
             active: dict[int, int] = {
@@ -176,25 +184,47 @@ class FsdpMuon(Muon):
                 continue
             owners = {i: assignment.tensor_to_owner_rank[i] for i in active}
             groups.append((fsdp_group, active, owners))
+            has_comm.append(not self._split_tensors[fsdp_group].isdisjoint(active))
+
+        # The Newton-Schulz of a group without communication needs no gather. Split those groups
+        # evenly between both ends: the first ones hide the first gathers and the last ones hide
+        # the last scatters. The groups with communication keep their order in between.
+        free = [i for i in range(len(groups)) if not has_comm[i]]
+        comm = [i for i in range(len(groups)) if has_comm[i]]
+        half = (len(free) + 1) // 2
+        order = free[:half] + comm + free[half:]
+        groups = [groups[i] for i in order]
+        has_comm = [has_comm[i] for i in order]
 
         # Software pipeline over groups. While a group is orthogonalized, the gathers of the next
-        # `lookahead` groups and the scatters of the previous `lookahead` groups are in flight, so
-        # communication overlaps Newton-Schulz and only those groups hold buffers. Every rank posts
-        # transfers in the same order.
-        gathers = [self._gather(*group) for group in groups[: self.lookahead]]
+        # `lookahead` groups with communication and the scatters of the previous `lookahead` ones
+        # are in flight, so communication overlaps Newton-Schulz and only those groups hold
+        # buffers. A group without communication computes its momentum when its turn comes and
+        # applies its updates right after, so it holds nothing in between. The gathers are posted
+        # after the Newton-Schulz of the current group is enqueued, so a leading group without
+        # communication runs while they are posted. Every rank posts the transfers of the groups
+        # with communication in the same order, whatever its groups without communication are.
+        gathers: dict[int, _Transfer] = {}
         scatters: list[_Transfer] = []
-        for i in range(len(groups)):
-            if i + self.lookahead < len(groups):
-                gathers.append(self._gather(*groups[i + self.lookahead]))
-            gathered = gathers.pop(0)
+        ahead = 0  # Groups before this position are gathered or need no gather ahead of time.
+        for i, group in enumerate(groups):
+            gathered = gathers.pop(i, None) or self._gather(*group)
             gathered.wait()
             self._orthogonalize_updates(
                 gathered.fsdp_group, gathered.tensor_to_optimizer_group_index, gathered.full_updates
             )
-            scatters.append(self._scatter(gathered))
+            ahead = max(ahead, i + 1)
+            while ahead < len(groups) and len(gathers) < self.lookahead:
+                if has_comm[ahead]:
+                    gathers[ahead] = self._gather(*groups[ahead])
+                ahead += 1
+            if has_comm[i]:
+                scatters.append(self._scatter(gathered))
+                if len(scatters) > self.lookahead:
+                    self._apply_scattered_updates(scatters.pop(0))
+            else:
+                self._apply_scattered_updates(self._scatter(gathered))
             del gathered  # Drop the gather, and with it the momentum inputs it holds.
-            if len(scatters) > self.lookahead:
-                self._apply_scattered_updates(scatters.pop(0))
         for scattered in scatters:
             self._apply_scattered_updates(scattered)
 

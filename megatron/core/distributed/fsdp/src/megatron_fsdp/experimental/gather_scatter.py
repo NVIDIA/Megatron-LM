@@ -33,11 +33,23 @@ def _get_sorted_rank_ranges(buffer: DBuffer) -> dict[int, Range]:
     mesh = buffer.mesh
     if mesh.ndim != 1 or not isinstance(buffer.placements[0], Shard):
         raise NotImplementedError("Owner gather/scatter requires a 1-D sharded DBuffer.")
-    rank_ranges = [
-        (rank, buffer.layout.get_rank_range(mesh, buffer.placements, rank))
-        for rank in mesh.mesh.tolist()
-    ]
-    return dict(sorted(rank_ranges, key=lambda item: item[1].start))
+    rank_ranges = buffer.layout.get_rank_ranges(mesh, buffer.placements)
+    return dict(sorted(rank_ranges.items(), key=lambda item: item[1].start))
+
+
+def find_split_tensors(buffer: DBuffer) -> frozenset[int]:
+    """Return the indices of tensors whose elements span more than one rank.
+
+    Gather and scatter post P2P only for these tensors. The result depends only on the layout,
+    so every rank of the mesh computes the same set.
+    """
+    rank_ranges = _get_sorted_rank_ranges(buffer).values()
+    layout = buffer.layout
+    return frozenset(
+        i
+        for i in range(len(layout.tensor_shapes))
+        if sum(intersect_ranges(layout.get_tensor_range(i), r).numel > 0 for r in rank_ranges) > 1
+    )
 
 
 def gather(
