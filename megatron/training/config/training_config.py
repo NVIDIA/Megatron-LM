@@ -233,55 +233,11 @@ class SchedulerConfig:
     wsd_decay_steps: int | None = field(init=False, default=None)
     """Number of samples to decay WSD weight decay. Calculated at runtime."""
 
-    def validate_run(
-        self,
-        *,
-        train_iters: int | None,
-        train_samples: int | None,
-        skip_train: bool,
-        weight_decay: float | None,
-    ) -> None:
-        """Check this section against the rest of the run it belongs to."""
-        if train_iters and not skip_train:
-            # If we use iteration-based training, make sure the
-            # sample-based options are off.
-            assert train_samples is None, \
-                'expected iteration-based training'
-            assert self.lr_decay_samples is None, \
-                'expected iteration-based learning rate decay'
-            assert self.lr_warmup_samples == 0, \
-                'expected iteration-based learning rate warmup'
-            if self.lr_warmup_fraction is not None:
-                assert self.lr_warmup_iters == 0, \
-                    'can only specify one of lr-warmup-fraction and lr-warmup-iters'
-
-        # Sample-based training.
-        if train_samples and not skip_train:
-            # If we use sample-based training, make sure the
-            # iteration-based options are off.
-            assert train_iters is None, \
-                'expected sample-based training'
-            assert self.lr_decay_iters is None, \
-                'expected sample-based learning rate decay'
-            assert self.lr_warmup_iters == 0, \
-                'expected sample-based learning rate warmup'
-            if self.lr_warmup_fraction is not None:
-                assert self.lr_warmup_samples == 0, \
-                    'can only specify one of lr-warmup-fraction ' \
-                    'and lr-warmup-samples'
-
-        if self.weight_decay_incr_style == "constant":
-            for w in (self.start_weight_decay, self.end_weight_decay):
-                assert w is None or w == weight_decay
-        else:
+    def validate(self) -> None:
+        """Check scheduler-local constraints without changing configuration."""
+        if self.weight_decay_incr_style != "constant":
             assert self.start_weight_decay is not None
             assert self.end_weight_decay is not None
-
-    def finalize_scheduler_config(self, weight_decay: float | None) -> None:
-        """Finalize the scheduler configuration after validation and before training starts."""
-        if self.weight_decay_incr_style == "constant":
-            self.start_weight_decay = weight_decay
-            self.end_weight_decay = weight_decay
 
 
 @dataclass(kw_only=True)

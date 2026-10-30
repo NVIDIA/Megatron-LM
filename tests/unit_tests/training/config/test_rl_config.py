@@ -184,8 +184,41 @@ RUN = dict(
     load_optim=True,
     save_interval=None,
     exit_interval=None,
-    separate_inference_model=False,
 )
+
+
+def _run_container(rl, **values):
+    """Build real config owners for the cross-section behavior matrix."""
+    from megatron.core.optimizer import OptimizerConfig
+    from megatron.training.config import (
+        CheckpointConfig,
+        LoggerConfig,
+        PretrainConfigContainer,
+        SchedulerConfig,
+        TrainingConfig,
+        ValidationConfig,
+    )
+
+    return PretrainConfigContainer(
+        rl=rl,
+        model=types.SimpleNamespace(
+            transformer=types.SimpleNamespace(cuda_graph_impl=values["cuda_graph_impl"])
+        ),
+        train=TrainingConfig(
+            micro_batch_size=values["micro_batch_size"],
+            global_batch_size=values["global_batch_size"],
+            train_iters=values["train_iters"],
+            train_samples=values["train_samples"],
+            exit_interval=values["exit_interval"],
+        ),
+        validation=ValidationConfig(skip_train=values["skip_train"]),
+        checkpoint=CheckpointConfig(
+            load_optim=values["load_optim"], save_interval=values["save_interval"]
+        ),
+        optimizer=OptimizerConfig(),
+        scheduler=SchedulerConfig(),
+        logger=LoggerConfig(),
+    )
 
 
 @pytest.mark.parametrize(
@@ -215,20 +248,13 @@ RUN = dict(
         (dict(rl_rollout_only=True), dict(train_iters=0), "needs --train-iters"),
         (dict(), dict(skip_train=True), "--rl-rollout-only collects"),
         (dict(rl_rollout_only=True), dict(skip_train=True), "--rl-rollout-only collects"),
-        (
-            dict(
-                rl_offload_inference_model_weights=True, rl_inference_model_unified_memory_level=1
-            ),
-            dict(),
-            "requires a separate inference model",
-        ),
     ],
 )
 def test_validate_run_rejects_runs_inconsistent_with_the_section(rl_kwargs, run_overrides, match):
     # 4 x 3 samples per iteration over 2 GRPO iterations: 24 samples, 2 batches of 12.
     cfg = RLConfig(perform_rl_step=True, **GRPO_4x3, **rl_kwargs)
     with pytest.raises(ValueError, match=match):
-        cfg.validate_run(**{**RUN, **run_overrides})
+        _run_container(cfg, **{**RUN, **run_overrides}).validate()
 
 
 @pytest.mark.parametrize(
@@ -271,9 +297,11 @@ def test_validate_run_at_every_call_site():
     cfg = RLConfig(
         perform_rl_step=True, rl_training_cuda_graphs=True, rl_use_sequence_packing=True, **GRPO_4x3
     )
-    cfg.validate_run(**{**RUN, "save_interval": 4, "exit_interval": 2})
-    cfg.validate_run(**{**RUN, "cuda_graph_impl": None})
-    RLConfig(rl_use_sequence_packing=True).validate_run(**{**RUN, "micro_batch_size": 4})
+    _run_container(cfg, **{**RUN, "save_interval": 4, "exit_interval": 2}).validate()
+    _run_container(cfg, **{**RUN, "cuda_graph_impl": None}).validate()
+    _run_container(
+        RLConfig(rl_use_sequence_packing=True), **{**RUN, "micro_batch_size": 4}
+    ).validate()
     # The weight-offload rule needs the deployment: it passes with a separate model and is skipped
     # when the caller cannot see the inference shards.
     offload_weights = RLConfig(
@@ -282,27 +310,31 @@ def test_validate_run_at_every_call_site():
         rl_inference_model_unified_memory_level=1,
         **GRPO_4x3,
     )
-    offload_weights.validate_run(**{**RUN, "separate_inference_model": True})
-    offload_weights.validate_run(**{**RUN, "separate_inference_model": None})
+    _run_container(offload_weights, **RUN).validate()
 
-    cfg.validate_run(**{**RUN, "global_batch_size": None})
+    _run_container(cfg, **{**RUN, "global_batch_size": None}).validate()
     # The RL modes: rollout-only with or without the optimizer (either horizon form), and
     # eval-only (--skip-train with no horizon, including the --train-iters 0 spelling).
     rollout_only = RLConfig(perform_rl_step=True, rl_rollout_only=True, **GRPO_4x3)
-    rollout_only.validate_run(**RUN)
-    rollout_only.validate_run(**{**RUN, "load_optim": False})
-    rollout_only.validate_run(**{**RUN, "train_iters": None, "train_samples": 120})
+    _run_container(rollout_only, **RUN).validate()
+    _run_container(rollout_only, **{**RUN, "load_optim": False}).validate()
+    _run_container(rollout_only, **{**RUN, "train_iters": None, "train_samples": 120}).validate()
     # Offloading the optimizer needs one: accepted while it stays resident, rejected above when
     # --no-load-optim leaves it out.
-    RLConfig(
-        perform_rl_step=True,
-        rl_rollout_only=True,
-        rl_offload_optimizer_during_inference=True,
-        **GRPO_4x3,
-    ).validate_run(**RUN)
-    cfg.validate_run(**{**RUN, "skip_train": True, "train_iters": None})
-    cfg.validate_run(**{**RUN, "skip_train": True, "train_iters": 0})
-    RLConfig(rl_rollout_only=True).validate_run(**RUN)  # accepted while the RL loop is off
+    _run_container(
+        RLConfig(
+            perform_rl_step=True,
+            rl_rollout_only=True,
+            rl_offload_optimizer_during_inference=True,
+            **GRPO_4x3,
+        ),
+        **RUN,
+    ).validate()
+    _run_container(cfg, **{**RUN, "skip_train": True, "train_iters": None}).validate()
+    _run_container(cfg, **{**RUN, "skip_train": True, "train_iters": 0}).validate()
+    _run_container(
+        RLConfig(rl_rollout_only=True), **RUN
+    ).validate()  # accepted while the RL loop is off
 
     # Through the container: the sections supply the inputs.
     # The CUDA-graph rule reads the model's transformer section; skipped for a model without one.
@@ -346,7 +378,7 @@ def test_validate_run_at_every_call_site():
     )
     cuda_graph_container.validate()
     assert not cuda_graph_container.ddp.grad_buffer_offload
-    cuda_graph_container.rl.finalize_ddp_config(cuda_graph_container.ddp)
+    cuda_graph_container._finalize_rl_ddp()
     assert not cuda_graph_container.ddp.grad_buffer_offload
     explicit_layout_container = container(rl=RLConfig())
     explicit_layout_container.ddp.grad_buffer_offload = True
@@ -443,11 +475,13 @@ def test_ddp_layout_validation_and_finalization(
         rl_training_cuda_graphs=cuda_graphs,
     )
     ddp = DistributedDataParallelConfig(grad_buffer_offload=explicit_layout)
+    container = _run_container(cfg, **{**RUN, "global_batch_size": 8})
+    container.ddp = ddp
     before = dataclasses.asdict(ddp)
     for _ in range(2):
-        cfg.validate_ddp_config(ddp)
+        container.validate()
         assert dataclasses.asdict(ddp) == before
-    cfg.finalize_ddp_config(ddp)
+    container._finalize_rl_ddp()
     assert ddp.grad_buffer_offload == (
         explicit_layout or (perform_rl_step and offload and not cuda_graphs)
     )
@@ -463,9 +497,11 @@ def test_ddp_finalization_rejects_aliasing_before_mutation():
     ddp = DistributedDataParallelConfig(
         fp8_param_gather=True, reuse_grad_buf_for_mxfp8_param_ag=True
     )
+    container = _run_container(cfg, **{**RUN, "global_batch_size": 8})
+    container.ddp = ddp
     before = dataclasses.asdict(ddp)
     with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
-        cfg.finalize_ddp_config(ddp)
+        container._finalize_rl_ddp()
     assert dataclasses.asdict(ddp) == before
 
 
@@ -474,9 +510,11 @@ def test_ddp_finalization_preserves_subclass_fields():
 
     cfg = RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
     ddp = TorchFullyShardedDataParallelConfig(reshard_after_forward=False)
+    container = _run_container(cfg, **{**RUN, "global_batch_size": 8})
+    container.ddp = ddp
     before = dataclasses.asdict(ddp)
-    cfg.validate_ddp_config(ddp)
-    cfg.finalize_ddp_config(ddp)
+    container.validate()
+    container._finalize_rl_ddp()
     assert type(ddp) is TorchFullyShardedDataParallelConfig
     assert dataclasses.asdict(ddp) == {**before, "grad_buffer_offload": True}
 
@@ -499,8 +537,8 @@ def test_model_setup_uses_owned_ddp_config(
         perform_rl_step=perform_rl_step, rl_offload_optimizer_during_inference=True
     )
     ddp = run_config.ddp
-    finalize = Mock(wraps=run_config.rl.finalize_ddp_config)
-    monkeypatch.setattr(run_config.rl, "finalize_ddp_config", finalize)
+    finalize = Mock(wraps=run_config._finalize_rl_ddp)
+    monkeypatch.setattr(run_config, "_finalize_rl_ddp", finalize)
     monkeypatch.setattr(training, "get_args", lambda: args)
     monkeypatch.setattr(training, "get_timers", Mock())
     monkeypatch.setattr(training, "get_one_logger", lambda: None)
@@ -517,7 +555,7 @@ def test_model_setup_uses_owned_ddp_config(
         assert ddp.grad_buffer_offload is perform_rl_step
         assert run_config.ddp is ddp
         if perform_rl_step:
-            finalize.assert_called_once_with(ddp)
+            finalize.assert_called_once_with()
         else:
             finalize.assert_not_called()
         raise ReachedConstruction

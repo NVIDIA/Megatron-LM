@@ -1876,20 +1876,70 @@ def validate_args(args, defaults={}):
     if args.skip_train and not args.no_load_optim:
         args.no_load_optim = True
         warn_rank_0('enabling --no-load-optim when skipping training.')
-    rl_cfg.validate_run(
-        cuda_graph_impl=args.cuda_graph_impl,
-        micro_batch_size=args.micro_batch_size,
-        global_batch_size=args.global_batch_size,
-        train_iters=args.train_iters,
-        train_samples=args.train_samples,
-        skip_train=args.skip_train,
-        load_optim=not args.no_load_optim,
-        save_interval=args.save_interval,
-        exit_interval=args.exit_interval,
-        separate_inference_model=rl_cfg.uses_separate_inference_model(
+    # Pre-container CLI compatibility checks. Native cross-section validation lives in
+    # PretrainConfigContainer; keep launch-only inference deployment checks here.
+    if rl_cfg.perform_rl_step:
+        # Training CGs only make sense if we build any CGs.
+        if args.cuda_graph_impl == "none" and rl_cfg.rl_training_cuda_graphs:
+            raise ValueError("--rl-training-cuda-graphs is set but no CUDA graphs are being built.")
+
+        if rl_cfg.rl_use_sequence_packing and args.micro_batch_size != 1:
+            raise ValueError(
+                "micro_batch_size must be 1 when using sequence packing. To increase compute per "
+                "micro batch increase the sequence length."
+            )
+
+        if args.global_batch_size is not None:
+            # Ensure that collected samples are a multiple of the global batch size.
+            samples_per_inference_iteration = rl_cfg.grpo_samples_per_iteration * rl_cfg.grpo_iterations
+            if samples_per_inference_iteration % args.global_batch_size != 0:
+                raise ValueError(
+                    "grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by "
+                    "global_batch_size"
+                )
+            # Only exit/checkpoint on iterations where we generate data: generated
+            # data cannot currently be checkpointed.
+            iterations_per_inference_iteration = samples_per_inference_iteration // args.global_batch_size
+            if args.exit_interval is not None and args.exit_interval % iterations_per_inference_iteration != 0:
+                raise ValueError(
+                    "exit_interval should be divisible by number of global batches per inference "
+                    "iteration."
+                )
+            if args.save_interval is not None and args.save_interval % iterations_per_inference_iteration != 0:
+                raise ValueError(
+                    "save_interval should be divisible by number of global batches per inference "
+                    "iteration."
+                )
+
+        has_horizon = bool(args.train_iters) or bool(args.train_samples)
+        if rl_cfg.rl_rollout_only and not has_horizon:
+            raise ValueError(
+                "--rl-rollout-only iterates the RL loop; it needs --train-iters or --train-samples."
+            )
+        if args.skip_train and (has_horizon or rl_cfg.rl_rollout_only):
+            # Unlike pretraining, RL rejects a horizon under --skip-train: that spelling used to
+            # collect rollouts, and evaluating instead would change a launch's meaning silently.
+            raise ValueError(
+                "--skip-train only evaluates: drop --train-iters/--train-samples; "
+                "--rl-rollout-only collects rollouts without updates."
+            )
+        if rl_cfg.rl_offload_optimizer_during_inference and (
+            args.skip_train or (rl_cfg.rl_rollout_only and args.no_load_optim)
+        ):
+            raise ValueError(
+                "--skip-train and --rl-rollout-only --no-load-optim build no optimizer; "
+                "--rl-offload-optimizer-during-inference has nothing to offload."
+            )
+
+        # Offloading inference weights that are the training weights would be a no-op.
+        if not rl_cfg.uses_separate_inference_model(
             context_parallel_size=args.context_parallel_size, inference_shards=args.inference_shards
-        ),
-    )
+        ) and rl_cfg.rl_offload_inference_model_weights:
+            raise ValueError(
+                "--rl-offload-inference-model-weights requires a separate inference model. "
+                "This flag is only useful when doing refit since the weights are shared with "
+                "the training model."
+            )
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:

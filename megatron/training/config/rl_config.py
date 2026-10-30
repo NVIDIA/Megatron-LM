@@ -2,12 +2,9 @@
 
 import argparse
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 from megatron.core.inference.shards_spec import spec_declares_disaggregation
-
-if TYPE_CHECKING:
-    from megatron.core.distributed import DistributedDataParallelConfig
 
 SubmissionGranularity = Literal["R", "G", "B"]
 ConsumptionGranularity = Literal["G", "B"]
@@ -265,28 +262,6 @@ class RLConfig:
             and not self.rl_training_cuda_graphs
         )
 
-    def validate_ddp_config(self, ddp_config: "DistributedDataParallelConfig") -> None:
-        """Check the requested and RL-required layouts without changing either config."""
-        if (
-            ddp_config.grad_buffer_offload or self.requires_grad_buffer_offload
-        ) and ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
-            raise ValueError(
-                "Gradient-buffer offload is incompatible with "
-                "--reuse-grad-buf-for-mxfp8-param-ag: "
-                "parameters share the gradient-buffer storage that offload releases."
-            )
-
-    def finalize_ddp_config(self, ddp_config: "DistributedDataParallelConfig") -> None:
-        """Apply the RL layout during container finalization, before DDP allocates buffers.
-
-        Unlike validation, this updates the run's owned config so checkpoint metadata
-        and model construction see the same effective layout. Do not change the RL
-        offload policy after model setup; the buffer layout is fixed at construction.
-        """
-        self.validate_ddp_config(ddp_config)
-        if self.requires_grad_buffer_offload:
-            ddp_config.grad_buffer_offload = True
-
     def uses_separate_inference_model(
         self, *, context_parallel_size: int, inference_shards: str | None
     ) -> bool:
@@ -300,83 +275,3 @@ class RLConfig:
             or self.rl_inference_expert_tensor_model_parallel_size is not None
             or context_parallel_size > 1
         )
-
-    def validate_run(
-        self,
-        *,
-        cuda_graph_impl: str | None,
-        micro_batch_size: int | None,
-        global_batch_size: int | None,
-        train_iters: int | None,
-        train_samples: int | None,
-        skip_train: bool,
-        load_optim: bool,
-        save_interval: int | None,
-        exit_interval: int | None,
-        separate_inference_model: bool | None,
-    ) -> None:
-        """Check this section against the rest of the run it belongs to."""
-        if not self.perform_rl_step:
-            return
-
-        # Training CGs only make sense if we build any CGs.
-        if cuda_graph_impl == "none" and self.rl_training_cuda_graphs:
-            raise ValueError("--rl-training-cuda-graphs is set but no CUDA graphs are being built.")
-
-        if self.rl_use_sequence_packing and micro_batch_size != 1:
-            raise ValueError(
-                "micro_batch_size must be 1 when using sequence packing. To increase compute per "
-                "micro batch increase the sequence length."
-            )
-
-        # A native config can leave this default unresolved during user validation.
-        # Framework finalization repeats these checks with the resolved batch size.
-        if global_batch_size is not None:
-            # Ensure that collected samples are a multiple of the global batch size.
-            samples_per_inference_iteration = self.grpo_samples_per_iteration * self.grpo_iterations
-            if samples_per_inference_iteration % global_batch_size != 0:
-                raise ValueError(
-                    "grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by "
-                    "global_batch_size"
-                )
-            # Only exit/checkpoint on iterations where we generate data: generated
-            # data cannot currently be checkpointed.
-            iterations_per_inference_iteration = samples_per_inference_iteration // global_batch_size
-            if exit_interval is not None and exit_interval % iterations_per_inference_iteration != 0:
-                raise ValueError(
-                    "exit_interval should be divisible by number of global batches per inference "
-                    "iteration."
-                )
-            if save_interval is not None and save_interval % iterations_per_inference_iteration != 0:
-                raise ValueError(
-                    "save_interval should be divisible by number of global batches per inference "
-                    "iteration."
-                )
-
-        has_horizon = bool(train_iters) or bool(train_samples)
-        if self.rl_rollout_only and not has_horizon:
-            raise ValueError(
-                "--rl-rollout-only iterates the RL loop; it needs --train-iters or --train-samples."
-            )
-        if skip_train and (has_horizon or self.rl_rollout_only):
-            # Unlike pretraining, RL rejects a horizon under --skip-train: that spelling used to
-            # collect rollouts, and evaluating instead would change a launch's meaning silently.
-            raise ValueError(
-                "--skip-train only evaluates: drop --train-iters/--train-samples; "
-                "--rl-rollout-only collects rollouts without updates."
-            )
-        if self.rl_offload_optimizer_during_inference and (
-            skip_train or (self.rl_rollout_only and not load_optim)
-        ):
-            raise ValueError(
-                "--skip-train and --rl-rollout-only --no-load-optim build no optimizer; "
-                "--rl-offload-optimizer-during-inference has nothing to offload."
-            )
-
-        # Offloading inference weights that are the training weights would be a no-op.
-        if separate_inference_model is False and self.rl_offload_inference_model_weights:
-            raise ValueError(
-                "--rl-offload-inference-model-weights requires a separate inference model. "
-                "This flag is only useful when doing refit since the weights are shared with "
-                "the training model."
-            )

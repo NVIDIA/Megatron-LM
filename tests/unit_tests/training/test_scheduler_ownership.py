@@ -205,7 +205,7 @@ def test_skip_train_bypasses_lr_validation(run_config):
     run_config.validate()
 
 
-def test_cli_options_are_validated_by_the_scheduler_config():
+def test_cli_options_are_validated_by_the_container(run_config):
     args, config = cli_config(
         "--train-iters", "10", "--lr-decay-samples", "5", "--micro-batch-size", "1"
     )
@@ -213,12 +213,10 @@ def test_cli_options_are_validated_by_the_scheduler_config():
     # CLI argument validation no longer owns these checks, so it does not reject them.
     assert config.lr_decay_samples == 5 and train.train_iters == 10
     with pytest.raises(AssertionError, match="expected iteration-based learning rate decay"):
-        config.validate_run(
-            train_iters=train.train_iters,
-            train_samples=train.train_samples,
-            skip_train=False,
-            weight_decay=0.0,
-        )
+        run_config.train = train
+        run_config.scheduler = config
+        run_config.optimizer.weight_decay = 0.0
+        run_config.validate()
 
 
 @pytest.fixture

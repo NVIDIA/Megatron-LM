@@ -3,7 +3,7 @@ import copy
 import os
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
-from dataclasses import is_dataclass
+from dataclasses import is_dataclass, replace
 from typing import Any, Type, TypeVar
 
 try:
@@ -38,7 +38,7 @@ from megatron.training.config.training_config import (
 )
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.models import GPTModelConfig, Serializable, HybridModelConfig
+from megatron.training.models import GPTModelConfig, HybridModelConfig, Serializable
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
@@ -48,6 +48,11 @@ class ConfigContainerBase:
     Configuration container base class for Megatron configurations.
 
     Provides validation, runtime finalization, and YAML/Dict serialization.
+
+    Section ``validate()`` methods take no inputs and check local constraints without
+    mutation. Containers check relationships between their owned sections. Runtime
+    setup calls ``finalize()`` once; the container explicitly orders cross-section
+    derivations in ``_finalize()`` rather than supplying inputs to section lifecycle APIs.
     """
 
     _finalized: bool = field(default=False, init=False, repr=False, compare=False)
@@ -76,10 +81,25 @@ class ConfigContainerBase:
         self._finalized = True
 
     def _finalize(self) -> None:
-        """Apply shared runtime derivations after all validation has succeeded."""
-        rng = getattr(self, "rng", None)
-        if rng is not None:
-            rng.finalize_model_config(getattr(self, "model", None))
+        """Apply shared cross-section derivations before runtime initialization."""
+        if getattr(self, "rng", None) is not None:
+            self._finalize_rng()
+
+    def _finalize_rng(self) -> None:
+        """Derive the model's tracker settings from the run's RNG policy."""
+        from megatron.core.transformer import TransformerConfig
+
+        model = getattr(self, "model", None)
+        transformer = getattr(model, "transformer", model)
+        if not isinstance(transformer, TransformerConfig):
+            return
+        if transformer.cuda_graph_impl != "none" and "transformer_engine" in (
+            transformer.transformer_impl, transformer.cuda_graph_impl
+        ):
+            self.rng.te_rng_tracker = True
+        # Core retains these fields for standalone use; within a run they are derived.
+        transformer.use_te_rng_tracker = self.rng.te_rng_tracker
+        transformer.inference_rng_tracker = self.rng.inference_rng_tracker
     
     @classmethod
     def from_dict(
@@ -383,36 +403,131 @@ class PretrainConfigContainer(ConfigContainerBase):
 
 
     def validate(self) -> None:
-        """Validate each section, then the RL section against the rest of the run."""
-        self.rl.validate_ddp_config(self.ddp)
+        """Validate sections, then cross-section consistency without mutation."""
+        self._validate_rl_ddp()
         super().validate()
-        global_batch_size, _, _ = self._resolve_batch_sizes()
-        self._validate_rl_config(global_batch_size)
+        self._resolve_batch_sizes()
+        self._validate_rl_config()
+        self._validate_scheduler()
 
-    def _validate_rl_config(self, global_batch_size: int | None) -> None:
-        """Check RL policy against the supplied or resolved training batch size."""
+    def _validate_rl_config(self) -> None:
+        """Check RL policy against the run's authoritative sections."""
         transformer = getattr(self.model, "transformer", None)
         cuda_graph_impl = None if transformer is None else transformer.cuda_graph_impl
-        self.rl.validate_run(
-            cuda_graph_impl=cuda_graph_impl,
-            micro_batch_size=self.train.micro_batch_size,
-            global_batch_size=global_batch_size,
-            train_iters=self.train.train_iters,
-            train_samples=self.train.train_samples,
-            skip_train=self.validation.skip_train,
-            load_optim=self.checkpoint.load_optim,
-            save_interval=self.checkpoint.save_interval,
-            exit_interval=self.train.exit_interval,
-            # The rollout deployment (inference shards, model CP) is not a pretrain section;
-            # validate_args checks that rule from the launch arguments.
-            separate_inference_model=None,
-        )
-        self.scheduler.validate_run(
-            train_iters=self.train.train_iters,
-            train_samples=self.train.train_samples,
-            skip_train=self.validation.skip_train,
-            weight_decay=self.optimizer.weight_decay,
-        )
+        micro_batch_size = self.train.micro_batch_size
+        global_batch_size = self.train.global_batch_size
+        train_iters = self.train.train_iters
+        train_samples = self.train.train_samples
+        skip_train = self.validation.skip_train
+        load_optim = self.checkpoint.load_optim
+        save_interval = self.checkpoint.save_interval
+        exit_interval = self.train.exit_interval
+        if not self.rl.perform_rl_step:
+            return
+
+        # Training CGs only make sense if we build any CGs.
+        if cuda_graph_impl == "none" and self.rl.rl_training_cuda_graphs:
+            raise ValueError("--rl-training-cuda-graphs is set but no CUDA graphs are being built.")
+
+        if self.rl.rl_use_sequence_packing and micro_batch_size != 1:
+            raise ValueError(
+                "micro_batch_size must be 1 when using sequence packing. To increase compute per "
+                "micro batch increase the sequence length."
+            )
+
+        # A native config can leave this default unresolved during user validation.
+        # Framework finalization repeats these checks with the resolved batch size.
+        if global_batch_size is not None:
+            # Ensure that collected samples are a multiple of the global batch size.
+            samples_per_inference_iteration = self.rl.grpo_samples_per_iteration * self.rl.grpo_iterations
+            if samples_per_inference_iteration % global_batch_size != 0:
+                raise ValueError(
+                    "grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by "
+                    "global_batch_size"
+                )
+            # Only exit/checkpoint on iterations where we generate data: generated
+            # data cannot currently be checkpointed.
+            iterations_per_inference_iteration = samples_per_inference_iteration // global_batch_size
+            if exit_interval is not None and exit_interval % iterations_per_inference_iteration != 0:
+                raise ValueError(
+                    "exit_interval should be divisible by number of global batches per inference "
+                    "iteration."
+                )
+            if save_interval is not None and save_interval % iterations_per_inference_iteration != 0:
+                raise ValueError(
+                    "save_interval should be divisible by number of global batches per inference "
+                    "iteration."
+                )
+
+        has_horizon = bool(train_iters) or bool(train_samples)
+        if self.rl.rl_rollout_only and not has_horizon:
+            raise ValueError(
+                "--rl-rollout-only iterates the RL loop; it needs --train-iters or --train-samples."
+            )
+        if skip_train and (has_horizon or self.rl.rl_rollout_only):
+            # Unlike pretraining, RL rejects a horizon under --skip-train: that spelling used to
+            # collect rollouts, and evaluating instead would change a launch's meaning silently.
+            raise ValueError(
+                "--skip-train only evaluates: drop --train-iters/--train-samples; "
+                "--rl-rollout-only collects rollouts without updates."
+            )
+        if self.rl.rl_offload_optimizer_during_inference and (
+            skip_train or (self.rl.rl_rollout_only and not load_optim)
+        ):
+            raise ValueError(
+                "--skip-train and --rl-rollout-only --no-load-optim build no optimizer; "
+                "--rl-offload-optimizer-during-inference has nothing to offload."
+            )
+
+
+    def _validate_rl_ddp(self) -> None:
+        """Check requested and RL-required layouts without modifying either section."""
+        if (
+            self.ddp.grad_buffer_offload or self.rl.requires_grad_buffer_offload
+        ) and self.ddp.reuse_grad_buf_for_mxfp8_param_ag:
+            raise ValueError(
+                "Gradient-buffer offload is incompatible with "
+                "--reuse-grad-buf-for-mxfp8-param-ag: "
+                "parameters share the gradient-buffer storage that offload releases."
+            )
+
+    def _validate_scheduler(self) -> None:
+        """Check scheduler policy against training and optimizer settings."""
+        train_iters = self.train.train_iters
+        train_samples = self.train.train_samples
+        skip_train = self.validation.skip_train
+        weight_decay = self.optimizer.weight_decay
+        if train_iters and not skip_train:
+            # If we use iteration-based training, make sure the
+            # sample-based options are off.
+            assert train_samples is None, \
+                'expected iteration-based training'
+            assert self.scheduler.lr_decay_samples is None, \
+                'expected iteration-based learning rate decay'
+            assert self.scheduler.lr_warmup_samples == 0, \
+                'expected iteration-based learning rate warmup'
+            if self.scheduler.lr_warmup_fraction is not None:
+                assert self.scheduler.lr_warmup_iters == 0, \
+                    'can only specify one of lr-warmup-fraction and lr-warmup-iters'
+
+        # Sample-based training.
+        if train_samples and not skip_train:
+            # If we use sample-based training, make sure the
+            # iteration-based options are off.
+            assert train_iters is None, \
+                'expected sample-based training'
+            assert self.scheduler.lr_decay_iters is None, \
+                'expected sample-based learning rate decay'
+            assert self.scheduler.lr_warmup_iters == 0, \
+                'expected sample-based learning rate warmup'
+            if self.scheduler.lr_warmup_fraction is not None:
+                assert self.scheduler.lr_warmup_samples == 0, \
+                    'can only specify one of lr-warmup-fraction ' \
+                    'and lr-warmup-samples'
+
+        if self.scheduler.weight_decay_incr_style == "constant":
+            for w in (self.scheduler.start_weight_decay, self.scheduler.end_weight_decay):
+                assert w is None or w == weight_decay
 
     def _finalize(self) -> None:
         from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
@@ -421,17 +536,29 @@ class PretrainConfigContainer(ConfigContainerBase):
         # TODO: Use get_batch_parallel_size(self) once topology inputs are config-owned.
         # Keep this temporary args dependency in framework finalization, not validation.
         batch_sizes = self._resolve_batch_sizes(get_batch_parallel_size(get_args()))
-        self._validate_rl_config(batch_sizes[0])
+        # Check the resolved batch before mutating the caller's configuration.
+        replace(
+            self, train=replace(self.train, global_batch_size=batch_sizes[0])
+        )._validate_rl_config()
+        self._validate_scheduler()
         (
             self.train.global_batch_size,
             self.validation.eval_global_batch_size,
             self.validation.eval_micro_batch_size,
         ) = batch_sizes
         super()._finalize()
-        self.scheduler.finalize_scheduler_config(self.optimizer.weight_decay)
+        if self.scheduler.weight_decay_incr_style == "constant":
+            self.scheduler.start_weight_decay = self.optimizer.weight_decay
+            self.scheduler.end_weight_decay = self.optimizer.weight_decay
         self._resolve_scheduler_step_fields()
         if self.rl.perform_rl_step:
-            self.rl.finalize_ddp_config(self.ddp)
+            self._finalize_rl_ddp()
+
+    def _finalize_rl_ddp(self) -> None:
+        """Apply the RL-required layout before DDP allocates its buffers."""
+        self._validate_rl_ddp()
+        if self.rl.requires_grad_buffer_offload:
+            self.ddp.grad_buffer_offload = True
 
 
 def update_train_iters(train: TrainingConfig) -> None:

@@ -378,6 +378,18 @@ def _model_rng_config(args: Namespace) -> RNGConfig:
     return _default_config_from_args(RNGConfig, args)
 
 
+def _apply_model_rng_config(config, rng: RNGConfig) -> None:
+    """Bind RNG settings while adapting a legacy model provider, before container finalization."""
+    if not isinstance(config, TransformerConfig):
+        return
+    if config.cuda_graph_impl != "none" and "transformer_engine" in (
+        config.transformer_impl, config.cuda_graph_impl
+    ):
+        rng.te_rng_tracker = True
+    config.use_te_rng_tracker = rng.te_rng_tracker
+    config.inference_rng_tracker = rng.inference_rng_tracker
+
+
 def core_transformer_config_from_args(args, config_class=None):
     """Build a transformer config from normalized arguments."""
     from megatron.core.activations import squared_relu
@@ -508,7 +520,7 @@ def core_transformer_config_from_args(args, config_class=None):
     config = config_class(**kw_args)
 
     _apply_yarn_config_from_args(config, args)
-    _model_rng_config(args).finalize_model_config(config)
+    _apply_model_rng_config(config, _model_rng_config(args))
 
     # Return config.
     return config
