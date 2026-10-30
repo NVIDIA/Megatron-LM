@@ -193,11 +193,16 @@ def test_batch_invariant_decode_step_replays():
     )
 
 
-def test_selective_state_update_replays():
+# A per-channel D (D_has_hdim) only changes which D element each lane loads, so its layout is
+# replayed at a small batch.
+@pytest.mark.parametrize(
+    "batch, D_has_hdim", [(256, False), (8, True)], ids=["per_head_D", "per_channel_D"]
+)
+def test_selective_state_update_replays(batch, D_has_hdim):
     from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
 
     seeded()
-    batch, nheads, headdim, dstate, ngroups = 256, 32, 64, 128, 1
+    nheads, headdim, dstate, ngroups = 32, 64, 128, 1
     state = torch.randn(batch, nheads, headdim, dstate, device="cuda")
     x = torch.randn(batch, nheads, headdim, device="cuda", dtype=torch.bfloat16)
     dt = torch.rand(batch, nheads, device="cuda").unsqueeze(-1).expand(batch, nheads, headdim)
@@ -208,7 +213,12 @@ def test_selective_state_update_replays():
     )
     Bm = torch.randn(batch, ngroups, dstate, device="cuda", dtype=torch.bfloat16)
     Cm = torch.randn(batch, ngroups, dstate, device="cuda", dtype=torch.bfloat16)
-    D = torch.randn(nheads, device="cuda").unsqueeze(-1).expand(nheads, headdim)
+    # The mixer broadcasts a per-head D over headdim, or passes one D per channel when D_has_hdim.
+    D = (
+        torch.randn(nheads, headdim, device="cuda")
+        if D_has_hdim
+        else torch.randn(nheads, device="cuda").unsqueeze(-1).expand(nheads, headdim)
+    )
     dt_bias = (torch.rand(nheads, device="cuda") - 4.0).unsqueeze(-1).expand(nheads, headdim)
 
     def fn(state, x, dt, A, Bm, Cm, D, dt_bias):
