@@ -85,9 +85,12 @@ def build_scheduler(monkeypatch, run_config):
         # Everything the scheduler reads from SchedulerConfig must come from the config owner.
         remove_scheduler_args(args)
         args.lr, args.min_lr = 1e-3, 1e-5
-        run_config.train = TrainingConfig(global_batch_size=4, **train)
+        run_config.train = TrainingConfig(micro_batch_size=1, global_batch_size=4, **train)
         run_config.scheduler = config
-        run_config._resolve_scheduler_step_fields()
+        monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=1))
+        if config.weight_decay_incr_style == "constant" and config.start_weight_decay is not None:
+            run_config.optimizer.weight_decay = config.start_weight_decay
+        run_config.finalize()
         monkeypatch.setattr(training, "get_args", lambda: args)
         training.get_optimizer_param_scheduler(Mock())
         return scheduler_cls.call_args.kwargs
@@ -205,7 +208,7 @@ def test_skip_train_bypasses_lr_validation(run_config):
     run_config.validate()
 
 
-def test_cli_options_are_validated_by_the_scheduler_config():
+def test_cli_options_are_validated_by_the_container(run_config):
     args, config = cli_config(
         "--train-iters", "10", "--lr-decay-samples", "5", "--micro-batch-size", "1"
     )
@@ -213,12 +216,10 @@ def test_cli_options_are_validated_by_the_scheduler_config():
     # CLI argument validation no longer owns these checks, so it does not reject them.
     assert config.lr_decay_samples == 5 and train.train_iters == 10
     with pytest.raises(AssertionError, match="expected iteration-based learning rate decay"):
-        config.validate_run(
-            train_iters=train.train_iters,
-            train_samples=train.train_samples,
-            skip_train=False,
-            weight_decay=0.0,
-        )
+        run_config.train = train
+        run_config.scheduler = config
+        run_config.optimizer.weight_decay = 0.0
+        run_config.validate()
 
 
 @pytest.fixture

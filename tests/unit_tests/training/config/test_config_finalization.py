@@ -43,8 +43,8 @@ def test_validation_is_read_only_and_finalization_runs_once(monkeypatch, run_con
         assert not cfg._finalized
 
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=1))
-    rng_finalize = Mock(wraps=cfg.rng.finalize_model_config)
-    monkeypatch.setattr(cfg.rng, "finalize_model_config", rng_finalize)
+    finalize = Mock(wraps=cfg._finalize)
+    monkeypatch.setattr(cfg, "_finalize", finalize)
     cfg.finalize()
     assert cfg._finalized
     assert cfg.rng.te_rng_tracker
@@ -55,7 +55,7 @@ def test_validation_is_read_only_and_finalization_runs_once(monkeypatch, run_con
     cfg.validate()
     cfg.finalize()
     assert cfg.to_dict() == after
-    rng_finalize.assert_called_once_with(model)
+    finalize.assert_called_once_with()
     assert "_finalized" not in after
     assert copy.deepcopy(cfg)._finalized
 
@@ -97,3 +97,41 @@ def test_serialization_starts_a_new_lifecycle(monkeypatch, run_config):
     restored.finalize()
     assert restored._finalized
     assert restored.to_dict() == serialized
+
+
+def test_scheduler_uses_recipe_edits_without_mutating_during_validation(monkeypatch, run_config):
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=1))
+    run_config.train.micro_batch_size = 2
+    run_config.train.global_batch_size = 8
+    run_config.train.train_iters = 10
+    run_config.scheduler.lr_warmup_fraction = 0.1
+    run_config.optimizer.weight_decay = 0.25
+    before = copy.deepcopy(run_config.to_dict())
+    run_config.validate()
+    run_config.validate()
+    assert run_config.to_dict() == before
+
+    # Later recipe edits, not a previously supplied argument bundle, drive finalization.
+    run_config.optimizer.weight_decay = 0.5
+    run_config.train.global_batch_size = 16
+    run_config.finalize()
+    assert run_config.scheduler.start_weight_decay == 0.5
+    assert run_config.scheduler.end_weight_decay == 0.5
+    assert run_config.scheduler.lr_decay_steps == 160
+    assert run_config.scheduler.lr_warmup_steps == 16
+
+
+def test_invalid_resolved_rl_batch_leaves_container_unfinalized(monkeypatch, run_config):
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=3))
+    run_config.train.micro_batch_size = 1
+    run_config.train.global_batch_size = None
+    run_config.rl = RLConfig(perform_rl_step=True)
+    before = copy.deepcopy(run_config.to_dict())
+    run_config.validate()
+    assert run_config.to_dict() == before
+    with pytest.raises(ValueError, match="divisible by global_batch_size"):
+        run_config.finalize()
+    assert run_config.train.global_batch_size == 3
+    assert run_config.validation.eval_global_batch_size == 3
+    assert run_config.validation.eval_micro_batch_size == 1
+    assert not run_config._finalized

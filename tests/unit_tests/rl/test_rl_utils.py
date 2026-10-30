@@ -784,7 +784,7 @@ class TestRLUtils:
         cfg.rl.rl_offload_optimizer_during_inference = True
         cfg.validate()
         assert not cfg.ddp.grad_buffer_offload
-        cfg.rl.finalize_ddp_config(cfg.ddp)
+        cfg.finalize()
         assert cfg.ddp.grad_buffer_offload
 
     def test_rl_optimizer_offload_rejects_mxfp8_grad_buffer_aliasing(self):

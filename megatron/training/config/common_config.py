@@ -24,21 +24,6 @@ class RNGConfig:
         if self.seed is None or self.seed <= 0:
             raise ValueError("Seed must be a positive integer.")
 
-    def finalize_model_config(self, model_config: object) -> None:
-        """Derive Core tracker settings from this run's RNG policy."""
-        from megatron.core.transformer import TransformerConfig
-
-        transformer = getattr(model_config, "transformer", model_config)
-        if not isinstance(transformer, TransformerConfig):
-            return
-        if transformer.cuda_graph_impl != "none" and "transformer_engine" in (
-            transformer.transformer_impl, transformer.cuda_graph_impl
-        ):
-            self.te_rng_tracker = True
-        # Core retains these fields for standalone use; within a run they are derived.
-        transformer.use_te_rng_tracker = self.te_rng_tracker
-        transformer.inference_rng_tracker = self.inference_rng_tracker
-
 
 @dataclass(kw_only=True)
 class ProfilingConfig:

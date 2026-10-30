@@ -27,6 +27,7 @@ from megatron.core.activations import squared_relu
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import get_torch_version, is_torch_min_version
 from megatron.training.argument_utils import (
+    _apply_model_rng_config,
     _mfsdp_v2_disables_pipeline_output_dealloc,
     _model_rng_config,
 )
@@ -447,7 +448,7 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
         config = MLATransformerConfig(**kw_args)
     else:
         config = TransformerConfig(**kw_args)
-    rng.finalize_model_config(config)
+    _apply_model_rng_config(config, rng)
     return config
 
 def load_yaml(yaml_path):
