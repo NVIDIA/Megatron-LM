@@ -54,6 +54,15 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
     """Determine the most appropriate layer specification based on availability."""
     transformer_cfg = config.transformer
+    if transformer_cfg.use_liger and (
+        config.restore_modelopt_state
+        or transformer_cfg.experimental_attention_variant is not None
+        or isinstance(transformer_cfg, HeterogeneousTransformerConfig)
+    ):
+        raise ValueError(
+            "use_liger currently supports standard local GPT specs, not ModelOpt, "
+            "experimental attention, or heterogeneous specs."
+        )
     use_te = transformer_cfg.transformer_impl == "transformer_engine"
     if (
         transformer_cfg.transformer_impl == "inference_optimized"
@@ -87,7 +96,7 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
         )
     elif transformer_cfg.experimental_attention_variant is not None:
         return get_transformer_block_with_experimental_attention_variant_spec(config=transformer_cfg, vp_stage=vp_stage)
-    elif transformer_cfg.num_moe_experts is not None:
+    elif transformer_cfg.num_moe_experts is not None or transformer_cfg.use_liger:
         return get_gpt_decoder_block_spec(
             transformer_cfg,
             use_transformer_engine=use_te,
@@ -136,6 +145,7 @@ def _te_or_local_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSp
             use_kitchen=transformer_cfg.use_kitchen,
             use_kitchen_attention=transformer_cfg.use_kitchen_attention,
             kitchen_attention_backend=transformer_cfg.kitchen_attention_backend,
+            use_liger=transformer_cfg.use_liger,
         )
 
 
