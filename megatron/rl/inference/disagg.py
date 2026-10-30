@@ -26,7 +26,7 @@ def disagg_refit_pools(
 
 
 def build_disagg_inference_model(
-    args, model_type, transformer_config, *, cfg_container, model_alloc_ctx
+    args, transformer_config, *, cfg_container, model_alloc_ctx
 ):
     """Build this rank's disaggregated RL inference shard."""
     for field in (
@@ -78,7 +78,7 @@ def build_disagg_inference_model(
         model_config = copy.deepcopy(cfg_container.model)
         model_config.transformer = cfg
         model = model_config.get_builder_cls()(model_config).build_distributed_models(
-            pg_collection=my_pg, wrap_with_ddp=False, model_type=model_type
+            pg_collection=my_pg, wrap_with_ddp=False
         )
     model[0].eval()
     return model

@@ -957,10 +957,7 @@ class TestUnimodalBuildDistributedModels:
                 build_fn, self.transformer_config, self.pg, wrap_with_ddp=False
             )
             mocks["bvps"].assert_called_once_with(
-                build_fn,
-                self.pg,
-                self.transformer_config.virtual_pipeline_model_parallel_size,
-                ModelType.encoder_or_decoder,
+                build_fn, self.pg, self.transformer_config.virtual_pipeline_model_parallel_size
             )
         finally:
             self._stop_patches()

@@ -11,7 +11,6 @@ from megatron.training import get_args
 from megatron.training import print_rank_0
 from megatron.training import get_timers
 from megatron.core import tensor_parallel
-from megatron.core.enums import ModelType
 from megatron.core.models.bert.bert_model import BertModel
 from megatron.training import pretrain
 from megatron.training.utils import average_losses_across_data_parallel_group
@@ -194,5 +193,4 @@ if __name__ == "__main__":
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
     pretrain(full_config, train_valid_test_datasets_provider,
-             ModelType.encoder_or_decoder,
              forward_step, model_provider)

@@ -73,10 +73,9 @@ def add_convert_args(parser):
     return parser
 
 
-def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True):
+def get_model(model_provider_func, wrap_with_ddp=True):
     """Build the model."""
     args = get_args()
-    args.model_type = model_type
     pre_process = mpu.is_pipeline_first_stage()
     post_process = mpu.is_pipeline_last_stage()
 
@@ -87,7 +86,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     else:
         model = model_provider_func(pre_process=pre_process, post_process=post_process)
 
-    model.model_type = model_type
+    model.model_type = ModelType.encoder_or_decoder
     return [model]
 
 

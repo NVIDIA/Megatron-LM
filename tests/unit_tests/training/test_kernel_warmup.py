@@ -317,7 +317,7 @@ def pretrain_until_warmup(monkeypatch):
             finalize=lambda: None,
         )
         with pytest.raises(WarmupReached):
-            training.pretrain(cfg, None, None, None, pg_collection=Namespace(tp=tp_group))
+            training.pretrain(cfg, None, None, pg_collection=Namespace(tp=tp_group))
         return calls[0]
 
     return invoke

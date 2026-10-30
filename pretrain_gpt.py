@@ -23,7 +23,6 @@ import torch
 from gpt_builders import gpt_builder
 from megatron.core import mpu
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
-from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -497,7 +496,6 @@ if __name__ == "__main__":
     pretrain(
         full_config,
         train_valid_test_datasets_provider,
-        ModelType.encoder_or_decoder,
         forward_step,
         store=store,
         get_embedding_ranks=get_embedding_ranks,

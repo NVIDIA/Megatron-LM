@@ -14,7 +14,6 @@ import torch
 import transformers
 
 from megatron.core import mpu, tensor_parallel
-from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.loss_func import loss_func
@@ -581,7 +580,6 @@ if __name__ == "__main__":
     pretrain(
         full_config,
         train_valid_test_sft_datasets_provider,
-        ModelType.encoder_or_decoder,
         forward_step,
         partial(model_provider, modelopt_gpt_hybrid_builder),
         non_loss_data_func=non_loss_data_func,
