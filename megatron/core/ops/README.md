@@ -267,7 +267,7 @@ below), not by an operation constructor. Say a library `foo` provides both.
 
 ## Liger RMSNorm
 
-Install `pip install liger-kernel==0.8.1` or a newer compatible release. Use
+Install `pip install liger-kernel==0.8.5` or a newer compatible release. Use
 `--transformer-impl local --normalization RMSNorm --use-liger` for standard GPT
 training, or set those fields in `TransformerConfig` and pass
 `get_gpt_decoder_block_spec(config, use_transformer_engine=False)` to `GPTModel`.
