@@ -499,3 +499,115 @@ class TestTPGTPMuonQKVPadding:
             split_per_head,
             split_shapes,
         )
+
+
+def _worker_muon_split_sentinels(
+    rank, world_size, port, combined_gtp, mla, per_head, constructor_layout=False
+):
+    """Inspect exact NS inputs after gathering fragments and removing GTP padding."""
+    del port
+    tp_size = 2 if combined_gtp else world_size
+    gtp_size = world_size // tp_size
+    tp_group, gtp_group, tp_rank, gtp_rank = _build_groups(rank, world_size, tp_size, gtp_size)
+
+    def rows(values):
+        return torch.tensor(values, device="cuda", dtype=torch.float32)[:, None].repeat(1, 4)
+
+    if mla:
+        # Two MLA heads, each with six content-Q rows and two RoPE-Q rows.
+        logical_grad = rows([11] * 6 + [21] * 2 + [12] * 6 + [22] * 2)
+        projection_shapes = [6, 2]
+        head_shapes = [6, 2, 6, 2]
+        if per_head:
+            expected_inputs = [rows([11] * 6), rows([21] * 2), rows([12] * 6), rows([22] * 2)]
+        else:
+            expected_inputs = [rows([11] * 6 + [12] * 6), rows([21] * 2 + [22] * 2)]
+    else:
+        # Two query groups with two Q heads and one K/V head per group. Distinct
+        # markers per head expose both component mixing and head/group reordering.
+        logical_grad = rows([11, 11, 12, 12, 21, 21, 31, 31, 13, 13, 14, 14, 22, 22, 32, 32])
+        projection_shapes = [4, 2, 2]
+        head_shapes = [2] * 8
+        if per_head:
+            expected_inputs = [rows([11, 12, 21, 31, 13, 14, 22, 32])[:, None, :].repeat(1, 2, 1)]
+        else:
+            expected_inputs = [
+                rows([11, 11, 12, 12, 13, 13, 14, 14]),
+                rows([21, 21, 22, 22]),
+                rows([31, 31, 32, 32]),
+            ]
+
+    # TP-only cases use TP > num_query_groups; combined cases pad each TP slice
+    # independently, including entirely padded GTP shards at GTP4.
+    tp_rows = logical_grad.shape[0] // tp_size
+    pad_length = 2 * gtp_size if combined_gtp else 0
+    physical_tp = F.pad(
+        logical_grad[tp_rank * tp_rows : (tp_rank + 1) * tp_rows],
+        (0, 0, 0, pad_length),
+        value=10_000,
+    )
+    shard_rows = physical_tp.shape[0] // gtp_size
+    local_grad = physical_tp[gtp_rank * shard_rows : (gtp_rank + 1) * shard_rows].clone()
+    param = torch.nn.Parameter(torch.zeros_like(local_grad))
+    param.partition_dim = 0
+    param.is_qkv = True
+    param.is_gtp_weight_remat = combined_gtp
+    param.qkv_gtp_pad_length = pad_length
+    param.qkv_split_shapes = head_shapes if per_head else projection_shapes
+    if constructor_layout:
+        # Legacy direct callers may provide only local parameter splits. The
+        # constructor's global layout must still drive collective participation.
+        param.qkv_split_shapes = [shard_rows]
+    else:
+        param.qkv_split_shapes_global = head_shapes if per_head else projection_shapes * 2
+    param.qkv_split_groups_are_complete = False
+    optimizer = TensorParallelMuon(
+        params=[param],
+        split_qkv=True,
+        split_qkv_per_head=per_head,
+        is_qkv_fn=lambda p: p.is_qkv,
+        qkv_split_shapes=head_shapes if per_head else projection_shapes,
+        pg_collection=ProcessGroupCollection(tp=tp_group, gtp_remat=gtp_group),
+    )
+    calls = []
+
+    def inspect_ns_input(x, tp_group, partition_dim, tp_mode_this_group):
+        assert tp_group is None and partition_dim is None
+        assert tp_mode_this_group == "duplicated"
+        calls.append(x.clone())
+        return x + 100
+
+    optimizer.scaled_orthogonalize_fn = inspect_ns_input
+    actual = optimizer.orthogonalize(param, local_grad)
+
+    assert len(calls) == len(expected_inputs)
+    for observed, expected_input in zip(calls, expected_inputs):
+        torch.testing.assert_close(observed, expected_input, rtol=0, atol=0)
+    # The expected update is independent of the splitter: add 100 to logical rows,
+    # restore zero padding, and select the original rank's physical shard.
+    expected_tp = F.pad(
+        logical_grad[tp_rank * tp_rows : (tp_rank + 1) * tp_rows] + 100, (0, 0, 0, pad_length)
+    )
+    expected_local = expected_tp[gtp_rank * shard_rows : (gtp_rank + 1) * shard_rows]
+    torch.testing.assert_close(actual, expected_local, rtol=0, atol=0)
+
+
+class TestTPGTPMuonSplitSentinels:
+    """Check projection/head contents, ordering, and restored shards with fixed markers."""
+
+    @pytest.mark.parametrize("world_size", [4, 8])
+    @pytest.mark.parametrize("combined_gtp", [False, True], ids=["tp-fragmented", "tp-gtp-padded"])
+    @pytest.mark.parametrize("mla", [False, True], ids=["gqa", "mla"])
+    @pytest.mark.parametrize("per_head", [False, True], ids=["projection", "per-head"])
+    def test_ns_receives_correct_components(self, world_size, combined_gtp, mla, per_head):
+        if not HAVE_EMERGING_OPTIMIZERS:
+            pytest.skip("emerging_optimizers package is not installed")
+        _requires_multi_gpu(world_size)
+        _run_distributed(_worker_muon_split_sentinels, world_size, combined_gtp, mla, per_head)
+
+    @pytest.mark.parametrize("world_size", [4, 8])
+    def test_constructor_global_layout_overrides_sharded_local_splits(self, world_size):
+        if not HAVE_EMERGING_OPTIMIZERS:
+            pytest.skip("emerging_optimizers package is not installed")
+        _requires_multi_gpu(world_size)
+        _run_distributed(_worker_muon_split_sentinels, world_size, False, True, True, True)

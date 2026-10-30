@@ -5,7 +5,7 @@ import copy
 import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Optional, Protocol, Tuple, Union
+from typing import Callable, Optional, Protocol, Self, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -154,14 +154,14 @@ class QKVLayout:
     per_head_split_shapes: tuple[int, ...]
 
     @classmethod
-    def from_transformer_config(cls, config: TransformerConfig) -> 'QKVLayout':
+    def from_transformer_config(cls, config: TransformerConfig) -> Self:
         """Build the fused QKV row layout described by a transformer config."""
         assert config.num_query_groups is not None
         assert config.kv_channels is not None
         num_query_heads_per_group = config.num_attention_heads // config.num_query_groups
         projection_split_shapes = [num_query_heads_per_group * config.kv_channels]
         per_head_split_shapes = [config.kv_channels] * num_query_heads_per_group
-        if config.attention_output_gate:
+        if getattr(config, "attention_output_gate", False):
             projection_split_shapes.append(num_query_heads_per_group * config.kv_channels)
             per_head_split_shapes += [config.kv_channels] * num_query_heads_per_group
         projection_split_shapes += [config.kv_channels, config.kv_channels]
@@ -173,9 +173,7 @@ class QKVLayout:
         )
 
     @classmethod
-    def from_mla_head_components(
-        cls, num_heads: int, component_widths: tuple[int, ...]
-    ) -> 'QKVLayout':
+    def from_mla_head_components(cls, num_heads: int, component_widths: tuple[int, ...]) -> Self:
         """Build an MLA up-projection layout from one head's component widths.
 
         Each group is one attention head. Projection-level Muon aggregates each component

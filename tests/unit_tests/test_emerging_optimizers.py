@@ -13,7 +13,10 @@ from packaging.version import Version
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
@@ -237,6 +240,127 @@ def test_muon_qkv_query_group_layout_localization():
     assert _qkv_split_groups_are_complete(split_shapes, local_start=384, local_rows=768)
     assert not _qkv_split_groups_are_complete(split_shapes, local_start=0, local_rows=192)
     assert not _qkv_split_groups_are_complete(split_shapes, local_start=192, local_rows=192)
+
+
+def test_muon_qkv_split_shapes_config_without_attention_output_gate():
+    """Custom QKV configs predating attention gating retain their ungated layout."""
+    from types import SimpleNamespace
+
+    config = SimpleNamespace(num_attention_heads=4, num_query_groups=2, kv_channels=2)
+
+    assert _get_qkv_split_shapes(config) == ([4, 2, 2], [4, 2, 2, 4, 2, 2])
+    assert _get_qkv_split_shapes(config, split_qkv_per_head=True) == ([2] * 8, [2] * 8)
+
+
+@pytest.mark.parametrize("layout_kind", ["gqa", "gated_gqa", "mla"])
+@pytest.mark.parametrize("split_per_head", [False, True])
+def test_muon_qkv_split_sentinel_contents(layout_kind, split_per_head):
+    """NS receives the intended components and its outputs return to their original rows."""
+    if layout_kind == "mla":
+        layout = QKVLayout.from_mla_head_components(2, (3, 1))
+        # Unequal content/RoPE widths: projection NS combines matching components
+        # across heads; per-head NS handles the four components independently.
+        component_specs = [("c0", 1, 3), ("r0", 2, 1), ("c1", 1, 3), ("r1", 2, 1)]
+        projection_names = [("c0", "c1"), ("r0", "r1")]
+    else:
+        gated = layout_kind == "gated_gqa"
+        layout = QKVLayout.from_transformer_config(
+            TransformerConfig(
+                num_layers=1,
+                hidden_size=8,
+                num_attention_heads=4,
+                num_query_groups=2,
+                kv_channels=2,
+                attention_output_gate=gated,
+            )
+        )
+        # Q=1, K=2, V=3, gate=4. Distinct row IDs in the second column also
+        # distinguish heads of the same projection and rows within each head.
+        if gated:
+            component_specs = [
+                ("q0", 1, 2),
+                ("q1", 1, 2),
+                ("g0", 4, 2),
+                ("g1", 4, 2),
+                ("k0", 2, 2),
+                ("v0", 3, 2),
+                ("q2", 1, 2),
+                ("q3", 1, 2),
+                ("g2", 4, 2),
+                ("g3", 4, 2),
+                ("k1", 2, 2),
+                ("v1", 3, 2),
+            ]
+            projection_names = [
+                ("q0", "q1", "q2", "q3"),
+                ("g0", "g1", "g2", "g3"),
+                ("k0", "k1"),
+                ("v0", "v1"),
+            ]
+        else:
+            component_specs = [
+                ("q0", 1, 2),
+                ("q1", 1, 2),
+                ("k0", 2, 2),
+                ("v0", 3, 2),
+                ("q2", 1, 2),
+                ("q3", 1, 2),
+                ("k1", 2, 2),
+                ("v1", 3, 2),
+            ]
+            projection_names = [("q0", "q1", "q2", "q3"), ("k0", "k1"), ("v0", "v1")]
+
+    components = {
+        name: torch.tensor(
+            [[value, 10 * index + row] for row in range(rows)], dtype=torch.float32, device="cuda"
+        )
+        for index, (name, value, rows) in enumerate(component_specs)
+    }
+    grad = torch.cat(list(components.values()))
+    matrix_names = [(name,) for name in components] if split_per_head else projection_names
+    expected_inputs = [torch.cat([components[name] for name in names]) for names in matrix_names]
+    expected_updates = {
+        name: components[name] + 100 * (index + 1)
+        for index, names in enumerate(matrix_names)
+        for name in names
+    }
+    # Build the oracle from named components, independently of the split/reshape
+    # implementation. Every NS matrix gets a unique output offset to check reassembly.
+    expected = torch.cat([expected_updates[name] for name in components])
+    split_shapes, logical_split_shapes = _get_qkv_split_shapes(
+        layout, split_qkv_per_head=split_per_head
+    )
+    param = torch.nn.Parameter(torch.zeros_like(grad))
+    param.is_qkv = True
+    param.qkv_split_shapes = split_shapes
+    param.qkv_split_shapes_global = logical_split_shapes
+    optimizer = TensorParallelMuon(
+        params=[param],
+        split_qkv=True,
+        split_qkv_per_head=split_per_head,
+        is_qkv_fn=lambda p: p.is_qkv,
+        pg_collection=None,
+    )
+    calls = []
+
+    def record_and_offset(x, *_args, **_kwargs):
+        calls.append(x.clone())
+        if x.ndim == 3:
+            offsets = torch.arange(1, len(expected_inputs) + 1, device=x.device).view(-1, 1, 1)
+            return x + 100 * offsets
+        return x + 100 * len(calls)
+
+    optimizer.scaled_orthogonalize_fn = record_and_offset
+    actual = optimizer.orthogonalize(param, grad)
+
+    if split_per_head and layout_kind != "mla":
+        assert len(calls) == 1
+        torch.testing.assert_close(calls[0], torch.stack(expected_inputs), rtol=0, atol=0)
+    else:
+        assert len(calls) == len(expected_inputs)
+        for actual_input, expected_input in zip(calls, expected_inputs):
+            torch.testing.assert_close(actual_input, expected_input, rtol=0, atol=0)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("tp_mode", ["duplicated", "blockwise"])
@@ -1112,8 +1236,8 @@ class TestMuonOptimizerMultiRankTP:
         )
         model = GPTModel(
             config=transformer_config,
-            transformer_layer_spec=get_gpt_layer_local_spec(
-                multi_latent_attention=True, normalization=transformer_config.normalization
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
+                multi_latent_attention=True
             ),
             vocab_size=32,
             max_sequence_length=8,

@@ -743,8 +743,8 @@ def check_config_overrides_consistency(
 
 
 def qkv_rows_after_gtp_gather(
-    param: torch.nn.Parameter, gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None
-) -> Tuple[int, int]:
+    param: torch.nn.Parameter, gtp_remat_group: torch.distributed.ProcessGroup | None = None
+) -> tuple[int, int]:
     """Return a fused QKV weight's logical TP-local rows and GTP shard count.
 
     Not ``param.shape[0]``: once the GTP degree stops dividing the query-group count, a
@@ -775,10 +775,10 @@ def qkv_rows_after_gtp_gather(
 
 def _get_megatron_emerging_optimizer(
     config: OptimizerConfig,
-    model_chunks: List[MegatronModule],
-    config_overrides: Optional[Dict[ParamKey, Any]] = None,
-    pg_collection: Optional[ProcessGroupCollection] = None,
-    param_group_process_group: Optional[torch.distributed.ProcessGroup] = None,
+    model_chunks: list[MegatronModule],
+    config_overrides: dict[ParamKey, Any] | None = None,
+    pg_collection: ProcessGroupCollection | None = None,
+    param_group_process_group: torch.distributed.ProcessGroup | None = None,
 ) -> MegatronOptimizer:
     """Build an emerging optimizer (e.g. Muon) for the given model chunks.
 
