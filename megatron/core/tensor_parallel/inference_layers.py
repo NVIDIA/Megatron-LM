@@ -25,6 +25,14 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
+from megatron.core.tensor_parallel.ordered_reduce import (
+    can_use_symm_pull,
+    ordered_reduce_scatter_shards,
+    row_parallel_shard_partials,
+    symm_ordered_reduce_scatter,
+    symm_ordered_reduce_scatter_shards,
+    use_ordered_tp_reduce,
+)
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     get_batch_invariant_backend,
     is_batch_invariant_mode_enabled,
@@ -466,6 +474,8 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         it will revert to torch.dist (NCCL) reduce-scatter.
         """
         use_mxfp8 = isinstance(self.weight, MXFP8Tensor)
+        if self._bi_tp_local_shards > 1:
+            return self._matmul_shards_reduce(x, use_mxfp8)
         symm_mem_buffer_dims = list(x.size())
         if use_mxfp8:
             # Remove seq_len dimension for MXFP8 (mm_mxfp8 squeezes internally)
@@ -474,11 +484,15 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         buf = SymmetricMemoryManager.get_buffer("tp", process_group=self.tp_group)
         symm_mem_buffer = buf.maybe_get_tensor(symm_mem_buffer_dims, dtype=x.dtype)
 
+        if use_ordered_tp_reduce(self.tp_group, x.dtype):
+            return self._matmul_ordered_reduce_scatter(x, symm_mem_buffer, use_mxfp8)
+
         # RS requires bf16 (hardware multimem reduce is bf16-only).
         # Check the matmul output shape: if it is NVLS-eligible, the RS output
         # (world_size times smaller on dim 0) is too.
         # TP sequence-parallel RS: use NCCL in batch-invariant mode to match
-        # the training reduction path. This does not affect MoE EP NVLS.
+        # the training reduction path (TP <= 2 here; TP >= 3 returned above).
+        # This does not affect MoE EP NVLS.
         can_use_nvls = (
             self.triton_nvls_kernels_allowed
             and x.dtype == torch.bfloat16
@@ -525,6 +539,56 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             x, _ = reduce_scatter_along_first_dim(x, tp_group=self.tp_group)
         return x
 
+    def _matmul_shards_reduce(self, x, use_mxfp8):
+        """batch_invariant_tp_shards with several shards per rank: the same bits as training.
+
+        One strided batched GEMM for this rank's shards, then the reduce-scatter (or, at
+        TP 1, the local fold) of the shard partials in global shard order.
+        """
+        assert not use_mxfp8, "batch_invariant_tp_shards with several shards per rank is BF16 only"
+        c = self._bi_tp_local_shards
+        if self.tp_size > 1 and self.triton_nvls_kernels_allowed:
+            buf = SymmetricMemoryManager.get_buffer("tp", process_group=self.tp_group)
+            dims = [c, *x.shape[:-1], self.weight.size(0)]
+            symm = buf.maybe_get_tensor(dims, dtype=x.dtype)
+            if symm["handle"] is not None and can_use_symm_pull(symm["handle"], x):
+                # The GEMM writes the shard partials straight into the symmetric buffer; one
+                # kernel pulls the owned rows of every peer's partials and folds them.
+                parts = row_parallel_shard_partials(x, self.weight, c, out=symm["tensor"])
+                out_dims = list(parts.shape[1:])
+                out_dims[0] //= self.tp_size
+                output = torch.empty(out_dims, dtype=x.dtype, device=x.device)
+                return symm_ordered_reduce_scatter_shards(output, parts, symm["handle"])
+        parts = row_parallel_shard_partials(x, self.weight, c)
+        return ordered_reduce_scatter_shards(parts, self.tp_group if self.tp_size > 1 else None)
+
+    def _matmul_ordered_reduce_scatter(self, x, symm_mem_buffer, use_mxfp8):
+        """Batch-invariant mode at TP >= 3: reduce-scatter with the fixed rank-order sum.
+
+        Gives the same bits as the training forward (tensor_parallel/ordered_reduce.py).
+        With a symmetric buffer, the GEMM writes into it and one kernel pulls the owned rows
+        from every peer and folds them; otherwise all-to-all + fold.
+        """
+        if (
+            self.triton_nvls_kernels_allowed
+            and symm_mem_buffer["handle"] is not None
+            and can_use_symm_pull(symm_mem_buffer["handle"], x)
+        ):
+            symm_tensor = symm_mem_buffer["tensor"]
+            if use_mxfp8 or get_batch_invariant_backend() == "te_native":
+                # Native kernels: writing into the buffer gives the same bits.
+                x = _apply_linear(x, self.weight, self.config, out=symm_tensor)
+            else:
+                # The batch-invariant GEMM backends patch aten::mm, not its out= variant.
+                symm_tensor.copy_(_apply_linear(x, self.weight, self.config))
+                x = symm_tensor
+            output_dims = list(x.size())
+            output_dims[0] = x.size(0) // self.tp_size
+            output = torch.empty(output_dims, dtype=x.dtype, device=x.device)
+            return symm_ordered_reduce_scatter(output, x, symm_mem_buffer["handle"])
+        x = _apply_linear(x, self.weight, self.config)
+        return reduce_scatter_to_sequence_parallel_region(x, group=self.tp_group)
+
     def _set_next_layer_norm_weights(self, weights: torch.Tensor):
         """
         Set next layer norm weights for fused reduce-scatter + add + rms-norm + all-gather.
@@ -547,6 +611,8 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             return super().forward(x)
 
         if self.tp_size == 1:
+            if self._bi_tp_local_shards > 1:
+                return self._matmul_shards_reduce(x, isinstance(self.weight, MXFP8Tensor)), None
             x = _apply_linear(x, self.weight, self.config)
             return x, None
         else:
@@ -631,8 +697,25 @@ def inference_reduce_scatter_to_sequence_parallel_region(
         config, 'inference_disable_triton_nvls_kernels', False
     )
 
+    if use_ordered_tp_reduce(tp_group, x.dtype):
+        # Batch-invariant mode at TP >= 3: fixed rank-order sum, same bits as training.
+        if triton_nvls_kernels_allowed and SymmetricMemoryManager.is_initialized("tp"):
+            buf = SymmetricMemoryManager.get_buffer("tp", process_group=tp_group)
+            symm_mem_buffer = buf.maybe_get_tensor(list(x.size()), dtype=x.dtype)
+            if symm_mem_buffer["handle"] is not None and can_use_symm_pull(
+                symm_mem_buffer["handle"], x
+            ):
+                symm_mem_buffer["tensor"].copy_(x)
+                output_dims = list(x.size())
+                output_dims[0] = x.size(0) // tp_size
+                output = torch.empty(output_dims, dtype=x.dtype, device=x.device)
+                return symm_ordered_reduce_scatter(
+                    output, symm_mem_buffer["tensor"], symm_mem_buffer["handle"]
+                )
+        return reduce_scatter_to_sequence_parallel_region(x, group=tp_group)
+
     # TP sequence-parallel RS: use NCCL in batch-invariant mode to match
-    # training. This does not affect MoE EP NVLS.
+    # training (TP <= 2 here). This does not affect MoE EP NVLS.
     if (
         triton_nvls_kernels_allowed
         and SymmetricMemoryManager.is_initialized("tp")
