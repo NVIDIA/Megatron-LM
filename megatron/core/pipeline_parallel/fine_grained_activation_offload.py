@@ -1022,26 +1022,24 @@ class ChunkOffloadHandler:
         state = (src_tensor.device, cpu_backup, use_cpu_pool, view_meta)
         return state
 
-    @_otel_trace_fn('activation_offload', 'megatron.activation.reload')
-    def reload(self, state, non_blocking=None, stream=None):
-        """Reload: allocate the destination on the current stream and copy into it."""
-        return self._reload_into(
-            state, self._allocate_reload_destination(state), non_blocking, stream=stream
-        )
-
     @staticmethod
-    def _allocate_reload_destination(state):
-        """The GPU destination of an offloaded ``state``, allocated on the current stream."""
+    def _allocate_reload_buffer(state):
+        """An empty GPU buffer for an offloaded ``state``, allocated on the current stream."""
         dev, cpu_backup, _, _ = state
         return torch.empty(
             cpu_backup.size(), dtype=cpu_backup.dtype, layout=cpu_backup.layout, device=dev
         )
 
-    def _reload_into(self, state, gpu_tensor, non_blocking=None, stream=None):
-        """Copy an offloaded ``state`` into ``gpu_tensor`` on the current stream; ``stream`` is
-        the one the pinned source is released against."""
+    @_otel_trace_fn('activation_offload', 'megatron.activation.reload')
+    def reload(self, state, non_blocking=None, stream=None, *, destination=None):
+        """Copy an offloaded ``state`` back to the GPU on the current stream.
+
+        ``destination`` is the buffer to copy into; when ``None`` it is allocated on the
+        current stream. ``stream`` is the one the pinned source is released against.
+        """
         debug_rank("------reload")
         dev, cpu_backup, use_cpu_pool, view_meta = state
+        gpu_tensor = self._allocate_reload_buffer(state) if destination is None else destination
         if non_blocking is None:
             non_blocking = cpu_backup.is_pinned()
         gpu_tensor.copy_(cpu_backup, non_blocking=non_blocking)
@@ -1279,10 +1277,10 @@ class ChunkOffloadHandler:
         return len(count_modules)
 
     def bulk_reload_group(self):
-        """Reload the next offloaded group: allocate the GPU destinations on the current
+        """Reload the next offloaded group: allocate the GPU buffers on the current
         (consumer) stream, copy into them on the H2D stream.
 
-        The destination's allocation stream decides which allocator pool it returns to when
+        The buffer's allocation stream decides which allocator pool it returns to when
         the backward frees it. Allocated on the H2D stream, those blocks could only be reused
         by later reloads; allocated on the consumer stream, they recirculate like any other
         activation. Stream order: the H2D stream waits for the consumer stream (a fresh block
@@ -1295,7 +1293,7 @@ class ChunkOffloadHandler:
         nvtx_range_push(nvtx_msg)
         consumer_stream = torch.cuda.current_stream()
         staged = [
-            (tensor_tag, state, self._allocate_reload_destination(state))
+            (tensor_tag, state, self._allocate_reload_buffer(state))
             for tensor_tag, state in group_to_reload._tensors.items()
             if isinstance(state, tuple)  # only tensors that were offloaded
         ]
@@ -1306,7 +1304,9 @@ class ChunkOffloadHandler:
             group_to_reload.wait_offload_event(self.h2d_stream)
         with torch.cuda.stream(self.h2d_stream):
             for tensor_tag, state, gpu_tensor in staged:
-                recovered_tensor = self._reload_into(state, gpu_tensor, stream=self.h2d_stream)
+                recovered_tensor = self.reload(
+                    state, stream=self.h2d_stream, destination=gpu_tensor
+                )
                 debug_rank(f"----recovered_tensor {recovered_tensor.shape}")
                 group_to_reload.push_tensor(tensor_tag, recovered_tensor)
             group_to_reload.record_reload_event(self.h2d_stream)
