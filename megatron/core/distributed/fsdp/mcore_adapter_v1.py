@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MFSDP v1 integration with MCore models and process groups."""
+"""MCore adapter for the Megatron-FSDP v1 implementation."""
 
 import logging
 import random
