@@ -6,7 +6,7 @@ Covers:
 - CUDA-graph bucket token counts floored to 64-multiples under batch-invariant mode
 - swiglu_with_probs / weighted_silu_mul_bounded: training-parity rounding vs reference
 - _moe_sum apply_weights / acc_fp64 options
-- vllm_fused_moe end-to-end batch invariance for gated (SwiGLU) models
+- vllm_fused_moe end-to-end batch invariance for SwiGLU and squared-ReLU models
 - te_native backend registration
 """
 
@@ -341,48 +341,221 @@ class TestMoeSumOptions:
             )
 
 
-# ---------------------------------------------------------------------------
-# End-to-end batch invariance (gated / SwiGLU)
-# ---------------------------------------------------------------------------
+# End-to-end batch invariance across physical shapes and routing layouts
+
+
+def _assert_target_variation_witnesses(witnesses):
+    """Require physical and routing variation in target-invariance rows."""
+    physical_shapes = {
+        (w["hidden_shape"], w["routing_shape"]) for w in witnesses if w["position"] == "front"
+    }
+    assert physical_shapes == {
+        ((64, 128), (64, 2)),
+        ((128, 128), (128, 2)),
+        ((256, 128), (256, 2)),
+    }, f"physical shape witness did not cover 64/128/256 rows: {physical_shapes}"
+
+    by_size = {w["hidden_shape"][0]: w for w in witnesses if w["position"] == "front"}
+    load_signatures = {w["expert_loads"] for w in by_size.values()}
+    offset_signatures = {w["target_segment_offsets"] for w in by_size.values()}
+    assert len(load_signatures) > 1 or len(offset_signatures) > 1, (
+        "routing/load witness did not change across physical batch shapes: "
+        f"loads={load_signatures}, offsets={offset_signatures}"
+    )
+    for witness in witnesses:
+        loads = witness["expert_loads"]
+        assert max(loads) > min(loads), f"expert load is not unequal: {loads}"
+
+    by_layout = {(w["hidden_shape"][0], w["position"]): w for w in witnesses}
+    assert len(by_layout) == len(witnesses) == 6
+    for physical_rows in (64, 128, 256):
+        front, back = (by_layout[physical_rows, position] for position in ("front", "back"))
+        assert front["target_rows"] == tuple(range(8))
+        assert back["target_rows"] == tuple(range(physical_rows - 8, physical_rows))
 
 
 class TestVllmFusedMoeBatchInvariance:
 
-    def test_same_tokens_bitwise_across_cobatch_sizes(self):
+    @pytest.mark.parametrize("activation_name", ["SWIGLU", "SQUARED_RELU"])
+    def test_target_bitwise_across_physical_shapes_and_routing(self, monkeypatch, activation_name):
+        import importlib
+
         from megatron.core.inference.moe import ActivationType
-        from megatron.core.inference.moe.vllm_fused_moe import vllm_fused_moe
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            get_batch_invariant_backend,
+            get_batch_invariant_collective,
+            is_batch_invariant_mode_enabled,
+        )
 
-        torch.manual_seed(11)
-        max_tokens, K, ffn, E, topk = 256, 128, 64, 8, 4
-        hidden = (torch.randn(max_tokens, K, device="cuda") * 0.05).bfloat16()
-        fc1 = (torch.randn(E, 2 * ffn, K, device="cuda") * 0.02).bfloat16()
-        fc2 = (torch.randn(E, K, ffn, device="cuda") * 0.02).bfloat16()
-        routing = torch.stack(
-            [torch.randperm(E, device="cuda")[:topk] for _ in range(max_tokens)]
-        ).long()
-        probs = torch.rand(max_tokens, topk, device="cuda", dtype=torch.float32)
-        probs = probs / probs.sum(-1, keepdim=True)
+        vllm_module = importlib.import_module("megatron.core.inference.moe.vllm_fused_moe")
+        original_invoke = vllm_module._invoke_fused_moe_kernel
+        kernel_calls = []
 
-        def run(valid, hint):
-            with set_batch_invariant_mode(True, backend="triton"):
-                return vllm_fused_moe(
-                    hidden,
-                    probs,
-                    fc1,
-                    fc2,
-                    activation_type=ActivationType.SWIGLU,
-                    num_local_experts=E,
-                    local_expert_start=0,
-                    valid_tokens=_vt(valid),
-                    routing_map=routing,
-                    num_tokens_hint=hint,
+        def invoke_with_witness(*args, **kwargs):
+            result = original_invoke(*args, **kwargs)
+            # Synchronize the real production launch before witnessing its device-built routing.
+            torch.cuda.synchronize()
+            block_m = kwargs["config"]["BLOCK_SIZE_M"]
+            num_post_padded = int(args[6].item())
+            num_blocks = (num_post_padded + block_m - 1) // block_m
+            kernel_calls.append(
+                {
+                    "a_shape": tuple(args[0].shape),
+                    "b_shape": tuple(args[1].shape),
+                    "top_k": kwargs["top_k"],
+                    "grid_size": kwargs["grid_size"],
+                    "block_m": block_m,
+                    "sorted_ids": args[4][:num_post_padded].cpu(),
+                    "expert_ids": args[5][:num_blocks].cpu(),
+                }
+            )
+            return result
+
+        monkeypatch.setattr(vllm_module, "_invoke_fused_moe_kernel", invoke_with_witness)
+
+        target_count, hidden_size, ffn, num_experts, topk = 8, 128, 64, 8, 2
+        activation_type = getattr(ActivationType, activation_name)
+        fc1_width = 2 * ffn if activation_type == ActivationType.SWIGLU else ffn
+        witnesses = []
+        target_outputs = []
+
+        # BI vLLM FC1/FC2 use Triton regardless of the dense-GEMM backend, so this is one MoE row.
+        # Dense TE contrasts live in dynamic model tests; registration below is separate.
+        backend = "triton"
+        assert not is_batch_invariant_mode_enabled(), "backend state leaked from another row"
+        with set_batch_invariant_mode(True, backend=backend):
+            assert get_batch_invariant_backend() == backend
+            assert get_batch_invariant_collective() == "ordered"
+            torch.manual_seed(11)
+            target_hidden = (
+                torch.randn(target_count, hidden_size, device="cuda") * 0.05
+            ).bfloat16()
+            target_probs = torch.tensor(
+                [[0.25, 0.75], [0.4, 0.6], [0.6, 0.4], [0.75, 0.25]] * 2,
+                device="cuda",
+                dtype=torch.float32,
+            )
+            target_routing = torch.tensor(
+                [[4, 6], [5, 7], [4, 7], [5, 6]] * 2, device="cuda", dtype=torch.long
+            )
+
+            max_cobatch = 256 - target_count
+            cobatch_hidden = (
+                torch.randn(max_cobatch, hidden_size, device="cuda") * 0.05
+            ).bfloat16()
+            cobatch_probs = torch.rand(max_cobatch, topk, device="cuda", dtype=torch.float32)
+            cobatch_probs /= cobatch_probs.sum(-1, keepdim=True)
+            cobatch_index = torch.arange(max_cobatch, device="cuda")
+            first_expert = cobatch_index % num_experts
+            # Skew the second route toward expert 0, keeping two distinct experts per co-batch row.
+            second_expert = torch.where(first_expert == 0, 1, 0)
+            cobatch_routing = torch.stack((first_expert, second_expert), dim=1).long()
+            weight_options = dict(device="cuda", dtype=torch.bfloat16)
+            fc1 = torch.randn(num_experts, fc1_width, hidden_size, **weight_options) * 0.02
+            fc2 = torch.randn(num_experts, hidden_size, ffn, **weight_options) * 0.02
+
+            for physical_rows in (64, 128, 256):
+                cobatch_count = physical_rows - target_count
+                permutation = torch.roll(
+                    torch.arange(cobatch_count, device="cuda").flip(0), shifts=physical_rows // 8
                 )
+                co_hidden = cobatch_hidden[:cobatch_count].index_select(0, permutation)
+                co_probs = cobatch_probs[:cobatch_count].index_select(0, permutation)
+                co_routing = cobatch_routing[:cobatch_count].index_select(0, permutation)
 
-        # the first 64 tokens, computed in co-batches of different sizes and
-        # hint classes, must be bitwise identical
-        small = run(valid=64, hint=64)[:64]
-        large = run(valid=256, hint=256)[:64]
-        assert torch.equal(small, large)
+                for position in ("front", "back"):
+                    hidden, probs, routing = (
+                        torch.cat(
+                            (target, neighbors) if position == "front" else (neighbors, target)
+                        )
+                        for target, neighbors in zip(
+                            (target_hidden, target_probs, target_routing),
+                            (co_hidden, co_probs, co_routing),
+                        )
+                    )
+                    start = 0 if position == "front" else physical_rows - target_count
+                    target_rows = torch.arange(start, start + target_count, device="cuda")
+
+                    assert hidden.shape == (physical_rows, hidden_size)
+                    assert routing.shape == (physical_rows, topk)
+                    assert torch.equal(hidden.index_select(0, target_rows), target_hidden)
+                    assert torch.equal(probs.index_select(0, target_rows), target_probs)
+                    assert torch.equal(routing.index_select(0, target_rows), target_routing)
+
+                    call_start = len(kernel_calls)
+                    output = vllm_module.vllm_fused_moe(
+                        hidden,
+                        probs,
+                        fc1,
+                        fc2,
+                        activation_type=activation_type,
+                        num_local_experts=num_experts,
+                        local_expert_start=0,
+                        valid_tokens=_vt(physical_rows),
+                        routing_map=routing,
+                        num_tokens_hint=physical_rows,
+                    )
+                    target_outputs.append(output.index_select(0, target_rows).clone())
+                    run_calls = kernel_calls[call_start:]
+                    assert len(run_calls) == 2, "FC1 and FC2 production kernels must both execute"
+                    assert [call["top_k"] for call in run_calls] == [topk, 1]
+                    assert run_calls[0]["a_shape"] == (physical_rows, hidden_size)
+                    assert run_calls[1]["a_shape"] == (physical_rows * topk, ffn)
+
+                    fc1_call = run_calls[0]
+                    sorted_ids = fc1_call["sorted_ids"]
+                    live_ids = sorted_ids[sorted_ids < physical_rows * topk].long()
+                    assert live_ids.numel() == physical_rows * topk
+                    actual_loads = torch.bincount(
+                        routing.reshape(-1).cpu().index_select(0, live_ids), minlength=num_experts
+                    )
+                    expected_loads = torch.bincount(
+                        routing.reshape(-1).cpu(), minlength=num_experts
+                    )
+                    assert torch.equal(actual_loads, expected_loads)
+
+                    target_pair_ids = (
+                        target_rows[:, None] * topk + torch.arange(topk, device="cuda")[None, :]
+                    ).reshape(-1)
+                    assert set(target_pair_ids.cpu().tolist()).issubset(set(live_ids.tolist()))
+                    expert_ids = fc1_call["expert_ids"]
+                    target_segment_offsets = []
+                    for expert in sorted(set(target_routing.reshape(-1).cpu().tolist())):
+                        expert_blocks = torch.nonzero(expert_ids == expert).flatten()
+                        assert expert_blocks.numel() > 0
+                        target_segment_offsets.append(int(expert_blocks[0]) * fc1_call["block_m"])
+
+                    witness = {
+                        "backend": backend,
+                        "activation": activation_name,
+                        "position": position,
+                        "hidden_shape": tuple(hidden.shape),
+                        "routing_shape": tuple(routing.shape),
+                        "target_rows": tuple(target_rows.cpu().tolist()),
+                        "expert_loads": tuple(actual_loads.tolist()),
+                        "target_segment_offsets": tuple(target_segment_offsets),
+                        "kernel_calls": tuple(
+                            (call["a_shape"], call["b_shape"], call["grid_size"])
+                            for call in run_calls
+                        ),
+                    }
+                    witnesses.append(witness)
+                    print("batch_invariant_moe_witness", witness)
+        reference = target_outputs[0]
+        assert reference.abs().max() > 0, "target oracle received only zero expert outputs"
+        for target_output in target_outputs[1:]:
+            assert torch.equal(target_output, reference)
+
+        _assert_target_variation_witnesses(witnesses)
+
+        # Hiding physical/routing variation must trip its witness oracle without changing outputs.
+        for fields, message in (
+            (("hidden_shape", "routing_shape"), "physical shape witness"),
+            (("expert_loads", "target_segment_offsets"), "routing/load witness"),
+        ):
+            frozen = {name: witnesses[0][name] for name in fields}
+            with pytest.raises(AssertionError, match=message):
+                _assert_target_variation_witnesses([{**w, **frozen} for w in witnesses])
 
 
 # ---------------------------------------------------------------------------

@@ -812,7 +812,7 @@ def vllm_fused_moe(
 
     topk_weights_flat = probs.reshape(-1).contiguous()
     # With moe_apply_probs_on_input FC1 applies the routing weights to its input rows, so
-    # the activation and the reduction below must not apply them again.
+    # the activation and FC2's epilogue below must not apply them again.
     output_weights_flat = None if apply_probs_on_input else topk_weights_flat
 
     # FC1 + activation: [max_tokens, K] → [max_tokens*topk, N]. Outside
@@ -881,11 +881,14 @@ def vllm_fused_moe(
             intermediate1, (valid_tokens * topk).to(torch.int32), glu_options=glu_options
         )
 
-    # FC2: [max_tokens*topk, N] → [max_tokens*topk, K]. Batch-invariant mode
-    # already applied routing weights at the activation to match training;
-    # ordinary inference applies them in the reduction kernel.
-    # Only local-expert blocks are processed; non-local positions are left
-    # undefined and skipped by _moe_sum (which checks the routing map).
+    # FC2: [max_tokens*topk, N] → [max_tokens*topk, K]. Ordinary inference
+    # multiplies each row by its routing probability in the GEMM epilogue, on
+    # the fp32 accumulator before the bf16 store (as upstream vLLM does).
+    # Batch-invariant mode already applied the probabilities at the activation
+    # to match training, and moe_apply_probs_on_input at FC1's input rows.
+    # Only local-expert blocks are processed; non-local
+    # positions are left undefined and skipped by _moe_sum (which checks the
+    # routing map).
     intermediate3 = VllmFusedMoeBuffers.get(
         "intermediate3", (num_valid, K), hidden_states.dtype, hidden_states.device
     )
@@ -897,24 +900,19 @@ def vllm_fused_moe(
         sorted_token_ids,
         expert_ids,
         num_post_padded,
-        mul_routed_weight=False,
+        mul_routed_weight=not (batch_invariant_mode or apply_probs_on_input),
         top_k=1,
         config=config,
         grid_size=grid_size_fc2,
     )
 
     # Reduce over topk: [max_tokens*topk, K] → [max_tokens, K]
-    # Applies routing weights and accumulates in fp32, writes directly to
-    # out (if provided), zeros rows beyond valid_tokens, and skips non-local
-    # expert slots.
-    apply_routing_weights = not apply_probs_on_input
-    accumulate_in_fp64 = False
-    if batch_invariant_mode:
-        # Probabilities were applied at the activation (or the input) to mirror
-        # training. Use training's invariant within-rank accumulation for the
-        # unweighted sum.
-        apply_routing_weights = False
-        accumulate_in_fp64 = True
+    # The routing probabilities are already applied (FC2 epilogue, FC1's input
+    # with moe_apply_probs_on_input, or the activation in batch-invariant mode),
+    # so this is an unweighted sum. It accumulates in fp32, writes directly to
+    # out (if provided), and skips non-local expert slots. Batch-invariant mode
+    # uses training's invariant within-rank accumulation (fp64).
+    accumulate_in_fp64 = batch_invariant_mode
 
     return _moe_sum(
         intermediate3,
@@ -927,6 +925,6 @@ def vllm_fused_moe(
         local_expert_start,
         num_local_experts,
         out=out,
-        apply_weights=apply_routing_weights,
+        apply_weights=False,
         acc_fp64=accumulate_in_fp64,
     )
