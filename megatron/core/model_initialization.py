@@ -27,8 +27,8 @@ def is_muon_parameter(param: torch.Tensor) -> bool:
     """Return whether a parameter is managed by Muon rather than its scalar fallback."""
     return (
         param.requires_grad
-        and getattr(param, 'use_muon', True)
-        and not getattr(param, 'is_embedding_or_output_parameter', False)
+        and getattr(param, "use_muon", True)
+        and not getattr(param, "is_embedding_or_output_parameter", False)
         and param.ndim == 2
     )
 
@@ -85,7 +85,15 @@ def logical_frobenius_inner_product(
         raise ValueError("Muon Hyperball requires an explicit ProcessGroupCollection")
     inner_product = (lhs.float() * rhs.float()).sum()
     for group in _parameter_shard_groups(param, pg_collection):
-        torch.distributed.all_reduce(inner_product, op=torch.distributed.ReduceOp.SUM, group=group)
+        reduction_input = inner_product
+        if inner_product.device.type == "cpu" and torch.distributed.get_backend(group) == "nccl":
+            reduction_input = inner_product.to(
+                device=torch.device("cuda", torch.cuda.current_device())
+            )
+        torch.distributed.all_reduce(
+            reduction_input, op=torch.distributed.ReduceOp.SUM, group=group
+        )
+        inner_product = reduction_input.to(device=lhs.device)
     return inner_product
 
 

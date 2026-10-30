@@ -972,23 +972,23 @@ _EMERGING_OPTIMIZERS.update(
                 }
             },
         ),
-        'muon_ht': EmergingOptimizerEntry(
+        "muon_ht": EmergingOptimizerEntry(
             optimizer_cls=TensorParallelMuonHT,
             init_state_fn=_eopt_init_state_fn,
             config_to_kwargs=_hyperball_muon_config_to_kwargs,
             default_param_overrides={
                 ParamKey(predicate=ParamPredicate(name="muon_excluded", fn=_is_muon_excluded)): {
-                    'optimizer': 'adam'
+                    "optimizer": "adam"
                 }
             },
         ),
-        'muon_h': EmergingOptimizerEntry(
+        "muon_h": EmergingOptimizerEntry(
             optimizer_cls=TensorParallelMuonH,
             init_state_fn=_eopt_init_state_fn,
             config_to_kwargs=_hyperball_muon_config_to_kwargs,
             default_param_overrides={
                 ParamKey(predicate=ParamPredicate(name="muon_excluded", fn=_is_muon_excluded)): {
-                    'optimizer': 'adam'
+                    "optimizer": "adam"
                 }
             },
         ),

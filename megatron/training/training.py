@@ -3019,6 +3019,7 @@ def setup_model_and_optimizer(
             config_overrides=config_overrides,
             use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
+            pg_collection=(pg_collection if config.optimizer in ("muon_h", "muon_ht") else None),
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 

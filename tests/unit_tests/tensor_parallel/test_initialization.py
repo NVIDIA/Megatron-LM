@@ -49,7 +49,7 @@ class Test:
         config = TransformerConfig(
             num_layers=1, hidden_size=12, num_attention_heads=4, muon_ht_radius=2.5
         )
-        model = nn.Linear(12, 12, bias=True, device='cuda')
+        model = nn.Linear(12, 12, bias=True, device="cuda")
 
         result = prepare_existing_model_chunks_for_distributed_training(
             [model],
@@ -59,7 +59,7 @@ class Test:
             mixed_precision_wrapper=None,
         )
 
-        torch.testing.assert_close(result[0].weight.norm(), torch.tensor(2.5, device='cuda'))
+        torch.testing.assert_close(result[0].weight.norm(), torch.tensor(2.5, device="cuda"))
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_muon_ht_init_respects_disabled_parameter_initialization(self):
@@ -72,7 +72,7 @@ class Test:
             muon_ht_radius=2.5,
             perform_initialization=False,
         )
-        model = nn.Linear(12, 12, bias=False, device='cuda')
+        model = nn.Linear(12, 12, bias=False, device="cuda")
         weight_before = model.weight.detach().clone()
 
         result = prepare_existing_model_chunks_for_distributed_training(
