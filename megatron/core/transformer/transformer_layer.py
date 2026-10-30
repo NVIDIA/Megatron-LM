@@ -60,6 +60,10 @@ from megatron.core.utils import (
 
 if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
+    from megatron.core.tensor_parallel.inference_layers import (
+        FusedTPHandoff,
+        InferenceLayerNormColumnParallelLinear,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -698,9 +702,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 "without subclass-specific attention state."
             )
 
-        using_fused_tp_inference_kernel = (
-            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
-        )
+        using_fused_tp_inference_kernel = self._using_fused_tp_inference()
         if using_fused_tp_inference_kernel:
             self._set_proj_residual(residual)
 
@@ -830,9 +832,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 hidden_states, residual_stream_recompute_context=residual_stream_recompute_context
             )
 
-        using_fused_tp_inference_kernel = (
-            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
-        )
+        using_fused_tp_inference_kernel = self._using_fused_tp_inference()
         if using_fused_tp_inference_kernel:
             # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
             # operation in attention's out_proj (linear_proj)
@@ -1037,9 +1037,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         ``attn_state``. Base uses that state for an optional residual connection and
         otherwise performs the ordinary bias-dropout-add.
         """
-        using_fused_tp_inference_kernel = (
-            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
-        )
+        using_fused_tp_inference_kernel = self._using_fused_tp_inference()
         residual_connection = self._get_self_attention_residual_connection(operation="write")
         recompute_context = (
             residual_stream_recompute_context if residual_connection is not None else None
@@ -1464,14 +1462,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             and not isinstance(self.mlp, IdentityOp)
         )
 
-        using_fused_tp_inference_kernel = (
-            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
-        )
+        using_fused_tp_inference_kernel = self._using_fused_tp_inference()
         moe_kwargs = {}
         if self.is_moe_layer and input_ids is not None:
             moe_kwargs["input_ids"] = input_ids
         if self.is_moe_layer:
             moe_kwargs["packed_seq_params"] = packed_seq_params
+
+        if using_fused_tp_inference_kernel:
+            # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
+            # operation in MLP's fc2, which adds it since _apply_mlp_bda_step will not.
+            self._set_fc2_residual(residual)
 
         if self.recompute_mlp:
             mlp_output_with_bias = precision_aware_checkpoint(
@@ -1528,10 +1529,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             bias_output = bias_chunks[0] if bias_chunks else None
             mlp_output_with_bias = (mlp_output, bias_output)
         else:
-            if using_fused_tp_inference_kernel:
-                # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
-                # operation in MLP's fc2.
-                self._set_fc2_residual(residual)
             mlp_output_with_bias = apply_module(self.mlp)(
                 pre_mlp_layernorm_output, padding_mask=padding_mask, **moe_kwargs
             )
@@ -1579,9 +1576,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             )
             return self._legacy_forward_post_mlp(self, mlp_output_with_bias, residual)
 
-        using_fused_tp_inference_kernel = (
-            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
-        )
+        using_fused_tp_inference_kernel = self._using_fused_tp_inference()
 
         residual_connection = self._get_mlp_residual_connection(operation="write")
         recompute_context = (
@@ -1674,36 +1669,58 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
     def configure_fused_tp_inference(
         self,
-        skip_qkv_norm_and_all_gather: bool = False,
+        qkv_fused_tp_handoff: Optional[FusedTPHandoff] = None,
         fc2_next_layer_norm_weights: Optional[Tensor] = None,
     ):
         """
         Configure settings for fused TP communication in inference mode.
 
         Args:
-            skip_qkv_norm (bool): Whether to skip norm and all-gather for linear_qkv.
+            qkv_fused_tp_handoff (Optional[FusedTPHandoff]): Previous layer's MLP FC2
+                handoff, which records whether it applied linear_qkv's norm and all-gather.
             fc2_next_layer_norm_weights (Optional[Tensor]): Next layer's QKV norm weights
-                for current layer's MLP FC2.
+                for current layer's MLP FC2, or None if nothing after FC2 can take its
+                input from the fused kernel (last layer, or a next layer without a fusable
+                linear_qkv, such as MLA). FC2 then reduce-scatters and adds the residual.
         """
-        self.self_attention.linear_qkv.skip_norm_and_all_gather = skip_qkv_norm_and_all_gather
+        # Only a fusable linear_qkv can take its input norm and all-gather over from the
+        # previous layer's FC2. Otherwise (e.g. MLA) get_qkv_layer_norm_weights gives that
+        # FC2 no weights and this layer applies its own input norm.
+        linear_qkv = self._get_fusable_linear_qkv()
+        if linear_qkv is not None:
+            linear_qkv.fused_tp_handoff = qkv_fused_tp_handoff
 
         # Use current layer's own MLP FC1 norm weights for attention's/mixer's out_proj
         mlp_fc1_weights = self.get_mlp_layer_norm_weights()
         self._set_proj_next_layer_norm_weights(mlp_fc1_weights)
 
-        self.mlp.linear_fc1.skip_norm_and_all_gather = True
+        self.mlp.linear_fc1.fused_tp_handoff = self.self_attention.linear_proj.fused_tp_handoff
         # Use next layer's attention norm weights for current layer's MLP FC2
         self._set_fc2_next_layer_norm_weights(fc2_next_layer_norm_weights)
+
+    def get_fc2_fused_tp_handoff(self) -> FusedTPHandoff:
+        """Get the MLP FC2 handoff for the next layer's QKV."""
+        return self.mlp.linear_fc2.fused_tp_handoff
+
+    def _using_fused_tp_inference(self) -> bool:
+        """Whether attention's linear_proj and MLP's linear_fc2 own the residual adds.
+
+        With fused TP communication they do in inference, but only in eval mode: in
+        training mode the inference linears run their training path, so the layer keeps
+        its own bias-dropout-add even while InferenceMode is active.
+        """
+        return (
+            self.config.inference_fuse_tp_communication
+            and InferenceMode.is_active()
+            and not self.training
+        )
 
     def _set_proj_next_layer_norm_weights(self, weights: Tensor):
         """Set next layer norm weights for attention/mixer's linear_proj."""
         self.self_attention.linear_proj._set_next_layer_norm_weights(weights)
 
     def _set_fc2_next_layer_norm_weights(self, weights: Optional[Tensor]):
-        """Set next layer norm weights for MLP FC2."""
-        if weights is None:
-            # Create dummy tensor for last layer (same shape as fc1 norm weights)
-            weights = torch.empty_like(self.get_mlp_layer_norm_weights())
+        """Set next layer norm weights for MLP FC2 (None: reduce-scatter and residual add)."""
         self.mlp.linear_fc2._set_next_layer_norm_weights(weights)
 
     def _set_proj_residual(self, residual: Tensor):
@@ -1723,14 +1740,39 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         """
         return self.mlp.linear_fc1.layer_norm_weight.data
 
-    def get_qkv_layer_norm_weights(self) -> Tensor:
+    def get_qkv_layer_norm_weights(self) -> Optional[Tensor]:
         """
         Get the QKV layer norm weights.
 
         Returns:
-            Tensor: The layer norm weight data.
+            Optional[Tensor]: The layer norm weight data, or None if the previous layer's
+                FC2 cannot apply this layer's input norm (see _get_fusable_linear_qkv).
         """
-        return self.self_attention.linear_qkv.layer_norm_weight.data
+        linear_qkv = self._get_fusable_linear_qkv()
+        return linear_qkv.layer_norm_weight.data if linear_qkv is not None else None
+
+    def _get_fusable_linear_qkv(self) -> Optional[InferenceLayerNormColumnParallelLinear]:
+        """
+        Get the attention's linear_qkv if the previous layer's FC2 can fuse its input norm
+        and all-gather. That holds only for an InferenceLayerNormColumnParallelLinear: in
+        inference it applies the same RMSNorm (layer_norm_weight, layernorm_epsilon) as the
+        fused kernel, and reads its input from symmetric memory when its fused_tp_handoff
+        says the kernel ran.
+
+        Other attention inputs apply their own norm. For example, MLA has no linear_qkv: its
+        input_layernorm is a separate module, and its down projections take the normalized
+        sequence-parallel shard, not the all-gathered input.
+
+        Returns:
+            Optional[InferenceLayerNormColumnParallelLinear]: linear_qkv, or None.
+        """
+        # Import here to avoid a circular import.
+        from megatron.core.tensor_parallel import inference_layers
+
+        linear_qkv = getattr(self.self_attention, "linear_qkv", None)
+        if isinstance(linear_qkv, inference_layers.InferenceLayerNormColumnParallelLinear):
+            return linear_qkv
+        return None
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
