@@ -13,6 +13,7 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
+    RuntimePolicy,
     SchedulePolicy,
     fully_shard,
     fully_shard_context,
@@ -141,8 +142,10 @@ def test_overlaps_communication_and_compute(
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
     with fully_shard_context(
         device=device,
-        use_symmetric_memory=use_symmetric_memory,
-        unify_communication_stream=unify_communication_stream,
+        runtime_policy=RuntimePolicy(
+            use_symmetric_memory=use_symmetric_memory,
+            unify_communication_stream=unify_communication_stream,
+        ),
     ) as context:
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
@@ -244,8 +247,10 @@ def test_overlaps_communication_and_compute(
             f"Expected exactly {expected_allgather_overlap_count} all-gathers to "
             f"overlap compute, got {allgather_overlap_count}/{len(allgather_groups)}."
         )
-    assert reduce_scatter_overlap_count == expected_reduce_scatter_overlap_count, (
-        f"Expected exactly {expected_reduce_scatter_overlap_count} reduce-scatters to overlap "
+    # Skipping the wait after non-final microbatches can also let their last
+    # reduction overlap the next forward.
+    assert reduce_scatter_overlap_count >= expected_reduce_scatter_overlap_count, (
+        f"Expected at least {expected_reduce_scatter_overlap_count} reduce-scatters to overlap "
         f"compute, got {reduce_scatter_overlap_count}/{len(reduce_scatter_groups)}."
     )
 

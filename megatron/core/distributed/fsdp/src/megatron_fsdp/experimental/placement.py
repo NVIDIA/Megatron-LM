@@ -31,12 +31,25 @@ sharded        ``Replicate``  ``allgather()``
 =============  =============  ====================
 """
 
+import enum
 from collections.abc import Iterable
 
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
-__all__ = ["BlockAtomic", "RowAtomic", "TensorAtomic", "changed_mesh_axis"]
+__all__ = ["BlockAtomic", "RowAtomic", "ShardLayout", "TensorAtomic", "changed_mesh_axis"]
+
+
+class ShardLayout(enum.Enum):
+    """How a ``RowAtomic`` / ``BlockAtomic`` group is split into per-rank segments."""
+
+    PADDED = "padded"
+    """Equal segments. The group is padded to a multiple of ``dp_size * LCM(row sizes)``
+    (times the block size for ``BlockAtomic``)."""
+
+    UNPADDED = "unpadded"
+    """No padding. Tensors are packed back to back and segments end on the row/block
+    boundary nearest to an even split."""
 
 
 class RowAtomic(Shard):
@@ -73,7 +86,7 @@ class TensorAtomic(Shard):
     With ``fully_shard``, use ``TensorAtomic()`` in ``Placements`` and supply only
     ``fully_shard_context(parameter_to_owner=...)``. Each parameter group derives
     its tensor owners from that mapping and passes them to
-    ``GlobalLayout.build_for_tensor_atomic``. Ownership is encoded by the layout's
+    ``layout_builder.build_for_tensor_atomic``. Ownership is encoded by the layout's
     offsets; this placement stores no owner assignments.
     """
 

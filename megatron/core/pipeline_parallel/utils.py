@@ -1,8 +1,8 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Callable, Optional
 
 import torch
@@ -251,6 +251,9 @@ class ScheduleNode:
         self.ncclep_zero_copy = ncclep_zero_copy
         self.inputs = None
         self.outputs = None
+        # When True, the forward runs under torch.no_grad() so no autograd graph is
+        # retained; the layer-level full recompute path replays it with grad at backward.
+        self.forward_no_grad = False
 
     def default_backward_func(self, outputs, output_grad):
         """Default backward function"""
@@ -282,12 +285,26 @@ class ScheduleNode:
                     input.requires_grad = inputs[i].requires_grad
 
             data = tuple(self.inputs)
-            data = self.forward_func(*data)
+            # Full recompute: skip the graph now, rebuild it by re-running at backward.
+            grad_ctx = torch.no_grad() if self.forward_no_grad else nullcontext()
+            with grad_ctx:
+                data = self.forward_func(*data)
 
             if not isinstance(data, tuple):
                 data = make_viewless(data)
             else:
                 data = tuple([make_viewless(e) if isinstance(e, torch.Tensor) else e for e in data])
+
+            if self.forward_no_grad:
+                # no_grad does not make the output graph-free: forward_func may re-enter
+                # grad mode (TransformerLayer runs its bias-dropout-add under
+                # torch.enable_grad), and the output then carries a grad_fn that pins the
+                # tensors it was built from for as long as the output is retained, i.e.
+                # across the forward->backward gap when it becomes the next segment's input.
+                if isinstance(data, tuple):
+                    data = tuple(e.detach() if isinstance(e, torch.Tensor) else e for e in data)
+                else:
+                    data = data.detach()
 
             self.output = data
 

@@ -18,9 +18,11 @@ from math import ceil
 from typing import Any, Dict, List
 
 import torch
+from torch.utils._pytree import tree_flatten as tree_flatten_pyt
 from torch.utils._pytree import tree_map as tree_map_pyt
 
 from megatron.core.num_microbatches_calculator import get_num_microbatches
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
@@ -29,7 +31,13 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     is_checkpointing,
 )
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
+from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
+    CSALayerConfig,
+)
+from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
@@ -70,9 +78,9 @@ except ImportError:
 if HAVE_GTP:
     from megatron.core.tensor_parallel.gtp_api import (
         GTP_CONFIG,
-        GTPChain,
         get_rs_stream,
         initialize_graph_wgrad_rings,
+        is_graphed_chain,
         preserve_gtp_prefetch_state,
         set_cuda_graph_mempool,
         track_gtp_capture_comms,
@@ -82,7 +90,7 @@ else:
     # Placeholders so static analysis does not flag these GTP-only symbols as
     # possibly-used-before-assignment; every use site is guarded by HAVE_GTP /
     # gtp_remat at runtime.
-    GTPChain = None
+    is_graphed_chain = None
     GTP_CONFIG = None
     get_rs_stream = None
     initialize_graph_wgrad_rings = None
@@ -312,14 +320,17 @@ class CudagraphBufferMetadata:
 class ArgMetadata:
     """Arg meta."""
 
-    def __init__(self, arg):
+    def __init__(self, arg, keep_values: bool = False):
         self.type = type(arg)
+        self.values = None
         if isinstance(arg, torch.Tensor):
             self.shape = arg.shape
             self.dtype = arg.dtype
             self.device = arg.device
             self.value = arg.data_ptr()
             self.requires_grad = arg.requires_grad
+            if keep_values:
+                self.values = arg.detach().clone()
             if hasattr(arg, "cg_buffer_metadata"):
                 # Its important this is a reference copy
                 self.cg_buffer_metadata = arg.cg_buffer_metadata
@@ -342,6 +353,10 @@ def alloc_tensor_from_graph_mempool(meta: ArgMetadata):
         torch.cuda.current_device(), CudaGraphManager.global_mempool
     )
     out = meta.zeros_like()
+    if meta.values is not None:
+        # Warmup runs the layer on this buffer before capture.
+        # Sequence metadata (cu_seqlens) must hold real values until TransfomerEngine#3205.
+        out.copy_(meta.values)
     out.is_from_global_mempool = True
     out.requires_grad_(meta.requires_grad)
 
@@ -580,6 +595,7 @@ class _CudagraphGlobalRecord:
     cudagraph_record: list[tuple] = []
     cudagraph_inference_record: list[tuple] = []
     _saved_tensors_observer = None
+    _te_capture_started = False
 
     @classmethod
     def _enable_saved_tensors_observer(cls):
@@ -626,6 +642,13 @@ class _CudagraphGlobalRecord:
         try:
             return cls._create_cudagraphs()
         finally:
+            # A failed capture must not leave DDP hooks disabled for subsequent backwards.
+            if is_graph_capturing():
+                _set_warmup_end()
+                _set_capture_end()
+                if cls._te_capture_started:
+                    te_set_capture_end()
+                    cls._te_capture_started = False
             cls._disable_saved_tensors_observer()
 
     @classmethod
@@ -681,9 +704,20 @@ class _CudagraphGlobalRecord:
             GTP_CONFIG.check_param_states = False
             initialize_graph_wgrad_rings()
 
+        # Recording/warmup can keep AccumulateGrad nodes alive on the default stream.
+        # Match full-iteration capture: let autograd redirect those stale references to
+        # the capturing stream rather than introduce an illegal default-stream dependency.
+        # Intentionally leave this process-global setting enabled, as full-iteration capture
+        # does. The API has no getter for restoring its previous value; resetting it to False
+        # could disable an override enabled by another caller. It only affects capture-time
+        # stream handling, not ordinary eager backward.
+        if hasattr(torch.autograd.graph, 'set_override_stale_capture_stream'):
+            torch.autograd.graph.set_override_stale_capture_stream(True)
+
         _set_capture_start()
         if has_te_modules:
             te_set_capture_start()
+            cls._te_capture_started = True
 
         global bwd_buffer_reuse_ref_count, fwd_buffer_reuse_ref_count
 
@@ -755,6 +789,7 @@ class _CudagraphGlobalRecord:
         _set_capture_end()
         if has_te_modules:
             te_set_capture_end()
+            cls._te_capture_started = False
 
         torch.cuda.set_stream(torch.cuda.default_stream())
 
@@ -1098,19 +1133,10 @@ class _CudaGraphRunner(torch.nn.Module):
         if not self.finalized_during_bwd_capture:
             return
 
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["gtp_remat", "expt_gtp_remat"]
-        )
-        dense_group = pg_collection.gtp_remat
-        expert_group = pg_collection.expt_gtp_remat
-        params_by_group = defaultdict(list)
+        params_by_stream = defaultdict(list)
         for param in self.finalized_during_bwd_capture:
-            is_expert = not getattr(param, 'allreduce', True)
-            params_by_group[expert_group if is_expert else dense_group].append(param)
-        self._gtp_finalize_hook_plan = [
-            (get_rs_stream(GTPChain.GRAPHED.value, group), params)
-            for group, params in params_by_group.items()
-        ]
+            params_by_stream[get_rs_stream(param.chain_id, param.group)].append(param)
+        self._gtp_finalize_hook_plan = list(params_by_stream.items())
 
     def __str__(self):
         return "%s; hid %s" % (
@@ -1377,9 +1403,9 @@ class _CudaGraphRunner(torch.nn.Module):
                         # by both capture ownership and chain keeps UNGRAPHED work on its eager
                         # lifecycle instead of turning it into a cross-graph handoff.
                         warmup_params, warmup_ag_streams, warmup_rs_streams = (
-                            warmup_comms.get_comms_for_chain(GTPChain.GRAPHED.value)
+                            warmup_comms.get_comms_for_chains(is_graphed_chain)
                         )
-                        wait_async_comms(GTPChain.GRAPHED.value, params=warmup_params)
+                        wait_async_comms(graphed_only=True, params=warmup_params)
                         self._wait_side_streams(warmup_ag_streams)
                         self._wait_side_streams(warmup_rs_streams)
             _set_warmup_end()
@@ -1423,12 +1449,10 @@ class _CudaGraphRunner(torch.nn.Module):
 
                     if self.gtp_remat:
                         # Forward only issues AG prefetches. Drain the operations directly.
-                        captured_params, captured_ag_streams, _ = capture_comms.get_comms_for_chain(
-                            GTPChain.GRAPHED.value
+                        captured_params, captured_ag_streams, _ = (
+                            capture_comms.get_comms_for_chains(is_graphed_chain)
                         )
-                        wait_async_comms(
-                            GTPChain.GRAPHED.value, skip_rs=True, params=captured_params
-                        )
+                        wait_async_comms(graphed_only=True, skip_rs=True, params=captured_params)
                         self._wait_side_streams(captured_ag_streams)
 
                 if self.gtp_remat:
@@ -1582,10 +1606,10 @@ class _CudaGraphRunner(torch.nn.Module):
             #             happen here (see wait_async_comms).
             if self.gtp_remat:
                 captured_params, captured_ag_streams, captured_rs_streams = (
-                    capture_comms.get_comms_for_chain(GTPChain.GRAPHED.value)
+                    capture_comms.get_comms_for_chains(is_graphed_chain)
                 )
                 # Phase 1: drain AG
-                wait_async_comms(GTPChain.GRAPHED.value, skip_rs=True, params=captured_params)
+                wait_async_comms(graphed_only=True, skip_rs=True, params=captured_params)
                 self._wait_side_streams(captured_ag_streams)
 
                 # Release the next runner after AG drain but before RS drain.
@@ -1593,7 +1617,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
                 # Phase 2: in-graph RS drain + finalize.
                 wait_async_comms(
-                    GTPChain.GRAPHED.value, finalize_after_drain=True, params=captured_params
+                    graphed_only=True, finalize_after_drain=True, params=captured_params
                 )
                 self._wait_side_streams(captured_rs_streams)
 
@@ -1711,8 +1735,19 @@ class _CudaGraphRunner(torch.nn.Module):
 
             self.apply_cudagraph_record_metadata(args, kwargs, out)
 
+            # Sequence metadata (cu_seqlens) must hold real values until TransfomerEngine#3205.
+            warmup_value_ids = {
+                id(value)
+                for leaf in tree_flatten_pyt((args, kwargs))[0]
+                if isinstance(leaf, PackedSeqParams)
+                for value in vars(leaf).values()
+                if torch.is_tensor(value)
+            }
+
             def _replace_with_meta(arg):
-                return ArgMetadata(arg) if torch.is_tensor(arg) else arg
+                if not torch.is_tensor(arg):
+                    return arg
+                return ArgMetadata(arg, keep_values=id(arg) in warmup_value_ids)
 
             m_args = tree_map(_replace_with_meta, args)
             m_kwargs = tree_map(_replace_with_meta, kwargs)
@@ -2425,10 +2460,15 @@ class TECudaGraphHelper:
             ), "Layer is not in the chunk"
 
             def get_rotary_pos_emb(transformer_module, transformer_input):
-                if (
-                    transformer_module.position_embedding_type == 'rope'
-                    and not self.config.multi_latent_attention
-                ):
+                uses_mla = self.config.multi_latent_attention
+                if getattr(transformer_module, "hybrid_layer_config_list", None) is not None:
+                    # Config types select the layer implementation; copied flags may differ.
+                    config_type = type(layer.config)
+                    if config_type is AttentionLayerConfig:
+                        uses_mla = False
+                    elif config_type in (MLALayerConfig, DSALayerConfig, CSALayerConfig):
+                        uses_mla = True
+                if transformer_module.position_embedding_type == 'rope' and not uses_mla:
                     rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
                         None, transformer_module.decoder, transformer_input, self.config, None
                     )
