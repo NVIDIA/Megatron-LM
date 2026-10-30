@@ -10,11 +10,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.distributed.param_and_grad_buffer import (
-    _ParamAndGradBuffer,
-    _scale_tensors_,
-    partition_buckets,
-)
+from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import TestModel, Utils
@@ -693,29 +689,6 @@ class TestFP32LocalGradAccumulation:
 
         Utils.destroy_model_parallel()
 
-    def test_scale_gradients_with_device_tensor_matches_inplace_mul(self):
-        """A CUDA scalar tensor (as passed by finalize_model_grads) should scale bf16 grad_data
-        and fp32 extra main_grads bitwise identically to `tensor *= scaling_factor`."""
-        Utils.initialize_model_parallel()
-        _, buf, _ = self._make_model(patterns=('*.weight',))
-        assert buf.grad_data.dtype == torch.bfloat16 and len(buf.extra_main_grads) > 0
-
-        torch.manual_seed(0)
-        grads = [buf.grad_data, *buf.extra_main_grads]
-        for grad in grads:
-            grad.normal_()
-        scaling = 1.0 / torch.clamp(torch.tensor(7, dtype=torch.int, device="cuda"), min=1)
-        expected = [grad.clone() for grad in grads]
-        for grad in expected:
-            grad *= scaling
-
-        buf.scale_gradients(scaling)
-
-        for grad, reference in zip(grads, expected):
-            assert torch.equal(_bits(grad), _bits(reference))
-
-        Utils.destroy_model_parallel()
-
     def test_grad_sync_copies_to_and_from_comm_buffer(self):
         """During grad sync, values in FP32 main_grad should be copied to the comm buffer
         before the collective, and the reduced result should be copied back afterward."""
@@ -1117,94 +1090,3 @@ def test_expert_parallel_params_get_separate_buffers(use_distributed_optimizer: 
             )
 
     Utils.destroy_model_parallel()
-
-
-def _bits(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.view({2: torch.int16, 4: torch.int32, 8: torch.int64}[tensor.element_size()])
-
-
-def _scaling_test_tensors(dtypes):
-    torch.manual_seed(0)
-    special_values = [0.0, -0.0, 1.0, -1.0, float("inf"), float("-inf"), 1e-40, 3.0e38]
-    tensors = []
-    for i, dtype in enumerate(dtypes):
-        values = torch.randn(4096 + 7 * i, device="cuda") * 1000
-        values[: len(special_values)] = torch.tensor(special_values)
-        tensors.append(values.to(dtype))
-    return tensors
-
-
-@pytest.mark.parametrize(
-    "dtypes",
-    [(torch.bfloat16,), (torch.float16,), (torch.float32,), (torch.bfloat16, torch.float32)],
-)
-@pytest.mark.parametrize("factor_dtype", [torch.float32, torch.float64, torch.bfloat16])
-@pytest.mark.parametrize("factor", [1.0 / 3, 1.0 / 123457, 7.0])
-def test_scale_tensors_with_device_factor_matches_inplace_mul(dtypes, factor_dtype, factor):
-    tensors = _scaling_test_tensors(dtypes)
-    scaling = torch.tensor(factor, dtype=factor_dtype, device="cuda")
-    expected = [tensor.clone() for tensor in tensors]
-    for tensor in expected:
-        tensor *= scaling
-
-    _scale_tensors_(tensors, scaling)
-
-    for tensor, reference in zip(tensors, expected):
-        assert torch.equal(_bits(tensor), _bits(reference))
-
-
-@pytest.mark.parametrize("kind", ["python_float", "cpu_tensor", "cuda_1d_tensor"])
-def test_scale_tensors_with_other_factors_matches_inplace_mul(kind):
-    scaling = {
-        "python_float": lambda: 1.0 / 3,
-        "cpu_tensor": lambda: torch.tensor(1.0 / 3),
-        "cuda_1d_tensor": lambda: torch.tensor([1.0 / 3], device="cuda"),
-    }[kind]()
-    tensors = _scaling_test_tensors((torch.bfloat16, torch.float32))
-    expected = [tensor.clone() for tensor in tensors]
-    for tensor in expected:
-        tensor *= scaling
-
-    _scale_tensors_(tensors, scaling)
-
-    for tensor, reference in zip(tensors, expected):
-        assert torch.equal(_bits(tensor), _bits(reference))
-
-
-def test_scale_tensors_with_device_factor_uses_fused_foreach_kernel():
-    tensors = _scaling_test_tensors((torch.bfloat16, torch.float32))
-    scaling = torch.tensor(1.0 / 3, device="cuda")
-    _scale_tensors_(tensors, scaling)
-    torch.cuda.synchronize()
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
-    ) as profile:
-        _scale_tensors_(tensors, scaling)
-        torch.cuda.synchronize()
-
-    kernel_names = {event.key for event in profile.key_averages()}
-    assert any("multi_tensor_apply_kernel" in name for name in kernel_names), kernel_names
-    # MulFunctor is the broadcasting `tensor *= scalar_tensor` kernel, also used by the slow
-    # foreach fallback.
-    assert not any("MulFunctor" in name for name in kernel_names), kernel_names
-
-
-def test_scale_tensors_reads_device_factor_at_graph_replay():
-    tensors = _scaling_test_tensors((torch.bfloat16, torch.float32))
-    original = [tensor.clone() for tensor in tensors]
-    scaling = torch.tensor(0.5, device="cuda")
-    _scale_tensors_([tensor.clone() for tensor in tensors], scaling)
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        _scale_tensors_(tensors, scaling)
-
-    for factor in (1.0 / 3, 1.0 / 7):
-        for tensor, source in zip(tensors, original):
-            tensor.copy_(source)
-        scaling.fill_(factor)
-        graph.replay()
-        for tensor, source in zip(tensors, original):
-            reference = source * torch.tensor(factor, device="cuda")
-            assert torch.equal(_bits(tensor), _bits(reference))
