@@ -173,3 +173,29 @@ def test_causal_conv1d_channel_contiguous_matches_sequence_contiguous(dtype):
     torch.testing.assert_close(
         dbias_channel, dbias_sequence, rtol=param_grad_rtol, atol=param_grad_atol
     )
+
+
+@pytest.mark.parametrize(
+    ("batch_and_length", "width", "offset", "copied"),
+    [
+        ((2, 3), 24, 8, False),
+        ((2, 3), 20, 0, True),
+        ((2, 3), 24, 4, True),
+        # Size 1 in batch and length: contiguous() would return the view unchanged.
+        ((1, 1), 20, 0, True),
+    ],
+    ids=["aligned", "token-stride", "start", "single-token"],
+)
+def test_ensure_channel_last_alignment(monkeypatch, batch_and_length, width, offset, copied):
+    """A channel slice of a wider tensor is copied exactly when causal_conv1d's channel-last
+    kernel would reject its start or strides, and never for the F.conv1d fallback."""
+    x = torch.randn(*batch_and_length, width)[..., offset : offset + 8]
+
+    monkeypatch.setattr(causal_conv1d_module, "causal_conv1d_fn", None)
+    assert causal_conv1d_module.ensure_channel_last_alignment(x) is x
+
+    monkeypatch.setattr(causal_conv1d_module, "causal_conv1d_fn", lambda **kwargs: None)
+    aligned = causal_conv1d_module.ensure_channel_last_alignment(x)
+    assert (aligned is not x) == copied
+    assert torch.equal(aligned, x)
+    assert aligned.storage_offset() % 8 == aligned.stride(0) % 8 == aligned.stride(1) % 8 == 0
