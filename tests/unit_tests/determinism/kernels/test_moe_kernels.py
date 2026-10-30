@@ -34,7 +34,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.moe import moe_utils
+from megatron.core.transformer.moe import batch_invariant, moe_utils
 from megatron.core.transformer.moe.experts import (
     SequentialMLP,
     TEGroupedMLP,
@@ -43,7 +43,10 @@ from megatron.core.transformer.moe.experts import (
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.ops.virtual_expert_triton import VirtualExpertPlannerWorkspace
 from megatron.core.transformer.moe.router import InferenceTopKRouter, TopKRouter
-from megatron.core.transformer.moe.token_dispatcher import _VirtualExpertHybridEPManager
+from megatron.core.transformer.moe.token_dispatcher import (
+    _NCCLEPManager,
+    _VirtualExpertHybridEPManager,
+)
 from megatron.core.transformer.moe.virtual_expert_load_balancer import (
     VirtualExpertLoadBalancer,
     plan_virtual_expert_routes,
@@ -515,6 +518,49 @@ def test_virtual_expert_routing_adapter_replay(dtype, compiled):
         replays=3,
         contention=True,
         what=f"virtual-expert routing adapter[{dtype=}, {compiled=}]",
+    )
+
+
+@pytest.mark.parametrize("routing", ["bool", "indices"])
+def test_ncclep_padding_mask_metadata_replays(routing):
+    """NCCL EP routing metadata under a padding mask: padded rows become -1 routes with zero
+    weight (the kernels skip them and combine writes zeros back), valid rows keep their ids and
+    weights, and the packed-sequence flag is recorded; bit-exact on replay."""
+    Utils.initialize_distributed()
+    seeded()
+    num_tokens, num_experts, topk = 258, 64, 8
+    routing_map, full_probs = _routing(num_tokens=num_tokens, num_experts=num_experts, topk=topk)
+    expected_ids = full_probs.topk(topk, dim=1).indices
+    if routing == "indices":
+        routing_map = expected_ids.to(torch.int32)
+    padding_mask = torch.zeros((2, 129), dtype=torch.bool, device="cuda")
+    padding_mask[0, 3::7] = True
+    flat_padding = padding_mask.t().reshape(-1)
+    manager = object.__new__(_NCCLEPManager)
+    manager.router_topk = topk
+
+    def adapt(probs):
+        manager.setup_metadata(
+            routing_map,
+            probs,
+            padding_mask=padding_mask,
+            packed_seq_params=PackedSeqParams(qkv_format="thd"),
+        )
+        return manager.token_indices, manager.token_probs
+
+    indices, selected_probs = adapt(full_probs)
+    assert manager._is_thd and manager.num_local_tokens == num_tokens
+    expected_ids = expected_ids.masked_fill(flat_padding[:, None], -1)
+    torch.testing.assert_close(indices, expected_ids, rtol=0, atol=0)
+    expected_probs = full_probs.gather(1, expected_ids.clamp_min(0))
+    expected_probs = expected_probs.masked_fill(flat_padding[:, None], 0)
+    torch.testing.assert_close(selected_probs, expected_probs, rtol=0, atol=0)
+    assert_replays_bit_exact(
+        adapt,
+        (full_probs,),
+        replays=3,
+        contention=True,
+        what=f"ncclep padding-mask metadata[{routing=}]",
     )
 
 
@@ -1550,3 +1596,39 @@ class TestMoEModules:
         with deterministic_algorithms(True):
             layer(hidden)
         assert layer.token_dispatcher.probs is None
+
+
+@pytest.mark.parametrize("collective", ["ordered", "multimem"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_batch_invariant_unpermute_replays(monkeypatch, collective, dtype):
+    """The fused batch-invariant unpermute (``probs=None``) and its backward replay bit-exactly."""
+    if not batch_invariant.HAVE_TRITON:
+        pytest.skip("requires Triton")
+    seeded()
+    monkeypatch.setattr(batch_invariant, "get_batch_invariant_collective", lambda: collective)
+    monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: 2)
+    num_tokens, hidden = 4096, 520
+    rows = torch.randn(2 * num_tokens, hidden, device="cuda", dtype=dtype, requires_grad=True)
+    # Two experts on two EP ranks, one slot each: every token sums one row per rank.
+    inverse_map = torch.stack(
+        (
+            torch.arange(2 * num_tokens, device="cuda").view(2, num_tokens).T,
+            torch.tensor([0, 1], device="cuda").expand(num_tokens, 2),
+        )
+    )
+    grad = torch.randn(num_tokens, hidden, device="cuda", dtype=dtype)
+    grad.view(-1)[::7] = -0.0
+
+    def combine(x):
+        return batch_invariant.unpermute(
+            x, torch.Size((num_tokens, hidden)), probs=None, num_experts=2, inverse_map=inverse_map
+        )
+
+    assert_replays_bit_exact(
+        combine,
+        (rows,),
+        replays=3,
+        contention=True,
+        grad_outputs={"out": grad},
+        what=f"batch-invariant unpermute[{collective=}, {dtype=}]",
+    )
