@@ -12,7 +12,7 @@ from torch.utils.checkpoint import checkpoint
 
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
-from megatron.core.transformer.residual_recompute_plan import (
+from megatron.core.transformer.residual_recompute import (
     build_recompute_block_end_plan,
     build_recompute_layer_managers,
     finalize_recompute_block,
