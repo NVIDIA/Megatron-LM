@@ -638,43 +638,27 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 HyperConnectionHybridLayer,
             ]
 
-        # mHC calls inner-layer methods directly, bypassing the inner layer's FSDP hooks.
-        # If the wrapper is an FSDP unit, let it own those parameters and skip wrapping
-        # the inner layer separately. Routed experts keep their own expert-DP units.
+        # mHC bypasses inner-layer FSDP hooks, so selected wrappers own those parameters.
+        # Routed experts keep their separate expert-DP units.
         mhc_inner_layers_to_skip = set()
+        mhc_recompute_fsdp_units = set()
         for submodule in module.modules():
-            if not isinstance(submodule, HyperConnectionHybridLayer):
-                continue
-
-            wrapper_is_fsdp_unit = any(
+            if not isinstance(submodule, HyperConnectionHybridLayer) or not any(
                 isinstance(submodule, module_type) for module_type in fsdp_unit_modules
-            )
-            if not wrapper_is_fsdp_unit:
+            ):
                 continue
-
             mhc_inner_layers_to_skip.add(submodule.inner_layer)
 
-        # mHC replays saved operations from a block-output gradient hook, before
-        # the enclosing FSDP units enter pre_backward(). The replay manager restores
-        # activations but does not prepare FSDP parameters. Modules that read their
-        # own parameters during replay therefore need independent FSDP units: their
-        # forward hooks gather parameters, and their gradient hooks handle reduction.
-        # The current mHC path replays the input/pre-MLP norms this way; the mapping
-        # projection and gates are not replayed. Keep this selection aligned with
-        # the parameterized modules registered to the mHC recompute manager.
-        mhc_recompute_fsdp_units = set()
-        uses_mhc_recompute = config.recompute_granularity == "selective" and "mhc" in (
-            config.recompute_modules or []
-        )
-        if uses_mhc_recompute:
-            for inner_layer in mhc_inner_layers_to_skip:
-                for module_name in ("input_layernorm", "pre_mlp_layernorm"):
-                    replay_module = getattr(inner_layer, module_name, None)
-                    if replay_module is None:
-                        continue
-                    if next(replay_module.parameters(), None) is None:
-                        continue
-                    mhc_recompute_fsdp_units.add(replay_module)
+            # mHC replays activations from an output-gradient hook before FSDP pre_backward().
+            # Replayed input/pre-MLP norms need their own parameter gather/reduce hooks.
+            # Keep this list aligned with replay; mapping projections/gates are not replayed.
+            if config.recompute_granularity == "selective" and "mhc" in (
+                config.recompute_modules or []
+            ):
+                for name in ("input_layernorm", "pre_mlp_layernorm"):
+                    replay_unit = getattr(submodule.inner_layer, name, None)
+                    if replay_unit is not None and next(replay_unit.parameters(), None) is not None:
+                        mhc_recompute_fsdp_units.add(replay_unit)
 
         log_single_rank(
             logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", ddp_config
