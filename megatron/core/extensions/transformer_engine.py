@@ -2051,12 +2051,15 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
         input_: torch.Tensor,
         weight: Optional[torch.Tensor] = None,
         runtime_gather_output: Optional[bool] = None,
+        output_dtype: Optional[torch.dtype] = None,
     ):
         """Run TE MXFP8 output projection. Returns ``(output, bias)``."""
         from megatron.core.fp8_utils import get_fp8_context
 
         if weight is not None and weight is not self.weight:
             raise RuntimeError("TE MXFP8 output projection does not support runtime weight.")
+        if output_dtype is not None and output_dtype != input_.dtype:
+            raise ValueError("TE MXFP8 output projection does not support output_dtype.")
 
         with get_fp8_context(self.config):
             torch.cuda.nvtx.range_push("mxfp8_output_proj_telinear")
