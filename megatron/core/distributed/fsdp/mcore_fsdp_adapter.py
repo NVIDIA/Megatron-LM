@@ -40,6 +40,7 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
+from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
@@ -630,8 +631,25 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # Optimizer construction reads this attribute; retain the v1 contract for compatibility.
         self.ddp_config = ddp_config
 
+        use_mhc_units = fsdp_unit_modules is None and not config.overlap_moe_expert_parallel_comm
         if fsdp_unit_modules is None:
             fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+
+        fsdp_units = {
+            submodule
+            for submodule in module.modules()
+            if isinstance(submodule, tuple(fsdp_unit_modules))
+        }
+        if use_mhc_units:
+            for submodule in module.modules():
+                if (
+                    isinstance(submodule, HyperConnectionHybridLayer)
+                    and submodule.inner_layer in fsdp_units
+                ):
+                    # mHC calls split transformer branches directly, bypassing the inner
+                    # layer's forward hooks. Own those parameters at the called wrapper.
+                    fsdp_units.remove(submodule.inner_layer)
+                    fsdp_units.add(submodule)
 
         log_single_rank(
             logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", ddp_config
@@ -735,7 +753,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     # The root is always sharded after selected child units so it is not
                     # wrapped twice when its type also appears in fsdp_unit_modules.
                     continue
-                if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
+                if submodule in fsdp_units:
                     if config.init_model_with_meta_device:
                         _materialize_owned_meta_modules(submodule, device)
                     fully_shard(

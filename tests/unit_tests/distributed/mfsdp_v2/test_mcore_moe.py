@@ -62,8 +62,9 @@ def process_group_collections(distributed_setup):
     destroy_model_parallel()
 
 
-def test_build_train_step_and_clip(process_group_collections, distributed_setup):
-    """Shard experts over expert-DP and clip their combined gradients."""
+@pytest.mark.parametrize("enable_mhc", [False, True])
+def test_build_train_step_and_clip(process_group_collections, distributed_setup, enable_mhc):
+    """Match dense training with expert-DP sharding, including mHC branch calls."""
     process_group_collection, reference_process_group_collection = process_group_collections
     world_size = distributed_setup.world_size
     # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
@@ -86,6 +87,9 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
         hidden_dropout=0.0,
         gradient_accumulation_fusion=False,
         attention_backend=AttnBackend.unfused,
+        enable_mhc_connections=enable_mhc,
+        mhc_num_residual_streams=2,
+        normalization="RMSNorm",
     )
     # Pair CPU initialization with an explicit common seed for the reference and EP model.
     torch.manual_seed(123)
@@ -107,7 +111,14 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
         pg_collection=process_group_collection,
     ).cuda()
     model.load_state_dict(reference_model.state_dict(), strict=False)
+    parameter_names = {id(parameter): name for name, parameter in model.named_parameters()}
+    reference_parameters = dict(reference_model.named_parameters())
+    reference_names = {id(parameter): name for name, parameter in reference_parameters.items()}
+    parameter_mapping = {name: name for name in parameter_names.values()}
     for model_layer, reference_layer in zip(model.decoder.layers, reference_model.decoder.layers):
+        if enable_mhc:
+            model_layer = model_layer.inner_layer
+            reference_layer = reference_layer.inner_layer
         if not isinstance(model_layer, MoETransformerLayer):
             continue
         for fc in ("linear_fc1", "linear_fc2"):
@@ -119,6 +130,9 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
                     reference_parameter = getattr(reference_fc, f"{parameter_name}{global_}", None)
                     if model_parameter is not None:
                         model_parameter.data.copy_(reference_parameter.data)
+                        parameter_mapping[parameter_names[id(model_parameter)]] = reference_names[
+                            id(reference_parameter)
+                        ]
     reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
     model = FullyShardedDataParallel(
         config=config,
@@ -133,7 +147,12 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
         pg_collection=process_group_collection,
     )
     assert isinstance(model.module, FsdpModule)
-    assert isinstance(model.module.decoder.layers[1].mlp.experts, FsdpModule)
+    moe_layer = model.module.decoder.layers[1]
+    if enable_mhc:
+        assert all(isinstance(layer, FsdpModule) for layer in model.module.decoder.layers)
+        assert not isinstance(moe_layer.inner_layer, FsdpModule)
+        moe_layer = moe_layer.inner_layer
+    assert isinstance(moe_layer.mlp.experts, FsdpModule)
 
     optimizer_config = OptimizerConfig(
         lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
@@ -159,17 +178,6 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
         )
         return torch.nn.functional.mse_loss(output, targets)
 
-    reference_losses = []
-    for _ in range(5):
-        reference_optimizer.zero_grad(set_to_none=True)
-        (reference_loss,) = run_forward_backward_on_microbatches(reference_model, reference_forward)
-        reference_success, reference_pre_clip_norm, _ = reference_optimizer.step()
-        assert reference_success
-        assert (
-            reference_pre_clip_norm > optimizer_config.clip_grad
-        ), "Reference gradients must exceed the clipping threshold to exercise clipping."
-        reference_losses.append(reference_loss)
-
     def forward():
         output = model(
             input_ids=input_ids[input_slice],
@@ -178,14 +186,36 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
         )
         return torch.nn.functional.mse_loss(output, targets[input_slice])
 
-    losses = []
+    parameters = dict(model.module.named_parameters())
+    reference_losses, losses = [], []
     for _ in range(5):
+        reference_optimizer.zero_grad(set_to_none=True)
+        (reference_loss,) = run_forward_backward_on_microbatches(reference_model, reference_forward)
         optimizer.zero_grad(set_to_none=True)
         (loss,) = run_forward_backward_on_microbatches(model, forward)
+        for name, reference_name in parameter_mapping.items():
+            actual, expected = parameters[name].grad, reference_parameters[reference_name].grad
+            assert (actual is None) == (expected is None), name
+            if expected is not None:
+                torch.testing.assert_close(actual.full_tensor(), expected)
+        # A plain reference model has no DDP hooks maintaining main_grad aliases.
+        for parameter in reference_parameters.values():
+            if hasattr(parameter, "main_grad"):
+                parameter.main_grad = parameter.grad
+        reference_success, reference_pre_clip_norm, _ = reference_optimizer.step()
+        assert reference_success
+        assert (
+            reference_pre_clip_norm > optimizer_config.clip_grad
+        ), "Reference gradients must exceed the clipping threshold to exercise clipping."
         success, _, _ = optimizer.step()
         assert success
+        for name, reference_name in parameter_mapping.items():
+            torch.testing.assert_close(
+                parameters[name].detach().full_tensor(), reference_parameters[reference_name]
+            )
         torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
         losses.append(loss)
+        reference_losses.append(reference_loss)
 
     losses = torch.stack(losses)
     reference_losses = torch.stack(reference_losses)
