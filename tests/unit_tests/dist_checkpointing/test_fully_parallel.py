@@ -93,6 +93,68 @@ class TestFullyParallelSaveAndLoad:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.parametrize('cache_distribution', [False, True])
+    @pytest.mark.parametrize('validate_access_integrity', [False, True])
+    @pytest.mark.parametrize('save_method', ['save', 'async_save'])
+    def test_repeated_save_validation_with_mixed_group_sizes(
+        self, cache_distribution, validate_access_integrity, save_method
+    ):
+        """All ranks must agree on global validation, including singleton groups."""
+        Utils.initialize_model_parallel(1, 1)
+        if Utils.world_size < 4:
+            pytest.skip('Mixed checkpoint groups require at least four ranks')
+        split = Utils.world_size // 2
+        memberships = [list(range(split))] + [[rank] for rank in range(split, Utils.world_size)]
+        for members in memberships:
+            group = torch.distributed.new_group(members)
+            if Utils.rank in members:
+                local_group = group
+
+        def state_dict():
+            if Utils.rank < split:
+                tensor = ShardedTensor.from_rank_offsets(
+                    'encoder', torch.ones(4), replica_id=Utils.rank
+                )
+            else:
+                tensor = ShardedTensor.from_rank_offsets(
+                    'language',
+                    torch.ones(4),
+                    (0, Utils.rank - split, Utils.world_size - split),
+                    replica_id=0,
+                )
+            return {'weight': tensor}
+
+        module = inspect.getmodule(FullyParallelSaveStrategyWrapper)
+        original = module.determine_global_metadata
+        validation_calls = 0
+        first_metadata = None
+
+        def count_validation(sharded_state_dict):
+            nonlocal validation_calls, first_metadata
+            validation_calls += 1
+            if first_metadata is None:
+                first_metadata = original(sharded_state_dict)
+            # Count a repeated global gather without entering it: the original
+            # bug makes only singleton-group ranks participate and would hang.
+            return first_metadata
+
+        strategy = FullyParallelSaveStrategyWrapper(
+            mock.Mock(),
+            local_group,
+            do_cache_distribution=cache_distribution,
+            validate_access_integrity=validate_access_integrity,
+        )
+        try:
+            with mock.patch.object(module, 'determine_global_metadata', count_validation):
+                for iteration in (1, 2):
+                    getattr(strategy, save_method)(state_dict(), Path(str(iteration)))
+            per_rank_calls = [None] * Utils.world_size
+            torch.distributed.all_gather_object(per_rank_calls, validation_calls)
+            expected = 0 if not validate_access_integrity else (1 if cache_distribution else 2)
+            assert per_rank_calls == [expected] * Utils.world_size
+        finally:
+            torch.distributed.destroy_process_group(local_group)
+
     @staticmethod
     def get_sharded_state_dict():
         return {
