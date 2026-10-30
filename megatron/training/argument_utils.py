@@ -803,9 +803,16 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
 
     rerunsm_kwargs = _default_config_from_args(RerunStateMachineConfig, args, return_instance=False)
     rerunsm_kwargs["check_for_nan_in_loss"] = args.check_for_nan_in_loss_and_grad
+    # Preserve the legacy CLI spelling; native configs use Core's canonical mode.
+    if rerunsm_kwargs.get("rerun_mode") == "report_stats":
+        rerunsm_kwargs["rerun_mode"] = "report_determinism_stats"
 
     optim_cfg, _ = get_megatron_optimizer_config(args)
-    ddp_config = get_megatron_ddp_config(args, use_torch_fsdp2=getattr(args, "use_torch_fsdp2", False))
+    ddp_config = get_megatron_ddp_config(
+        args,
+        use_torch_fsdp2=getattr(args, "use_torch_fsdp2", False),
+        check_for_nan_in_grad=args.check_for_nan_in_loss_and_grad,
+    )
 
     cfg = PretrainConfigContainer(
         train=_default_config_from_args(TrainingConfig, args),

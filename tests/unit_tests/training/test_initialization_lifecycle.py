@@ -747,6 +747,18 @@ def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(
         else inference_cfg_container_from_args(args, build_model_config=False)
     )
     cfg.model = model
+    if training:
+        # Native recipe edits must win over stale or absent legacy CLI settings.
+        cfg.rerun_state_machine.rerun_mode = "report_determinism_stats"
+        cfg.rerun_state_machine.error_injection_rate = 17
+        cfg.rerun_state_machine.error_injection_type = "correct_result"
+        for name in (
+            "rerun_mode",
+            "error_injection_rate",
+            "error_injection_type",
+            "result_rejected_tracker_filename",
+        ):
+            delattr(args, name)
     global_vars.set_args(args)
     global_vars.set_run_config(cfg)
     events = []
@@ -793,7 +805,8 @@ def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(
     training_services = Mock(side_effect=lambda args: events.append("training"))
     monkeypatch.setattr(global_vars, "initialize_training_runtime_services", training_services)
     monkeypatch.setattr(initialize, "setup_logging", Mock())
-    monkeypatch.setattr(initialize, "initialize_rerun_state_machine", Mock())
+    initialize_rerun = Mock()
+    monkeypatch.setattr(initialize, "initialize_rerun_state_machine", initialize_rerun)
     monkeypatch.setattr(initialize.tuning, "install", Mock())
 
     initialize.initialize_megatron(
@@ -810,6 +823,13 @@ def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(
         + (["training"] if training else [])
     )
     assert training_services.call_count == int(training)
+    assert initialize_rerun.call_count == int(training)
+    if training:
+        settings = initialize_rerun.call_args.kwargs
+        assert settings["mode"].value == "report_determinism_stats"
+        assert settings["error_injector"].error_injection_rate == 17
+        assert settings["error_injector"].error_injection_type.value == "correct_result"
+        assert settings["result_rejected_tracker_filename"] is None
     assert (global_vars._GLOBAL_TOKENIZER is None) == (vocabulary == "custom")
 
 

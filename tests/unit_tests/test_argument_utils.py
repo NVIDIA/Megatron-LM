@@ -108,11 +108,19 @@ def test_no_megatron_fsdp_padded_shards_flag_reaches_ddp_config():
 
     default_args = parser.parse_args([])
     assert default_args.megatron_fsdp_padded_shards is True
-    assert get_megatron_ddp_config(default_args, use_torch_fsdp2=False).megatron_fsdp_padded_shards
+    assert get_megatron_ddp_config(
+        default_args,
+        use_torch_fsdp2=False,
+        check_for_nan_in_grad=default_args.check_for_nan_in_loss_and_grad,
+    ).megatron_fsdp_padded_shards
 
     disabled_args = parser.parse_args(["--no-megatron-fsdp-padded-shards"])
     assert disabled_args.megatron_fsdp_padded_shards is False
-    ddp_config = get_megatron_ddp_config(disabled_args, use_torch_fsdp2=False)
+    ddp_config = get_megatron_ddp_config(
+        disabled_args,
+        use_torch_fsdp2=False,
+        check_for_nan_in_grad=disabled_args.check_for_nan_in_loss_and_grad,
+    )
     assert ddp_config.megatron_fsdp_padded_shards is False
 
 
@@ -1442,7 +1450,7 @@ class TestPretrainContainerFromArgsStructure:
         mock_ddp.return_value = mock_ddp_instance
         args = _make_args()
         result = pretrain_cfg_container_from_args(args)
-        mock_ddp.assert_called_once_with(args, use_torch_fsdp2=False)
+        mock_ddp.assert_called_once_with(args, use_torch_fsdp2=False, check_for_nan_in_grad=True)
         assert result.ddp is mock_ddp_instance
 
     @pytest.mark.parametrize("enabled", [False, True])
@@ -1569,10 +1577,19 @@ class TestRerunStateMachineConfigMapping:
 
     def test_direct_rerun_state_machine_fields_from_args(self, patch_training_helpers):
         """RerunStateMachineConfig fields with 1-to-1 name mapping are pulled directly from args."""
-        args = _make_args(error_injection_rate=500, rerun_mode="report_stats")
+        args = _make_args(error_injection_rate=500, rerun_mode="report_determinism_stats")
         result = pretrain_cfg_container_from_args(args)
         assert result.rerun_state_machine.error_injection_rate == 500
-        assert result.rerun_state_machine.rerun_mode == "report_stats"
+        assert result.rerun_state_machine.rerun_mode == "report_determinism_stats"
+
+    @pytest.mark.parametrize("mode", ["report_stats", "report_determinism_stats"])
+    def test_stats_cli_spellings_resolve_to_core_mode(self, patch_training_helpers, mode):
+        parser = ArgumentParser()
+        add_megatron_arguments(parser)
+        parsed = parser.parse_args(["--rerun-mode", mode])
+        result = pretrain_cfg_container_from_args(_make_args(rerun_mode=parsed.rerun_mode))
+        assert result.rerun_state_machine.rerun_mode == "report_determinism_stats"
+        result.rerun_state_machine.validate()
 
 
 class TestTrainingConfigMapping:

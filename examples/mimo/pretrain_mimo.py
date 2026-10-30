@@ -75,7 +75,6 @@ def _parse_and_validate() -> argparse.Namespace:
         or getattr(args, "use_layer_wise_distributed_optimizer", False)
     ):
         raise ValueError("Other optimizer paths have not been tested with heterogeneous MIMO")
-    validate_encoder_prefetch_args(args)
 
     if getattr(args, "padded_vocab_size", None) is None:
         args.padded_vocab_size = calculate_padded_vocab_size(
@@ -93,6 +92,7 @@ def main() -> None:
     set_args(args)
     model_cfg = MimoBuildConfig()
     cfg = pretrain_cfg_container_from_args(args, model_cfg)
+    validate_encoder_prefetch_args(args, rerun_mode=cfg.rerun_state_machine.rerun_mode)
     set_run_config(cfg)
     provider = resolve_provider(args)
 

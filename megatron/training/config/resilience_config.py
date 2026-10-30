@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from megatron.core.fault_injector import FaultInjectorConfig
+from megatron.core.rerun_state_machine import RerunDiagnostic, RerunMode
 
 
 @dataclass(kw_only=True)
@@ -18,7 +19,7 @@ class RerunStateMachineConfig:
     )
     """Type of error to inject. """
 
-    rerun_mode: Literal["disabled", "validate_results", "report_stats"] = "validate_results"
+    rerun_mode: Literal["disabled", "validate_results", "report_determinism_stats"] = "validate_results"
     """Use re-run engine to validate results (default) or to emit stats
     on variability of computations due to non-deterministic algorithms."""
 
@@ -27,6 +28,14 @@ class RerunStateMachineConfig:
 
     check_for_spiky_loss: bool = False
     """Check for spiky loss."""
+
+    result_rejected_tracker_filename: str | None = None
+    """Optional file recording rejected results and iterations to skip on restart."""
+
+    def validate(self) -> None:
+        """Check rerun settings without constructing or modifying runtime state."""
+        RerunMode(self.rerun_mode)
+        RerunDiagnostic(self.error_injection_type)
 
 
 @dataclass(kw_only=True)
@@ -44,3 +53,8 @@ class StragglerDetectionConfig:
 
     disable_straggler_on_startup: bool = False
     """If set, StragglerDetector is disabled on startup."""
+
+    def validate(self) -> None:
+        """Check enabled detector settings without opening its controller socket."""
+        if self.log_straggler and not 0 <= self.straggler_ctrlr_port <= 65535:
+            raise ValueError("straggler_ctrlr_port must be between 0 and 65535")
