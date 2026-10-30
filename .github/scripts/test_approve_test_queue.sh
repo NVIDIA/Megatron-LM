@@ -70,3 +70,84 @@ if [[ -z "$next_approval_line" ]] || ! /usr/bin/sed -n "${guard_line},${next_app
 fi
 
 echo "Approve Test Queue preserves concurrency while skipping disabled full-test PRs"
+
+python3 - "$WORKFLOW" <<'PY'
+import contextlib
+import io
+import json
+import os
+import re
+import sys
+import textwrap
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import mock_open, patch
+
+source = Path(sys.argv[1]).read_text()
+source = textwrap.dedent(source.split('        shell: python\n        run: |\n', 1)[1].split('\n  notify:', 1)[0])
+
+
+def approvals(prs, queued=(), running=(), waiting=(), branch="main", contributor="internal", limit=20):
+    runs = {}
+    approved = []
+    by_status = {}
+    for status, numbers in (("queued", queued), ("in_progress", running), ("waiting", waiting)):
+        by_status[status] = []
+        for number in numbers:
+            run_id = len(runs) + 1
+            run = {"id": run_id, "name": "CICD Megatron-LM", "display_title": str(number),
+                   "head_branch": f"pull-request/{number}", "created_at": f"2026-01-01T00:00:{run_id:02d}Z"}
+            runs[run_id] = number
+            by_status[status].append(run)
+
+    def response(data):
+        return SimpleNamespace(status_code=200, links={}, json=lambda: data, raise_for_status=lambda: None)
+
+    def get(url, **kwargs):
+        if "actions/runs?" in url:
+            status = re.search(r"status=([^&]+)", url).group(1)
+            return response({"workflow_runs": by_status[status]})
+        if "/pulls/" in url:
+            number = int(url.rsplit("/", 1)[1])
+            author, base = prs[number]
+            return response({"number": number, "user": {"login": author}, "base": {"ref": base}, "labels": []})
+        if url.endswith("/pending_deployments"):
+            return response([{"id": 1, "environment": {"id": 1}}])
+        raise AssertionError(url)
+
+    def post(url, **kwargs):
+        approved.append(runs[int(url.split("/runs/")[1].split("/")[0])])
+        return response([{"state": "approved"}])
+
+    sso = {author: {"org_roles": ["NVIDIA:Member"]} for author, _ in prs.values()} if contributor == "internal" else {}
+    env = {"GITHUB_TOKEN": "test", "GITHUB_REPOSITORY": "NVIDIA/Megatron-LM",
+           "CONTRIBUTOR_TYPE": contributor, "MAX_CONCURRENCY": str(limit * 2),
+           "MAX_CONCURRENCY_EXTERNAL": str(limit), "SSO_USERS_FILE": "sso.json",
+           "ALLOW_PR_RUN_ALL_TESTS": "true"}
+    with patch.dict(os.environ, env), patch.dict(sys.modules, {"requests": SimpleNamespace(get=get, post=post)}), \
+         patch("builtins.open", mock_open(read_data=json.dumps(sso))), contextlib.redirect_stdout(io.StringIO()):
+        try:
+            exec(compile(source.replace("${{ matrix.branch }}", branch), "queue", "exec"), {})
+        except SystemExit as exc:
+            assert exc.code == 0, exc.code
+    return approved
+
+
+prs = {1: ("alice", "main"), 2: ("alice", "main"), 3: ("alice", "main"),
+       4: ("bob", "main"), 5: ("alice", "dev")}
+# Existing active work and approvals in this pass both consume the author's slots.
+assert approvals(prs, queued=[1], running=[2], waiting=[3, 4]) == [4]
+assert approvals(prs, waiting=[1, 2, 3, 4]) == [1, 2, 4]
+assert approvals(prs, running=[1], waiting=[2, 3, 4]) == [2, 4]
+# A PR appearing in both status snapshots still consumes only one author slot.
+assert approvals(prs, queued=[1], running=[1], waiting=[2, 3]) == [2]
+# Different branches remain independent, including the global external queue.
+assert approvals(prs, running=[1, 2], waiting=[3, 4, 5], contributor="external") == [4, 5]
+assert approvals(prs, running=[1, 2], waiting=[5], branch="dev") == [5]
+release_prs = {n: (author, "release/a" if base == "main" else "release/b")
+               for n, (author, base) in prs.items()}
+assert approvals(release_prs, running=[1, 2], waiting=[3, 4, 5], branch="others") == [4, 5]
+# The existing queue-wide limit still applies.
+assert approvals(prs, waiting=[1, 2, 4], limit=2) == [1, 2]
+print("Approve Test Queue limits each author to two active PRs per base branch")
+PY
