@@ -535,6 +535,52 @@ class TestMimoModel:
         torch.testing.assert_close(packed_seq_params.cu_seqlens_q, cu_seqlens.squeeze(0))
         assert packed_seq_params.max_seqlen_q == self.seq_len
 
+    def test_external_features_match_internal_encoder_and_backward(self):
+        """Separate encoding preserves two images' outputs and gradients without rerouting."""
+        model = get_vlm_mimo_model(32, 64, 16, 16, 16, 8, {"images": 100}).to(self.device).eval()
+        tokens = torch.arange(16, device=self.device).unsqueeze(0)
+        tokens[:, 2:7] = tokens[:, 10:15] = 100
+        positions = torch.arange(16, device=self.device).unsqueeze(0)
+        images = torch.randn(2, 3, 16, 16, device=self.device)
+        inputs = {"images": {"clip_encoder": {"x": images}}}
+        metadata = dict(
+            input_ids=tokens,
+            position_ids=positions,
+            cu_seqlens=torch.tensor([0, 8, 16], dtype=torch.int32, device=self.device),
+            max_seqlen=torch.tensor(8, dtype=torch.int32, device=self.device),
+        )
+
+        internal, _ = model(**metadata, modality_inputs=inputs)
+        internal.square().sum().backward()
+        reference_grads = {
+            name: parameter.grad.detach().clone()
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        }
+        model.zero_grad(set_to_none=True)
+        features = model.encode_modalities(inputs)
+        assert features["images"].shape == (10, 32)
+        leaf = features["images"].detach().requires_grad_()
+        routed = {"images": leaf}
+        with patch.object(model, "_apply_colocated_comms") as communicate:
+            model.colocated_comms = {("images", MIMO_LANGUAGE_MODULE_KEY): MagicMock()}
+            external, _ = model(**metadata, modality_embeddings=routed)
+            external.square().sum().backward()
+            features["images"].backward(leaf.grad)
+            communicate.assert_not_called()
+        assert set(routed) == {"images"}
+        torch.testing.assert_close(external, internal, rtol=1e-5, atol=1e-6)
+        for name, parameter in model.named_parameters():
+            if name in reference_grads:
+                torch.testing.assert_close(
+                    parameter.grad, reference_grads[name], rtol=1e-5, atol=1e-6
+                )
+            else:
+                assert parameter.grad is None
+        assert model.encode_modalities(None) == {}
+        with pytest.raises(ValueError, match="either modality_inputs or modality_embeddings"):
+            model(**metadata, modality_inputs=inputs, modality_embeddings=routed)
+
     def test_forward_with_partition_adapter(self):
         """MTP token metadata must use the same CP-local sequence as hidden states.
 
@@ -570,6 +616,7 @@ class TestMimoModel:
             "labels": None,
             "loss_mask": sharded_loss_mask,
             "mtp_input_mask": text_mask[:, :sharded_seq_len],
+            "padding_mask": torch.zeros_like(sharded_input_ids, dtype=torch.bool),
         }
         cp_batch = ContextParallelBatch(
             boundary_layout="contiguous",
@@ -594,6 +641,7 @@ class TestMimoModel:
             captured['loss_mask'] = kwargs.get('loss_mask')
             captured['mtp_input_mask'] = kwargs.get('mtp_input_mask')
             captured["cp_batch"] = kwargs.get("cp_batch")
+            captured["padding_mask"] = kwargs.get("padding_mask")
             return torch.zeros(
                 self.batch_size, sharded_seq_len, self.vocab_size, device=self.device
             )
@@ -639,6 +687,7 @@ class TestMimoModel:
         assert captured['mtp_input_mask'].dtype == torch.bool
         assert torch.equal(captured['mtp_input_mask'], text_mask[:, :sharded_seq_len])
         assert captured["cp_batch"] is cp_batch
+        assert captured["padding_mask"] is boundary_batch["padding_mask"]
         # forward() returns the adapter's possibly sharded loss mask.
         assert out_loss_mask is sharded_loss_mask
 
