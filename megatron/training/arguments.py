@@ -1026,6 +1026,9 @@ def validate_args(args, defaults={}):
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
 
+    if args.moe_megakernel_backend == "mok" and (args.use_megatron_fsdp or args.use_torch_fsdp2):
+        raise ValueError("MOK has not been validated with Megatron-FSDP or Torch FSDP2")
+
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
@@ -1879,19 +1882,22 @@ def validate_args(args, defaults={}):
             warn_rank_0('enabling --no-load-rng for upcycling.')
 
     # --skip-train checks.
-    # In RL inference-only mode, --no-load-optim is user-controlled: it determines whether the
-    # optimizer is created (needed for --rl-offload-optimizer-during-inference) or skipped entirely.
-    if args.skip_train and not args.perform_rl_step and not args.no_load_optim:
+    if args.skip_train and not args.no_load_optim:
         args.no_load_optim = True
         warn_rank_0('enabling --no-load-optim when skipping training.')
     rl_cfg.validate_run(
         cuda_graph_impl=args.cuda_graph_impl,
         micro_batch_size=args.micro_batch_size,
         global_batch_size=args.global_batch_size,
+        train_iters=args.train_iters,
+        train_samples=args.train_samples,
         skip_train=args.skip_train,
         load_optim=not args.no_load_optim,
         save_interval=args.save_interval,
         exit_interval=args.exit_interval,
+        separate_inference_model=rl_cfg.uses_separate_inference_model(
+            context_parallel_size=args.context_parallel_size, inference_shards=args.inference_shards
+        ),
     )
 
     # Optimizer CPU offload check
@@ -2437,6 +2443,8 @@ def _add_network_size_args(parser):
         "hash_moe_vocab_size",
         "fp8_param",
         "fp4_param",
+        # filled from the explicit --seq-length argument below
+        "max_seq_length_per_sample",
         # incompatible defaults in dataclass
         "gradient_accumulation_fusion",
         "overlap_p2p_comm",
@@ -2458,9 +2466,18 @@ def _add_network_size_args(parser):
         "expert_gtp_weight_remat_size",
         # Constructed from the dedicated flat CLI arguments below.
         "wide_residual",
+        # Parsed manually as a JSON object below.
+        "moe_megakernel_backend_config",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
+    transformer_group.add_argument(
+        "--moe-megakernel-backend-config",
+        type=json.loads,
+        default=None,
+        metavar="JSON",
+        help="Backend-specific MoE megakernel options as a JSON object.",
+    )
 
     group = parser.add_argument_group(title='network size')
 
@@ -3668,6 +3685,12 @@ def _add_experimental_args(parser):
                              "model gradients during FSDP. If 'auto', then the main gradient data-type will "
                              "be used for the gradient communication / reduction data-type. When using NCCL "
                              "v2.27+, reduction is always computed in FP32 if using NCCL Symmetric kernels.")
+    group.add_argument("--no-megatron-fsdp-padded-shards", action="store_false",
+                       dest="megatron_fsdp_padded_shards",
+                       help="Megatron-FSDP v2 only. If not set, pad every parameter group so each "
+                       "rank gets an equal shard. If set, pack each group without padding and split "
+                       "it into generally unequal per-rank shards at row boundaries (32-row block "
+                       "boundaries for MXFP8).")
     group.add_argument(
             '--megatron-fsdp-enable-fine-grained-param-gather',
             action='store_true',
@@ -3742,8 +3765,6 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
 def _add_sft_args(parser):
     group = parser.add_argument_group(title='sft')
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
-    group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
-                       help='SFT prompt format.')
     group.add_argument(
         '--sft-loss-log-mode',
         type=str,
