@@ -63,7 +63,7 @@ Distillation is triggered by calling `pretrain_gpt.py` or `pretrain_hybrid.py` w
 optionally alongside the additional following arguments:
 
 ```bash
---export-kd-distill-cfg <path-to-distill-config-yaml-file>
+--export-kd-cfg <path-to-distill-config-yaml-file>
 --export-kd-teacher-model-config <path-to-teacher-model-config-file>
 ```
 
