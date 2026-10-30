@@ -25,6 +25,7 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.utils import log_single_rank
 from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron.training.global_vars import get_run_config
+from megatron.training.models import LLaVAModelConfig
 from megatron.training.vocab_utils import model_vocab_size
 
 
@@ -51,6 +52,11 @@ def model_provider(
     """
     args = get_args()
     cfg = get_run_config()
+    if not isinstance(cfg.model, LLaVAModelConfig):
+        raise TypeError(
+            "Expected cfg.model to be LLaVAModelConfig, "
+            f"got {type(cfg.model).__name__}"
+        )
     use_te = args.use_te
 
     print_rank_0('building a multimodal model ...')

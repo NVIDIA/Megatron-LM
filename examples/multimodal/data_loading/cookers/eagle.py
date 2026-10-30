@@ -6,6 +6,7 @@ from PIL import Image
 from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
 from megatron.energon import CachePool, FileStore, MockLazy, basic_sample_keys, cooker, stateless
 from megatron.training.global_vars import get_run_config
+from megatron.training.models import LLaVAModelConfig
 
 from ..conversation_sample import ConversationSample, Message
 
@@ -14,6 +15,11 @@ from ..conversation_sample import ConversationSample, Message
 @cooker(need_cache=True)
 def cook_eagle(sample: dict, cache: CachePool, media_source: FileStore) -> ConversationSample:
     cfg = get_run_config()
+    if not isinstance(cfg.model, LLaVAModelConfig):
+        raise TypeError(
+            "Expected cfg.model to be LLaVAModelConfig, "
+            f"got {type(cfg.model).__name__}"
+        )
     data = sample["json"]
     raw_imgs = data.get("images", [])
     image_sizes = data.get("image_sizes", [])

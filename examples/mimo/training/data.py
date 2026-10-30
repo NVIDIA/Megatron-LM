@@ -17,6 +17,7 @@ from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.training.global_vars import get_run_config
+from megatron.training.models import MimoBuildConfig
 
 _ENCODER_SEED_OFFSET = 10_000
 _LANGUAGE_SEED_OFFSET = 20_000
@@ -289,6 +290,11 @@ def build_train_valid_test_data_loaders(
 ) -> tuple[Optional[DataLoader], Optional[DataLoader], Optional[DataLoader]]:
     """Build independent mock DataLoaders for the data-consuming rank role."""
     cfg = get_run_config()
+    if not isinstance(cfg.model, MimoBuildConfig):
+        raise TypeError(
+            "Expected cfg.model to be MimoBuildConfig, "
+            f"got {type(cfg.model).__name__}"
+        )
     if getattr(args, "dataset_provider", "mock") != "mock":
         raise ValueError(f"unsupported dataset provider: {args.dataset_provider}")
 

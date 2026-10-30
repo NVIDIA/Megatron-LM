@@ -15,6 +15,7 @@ from torchvision.transforms import Compose
 from torchvision.transforms.functional import InterpolationMode
 
 from megatron.core.models.multimodal.utils import patchify_image
+from megatron.training.models import LLaVAModelConfig, MimoBuildConfig
 
 from .conversation_sample import ImageMedia, VideoFrameMedia
 
@@ -1807,6 +1808,11 @@ def create_image_tiling_strategy(args):
     from megatron.training.global_vars import get_run_config
 
     cfg = get_run_config()
+    if not isinstance(cfg.model, (LLaVAModelConfig, MimoBuildConfig)):
+        raise TypeError(
+            "Expected cfg.model to be LLaVAModelConfig or MimoBuildConfig, "
+            f"got {type(cfg.model).__name__}"
+        )
     assert cfg.model.img_h == cfg.model.img_w, "img_h and img_w must be the same"
 
     match_tiling_dynamic_resolution = args.match_tiling_dynamic_resolution

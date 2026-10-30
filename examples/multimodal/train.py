@@ -32,6 +32,7 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.global_vars import set_run_config
+from megatron.training.models import LLaVAModelConfig
 from megatron.training.training import (
     update_packed_sequence_stats,
     update_seqlen_stats_from_cu_seqlens,
@@ -54,6 +55,10 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
     Note: attn_mask_type in layer_specs.py sets the attention mask. Attention mask is None here.
     """
     cfg = get_run_config()
+    if not isinstance(cfg.model, LLaVAModelConfig):
+        raise TypeError(
+            f"Expected cfg.model to be LLaVAModelConfig, got {type(cfg.model).__name__}"
+        )
     imgs = None
     tokens = None
     labels = None
@@ -570,7 +575,6 @@ if __name__ == "__main__":
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
     from megatron.training.argument_utils import model_config_from_args
-    from megatron.training.models import LLaVAModelConfig
 
     model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)

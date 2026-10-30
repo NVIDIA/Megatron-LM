@@ -38,6 +38,7 @@ from megatron.energon import (
 from megatron.energon.task_encoder.base import stateless
 from megatron.training import get_args, get_tokenizer
 from megatron.training.global_vars import get_run_config
+from megatron.training.models import LLaVAModelConfig
 
 
 @dataclass
@@ -200,6 +201,11 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
 
         self.args = get_args()
         cfg = get_run_config()
+        if not isinstance(cfg.model, LLaVAModelConfig):
+            raise TypeError(
+                "Expected cfg.model to be LLaVAModelConfig, "
+                f"got {type(cfg.model).__name__}"
+            )
         # Workers retain serializable preprocessing inputs, not the runtime config.
         self.img_h = cfg.model.img_h
         self.img_w = cfg.model.img_w

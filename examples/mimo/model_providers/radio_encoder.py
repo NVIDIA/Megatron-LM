@@ -21,6 +21,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.global_vars import get_run_config
+from megatron.training.models import MimoBuildConfig
 
 
 def add_radio_encoder_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -144,6 +145,11 @@ def radio_vision_encoder_spec(
 ) -> ModuleSpec:
     """Build the RADIO encoder spec from model geometry and remaining provider inputs."""
     cfg = get_run_config()
+    if not isinstance(cfg.model, MimoBuildConfig):
+        raise TypeError(
+            "Expected cfg.model to be MimoBuildConfig, "
+            f"got {type(cfg.model).__name__}"
+        )
     return ModuleSpec(
         module=RADIOEncoderWrapper,
         params={

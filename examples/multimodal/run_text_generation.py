@@ -47,6 +47,7 @@ from megatron.training.global_vars import (
     set_run_config,
 )
 from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.models import LLaVAModelConfig
 
 
 def is_first_rank():
@@ -162,6 +163,10 @@ def get_evaluation_dataloader(
 def generate_samples(model, config: EvaluationConfig, print_output):
     """Text generation using a trained vision language model."""
     cfg = get_run_config()
+    if not isinstance(cfg.model, LLaVAModelConfig):
+        raise TypeError(
+            f"Expected cfg.model to be LLaVAModelConfig, got {type(cfg.model).__name__}"
+        )
     args = get_args()
 
     dataloader = get_evaluation_dataloader(
@@ -850,7 +855,6 @@ def run_evaluation_loop(model, configs, output_dir_override=None, iteration=None
 def eval_tasks():
     """Vision language model text generation for single or batch tasks."""
     from megatron.training.argument_utils import model_config_from_args
-    from megatron.training.models import LLaVAModelConfig
 
     args = parse_and_validate_args(extra_args_provider=add_text_generation_args)
     model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)

@@ -34,6 +34,7 @@ from megatron.energon.av import AVDecoder
 from megatron.energon.edataclass import edataclass
 from megatron.training import get_args, get_tokenizer
 from megatron.training.global_vars import get_run_config
+from megatron.training.models import LLaVAModelConfig, MimoBuildConfig
 
 from .conversation_sample import ConversationSample, ImageMedia, Media, VideoFrameMedia, VideoMedia
 from .cookers.conversation import (
@@ -337,6 +338,11 @@ class MultiModalTaskEncoder(
         self.is_val = is_val
         self.args = get_args()
         cfg = get_run_config()
+        if not isinstance(cfg.model, (LLaVAModelConfig, MimoBuildConfig)):
+            raise TypeError(
+                "Expected cfg.model to be LLaVAModelConfig or MimoBuildConfig, "
+                f"got {type(cfg.model).__name__}"
+            )
         # Workers retain serializable preprocessing inputs, not the runtime config.
         self.img_h = cfg.model.img_h
         self.img_w = cfg.model.img_w

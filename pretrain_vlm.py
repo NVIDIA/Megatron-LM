@@ -53,6 +53,10 @@ def vlm_data_inputs_from_args(args: Namespace, model_config: LLaVAModelConfig) -
     consumers then need only the resolved length and the model's overlap setting.
     The decoder length remains in args until the data sequence-length migration.
     """
+    if not isinstance(model_config, LLaVAModelConfig):
+        raise TypeError(
+            f"Expected LLaVAModelConfig, got {type(model_config).__name__}"
+        )
     sequence_length = getattr(args, "dataloader_seq_length", None)
     if sequence_length is None:
         sequence_length = args.seq_length
@@ -111,6 +115,10 @@ def model_provider(
     """
     args = get_args()
     cfg = get_run_config()
+    if not isinstance(cfg.model, LLaVAModelConfig):
+        raise TypeError(
+            f"Expected cfg.model to be LLaVAModelConfig, got {type(cfg.model).__name__}"
+        )
     vision_model_type = "clip"
 
     assert (
@@ -283,6 +291,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, *, sequence_l
         train_ds, val_ds, test_ds (megatron.core.datasets.multimodal_dataset.MockMultimodalDataset): Train, validation, and test datasets, respectively.
     """
     cfg = get_run_config()
+    if not isinstance(cfg.model, LLaVAModelConfig):
+        raise TypeError(
+            f"Expected cfg.model to be LLaVAModelConfig, got {type(cfg.model).__name__}"
+        )
     args = get_args()
 
     config = MultimodalDatasetConfig(
@@ -362,6 +374,10 @@ def get_batch(data_iterator, *, qkv_format: str = "sbhd"):
     """
     args = get_args()
     cfg = get_run_config()
+    if not isinstance(cfg.model, LLaVAModelConfig):
+        raise TypeError(
+            f"Expected cfg.model to be LLaVAModelConfig, got {type(cfg.model).__name__}"
+        )
     cp_size = cfg.model.transformer.context_parallel_size
     # Broadcast data.
     if data_iterator is not None:

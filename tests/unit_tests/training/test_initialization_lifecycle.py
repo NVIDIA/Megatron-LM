@@ -960,6 +960,34 @@ def test_model_precision_is_derived_centrally(monkeypatch, run_config):
     assert not runtime_optimizer.use_precision_aware_optimizer_no_fp8_or_ds_fp8
 
 
+@pytest.mark.parametrize("missing_model", [False, True])
+@pytest.mark.parametrize(
+    "consumer", ["model", "dataset", "batch", "data_inputs", "mimo_data", "radio"]
+)
+def test_vlm_consumers_reject_incompatible_model_config(
+    monkeypatch, run_config, consumer, missing_model
+):
+    import pretrain_vlm
+    from examples.mimo.model_providers.radio_encoder import radio_vision_encoder_spec
+    from examples.mimo.training.data import build_train_valid_test_data_loaders
+
+    if missing_model:
+        run_config.model = None
+    # The default fixture supplies GPTModelConfig: valid for training, not vision consumers.
+    args = Namespace()
+    monkeypatch.setattr(pretrain_vlm, "get_args", lambda: args)
+    calls = {
+        "model": lambda: pretrain_vlm.model_provider(data_sequence_length=16),
+        "dataset": lambda: pretrain_vlm.train_valid_test_datasets_provider([], sequence_length=16),
+        "batch": lambda: pretrain_vlm.get_batch(None),
+        "data_inputs": lambda: pretrain_vlm.vlm_data_inputs_from_args(args, run_config.model),
+        "mimo_data": lambda: build_train_valid_test_data_loaders(args, None),
+        "radio": lambda: radio_vision_encoder_spec(args, None, None),
+    }
+    with pytest.raises(TypeError, match="Expected .*Config.*got (GPTModelConfig|NoneType)"):
+        calls[consumer]()
+
+
 @pytest.mark.parametrize("cp_size,qkv_format", [(1, "sbhd"), (2, "sbhd"), (2, "thd")])
 def test_llava_callback_consumes_its_model_config(
     monkeypatch, isolated_globals, run_config, cp_size, qkv_format
