@@ -369,7 +369,7 @@ def _wandb_run_id(exp_name: str) -> str:
     ambiguous there. Experiment names are often paths, so substitute rather than fail;
     the unmodified name is still what gets displayed.
     """
-    return re.sub(r'[/\\#?%:]', '-', exp_name)
+    return re.sub(r"[/\\#?%:]", "-", exp_name)
 
 
 def _set_wandb_writer(args):
@@ -400,15 +400,18 @@ def _set_wandb_writer(args):
         # node failure, an in-job restarter -- and each restart would otherwise open a
         # fresh run, scattering one training run across many and leaving every chart
         # covering only the stretch between two failures. Deriving a stable id from the
-        # experiment name and resuming it keeps them a single timeline.
-        run_id = cfg.logger.wandb_run_id or _wandb_run_id(cfg.logger.wandb_exp_name)
+        # experiment name and resuming it keeps them a single timeline. An unnamed run has
+        # nothing stable to derive an id from, so wandb assigns one as before.
+        run_id = cfg.logger.wandb_run_id or (
+            _wandb_run_id(cfg.logger.wandb_exp_name) if cfg.logger.wandb_exp_name else None
+        )
         wandb_kwargs = {
             'dir': save_dir,
-            'id': run_id,
+            "id": run_id,
             'name': cfg.logger.wandb_exp_name,
             'project': cfg.logger.wandb_project,
             'config': wandb_config,
-            'resume': 'allow'}
+            "resume": "allow"}
         if cfg.logger.wandb_entity:
             wandb_kwargs['entity'] = cfg.logger.wandb_entity
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)
