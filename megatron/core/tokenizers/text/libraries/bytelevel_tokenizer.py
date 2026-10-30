@@ -80,8 +80,13 @@ class ByteLevelTokenizer(MegatronTokenizerTextAbstract):
         """
         Convert a list of IDs to a text.
         """
-        # remove special tokens.
-        ids = [x for x in ids if x < self.special_start]
+        # Preserve byte-range decoding, including the default EOS/PAD byte values.
+        special_ids = {
+            token_id
+            for token_id in (self.bos_id, self.eos_id, self.pad_id)
+            if token_id is not None and token_id >= 256
+        }
+        ids = [x for x in ids if x < self.special_start and x not in special_ids]
         return bytes(ids).decode('utf-8', errors='ignore').rstrip()
 
     def tokens_to_ids(self, tokens):
