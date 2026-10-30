@@ -2,16 +2,18 @@
 
 """Explicit encoder-graph lifetime for colocated packed multimodal training."""
 
-from typing import Sequence
+from typing import Callable, Hashable, Mapping, Sequence
 
 import torch
 from torch.distributed import ProcessGroup
 
 from megatron.core.models.mimo.comm.pack_bridge import (
+    FeatureSlice,
     PackFeatureBridge,
     PackFeaturePlan,
     PackFeatureTransfer,
 )
+from megatron.core.models.mimo.planning import plan_encoder_chunks
 
 
 class MimoStepRuntime:
@@ -111,4 +113,125 @@ class MimoStepRuntime:
     def finish_forward(self) -> None:
         """Release an evaluation step after all rounds, without a loss-closure hook."""
         self._check_finished(forward_only=True)
+        self._clear()
+
+
+class LazyMimoStepRuntime(MimoStepRuntime):
+    """Execute independent encoder chunks only while their consumers need them.
+
+    The global packing plan remains unchanged. A caller supplies a local encoder
+    callback which prepares only the requested media and returns their projected
+    rows with an independent graph. Parameter gradients accumulate normally;
+    gradient synchronization, normalization and optimizer updates stay with the
+    host. A shared media graph stays live through its last consuming round.
+    """
+
+    def _clear(self) -> None:
+        super()._clear()
+        self.chunks = self.round_plans = ()
+        self.live_chunks = {}
+        self.encode = self.empty_template = None
+        self._round_chunks = ()
+
+    def begin_lazy_step(
+        self,
+        feature_plans: Sequence[Sequence[PackFeaturePlan]],
+        feature_slices: Mapping[Hashable, FeatureSlice],
+        encode: Callable[[Sequence[Hashable]], torch.Tensor],
+        empty_template: torch.Tensor,
+        *,
+        forward_only: bool,
+    ) -> None:
+        """Plan chunk lifetimes without loading media or invoking the encoder.
+
+        ``empty_template`` supplies the common device, dtype and hidden width;
+        it must have shape ``[0, hidden]``. Empty producers still route every round.
+        """
+        if empty_template.ndim != 2 or empty_template.shape[0] != 0:
+            raise ValueError("empty_template must have shape [0, hidden]")
+        chunks = plan_encoder_chunks(feature_plans, feature_slices)
+        if any(chunk.producer_rank not in self.bridge.ranks for chunk in chunks):
+            raise ValueError("Encoder chunk producer is outside the transport group")
+        self.begin_step(empty_template, len(feature_plans), forward_only=forward_only)
+        self.round_plans = tuple(tuple(plans) for plans in feature_plans)
+        self.chunks, self.encode, self.empty_template = chunks, encode, empty_template
+
+    def route(
+        self, plans: Sequence[PackFeaturePlan], cp_group: ProcessGroup
+    ) -> PackFeatureTransfer:
+        """Encode first-use chunks and rebase this round's source row offsets."""
+        if not self.active or self.pending is not None or self.completed_rounds == self.num_rounds:
+            raise RuntimeError("Routing requires an active step with no pending or exhausted round")
+        index = self.completed_rounds
+        if tuple(plans) != self.round_plans[index]:
+            raise ValueError("Feature plans must follow the source step's saved round order")
+        active = [chunk for chunk in self.chunks if chunk.first_round <= index <= chunk.last_round]
+        self._round_chunks = tuple(
+            chunk for chunk in active if chunk.producer_rank == self.bridge.rank
+        )
+        for chunk in self._round_chunks:
+            if chunk.first_round == index:
+                with torch.set_grad_enabled(not self.forward_only):
+                    features = self.encode(chunk.media_ids)
+                if (
+                    features.shape != (chunk.num_rows, self.empty_template.shape[1])
+                    or features.device != self.empty_template.device
+                    or features.dtype != self.empty_template.dtype
+                ):
+                    raise ValueError(
+                        "Encoder chunk output must match its planned rows and template"
+                    )
+                gradient = (
+                    None if self.forward_only else torch.zeros_like(features, dtype=torch.float32)
+                )
+                self.live_chunks[chunk] = (features, gradient)
+
+        offsets, rebased = {}, {}
+        for chunk in active:
+            offset = offsets.get(chunk.producer_rank, 0)
+            for feature in chunk.features:
+                rebased[feature] = FeatureSlice(chunk.producer_rank, offset, feature.length)
+                offset += feature.length
+            offsets[chunk.producer_rank] = offset
+        buffers = [self.live_chunks[chunk][0].detach() for chunk in self._round_chunks]
+        self.local_features = (
+            torch.cat(buffers)
+            if len(buffers) > 1
+            else buffers[0] if buffers else self.empty_template
+        )
+        return super().route(
+            tuple(
+                PackFeaturePlan(plan.cp_ranks, tuple(rebased[f] for f in plan.features))
+                for plan in plans
+            ),
+            cp_group,
+        )
+
+    def complete_round(self, transfer: PackFeatureTransfer) -> None:
+        """Return visual gradients and immediately backward completed chunks."""
+        if not self.active or transfer is not self.pending or transfer is None:
+            raise RuntimeError(
+                "Expected the current pending transfer, not a stale or completed one"
+            )
+        if not self.forward_only:
+            gradient = self.bridge.backward(transfer)
+            offset = 0
+            for chunk in self._round_chunks:
+                self.live_chunks[chunk][1].add_(gradient.narrow(0, offset, chunk.num_rows))
+                offset += chunk.num_rows
+        for chunk in self._round_chunks:
+            if chunk.last_round == self.completed_rounds:
+                features, gradient = self.live_chunks.pop(chunk)
+                if not self.forward_only and features.requires_grad:
+                    features.backward(gradient.to(features.dtype))
+        self.pending = None
+        self.local_features = self.empty_template
+        self._round_chunks = ()
+        self.completed_rounds += 1
+
+    def finish_backward(self) -> None:
+        """Finish after all chunk graphs have already been backpropagated."""
+        self._check_finished(forward_only=False)
+        if self.live_chunks:
+            raise RuntimeError("Encoder chunks remain live after all decoder rounds")
         self._clear()

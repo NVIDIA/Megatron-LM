@@ -27,6 +27,73 @@ class MediaTask:
     cost: float = 1.0
 
 
+@dataclass(frozen=True)
+class EncoderChunk:
+    """Whole media with the same producer and first/last decoder consumers.
+
+    The encoder returns rows in ``media_ids`` order. Its independent graph can
+    be released after ``last_round``, even when other chunks remain live.
+    """
+
+    producer_rank: int
+    first_round: int
+    last_round: int
+    media_ids: tuple[Hashable, ...]
+    features: tuple[FeatureSlice, ...]
+
+    @property
+    def num_rows(self) -> int:
+        """Number of projected rows in the encoder output."""
+        return sum(feature.length for feature in self.features)
+
+
+def plan_encoder_chunks(
+    rounds: Sequence[Sequence[PackFeaturePlan]], feature_slices: Mapping[Hashable, FeatureSlice]
+) -> tuple[EncoderChunk, ...]:
+    """Group source media by graph lifetime without changing producer assignment.
+
+    Exact duplicate slices alias the same media computation; the first media ID
+    is canonical. Partial overlaps and sub-media references are rejected because
+    their independent encoder graph boundaries would otherwise be ambiguous.
+    """
+    media_by_slice = {}
+    for media_id, feature in feature_slices.items():
+        if feature.offset < 0 or feature.length <= 0:
+            raise ValueError("Encoder media need nonnegative offsets and positive lengths")
+        media_by_slice.setdefault(feature, media_id)
+    previous = {}
+    for feature in sorted(media_by_slice, key=lambda item: (item.producer_rank, item.offset)):
+        if feature.offset < previous.get(feature.producer_rank, 0):
+            raise ValueError("Encoder media slices must not partially overlap")
+        previous[feature.producer_rank] = feature.offset + feature.length
+
+    lifetimes = {}
+    for index, plans in enumerate(rounds):
+        for plan in plans:
+            for feature in plan.features:
+                if feature not in media_by_slice:
+                    raise ValueError(
+                        "Each decoder feature must reference a whole known media slice"
+                    )
+                lifetime = lifetimes.setdefault(feature, [index, index])
+                lifetime[1] = index
+    chunks = {}
+    for feature, media_id in media_by_slice.items():
+        if feature in lifetimes:
+            first, last = lifetimes[feature]
+            chunks.setdefault((feature.producer_rank, first, last), []).append((media_id, feature))
+    return tuple(
+        EncoderChunk(
+            producer,
+            first,
+            last,
+            tuple(media_id for media_id, _ in media),
+            tuple(feature for _, feature in media),
+        )
+        for (producer, first, last), media in chunks.items()
+    )
+
+
 def assign_media_to_producers(
     tasks: Sequence[MediaTask], producer_ranks: Sequence[int]
 ) -> tuple[dict[int, list[MediaTask]], dict[Hashable, FeatureSlice]]:

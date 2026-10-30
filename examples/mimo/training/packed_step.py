@@ -9,7 +9,7 @@ import torch.distributed as dist
 
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.models.mimo.packing import prepare_mimo_step
-from megatron.core.models.mimo.runtime import MimoStepRuntime
+from megatron.core.models.mimo.runtime import LazyMimoStepRuntime, MimoStepRuntime
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.utils import get_attr_wrapped_model
 
@@ -18,9 +18,11 @@ class PackedMimoStep:
     """Adapt a replicated source-global-batch iterator to the native PP1 schedule.
 
     ``prepare_source(source)`` is supplied by the model/data adapter and returns
-    ``(samples, feature_slices, encoder_inputs)`` for this rank. It owns media
-    processing and producer assignment; all sequence packing and runtime state
-    belong to the public core APIs. One adapter handles one named modality.
+    ``(samples, feature_slices, encoder_inputs)`` for this rank. ``encoder_inputs``
+    can be a callable accepting ordered media IDs to materialize on first use,
+    or an already prepared input dict for whole-step encoding. The source owns
+    media processing and assignment; packing and graph lifetimes belong to core.
+    One adapter handles one named modality.
 
     The constructor does not change config. Call ``install`` explicitly after
     model construction. Ordinary decoder backward, DDP, optimizer and checkpoint
@@ -62,7 +64,7 @@ class PackedMimoStep:
     ):
         """Register the host hooks after validating the supported execution mode."""
         if overlap_grad_reduce or overlap_param_gather:
-            raise ValueError("Delayed encoder backward requires non-overlapped DDP")
+            raise ValueError("Packed encoder backward requires non-overlapped DDP")
         if getattr(self.model.config, "overlap_moe_expert_parallel_comm", False):
             raise ValueError("Packed MIMO requires the sequential PP1 decoder schedule")
         if rerun_mode != "disabled":
@@ -91,26 +93,48 @@ class PackedMimoStep:
         # The host explicitly sets model.train()/eval(). Do not infer the mode
         # from the grad context in which data preparation happened to run.
         forward_only = not self.model.training
-        with torch.set_grad_enabled(not forward_only):
-            encoded = self.model.encode_modalities(encoder_inputs)
-        features = encoded.get(self.modality_name)
-        if features is None:
-            features = torch.empty(
-                (0, self.model.config.hidden_size),
-                device=device,
-                dtype=self.model.config.params_dtype,
-            )
-        expected = max(
-            (
-                piece.offset + piece.length
-                for piece in slices.values()
-                if piece.producer_rank == dist.get_rank()
-            ),
-            default=0,
+        empty = torch.empty(
+            (0, self.model.config.hidden_size), device=device, dtype=self.model.config.params_dtype
         )
-        if features.shape[0] != expected:
-            raise ValueError(f"Encoder emitted {features.shape[0]} rows, expected {expected}")
-        self.runtime.begin_step(features, len(self.plan.rounds), forward_only=forward_only)
+        runtime_type = LazyMimoStepRuntime if callable(encoder_inputs) else MimoStepRuntime
+        if type(self.runtime) is not runtime_type:
+            self.runtime = runtime_type(self.pg.dp_cp)
+            self.model.mimo_step_runtime = self.runtime
+        if callable(encoder_inputs):
+            # Encoding moves inside the decoder's forward callback. Preserve the
+            # preparation context rather than inheriting decoder-only autocast.
+            encoder_autocast = torch.is_autocast_enabled("cuda")
+            encoder_autocast_dtype = torch.get_autocast_dtype("cuda")
+
+            def encode(media_ids):
+                with torch.autocast("cuda", enabled=encoder_autocast, dtype=encoder_autocast_dtype):
+                    return self.model.encode_modalities(encoder_inputs(media_ids)).get(
+                        self.modality_name, empty
+                    )
+
+            self.runtime.begin_lazy_step(
+                [item.feature_plans for item in self.plan.rounds],
+                slices,
+                encode,
+                empty,
+                forward_only=forward_only,
+            )
+        else:
+            with torch.set_grad_enabled(not forward_only):
+                features = self.model.encode_modalities(encoder_inputs).get(
+                    self.modality_name, empty
+                )
+            expected = max(
+                (
+                    piece.offset + piece.length
+                    for piece in slices.values()
+                    if piece.producer_rank == dist.get_rank()
+                ),
+                default=0,
+            )
+            if features.shape[0] != expected:
+                raise ValueError(f"Encoder emitted {features.shape[0]} rows, expected {expected}")
+            self.runtime.begin_step(features, len(self.plan.rounds), forward_only=forward_only)
         return (
             RerunDataIterator(iter(self.plan.rounds)),
             len(self.plan.rounds),
@@ -121,7 +145,8 @@ class PackedMimoStep:
     def forward(self, item, wrapped_model):
         """The PP1 schedule completes the previous backward before this callback."""
         if self.runtime.pending is not None:
-            self.runtime.complete_round(self.runtime.pending)
+            with torch.autocast("cuda", enabled=False):
+                self.runtime.complete_round(self.runtime.pending)
         transfer = self.runtime.route(item.feature_plans, item.cp_group)
         output, mask = wrapped_model(
             **item.model_inputs, modality_embeddings={self.modality_name: transfer.features}

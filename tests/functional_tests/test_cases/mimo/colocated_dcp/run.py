@@ -148,12 +148,20 @@ def source_batch(step, seed, domain):
         )
         tasks.extend(MediaTask(media_id, 5) for media_id in media_ids)
     assignments, slices = assign_media_to_producers(tasks, domain)
-    images = [
-        torch.randn((3, 16, 16), generator=torch.Generator().manual_seed(seed + task.media_id))
+    images = {
+        task.media_id: torch.randn(
+            (3, 16, 16), generator=torch.Generator().manual_seed(seed + task.media_id)
+        )
         for task in assignments[dist.get_rank()]
-    ]
-    inputs = {"images": {"clip": {"x": torch.stack(images).cuda().bfloat16()}}} if images else {}
-    return samples, slices, inputs
+    }
+
+    def inputs(media_ids):
+        selected = [images[media_id] for media_id in media_ids]
+        return (
+            {"images": {"clip": {"x": torch.stack(selected).cuda().bfloat16()}}} if selected else {}
+        )
+
+    return samples, slices, inputs, images
 
 
 def fingerprint(value, *, skip_optimizer_padding=False):
@@ -324,7 +332,7 @@ def main():
         pg_collection=pg,
         use_gloo_process_groups=False,
     )
-    adapter = PackedMimoStep(model, pg, lambda source: source, modality_name="images")
+    adapter = PackedMimoStep(model, pg, lambda source: source[:3], modality_name="images")
     adapter.install()
     start = 0
     report = dict(
@@ -395,7 +403,7 @@ def main():
         )
         row = dict(
             step=step + 1,
-            source_hash=fingerprint(source),
+            source_hash=fingerprint((source[:2], source[3])),
             lm_loss=(lm[0] / lm[1]).item(),
             supervised_tokens=int(lm[1]),
             mtp_loss=mtp,
