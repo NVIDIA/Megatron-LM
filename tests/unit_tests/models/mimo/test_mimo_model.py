@@ -535,7 +535,8 @@ class TestMimoModel:
         torch.testing.assert_close(packed_seq_params.cu_seqlens_q, cu_seqlens.squeeze(0))
         assert packed_seq_params.max_seqlen_q == self.seq_len
 
-    def test_external_features_match_internal_encoder_and_backward(self):
+    @pytest.mark.parametrize("disaggregated", (False, True))
+    def test_external_features_match_internal_encoder_and_backward(self, disaggregated):
         """Separate encoding preserves two images' outputs and gradients without rerouting."""
         model = get_vlm_mimo_model(32, 64, 16, 16, 16, 8, {"images": 100}).to(self.device).eval()
         tokens = torch.arange(16, device=self.device).unsqueeze(0)
@@ -548,6 +549,8 @@ class TestMimoModel:
             position_ids=positions,
             cu_seqlens=torch.tensor([0, 8, 16], dtype=torch.int32, device=self.device),
             max_seqlen=torch.tensor(8, dtype=torch.int32, device=self.device),
+            padding_mask=torch.zeros_like(tokens, dtype=torch.bool),
+            cp_group=parallel_state.get_context_parallel_group(),
         )
 
         internal, _ = model(**metadata, modality_inputs=inputs)
@@ -560,6 +563,14 @@ class TestMimoModel:
         model.zero_grad(set_to_none=True)
         features = model.encode_modalities(inputs)
         assert features["images"].shape == (10, 32)
+        if disaggregated:
+            model.external_feature_transport = True
+            model.role = RankRole(
+                modules={MIMO_LANGUAGE_MODULE_KEY: ModuleStageInfo(True, True)},
+                mode=ModuleLayout.NON_COLOCATED,
+            )
+            # Native PP1 calls this before forward, even without a pipeline peer.
+            model.set_input_tensor([None])
         leaf = features["images"].detach().requires_grad_()
         routed = {"images": leaf}
         with patch.object(model, "_apply_colocated_comms") as communicate:
@@ -580,6 +591,12 @@ class TestMimoModel:
         assert model.encode_modalities(None) == {}
         with pytest.raises(ValueError, match="either modality_inputs or modality_embeddings"):
             model(**metadata, modality_inputs=inputs, modality_embeddings=routed)
+        if disaggregated:
+            with pytest.raises(ValueError, match="require modality_embeddings"):
+                model(**metadata)
+            model.set_input_tensor(routed)
+            with pytest.raises(ValueError, match="also consume pipeline inputs"):
+                model(**metadata, modality_embeddings=routed)
 
     def test_forward_with_partition_adapter(self):
         """MTP token metadata must use the same CP-local sequence as hidden states.

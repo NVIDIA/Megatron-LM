@@ -54,9 +54,9 @@ def prepare_mimo_step(
     device: torch.device,
     tp_cp_groups: Optional[Mapping[int, dist.ProcessGroup]] = None,
 ) -> MimoStepPlan:
-    """Plan colocated TP1/PP1 multimodal packs without executing either model.
+    """Plan TP1/PP1 multimodal packs on the decoder domain without executing either model.
 
-    Source ownership is **replicated**: every transport rank must have the same
+    Source ownership is **replicated**: every decoder rank must have the same
     ordered mapping of complete source samples and media descriptors. Rank-local
     datasets must materialize those inputs before calling this function; the
     text-only scheduler reroute cannot transport media metadata. The function
@@ -75,8 +75,9 @@ def prepare_mimo_step(
     unified CP partition. No encoder, processor, dataset, process-group creation,
     or training configuration mutation occurs here.
     """
+
     if config.tensor_model_parallel_size != 1 or config.pipeline_model_parallel_size != 1:
-        raise ValueError("Colocated MIMO preparation currently requires TP=PP=1")
+        raise ValueError("MIMO preparation currently requires TP=PP=1")
     domain_ranks = tuple(domain_ranks)
     rank = dist.get_rank()
     if len(set(domain_ranks)) != len(domain_ranks) or rank not in domain_ranks:

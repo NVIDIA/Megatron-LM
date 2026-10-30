@@ -67,7 +67,8 @@ class MimoModel(MegatronModule):
         """Initialize the multimodal model.
 
         Set ``external_feature_transport`` when the caller routes independently encoded
-        features. This skips construction of the static colocated bridge communicators.
+        features. This skips static bridge communication, including the pipeline input
+        boundary on disjoint ranks. Features must already be projected to language width.
 
         Example:
             ```python
@@ -75,6 +76,7 @@ class MimoModel(MegatronModule):
             model = MimoModel(mimo_config)
             ```
         """
+
         # Initialize with language model's transformer config for MegatronModule compatibility
         super().__init__(mimo_config.language_model_spec.params['config'])
 
@@ -87,8 +89,9 @@ class MimoModel(MegatronModule):
         modality_names = list(mimo_config.modality_submodules_spec.keys())
         self.colocated_comms = {}
         self.role = RankRole.build(modality_names, mimo_config.module_to_grid_map)
-        if external_feature_transport and self.role.mode is not ModuleLayout.COLOCATED:
-            raise ValueError("External feature transport currently requires colocated modules")
+        self.external_feature_transport = external_feature_transport
+        if external_feature_transport and mimo_config.language_model_input_projections_spec:
+            raise ValueError("External feature transport requires projections on encoder ranks")
         if (
             not external_feature_transport
             and self.role.mode is ModuleLayout.COLOCATED
@@ -680,10 +683,11 @@ class MimoModel(MegatronModule):
                 derive every position from ``input_ids``. See
                 ``align_embeddings_by_token_positions`` for the trusted-producer contract.
             modality_embeddings: Already projected and routed features for this complete pack.
-                Colocated only; bypasses encoder execution and static bridge communication.
-                Mutually exclusive with ``modality_inputs``. The caller owns feature backward.
+                Bypasses encoder execution and static bridge communication. Disjoint language
+                ranks require ``external_feature_transport=True``. Mutually exclusive with
+                ``modality_inputs``. The caller owns feature backward.
             padding_mask: Boolean ``[B, S]`` mask, True at physical padding positions.
-            cp_group: Optional runtime CP group for a packed colocated forward. CP1 requires
+            cp_group: Optional runtime CP group for a packed forward. CP1 requires
                 an explicit singleton group; None retains the configured static CP group.
             tp_cp_group: TP x runtime CP group, required with runtime CP and sequence parallelism.
 
@@ -697,13 +701,27 @@ class MimoModel(MegatronModule):
         input_tensors = getattr(self, 'input_tensors', None)
         if modality_embeddings is not None and modality_inputs is not None:
             raise ValueError("Pass either modality_inputs or modality_embeddings, not both")
-        if self.role.mode is not ModuleLayout.COLOCATED and any(
-            value is not None
-            for value in (modality_embeddings, padding_mask, cp_group, tp_cp_group)
+        external_language = self.external_feature_transport and self.role.has_language_module
+        if self.external_feature_transport and self.role.mode is ModuleLayout.NON_COLOCATED:
+            if input_tensors is not None:
+                raise ValueError("External feature transport cannot also consume pipeline inputs")
+            if external_language and modality_embeddings is None:
+                raise ValueError(
+                    "External language ranks require modality_embeddings; use {} for text"
+                )
+        if (
+            self.role.mode is not ModuleLayout.COLOCATED
+            and not external_language
+            and any(
+                value is not None
+                for value in (modality_embeddings, padding_mask, cp_group, tp_cp_group)
+            )
         ):
-            raise ValueError("External features and runtime CP currently require colocated modules")
+            raise ValueError(
+                "External features and runtime CP require a language transport endpoint"
+            )
 
-        if self.role.mode == ModuleLayout.COLOCATED:
+        if self.role.mode == ModuleLayout.COLOCATED or external_language:
             return self._forward_all_modules(
                 input_ids,
                 position_ids,
@@ -723,6 +741,8 @@ class MimoModel(MegatronModule):
 
         if self.role.mode == ModuleLayout.NON_COLOCATED:
             if self.role.has_modality_modules:
+                if self.external_feature_transport:
+                    return self.encode_modalities(modality_inputs), loss_mask
                 # Token indices are consumed only when language embeddings are assembled.
                 return self._forward_encoders(input_ids, modality_inputs, input_tensors), loss_mask
 
@@ -1157,9 +1177,9 @@ class MimoModel(MegatronModule):
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
         tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
-        """Forward pass when all modules are on all ranks (no multi-module PP).
+        """Merge local or externally routed features and run the complete language model.
 
-        This is the original behavior, preserved for backward compatibility.
+        External transport also uses this path on disjoint language ranks.
         """
         owns_mtp = self._language_model_owns_mtp()
 
