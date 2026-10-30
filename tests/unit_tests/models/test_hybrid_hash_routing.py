@@ -179,6 +179,7 @@ def make_stack(layers, **config_overrides):
         use_cpu_initialization=True,
         **config_overrides,
     )
+    submodules = HybridStackSubmodules(attention_layer=IdentityOp, mamba_layer=IdentityOp)
     pattern = ''.join(
         LayerSymbols.ATTENTION if isinstance(layer, TransformerLayer) else LayerSymbols.MAMBA
         for layer in layers
@@ -187,7 +188,7 @@ def make_stack(layers, **config_overrides):
     with mock.patch("megatron.core.models.hybrid.hybrid_block.build_module", side_effect=layers):
         return HybridStack(
             config=config,
-            submodules=HybridStackSubmodules(),
+            submodules=submodules,
             layer_config_list=validate_segment_layers(pattern, config),
             post_process=False,
             post_layer_norm=False,
