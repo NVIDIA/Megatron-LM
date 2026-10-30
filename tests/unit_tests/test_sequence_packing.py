@@ -656,6 +656,7 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
         (2, 1, 4, None, "default_dynamic_cp"),
         (1, 2, 4, None, "default_dynamic_cp"),
         (1, 4, 2, 4, "default_dynamic_cp"),
+        (1, 1, 2, None, "default_dynamic_cp"),
     ],
 )
 def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
@@ -778,6 +779,14 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
         assert (
             type(sequence_square_sum_this_global_batch) is float
             or type(sequence_square_sum_this_global_batch) is np.float32
+        )
+        # The statistics count every sample of the global batch once, independent of CP.
+        # These pre-packed samples carry no real length, so their padded length is used.
+        # TP ranks other than 0 receive the statistics as float32.
+        padded_lengths = [((num + 15) // 16) * 16 for num in nums]
+        assert num_total_tokens_this_global_batch == pytest.approx(sum(padded_lengths))
+        assert sequence_square_sum_this_global_batch == pytest.approx(
+            sum(length * length for length in padded_lengths)
         )
 
         def _check_batch(batch_all, batch_keys):
