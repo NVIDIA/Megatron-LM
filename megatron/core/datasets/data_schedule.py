@@ -538,7 +538,7 @@ def wrap_data_iterator(
     alignment, pad_enabled = get_packed_sequence_alignment(config, tp_group.size())
     scheduler_kwargs['pad_sequences'] = pad_enabled
     if scheduler_type == PackingSchedulerEnum.DP_BALANCED:
-        metadata_capacity = getattr(config, "thd_max_packed_sequences", None)
+        metadata_capacity = getattr(config, "cuda_graph_thd_max_packed_sequences", None)
         if metadata_capacity is not None:
             # Main's implicit MXFP8 alignment can append a dummy document too.
             scheduler_kwargs["max_num_seqs"] = metadata_capacity - int(pad_enabled)
@@ -861,7 +861,7 @@ def get_batch_on_this_rank_for_sequence_packing(
             tokens_per_sample=None,
         )
 
-        if getattr(config, "thd_max_packed_sequences", None) is not None:
+        if getattr(config, "cuda_graph_thd_max_packed_sequences", None) is not None:
             # The general batch builder retains TE's physical-offset workaround
             # for some layouts. Graph padding must keep logical boundaries and
             # the fixed max-seqlen bound through this new HybridModel return path.

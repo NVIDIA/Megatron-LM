@@ -101,7 +101,7 @@ but custom training scripts must do the same work themselves.
 
 For scheduler-produced THD batches, use `--use-varlen-dataset`,
 `--sequence-packing-scheduler dp_balanced`, `--cuda-graph-modules attn`,
-`--pad-packed-seq-alignment max`, and an explicit `--thd-max-packed-sequences`. The metadata capacity includes one
+`--pad-packed-seq-alignment max`, and an explicit `--cuda-graph-thd-max-packed-sequences`. The metadata capacity includes one
 reserved dummy document for token padding. `--max-seqlen-per-dp-cp-rank` sets the
 fixed local token capacity; the source global batch size and micro-batch size 1
 must stay fixed. PP/VPP automatically keeps graph inputs alive until their

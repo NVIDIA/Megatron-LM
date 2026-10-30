@@ -1287,7 +1287,7 @@ class TestTECudaGraphHelper:
                 num_attention_heads=4,
                 use_cpu_initialization=True,
                 cuda_graph_impl="transformer_engine",
-                thd_max_packed_sequences=4,
+                cuda_graph_thd_max_packed_sequences=4,
                 cuda_graph_modules=[CudaGraphModule.attn],
                 sequence_packing_scheduler="dp_balanced",
                 max_seqlen_per_dp_cp_rank=32 // cp_size,

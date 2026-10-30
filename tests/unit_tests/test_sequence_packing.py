@@ -72,7 +72,9 @@ def test_packed_graph_tail_preserves_document_offsets():
         if owns_tokens:
             batch["tokens"] = torch.arange(12)
         config = SimpleNamespace(
-            pad_packed_seq_alignment="max", max_seqlen_per_dp_cp_rank=8, thd_max_packed_sequences=4
+            pad_packed_seq_alignment="max",
+            max_seqlen_per_dp_cp_rank=8,
+            cuda_graph_thd_max_packed_sequences=4,
         )
         pad_packed_batch_before_cp_slice(batch, config, cp_size=2, tp_size=1)
         assert ("tokens" in batch) == owns_tokens
@@ -85,7 +87,7 @@ def test_packed_graph_tail_preserves_document_offsets():
         pad_packed_batch_before_cp_slice(batch, config, cp_size=2, tp_size=1)
         for key in previous:
             torch.testing.assert_close(batch[key], previous[key])
-        config.thd_max_packed_sequences = 2
+        config.cuda_graph_thd_max_packed_sequences = 2
         with pytest.raises(ValueError, match="documents exceed"):
             pad_packed_batch_before_cp_slice(batch, config, cp_size=2, tp_size=1)
 
@@ -113,7 +115,7 @@ def test_graph_scheduler_accounts_for_main_padding(monkeypatch, alignment, fp8, 
         fp8=fp8,
         fp8_recipe="mxfp8",
         max_seqlen_per_dp_cp_rank=128,
-        thd_max_packed_sequences=3,
+        cuda_graph_thd_max_packed_sequences=3,
         virtual_pipeline_model_parallel_size=None,
     )
     observed = []
@@ -157,7 +159,7 @@ def test_scheduler_loader_preserves_graph_logical_offsets(
     }
     config = SimpleNamespace(
         pad_packed_seq_alignment=alignment,
-        thd_max_packed_sequences=metadata_capacity,
+        cuda_graph_thd_max_packed_sequences=metadata_capacity,
         max_seqlen_per_dp_cp_rank=16,
         linear_cp_layout="contiguous",
         attention_cp_layout="contiguous",

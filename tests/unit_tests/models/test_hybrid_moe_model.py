@@ -349,7 +349,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "tensor_parallel_num_weight_shards": 2,
     "tensor_parallel_num_sequence_shards": 2,
     "test_mode": False,
-    "thd_max_packed_sequences": None,
+    "cuda_graph_thd_max_packed_sequences": None,
     "timers": None,
     "tp_comm_atomic_ag": False,
     "tp_comm_atomic_rs": False,

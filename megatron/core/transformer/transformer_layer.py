@@ -1745,7 +1745,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         if getattr(self.config, "sequence_packing_scheduler", None) is not None:
             capacity = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
             offsets = torch.zeros(
-                self.config.thd_max_packed_sequences + 1,
+                self.config.cuda_graph_thd_max_packed_sequences + 1,
                 dtype=torch.int32,
                 device=static_inputs["hidden_states"].device,
             )
@@ -1965,7 +1965,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 "cu_seqlens_kv_padded",
             ):
                 offsets = getattr(packed, name)
-                if offsets is None or offsets.numel() != self.config.thd_max_packed_sequences + 1:
+                if (
+                    offsets is None
+                    or offsets.numel() != self.config.cuda_graph_thd_max_packed_sequences + 1
+                ):
                     raise ValueError(
                         "Packed CUDA graph inputs must use the configured metadata capacity."
                     )
