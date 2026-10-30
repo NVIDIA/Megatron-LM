@@ -55,6 +55,7 @@ try:
         MixedPrecisionPolicy,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+        FsdpContext,
         Placements,
         RuntimePolicy,
         SchedulePolicy,
@@ -705,10 +706,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         active_context = current_fully_shard_context()
         if active_context is None:
             construction_context = fully_shard_context(
-                device=device,
-                runtime_policy=RuntimePolicy(
-                    use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True
-                ),
+                FsdpContext(
+                    device=device,
+                    runtime_policy=RuntimePolicy(
+                        use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True
+                    ),
+                )
             )
         else:
             if not active_context.caller_managed_grad_sync:
