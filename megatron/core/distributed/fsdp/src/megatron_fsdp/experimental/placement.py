@@ -31,12 +31,25 @@ sharded        ``Replicate``  ``allgather()``
 =============  =============  ====================
 """
 
+import enum
 from collections.abc import Iterable
 
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
-__all__ = ["BlockAtomic", "RowAtomic", "TensorAtomic", "changed_mesh_axis"]
+__all__ = ["BlockAtomic", "RowAtomic", "ShardLayout", "TensorAtomic", "changed_mesh_axis"]
+
+
+class ShardLayout(enum.Enum):
+    """How a ``RowAtomic`` / ``BlockAtomic`` group is split into per-rank segments."""
+
+    PADDED = "padded"
+    """Equal segments. The group is padded to a multiple of ``dp_size * LCM(row sizes)``
+    (times the block size for ``BlockAtomic``)."""
+
+    UNPADDED = "unpadded"
+    """No padding. Tensors are packed back to back and segments end on the row/block
+    boundary nearest to an even split."""
 
 
 class RowAtomic(Shard):
