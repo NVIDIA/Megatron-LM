@@ -281,11 +281,7 @@ class FsdpModule:
 
         # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
         # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
-        if context.is_recording_execution_order and not is_recomputing:
-            context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.FORWARD))
-        self.unshard(
-            Phase.FORWARD, prefetch=not is_recomputing and not context.is_recording_execution_order
-        )
+        self.unshard(Phase.FORWARD, prefetch=not is_recomputing)
 
     def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
@@ -313,24 +309,34 @@ class FsdpModule:
 
             if not prefetch:
                 return
-            context = self.context
-            match phase:
-                case Phase.FORWARD:
-                    self._prefetch_parameter_groups(
-                        context.execution_order, self._schedule_policy.forward_prefetch_size
-                    )
-                case Phase.BACKWARD:
-                    self._prefetch_parameter_groups(
-                        context.execution_order, self._schedule_policy.backward_prefetch_size
-                    )
-                case _:
-                    raise ValueError(
-                        f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}."
-                    )
+            self.prefetch(phase)
 
-    def _prefetch_parameter_groups(self, order: ExecutionOrder, prefetch_size: int | None) -> None:
+    def prefetch(self, phase: Phase) -> None:
+        """Record a compute event or prefetch its successors in the selected order."""
+        match phase:
+            case Phase.FORWARD:
+                budget = self._schedule_policy.forward_prefetch_size
+            case Phase.BACKWARD:
+                budget = self._schedule_policy.backward_prefetch_size
+            case _:
+                raise ValueError(
+                    f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}."
+                )
+        context = self.context
+        if not cast(nn.Module, self).training:
+            # Evaluation has a different (forward-only) schedule. Gather on demand
+            # without modifying the training trace or its cursor.
+            return
+        if context.is_recording_execution_order:
+            context.execution_order.append(ExecutionEvent(cast(nn.Module, self), phase))
+            return
+        self._prefetch_parameter_groups(context.execution_order, budget, phase)
+
+    def _prefetch_parameter_groups(
+        self, order: ExecutionOrder, prefetch_size: int | None, phase: Phase
+    ) -> None:
         """Validate the current event, prefetch successors, and advance once."""
-        event = ExecutionEvent(cast(nn.Module, self), self.phase)
+        event = ExecutionEvent(cast(nn.Module, self), phase)
         if order.peek() != event:
             raise RuntimeError(
                 "FSDP module calls diverged from the expected execution order "
@@ -425,8 +431,6 @@ class FsdpModule:
         self.phase = Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
-        if context.is_recording_execution_order:
-            context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.BACKWARD))
         current_stream = context.current_stream()
         if self.is_root():
             context.register_post_backward_hook()
@@ -439,7 +443,7 @@ class FsdpModule:
             # fork each preceding module issues before its collective.
             context.reduce_scatter_stream.wait_stream(current_stream)
 
-        self.unshard(Phase.BACKWARD, prefetch=not context.is_recording_execution_order)
+        self.unshard(Phase.BACKWARD, prefetch=True)
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""

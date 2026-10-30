@@ -59,6 +59,7 @@ try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
         FsdpContext,
         Placements,
+        PrefetchOrder,
         RuntimePolicy,
         SchedulePolicy,
         ShardLayout,
@@ -720,10 +721,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # open and finalize our own. MCore's finalize_model_grads() owns the wait
         # after the schedule completes, including delayed wgrad and custom 1F1B work.
         active_context = current_fully_shard_context()
+        prefetch_order = self.prefetch_order_for(config)
         if active_context is None:
             construction_context = fully_shard_context(
                 FsdpContext(
                     device=device,
+                    prefetch_order=prefetch_order,
                     runtime_policy=RuntimePolicy(
                         use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True
                     ),
@@ -734,6 +737,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 raise ValueError(
                     "MCore MFSDP v2 requires shared contexts to be constructed with "
                     "RuntimePolicy(caller_managed_grad_sync=True)."
+                )
+            if (
+                prefetch_order is PrefetchOrder.RECORDED
+                and active_context.prefetch_order is not PrefetchOrder.RECORDED
+            ):
+                raise ValueError(
+                    "PP/VPP and EP-overlap MFSDP v2 schedules require "
+                    "FsdpContext(prefetch_order=PrefetchOrder.RECORDED)."
                 )
             construction_context = nullcontext(active_context)
         with construction_context:
@@ -754,6 +765,17 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         if config.overlap_moe_expert_parallel_comm:
             register_combined_1f1b_hooks(self.module)
+
+    @staticmethod
+    def prefetch_order_for(config: TransformerConfig) -> "PrefetchOrder":
+        """Use recorded prefetch for schedules that interleave chunks or compute phases."""
+        if (
+            config.pipeline_model_parallel_size > 1
+            or config.virtual_pipeline_model_parallel_size is not None
+            or config.overlap_moe_expert_parallel_comm
+        ):
+            return PrefetchOrder.RECORDED
+        return PrefetchOrder.REGISTRATION
 
     def load_state_dict(self, state_dict, strict=True):
         """Load main weights and refresh the buffers used for forward compute."""
