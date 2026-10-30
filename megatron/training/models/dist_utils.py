@@ -14,7 +14,7 @@ from megatron.core.distributed import (
 )
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
 from megatron.core.full_cuda_graph import get_shared_capture_stream
-from megatron.core.model_initialization import maybe_initialize_muon_ht_parameters
+from megatron.core.model_initialization import initialize_muon_ht_parameters
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import (
     LayerWiseDistributedOptimizer,
@@ -176,6 +176,9 @@ def prepare_existing_model_chunks_for_distributed_training(
         raise ValueError("ddp_config is required when wrap_with_ddp is True")
 
     init_model_with_meta_device = transformer_config.init_model_with_meta_device
+    muon_ht_radius = (
+        transformer_config.muon_ht_radius if transformer_config.perform_initialization else None
+    )
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -195,8 +198,13 @@ def prepare_existing_model_chunks_for_distributed_training(
         for model_module in model_list:
             model_module.cuda(torch.cuda.current_device())
 
-    if not init_model_with_meta_device:
-        maybe_initialize_muon_ht_parameters(model_list, transformer_config, pg_collection)
+    if not init_model_with_meta_device and muon_ht_radius is not None:
+        initialize_muon_ht_parameters(
+            model_list,
+            radius=muon_ht_radius,
+            eps=transformer_config.muon_ht_eps,
+            pg_collection=pg_collection,
+        )
 
     model_list = _wrap_with_mp_wrapper(model_list, transformer_config, mixed_precision_wrapper)
 
@@ -206,7 +214,13 @@ def prepare_existing_model_chunks_for_distributed_training(
             to_empty_if_meta_device(model_module, device=torch.device("cuda"))
             for model_module in model_list
         ]
-        maybe_initialize_muon_ht_parameters(model_list, transformer_config, pg_collection)
+        if muon_ht_radius is not None:
+            initialize_muon_ht_parameters(
+                model_list,
+                radius=muon_ht_radius,
+                eps=transformer_config.muon_ht_eps,
+                pg_collection=pg_collection,
+            )
 
     if correct_amax_history_if_needed is not None:
         correct_amax_history_if_needed(model_list)

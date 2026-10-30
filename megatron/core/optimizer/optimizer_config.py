@@ -325,10 +325,10 @@ class OptimizerConfig:
     One of 'adam' or 'lion'. Defaults to 'adam'."""
 
     muon_ht_eps: float = 1e-15
-    """Minimum norm used for numerical stability by TensorParallelMuonHT."""
+    """Minimum norm used for numerical stability by TensorParallelMuonH and MuonHT."""
 
     muon_ht_radius: float | None = None
-    """Fixed global Frobenius norm required by TensorParallelMuonHT. Megatron model
+    """Fixed global Frobenius norm required by TensorParallelMuonH and MuonHT. Megatron model
     initialization places every Muon-managed matrix at this radius before constructing
     mixed-precision and distributed wrappers."""
 

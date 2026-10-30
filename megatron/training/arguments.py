@@ -2808,13 +2808,13 @@ def _add_regularization_args(parser):
         '--muon-ht-eps',
         type=float,
         default=1e-15,
-        help='Minimum norm used for numerical stability by muon_ht',
+        help='Minimum norm used for numerical stability by muon_h and muon_ht',
     )
     group.add_argument(
         '--muon-ht-radius',
         type=float,
         default=None,
-        help='Fixed global Frobenius norm required to initialize all muon_ht parameters',
+        help='Fixed global Frobenius norm required to initialize all muon_h/muon_ht parameters',
     )
     group.add_argument('--lion-beta1', type=float, default=0.95,
                        help='First beta coefficient for Lion optimizer '
@@ -2904,7 +2904,17 @@ def _add_training_args(parser):
         '--optimizer',
         type=str,
         default='adam',
-        choices=['adam', 'sgd', 'muon', 'muon_ht', 'dist_muon', 'lion', 'soap', 'adaptive_muon'],
+        choices=[
+            'adam',
+            'sgd',
+            'muon',
+            'muon_h',
+            'muon_ht',
+            'dist_muon',
+            'lion',
+            'soap',
+            'adaptive_muon',
+        ],
         help='Optimizer function. '
         'Note: dist_muon is deprecated; use --optimizer muon '
         'with --use-distributed-optimizer instead.',

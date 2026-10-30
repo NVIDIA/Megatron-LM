@@ -544,7 +544,8 @@ class TransformerConfig(ModelParallelConfig):
     init_method and output_layer_init_method are provided."""
 
     muon_ht_radius: Optional[float] = None
-    """If set and parameter initialization is enabled, Megatron places every Muon-managed
+    """If set and parameter initialization is enabled, Megatron places every MuonH- or
+    MuonHT-managed
     matrix on this fixed-radius Hyperball sphere before mixed-precision and distributed wrapping."""
 
     muon_ht_eps: float = 1e-15

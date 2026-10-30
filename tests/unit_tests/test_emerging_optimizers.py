@@ -20,6 +20,7 @@ from megatron.core.optimizer.emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
     TensorParallelAdaptiveMuon,
     TensorParallelMuon,
+    TensorParallelMuonH,
     TensorParallelMuonHT,
     _get_qkv_split_shapes,
     _select_tp_mode,
@@ -619,13 +620,13 @@ def test_muon_entry_registered_with_dispatcher():
     assert adaptive_entry.config_to_kwargs is eo_mod._adaptive_muon_config_to_kwargs
 
 
-def test_muon_ht_normalizes_update_and_preserves_weight_norm():
-    """TensorParallelMuonHT should enforce both Hyperball norm constraints."""
+def test_muon_h_normalizes_update_and_preserves_weight_norm():
+    """TensorParallelMuonH should enforce both Hyperball norm constraints."""
     parameter = torch.nn.Parameter(
         torch.arange(1, 13, dtype=torch.float32, device='cuda').reshape(3, 4)
     )
     radius = parameter.norm()
-    optimizer = TensorParallelMuonHT(
+    optimizer = TensorParallelMuonH(
         params=[parameter],
         lr=0.1,
         momentum=0.0,
@@ -645,6 +646,46 @@ def test_muon_ht_normalizes_update_and_preserves_weight_norm():
         optimizer.post_weight_update_fn_inplace(parameter)
 
     torch.testing.assert_close(parameter.norm(), radius)
+
+
+def test_muon_ht_projects_raw_gradient_before_momentum_and_restores_grad():
+    """MuonHT momentum should receive a tangent gradient without replacing ``param.grad``."""
+    parameter = torch.nn.Parameter(
+        torch.tensor([[1.0, 0.0], [0.0, 2.0]], dtype=torch.float32, device='cuda')
+    )
+    raw_gradient = torch.tensor([[3.0, 1.0], [2.0, 4.0]], dtype=torch.float32, device='cuda')
+    parameter.grad = raw_gradient
+    parameter_before = parameter.detach().clone()
+    expected_tangent_gradient = raw_gradient - parameter_before * (
+        (parameter_before * raw_gradient).sum() / parameter_before.square().sum()
+    )
+    optimizer = TensorParallelMuonHT(
+        params=[parameter],
+        lr=0.1,
+        momentum=0.0,
+        nesterov=False,
+        weight_decay=0.0,
+        hyperball_radius=parameter.norm().item(),
+        pg_collection=_muon_ht_process_groups(),
+        tp_mode="duplicated",
+    )
+
+    def identity_orthogonalize(_p, grad, **_kwargs):
+        return grad.clone()
+
+    optimizer.orthogonalize = identity_orthogonalize
+    optimizer.step()
+
+    torch.testing.assert_close(
+        optimizer.state[parameter]["momentum_buffer"], expected_tangent_gradient
+    )
+    torch.testing.assert_close(
+        (parameter_before * optimizer.state[parameter]["momentum_buffer"]).sum(),
+        torch.zeros((), device='cuda'),
+        atol=1e-6,
+        rtol=0.0,
+    )
+    assert parameter.grad is raw_gradient
 
 
 def test_muon_ht_model_initialization_constrains_only_muon_parameters():
@@ -1000,14 +1041,18 @@ class TestMuonOptimizerMultiRank:
         with pytest.raises(ValueError, match='num_ns_steps must be at least 1'):
             get_megatron_optimizer(config=optimizer_config_invalid_ns, model_chunks=[model])
 
-    def test_get_megatron_optimizer_muon_ht(self):
-        """The public optimizer factory should construct and run TensorParallelMuonHT."""
+    @pytest.mark.parametrize(
+        ("optimizer_name", "optimizer_class"),
+        [("muon_h", TensorParallelMuonH), ("muon_ht", TensorParallelMuonHT)],
+    )
+    def test_get_megatron_optimizer_hyperball_muon(self, optimizer_name, optimizer_class):
+        """The public optimizer factory should construct and run both Hyperball variants."""
         model = self.create_ddp_model(Net().bfloat16().cuda().requires_grad_(True))
         initialize_muon_ht_parameters(
             [model], radius=2.5, eps=1e-15, pg_collection=_muon_ht_process_groups()
         )
         optimizer_config = OptimizerConfig(
-            optimizer='muon_ht',
+            optimizer=optimizer_name,
             lr=0.01,
             weight_decay=0.0,
             bf16=True,
@@ -1036,7 +1081,7 @@ class TestMuonOptimizerMultiRank:
         raw_optimizers = [
             child.optimizer for child in optimizer.chained_optimizers if hasattr(child, "optimizer")
         ]
-        assert any(isinstance(raw, TensorParallelMuonHT) for raw in raw_optimizers)
+        assert any(type(raw) is optimizer_class for raw in raw_optimizers)
         for parameter in model.parameters():
             if parameter.ndim == 2:
                 torch.testing.assert_close(
@@ -1313,6 +1358,38 @@ class TestMuonOptimizerMultiRankTP:
         result_norm_squared = parameter.float().square().sum()
         torch.distributed.all_reduce(result_norm_squared, group=pg_collection.tp)
         torch.testing.assert_close(result_norm_squared.sqrt(), radius)
+
+    def test_muon_ht_tangent_projection_uses_global_tp_inner_product(self):
+        """The projected gradient should be globally tangent across TP shards."""
+        pg_collection = _muon_ht_process_groups()
+        tp_rank = pg_collection.tp.rank()
+        parameter = torch.nn.Parameter(
+            torch.full((3, 4), float(tp_rank + 1), dtype=torch.float32, device='cuda')
+        )
+        parameter.tensor_model_parallel = True
+        parameter.partition_dim = 0
+        gradient = torch.arange(12, dtype=torch.float32, device='cuda').reshape(3, 4)
+        gradient.add_(tp_rank)
+
+        model = nn.Module()
+        model.register_parameter('weight', parameter)
+        initialize_muon_ht_parameters([model], radius=2.5, eps=1e-15, pg_collection=pg_collection)
+        optimizer = TensorParallelMuonHT(
+            params=[parameter],
+            weight_decay=0.0,
+            hyperball_radius=2.5,
+            pg_collection=pg_collection,
+            tp_mode="distributed",
+        )
+
+        with torch.no_grad():
+            tangent_gradient = optimizer._project_gradient_to_tangent(parameter, gradient)
+            global_inner_product = (parameter.float() * tangent_gradient.float()).sum()
+            torch.distributed.all_reduce(global_inner_product, group=pg_collection.tp)
+
+        torch.testing.assert_close(
+            global_inner_product, torch.zeros_like(global_inner_product), atol=1e-5, rtol=0.0
+        )
 
 
 @pytest.mark.skipif(
