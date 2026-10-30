@@ -60,7 +60,7 @@ def build_hybrid_mesh(dp_outer: int, dp_shard: int):
 class ToyMoEStack(torch.nn.Module):
     """A stack of FSDP unit modules that each own a dense and an expert bucket group."""
 
-    def __init__(self, num_blocks: int = 3):
+    def __init__(self, num_blocks: int = 3) -> None:
         super().__init__()
         self.blocks = torch.nn.ModuleList([ToyMoEModel() for _ in range(num_blocks)])
 

@@ -4700,7 +4700,8 @@ class AllGatherPipeline:
     def _complete_frontier_fsdp_unit(
         self, bucket_ids: List[int], prefetch_order: PrefetchOrder
     ) -> List[int]:
-        """Extend a bucket list through the rest of the FSDP unit at its prefetch frontier."""
+        """Extend a bucket list through the rest of the FSDP unit at its prefetch frontier,
+        including buckets of that unit the window skipped."""
         parameter_groups = self.buffer.parameter_groups
         result = set(bucket_ids)
         step = 1 if prefetch_order == PrefetchOrder.FORWARD_PASS_ORDER else -1
@@ -4716,6 +4717,12 @@ class AllGatherPipeline:
         ):
             result.update(self.buffer.bucket_to_bucket_group[bucket_id])
             bucket_id = (max(result) + 1) if step > 0 else (min(result) - 1)
+
+        # Buckets split by dtype but bucket groups only by expert status, so a selected group
+        # can skip over buckets of the same unit.
+        for bucket_id in range(min(result), max(result) + 1):
+            if bucket_id not in result and parameter_groups[bucket_id].fsdp_unit_id == fsdp_unit_id:
+                result.update(self.buffer.bucket_to_bucket_group[bucket_id])
 
         return list(sorted(result))
 

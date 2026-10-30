@@ -224,7 +224,7 @@ def test_hfsdp_pipeline_preserves_inner_prefetch_size_policy():
     ]
 
 
-def _hfsdp_window_pipeline(unit_ids, sizes, overlap=True, double_buffer=False):
+def _hfsdp_window_pipeline(unit_ids, sizes, overlap=True, double_buffer=False, bucket_groups=None):
     """An HFSDP all-gather pipeline whose buckets are replicated on DP-Shard and sharded on
     DP-Outer. It records the DP-Inner window and the DP-Outer gathers instead of launching
     them."""
@@ -243,7 +243,8 @@ def _hfsdp_window_pipeline(unit_ids, sizes, overlap=True, double_buffer=False):
             )
             for unit_id, size in zip(unit_ids, sizes)
         ],
-        bucket_to_bucket_group={bucket_id: [bucket_id] for bucket_id in range(len(unit_ids))},
+        bucket_to_bucket_group=bucket_groups
+        or {bucket_id: [bucket_id] for bucket_id in range(len(unit_ids))},
         double_buf_units=set(unit_ids) if double_buffer else set(),
         ddp_config=SimpleNamespace(
             fsdp_double_buffer=double_buffer,
@@ -299,6 +300,63 @@ def test_all_gather_pipeline_complete_frontier_unit(order, start_buckets, expect
     actual = pipeline._complete_frontier_fsdp_unit(start_buckets, order)
 
     assert actual == expected_buckets
+
+
+# Unit 1 has a dense bucket group [1, 3] around an expert bucket 2, as when its dense
+# parameters span two dtypes.
+_SKIP_UNIT_IDS = [0, 1, 1, 1, 2]
+_SKIP_BUCKET_GROUPS = {0: [0], 1: [1, 3], 2: [2], 3: [1, 3], 4: [4]}
+
+
+@pytest.mark.parametrize(
+    ("order", "start_buckets", "expected_buckets"),
+    [
+        (PrefetchOrder.FORWARD_PASS_ORDER, [0, 1, 3], [0, 1, 2, 3]),
+        (PrefetchOrder.BACKWARD_PASS_ORDER, [1, 3, 4], [1, 2, 3, 4]),
+        (PrefetchOrder.FORWARD_PASS_ORDER, [3], [3]),
+        (PrefetchOrder.BACKWARD_PASS_ORDER, [1], [1]),
+    ],
+)
+def test_all_gather_pipeline_complete_frontier_unit_fills_skipped_buckets(
+    order, start_buckets, expected_buckets
+):
+    """Buckets of the frontier unit that a non-contiguous bucket group skipped are added;
+    buckets outside the selected span are not."""
+    pipeline = AllGatherPipeline.__new__(AllGatherPipeline)
+    pipeline.buffer = SimpleNamespace(
+        parameter_groups=[SimpleNamespace(fsdp_unit_id=unit_id) for unit_id in _SKIP_UNIT_IDS],
+        bucket_to_bucket_group=_SKIP_BUCKET_GROUPS,
+    )
+
+    actual = pipeline._complete_frontier_fsdp_unit(start_buckets, order)
+
+    assert actual == expected_buckets
+
+
+@pytest.mark.parametrize(
+    ("order", "requested", "inner"),
+    [
+        (PrefetchOrder.FORWARD_PASS_ORDER, 0, [0, 1, 2, 3]),
+        (PrefetchOrder.BACKWARD_PASS_ORDER, 4, [1, 2, 3, 4]),
+    ],
+)
+def test_hfsdp_pipeline_window_fills_skipped_unit_buckets(order, requested, inner):
+    """A size-limited window that selects a non-contiguous bucket group still covers the
+    whole frontier unit."""
+    pipeline, params = _hfsdp_window_pipeline(
+        _SKIP_UNIT_IDS, [6, 20, 6, 6, 6], bucket_groups=_SKIP_BUCKET_GROUPS
+    )
+
+    pipeline.all_gather_params(
+        [params[requested]],
+        prefetch=True,
+        prefetch_order=order,
+        suggested_AG_prefetch_size=10,
+        outer_fsdp_group_param_gather=True,
+    )
+
+    assert pipeline.recorded.get("inner") == inner
+    assert pipeline.recorded.get("outer") == [0, 1, 2, 3, 4]
 
 
 @pytest.mark.parametrize(
