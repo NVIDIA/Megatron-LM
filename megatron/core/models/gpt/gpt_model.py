@@ -819,9 +819,9 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                     input_ids=input_ids,
                     mtp_input_mask=mtp_input_mask,
+                    # dp_cp_gtp_remat accompanies dp_cp; without it, the metrics average over dp_cp.
                     metric_avg_group=(
-                        getattr(self.pg_collection, 'dp_cp_gtp_remat', None)
-                        or self.pg_collection.dp_cp
+                        vars(self.pg_collection).get('dp_cp_gtp_remat') or self.pg_collection.dp_cp
                     ),
                 )
         sequence_parallel_override = False
