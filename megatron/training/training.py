@@ -96,7 +96,6 @@ from megatron.core.optimizer_param_scheduler import (
 )
 from megatron.core.parallel_state import (
     create_all_gather_groups,
-    destroy_global_memory_buffer,
     destroy_model_parallel,
     get_context_parallel_group,
     get_dynamic_data_context_parallel_groups,
@@ -135,6 +134,7 @@ from megatron.core.utils import (
     StragglerDetector,
     check_param_hashes_across_dp_replicas,
     configure_nvtx_profiling,
+    destroy_global_memory_buffer,
     get_attr_wrapped_model,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
