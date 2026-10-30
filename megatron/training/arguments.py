@@ -1020,7 +1020,8 @@ def validate_args(args, defaults={}):
         raise ValueError("--fp4-format requires Transformer Engine >= 2.7.0.dev0 for NVFP4BlockScaling support.")
 
     if (
-        args.fp8_recipe == 'mxfp8'
+        args.fp8
+        and args.fp8_recipe == 'mxfp8'
         and args.transformer_impl == 'inference_optimized'
         and not is_flashinfer_min_version("0.6.4")
     ):
@@ -1456,7 +1457,7 @@ def validate_args(args, defaults={}):
         # GTP with the mxfp8 recipe requires --fp8-param-gather: GTP keeps no bf16 weight and
         # relies on the optimizer maintaining the fp8 shard (the forward all-gathers fp8 and does
         # not re-quantize). Without fp8-param-gather the fp8 forward weight would never be updated.
-        if getattr(args, 'fp8_recipe', None) == 'mxfp8':
+        if args.fp8 and getattr(args, 'fp8_recipe', None) == 'mxfp8':
             assert getattr(args, 'fp8_param_gather', False), (
                 "GTP + mxfp8 requires --fp8-param-gather (the optimizer maintains the fp8 shard; "
                 "GTP does not keep or re-quantize a bf16 weight)."
@@ -1897,10 +1898,11 @@ def validate_args(args, defaults={}):
             "The optimizer cpu offload must be used in conjunction with `--use-precision-aware-optimizer`, "
             "as the hybrid device optimizer reuses the code path of this flag."
         )
-        assert not args.fp8_param_gather or args.fp8_recipe == "delayed", (
-            "When `--fp8-param-gather` is enabled, the optimizer cpu offload "
-            "must be used in conjunction with `--fp8-recipe delayed`."
-        )
+        if args.fp8:
+            assert not args.fp8_param_gather or args.fp8_recipe == "delayed", (
+                "When `--fp8-param-gather` is enabled, the optimizer cpu offload "
+                "must be used in conjunction with `--fp8-recipe delayed`."
+            )
 
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
