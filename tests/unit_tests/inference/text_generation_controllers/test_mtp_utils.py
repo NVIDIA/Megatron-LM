@@ -447,7 +447,7 @@ class TestPrepareNextForwardPass:
 
     @pytest.mark.parametrize(
         "num_decode,num_prefill,num_spec",
-        [(1, 0, 2), (3, 0, 2), (3, 2, 2), (0, 3, 2), (5, 3, 4), (3, 0, 3), (2, 2, 3)],
+        [(1, 0, 2), (3, 0, 2), (3, 2, 2), (2, 2, 3), (0, 3, 2), (5, 3, 4), (3, 0, 3)],
     )
     def test_basic(self, num_decode, num_prefill, num_spec):
         output_tokens, required_logit_indices, input_tokens, accepted_mask, last_one_indices = (
@@ -501,6 +501,9 @@ class TestPrepareNextForwardPass:
         torch.testing.assert_close(tri_last_seq, ref_last_seq)
         torch.testing.assert_close(tri_accepted, ref_accepted)
         torch.testing.assert_close(tri_counts, ref_counts)
+        if num_prefill > 0:
+            assert (tri_accepted[num_decode:active] == -1).all()
+            assert (tri_counts[num_decode:active] == 0).all()
 
     @pytest.mark.parametrize(
         "prepare_fn",
@@ -547,6 +550,39 @@ class TestPrepareNextForwardPass:
         assert sampled.tolist() == [47, 71]
         assert accepted.tolist() == [[45, 46], [-1, -1]]
         assert counts.tolist() == [2, 0]
+
+    def test_mixed_async_prefill_row_clears_false_termination_match(self):
+        """A prefill row cannot inherit a stale accepted termination token."""
+        termination_id = 91
+        accepted_tokens = torch.tensor([[7, -1], [termination_id, 92]], device=DEVICE)
+        accepted_counts = torch.tensor([1, 2], device=DEVICE)
+
+        def prefill_has_valid_termination_match() -> bool:
+            valid_count = int(accepted_counts[1].item())
+            valid_tokens = accepted_tokens[1, :valid_count]
+            return bool((valid_tokens == termination_id).any().item())
+
+        assert accepted_tokens[1].tolist() == [91, 92]
+        assert accepted_counts[1].item() == 2
+        assert prefill_has_valid_termination_match()
+
+        prepare_next_forward_pass_pytorch(
+            num_decode_requests=1,
+            output_tokens=torch.tensor([0, 40, 0, 41], device=DEVICE),
+            required_logit_indices=torch.arange(4, device=DEVICE),
+            last_one_indices=torch.tensor([1, 3], device=DEVICE),
+            accepted_tokens_mask=torch.tensor([True, True, False, True], device=DEVICE),
+            input_tokens=torch.tensor([0, 7, 0, 0], device=DEVICE),
+            sampled_tokens_buf=torch.zeros(2, dtype=torch.long, device=DEVICE),
+            last_accepted_seq_buf=torch.zeros(2, dtype=torch.long, device=DEVICE),
+            accepted_tokens_per_request=accepted_tokens,
+            accepted_token_counts=accepted_counts,
+            num_speculative_tokens=2,
+        )
+
+        assert accepted_tokens.tolist() == [[7, -1], [-1, -1]]
+        assert accepted_counts.tolist() == [1, 0]
+        assert not prefill_has_valid_termination_match()
 
     def test_empty(self):
         """Zero active requests should be a no-op."""

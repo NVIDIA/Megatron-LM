@@ -454,6 +454,12 @@ prompt top-N log-probs, are always raw in both modes, because prompt tokens were
 not sampled from the processed distribution.
 `'processed_logprobs'` is not yet supported with speculative decoding.
 
+With prefix caching, prompt log-probs are cached on the KV blocks of the
+tokens that produced them, so a request that returns prompt log-probs can
+still skip a cached prefix. It skips only the blocks whose cached rows cover
+its `top_n_logprobs`, and computes the rest. Requests with `top_n_logprobs`
+above 100 share cached KV but compute every prompt token.
+
 ### Engine Configuration
 
 `InferenceConfig` configures the engine, KV-cache, and CUDA-graph behavior and is
@@ -504,6 +510,17 @@ than `InferenceConfig`, because they must be set when you build the model:
 default, or `nccl`), `inference_grouped_gemm_backend` (`vllm` by default, or
 `torch` / `flashinfer`), `quant_recipe`, `moe_enable_routing_replay`, and
 `window_size` for sliding-window attention.
+
+#### Tanh-clamped squared ReLU with FlashInfer
+
+On SM10x GPUs, BF16 and MXFP8 experts support the activation `(L * tanh(relu(x) / L)) ** 2` with
+`inference_grouped_gemm_backend="flashinfer"`, `activation_func=squared_relu`,
+`activation_func_tanh_clamp_scale=L`, `gated_linear_unit=False`,
+and `add_bias_linear=False`. 
+
+Requires FlashInfer >= 0.7.2, with `ActivationType.ClampedRelu2` and
+`clamped_relu2_limit` support. This path does not support
+`inference_flashinfer_mxfp8_token_capacity` or `batch_invariant_mode`.
 
 ### Reading Results
 

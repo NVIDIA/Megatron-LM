@@ -250,9 +250,7 @@ def prepare_next_forward_pass(
                     count += 1
             accepted_token_counts[pid] = count
         else:
-            # Prefill requests proposed no drafts. Clear the row, which may still hold
-            # the drafts of the decode request that occupied it in an earlier step.
-            accepted_tokens_per_request[pid] = -1
+            accepted_tokens_per_request[pid].fill_(-1)
             accepted_token_counts[pid] = 0
 
 
