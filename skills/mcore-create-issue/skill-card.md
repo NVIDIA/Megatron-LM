@@ -20,7 +20,7 @@ Mitigation: Review and scan skill before deployment. <br>
 
 ## Reference(s): <br>
 - [Megatron-LM Developer Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html) <br>
-- [Contributing to Megatron-LM](docs/developer/contribute.md) <br>
+- [Contributing to Megatron-LM](../../docs/developer/contribute.md) <br>
 
 
 ## Skill Output: <br>
