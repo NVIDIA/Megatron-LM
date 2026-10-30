@@ -211,6 +211,32 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
                 "Use regular DDP or the distributed optimizer for now."
             )
 
+        # GTP weight rematerialization gives each rank of a GTP group a different shard of a
+        # weight. Megatron-FSDP v1 has no GTP handling and shards and reduces parameters over
+        # one data-parallel group: the replicate group cannot form a device mesh that covers
+        # the GTP ranks, and the GTP-inclusive group treats different shards as copies of one
+        # parameter.
+        gtp_weight_remat_sizes = {
+            "gtp_weight_remat_size": config.gtp_weight_remat_size,
+            "expert_gtp_weight_remat_size": config.expert_gtp_weight_remat_size,
+        }
+        if pg_collection is not None:
+            # An unset collection field means that axis is not sharded.
+            gtp_weight_remat_sizes.update(
+                (f"pg_collection.{name}", group.size())
+                for name, group in vars(pg_collection).items()
+                if name in ("gtp_remat", "expt_gtp_remat") and group is not None
+            )
+        active_gtp_weight_remat = [
+            f"{name}={size}" for name, size in gtp_weight_remat_sizes.items() if size > 1
+        ]
+        if active_gtp_weight_remat:
+            raise ValueError(
+                "Megatron-FSDP v1 does not support GTP weight rematerialization, got "
+                f"{', '.join(active_gtp_weight_remat)}. Use Megatron DDP with GTP, or disable "
+                "GTP weight rematerialization."
+            )
+
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
