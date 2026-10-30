@@ -57,6 +57,8 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_get_slice_after,
     tensor_merge,
 )
+from megatron.core.inference.utils import InferenceMode
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
@@ -130,6 +132,30 @@ def ssm_chunking(layer_type_list: List[str], layers: Sequence) -> Optional[SSMCh
                 f"{chunking} but layer {layer_idx} has {layer_chunking}"
             )
     return chunking
+
+
+def steps_from_zero_state(packed_seq_params: Optional[PackedSeqParams]) -> bool:
+    """Whether a recurrent mixer runs its input as one step per token from a zero state.
+
+    It does for packed sequences of one token each in inference, as a context-free MTP draft
+    step packs its requests (see `PackedSeqParams.single_token_sequences`). Every token then
+    starts a recurrence of its own: the mixer's short convolution sees the token alone, and its
+    recurrence takes one step from a zero state, which it neither reads nor stores. The mixer
+    runs that step on all tokens at once, with kernels that need no varlen metadata (whose host
+    syncs CUDA graphs cannot capture) and keep no state per sequence. Some of those kernels have
+    no backward, hence inference only.
+
+    Args:
+        packed_seq_params: The mixer's packed-sequence parameters, or None.
+
+    Returns:
+        True if the mixer runs every token as one step from a zero state.
+    """
+    return (
+        InferenceMode.is_active()
+        and packed_seq_params is not None
+        and packed_seq_params.has_single_token_sequences()
+    )
 
 
 class SSMDynamicInferenceMixin:

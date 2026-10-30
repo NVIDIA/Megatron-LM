@@ -33,7 +33,7 @@ from megatron.core.ssm.ops.common.intermediate_extraction import (
 from megatron.core.ssm.ops.mamba2.batch_invariant_decode import MambaBatchInvariantDecode
 from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
 from megatron.core.ssm.packed_seq_helpers import build_packed_seq_idx
-from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
+from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin, steps_from_zero_state
 from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
@@ -492,11 +492,16 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
 
         if inference_mode or not self.use_mem_eff_path:
             # TODO(ksanthanam): Consider deprecating this path for training
-            assert packed_seq_params is None, (
+            assert packed_seq_params is None or steps_from_zero_state(packed_seq_params), (
                 "Training with packed sequences is not supported "
                 "in the non-memory-efficient code path."
             )
-            y = self._static_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
+            y = self._static_prefill(
+                zxBCdt,
+                conv_state=conv_state,
+                ssm_state=ssm_state,
+                packed_seq_params=packed_seq_params,
+            )
         else:
             assert ssm_state is None
             y = self._ssm_training(zxBCdt, packed_seq_params)
@@ -595,25 +600,42 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         zxBCdt: torch.Tensor,
         conv_state: Optional[torch.Tensor],
         ssm_state: Optional[torch.Tensor],
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> torch.Tensor:
         """
-        Performs single-sequence SSM prefill for static-batching inference and the
+        Performs SSM prefill for static-batching inference and the
         non-memory-efficient (`use_mem_eff_path=False`) training fallback.
 
         `conv_state` / `ssm_state` are `None` for the training fallback and
         non-`None` for static-batching inference (updated in place).
+
+        Packed input holds sequences of one token each, which run one step each from a zero
+        state (see `steps_from_zero_state`): the convolution sees every token alone, as a row
+        of its own, and the chunked scan restarts at every token through the per-token
+        sequence index `seq_idx`. No state is cached.
 
         Args:
             zxBCdt: The input tensor of shape (l, b, d), a concatenation of
                 z, x, B, C, and dt projections.
             conv_state: The convolution state tensor, or `None` for training.
             ssm_state: The selective scan state tensor, or `None` for training.
+            packed_seq_params: Packed sequences of one token each, or `None`.
 
         Returns:
             Output tensor of shape (l, b, d).
         """
         # transpose: l b pd --> b l pd
         zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
+
+        seq_idx = None
+        if packed_seq_params is not None:
+            assert (
+                conv_state is None and ssm_state is None
+            ), "Static-batching state caching does not support packed sequences."
+            assert self.cp.cp_size == 1, "Context parallel is not supported for packed inference."
+            seq_idx = packed_seq_params.seq_idx
+            if seq_idx is None:
+                seq_idx = build_packed_seq_idx(packed_seq_params, zxBCdt.shape[1])
 
         # (nheads_local_tpcp)
         A = -torch.exp(self.cp.get_A_log().float())
@@ -629,7 +651,14 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         )
 
         # Compute short convolution (single-sequence / non-varlen).
-        xBC = rearrange(xBC, "b l d -> b d l").contiguous()
+        if seq_idx is None:
+            xBC = rearrange(xBC, "b l d -> b d l").contiguous()
+        else:
+            # Every token is a sequence of its own: convolve each as a batch row [l, d, 1], as
+            # decode does, which needs no sequence boundaries. Copy to standard strides:
+            # contiguous() would keep one token's [1, d, 1] slice of the projection, which reads
+            # as channels-last.
+            xBC = rearrange(xBC, "1 l d -> l d 1").clone(memory_format=torch.contiguous_format)
         if conv_state is not None:
             # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
             # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
@@ -646,7 +675,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
                 bias=self.cp.get_conv1d_bias(),
                 activation=self.activation,
             )
-        xBC = rearrange(xBC, "b d l -> b l d").contiguous()
+        if seq_idx is None:
+            xBC = rearrange(xBC, "b d l -> b l d").contiguous()
+        else:
+            xBC = rearrange(xBC, "l d 1 -> 1 l d")
 
         x, B, C = torch.split(
             xBC,
@@ -697,6 +729,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             dt_softplus=True,
             return_final_states=ssm_state is not None,
             initial_states=initial_ssm_state,
+            seq_idx=seq_idx,
             **state_dtype_kwarg,
         )
 

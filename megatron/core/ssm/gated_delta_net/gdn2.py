@@ -23,15 +23,17 @@ from megatron.core.ssm.gated_delta_net.common import (
     get_parameter_local_cp,
     l2norm,
 )
+from megatron.core.ssm.ssm_inference import steps_from_zero_state
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 try:
-    # The GDN2 kernel is only available in flash-linear-attention >= 0.5.1.
+    # The GDN2 kernels are only available in flash-linear-attention >= 0.5.1.
     from fla.ops.gdn2.chunk import chunk_gdn2
+    from fla.ops.gdn2.fused_recurrent import fused_recurrent_gdn2
 
     HAVE_FLA_GDN2 = True
 except ImportError:
-    chunk_gdn2 = None
+    chunk_gdn2 = fused_recurrent_gdn2 = None
     HAVE_FLA_GDN2 = False
 
 logger = logging.getLogger(__name__)
@@ -101,6 +103,8 @@ class GatedDeltaNet2(_GDNBase):
         if backend == "torch":
             self.gdn_backend = "torch"
             self.gated_delta_rule = torch_chunk_gdn2
+            # The torch kernel runs sequences of one token each like any other batch.
+            self.single_token_gated_delta_rule = torch_chunk_gdn2
             return
 
         assert (
@@ -108,6 +112,9 @@ class GatedDeltaNet2(_GDNBase):
         ), "GDN2 requires flash-linear-attention >= 0.5.1 with the fla.ops.gdn2 kernel."
         self.gdn_backend = "fla"
         self.gated_delta_rule = chunk_gdn2
+        # FLA's recurrent kernel takes one step per sequence of one token without the chunked
+        # kernel's per-sequence chunk state. It has no backward.
+        self.single_token_gated_delta_rule = fused_recurrent_gdn2
 
     def _reset_dt_bias(self):
         """Softplus-inverse init of dt_bias.
@@ -190,6 +197,9 @@ class GatedDeltaNet2(_GDNBase):
             # TODO: support inference
             raise NotImplementedError("GDN2 does not support inference for now.")
 
+        if steps_from_zero_state(packed_seq_params):
+            return self._single_token_sequences_pre_attn_and_core_attn(hidden_states)
+
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
             assert (
@@ -242,7 +252,40 @@ class GatedDeltaNet2(_GDNBase):
         # Transpose: s b x --> b s x
         # From sbhd to bshd format
         qkvzfbw = qkvzfbw.transpose(0, 1)
+        kernel_inputs, gate = self._conv_and_prepare_kernel_inputs(
+            qkvzfbw, batch, seq_len, cu_seqlens_q
+        )
 
+        nvtx_range_push(suffix="gated_delta_rule")
+        core_attn_out, _ = self.gated_delta_rule(
+            **kernel_inputs,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=cu_seqlens_q,
+        )
+        nvtx_range_pop(suffix="gated_delta_rule")
+
+        if self.recompute_norm_out:
+            self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            norm_func = partial(
+                self._gated_norm_and_a2a,
+                thd_cp_a2a_inv=thd_cp_a2a_inv,
+                batch=batch,
+                seq_len=seq_len,
+                packed_seq_params=packed_seq_params,
+            )
+            norm_out = self.norm_out_checkpoint.checkpoint(norm_func, core_attn_out, gate)
+        else:
+            norm_out = self._gated_norm_and_a2a(
+                core_attn_out, gate, thd_cp_a2a_inv, batch, seq_len, packed_seq_params
+            )
+
+        return norm_out
+
+    def _conv_and_prepare_kernel_inputs(self, qkvzfbw, batch, seq_len, cu_seqlens_q):
+        """Split the bshd in_proj output, run the causal conv over q/k/v, and prepare the
+        recurrence inputs. Returns the kernel inputs and the output gate (z)."""
         # Split the tensor into q/k/v, gate (z), and the GDN2 gate features f, b, w
         qkv, gate, f, b, w = torch.split(qkvzfbw, self.feat_dim_split, dim=-1)
         gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
@@ -310,32 +353,25 @@ class GatedDeltaNet2(_GDNBase):
         gate = kernel_inputs.pop("gate")
         nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
 
-        nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, _ = self.gated_delta_rule(
-            **kernel_inputs,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-            cu_seqlens=cu_seqlens_q,
+        return kernel_inputs, gate
+
+    def _single_token_sequences_pre_attn_and_core_attn(self, hidden_states):
+        """Run packed sequences of one token each, one step each from a zero state.
+
+        See ``steps_from_zero_state``. The in_proj output [t, 1, x] is already the bshd batch of
+        t length-1 sequences: the conv sees each token alone, and the kernel takes one step per
+        sequence, without the chunked kernel's varlen metadata.
+        """
+        assert self.cp_size == 1, "GDN2 single-token sequences do not support CP."
+        nvtx_range_push(suffix="in_proj")
+        qkvzfbw, _ = self.in_proj(hidden_states)
+        nvtx_range_pop(suffix="in_proj")
+        num_tokens = qkvzfbw.size(0)
+        kernel_inputs, gate = self._conv_and_prepare_kernel_inputs(qkvzfbw, num_tokens, 1, None)
+        core_attn_out, _ = self.single_token_gated_delta_rule(
+            **kernel_inputs, use_qk_l2norm_in_kernel=False
         )
-        nvtx_range_pop(suffix="gated_delta_rule")
-
-        if self.recompute_norm_out:
-            self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            norm_func = partial(
-                self._gated_norm_and_a2a,
-                thd_cp_a2a_inv=thd_cp_a2a_inv,
-                batch=batch,
-                seq_len=seq_len,
-                packed_seq_params=packed_seq_params,
-            )
-            norm_out = self.norm_out_checkpoint.checkpoint(norm_func, core_attn_out, gate)
-        else:
-            norm_out = self._gated_norm_and_a2a(
-                core_attn_out, gate, thd_cp_a2a_inv, batch, seq_len, packed_seq_params
-            )
-
-        return norm_out
+        return self._apply_gated_norm(core_attn_out, gate).reshape(num_tokens, 1, -1)
 
 
 ####################

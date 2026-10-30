@@ -444,6 +444,31 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
 
+    def _runs_tokens_as_batch(self, packed_seq_params: Optional[PackedSeqParams]) -> bool:
+        """Whether this layer runs packed sequences of one token each as a batch.
+
+        A context-free MTP draft step packs its requests so (see
+        ``PackedSeqParams.single_token_sequences``). Only core attention needs the sequence
+        boundaries, so that each query sees its own key alone. Every op before and after it
+        works per token and runs the tokens [t, 1, ...] as one unpacked sequence; rotary
+        embeddings then rotate a query and its only key by the same angle, which leaves their
+        product unchanged. Core attention runs the tokens as the sbhd batch [1, t, ...] of
+        length-1 sequences, without the pack, so it needs no THD support for them.
+
+        DSA keeps the pack: its indexer reads the layer input, which sequence parallelism splits
+        along the tokens, and its packed path runs such sequences without host syncs.
+        """
+        return (
+            packed_seq_params is not None
+            and packed_seq_params.has_single_token_sequences()
+            and not getattr(self.core_attention, "requires_dsa_inputs", False)
+        )
+
+    @staticmethod
+    def _swap_tokens_and_batch(x: Tensor) -> Tensor:
+        """View the tokens [t, 1, ...] as the batch [1, t, ...], or back."""
+        return x.reshape(x.size(1), x.size(0), *x.shape[2:])
+
     def _get_core_attention_extra_kwargs(
         self,
         hidden_states: Tensor,
@@ -1435,6 +1460,10 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         assert (
             packed_sequence_cp_metadata is None
         ), "Attention does not support packed-sequence chunkwise CP metadata."
+        # Up to core attention, sequences of one token each run as one unpacked sequence.
+        tokens_as_batch = self._runs_tokens_as_batch(packed_seq_params)
+        if tokens_as_batch:
+            packed_seq_params = None
         runtime_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
 
         # Check if we need to skip RoPE
@@ -1670,6 +1699,12 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         # ==================================
 
         nvtx_range_push(suffix="core_attention")
+        if tokens_as_batch:
+            # Core attention runs the tokens as a batch of length-1 sequences. hidden_states is
+            # the indexer input of DSA over GQA, which rules out sequence parallelism.
+            query, key, value, hidden_states = (
+                self._swap_tokens_and_batch(x) for x in (query, key, value, hidden_states)
+            )
         core_attention_extra_kwargs = self._get_core_attention_extra_kwargs(
             hidden_states=hidden_states,
             query=query,
@@ -1759,6 +1794,8 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             core_attn_out = core_attn_manager.group_offload(
                 core_attn_out, forced_released_tensors=[query, key, value]
             )
+        if tokens_as_batch:
+            core_attn_out = self._swap_tokens_and_batch(core_attn_out)
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
