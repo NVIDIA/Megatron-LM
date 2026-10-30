@@ -193,6 +193,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Replays TE's overwrite_input path when supported.",
     ),
     KernelEntry(
+        name="liger_cross_entropy",
+        sources=("megatron/core/ops/loss/liger_cross_entropy.py",),
+        tests=(K + "test_liger_loss.py",),
+        kind="external-lib",
+        notes="Vocab-parallel loss, logits gradients and original predictions replayed "
+        "under contention with explicit TP groups.",
+    ),
+    KernelEntry(
         name="jit_fuser",
         sources=("megatron/core/jit.py",),
         kind="torch.compile",
