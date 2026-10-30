@@ -557,20 +557,28 @@ class MoELayer(BaseMoELayer):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        replay_topk_idx: Optional[torch.Tensor] = None,
     ):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping. The input padding mask is batch-first;
-        routing consumes it sequence-first to align with ``hidden_states``.
+        routing consumes it sequence-first to align with ``hidden_states``. With routing replay,
+        ``replay_topk_idx`` ([num_tokens, topk]) replaces the micro-batch's indices for this call.
         """
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
         if self.token_dispatcher is not None:
             hidden_states = self.token_dispatcher.wrap_layer_input(hidden_states)
-        probs, routing_map = apply_module(self.router)(
-            hidden_states, padding_mask, input_ids=input_ids, packed_seq_params=packed_seq_params
-        )
+        with RouterReplay.replay_indices_for_call(
+            getattr(self.router, "router_replay", None), replay_topk_idx
+        ):
+            probs, routing_map = apply_module(self.router)(
+                hidden_states,
+                padding_mask,
+                input_ids=input_ids,
+                packed_seq_params=packed_seq_params,
+            )
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -791,7 +799,11 @@ class MoELayer(BaseMoELayer):
 
             def megakernel_forward(hidden_states, padding_mask):
                 probs, routing_map = self.route(
-                    hidden_states, padding_mask, input_ids, packed_seq_params=packed_seq_params
+                    hidden_states,
+                    padding_mask,
+                    input_ids,
+                    packed_seq_params=packed_seq_params,
+                    replay_topk_idx=replay_topk_idx,
                 )
                 return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
 
@@ -814,15 +826,13 @@ class MoELayer(BaseMoELayer):
                     if not self.run_shared_experts_after_router:
                         shared_expert_output = self.shared_experts_compute(layer_input)
 
-                    with RouterReplay.replay_indices_for_call(
-                        getattr(self.router, "router_replay", None), replay_topk_idx
-                    ):
-                        probs, routing_map = self.route(
-                            layer_input,
-                            padding_mask,
-                            input_ids,
-                            packed_seq_params=packed_seq_params,
-                        )
+                    probs, routing_map = self.route(
+                        layer_input,
+                        padding_mask,
+                        input_ids,
+                        packed_seq_params=packed_seq_params,
+                        replay_topk_idx=replay_topk_idx,
+                    )
                     hidden_states, probs = self.preprocess(
                         layer_input,
                         probs,
