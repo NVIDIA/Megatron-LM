@@ -20,6 +20,12 @@ try:
 except ImportError:
     PunktLanguageVars = object  # Fallback to the built-in object class
     nltk_available = False
+try:
+    # NLTK >= 3.9 ships the pretrained Punkt models as "punkt_tab" and refuses to
+    # unpickle the legacy "punkt" models.
+    from nltk.tokenize.punkt import PunktTokenizer
+except ImportError:
+    PunktTokenizer = None
 
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.arguments import _add_tokenizer_args
@@ -55,13 +61,16 @@ class Encoder(object):
             if not nltk_available:
                 print("NLTK is not available to split sentences.")
                 exit()
-            if os.environ.get("NLTK_DATA"):
-                library = os.path.join(os.environ.get("NLTK_DATA"), "tokenizers", "punkt", f"{self.args.lang}.pickle")
-                url = f"file:{library}"
+            if PunktTokenizer is not None:
+                splitter = PunktTokenizer(self.args.lang)
             else:
-                library = os.path.join("tokenizers", "punkt", f"{self.args.lang}.pickle")
-                url = f"nltk:{library}"
-            splitter = nltk.load(url)
+                if os.environ.get("NLTK_DATA"):
+                    library = os.path.join(os.environ.get("NLTK_DATA"), "tokenizers", "punkt", f"{self.args.lang}.pickle")
+                    url = f"file:{library}"
+                else:
+                    library = os.path.join("tokenizers", "punkt", f"{self.args.lang}.pickle")
+                    url = f"nltk:{library}"
+                splitter = nltk.load(url)
             if self.args.keep_newlines:
                 # this prevents punkt from eating newlines after sentences
                 Encoder.splitter = nltk.tokenize.punkt.PunktSentenceTokenizer(
@@ -327,7 +336,8 @@ def main():
         print(f"Processing data with {num_workers} workers.")
         if args.split_sentences:
             if nltk_available:
-                nltk.download("punkt", quiet=True, download_dir=os.environ.get("NLTK_DATA"))
+                punkt_resource = "punkt_tab" if PunktTokenizer is not None else "punkt"
+                nltk.download(punkt_resource, quiet=True, download_dir=os.environ.get("NLTK_DATA"))
             else:
                 raise Exception(
                     "nltk library required for sentence splitting is not available.")
@@ -411,9 +421,6 @@ def main():
 
             for p in processes:
                 p.join()
-
-            if args.partitions == 1:
-                continue
 
         def process_json_file(name, q, input_key):
             worker_performance = partition.process_json_file((name[input_key], name['output_prefix']))
