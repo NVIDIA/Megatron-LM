@@ -379,7 +379,9 @@ def _model_rng_config(args: Namespace) -> RNGConfig:
 
 
 def _apply_model_rng_config(config, rng: RNGConfig) -> None:
-    """Bind RNG settings while adapting a legacy model provider, before container finalization."""
+    """Bind RNG settings for legacy model configs outside the container lifecycle."""
+    # TODO: After #8234 merges, remove this compatibility helper and its calls in favor of
+    # container finalization, checking remaining standalone adapter callers first.
     if not isinstance(config, TransformerConfig):
         return
     if config.cuda_graph_impl != "none" and "transformer_engine" in (
