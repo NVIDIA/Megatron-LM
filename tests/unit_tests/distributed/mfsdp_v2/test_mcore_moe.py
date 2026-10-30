@@ -130,6 +130,7 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup,
                     reference_parameter = getattr(reference_fc, f"{parameter_name}{global_}", None)
                     if model_parameter is not None:
                         model_parameter.data.copy_(reference_parameter.data)
+                    if isinstance(model_parameter, torch.nn.Parameter):
                         parameter_mapping[parameter_names[id(model_parameter)]] = reference_names[
                             id(reference_parameter)
                         ]
@@ -190,9 +191,13 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup,
     reference_losses, losses = [], []
     for _ in range(5):
         reference_optimizer.zero_grad(set_to_none=True)
-        (reference_loss,) = run_forward_backward_on_microbatches(reference_model, reference_forward)
+        reference_loss, _ = run_forward_backward_on_microbatches(
+            reference_model, reference_forward, num_microbatches=2, loss_scale=0.5
+        )
         optimizer.zero_grad(set_to_none=True)
-        (loss,) = run_forward_backward_on_microbatches(model, forward)
+        loss, _ = run_forward_backward_on_microbatches(
+            model, forward, num_microbatches=2, loss_scale=0.5
+        )
         for name, reference_name in parameter_mapping.items():
             actual, expected = parameters[name].grad, reference_parameters[reference_name].grad
             assert (actual is None) == (expected is None), name
