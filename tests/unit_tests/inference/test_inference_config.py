@@ -153,10 +153,12 @@ class TestInferenceConfig:
                     "include_frame_timestamps_for_nemotron_vl": True,
                 },
                 "content_part_order": "media_first",
+                "content_rendering": "nemotron_vl",
             }
         )
 
         assert config.content_part_order == "media_first"
+        assert config.content_rendering == "nemotron_vl"
         assert config.get_spec("image") == MediaPromptSpec(model_token="<image>", prefix="<img>")
         assert config.get_spec("video") == MediaPromptSpec(
             model_token="<video>",
@@ -195,6 +197,11 @@ class TestInferenceConfig:
     def test_multimodal_prompt_config_rejects_invalid_content_part_order(self):
         with pytest.raises(ValueError, match="content_part_order"):
             MultimodalPromptConfig(content_part_order="interleave")
+
+    def test_multimodal_prompt_config_rejects_invalid_content_rendering(self):
+        assert MultimodalPromptConfig().content_rendering == "join"
+        with pytest.raises(ValueError, match="content_rendering"):
+            MultimodalPromptConfig(content_rendering="qwen_vl")
 
     def test_media_prompt_timestamps_require_temporal_expansion(self):
         with pytest.raises(ValueError, match="requires"):
