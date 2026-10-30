@@ -144,6 +144,16 @@ def test_get_param_groups_scopes_alignment_to_explicit_process_group(mocker):
     assert all_gather_object.call_args.kwargs == {'group': None}
 
 
+def test_copy_optimizer_param_metadata_preserves_muon_ht_radius():
+    source = torch.empty(1)
+    destination = torch.empty_like(source)
+    source._muon_ht_radius = torch.tensor(2.5)
+
+    copy_optimizer_param_metadata(destination, source)
+
+    assert destination._muon_ht_radius is source._muon_ht_radius
+
+
 @patch('torch.distributed.get_world_size', return_value=1)
 @patch(
     'torch.distributed.all_gather_object',

@@ -16,6 +16,12 @@ from typing import Any, Callable, Dict, Literal, Optional, get_args
 import torch
 from torch.optim.optimizer import ParamsT
 
+from megatron.core.model_initialization import (
+    is_muon_parameter,
+    logical_frobenius_inner_product,
+    logical_frobenius_norm,
+    validate_hyperball_config,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.utils import (
     get_emerging_optimizers_version,
@@ -151,7 +157,7 @@ def _is_nonlinear_or_embedding(param):
 
 def _is_muon_excluded(param):
     """True for parameters that should use the scalar optimizer instead of Muon."""
-    return not getattr(param, 'use_muon', True) or _is_nonlinear_or_embedding(param)
+    return not is_muon_parameter(param)
 
 
 def _get_qkv_split_shapes(model_cfg) -> list[int]:
@@ -642,6 +648,130 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         return grad
 
 
+class TensorParallelMuonH(TensorParallelMuon):
+    """Tensor-parallel Muon with Hyperball-style weight and update normalization.
+
+    Applies ``W_next = R * normalize(W - lr * R * normalize(update))`` through
+    Emerging Optimizers' pre- and post-weight-update extension points. Megatron model
+    initialization places every Muon-managed matrix at the configured radius ``R`` before
+    creating mixed-precision copies. FP32 norm sums are reduced only across applicable TP,
+    expert-TP, and GTP-remat shard groups. The fixed radius remains configuration rather
+    than per-parameter optimizer state, avoiding scalar distributed-checkpoint entries.
+
+    This matches Emerging Optimizers' ``MuonHyperball``, often called MuonH. Unlike
+    :class:`TensorParallelMuonHT`, it does not project the raw gradient onto the sphere's
+    tangent space before momentum and Muon orthogonalization.
+
+    Args:
+        params: Iterable of parameters to optimize or dicts defining parameter groups.
+        hyperball_eps: Minimum norm used for numerical stability.
+        hyperball_radius: Fixed global Frobenius norm for every parameter. Megatron model
+            initialization places Muon-managed parameters at this radius.
+        pg_collection: Explicit model-parallel process groups used for sharded norms.
+        **kwargs: Arguments passed to :class:`TensorParallelMuon`.
+    """
+
+    def __init__(
+        self,
+        params: ParamsT,
+        *,
+        hyperball_radius: float,
+        pg_collection: ProcessGroupCollection,
+        hyperball_eps: float = 1e-15,
+        **kwargs: Any,
+    ) -> None:
+        validate_hyperball_config(hyperball_eps, hyperball_radius)
+        if pg_collection is None:
+            raise ValueError("TensorParallelMuonH requires an explicit ProcessGroupCollection")
+
+        self.hyperball_eps = hyperball_eps
+        self.hyperball_radius = hyperball_radius
+        super().__init__(params, pg_collection=pg_collection, **kwargs)
+
+        for group in self.param_groups:
+            if group["weight_decay"] != 0.0:
+                raise ValueError(
+                    "TensorParallelMuonH replaces weight decay with Hyperball norm control; "
+                    "set weight_decay=0.0"
+                )
+
+    def _global_frobenius_norm(self, tensor: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+        """Compute the FP32 Frobenius norm over all unique shards of ``p``."""
+        return logical_frobenius_norm(tensor, p, self.pg_collection)
+
+    def pre_weight_update_fn_inplace(self, p: torch.Tensor, update: torch.Tensor) -> None:
+        """Scale the global update norm to the configured radius."""
+        radius = p.new_tensor(self.hyperball_radius, dtype=torch.float32)
+        update_norm = self._global_frobenius_norm(update, p)
+        is_numerical_zero = update_norm < self.hyperball_eps
+        scale = torch.where(
+            is_numerical_zero,
+            torch.zeros_like(update_norm),
+            radius / update_norm.clamp_min(self.hyperball_eps),
+        )
+        update.mul_(scale.to(dtype=update.dtype))
+
+    def post_weight_update_fn_inplace(self, p: torch.Tensor) -> None:
+        """Project the global updated parameter norm back to the configured radius."""
+        radius = p.new_tensor(self.hyperball_radius, dtype=torch.float32)
+        p_norm = self._global_frobenius_norm(p, p)
+        is_numerical_zero = p_norm < self.hyperball_eps
+        scale = torch.where(
+            is_numerical_zero,
+            torch.zeros_like(p_norm),
+            radius / p_norm.clamp_min(self.hyperball_eps),
+        )
+        p.mul_(scale.to(dtype=p.dtype))
+
+
+class TensorParallelMuonHT(TensorParallelMuonH):
+    """MuonH with a tangent-space projection of the raw gradient.
+
+    MuonH normalizes the orthogonalized update and retracts the updated weight to the
+    fixed-radius Frobenius sphere. MuonHT additionally computes
+    ``G_tangent = G - <W, G>_F / <W, W>_F * W`` before momentum accumulation and Muon
+    orthogonalization, as proposed in https://github.com/marin-community/marin/issues/2434.
+    Inner products and norms use FP32 accumulation and reduce across the applicable TP,
+    expert-TP, and GTP-remat shard groups. Both variants use Megatron initialization to
+    place weights at the configured radius and keep that radius as configuration rather
+    than per-parameter checkpoint state.
+    """
+
+    def _project_gradient_to_tangent(self, p: torch.Tensor, grad: torch.Tensor) -> torch.Tensor:
+        """Return the global Frobenius-sphere tangent projection of ``grad``."""
+        weight_squared_norm = logical_frobenius_inner_product(p, p, p, self.pg_collection)
+        weight_gradient_inner_product = logical_frobenius_inner_product(
+            p, grad, p, self.pg_collection
+        )
+        squared_eps = self.hyperball_eps * self.hyperball_eps
+        projection_scale = torch.where(
+            weight_squared_norm < squared_eps,
+            torch.zeros_like(weight_gradient_inner_product),
+            weight_gradient_inner_product / weight_squared_norm.clamp_min(squared_eps),
+        )
+        return grad - p.to(dtype=grad.dtype) * projection_scale.to(dtype=grad.dtype)
+
+    @torch.no_grad()  # type: ignore[misc]
+    def step(self, closure: Optional[Callable] = None) -> Optional[float]:
+        """Project raw gradients before running the standard MuonH step."""
+        if closure is not None:
+            raise ValueError("closure is not supported")
+
+        original_gradients = []
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                original_gradients.append((p, p.grad))
+                p.grad = self._project_gradient_to_tangent(p, p.grad)
+
+        try:
+            return super().step()
+        finally:
+            for p, grad in original_gradients:
+                p.grad = grad
+
+
 class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
     """Tensor Parallel Adaptive Muon optimizer.
 
@@ -809,6 +939,14 @@ def _adaptive_muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict
     return kwargs
 
 
+def _hyperball_muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
+    """Convert OptimizerConfig to TensorParallelMuonH/HT constructor kwargs."""
+    kwargs = _muon_config_to_kwargs(config, model_chunks, pg_collection)
+    kwargs["hyperball_eps"] = config.muon_ht_eps
+    kwargs["hyperball_radius"] = config.muon_ht_radius
+    return kwargs
+
+
 def _default_adam_based_eopt_config_to_kwargs(
     eopt_name, config, model_chunks, pg_collection
 ) -> Dict[str, Any]:
@@ -831,6 +969,26 @@ _EMERGING_OPTIMIZERS.update(
             default_param_overrides={
                 ParamKey(predicate=ParamPredicate(name="muon_excluded", fn=_is_muon_excluded)): {
                     'optimizer': 'adam'
+                }
+            },
+        ),
+        "muon_ht": EmergingOptimizerEntry(
+            optimizer_cls=TensorParallelMuonHT,
+            init_state_fn=_eopt_init_state_fn,
+            config_to_kwargs=_hyperball_muon_config_to_kwargs,
+            default_param_overrides={
+                ParamKey(predicate=ParamPredicate(name="muon_excluded", fn=_is_muon_excluded)): {
+                    "optimizer": "adam"
+                }
+            },
+        ),
+        "muon_h": EmergingOptimizerEntry(
+            optimizer_cls=TensorParallelMuonH,
+            init_state_fn=_eopt_init_state_fn,
+            config_to_kwargs=_hyperball_muon_config_to_kwargs,
+            default_param_overrides={
+                ParamKey(predicate=ParamPredicate(name="muon_excluded", fn=_is_muon_excluded)): {
+                    "optimizer": "adam"
                 }
             },
         ),
