@@ -76,7 +76,13 @@ def shell_environment(tmp_path: Path) -> dict[str, str]:
         destination = tmp_path / relative
         destination.parent.mkdir(parents=True)
         destination.symlink_to(ROOT / relative)
-    return {"PATH": f"{binaries}{os.pathsep}{os.environ['PATH']}"}
+    placement = tmp_path / "tests/unit_tests/gb200_placement.py"
+    placement.parent.mkdir(parents=True, exist_ok=True)
+    placement.symlink_to(ROOT / "tests/unit_tests/gb200_placement.py")
+    return {
+        "PATH": f"{binaries}{os.pathsep}{os.environ['PATH']}",
+        "UNIT_TEST_GB200_ENABLED": "false",
+    }
 
 
 @pytest.mark.parametrize(
@@ -806,7 +812,9 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
     outputs = {"has_tests": str(has_tests).lower()}
     assert workflow["jobs"]["select"]["runs-on"] == "ubuntu-latest"
     assert workflow["jobs"]["select"]["name"] == "unit tests selection"
-    assert workflow["jobs"]["select"]["if"] == "inputs.unit_testmon_mode == 'enforce'"
+    assert workflow["jobs"]["select"]["if"] == (
+        "inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_target_branch == 'main'"
+    )
     for step in workflow["jobs"]["select"]["steps"]:
         assert "unit_testmon_mode" not in step.get("if", "")
     for platform, parser_job, output in (
@@ -820,7 +828,11 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
             (ROOT / "tests/test_utils/recipes" / platform / "unit-tests.yaml").read_text()
         )
         assert json.loads(parsed[output]) == [
-            {"bucket": case} for product in recipe["products"] for case in product["test_case"]
+            {"bucket": case}
+            for product in recipe["products"]
+            if platform == "h100"
+            or product["products"][0]["scope"] != ["unit-tests-github-portable"]
+            for case in product["test_case"]
         ]
     assert restore["env"]["BUCKETS"] == "${{ inputs.buckets }}"
     assert workflow[True]["workflow_call"]["inputs"]["buckets"]["required"] is True
@@ -831,7 +843,7 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
     needs = SimpleNamespace(
         select=SimpleNamespace(result="success", outputs=SimpleNamespace(**outputs))
     )
-    inputs = SimpleNamespace(unit_testmon_mode="enforce")
+    inputs = SimpleNamespace(unit_testmon_mode="enforce", unit_testmon_target_branch="main")
     context = {"needs": needs, "inputs": inputs}
     assert eval(expression, {"__builtins__": {}}, context) == has_tests
     assert workflow["jobs"]["run"]["strategy"]["matrix"]["include"] == (
@@ -917,6 +929,8 @@ def test_grouped_cpu_selection(
         "testmon_plan.py",
         "testmon_mandatory.py",
         "find_test_cases.py",
+        "gb200_placement.py",
+        "gb200_placement_plugin.py",
     ):
         (unit_tests / script).symlink_to(ROOT / "tests/unit_tests" / script)
     (unit_tests / "testmon_mandatory_tests.yaml").write_text("mappings: []\n")
@@ -1057,3 +1071,113 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
             assert matches[0]["plan_artifact"] == upload["name"]
     assert any("/empty/" in upload["plan"]["bucket"] for upload in uploads)
     assert all(entry["plan_artifact"] == "" for entry in matrix if entry["mode"] == "full")
+
+
+@pytest.mark.parametrize("enabled", ["false", "true"])
+def test_portable_bucket_routing_happens_before_gpu_allocation(
+    tmp_path: Path, shell_environment: dict[str, str], enabled: str
+) -> None:
+    matrices = {}
+    recipes = {}
+    for platform, parser_job, output in (
+        ("h100", "cicd-parse-unit-tests", "unit-tests"),
+        ("gb200", "cicd-parse-unit-tests-gb200", "unit-tests-gb200"),
+    ):
+        parser = _step("cicd-main.yml", parser_job, "parse-unit-tests")
+        result, values = _run(
+            parser["run"], tmp_path, {**shell_environment, "UNIT_TEST_GB200_ENABLED": enabled}
+        )
+        assert result.returncode == 0, result.stderr
+        matrices[platform] = {entry["bucket"] for entry in json.loads(values[output])}
+        assert values["gb200-enabled"] == enabled
+        recipes[platform] = yaml.safe_load(
+            (ROOT / "tests/test_utils/recipes" / platform / "unit-tests.yaml").read_text()
+        )
+    full_h100 = {case for product in recipes["h100"]["products"] for case in product["test_case"]}
+    new_gb200 = {
+        case
+        for product in recipes["gb200"]["products"]
+        if product["products"][0]["scope"] == ["unit-tests-github-portable"]
+        for case in product["test_case"]
+    }
+    assert len(new_gb200) == 18
+    if enabled == "false":
+        assert matrices["h100"] == full_h100
+        assert not matrices["gb200"] & new_gb200
+    else:
+        assert len(full_h100 - matrices["h100"]) == 11
+        assert full_h100 - matrices["h100"] <= matrices["gb200"]
+        assert new_gb200 <= matrices["gb200"]
+    # Keep the original GB200-only GDN case and existing GTP job unchanged.
+    assert "tests/unit_tests/ssm/test_gated_delta_net.py" in matrices["gb200"]
+    assert "tests/unit_tests/generalized_tensor_parallel/**/*.py" in matrices["gb200"]
+
+
+@pytest.mark.parametrize(
+    ("h100_result", "gb200_required", "gb200_result", "expected"),
+    [
+        ("success", "true", "success", "true"),
+        ("success", "true", "failure", "false"),
+        ("success", "true", "skipped", "false"),
+        ("success", "false", "skipped", "true"),
+        ("failure", "true", "success", "false"),
+    ],
+)
+def test_functional_lanes_wait_for_both_required_unit_lanes(
+    tmp_path: Path, h100_result: str, gb200_required: str, gb200_result: str, expected: str
+) -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())
+    gate = workflow["jobs"]["cicd-integration-gate"]
+    assert {"cicd-unit-tests-latest", "cicd-unit-tests-latest-gb200"} <= set(gate["needs"])
+    result, outputs = _run(
+        _step("cicd-main.yml", "cicd-integration-gate", "gate")["run"],
+        tmp_path,
+        {
+            "WAIT_RESULT": "success",
+            "UNIT_RESULT": h100_result,
+            "UNIT_GB200_REQUIRED": gb200_required,
+            "UNIT_GB200_RESULT": gb200_result,
+            "IS_MERGE_GROUP": "false",
+            "IS_CI_WORKLOAD": "false",
+            "FORCE_RUN_ALL": "false",
+            "RUN_H100_FUNCTIONAL": "true",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert outputs["should_run"] == expected
+    assert outputs["should_run_gb200"] == expected
+
+
+def test_portable_gb200_recipes_preserve_four_gpu_allocations() -> None:
+    recipe = yaml.safe_load((ROOT / "tests/test_utils/recipes/gb200/unit-tests.yaml").read_text())
+    assert recipe["spec"]["gpus"] == 4
+    for product in recipe["products"]:
+        for variant in product["products"]:
+            assert variant.get("gpus", [4]) == [4]
+            if variant["scope"] == ["unit-tests-github-portable"]:
+                assert variant["environment"] == ["dev"]
+                assert variant["tag"] == ["latest"]
+    assert "export GPUS_PER_NODE=2" in recipe["spec"]["script"]
+
+
+def test_placement_flag_reaches_selection_runtime_and_baseline() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
+    assert (
+        workflow[True]["workflow_call"]["inputs"]["unit_test_gb200_enabled"]["default"] == "false"
+    )
+    assert _step("_unit-tests.yml", "select", "plan")["env"]["UNIT_TEST_GB200_ENABLED"] == (
+        "${{ inputs.unit_test_gb200_enabled }}"
+    )
+    assert workflow["jobs"]["run"]["steps"][-1]["with"]["unit_test_gb200_enabled"] == (
+        "${{ inputs.unit_test_gb200_enabled }}"
+    )
+    action = yaml.safe_load((ROOT / ".github/actions/action.yml").read_text())
+    placement_step = next(
+        step for step in action["runs"]["steps"] if step["name"] == "Configure unit-test placement"
+    )
+    assert '>> "$GITHUB_ENV"' in placement_step["run"]
+    producer = yaml.safe_load((ROOT / ".github/workflows/populate-build-cache.yml").read_text())
+    action_step = producer["jobs"]["populate-testmon-cache"]["steps"][-1]
+    assert action_step["with"]["unit_test_gb200_enabled"] == (
+        "${{ matrix.platform == 'dgx_gb200' && 'true' || 'false' }}"
+    )

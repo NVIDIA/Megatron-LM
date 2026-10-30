@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -32,6 +33,7 @@ def _bucket_files(
         file_has_marker,
         is_child_of_bucket,
     )
+    from gb200_placement import active_buckets
     from testmon_mandatory import load_mappings, mandatory_files, triggered_patterns
 
     recipe_path = Path(PLATFORMS[recipe_platform]["recipe"])
@@ -41,6 +43,10 @@ def _bucket_files(
     except yaml.YAMLError as error:
         raise ValueError(f"invalid mandatory-test configuration: {error}") from error
     all_buckets = [case for product in recipe["products"] for case in product["test_case"]]
+    if recipe_platform == "dgx_gb200":
+        all_buckets = active_buckets(
+            all_buckets, "gb200", os.environ.get("UNIT_TEST_GB200_ENABLED") == "true"
+        )
     bucket_files = set(expand_pattern(str(root / bucket)))
     ignored = {str(root / path) for path in PLATFORM_EXCLUSIONS.get(recipe_path.parent.name, ())}
     for test_case in all_buckets:

@@ -66,6 +66,10 @@ inputs:
     description: "Git ref to check out. Must match the SHA used by the upstream parse step so recipes don't diverge between scheduling and execution."
     required: false
     default: ""
+  unit_test_gb200_enabled:
+    description: "Enable portable dev/latest GB200 unit-test placement."
+    required: false
+    default: "false"
   unit_testmon_mode:
     description: "Unit-test mode: full, enforce, preselected (CPU plan), or baseline (main producer only)."
     required: false
@@ -93,6 +97,15 @@ runs:
       uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       with:
         ref: ${{ inputs.sha }}
+
+    - name: Configure unit-test placement
+      if: inputs.is_unit_test == 'true'
+      shell: bash -e -u -o pipefail {0}
+      env:
+        UNIT_TEST_GB200_ENABLED: ${{ inputs.unit_test_gb200_enabled }}
+      run: |
+        [[ "$UNIT_TEST_GB200_ENABLED" == "true" || "$UNIT_TEST_GB200_ENABLED" == "false" ]]
+        echo "UNIT_TEST_GB200_ENABLED=$UNIT_TEST_GB200_ENABLED" >> "$GITHUB_ENV"
 
     - name: Change ownership of /home/runner/
       shell: bash
@@ -317,6 +330,7 @@ runs:
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
         export NCCL_DEBUG=INFO
+        export UNIT_TEST_GB200_ENABLED="${{ inputs.unit_test_gb200_enabled }}"
         export PIP_DEFAULT_TIMEOUT=120
         export PIP_RETRIES=5
         export UV_HTTP_TIMEOUT=120

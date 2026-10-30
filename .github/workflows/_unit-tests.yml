@@ -22,6 +22,10 @@ on:
       sha:
         type: string
         required: true
+      unit_test_gb200_enabled:
+        description: Enable the portable dev/latest GB200 unit-test placement
+        type: string
+        default: "false"
       unit_testmon_mode:
         type: string
         default: full
@@ -102,6 +106,7 @@ jobs:
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           BUCKETS: ${{ inputs.buckets }}
+          UNIT_TEST_GB200_ENABLED: ${{ inputs.unit_test_gb200_enabled }}
           RECIPE_PLATFORM: ${{ inputs.platform }}
           SOURCE_SHA: ${{ inputs.sha }}
           TARGET_BRANCH: ${{ inputs.unit_testmon_target_branch }}
@@ -162,6 +167,7 @@ jobs:
           container-image: ${{ inputs.container-image }}
           platform: ${{ inputs.platform }}
           sha: ${{ inputs.sha }}
+          unit_test_gb200_enabled: ${{ inputs.unit_test_gb200_enabled }}
           unit_testmon_mode: ${{ matrix.mode || 'full' }}
           unit_testmon_target_branch: ${{ inputs.unit_testmon_target_branch }}
           unit_testmon_plan_artifact: ${{ matrix.plan_artifact }}
