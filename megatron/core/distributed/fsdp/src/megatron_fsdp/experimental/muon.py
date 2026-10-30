@@ -4,10 +4,9 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 import torch
-from torch.distributed.tensor import DTensor
 
 try:
     import emerging_optimizers  # pylint: disable=unused-import
@@ -68,7 +67,7 @@ class FsdpMuon(Muon):
 
     This optimizer refreshes its FSDP model weights itself, so it does not need
     ``fully_shard_optimizer``.
-    Momentum is initialized lazily as DTensors in the standard optimizer state.
+    Momentum is initialized lazily as local tensors in the standard optimizer state.
 
     Limitations:
         - Non-2D parameters are skipped. Use a separate optimizer for them and for
@@ -190,18 +189,17 @@ class FsdpMuon(Muon):
         )
         for i, group_index in tensor_to_optimizer_group_index.items():
             group: dict[str, Any] = self.param_groups[group_index]
-            param: DTensor = cast(DTensor, fsdp_group.fsdp_parameters[i].sharded)
-            assert isinstance(param.grad, DTensor)
+            param = fsdp_group.fsdp_parameters[i].sharded
             state: dict[str, Any] = self.state[param]
             if not state:
                 state["momentum_buffer"] = torch.zeros_like(param)
             local_input: torch.Tensor = momentum_inputs.get_tensor_view(i)
-            momentum: torch.Tensor = state["momentum_buffer"].to_local()
-            grad: torch.Tensor = param.grad.to_local().to(momentum.dtype).reshape(momentum.shape)
+            momentum: torch.Tensor = state["momentum_buffer"]
+            grad: torch.Tensor = param.grad.to(momentum.dtype).reshape(momentum.shape)
             # Match EO's decay before momentum without calling its private helper.
             weight_decay: float = group["weight_decay"]
             if weight_decay != 0:
-                weight: torch.Tensor = param.to_local()
+                weight: torch.Tensor = param
                 lr: float = group["lr"]
                 match self.weight_decay_method:
                     case "decoupled":
@@ -246,8 +244,7 @@ class FsdpMuon(Muon):
         """Apply owned result slices and received updates to local parameter shards."""
         buffer: DBuffer = fsdp_group.main_weight
         for i, group_index in tensor_to_optimizer_group_index.items():
-            param: DTensor = cast(DTensor, fsdp_group.fsdp_parameters[i].sharded)
-            weight: torch.Tensor = param.to_local()
+            weight = fsdp_group.fsdp_parameters[i].sharded
             if i in full_updates:
                 # Scatter writes only remote-owned shards; owners keep their full result.
                 offset: int = max(buffer.offset - buffer.layout.get_tensor_range(i).start, 0)

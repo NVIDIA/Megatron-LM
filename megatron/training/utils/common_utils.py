@@ -11,10 +11,14 @@ from datetime import datetime
 from typing import Optional
 
 import torch
+from torch.distributed.tensor import DTensor, Shard
 
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
 from megatron.core._slurm_utils import resolve_slurm_local_rank
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    get_containing_parameter_group,
+)
 from megatron.core.msc_utils import maybe_msc
 
 try:
@@ -105,23 +109,28 @@ def calc_params_l2_norm(
     args = get_args()
 
     if getattr(args, 'use_megatron_fsdp', False):
-        # All Megatron FSDP parameters are expected to be PyTorch DTensor.
-        # params_data is a dict of device_mesh -> list of local tensors.
-        params = []
+        params_by_sharding = defaultdict(list)
         for model_chunk in model:
             model_chunk.stop_communication()
             for name, param in model_chunk.named_parameters():
                 if trainable_only and not param.requires_grad:
                     continue
-                if not hasattr(param, "_local_tensor"):
-                    raise RuntimeError(
-                        f"Megatron FSDP requires parameters are PyTorch DTensor. "
-                        f"Parameter {name} is not a DTensor."
-                    )
-                params.append(param)
+                if isinstance(param, DTensor):
+                    mesh, placements = param.device_mesh, param.placements
+                    local_param = param.to_local()
+                else:
+                    group = get_containing_parameter_group(param)
+                    if group is None:
+                        raise RuntimeError(f'Parameter {name} has no MFSDP parameter layout.')
+                    mesh, placements = group.main_weight.mesh, group.main_weight.placements
+                    # DBuffer's packed shard placements are not hashable. Norm reduction
+                    # only needs to distinguish sharded from replicated mesh axes.
+                    placements = tuple(Shard(p.dim) if p.is_shard() else p for p in placements)
+                    local_param = param
+                params_by_sharding[(mesh, placements, local_param.dtype)].append(local_param)
 
-        return calc_dtensor_params_l2_norm(
-            params, return_squared_tensor=return_squared_tensor
+        return _calculate_sharded_params_l2_norm(
+            params_by_sharding, return_squared_tensor=return_squared_tensor
         )
 
     # 8 buckets: 4 categories × (non-sharded, sharded optimizer main_param).
@@ -305,15 +314,12 @@ def _calc_mimo_params_l2_norm(
     return total_norm_sq if return_squared_tensor else total_norm_sq.sqrt().item()
 
 
-def calc_dtensor_params_l2_norm(params, return_squared_tensor=False):
-    """Calculate l2 norm of DTensor parameters."""
-    params_data = defaultdict(list)
-    for param in params:
-        params_data[param._spec].append(param._local_tensor)
+def _calculate_sharded_params_l2_norm(params_by_sharding, return_squared_tensor=False):
+    """Calculate a norm from local parameters grouped by (mesh, placements, dtype)."""
 
     total_norm_2 = torch.zeros((1,), dtype=torch.float32, device='cuda')
     dummy_overflow_buf = torch.zeros((1,), dtype=torch.int, device='cuda')
-    for dtensor_spec, local_tensors in params_data.items():
+    for (mesh, placements, _dtype), local_tensors in params_by_sharding.items():
         local_tensors = [t for t in local_tensors if t.numel() > 0]
         if len(local_tensors) == 0:
             norm = torch.zeros((1,), dtype=torch.float32, device='cuda')
@@ -323,8 +329,8 @@ def calc_dtensor_params_l2_norm(params, return_squared_tensor=False):
             )
         norm_2 = norm * norm
         for pg, placement in zip(
-            dtensor_spec.device_mesh.get_all_groups(),
-            dtensor_spec.placements,
+            mesh.get_all_groups(),
+            placements,
         ):
             if placement.is_shard():
                 torch.distributed.all_reduce(

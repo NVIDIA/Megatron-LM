@@ -6,11 +6,14 @@ import os
 
 import pytest
 import torch
-from torch.distributed.tensor import Replicate, Shard
+from torch.distributed.tensor import DTensor, Replicate
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    get_containing_parameter_group,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
@@ -149,9 +152,13 @@ def test_hybrid_placements(model_parallel_cleanup, outer_strategy, inner_strateg
         ),
         pg_collection=process_group_collection,
     )
-    expected_outer = Replicate() if outer_strategy == "no_shard" else Shard(0)
+    expected_outer = Replicate() if outer_strategy == "no_shard" else RowAtomic()
     for parameter in model.parameters():
-        assert parameter.data.placements == (expected_outer, Shard(0))
+        assert not isinstance(parameter, DTensor)
+        assert get_containing_parameter_group(parameter).main_weight.placements == (
+            expected_outer,
+            RowAtomic(),
+        )
 
     hidden = torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
 
@@ -166,8 +173,9 @@ def test_hybrid_placements(model_parallel_cleanup, outer_strategy, inner_strateg
     graded = [p for p in model.parameters() if p.grad is not None]
     assert graded, "no gradients to inspect"
     for parameter in graded:
-        assert parameter.grad.device_mesh.mesh_dim_names == ("dp_outer", "dp_shard")
-        assert parameter.grad.placements == (expected_outer, Shard(0))
+        gradient_buffer = get_containing_parameter_group(parameter).pre_optimizer_main_grad
+        assert gradient_buffer.mesh.mesh_dim_names == ("dp_outer", "dp_shard")
+        assert gradient_buffer.placements == (expected_outer, RowAtomic())
 
 
 @pytest.mark.parametrize("microbatches", [1, 2])
@@ -293,8 +301,8 @@ def test_moe_with_independent_hybrid_placements(
         success, _, _ = optimizer.step()
         assert success
 
-    dense_outer = Replicate() if dense_outer_strategy == "no_shard" else Shard(0)
-    expert_outer = Replicate() if expert_outer_strategy == "no_shard" else Shard(0)
+    dense_outer = Replicate() if dense_outer_strategy == "no_shard" else RowAtomic()
+    expert_outer = Replicate() if expert_outer_strategy == "no_shard" else RowAtomic()
     seen_expert = set()
     for name, parameter in model.named_parameters():
         if parameter.grad is not None:
@@ -302,6 +310,7 @@ def test_moe_with_independent_hybrid_placements(
             is_expert = "experts" in name
             seen_expert.add(is_expert)
             outer = expert_outer if is_expert else dense_outer
-            assert parameter.grad.device_mesh.mesh_dim_names == ("dp_outer", "dp_shard")
-            assert parameter.grad.placements == (outer, Shard(0)), name
+            gradient_buffer = get_containing_parameter_group(parameter).pre_optimizer_main_grad
+            assert gradient_buffer.mesh.mesh_dim_names == ("dp_outer", "dp_shard")
+            assert gradient_buffer.placements == (outer, RowAtomic()), name
     assert seen_expert == {False, True}

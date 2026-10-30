@@ -1171,7 +1171,7 @@ def get_megatron_optimizer(
                         param_group['params'] = [
                             parameter
                             for parameter in param_group['params']
-                            if parameter.to_local().numel() > 0
+                            if parameter.numel() > 0
                         ]
                     param_groups = [
                         param_group for param_group in param_groups if param_group['params']
