@@ -648,38 +648,82 @@ class TEGroupedMLP(MegatronModule):
         # Leave CuTeDSL eligibility and layout checks to TE's fusion matcher.
         return True
 
+    @staticmethod
+    def _grouped_linear_param_names(
+        linear: torch.nn.Module, single_grouped_weight: bool, single_grouped_bias: bool
+    ) -> list[str]:
+        """Names of the source GroupedLinear parameters that a fused op exposes."""
+        names = (
+            ["weight"]
+            if single_grouped_weight
+            else [f"weight{idx}" for idx in range(linear.num_gemms)]
+        )
+        if linear.use_bias:
+            names += (
+                ["bias"]
+                if single_grouped_bias
+                else [f"bias{idx}" for idx in range(linear.num_gemms)]
+            )
+        return names
+
+    @staticmethod
+    def _register_grouped_linear_params(
+        op: torch.nn.Module,
+        linear: torch.nn.Module,
+        single_grouped_weight: bool,
+        single_grouped_bias: bool,
+    ) -> None:
+        """Give a fused op the weights exposed by its source GroupedLinear."""
+        if single_grouped_weight:
+            op.register_parameter("weight", linear.get_parameter("weight"))
+            for idx in range(linear.num_gemms):
+                op.register_parameter(f"weight{idx}", None)
+        else:
+            op.register_parameter("weight", None)
+            for idx in range(linear.num_gemms):
+                op.register_parameter(f"weight{idx}", getattr(linear, f"weight{idx}"))
+
+        if not linear.use_bias:
+            return
+
+        if single_grouped_bias:
+            op.register_parameter("bias", linear.get_parameter("bias"))
+            for idx in range(linear.num_gemms):
+                op.register_parameter(f"bias{idx}", None)
+        else:
+            op.register_parameter("bias", None)
+            for idx in range(linear.num_gemms):
+                op.register_parameter(f"bias{idx}", linear.get_parameter(f"bias{idx}"))
+
+    def _rebind_fused_ops_params(self) -> None:
+        """Point the fused ops at the source GroupedLinears' current parameter objects.
+
+        The fused ops register the source Parameter objects when they are built. FSDP
+        implementations that swap Parameter objects on unshard/reshard (e.g. MFSDP v2
+        installs sharded DTensors at rest and separate unsharded parameters for compute)
+        leave those registrations stale, so the fused kernels would read released sharded
+        storage. Re-register only when an object actually changed.
+        """
+        for op, linear, single_grouped_weight, single_grouped_bias in getattr(
+            self, "_fused_param_bindings", ()
+        ):
+            names = self._grouped_linear_param_names(
+                linear, single_grouped_weight, single_grouped_bias
+            )
+            if any(op._parameters.get(name) is not linear._parameters.get(name) for name in names):
+                self._register_grouped_linear_params(
+                    op, linear, single_grouped_weight, single_grouped_bias
+                )
+
     def _make_fused_ops(self) -> torch.nn.Module:
         """Construct fused module for FC1, activation, and FC2."""
 
         assert HAVE_TE, "_make_fused_ops requires Transformer Engine."
 
-        def register_grouped_linear_params(
-            op: torch.nn.Module,
-            linear: torch.nn.Module,
-            single_grouped_weight: bool,
-            single_grouped_bias: bool,
-        ) -> None:
-            """Give a fused op the weights exposed by its source GroupedLinear."""
-            if single_grouped_weight:
-                op.register_parameter("weight", linear.get_parameter("weight"))
-                for idx in range(linear.num_gemms):
-                    op.register_parameter(f"weight{idx}", None)
-            else:
-                op.register_parameter("weight", None)
-                for idx in range(linear.num_gemms):
-                    op.register_parameter(f"weight{idx}", getattr(linear, f"weight{idx}"))
-
-            if not linear.use_bias:
-                return
-
-            if single_grouped_bias:
-                op.register_parameter("bias", linear.get_parameter("bias"))
-                for idx in range(linear.num_gemms):
-                    op.register_parameter(f"bias{idx}", None)
-            else:
-                op.register_parameter("bias", None)
-                for idx in range(linear.num_gemms):
-                    op.register_parameter(f"bias{idx}", linear.get_parameter(f"bias{idx}"))
+        register_grouped_linear_params = self._register_grouped_linear_params
+        # (op, source linear, single_grouped_weight, single_grouped_bias) for rebinding.
+        # A tuple attribute, like _fused_ops, so the ops are not registered as submodules.
+        param_bindings = []
 
         # Container for fusible ops
         ops = te.pytorch.ops.Sequential()
@@ -726,6 +770,9 @@ class TEGroupedMLP(MegatronModule):
         # the op and replace the shared DDP parameter with a fresh one lacking main_grad.
         register_grouped_linear_params(
             op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
+        )
+        param_bindings.append(
+            (op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias)
         )
         # FP8 dispatch: the FC1 input arrives as an opaque MXFP8 carrier tensor (TE EP dispatch
         # packs E4M3 data + scales into a plain tensor's storage); tell TE to rebuild the
@@ -837,6 +884,9 @@ class TEGroupedMLP(MegatronModule):
         register_grouped_linear_params(
             op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
         )
+        param_bindings.append(
+            (op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias)
+        )
         op.wgrad_store = self.linear_fc2.wgrad_store
         # FP8 combine backward: the FC2 output grad arrives as an opaque MXFP8 carrier tensor
         # (TE EP combine backward, same packing as dispatch); tell TE to rebuild the grouped
@@ -846,6 +896,8 @@ class TEGroupedMLP(MegatronModule):
         if getattr(self.config, 'moe_combine_bwd_dtype', 'bf16') == 'mxfp8':
             op.ep_mxfp8_carrier_grad = True
         ops.append(op)
+
+        self._fused_param_bindings = tuple(param_bindings)
 
         # Emulate submodule pre-forward hooks
         ops.register_forward_pre_hook(self._make_fused_impl_pre_forward_hook())
@@ -865,15 +917,22 @@ class TEGroupedMLP(MegatronModule):
 
         def forward_pre_hook(module, *_) -> None:
             for submodule in chain(self.linear_fc1.modules(), self.linear_fc2.modules()):
-                for hook in submodule._forward_pre_hooks.values():
-                    # Assume that hook does not interact with input
-                    ret = hook(submodule, None)
+                for hook_id, hook in list(submodule._forward_pre_hooks.items()):
+                    # Assume that hook does not interact with input. Match PyTorch's
+                    # dispatch: hooks registered with with_kwargs=True (e.g. MFSDP v2's
+                    # combined-1F1B unshard hooks) take (module, args, kwargs).
+                    if hook_id in submodule._forward_pre_hooks_with_kwargs:
+                        ret = hook(submodule, (), {})
+                    else:
+                        ret = hook(submodule, ())
                     if ret is not None:
                         raise RuntimeError(
                             f"Applying a fused implementation for {self.__class__.__name__}, "
                             f"but a {submodule.__class__.__name__} submodule "
                             "has a pre-forward hook that modifies the input tensor."
                         )
+            # The hooks above may unshard and swap the source Parameter objects.
+            self._rebind_fused_ops_params()
             self._ensure_main_grad_for_fused_impl()
 
         return forward_pre_hook

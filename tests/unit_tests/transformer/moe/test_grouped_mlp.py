@@ -608,6 +608,109 @@ def test_make_fused_impl_pre_forward_hook_dispatches_submodule_hooks():
     assert visited == {"fc1", "fc2"}
 
 
+def test_make_fused_impl_pre_forward_hook_dispatches_kwargs_hooks():
+    # MFSDP v2's combined-1F1B unshard hooks are registered with with_kwargs=True and
+    # take (module, args, kwargs); replaying them with two arguments raised TypeError.
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.linear_fc1 = torch.nn.Linear(2, 2)
+    module.linear_fc2 = torch.nn.Linear(2, 2)
+
+    calls = []
+
+    def kwargs_hook(submodule, args, kwargs):
+        calls.append(("kwargs", submodule, args, kwargs))
+
+    def plain_hook(submodule, args):
+        calls.append(("plain", submodule, args))
+
+    module.linear_fc1.register_forward_pre_hook(kwargs_hook, prepend=True, with_kwargs=True)
+    module.linear_fc1.register_forward_pre_hook(plain_hook)
+    module.linear_fc2.register_forward_pre_hook(kwargs_hook, prepend=True, with_kwargs=True)
+
+    hook = module._make_fused_impl_pre_forward_hook()
+    hook(object())
+
+    assert calls == [
+        ("kwargs", module.linear_fc1, (), {}),
+        ("plain", module.linear_fc1, ()),
+        ("kwargs", module.linear_fc2, (), {}),
+    ]
+
+
+class _FakeGroupedLinear(torch.nn.Module):
+    """Minimal stand-in for TEGroupedLinear's parameter layout."""
+
+    def __init__(self, *, num_gemms, use_bias, single_grouped):
+        super().__init__()
+        self.num_gemms = num_gemms
+        self.use_bias = use_bias
+        self.fuse_wgrad_accumulation = False
+        if single_grouped:
+            self.weight = torch.nn.Parameter(torch.ones(num_gemms, 2, 2))
+            if use_bias:
+                self.bias = torch.nn.Parameter(torch.zeros(num_gemms, 2))
+        else:
+            for idx in range(num_gemms):
+                self.register_parameter(f"weight{idx}", torch.nn.Parameter(torch.ones(2, 2)))
+                if use_bias:
+                    self.register_parameter(f"bias{idx}", torch.nn.Parameter(torch.zeros(2)))
+
+
+def _module_with_fused_param_bindings():
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    # fc1: one weight per expert, no bias; fc2: single grouped weight and bias.
+    module.linear_fc1 = _FakeGroupedLinear(num_gemms=2, use_bias=False, single_grouped=False)
+    module.linear_fc2 = _FakeGroupedLinear(num_gemms=2, use_bias=True, single_grouped=True)
+    fc1_op, fc2_op = torch.nn.Module(), torch.nn.Module()
+    bindings = ((fc1_op, module.linear_fc1, False, False), (fc2_op, module.linear_fc2, True, True))
+    for binding in bindings:
+        TEGroupedMLP._register_grouped_linear_params(*binding)
+    module._fused_param_bindings = bindings
+    return module, fc1_op, fc2_op
+
+
+def test_make_fused_impl_pre_forward_hook_rebinds_params_swapped_by_hooks():
+    # MFSDP v2 unshard hooks replace the source Parameter objects; the fused ops must
+    # follow them instead of keeping the stale sharded parameters registered at build time.
+    module, fc1_op, fc2_op = _module_with_fused_param_bindings()
+    stale_fc1_weight0 = fc1_op.weight0
+
+    def unshard_hook(submodule, _args, _kwargs):
+        for name, param in list(submodule._parameters.items()):
+            submodule._parameters[name] = torch.nn.Parameter(param.detach().clone())
+
+    module.linear_fc1.register_forward_pre_hook(unshard_hook, prepend=True, with_kwargs=True)
+    module.linear_fc2.register_forward_pre_hook(unshard_hook, prepend=True, with_kwargs=True)
+
+    hook = module._make_fused_impl_pre_forward_hook()
+    hook(object())
+
+    assert fc1_op.weight0 is module.linear_fc1.weight0
+    assert fc1_op.weight1 is module.linear_fc1.weight1
+    assert fc1_op.weight0 is not stale_fc1_weight0
+    assert fc1_op.weight is None
+    assert fc2_op.weight is module.linear_fc2.weight
+    assert fc2_op.bias is module.linear_fc2.bias
+    assert fc2_op.weight0 is None and fc2_op.bias1 is None
+
+
+def test_rebind_fused_ops_params_skips_unchanged_params(monkeypatch):
+    module, fc1_op, _ = _module_with_fused_param_bindings()
+    registered = []
+    monkeypatch.setattr(
+        TEGroupedMLP,
+        "_register_grouped_linear_params",
+        staticmethod(lambda *args: registered.append(args)),
+    )
+
+    module._rebind_fused_ops_params()
+
+    assert registered == []
+    assert fc1_op.weight0 is module.linear_fc1.weight0
+
+
 def test_make_fused_impl_pre_forward_hook_rejects_input_modifying_hook():
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
