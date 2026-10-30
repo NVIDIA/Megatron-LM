@@ -858,6 +858,9 @@ def mtp_on_this_rank(
         warn_global_process_group_fallback("mtp_on_this_rank", "pp_group")
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         pp_size = None
+        if layout is None:
+            # Without a layout, MTP sits on the last pipeline stage, which needs the size.
+            pp_size = parallel_state.get_pipeline_model_parallel_world_size()
     else:
         pp_rank = get_pg_rank(pp_group)
         pp_size = get_pg_size(pp_group)
@@ -884,8 +887,6 @@ def mtp_on_this_rank(
     else:
         # without custom PP layout, we only support put all of MTP layers on the last pipeline stage
         if mtp_num_layers is not None:
-            if pp_size is None:
-                pp_size = parallel_state.get_pipeline_model_parallel_world_size()
             mtp_on_this_rank = pp_rank == pp_size - 1
             if mtp_on_this_rank and not ignore_virtual and vp_size not in (None, 1):
                 assert (
@@ -2397,8 +2398,9 @@ class MultiTokenPredictionBlock(MegatronModule):
         if pg_collection is None:
             warn_global_process_group_fallback(type(self).__name__)
             # hcp feeds TEDotProductAttention's a2a+p2p path in the MTP layers. tp_cp and tp_dp_cp
-            # are the FP8/FP4 amax reduction groups of the MTP layers.
-            required_pgs = ['cp', 'hcp', 'tp', 'pp', 'tp_cp', 'tp_dp_cp'] + (
+            # are the FP8/FP4 amax reduction groups of the MTP layers, and gtp_remat the GTP
+            # weight-remat group of their linear layers, which would otherwise warn again.
+            required_pgs = ['cp', 'hcp', 'tp', 'pp', 'tp_cp', 'tp_dp_cp', 'gtp_remat'] + (
                 ['dp'] if self.config.mtp_hsm else []
             )
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)

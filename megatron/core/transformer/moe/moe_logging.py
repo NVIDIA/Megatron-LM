@@ -279,26 +279,22 @@ class MoEMetricsTracker:
 
         Reduction order: PP collect → reduce_group sum → avg_group avg → DP avg.
         """
-        if pg_collection is None:
-            warn_global_process_group_fallback(
-                "MoEMetricsTracker.report", deprecated_in="0.21", removed_in="0.23"
-            )
-            pp_group = parallel_state.get_pipeline_model_parallel_group()
-            dp_group = None
-        else:
+        pp_group = dp_group = None
+        if pg_collection is not None:
             pp_group = pg_collection.pp
             dp_group = pg_collection.dp_cp_gtp_remat
-            if dp_group is None:
-                warn_global_process_group_fallback(
-                    "MoEMetricsTracker.report",
-                    "pg_collection.dp_cp_gtp_remat",
-                    deprecated_in="0.21",
-                    removed_in="0.23",
-                )
         # The metric DP-average must span gtp_remat peers (they hold distinct tokens), else the
         # displayed value is a 1/gtp_remat subsample and looks noisy. Use the gtp_remat-inclusive
         # group; CP ranks (already summed in reduce_group) average as a no-op.
         if dp_group is None:
+            warn_global_process_group_fallback(
+                "MoEMetricsTracker.report",
+                "pg_collection" if pg_collection is None else "pg_collection.dp_cp_gtp_remat",
+                deprecated_in="0.21",
+                removed_in="0.23",
+            )
+            if pg_collection is None:
+                pp_group = parallel_state.get_pipeline_model_parallel_group()
             dp_group = parallel_state.get_data_parallel_group(
                 with_context_parallel=False, partial_data_parallel=False
             )

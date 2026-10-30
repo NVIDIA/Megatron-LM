@@ -295,6 +295,24 @@ def test_resolve_without_global_grid_names_only_the_groups_that_are_none(
     assert UNINITIALIZED not in str(_fallback_warning(record, "TPOnly").message)
 
 
+def test_resolve_without_global_grid_does_not_name_the_gtp_remat_groups(
+    uninitialized_grid, monkeypatch
+):
+    # A None GTP weight-remat group means that the axis is off, not WORLD.
+    monkeypatch.setattr(parallel_state, "_GTP_WEIGHT_REMAT_GROUP", None)
+    monkeypatch.setattr(parallel_state, "_EXPERT_GTP_WEIGHT_REMAT_GROUP", None)
+    required = ("tp", "gtp_remat", "expt_gtp_remat")
+    with pytest.warns(ProcessGroupFallbackWarning) as record:
+        resolved = resolve_process_groups(None, owner="Owner", required=required)
+        resolved_gtp = resolve_process_groups(None, owner="GTPOnly", required=required[1:])
+    assert vars(resolved) == {"tp": None, "gtp_remat": None, "expt_gtp_remat": None}
+    message = str(_fallback_warning(record, "Owner").message)
+    assert f"{UNINITIALIZED}, so the tp groups it returns are None. {WORLD}" in message
+    # No other group is None, so the warning is the one for the global grid.
+    assert vars(resolved_gtp) == {"gtp_remat": None, "expt_gtp_remat": None}
+    assert UNINITIALIZED not in str(_fallback_warning(record, "GTPOnly").message)
+
+
 def test_resolve_without_global_grid_raises_where_the_accessor_needs_a_grid(uninitialized_grid):
     # get_data_parallel_group asserts without a grid, so no None dp group reaches torch.distributed.
     with pytest.raises(AssertionError, match="data parallel group is not initialized"):
