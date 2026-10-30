@@ -562,6 +562,7 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
                 ),
                 [model],
                 use_gloo_process_groups=False,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
             return model, optimizer
 

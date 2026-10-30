@@ -1368,7 +1368,7 @@ def _worker_gdp_inproj_optim_param_map(rank, world_size, port):
 
         # The production backfill must fill it via the per-shard rebuild. An expert-parallel param
         # would raise instead; in_proj is dense, so it must rebuild cleanly.
-        _backfill_gtp_sharded_param_map(id_map, [[in_proj_w]], model_sd)
+        _backfill_gtp_sharded_param_map(id_map, [[in_proj_w]], model_sd, pg_collection=pg)
         assert 0 in id_map, "backfill did not restore in_proj"
         entry = id_map[0]
         # A plain per-shard ShardedTensor keyed by the tagged name -- NOT the model's gathered+split

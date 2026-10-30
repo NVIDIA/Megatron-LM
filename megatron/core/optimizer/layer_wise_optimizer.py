@@ -695,7 +695,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 ):
                     wrapper = GraphedGradCopyFloat16Optimizer
                 optimizers[i] = wrapper(
-                    opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
+                    opt,
+                    config,
+                    None,
+                    init_state_fn_list[i] if init_state_fn_list else None,
+                    pg_collection=self.pg_collection,
                 )
 
         self.tp_group = self.pg_collection.tp
