@@ -822,6 +822,13 @@ class TransformerConfig(ModelParallelConfig):
     use_kitchen: bool = False
     """Use the kitchen extension for transformer quantization."""
 
+    use_liger: bool = False
+    """Use Liger RMSNorm in local GPT specs, including the final and MTP norms.
+
+    Requires `normalization="RMSNorm"` and `transformer_impl="local"` and cannot be
+    combined with `use_kitchen`. Does not change the cross-entropy implementation.
+    """
+
     use_kitchen_attention: bool = False
     """Use the kitchen extension for attention (instead of TE's attention)."""
 
@@ -1792,6 +1799,13 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        if self.use_liger and (
+            self.normalization != "RMSNorm" or self.transformer_impl != "local" or self.use_kitchen
+        ):
+            raise ValueError(
+                "use_liger requires normalization='RMSNorm', transformer_impl='local', "
+                "and use_kitchen=False."
+            )
         self._validate_cp_layouts()
 
         if self.attn_logit_softcapping is not None and not (

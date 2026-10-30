@@ -1,20 +1,23 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from megatron.core.models.gpt import GPTModel
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_decoder_block_spec,
-    get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
-    get_gpt_layer_with_inference_spec,
-    get_gpt_mtp_block_spec,
-    get_gpt_decoder_layer_specs,
-)
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
     get_transformer_layer_with_experimental_attention_variant_spec,
 )
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
+    get_gpt_decoder_layer_specs,
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_inference_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
+)
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
+)
+from megatron.core.transformer.heterogeneous.heterogeneous_config import (
+    HeterogeneousTransformerConfig,
 )
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training import get_args, print_rank_0
@@ -30,15 +33,25 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
         else:
             config = core_transformer_config_from_args(args)
     if args.spec is not None:
+        # Explicit custom specs own their normalization implementations.
         transformer_layer_spec = import_module(args.spec)
     else:
         use_te = args.transformer_impl == "transformer_engine"
+        if config.use_liger and (
+            args.experimental_attention_variant is not None
+            or args.heterogeneous_layers_config_path is not None
+            or isinstance(config, HeterogeneousTransformerConfig)
+        ):
+            raise ValueError(
+                "use_liger currently supports standard local GPT specs, not experimental "
+                "attention or heterogeneous specs."
+            )
 
         if args.experimental_attention_variant is not None:
             transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
                 config=config, vp_stage=vp_stage
             )
-        elif args.num_experts:
+        elif args.num_experts or config.use_liger:
             # Define the decoder block spec
             transformer_layer_spec = get_gpt_decoder_block_spec(
                 config,
@@ -151,4 +164,5 @@ def _get_transformer_layer_spec(use_te, config):
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            use_liger=config.use_liger,
         )
