@@ -1675,36 +1675,38 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
     def configure_fused_tp_inference(
         self,
         skip_qkv_norm_and_all_gather: bool = False,
-        fc2_next_layer_norm_weights: Optional[Tensor] = None,
+        fc2_next_layer_norm_linear: Optional[torch.nn.Module] = None,
     ):
         """
         Configure settings for fused TP communication in inference mode.
 
         Args:
             skip_qkv_norm (bool): Whether to skip norm and all-gather for linear_qkv.
-            fc2_next_layer_norm_weights (Optional[Tensor]): Next layer's QKV norm weights
-                for current layer's MLP FC2.
+            fc2_next_layer_norm_linear (Optional[torch.nn.Module]): Next layer's QKV linear,
+                whose input norm the current layer's MLP FC2 applies.
         """
         self.self_attention.linear_qkv.skip_norm_and_all_gather = skip_qkv_norm_and_all_gather
 
-        # Use current layer's own MLP FC1 norm weights for attention's/mixer's out_proj
-        mlp_fc1_weights = self.get_mlp_layer_norm_weights()
-        self._set_proj_next_layer_norm_weights(mlp_fc1_weights)
+        # Use current layer's own MLP FC1 norm for attention's/mixer's out_proj
+        mlp_fc1 = self.get_mlp_layer_norm_linear()
+        self._set_proj_next_layer_norm_linear(mlp_fc1)
 
         self.mlp.linear_fc1.skip_norm_and_all_gather = True
-        # Use next layer's attention norm weights for current layer's MLP FC2
-        self._set_fc2_next_layer_norm_weights(fc2_next_layer_norm_weights)
+        # Use next layer's attention norm for current layer's MLP FC2
+        self._set_fc2_next_layer_norm_linear(fc2_next_layer_norm_linear)
 
-    def _set_proj_next_layer_norm_weights(self, weights: Tensor):
-        """Set next layer norm weights for attention/mixer's linear_proj."""
-        self.self_attention.linear_proj._set_next_layer_norm_weights(weights)
+    def _set_proj_next_layer_norm_linear(self, linear: torch.nn.Module):
+        """Set the layer whose input norm attention/mixer's linear_proj applies."""
+        self.self_attention.linear_proj._set_next_layer_norm_linear(linear)
 
-    def _set_fc2_next_layer_norm_weights(self, weights: Optional[Tensor]):
-        """Set next layer norm weights for MLP FC2."""
-        if weights is None:
-            # Create dummy tensor for last layer (same shape as fc1 norm weights)
-            weights = torch.empty_like(self.get_mlp_layer_norm_weights())
-        self.mlp.linear_fc2._set_next_layer_norm_weights(weights)
+    def _set_fc2_next_layer_norm_linear(self, linear: Optional[torch.nn.Module]):
+        """Set the layer whose input norm MLP FC2 applies."""
+        if linear is None:
+            # The last layer has no next norm, but its FC2 still runs the fused kernel for the
+            # residual add, and nothing reads the normalized output. Any norm of the right
+            # size will do: use this layer's FC1 norm.
+            linear = self.get_mlp_layer_norm_linear()
+        self.mlp.linear_fc2._set_next_layer_norm_linear(linear)
 
     def _set_proj_residual(self, residual: Tensor):
         """Set residual for attention's/mixer's out_proj (linear_proj)."""
@@ -1714,23 +1716,25 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         """Set residual for MLP FC2."""
         self.mlp.linear_fc2._set_residual(residual)
 
-    def get_mlp_layer_norm_weights(self) -> Tensor:
+    def get_mlp_layer_norm_linear(self) -> torch.nn.Module:
         """
-        Get the MLP FC1 layer norm weights.
+        Get the MLP FC1, which applies the pre-MLP layer norm.
 
         Returns:
-            Tensor: The layer norm weight data.
+            torch.nn.Module: linear_fc1. Fused TP communication holds this layer, not its norm
+                weights, and reads them on every forward, since moving, casting or
+                materializing the model after it is built rebinds or replaces parameters.
         """
-        return self.mlp.linear_fc1.layer_norm_weight.data
+        return self.mlp.linear_fc1
 
-    def get_qkv_layer_norm_weights(self) -> Tensor:
+    def get_qkv_layer_norm_linear(self) -> torch.nn.Module:
         """
-        Get the QKV layer norm weights.
+        Get the attention's QKV linear, which applies the input layer norm.
 
         Returns:
-            Tensor: The layer norm weight data.
+            torch.nn.Module: linear_qkv (see get_mlp_layer_norm_linear).
         """
-        return self.self_attention.linear_qkv.layer_norm_weight.data
+        return self.self_attention.linear_qkv
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
