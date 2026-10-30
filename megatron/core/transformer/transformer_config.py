@@ -437,6 +437,16 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_k_norm_fp32: bool = False
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
+
+    dsa_indexer_rope_fp32: bool = False
+    """Whether DSA indexer query/key RoPE preprocessing stays in FP32 end-to-end, with no
+    intermediate BF16 round-trip between the key LayerNorm and RoPE."""
+
+    dsa_indexer_scoring_precision: Literal["bf16", "fp8"] = "bf16"
+    """Precision of the cuDNN DSA indexer scoring matmul. "fp8" quantizes query/key to E4M3 with
+    UE8M0 per-vector scales; requires the cuDNN backend and ``dsa_indexer_loss_coeff=0``. Enable
+    ``dsa_indexer_rope_fp32`` alongside it to keep the preprocessing in FP32 as well."""
+
     dsa_indexer_weights_proj_use_quantization: bool = True
     """Whether ``DSAIndexer`` weights projection follows the enclosing FP8/FP4
     quantization context. Disable this to keep the projection parameter outside FP8/FP4;
@@ -1964,6 +1974,17 @@ class TransformerConfig(ModelParallelConfig):
                 "weights tensor. KPool selection bypasses the cuDNN top-k path; use KPool or "
                 "dsa_kernel_backend='tilelang'/'none'."
             )
+        if self.dsa_indexer_scoring_precision == "fp8":
+            if self.dsa_kernel_backend != "cudnn":
+                raise ValueError(
+                    "dsa_indexer_scoring_precision='fp8' requires dsa_kernel_backend='cudnn', got "
+                    f"{self.dsa_kernel_backend!r}."
+                )
+            if (self.dsa_indexer_loss_coeff or 0.0) > 0.0:
+                raise ValueError(
+                    "dsa_indexer_scoring_precision='fp8' requires dsa_indexer_loss_coeff=0; the "
+                    "indexer-loss path does not apply FP8 scoring and would silently use BF16."
+                )
 
         if is_gated_delta_net_variant(self.experimental_attention_variant):
             if self.deterministic_mode and self.gdn_kernel_backend != "torch":
