@@ -153,7 +153,7 @@ def nemotron_language_config(
     )
     config.sequence_parallel = tp_size > 1
     config.tensor_parallel_num_sequence_shards = tp_size * gtp_remat_num_sequence_shards
-    config.position_embedding_type = "none"
+    config.position_embedding_type = args.position_embedding_type
     return config
 
 
@@ -272,12 +272,20 @@ def language_model_spec(
         params={
             "config": config,
             "mamba_stack_spec": stack_spec,
-            "vocab_size": model_vocab_size(cfg.model),
+            "vocab_size": model_vocab_size(
+                cfg.model.vocab_size,
+                should_pad_vocab=cfg.model.should_pad_vocab,
+                make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by,
+                tensor_model_parallel_size=cfg.model.transformer.tensor_model_parallel_size,
+            ),
             "max_sequence_length": args.seq_length,
             "pre_process": pp_rank == 0,
             "post_process": pp_rank == pp_size - 1,
             "hybrid_layer_pattern": cfg.model.hybrid_layer_pattern,
-            "position_embedding_type": "none",
+            "position_embedding_type": args.position_embedding_type,
+            "rotary_base": args.rotary_base,
+            "rotary_percent": args.rotary_percent,
+            "seq_len_interpolation_factor": args.rotary_seq_len_interpolation_factor,
             "share_embeddings_and_output_weights": False,
             "scatter_embedding_sequence_parallel": False,
             "logit_dtype": cfg.model.logit_dtype,

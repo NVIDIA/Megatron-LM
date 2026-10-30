@@ -27,6 +27,7 @@ from megatron.training.config import (
     InferenceConfigContainer,
     InferenceSetupConfig,
     LoggerConfig,
+    MultiModalTokenizerConfig,
     PretrainConfigContainer,
     ProfilingConfig,
     RerunStateMachineConfig,
@@ -38,7 +39,15 @@ from megatron.training.config import (
     TrainingConfig,
     ValidationConfig,
 )
-from megatron.training.models import GPTModelConfig, HybridModelConfig, LLaVAModelConfig, ModelConfig
+from megatron.training.models import (
+    BertModelConfig,
+    GPTModelConfig,
+    HybridModelConfig,
+    LLaVAModelConfig,
+    MimoBuildConfig,
+    ModelConfig,
+    T5ModelConfig,
+)
 
 # TODO: support arg renames
 
@@ -564,21 +573,21 @@ def _default_config_from_args(
 
 
 def resolve_tokenizer_vocab_size(
-    cfg: PretrainConfigContainer | InferenceConfigContainer, padded_vocab_size: int | None
-) -> None:
+    cfg: PretrainConfigContainer | InferenceConfigContainer) -> None:
     """Bind tokenizer-derived vocabulary after runtime tokenizer construction.
+        
+    Final padded_vocab_size value is resolved by tokenizer initialization,
+        and updated on cfg.tokenizer. including any CLI/checkpoint override.
+        None is valid only when the model does not require a tokenizer-derived size.
 
     Args:
         cfg: Previously constructed run configuration. Explicit model
             vocabulary is preserved; only unresolved model sizes are bound.
-        padded_vocab_size: Final size resolved by tokenizer initialization,
-            including any CLI/checkpoint override. None is valid only when the
-            model does not require a tokenizer-derived size.
 
     Raises:
         ValueError: A model's vocabulary remains unresolved.
     """
-    cfg.tokenizer.padded_vocab_size = padded_vocab_size
+    padded_vocab_size = cfg.tokenizer.padded_vocab_size
     if cfg.model is not None and hasattr(cfg.model, "vocab_size") and cfg.model.vocab_size is None:
         if padded_vocab_size is None:
             raise ValueError('Model vocabulary must be resolved before model construction')
@@ -631,7 +640,6 @@ def gpt_config_from_args(
     kwargs["make_vocab_size_divisible_by"] = args.make_vocab_size_divisible_by
     kwargs["rope_scaling"] = args.use_rope_scaling
     kwargs["rope_scaling_factor"] = args.rope_scaling_factor
-    kwargs["tp_comm_overlap_cfg"] = getattr(args, "tp_comm_overlap_cfg", None)
 
     kwargs["seq_len_interpolation_factor"] = args.rotary_seq_len_interpolation_factor
     kwargs["seq_length"] = args.max_position_embeddings
@@ -760,6 +768,13 @@ def hybrid_config_from_args(
     return model_config_cls(**kwargs)
 
 
+def tokenizer_config_from_args(args: Namespace) -> TokenizerConfig:
+    if hasattr(args, "image_tag_type"):
+        return _default_config_from_args(MultiModalTokenizerConfig, args)
+    else:
+        return _default_config_from_args(TokenizerConfig, args)
+
+
 def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
     """Normalize legacy CLI/YAML profiling inputs at the configuration boundary."""
     # Legacy args retain these fields temporarily during the training-loop refactor;
@@ -774,13 +789,20 @@ def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
 
 
 def model_config_from_args(
-    args: Namespace, *, model_config_cls: type[ModelConfig] | None = None
-) -> ModelConfig:
+    args: Namespace,
+    *,
+    model_config_cls: type[
+        ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoBuildConfig
+    ]
+    | None = None,
+) -> ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoBuildConfig:
     """Build a model-family config at the CLI boundary.
 
     BERT, T5, LLaVA, and MIMO applications select their config class explicitly.
     Decoder-only callers use the existing GPT/Hybrid adapters. Model construction
     remains independent: an explicit provider callback is retained by pretrain.
+    Add a dedicated <model>_config_from_args adapter for model-specific handling;
+    keep the shared field mapping below independent of individual model families.
     """
     if model_config_cls is None:
         model_config_cls = (
@@ -792,6 +814,39 @@ def model_config_from_args(
         return gpt_config_from_args(args, model_config_cls=model_config_cls)
     if issubclass(model_config_cls, HybridModelConfig):
         return hybrid_config_from_args(args, model_config_cls=model_config_cls)
+    if issubclass(model_config_cls, BertModelConfig):
+        return bert_config_from_args(args, model_config_cls=model_config_cls)
+    if issubclass(model_config_cls, LLaVAModelConfig):
+        return llava_config_from_args(args, model_config_cls=model_config_cls)
+    return model_config_cls(**_model_config_kwargs_from_args(args, model_config_cls))
+
+
+def bert_config_from_args(
+    args: Namespace, model_config_cls: type[BertModelConfig] = BertModelConfig
+) -> BertModelConfig:
+    """Resolve the BERT layer spec and shared model fields at the CLI boundary."""
+    from megatron.core.models.bert.bert_layer_specs import bert_layer_local_spec
+
+    kwargs = _model_config_kwargs_from_args(args, model_config_cls)
+    if args.spec is not None:
+        kwargs["transformer_layer_spec"] = (
+            bert_layer_local_spec if args.spec[0] == "local" else import_module(args.spec)
+        )
+    return model_config_cls(**kwargs)
+
+
+def llava_config_from_args(
+    args: Namespace, model_config_cls: type[LLaVAModelConfig] = LLaVAModelConfig
+) -> LLaVAModelConfig:
+    """Resolve shared model fields and legacy decoder overlap at the CLI boundary."""
+    kwargs = _model_config_kwargs_from_args(args, model_config_cls)
+    # Both legacy switches enable decoder overlap. Vision/projection disable it.
+    kwargs["transformer"].tp_comm_overlap |= getattr(args, "decoder_tp_comm_overlap", False)
+    return model_config_cls(**kwargs)
+
+
+def _model_config_kwargs_from_args(args: Namespace, model_config_cls: type) -> dict[str, Any]:
+    """Map common CLI fields without applying model-specific policies."""
     if args.yaml_cfg is not None:
         from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
@@ -805,11 +860,11 @@ def model_config_from_args(
     aliases = dict(
         transformer=transformer,
         seq_length=args.max_position_embeddings,
-        training_world_size=getattr(args, "mimo_llm_world_size", None),
         vocab_size=vocab_size,
         should_pad_vocab=False,
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
         rope_scaling=args.use_rope_scaling,
+        seq_len_interpolation_factor=args.rotary_seq_len_interpolation_factor,
         img_h=getattr(args, "img_h", getattr(args, "image_size", 224)),
         img_w=getattr(args, "img_w", getattr(args, "image_size", 224)),
         drop_vision_class_token=getattr(args, "disable_vision_class_token", False),
@@ -818,10 +873,7 @@ def model_config_from_args(
     )
     model_fields = {f.name for f in fields(model_config_cls) if f.init}
     kwargs.update({name: value for name, value in aliases.items() if name in model_fields})
-    if issubclass(model_config_cls, LLaVAModelConfig):
-        # Both legacy switches enable decoder overlap. Vision/projection disable it.
-        transformer.tp_comm_overlap |= getattr(args, "decoder_tp_comm_overlap", False)
-    return model_config_cls(**kwargs)
+    return kwargs
 
 
 def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> PretrainConfigContainer:
@@ -861,7 +913,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
         checkpoint=CheckpointConfig(**ckpt_kwargs),
         profiling=profiling_config_from_args(args),
-        tokenizer=_default_config_from_args(TokenizerConfig, args),
+        tokenizer=tokenizer_config_from_args(args),
         rl=_default_config_from_args(RLConfig, args),
 
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
@@ -926,7 +978,7 @@ def inference_cfg_container_from_args(
         inference=inference_cfg_from_args(args),
         dist=deepcopy(_default_config_from_args(DistributedInitConfig, args)),
         rng=_default_config_from_args(RNGConfig, args),
-        tokenizer=_default_config_from_args(TokenizerConfig, args),
+        tokenizer=tokenizer_config_from_args(args),
         logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
         profiling=profiling_config_from_args(args),
     )

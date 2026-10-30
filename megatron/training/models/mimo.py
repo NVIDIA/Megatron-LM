@@ -1,20 +1,26 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 
 from megatron.core.transformer import TransformerConfig
 from megatron.training.models.base import ModelConfig
 
+if TYPE_CHECKING:
+    from examples.mimo.training.topology import HeteroTopology
+
 
 @dataclass(kw_only=True)
-class MimoModelConfig(ModelConfig):
+class MimoBuildConfig(ModelConfig):
     """MIMO language-grid inputs for the shared training lifecycle.
 
     Tower construction and topology remain owned by the MIMO application.
     """
+
+    builder: ClassVar[str] = "examples.mimo.training.builder.MimoModelBuilder"
+    _topology: "HeteroTopology | None" = field(default=None, repr=False, compare=False)
 
     transformer: TransformerConfig
     """Language-grid architecture, precision, and parallelism."""
@@ -28,7 +34,7 @@ class MimoModelConfig(ModelConfig):
     """Vision patch size."""
     drop_vision_class_token: bool = False
     """Drop vision class tokens before projecting image embeddings."""
-    training_world_size: int | None = None
+    mimo_llm_world_size: int | None = None
     """Language-grid rank count, or None to use the full launch."""
     vocab_size: int | None = None
     """Language-model vocabulary, or None until tokenizer initialization."""

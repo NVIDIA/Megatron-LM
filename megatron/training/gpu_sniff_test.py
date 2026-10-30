@@ -384,7 +384,6 @@ def _get_ffn_gemm_shapes():
 
     cfg = get_run_config()
     args = get_args()
-    cfg = get_run_config()
     h = cfg.model.transformer.hidden_size
     ffn_h = cfg.model.transformer.ffn_hidden_size
     if h is None or ffn_h is None:

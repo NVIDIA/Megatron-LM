@@ -10,7 +10,6 @@ import torch
 
 import megatron
 from megatron.core import mpu, tensor_parallel
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.t5_dataset import (
     T5MaskedWordPieceDataset,
@@ -31,6 +30,7 @@ from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.vocab_utils import model_vocab_size
 from megatron.training.global_vars import (
     get_run_config,
+    get_tokenizer,
     set_run_config,
 )
 from pretrain_gpt import loss_func
@@ -124,7 +124,12 @@ def model_provider(
         encoder_config=encoder_config,
         transformer_encoder_layer_spec=en_block_spec,
         transformer_decoder_layer_spec=de_block_spec,
-        vocab_size=model_vocab_size(cfg.model),
+        vocab_size=model_vocab_size(
+            cfg.model.vocab_size,
+            should_pad_vocab=cfg.model.should_pad_vocab,
+            make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by,
+            tensor_model_parallel_size=cfg.model.transformer.tensor_model_parallel_size,
+        ),
         max_sequence_length=cfg.model.seq_length,
         pre_process=pre_process,
         post_process=post_process,
@@ -133,6 +138,7 @@ def model_provider(
         share_embeddings_and_output_weights=cfg.model.share_embeddings_and_output_weights,
         position_embedding_type=cfg.model.position_embedding_type,
         rotary_percent=cfg.model.rotary_percent,
+        seq_len_interpolation_factor=cfg.model.seq_len_interpolation_factor,
         relative_attention_num_buckets=cfg.model.relative_attention_num_buckets,
         relative_attention_max_distance=cfg.model.relative_attention_max_distance,
         add_encoder=add_encoder,
@@ -208,8 +214,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples: int):
     """
     cfg = get_run_config()
     args = get_args()
-
-    tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
 
     config = T5MaskedWordPieceDatasetConfig(
         random_seed=cfg.rng.seed,

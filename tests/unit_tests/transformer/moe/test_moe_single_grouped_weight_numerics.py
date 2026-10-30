@@ -27,6 +27,7 @@ from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    get_run_config,
     initialize_runtime_services,
     set_args,
     set_run_config,
@@ -143,7 +144,7 @@ class TestMoESingleGroupedWeightNumerics:
         return GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.vocab_size,
+            vocab_size=get_run_config().model.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -166,6 +167,7 @@ class TestMoESingleGroupedWeightNumerics:
         overlap_param_gather: bool = False,
         overlap_grad_reduce: bool = False,
         grad_reduce_in_fp32: bool = False,
+        model_overrides: dict | None = None,
     ):
         self._cleanup()
 
@@ -173,6 +175,8 @@ class TestMoESingleGroupedWeightNumerics:
         args = parse_args()
         args.num_layers = 1
         args.vocab_size = 1024
+        # This fixture supplies its exact embedding size without constructing a tokenizer.
+        args.pad_vocab_size = False
         args.hidden_size = 256
         args.ffn_hidden_size = 256
         args.num_attention_heads = 8
@@ -227,11 +231,18 @@ class TestMoESingleGroupedWeightNumerics:
         elif precision != "bf16":
             raise ValueError(f"Unknown precision test case: {precision}")
 
+        # Apply architecture changes before constructing/finalizing the run config.
+        for name, value in (model_overrides or {}).items():
+            if not hasattr(args, name):
+                raise ValueError(f"Unknown model argument: {name}")
+            setattr(args, name, value)
         validate_args(args)
         set_args(args)
         # Temporary args/config duplication during the training-loop refactor:
         # migrated settings use config; remaining settings still use legacy args.
-        set_run_config(pretrain_cfg_container_from_args(args))
+        cfg = pretrain_cfg_container_from_args(args)
+        cfg.finalize()
+        set_run_config(cfg)
         initialize_runtime_services(args, build_tokenizer=False, training=True)
         return args
 

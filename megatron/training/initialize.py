@@ -102,7 +102,7 @@ def initialize_megatron(
     cfg.finalize()
     # Inference's args-only entrypoints keep their existing input boundary. Training
     # supplies a typed model config, including callback-based applications.
-    model_config = cfg.model.transformer if isinstance(cfg, PretrainConfigContainer) else args
+    model_config = cfg.model.transformer if training else args
     transformer_config = getattr(cfg.model, "transformer", None)
     tp_comm_overlap = (
         transformer_config.tp_comm_overlap
@@ -200,7 +200,7 @@ def initialize_megatron(
         # Setup MoE aux loss scale value.
         num_experts = (
             cfg.model.transformer.num_moe_experts
-            if isinstance(cfg, PretrainConfigContainer) else args.num_experts
+            if training else args.num_experts
         )
         if num_experts is not None:
             from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
@@ -485,7 +485,8 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 gtp_remat_num_sequence_shards=model_config.gtp_remat_num_sequence_shards,
                 context_parallel_size=model_config.context_parallel_size,
                 hierarchical_context_parallel_sizes=model_config.hierarchical_context_parallel_sizes,
-                hybrid_context_parallel=model_config.hybrid_context_parallel,
+                dynamic_context_parallel=model_config.dynamic_context_parallel,
+                min_dynamic_context_parallel_size=model_config.min_dynamic_context_parallel_size,
                 expert_model_parallel_size=model_config.expert_model_parallel_size,
                 num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
                 expert_tensor_parallel_size=model_config.expert_tensor_parallel_size,

@@ -21,7 +21,6 @@ from examples.mimo.training.args import (
     build_module_grid_specs,
     validate_hetero_grid_args,
 )
-from examples.mimo.training.builder import MimoBuildConfig
 from examples.mimo.training.data import add_mock_data_args, build_train_valid_test_data_loaders
 from examples.mimo.training.distributed import initialize_distributed, shutdown_distributed
 from examples.mimo.training.encoder_prefetch import (
@@ -34,9 +33,13 @@ from examples.mimo.training.step import mimo_forward_step
 from examples.mimo.training.topology import create_topology
 from megatron.core.enums import ModelType
 from megatron.core.utils import unwrap_model
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.argument_utils import (
+    model_config_from_args,
+    pretrain_cfg_container_from_args,
+)
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import set_args, set_run_config
+from megatron.training.models import MimoBuildConfig
 from megatron.training.training import pretrain
 from megatron.training.vocab_utils import calculate_padded_vocab_size
 
@@ -91,7 +94,6 @@ def main() -> None:
     """Build the heterogeneous topology and run stock pretraining."""
     args = _parse_and_validate()
     set_args(args)
-    from megatron.training.argument_utils import model_config_from_args
 
     model_cfg = model_config_from_args(args, model_config_cls=MimoBuildConfig)
     cfg = pretrain_cfg_container_from_args(args, model_cfg)

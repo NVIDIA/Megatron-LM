@@ -25,7 +25,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.global_vars import get_run_config
-from megatron.training.models import MimoModelConfig
+from megatron.training.models import MimoBuildConfig
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = pytest.mark.usefixtures("run_config")
@@ -54,7 +54,7 @@ def _build_wrapper(
         bf16=params_dtype == torch.bfloat16,
         attention_backend=attention_backend,
     )
-    get_run_config().model = MimoModelConfig(
+    get_run_config().model = MimoBuildConfig(
         transformer=config,
         seq_length=PATCHES,
         img_h=IMG,

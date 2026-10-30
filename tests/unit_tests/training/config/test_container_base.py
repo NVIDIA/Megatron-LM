@@ -14,6 +14,7 @@ import yaml
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.training.config.container import ConfigContainerBase
 from megatron.training.config.instantiate_utils import InstantiationMode
+from megatron.training.config.utils import serialize_value
 from megatron.training.models import Serializable
 
 
@@ -353,12 +354,12 @@ class TestConfigContainer_ToDict:
 
 
 class TestConfigContainer_ConvertValueToDict:
-    """Test ConfigContainer._convert_value_to_dict method."""
+    """Test serialize_value method."""
 
     def test_convert_config_container(self):
         """Test converting ConfigContainer instance."""
         config = TestConfigContainer(name="convert_test", value=999)
-        result = TestConfigContainer._convert_value_to_dict(config)
+        result = serialize_value(config)
 
         expected = {
             "_target_": _target_qualname(TestConfigContainer),
@@ -372,7 +373,7 @@ class TestConfigContainer_ConvertValueToDict:
     def test_convert_regular_dataclass(self):
         """Test converting regular dataclass."""
         simple = SimpleDataclass(name="simple_test", value=555)
-        result = TestConfigContainer._convert_value_to_dict(simple)
+        result = serialize_value(simple)
 
         expected = {
             "_target_": _target_qualname(SimpleDataclass),
@@ -385,7 +386,7 @@ class TestConfigContainer_ConvertValueToDict:
     def test_convert_list(self):
         """Test converting list with nested dataclasses."""
         items = [SimpleDataclass(name="item1", value=1), "string_item", 42]
-        result = TestConfigContainer._convert_value_to_dict(items)
+        result = serialize_value(items)
 
         assert len(result) == 3
         assert result[0]["_target_"] == _target_qualname(SimpleDataclass)
@@ -396,7 +397,7 @@ class TestConfigContainer_ConvertValueToDict:
     def test_convert_tuple(self):
         """Test converting tuple."""
         items = (SimpleDataclass(name="tuple_item"), "string")
-        result = TestConfigContainer._convert_value_to_dict(items)
+        result = serialize_value(items)
 
         assert len(result) == 2
         assert result[0]["_target_"] == _target_qualname(SimpleDataclass)
@@ -409,7 +410,7 @@ class TestConfigContainer_ConvertValueToDict:
             "value": 123,
             "nested": {"inner": SimpleDataclass(name="inner_config")},
         }
-        result = TestConfigContainer._convert_value_to_dict(data)
+        result = serialize_value(data)
 
         assert result["config"]["_target_"] == _target_qualname(SimpleDataclass)
         assert result["value"] == 123
@@ -429,17 +430,17 @@ class TestConfigContainer_ConvertValueToDict:
         obj = MySerializable()
         assert isinstance(obj, Serializable)  # runtime_checkable sanity check
 
-        result = TestConfigContainer._convert_value_to_dict(obj)
+        result = serialize_value(obj)
 
         assert result == {"_target_": "my.module.MySerializable", "x": 42}
 
     def test_convert_primitive_types(self):
         """Test converting primitive types."""
-        assert TestConfigContainer._convert_value_to_dict(42) == 42
-        assert TestConfigContainer._convert_value_to_dict("string") == "string"
-        assert TestConfigContainer._convert_value_to_dict(True) is True
-        assert TestConfigContainer._convert_value_to_dict(None) is None
-        assert TestConfigContainer._convert_value_to_dict(3.14) == 3.14
+        assert serialize_value(42) == 42
+        assert serialize_value("string") == "string"
+        assert serialize_value(True) is True
+        assert serialize_value(None) is None
+        assert serialize_value(3.14) == 3.14
 
     def test_convert_excludes_private_fields_in_dataclass(self):
         """Test that private fields are excluded from dataclass conversion."""
@@ -450,7 +451,7 @@ class TestConfigContainer_ConvertValueToDict:
             _private_field: str = "private"
 
         obj = DataclassWithPrivate()
-        result = TestConfigContainer._convert_value_to_dict(obj)
+        result = serialize_value(obj)
 
         assert "public_field" in result
         assert "_private_field" not in result
@@ -710,7 +711,7 @@ class TestConfigContainer_CallablesAndPartials:
     def test_dataclass_with_callables_to_dict(self):
         """Test converting dataclass with callables to dict."""
         callable_data = CallableDataclass()
-        result = TestConfigContainer._convert_value_to_dict(callable_data)
+        result = serialize_value(callable_data)
 
         assert result["_target_"] == _target_qualname(CallableDataclass)
         assert result["name"] == "callable_test"
@@ -746,36 +747,31 @@ class TestConfigContainer_CallablesAndPartials:
         assert result["torch_activation"] is torch.nn.functional.gelu
 
     def test_partial_function_handling(self):
-        """Test that partial objects pass through _convert_value_to_dict unchanged."""
+        """Test that partial objects pass through serialize_value unchanged."""
         partial_func = functools.partial(loss_function, reduction="sum")
-        result = TestConfigContainer._convert_value_to_dict(partial_func)
+        result = serialize_value(partial_func)
 
         assert result is partial_func
 
     def test_various_callable_types(self):
-        """Test that all callable types pass through _convert_value_to_dict unchanged."""
+        """Test that all callable types pass through serialize_value unchanged."""
         # Plain function
-        assert (
-            TestConfigContainer._convert_value_to_dict(activation_function) is activation_function
-        )
+        assert serialize_value(activation_function) is activation_function
 
         # Partial — not a dataclass/list/dict so falls through as-is
         partial_func = functools.partial(loss_function, reduction="mean")
-        assert TestConfigContainer._convert_value_to_dict(partial_func) is partial_func
+        assert serialize_value(partial_func) is partial_func
 
         # Torch built-in function
-        assert (
-            TestConfigContainer._convert_value_to_dict(torch.nn.functional.relu)
-            is torch.nn.functional.relu
-        )
+        assert serialize_value(torch.nn.functional.relu) is torch.nn.functional.relu
 
         # Lambda
         fn = lambda x: x * 2
-        assert TestConfigContainer._convert_value_to_dict(fn) is fn
+        assert serialize_value(fn) is fn
 
         # Callable nn.Module instance — not a dataclass, falls through as-is
         relu_instance = torch.nn.ReLU()
-        assert TestConfigContainer._convert_value_to_dict(relu_instance) is relu_instance
+        assert serialize_value(relu_instance) is relu_instance
 
     def test_config_with_callables_roundtrip_behavior(self):
         """Test that to_dict/from_dict roundtrip preserves all fields for callable configs."""

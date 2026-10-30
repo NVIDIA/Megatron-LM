@@ -9,11 +9,15 @@ import sys
 from functools import partial
 from typing import Any, Dict, Iterator
 
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.argument_utils import (
+    model_config_from_args,
+    pretrain_cfg_container_from_args,
+)
 from megatron.training.arguments import parse_and_validate_args
 import torch
 from megatron.training import get_args, pretrain, print_rank_0
 from megatron.training.global_vars import set_run_config
+from megatron.training.models import MimoBuildConfig
 
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
@@ -302,10 +306,8 @@ if __name__ == "__main__":
     
     train_valid_test_datasets_provider.is_distributed = True
     args = parse_and_validate_args(args_defaults={}, extra_args_provider=add_mimo_args)
-    from megatron.training.argument_utils import model_config_from_args
-    from megatron.training.models import MimoModelConfig
 
-    model_cfg = model_config_from_args(args, model_config_cls=MimoModelConfig)
+    model_cfg = model_config_from_args(args, model_config_cls=MimoBuildConfig)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
     pretrain(

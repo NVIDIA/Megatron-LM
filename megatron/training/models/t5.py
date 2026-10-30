@@ -1,14 +1,13 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from megatron.core.transformer import TransformerConfig
-from megatron.training.models.base import ModelConfig
 
 
 @dataclass(kw_only=True)
-class T5ModelConfig(ModelConfig):
+class T5ModelConfig:
     """T5 encoder-decoder inputs for the application's model provider."""
 
     transformer: TransformerConfig
@@ -25,12 +24,14 @@ class T5ModelConfig(ModelConfig):
     """Vocabulary alignment factor, multiplied by tensor-parallel size."""
     fp16_lm_cross_entropy: bool = False
     """Compute language-model cross entropy in half precision."""
-    share_embeddings_and_output_weights: bool = True
+    share_embeddings_and_output_weights: bool = False
     """Tie input embedding and output projection weights."""
-    position_embedding_type: str = "learned_absolute"
+    position_embedding_type: Literal["learned_absolute", "rope", "relative"] = "learned_absolute"
     """Position embedding implementation."""
     rotary_percent: float = 1.0
     """Fraction of the head dimension using rotary embeddings."""
+    seq_len_interpolation_factor: float | None = None
+    """Scale for linearly interpolating rotary position indices."""
     relative_attention_num_buckets: int = 32
     """Number of relative-position attention buckets."""
     relative_attention_max_distance: int = 128

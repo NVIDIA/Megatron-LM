@@ -2,26 +2,45 @@
 
 import math
 from functools import lru_cache
-from typing import TYPE_CHECKING
 
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer, vocab_size_with_padding
+from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.utils import print_rank_0
 
-if TYPE_CHECKING:
-    from megatron.training.models.base import ModelConfig
 
+def model_vocab_size(
+    vocab_size: int | None,
+    *,
+    should_pad_vocab: bool,
+    make_vocab_size_divisible_by: int,
+    tensor_model_parallel_size: int,
+) -> int:
+    """Return the vocabulary dimension used by embeddings and output projections.
 
-def model_vocab_size(model_config: "ModelConfig", *, logging_enabled: bool = False) -> int:
-    """Return the vocabulary dimension used to construct the configured model."""
-    if model_config.vocab_size is None:
+    The supplied ``vocab_size`` may be raw or already padded. If
+    ``should_pad_vocab`` is True, round up to a multiple of
+    ``make_vocab_size_divisible_by * tensor_model_parallel_size``; otherwise
+    return it unchanged. For example, size 261 with alignment 128 and TP=2
+    gives 512 with padding enabled, or 261 with padding disabled.
+
+    Tokenizer-resolved padded sizes must be passed with ``should_pad_vocab=False``
+    so they are not padded again. This calculation does not build a tokenizer
+    or update configuration fields.
+
+    Raises:
+        ValueError: If ``vocab_size`` is still None. Tokenizer-derived vocabulary
+            must be resolved before model construction or warmup.
+    """
+    if vocab_size is None:
         raise ValueError("Model vocabulary must be resolved before model construction or warmup.")
-    if model_config.should_pad_vocab:
+    if should_pad_vocab:
         return calculate_padded_vocab_size(
-            model_config.vocab_size,
-            model_config.make_vocab_size_divisible_by,
-            model_config.transformer.tensor_model_parallel_size,
-            logging_enabled=logging_enabled,
+            vocab_size,
+            make_vocab_size_divisible_by,
+            tensor_model_parallel_size,
+            logging_enabled=False,
         )
-    return model_config.vocab_size
+    return vocab_size
 
 
 def calculate_padded_vocab_size(
@@ -75,3 +94,20 @@ def _calculate_padded_vocab_size_cached(
 
     multiple = make_vocab_size_divisible_by * tensor_model_parallel_size
     return int(math.ceil(vocab_size / multiple) * multiple)
+
+
+def build_tokenizer_and_pad_vocab_size(config: TokenizerConfig, make_vocab_size_divisible_by: int | None = None, tensor_model_parallel_size: int = 1):
+    tokenizer = build_tokenizer(config)
+    
+    if config.pad_vocab_size:
+        if config.padded_vocab_size is None:
+            assert isinstance(make_vocab_size_divisible_by, int), "must provide value for 'make_vocab_size_divisible_by' if 'pad_vocab_size' is set."
+            config.padded_vocab_size = vocab_size_with_padding(
+                tokenizer.vocab_size,
+                make_vocab_size_divisible_by,
+                tensor_model_parallel_size,
+            )
+        else:
+            print_rank_0("padded_vocab_size already configured on TokenizerConfig. Skipping divisibility padding calculation and update.")
+
+    return tokenizer

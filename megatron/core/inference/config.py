@@ -62,8 +62,8 @@ class MambaInferenceStateConfig:
     slice start."""
 
     gdp_num_householder: int = 0
-    """Number of Householder copies of the Gated Delta Product layers, or 0 if the
-    model has none. Sizes the GDP chunk descriptors used by the forked prefill
+    """Number of Householder copies of the Gated Delta Product layers, 1 for GDN,
+    or 0 for other mixers. Sizes the chunk descriptors used by the forked prefill
     kernels, whose Householder-expanded token stream is this many times longer."""
 
     def __post_init__(self):
@@ -809,7 +809,13 @@ class InferenceConfig:
     ``AsyncScheduleMode.LEGACY`` to disable it."""
 
     logprobs_mode: Literal['raw_logprobs', 'processed_logprobs'] = 'raw_logprobs'
-    """Whether returned log-probs are modified by the sampling parameters or not."""
+    """Whether log-probs of engine-sampled tokens are modified by the sampling parameters.
+
+    `'processed_logprobs'` applies each request's temperature, top-k, and top-p to the
+    log-probs of tokens the engine sampled, including the top-N log-probs at those
+    positions. Prompt log-probs and prompt top-N log-probs score tokens the engine did
+    not sample, so they always use the raw distribution in both modes.
+    """
 
     request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None
     """
@@ -821,16 +827,6 @@ class InferenceConfig:
     """Whether to use synchronous ZMQ collectives for inference. If True, the
     all_reduce_max operation will be performed synchronously, which can help reduce
     performance variability for MoEs.
-    """
-
-    disable_ep_consensus: bool = False
-    """If True, the engine skips the EP-group consensus all-reduce in
-    `run_engine_with_coordinator` and decides whether to step based on local
-    state alone. The rank still calls `controller.dummy_forward()` whenever
-    `local_pending == 0`, so EP collectives (NCCL all-to-all, etc.) stay in
-    sync — without this, a peer running a real forward would deadlock waiting
-    on this rank's all-to-all participation. Trades off the consensus
-    all-reduce CPU cost for unconditional dummy_forwards on idle ranks.
     """
 
     ep_consensus_interval: int = 20

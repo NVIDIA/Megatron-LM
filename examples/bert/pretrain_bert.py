@@ -17,16 +17,15 @@ from megatron.training import pretrain
 from megatron.training.utils import average_losses_across_data_parallel_group
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
-from megatron.training.vocab_utils import model_vocab_size
 from megatron.training.argument_utils import model_config_from_args
 from megatron.training.models import BertModelConfig
+from megatron.training.vocab_utils import model_vocab_size
 from megatron.training.global_vars import (
     get_run_config,
+    get_tokenizer,
     set_run_config,
 )
-from megatron.core.transformer.spec_utils import import_module
-from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec, bert_layer_local_spec
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.bert_dataset import BERTMaskedWordPieceDataset, BERTMaskedWordPieceDatasetConfig
 from megatron.core.datasets.utils import get_blend_from_list
@@ -38,24 +37,24 @@ def model_provider(pre_process=True, post_process=True, vp_stage=None, config=No
 
     print_rank_0('building BERT model ...')
 
-    args = get_args()
     cfg = get_run_config()
     if config is None:
         config = cfg.model.transformer
     num_tokentypes = 2 if cfg.model.bert_binary_head else 0
 
-    if args.spec is None:
-        transformer_layer_spec = bert_layer_with_transformer_engine_spec #default spec
-    elif args.spec[0] == 'local':
-        print_rank_0('Using Local spec for transformer layers')
-        transformer_layer_spec = bert_layer_local_spec
-    else :
-        transformer_layer_spec = import_module(args.spec)
+    transformer_layer_spec = cfg.model.transformer_layer_spec
+    if transformer_layer_spec is None:
+        transformer_layer_spec = bert_layer_with_transformer_engine_spec
 
     model = BertModel(
         config=config,
         transformer_layer_spec=transformer_layer_spec,
-        vocab_size=model_vocab_size(cfg.model),
+        vocab_size=model_vocab_size(
+            cfg.model.vocab_size,
+            should_pad_vocab=cfg.model.should_pad_vocab,
+            make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by,
+            tensor_model_parallel_size=cfg.model.transformer.tensor_model_parallel_size,
+        ),
         max_sequence_length=cfg.model.seq_length,
         num_tokentypes=num_tokentypes,
         add_binary_head=cfg.model.bert_binary_head,
@@ -144,8 +143,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     """Build train, valid, and test datasets."""
     cfg = get_run_config()
     args = get_args()
-
-    tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
 
     config = BERTMaskedWordPieceDatasetConfig(
         random_seed=cfg.rng.seed,

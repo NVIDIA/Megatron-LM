@@ -70,9 +70,10 @@ def inline_profiler(monkeypatch, run_config):
     monkeypatch.setattr(training, "get_attr_wrapped_model", Mock(return_value=Mock()))
     monkeypatch.setattr(training, "get_rerun_state_machine", Mock(return_value=Mock()))
     monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
+    monkeypatch.setattr(training, "get_current_global_batch_size", lambda: 1)
     monkeypatch.setattr(training, "get_forward_backward_func", Mock())
     monkeypatch.setattr(training, "one_logger_utils", Mock())
-    monkeypatch.setattr(training, "should_disable_forward_pre_hook", lambda _: False)
+    monkeypatch.setattr(training, "should_disable_forward_pre_hook", lambda *_: False)
     monkeypatch.setattr(training, "_otel_managed_span", lambda *a, **kw: nullcontext())
     for name in (
         "write_args_to_tensorboard",
@@ -103,11 +104,10 @@ def inline_profiler(monkeypatch, run_config):
                 optimizer=None,
                 opt_param_scheduler=None,
                 train_data_iterator=None,
-                valid_data_iterator=None,
-                process_non_loss_data_func=None,
                 config=SimpleNamespace(finalize_model_grads_func=Mock()),
                 checkpointing_context={},
-                non_loss_data_func=None,
+                next_train_iterator=lambda iteration, current: current,
+                run_eval=Mock(),
             )
 
     return start
@@ -229,7 +229,7 @@ def test_inference_factory_keeps_automatic_model_construction(monkeypatch, expli
     args, _ = cli_config()
     model = object()
     build = Mock(return_value=model)
-    monkeypatch.setattr(argument_utils, "gpt_config_from_args", build)
+    monkeypatch.setattr(argument_utils, "model_config_from_args", build)
     kwargs = {"model_cfg": None} if explicit_none else {}
     config = argument_utils.inference_cfg_container_from_args(args, **kwargs)
     assert config.model is model

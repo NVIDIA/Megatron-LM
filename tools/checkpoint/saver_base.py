@@ -383,6 +383,7 @@ class MegatronCheckpointSaverBase:
         try:
             from megatron.core import mpu
             from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
+            from megatron.training import get_run_config
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
@@ -401,7 +402,7 @@ class MegatronCheckpointSaverBase:
             if true_vocab_size is not None:
                 # figure out what our padded vocab size is
                 orig_vocab_size = orig_word_embed.shape[0]
-                self.margs.padded_vocab_size = vocab_size_with_padding(true_vocab_size, self.margs)
+                self.margs.padded_vocab_size = vocab_size_with_padding(true_vocab_size, self.margs.make_vocab_size_divisible_by, self.margs.tensor_model_parallel_size)
 
                 # Cut out extra padding we don't need
                 if orig_vocab_size > self.margs.padded_vocab_size:
@@ -426,6 +427,12 @@ class MegatronCheckpointSaverBase:
             return full_word_embed
 
         full_word_embed = pad_weight(orig_word_embed, self.md.true_vocab_size)
+
+        # Target TP padding can differ from the source checkpoint captured at startup.
+        cfg = get_run_config()
+        cfg.tokenizer.padded_vocab_size = self.margs.padded_vocab_size
+        cfg.model.vocab_size = self.margs.padded_vocab_size
+        cfg.model.should_pad_vocab = False
 
         # Split into new tensor model parallel sizes
         out_word_embed = torch.chunk(full_word_embed, self.args.target_tensor_parallel_size, dim=0)

@@ -4,8 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable, ClassVar, Optional
+from typing import Any, Callable
 
 import torch
 
@@ -23,24 +22,11 @@ from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 from megatron.training.global_vars import get_args
 from megatron.training.models.base import ModelBuilder, compose_hooks
-from megatron.training.models.mimo import MimoModelConfig as MimoTrainingConfig
+from megatron.training.models.mimo import MimoBuildConfig
 
 _LANGUAGE_SEED_OFFSET = 0
 # Add per-encoder offsets before wiring more than one encoder grid.
 _ENCODER_SEED_OFFSET = 10_000
-
-
-@dataclass(kw_only=True)
-class MimoBuildConfig(MimoTrainingConfig):
-    """Shared model inputs and runtime topology used by :class:`MimoModelBuilder`.
-
-    ``_topology`` is underscore-prefixed so ``ModelConfig`` skips it during serialization;
-    shared model inputs remain serializable. Per-tower provider overrides and topology
-    remain application-specific; ``transformer`` describes the shared training inputs.
-    """
-
-    builder: ClassVar[str] = "examples.mimo.training.builder.MimoModelBuilder"
-    _topology: Optional[HeteroTopology] = field(default=None)
 
 
 def _resolve_role(topology: HeteroTopology):

@@ -71,10 +71,10 @@ def _topology(*, language_rank, encoder_rank=None, cp_rank=0, cp_size=1, gtp_ran
 @pytest.fixture
 def adapter(monkeypatch, run_config):
     from examples.mimo.training import data
-    from megatron.training.models import MimoModelConfig
+    from megatron.training.models import MimoBuildConfig
 
     run_config.rng.seed = 123
-    run_config.model = MimoModelConfig(
+    run_config.model = MimoBuildConfig(
         transformer=run_config.model.transformer,
         seq_length=8,
         img_h=4,

@@ -1,9 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 import copy
+import logging
 import os
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
-from dataclasses import is_dataclass, replace
+from dataclasses import replace
 from typing import Any, Type, TypeVar
 
 try:
@@ -16,6 +17,10 @@ except ImportError:
 from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.msc_utils import maybe_msc
+from megatron.core.num_microbatches_calculator import (
+    get_current_global_batch_size,
+    update_num_microbatches,
+)
 from megatron.core.optimizer import OptimizerConfig
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
 from megatron.training.config.inference_config import InferenceSetupConfig
@@ -33,12 +38,18 @@ from megatron.training.config.training_config import (
     TrainingConfig,
     ValidationConfig,
 )
-from megatron.training.config.utils import sanitize_dataclass_config
+from megatron.training.config.utils import sanitize_dataclass_config, serialize_dataclass
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.models import Serializable
+from megatron.training.models import (
+    BertModelConfig,
+    LLaVAModelConfig,
+    MimoBuildConfig,
+    T5ModelConfig,
+)
 from megatron.training.models.base import ModelConfig
 
 T = TypeVar("T", bound="ConfigContainerBase")
+logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True)
 class ConfigContainerBase:
@@ -49,48 +60,6 @@ class ConfigContainerBase:
     """
 
     _finalized: bool = field(default=False, init=False, repr=False, compare=False)
-
-    def get_model_world_size(self) -> int:
-        """Return ranks in the model grid, which may be a subset of the launch."""
-        launch_world_size = safe_get_world_size()
-        world_size = getattr(self.model, "training_world_size", None)
-        if world_size is None:
-            world_size = launch_world_size
-        if not 0 < world_size <= launch_world_size:
-            raise ValueError("Training model world size must fit within the global launch")
-        return world_size
-
-    def get_data_parallel_size(self) -> int:
-        """Return replica DP, excluding batch partitions within GTP weight groups."""
-        world_size = self.get_model_world_size()
-        transformer = self.model.transformer
-        tp = transformer.tensor_model_parallel_size
-        pp = transformer.pipeline_model_parallel_size
-        cp = transformer.context_parallel_size
-        weight_size = transformer.gtp_weight_remat_size
-        if min(tp, pp, cp, weight_size) < 1:
-            raise ValueError("Parallel sizes must be positive")
-        sequence_shards = transformer.gtp_remat_num_sequence_shards
-        if cp % sequence_shards:
-            raise ValueError("Runtime context-parallel size must contain the GTP sequence shards")
-        # Runtime CP already includes sequence shards inside each GTP weight group.
-        model_parallel_size = tp * pp * (cp // sequence_shards) * weight_size
-        if world_size % model_parallel_size:
-            raise ValueError(
-                f"world_size ({world_size}) must be divisible by TP x PP x "
-                f"CP x weight-remat size ({model_parallel_size})"
-            )
-        return world_size // model_parallel_size
-
-    def get_batch_parallel_size(self) -> int:
-        """Return independent batch partitions, including GTP batch shards but not CP."""
-        data_parallel_size = self.get_data_parallel_size()
-        transformer = self.model.transformer
-        return (
-            data_parallel_size
-            * transformer.gtp_weight_remat_size
-            // transformer.gtp_remat_num_sequence_shards
-        )
 
     def validate(self) -> None:
         """Check sub-configs without mutation; callers may validate repeatedly."""
@@ -207,67 +176,7 @@ class ConfigContainerBase:
         Returns:
             Dictionary representation of this config
         """
-        result = {}
-        result["_target_"] = f"{self.__class__.__module__}.{self.__class__.__qualname__}"
-
-        for f in dataclass_fields(self):
-            if f.name.startswith("_"):
-                continue
-
-            value = getattr(self, f.name)
-            result[f.name] = self._convert_value_to_dict(value)
-
-        return result
-
-    @classmethod
-    def _convert_value_to_dict(cls, value: Any) -> Any:
-        """
-        Recursively convert a value to a dictionary representation.
-
-        Handles:
-        - ConfigContainer instances (using to_dict)
-        - Serializable instances (using as_dict)
-        - Classes which implement a to_cfg_dict method
-        - Regular dataclasses (converting each non-private field)
-        - Lists and tuples (converting each element)
-        - Dictionaries (converting each value)
-        - Other types (kept as-is)
-
-        Args:
-            value: The value to convert
-
-        Returns:
-            The converted value
-        """
-        if isinstance(value, ConfigContainerBase):
-            return value.to_dict()
-        elif isinstance(value, Serializable):
-            return value.as_dict()
-        elif hasattr(value, "to_cfg_dict"):
-            # Allow non-Container classes to implement own custom method
-            return value.to_cfg_dict()
-        elif is_dataclass(value) and not isinstance(value, type):
-            # Handle regular dataclasses
-            result = {}
-
-            # Add _target_ field for instantiation
-            result["_target_"] = f"{value.__class__.__module__}.{value.__class__.__qualname__}"
-
-            # Convert each field, handling nested dataclasses properly
-            for field in dataclass_fields(value):
-                if field.name.startswith("_"):
-                    continue
-
-                field_value = getattr(value, field.name)
-                result[field.name] = cls._convert_value_to_dict(field_value)
-
-            return result
-        elif isinstance(value, (list, tuple)):
-            return [cls._convert_value_to_dict(item) for item in value]
-        elif isinstance(value, dict):
-            return {k: cls._convert_value_to_dict(v) for k, v in value.items()}
-        else:
-            return value
+        return serialize_dataclass(self)
 
     def to_yaml(self, yaml_path: str) -> None:
         """
@@ -315,11 +224,11 @@ class ConfigContainerBase:
 
 @dataclass(kw_only=True)
 class PretrainConfigContainer(ConfigContainerBase):
-    """Top-level container holding all configuration objects."""
+    """Training configuration; requires a model with a non-null transformer config."""
 
     train: TrainingConfig
     validation: ValidationConfig = field(default_factory=ValidationConfig)
-    model: ModelConfig
+    model: ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoBuildConfig
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
     # dataset: GPTDatasetConfig # TODO (@maanug): add support
@@ -335,16 +244,65 @@ class PretrainConfigContainer(ConfigContainerBase):
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
 
+    def get_model_world_size(self) -> int:
+        """Return ranks in the model grid, which may be a subset of the launch."""
+        launch_world_size = safe_get_world_size()
+        world_size = (
+            self.model.mimo_llm_world_size if isinstance(self.model, MimoBuildConfig) else None
+        )
+        if world_size is None:
+            world_size = launch_world_size
+        if not 0 < world_size <= launch_world_size:
+            raise ValueError("Training model world size must fit within the global launch")
+        return world_size
+
+    def get_data_parallel_size(self) -> int:
+        """Return replica DP, excluding batch partitions within GTP weight groups."""
+        world_size = self.get_model_world_size()
+        transformer = self.model.transformer
+        tp = transformer.tensor_model_parallel_size
+        pp = transformer.pipeline_model_parallel_size
+        cp = transformer.context_parallel_size
+        weight_size = transformer.gtp_weight_remat_size
+        if min(tp, pp, cp, weight_size) < 1:
+            raise ValueError("Parallel sizes must be positive")
+        sequence_shards = transformer.gtp_remat_num_sequence_shards
+        if cp % sequence_shards:
+            raise ValueError("Runtime context-parallel size must contain the GTP sequence shards")
+        # Runtime CP already includes sequence shards inside each GTP weight group.
+        model_parallel_size = tp * pp * (cp // sequence_shards) * weight_size
+        if world_size % model_parallel_size:
+            raise ValueError(
+                f"world_size ({world_size}) must be divisible by TP x PP x "
+                f"CP x weight-remat size ({model_parallel_size})"
+            )
+        return world_size // model_parallel_size
+
+    def get_batch_parallel_size(self) -> int:
+        """Return independent batch partitions, including GTP batch shards but not CP."""
+        data_parallel_size = self.get_data_parallel_size()
+        transformer = self.model.transformer
+        return (
+            data_parallel_size
+            * transformer.gtp_weight_remat_size
+            // transformer.gtp_remat_num_sequence_shards
+        )
+
     def finalize_optimizer_config(self, optimizer: OptimizerConfig) -> OptimizerConfig:
         """Derive configured or legacy-built optimizer precision from the finalized model."""
+        precision = {
+            name: getattr(self.model.transformer, name)
+            for name in ("fp16", "bf16", "params_dtype", "fp8_recipe")
+        }
+        changes = {
+            name: (getattr(optimizer, name), value)
+            for name, value in precision.items()
+            if getattr(optimizer, name) != value
+        }
+        if changes:
+            logger.warning("Overriding optimizer precision from model config (old, new): %s", changes)
         # Reconstruct so optimizer-local derived precision settings are recomputed too.
-        return replace(
-            optimizer,
-            fp16=self.model.transformer.fp16,
-            bf16=self.model.transformer.bf16,
-            params_dtype=self.model.transformer.params_dtype,
-            fp8_recipe=self.model.transformer.fp8_recipe,
-        )
+        return replace(optimizer, **precision)
 
     def _resolve_batch_sizes(
         self, batch_parallel_size: int | None = None
@@ -396,24 +354,80 @@ class PretrainConfigContainer(ConfigContainerBase):
             )
         return global_batch_size, eval_global_batch_size, eval_micro_batch_size
 
+    def _resolve_scheduler_step_fields(self):
+        """Calculate user-unspecified scheduler configuration arguments from configurable fields."""
+
+        # Without a training horizon there is nothing to resolve; building the optimizer param
+        # scheduler (get_optimizer_param_scheduler) is what requires one.
+        if self.train.train_iters is None and self.train.train_samples is None:
+            return
+        # Iteration-based training.
+        if self.train.train_iters:
+            if self.scheduler.lr_decay_iters is None:
+                self.scheduler.lr_decay_iters = self.train.train_iters
+            self.scheduler.lr_decay_steps = self.scheduler.lr_decay_iters * self.train.global_batch_size
+            self.scheduler.wd_incr_steps = self.train.train_iters * self.train.global_batch_size
+            self.scheduler.wsd_decay_steps = None
+            if self.scheduler.lr_wsd_decay_iters is not None:
+                self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_iters * self.train.global_batch_size
+            if self.scheduler.lr_warmup_fraction is not None:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
+            else:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_iters * self.train.global_batch_size
+        # Sample-based training.
+        elif self.train.train_samples:
+            # We need to set training iters for later use. Technically
+            # we need to adjust the training samples too (due to last
+            # batch being incomplete) but we leave it as is for now.
+            update_train_iters(self.train)
+            if self.scheduler.lr_decay_samples is None:
+                self.scheduler.lr_decay_samples = self.train.train_samples
+            self.scheduler.lr_decay_steps = self.scheduler.lr_decay_samples
+            self.scheduler.wd_incr_steps = self.train.train_samples
+            self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_samples
+            if self.scheduler.lr_warmup_fraction is not None:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
+            else:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
+
+
     def validate(self) -> None:
         """Validate each section and the cross-config GTP, batch-size, and RL policies."""
+        if self.model is None:
+            raise ValueError("Training requires a model config")
+        if getattr(self.model, "transformer", None) is None:
+            raise ValueError("Training requires model.transformer to be configured")
         self.rl.validate_ddp_config(self.ddp)
         super().validate()
-        self._validate_gtp_config()
-        global_batch_size, _, _ = self._resolve_batch_sizes()
-        self._validate_rl_config(global_batch_size)
-
-    def _validate_gtp_config(self) -> None:
-        """Check GTP compatibility with checkpointing and distributed configuration."""
-        transformer = getattr(self.model, "transformer", None)
-        if transformer is not None and transformer.gtp_remat_num_sequence_shards > 1:
+        # Config-only topology checks also run when validating a recipe off-cluster.
+        # Launch world-size checks remain in the runtime parallel-size helpers.
+        transformer = self.model.transformer
+        tp = transformer.tensor_model_parallel_size
+        pp = transformer.pipeline_model_parallel_size
+        cp = transformer.context_parallel_size
+        weight_size = transformer.gtp_weight_remat_size
+        if min(tp, pp, cp, weight_size) < 1:
+            raise ValueError("Parallel sizes must be positive")
+        sequence_shards = transformer.gtp_remat_num_sequence_shards
+        if cp % sequence_shards:
+            raise ValueError("Runtime context-parallel size must contain the GTP sequence shards")
+        if isinstance(self.model, MimoBuildConfig) and self.model.mimo_llm_world_size is not None:
+            world_size = self.model.mimo_llm_world_size
+            if world_size <= 0:
+                raise ValueError("MIMO language-model world size must be positive")
+            if world_size % (tp * pp * (cp // sequence_shards) * weight_size):
+                raise ValueError(
+                    "MIMO language-model world size must be divisible by its model parallel size"
+                )
+        if sequence_shards > 1:
             if self.checkpoint.ckpt_format != "torch_dist":
                 raise ValueError("GTP sequence sharding requires torch_dist checkpoints")
             if self.dist.use_torch_fsdp2 or self.ddp.use_megatron_fsdp:
                 raise ValueError("GTP sequence sharding uses Megatron DDP, not FSDP")
             if self.dist.use_tp_pp_dp_mapping:
                 raise ValueError("GTP sequence sharding does not support TP-PP-DP mapping")
+        global_batch_size, _, _ = self._resolve_batch_sizes()
+        self._validate_rl_config(global_batch_size)
 
     def _validate_rl_config(self, global_batch_size: int | None) -> None:
         """Check RL policy against the supplied or resolved training batch size."""
@@ -423,10 +437,21 @@ class PretrainConfigContainer(ConfigContainerBase):
             cuda_graph_impl=cuda_graph_impl,
             micro_batch_size=self.train.micro_batch_size,
             global_batch_size=global_batch_size,
+            train_iters=self.train.train_iters,
+            train_samples=self.train.train_samples,
             skip_train=self.validation.skip_train,
             load_optim=self.checkpoint.load_optim,
             save_interval=self.checkpoint.save_interval,
             exit_interval=self.train.exit_interval,
+            # The rollout deployment (inference shards, model CP) is not a pretrain section;
+            # validate_args checks that rule from the launch arguments.
+            separate_inference_model=None,
+        )
+        self.scheduler.validate_run(
+            train_iters=self.train.train_iters,
+            train_samples=self.train.train_samples,
+            skip_train=self.validation.skip_train,
+            weight_decay=self.optimizer.weight_decay,
         )
 
     def _finalize(self) -> None:
@@ -434,7 +459,9 @@ class PretrainConfigContainer(ConfigContainerBase):
         self._validate_rl_config(batch_sizes[0])
         # Resolve RNG and model settings before deriving optimizer precision.
         super()._finalize()
-        self.model.finalize()
+        finalize_model = getattr(self.model, "finalize", None)
+        if callable(finalize_model):
+            finalize_model()
         optimizer = self.finalize_optimizer_config(self.optimizer)
         (
             self.train.global_batch_size,
@@ -442,8 +469,37 @@ class PretrainConfigContainer(ConfigContainerBase):
             self.validation.eval_micro_batch_size,
         ) = batch_sizes
         self.optimizer = optimizer
+        self.scheduler.finalize_scheduler_config(self.optimizer.weight_decay)
+        self._resolve_scheduler_step_fields()
         if self.rl.perform_rl_step:
             self.rl.finalize_ddp_config(self.ddp)
+
+
+def update_train_iters(train: TrainingConfig) -> None:
+    """Resolve the sample-based training horizon on the supplied training config."""
+    # Imported lazily: megatron.training.utils imports megatron.training.config.
+    from megatron.training.utils import print_rank_0
+
+    # For iteration-based training, we don't need to do anything
+    if train.train_iters:
+        return
+
+    if train.step_batch_size_schedule is not None:
+        # Sample based training with step batch size schedule.
+        iterations = 0
+        consumed_samples = 0
+        while consumed_samples < train.train_samples:
+            update_num_microbatches(consumed_samples, consistency_check=False)
+            consumed_samples += get_current_global_batch_size()
+            iterations += 1
+        # Reset
+        update_num_microbatches(0, consistency_check=False)
+        train.train_iters = iterations
+    else:
+        # Constant batch size with sample-based training.
+        train.train_iters = train.train_samples // train.global_batch_size
+
+    print_rank_0(f'setting training iterations to {train.train_iters}')
 
 
 @dataclass(kw_only=True)
@@ -460,8 +516,8 @@ class InferenceConfigContainer(ConfigContainerBase):
     ``DistributedDataParallelConfig``, ``RerunStateMachineConfig``, ``StragglerDetectionConfig``.
     """
 
-    model: ModelConfig
-    """Which model to load for inference."""
+    model: ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoBuildConfig | None
+    """Model to load, or None for args-only entrypoints without model inputs."""
 
     checkpoint: CheckpointConfig
     """Checkpoint configuration used to load model weights."""

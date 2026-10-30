@@ -12,7 +12,89 @@ import examples.inference.launch_inference_server as high_level_server
 import tools.run_dynamic_text_generation_server as legacy_server
 from examples.inference.launch_inference_server import add_serve_args
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+from megatron.core.transformer import TransformerConfig
+from megatron.training import argument_utils, arguments, global_vars
+from megatron.training.models import GPTModelConfig, HybridModelConfig, LLaVAModelConfig
+from megatron.training.vocab_utils import model_vocab_size
 from tools.run_dynamic_text_generation_server import add_text_generation_server_args
+
+
+@pytest.mark.parametrize("family", ["gpt", "hybrid", "llava", "mimo"])
+@pytest.mark.parametrize("padded_vocab_size", [None, 768])
+def test_deferred_bootstrap_resolves_detected_model(monkeypatch, family, padded_vocab_size):
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.num_layers, args.hidden_size, args.num_attention_heads = 2, 128, 4
+    args.max_position_embeddings = 32
+    args.tokenizer_type = "NullTokenizer"
+    args.vocab_size = 261
+    args.pad_vocab_size = True
+    args.padded_vocab_size = padded_vocab_size
+    args.make_vocab_size_divisible_by = 128
+    for name in ("_GLOBAL_RUN_CONFIG", "_GLOBAL_TOKENIZER"):
+        monkeypatch.setattr(global_vars, name, None)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
+    monkeypatch.setattr(legacy_server, "parse_and_validate_args", lambda **kwargs: args)
+    monkeypatch.setattr(legacy_server.sys, "argv", ["server"])
+    monkeypatch.setattr(legacy_server, "_print_resolved_args", lambda *args: None)
+    monkeypatch.setattr(legacy_server.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(
+        argument_utils,
+        "core_transformer_config_from_args",
+        lambda args: TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4),
+    )
+    for name in ("_set_wandb_writer", "_set_telemetry"):
+        monkeypatch.setattr(global_vars, name, lambda *args, **kwargs: None)
+
+    def initialize_without_tokenizer(*, build_tokenizer):
+        assert not build_tokenizer
+        global_vars.initialize_runtime_services(args, build_tokenizer=False)
+        if padded_vocab_size is None:
+            cfg = global_vars.get_run_config()
+            with pytest.raises(ValueError, match="Model vocabulary must be resolved"):
+                model_vocab_size(
+                    cfg.model.vocab_size,
+                    should_pad_vocab=cfg.model.should_pad_vocab,
+                    make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by,
+                    tensor_model_parallel_size=cfg.model.transformer.tensor_model_parallel_size,
+                )
+
+    def detect(args, **kwargs):
+        assert global_vars._GLOBAL_TOKENIZER is None
+        if family in ("hybrid", "mimo"):
+            args.hybrid_layer_pattern = "M*"
+        if family == "mimo":
+            args.mimo_checkpoint_prefix_map = {"language_model.": "model.llm."}
+        return family in ("llava", "mimo")
+
+    monkeypatch.setattr(legacy_server, "initialize_megatron", initialize_without_tokenizer)
+    monkeypatch.setattr(legacy_server, "_detect_vlm_from_checkpoint", detect)
+    _, is_vlm = legacy_server.parse_args_and_detect_vlm(
+        extra_args_provider=None, args_defaults={}, user_passed_attrs=set()
+    )
+    cfg = global_vars.get_run_config()
+    expected_type = {
+        "gpt": GPTModelConfig,
+        "hybrid": HybridModelConfig,
+        "llava": LLaVAModelConfig,
+        "mimo": HybridModelConfig,
+    }[family]
+    assert type(cfg.model) is expected_type
+    assert is_vlm == (family in ("llava", "mimo"))
+    assert global_vars.get_tokenizer().vocab_size == 261
+    assert (
+        model_vocab_size(
+            cfg.model.vocab_size,
+            should_pad_vocab=cfg.model.should_pad_vocab,
+            make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by,
+            tensor_model_parallel_size=cfg.model.transformer.tensor_model_parallel_size,
+        )
+        == cfg.tokenizer.padded_vocab_size
+        == (384 if padded_vocab_size is None else padded_vocab_size)
+    )
+    if family == "mimo":
+        assert args.mimo_checkpoint_prefix_map == {"language_model.": "model.llm."}
 
 
 @pytest.mark.parametrize(

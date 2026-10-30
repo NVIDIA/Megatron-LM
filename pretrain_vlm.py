@@ -40,12 +40,9 @@ from megatron.training import (
 )
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.models import LLaVAModelConfig
 from megatron.training.vocab_utils import model_vocab_size
-from megatron.training.global_vars import (
-    get_run_config,
-    set_run_config,
-)
 from pretrain_gpt import loss_func
 
 
@@ -238,7 +235,12 @@ def model_provider(
     model = LLaVAModel(
         language_transformer_config=language_transformer_config,
         language_transformer_layer_spec=language_transformer_layer_spec,
-        language_vocab_size=model_vocab_size(cfg.model),
+        language_vocab_size=model_vocab_size(
+            cfg.model.vocab_size,
+            should_pad_vocab=cfg.model.should_pad_vocab,
+            make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by,
+            tensor_model_parallel_size=cfg.model.transformer.tensor_model_parallel_size,
+        ),
         language_max_sequence_length=language_max_sequence_length,
         vision_transformer_config=vision_transformer_config,
         vision_transformer_layer_spec=vision_transformer_layer_spec,

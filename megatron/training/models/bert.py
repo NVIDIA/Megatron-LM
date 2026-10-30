@@ -4,11 +4,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from megatron.core.transformer import TransformerConfig
-from megatron.training.models.base import ModelConfig
+from megatron.core.transformer.spec_utils import ModuleSpec
 
 
 @dataclass(kw_only=True)
-class BertModelConfig(ModelConfig):
+class BertModelConfig:
     """BERT model inputs; construction remains with the application's provider."""
 
     transformer: TransformerConfig
@@ -21,9 +21,11 @@ class BertModelConfig(ModelConfig):
     """Whether to pad the supplied raw vocabulary size."""
     make_vocab_size_divisible_by: int = 128
     """Vocabulary alignment factor, multiplied by tensor-parallel size."""
-    share_embeddings_and_output_weights: bool = True
+    share_embeddings_and_output_weights: bool = False
     """Tie embedding and language-model output weights."""
     bert_binary_head: bool = True
     """Include the sentence-order head and two token types."""
+    transformer_layer_spec: ModuleSpec | None = None
+    """Encoder layer spec; None selects the Transformer Engine BERT spec."""
     tp_comm_overlap_cfg: str | dict[str, Any] | None = None
     """Transformer Engine user-buffer overrides, as a YAML path or dictionary."""

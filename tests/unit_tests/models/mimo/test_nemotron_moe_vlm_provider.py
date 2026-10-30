@@ -24,10 +24,14 @@ from examples.mimo.model_providers.nemotron_moe_vlm import (
 from examples.mimo.model_providers.radio_encoder import RADIO_ENCODER_MODULE_NAME
 from examples.mimo.training.args import add_hetero_grid_args
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.enums import AttnBackend
-from megatron.training.argument_utils import model_config_from_args, resolve_tokenizer_vocab_size
+from megatron.training.argument_utils import (
+    model_config_from_args,
+    resolve_tokenizer_vocab_size,
+    tokenizer_config_from_args,
+)
 from megatron.training.global_vars import get_run_config
+from megatron.training.vocab_utils import build_tokenizer_and_pad_vocab_size
 
 pytestmark = pytest.mark.usefixtures("run_config")
 
@@ -316,11 +320,16 @@ def _parse_validate(argv):
         sys.argv = saved
     validate_args(args)
     cfg = get_run_config()
-    from megatron.training.models import MimoModelConfig
+    from megatron.training.models import MimoBuildConfig
 
-    cfg.model = model_config_from_args(args, model_config_cls=MimoModelConfig)
-    build_tokenizer(args)
-    resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
+    cfg.model = model_config_from_args(args, model_config_cls=MimoBuildConfig)
+    cfg.tokenizer = tokenizer_config_from_args(args)
+    build_tokenizer_and_pad_vocab_size(
+        cfg.tokenizer,
+        cfg.model.make_vocab_size_divisible_by,
+        cfg.model.transformer.tensor_model_parallel_size,
+    )
+    resolve_tokenizer_vocab_size(cfg)
     return args
 
 
@@ -533,6 +542,31 @@ def test_language_model_spec_propagates_logit_dtype(cli_dtype, expected_dtype):
     assert spec.params["logit_dtype"] is getattr(torch, expected_dtype)
 
 
+@pytest.mark.parametrize(
+    "position_type,rotary_base,rotary_percent,interpolation_factor",
+    [("none", 10000, 1.0, None), ("rope", 10000, 1.0, 1), ("rope", 123456, 0.5, 4)],
+)
+def test_language_model_spec_honors_rotary_args(
+    position_type, rotary_base, rotary_percent, interpolation_factor
+):
+    """Both language config and model construction honor the requested RoPE geometry."""
+    from examples.mimo.model_providers.nemotron_moe_vlm import language_model_spec
+
+    argv = _build_argv(*_PRESET_20L)
+    argv[argv.index("--position-embedding-type") + 1] = position_type
+    argv += ["--rotary-base", str(rotary_base), "--rotary-percent", str(rotary_percent)]
+    if interpolation_factor is not None:
+        argv += ["--rotary-seq-len-interpolation-factor", str(interpolation_factor)]
+    args = _parse_validate(argv)
+    spec = language_model_spec(args, pg_collection=None, llm_grid=None)
+
+    assert spec.params["config"].position_embedding_type == position_type
+    assert spec.params["position_embedding_type"] == position_type
+    assert spec.params["rotary_base"] == rotary_base
+    assert spec.params["rotary_percent"] == rotary_percent
+    assert spec.params["seq_len_interpolation_factor"] == interpolation_factor
+
+
 def test_vision_submodules_spec_wires_radio_encoder():
     """vision_submodules_spec wires the RADIO encoder + affine projector, and the
     preset's pixel-shuffle / class-token-drop knobs reach the wrapper params."""
@@ -650,7 +684,7 @@ def test_language_cp_comes_from_its_grid(monkeypatch, cp_size, use_groups, seque
 
     from examples.mimo.model_providers import nemotron_moe_vlm as provider
     from megatron.core.transformer import TransformerConfig
-    from megatron.training.models import MimoModelConfig
+    from megatron.training.models import MimoBuildConfig
 
     # Deliberately disagree with the grid to catch inheritance of stock CP.
     args = SimpleNamespace(
@@ -661,9 +695,13 @@ def test_language_cp_comes_from_its_grid(monkeypatch, cp_size, use_groups, seque
         vocab_size=64,
         seq_length=32,
         hybrid_layer_pattern="*",
+        position_embedding_type="none",
+        rotary_base=10000,
+        rotary_percent=1.0,
+        rotary_seq_len_interpolation_factor=None,
         logit_dtype=None,
     )
-    get_run_config().model = MimoModelConfig(
+    get_run_config().model = MimoBuildConfig(
         transformer=TransformerConfig(
             num_layers=1,
             hidden_size=32,

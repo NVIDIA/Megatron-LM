@@ -1,10 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import abc
-import functools
 import importlib
-import inspect
-from dataclasses import dataclass, field, is_dataclass
+from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar, runtime_checkable
 
@@ -13,82 +11,6 @@ from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
-
-# Hooks and callbacks that each run attaches to the live config. Not to be serialized.
-_RUNTIME_FIELDS = frozenset(
-    {
-        "pre_wrap_hooks",
-        "post_wrap_hooks",
-        "timers",
-        "finalize_model_grads_func",
-        "grad_scale_func",
-        "moe_grad_scale_func",
-        "mtp_grad_scale_func",
-        "no_sync_func",
-        "grad_sync_func",
-        "param_sync_func",
-    }
-)
-
-
-def _encode_callable(value: Callable) -> dict[str, Any] | None:
-    """Serialize a callable so that it can be deserialized with `instantiate()`."""
-
-    if isinstance(value, functools.partial):
-        inner = _encode_callable(value.func)
-        if inner is None:
-            return None
-        encoded: dict[str, Any] = {
-            "_target_": inner["_target_"],
-            "_partial_": True,
-            "_args_": [_model_value_to_dict(arg) for arg in value.args],
-        }
-        encoded.update({key: _model_value_to_dict(arg) for key, arg in value.keywords.items()})
-        return encoded
-
-    module = inspect.getmodule(value)
-    qualname = getattr(value, "__qualname__", None)
-    if module is None or qualname is None:
-        return None
-    # Encode only paths that resolve back to `value`; a bound method's path drops its instance.
-    resolved = module
-    for part in qualname.split("."):
-        resolved = getattr(resolved, part, None)
-    if resolved != value:
-        return None
-    return {"_target_": f"{module.__name__}.{qualname}", "_call_": False}
-
-
-def _model_value_to_dict(value: Any) -> Any:
-    """Preserve nested model-spec inputs, including dataclasses in partial kwargs."""
-    if is_dataclass(value) and not isinstance(value, type):
-        return _model_dataclass_to_dict(value)
-    if callable(value):
-        encoded = _encode_callable(value)
-        return value if encoded is None else encoded
-    if isinstance(value, dict):
-        return {key: _model_value_to_dict(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_model_value_to_dict(item) for item in value]
-    if hasattr(value, "as_dict"):
-        return value.as_dict()
-    return value
-
-
-def _model_dataclass_to_dict(config) -> dict[str, Any]:
-    """Encode model dataclasses consistently for checkpoint export and spec lookup."""
-    result = {"_target_": f"{config.__class__.__module__}.{config.__class__.__qualname__}"}
-    for f in dataclass_fields(config):
-        if f.name.startswith("_") or f.name in _RUNTIME_FIELDS:
-            continue
-        value = getattr(config, f.name)
-        if callable(value) and (isinstance(value, type) or not is_dataclass(value)):
-            encoded = _encode_callable(value)
-            if encoded is not None:
-                result[f.name] = encoded
-            continue
-        result[f.name] = _model_value_to_dict(value)
-    return result
 
 
 @runtime_checkable
@@ -109,10 +31,9 @@ class Serializable(Protocol):
 class ModelConfig:
     """Base class for model configurations.
 
-    Each model type (GPT, T5, Hybrid, etc.) defines a concrete subclass with its
+    Each builder-backed model type (GPT, Hybrid, etc.) defines a concrete subclass with its
     own model-specific parameters. This class is a pure data container - all model
-    construction logic lives in the corresponding ``ModelBuilder`` subclass or
-    an application-supplied model-provider callback.
+    construction logic lives in the corresponding ``ModelBuilder`` subclass.
 
     Builder-backed subclasses define:
         - ``builder``: a ``ClassVar[str]`` with the full import path to the
@@ -133,7 +54,7 @@ class ModelConfig:
     """
 
     # === Builder Metadata (Serializable) ===
-    builder: ClassVar[str | None] = None
+    builder: ClassVar[str]
     """Class variable with full path to builder class (e.g.,
     'megatron.bridge.builders.GPTModelBuilder').
     """
@@ -158,15 +79,10 @@ class ModelConfig:
     Should take the model as the only argument and return a new model as the only return value.
     """
 
-    def finalize(self) -> None:
-        """Finalize model-specific settings; the base implementation is a no-op."""
-
     def get_builder_cls(self) -> type:
         """Get the appropriate builder type for this config.
         Dynamically imports the builder from the string path.
         """
-        if self.builder is None:
-            raise ValueError("This model config requires a model-provider callback.")
         module_path, class_name = self.builder.rsplit(".", 1)
         module = importlib.import_module(module_path)
         builder_cls = getattr(module, class_name)
@@ -181,9 +97,14 @@ class ModelConfig:
         - All dataclass fields, including nested dataclasses
         """
 
-        result = _model_dataclass_to_dict(self)
-        if self.builder is not None:
-            result["_builder_"] = self.builder  # Serialize the builder path
+        from megatron.training.config.utils import serialize_dataclass
+
+        result = serialize_dataclass(
+            self,
+            skip_fields=frozenset({"pre_wrap_hooks", "post_wrap_hooks"}),
+            encode_callables=True,
+        )
+        result["_builder_"] = self.builder  # Serialize the builder path
         return result
 
     @classmethod
@@ -191,7 +112,7 @@ class ModelConfig:
         """Deserialize config from dictionary.
 
         Uses _target_ to determine the correct class to instantiate.
-        The builder is restored from _builder_ or from the class's ClassVar.
+        The builder is restored from the required _builder_ entry.
 
         Args:
             data: Dictionary with _target_ and config fields
@@ -234,8 +155,7 @@ class ModelConfig:
             return value
 
         result = _from_dict(data)
-        if "_builder_" in data:
-            result.builder = data["_builder_"]
+        result.builder = data["_builder_"]
 
         return result
 
