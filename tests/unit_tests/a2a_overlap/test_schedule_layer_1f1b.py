@@ -30,6 +30,7 @@ from tests.unit_tests.a2a_overlap.utils import (
     get_valid_fp8_flags,
     reset_model,
 )
+from tests.unit_tests.amax_reduction_group_utils import global_amax_groups
 from tests.unit_tests.test_utilities import (
     Utils,
     is_nccl_ep_fp8_dispatch_available,
@@ -293,7 +294,11 @@ class TestA2AOverlap:
             params = reset_model(gpt_model)
             input_tensors = [build_data() for _ in range(microbatches)]
 
-            fp8_context = get_fp8_context(config, 0) if config.fp8 else nullcontext()
+            fp8_context = (
+                get_fp8_context(config, 0, pg_collection=global_amax_groups())
+                if config.fp8
+                else nullcontext()
+            )
             with fp8_context:
                 capture_ref = run_transformer_layer_ref_with_capture(
                     gpt_model, input_tensors, microbatches
@@ -337,7 +342,11 @@ class TestA2AOverlap:
             params = reset_model(gpt_model)
             input_tensors = [build_data() for _ in range(microbatches)]
 
-            fp8_context = get_fp8_context(ref_config, 0) if ref_config.fp8 else nullcontext()
+            fp8_context = (
+                get_fp8_context(ref_config, 0, pg_collection=global_amax_groups())
+                if ref_config.fp8
+                else nullcontext()
+            )
             with fp8_context:
                 capture_ref = run_transformer_layer_ref_with_capture(
                     gpt_model, input_tensors, microbatches
@@ -396,7 +405,11 @@ class TestA2AOverlap:
             params = reset_model(gpt_model)
             input_tensors = [build_data() for _ in range(microbatches)]
 
-            fp8_context = get_fp8_context(ref_config, 0) if ref_config.fp8 else nullcontext()
+            fp8_context = (
+                get_fp8_context(ref_config, 0, pg_collection=global_amax_groups())
+                if ref_config.fp8
+                else nullcontext()
+            )
             with fp8_context:
                 capture_ref = run_transformer_layer_ref_with_capture(
                     gpt_model, input_tensors, microbatches
@@ -451,7 +464,11 @@ class TestA2AOverlap:
             params = reset_model(gpt_model)
             input_tensors = [build_data() for _ in range(microbatches)]
 
-            fp8_context = get_fp8_context(config, 0) if config.fp8 else nullcontext()
+            fp8_context = (
+                get_fp8_context(config, 0, pg_collection=global_amax_groups())
+                if config.fp8
+                else nullcontext()
+            )
             with fp8_context:
                 capture_ref = run_transformer_layer_ref_with_capture(
                     gpt_model, input_tensors, microbatches

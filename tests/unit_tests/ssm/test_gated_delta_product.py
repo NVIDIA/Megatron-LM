@@ -29,6 +29,7 @@ from megatron.core.ssm.gated_delta_product import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from tests.unit_tests.amax_reduction_group_utils import global_amax_groups
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -93,7 +94,7 @@ def _build_mixer(config, state_dict=None):
 def _run(mixer, hidden_states, grads):
     """Run one forward/backward and collect the output and every gradient."""
     x = hidden_states.clone().requires_grad_(True)
-    with get_fp8_context(mixer.config):
+    with get_fp8_context(mixer.config, pg_collection=global_amax_groups()):
         out, _ = mixer(x)
     out.backward(grads)
     param_grads = {name: param.grad.clone() for name, param in mixer.named_parameters()}

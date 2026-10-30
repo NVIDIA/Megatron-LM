@@ -20,6 +20,11 @@ import torch
 import torch.nn as nn
 
 from megatron.core import parallel_state
+from megatron.core.process_groups_config import warn_global_process_group_fallback
+
+# The groups whose ranks name a dump, in the order of parallel_state.get_all_ranks(): tensor,
+# GTP-remat, data (with GTP-remat peers), context, pipeline and expert parallel.
+_RANK_STRING_GROUPS = ('tp', 'gtp_remat', 'dp_gtp_remat', 'cp', 'pp', 'ep')
 
 
 def get_config_logger_path(config):
@@ -94,10 +99,21 @@ class JSONEncoderWithMcoreTypes(json.JSONEncoder):
             return str(o)
 
 
-def log_config_to_disk(config, dict_data, prefix='', rank_str=''):
+def _rank_string(groups):
+    """Join this rank's ranks in ``groups``; a None group, for an axis that is off, counts as 0."""
+    return '_'.join('0' if group is None else str(group.rank()) for group in groups)
+
+
+def log_config_to_disk(config, dict_data, prefix='', rank_str='', *, pg_collection=None):
     """
     Encodes the input dict (dict_data) using the JSONEncoderWithMcoreTypes
     and dumps to disk, as specified via path
+
+    The file name ends in ``rank_str``. By default it is this rank's
+    tp_gtp_dp_cp_pp_ep ranks in the groups of ``pg_collection``, the process
+    groups of the model that logs. When ``pg_collection`` is omitted, or does
+    not set all of these groups, the ranks come from the global parallel state;
+    this fallback is deprecated and emits a ``ProcessGroupFallbackWarning``.
     """
     path = get_config_logger_path(config)
     assert path is not None, 'Expected config_logger_dir to be non-empty in config.'
@@ -111,9 +127,18 @@ def log_config_to_disk(config, dict_data, prefix='', rank_str=''):
         del dict_data['self']
 
     # the caller of the funcion can decide the most informative string
-    # rank_str defaults to '0_0_0_0_0' format (tp_dp_cp_pp_ep ranks)
+    # rank_str defaults to '0_0_0_0_0_0' format (tp_gtp_dp_cp_pp_ep ranks)
     if rank_str == '':
-        rank_str = parallel_state.get_all_ranks()
+        groups = {} if pg_collection is None else vars(pg_collection)
+        if all(name in groups for name in _RANK_STRING_GROUPS):
+            rank_str = _rank_string(groups[name] for name in _RANK_STRING_GROUPS)
+        else:
+            # A partial collection could give two processes the same file name, so it falls back
+            # to the global ranks too.
+            warn_global_process_group_fallback(
+                'log_config_to_disk', deprecated_in='0.21', removed_in='0.23'
+            )
+            rank_str = parallel_state.get_all_ranks()
 
     path = get_path_with_count(os.path.join(path, f'{prefix}.rank_{rank_str}'))
     if type(dict_data).__name__ == 'OrderedDict':

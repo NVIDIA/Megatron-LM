@@ -4358,6 +4358,23 @@ def _run_gpu_sniff_test(tag, span_name='megatron.train.sniff_test'):
     print_datetime(f'finished GPU sniff test ({tag})')
 
 
+def _param_hashes_match_across_dp_replicas(model):
+    """Return whether every data-parallel replica of the model holds the same parameters.
+
+    The replicas are those of the model's process-group collection; a model without one is
+    checked across the replicas of the global parallel state.
+    """
+    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+    if model_pg_collection is None:
+        model_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    return check_param_hashes_across_dp_replicas(
+        model,
+        cross_check=True,
+        dp_group=model_pg_collection.dp,
+        expt_dp_group=model_pg_collection.expt_dp,
+    )
+
+
 def post_training_step_callbacks(
     model,
     optimizer,
@@ -4390,8 +4407,8 @@ def post_training_step_callbacks(
     ):
         if should_disable_forward_pre_hook(args):
             disable_forward_pre_hook(model, optimizer=optimizer)
-        assert check_param_hashes_across_dp_replicas(
-            model, cross_check=True
+        assert _param_hashes_match_across_dp_replicas(
+            model
         ), "Parameter hashes not matching across DP replicas"
         torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
@@ -4949,8 +4966,8 @@ def train(
     # span (parented to megatron.startup, still open here).
     if cfg.train.check_weight_hash_across_dp_replicas_interval is not None:
         with _otel_managed_span('job', 'megatron.startup.weight_hash_check', is_goodput_span=True):
-            assert check_param_hashes_across_dp_replicas(
-                model, cross_check=True
+            assert _param_hashes_match_across_dp_replicas(
+                model
             ), "Parameter hashes not matching across DP replicas"
             torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
@@ -4963,6 +4980,7 @@ def train(
             seq_length=args.seq_length,
             micro_batch_size=cfg.train.micro_batch_size,
             optimizers=[optimizer],
+            pg_collection=model_pg_collection,
         )
 
     # OTel: everything above in train() (the preamble: weight-hash check, sniff

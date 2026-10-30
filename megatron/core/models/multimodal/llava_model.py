@@ -175,7 +175,12 @@ class LLaVAModel(MegatronModule):
         super().__init__(config=language_transformer_config)
 
         if has_config_logger_enabled(language_transformer_config):
-            log_config_to_disk(language_transformer_config, locals(), prefix=type(self).__name__)
+            log_config_to_disk(
+                language_transformer_config,
+                locals(),
+                prefix=type(self).__name__,
+                pg_collection=pg_collection,
+            )
 
         log_single_rank(
             logging.getLogger(__name__),
