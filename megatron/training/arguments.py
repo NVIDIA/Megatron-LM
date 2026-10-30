@@ -3077,7 +3077,8 @@ def _add_network_size_args(parser):
         type=json.loads,
         default=None,
         metavar='JSON',
-        help='Backend-specific MoE megakernel options as a JSON object.',
+        help='MCore common options (shared_expert_mode) and backend-specific MoE '
+        'megakernel options as a JSON object.',
     )
 
     group = parser.add_argument_group(title='network size')

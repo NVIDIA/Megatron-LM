@@ -1066,9 +1066,13 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     moe_megakernel_backend_config: Optional[dict] = None
-    """Backend options for moe_megakernel_backend.
+    """MCore-managed common options and backend-specific options for moe_megakernel_backend.
 
-    For example, ``fwd_num_comm_sms`` is a valid MOK backend option.
+    MCore consumes ``shared_expert_mode``: ``auto`` (default) fuses compatible shared
+    MLPs, ``fused`` requires compatibility, and ``native`` runs shared experts in
+    MCore. Activation selection is independent. Native shared experts retain the
+    model's precision policy; MOK-fused shared experts use BF16.
+    Remaining options, such as MOK's ``fwd_num_comm_sms``, are passed to the backend.
     """
 
     moe_layer_freq: Union[int, List[int]] = 1
@@ -3430,8 +3434,12 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "moe_megakernel_backend_config requires moe_megakernel_backend to be set"
             )
-
         if self.moe_megakernel_backend == "mok":
+            from megatron.core.transformer.moe.megakernel import megakernel_fuses_shared_expert
+
+            if self.add_bias_linear:
+                raise ValueError("MOK requires add_bias_linear=False; expert bias is not supported")
+            fuse_shared = megakernel_fuses_shared_expert(self)
             # TODO: Add a materialized-wgrad adapter for non-fused accumulation.
             if not self.gradient_accumulation_fusion:
                 raise ValueError("MOK currently requires gradient_accumulation_fusion=True")
@@ -3465,17 +3473,21 @@ class TransformerConfig(ModelParallelConfig):
                     "MOK does not support overlap_dispatch_backward_with_experts_wgrad; "
                     "the megakernel never runs the native dispatch path"
                 )
-            if self.tensor_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
-                raise ValueError("MOK currently requires TP=1 and expert TP=1")
+            if self.expert_tensor_parallel_size != 1:
+                raise ValueError("MOK currently requires expert TP=1")
+            # ETP=1 routed weights are unsharded; MOK consumes each rank's SP tokens.
+            # TP-sharded shared experts and duplicated latent projections stay native.
+            if self.tensor_model_parallel_size > 1 and not self.sequence_parallel:
+                raise ValueError("MOK with TP>1 requires sequence_parallel=True")
             if self.expert_model_parallel_size not in (1, 4, 8, 16, 32, 64):
                 raise ValueError("MOK requires EP in {1, 4, 8, 16, 32, 64}")
-            if self.moe_shared_expert_intermediate_size is None:
-                raise ValueError("MOK requires a shared expert")
             if self.moe_shared_expert_overlap:
                 raise ValueError("MOK does not support MCore shared-expert overlap")
-            if self.moe_latent_size is not None:
-                raise ValueError("MOK does not support latent MoE")
-            if self.recompute_modules and "shared_experts" in self.recompute_modules:
+            if (
+                fuse_shared
+                and self.recompute_modules
+                and "shared_experts" in self.recompute_modules
+            ):
                 raise ValueError(
                     "MOK does not support recompute_modules=['shared_experts']; shared-expert "
                     "computation is fused into the megakernel. Use whole-MoE recompute "
@@ -3486,8 +3498,8 @@ class TransformerConfig(ModelParallelConfig):
                     "MOK does not support log_moe_overload_factor because it bypasses the "
                     "native token-dispatcher accounting path"
                 )
-            if not self.gated_linear_unit or self.activation_func != F.silu:
-                raise ValueError("MOK currently requires SwiGLU")
+            if not self.gated_linear_unit or self.activation_func not in (F.silu, situlu):
+                raise ValueError("MOK requires SwiGLU or SiTU-GLU")
 
         if isinstance(self.moe_router_load_balancing_type, list):
             assert isinstance(self.moe_aux_loss_coeff, list) and len(
