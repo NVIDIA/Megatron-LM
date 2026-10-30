@@ -13,11 +13,11 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
 from megatron.core.transformer.residual_connection import ResidualBranchInput
-from megatron.core.transformer.wide_residual_config import WideResidualConfig
-from megatron.core.transformer.wide_residual_layer import (
+from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
     load_residual_state,
 )
+from megatron.core.transformer.wide_residual_config import WideResidualConfig
 
 
 class _Mixer(nn.Module):

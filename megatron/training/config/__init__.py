@@ -12,6 +12,7 @@ from megatron.training.config.training_config import (
     LoggerConfig,
     CheckpointConfig,
     TokenizerConfig,
+    MultiModalTokenizerConfig
 )
 from megatron.training.config.resilience_config import (
     FaultInjectorConfig,

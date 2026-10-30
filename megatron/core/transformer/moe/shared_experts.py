@@ -30,7 +30,6 @@ from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
-    get_pg_size,
     is_te_min_version,
     is_torch_min_version,
     make_sharded_tensor_for_checkpoint,
@@ -494,7 +493,6 @@ class FusedSharedExpertMLP(SharedExpertMLP):
     def _make_fused_grouped_swiglu_ops(self) -> torch.nn.Module:
         """Construct the grouped-linear shared-expert MLP operations."""
         ops = te.pytorch.ops.Sequential()
-        tp_world_size = get_pg_size(self.tp_group)
         rng_state_tracker_function = None
         if get_cuda_rng_tracker().is_initialized():
             rng_state_tracker_function = get_cuda_rng_tracker
@@ -504,7 +502,8 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         op = te.pytorch.ops.GroupedLinear(
             num_groups=1,
             in_features=fc1_weight.size(1),
-            out_features=fc1_weight.size(0) * tp_world_size,
+            # fc1_weight is the local TP shard and GroupedLinear has no TP, so use the local size.
+            out_features=fc1_weight.size(0),
             device="meta",
             dtype=fc1_weight.dtype,
             bias=False,

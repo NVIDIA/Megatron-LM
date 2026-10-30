@@ -65,27 +65,85 @@ MXFP8_BLOCKWISE_RECIPE = "mxfp8_blockwise"
 SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
 
 
-def test_all_gather_pipeline_prefetch_size():
-    """The extracted prefetch heuristic stops after reaching the requested size."""
+def _prefetch_size_pipeline(sizes, sharded):
     pipeline = AllGatherPipeline.__new__(AllGatherPipeline)
     pipeline.buffer = SimpleNamespace(
-        num_buckets=4,
+        num_buckets=len(sizes),
         ddp_config=SimpleNamespace(fsdp_double_buffer=False),
         parameter_groups=[
             SimpleNamespace(
                 fsdp_unit_id=bucket_id,
-                model_weight_buffer=SimpleNamespace(bucket_index=SimpleNamespace(size=6)),
+                transpose_weight_buffer=None,
+                hfsdp_helper_wbuf=None,
+                model_weight_buffer=SimpleNamespace(
+                    bucket_index=SimpleNamespace(size=size), is_data_distributed=is_sharded
+                ),
             )
-            for bucket_id in range(4)
+            for bucket_id, (size, is_sharded) in enumerate(zip(sizes, sharded))
         ],
-        bucket_to_bucket_group={bucket_id: [bucket_id] for bucket_id in range(4)},
+        bucket_to_bucket_group={bucket_id: [bucket_id] for bucket_id in range(len(sizes))},
     )
+    return pipeline
+
+
+def test_all_gather_pipeline_prefetch_size():
+    """The extracted prefetch heuristic stops after reaching the requested size."""
+    pipeline = _prefetch_size_pipeline([6] * 4, [True] * 4)
 
     actual = pipeline._extend_by_prefetch_size(
         [0], PrefetchOrder.FORWARD_PASS_ORDER, suggested_prefetch_size=10, double_buffer_units=set()
     )
 
     assert actual == [0, 1, 2]
+
+
+@pytest.mark.parametrize(
+    ("order", "unsharded_bucket", "start_buckets", "expected_buckets"),
+    [
+        (PrefetchOrder.FORWARD_PASS_ORDER, 1, [0], [0, 1, 2, 3]),
+        (PrefetchOrder.BACKWARD_PASS_ORDER, 3, [4], [1, 2, 3, 4]),
+    ],
+)
+def test_all_gather_pipeline_prefetch_size_skips_unsharded_buckets(
+    order, unsharded_bucket, start_buckets, expected_buckets
+):
+    """Buckets that need no all-gather do not use up the prefetch size."""
+    sizes = [100 if b == unsharded_bucket else 6 for b in range(5)]
+    pipeline = _prefetch_size_pipeline(sizes, [b != unsharded_bucket for b in range(5)])
+
+    actual = pipeline._extend_by_prefetch_size(
+        start_buckets, order, suggested_prefetch_size=10, double_buffer_units=set()
+    )
+
+    assert actual == expected_buckets
+
+
+@pytest.mark.parametrize(
+    ("outer_size", "outer_gather", "expected_buckets"),
+    [(2, True, [0, 1, 2]), (1, True, [0, 1, 2, 3]), (2, False, [0, 1, 2, 3])],
+)
+def test_all_gather_pipeline_prefetch_size_counts_outer_gathers(
+    outer_size, outer_gather, expected_buckets
+):
+    """Buckets replicated on DP-Shard still use up the prefetch size when they need a
+    DP-Outer all-gather."""
+    pipeline = _prefetch_size_pipeline([6] * 4, [False] * 4)
+    for group in pipeline.buffer.parameter_groups:
+        group.is_expert_param = False
+        group.hfsdp_helper_wbuf = SimpleNamespace(is_data_distributed=False)
+    pipeline.buffer.dist_index = SimpleNamespace(
+        get_outer_fsdp_group=lambda is_expert_parallel: SimpleNamespace(size=lambda: outer_size)
+    )
+
+    actual = pipeline._extend_by_prefetch_size(
+        [0],
+        PrefetchOrder.FORWARD_PASS_ORDER,
+        suggested_prefetch_size=10,
+        double_buffer_units=set(),
+        outer_fsdp_group_param_gather=outer_gather,
+    )
+
+    assert actual == expected_buckets
 
 
 @pytest.mark.parametrize(
@@ -134,8 +192,8 @@ def test_hfsdp_pipeline_preserves_inner_prefetch_size_policy():
     }
     calls = []
 
-    def extend_by_size(bucket_ids, order, suggested_size, double_buffer_units):
-        calls.append(("inner", bucket_ids, order, suggested_size, double_buffer_units))
+    def extend_by_size(bucket_ids, order, suggested_size, double_buffer_units, **kwargs):
+        calls.append(("inner", bucket_ids, order, suggested_size, double_buffer_units, kwargs))
         return [0, 1]
 
     def extend_by_units(bucket_ids, order, num_units):
@@ -153,7 +211,14 @@ def test_hfsdp_pipeline_preserves_inner_prefetch_size_policy():
     )
 
     assert calls == [
-        ("inner", [0], PrefetchOrder.FORWARD_PASS_ORDER, 123, set()),
+        (
+            "inner",
+            [0],
+            PrefetchOrder.FORWARD_PASS_ORDER,
+            123,
+            set(),
+            {"outer_fsdp_group_param_gather": True},
+        ),
         ("outer", [0, 1], PrefetchOrder.FORWARD_PASS_ORDER, 1),
         ("launch_outer", [0, 1, 2], False),
     ]

@@ -2589,6 +2589,30 @@ class ParamAndGradBuffer:
         # Set ParameterGroup.grad_dtype.
         for group in self.parameter_groups:
             group.grad_dtype = self._resolve_group_grad_dtype(group, meta_device_init_fp8_params)
+
+        if self.ddp_config.gradient_reduce_div_fusion:
+            # PyTorch uses the first bucket's ReduceOp for the entire coalesced call.
+            # Mixing BF16 (pre-scaled SUM) with other dtypes (PREMUL_SUM) is unsafe.
+            requires_grad_only = (
+                self.only_create_grad_buffer_and_main_weight_buffer_for_param_requires_grad
+            )
+            for bucket_id, bucket_group in self.bucket_to_bucket_group.items():
+                if bucket_id != bucket_group[0]:
+                    continue
+                grad_comm_dtypes = {
+                    self.mp_policy.grad_comm_dtype or self.parameter_groups[i].grad_dtype
+                    for i in bucket_group
+                    if self.parameter_groups[i].requires_grad or not requires_grad_only
+                }
+                if len(grad_comm_dtypes) > 1:
+                    raise ValueError(
+                        "[Megatron-FSDP] gradient_reduce_div_fusion=True is not supported with "
+                        "mixed gradient communication dtypes in a coalesced bucket group "
+                        f"({', '.join(sorted(str(dtype) for dtype in grad_comm_dtypes))}). "
+                        "Set gradient_reduce_div_fusion=False "
+                        "(--no-gradient-reduce-div-fusion) or use a single grad_comm_dtype."
+                    )
+
         if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
             # Double Buffering
             UB_BUFFER_NUM = 2
@@ -4679,23 +4703,23 @@ class AllGatherPipeline:
         prefetch_order: PrefetchOrder,
         suggested_prefetch_size: Optional[int],
         double_buffer_units: set,
+        outer_fsdp_group_param_gather: bool = False,
     ) -> List[int]:
-        """Extend a bucket list using the communication-size heuristic."""
+        """Extend a bucket list using the communication-size heuristic. Buckets that need
+        neither a DP-Outer nor a DP-Shard all-gather count zero toward the size. Extension
+        stops once the prefetched size reaches `suggested_prefetch_size`, so the last bucket
+        group added may exceed it."""
         parameter_groups = self.buffer.parameter_groups
-        result = list(bucket_ids)
+        allgathered_bucket_ids = set(bucket_ids)
 
         def next_bucket_id():
             if prefetch_order == PrefetchOrder.FORWARD_PASS_ORDER:
-                candidate = result[0] + 1
-                for existing_bucket_id in result[1:]:
-                    if existing_bucket_id != candidate:
-                        break
+                candidate = min(allgathered_bucket_ids) + 1
+                while candidate in allgathered_bucket_ids:
                     candidate += 1
             else:
-                candidate = result[-1] - 1
-                for existing_bucket_id in reversed(result[:-1]):
-                    if existing_bucket_id != candidate:
-                        break
+                candidate = max(allgathered_bucket_ids) - 1
+                while candidate in allgathered_bucket_ids:
                     candidate -= 1
             if candidate < 0 or candidate >= self.buffer.num_buckets:
                 return None
@@ -4704,33 +4728,38 @@ class AllGatherPipeline:
         if suggested_prefetch_size is None:
             suggested_prefetch_size = 500_000_000
 
-        base_all_gather_size = sum(
-            parameter_groups[bucket_id].model_weight_buffer.bucket_index.size
-            for bucket_id in result
-        )
-        bucket_id = next_bucket_id()
-        while bucket_id is not None:
-            prefetched_size = (
-                sum(
-                    parameter_groups[result_bucket_id].model_weight_buffer.bucket_index.size
-                    for result_bucket_id in result
-                )
-                - base_all_gather_size
+        def needs_outer_gather(bucket_id):
+            group = parameter_groups[bucket_id]
+            if not outer_fsdp_group_param_gather or group.hfsdp_helper_wbuf is None:
+                return False
+            outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group(
+                is_expert_parallel=group.is_expert_param
             )
-            if prefetched_size >= suggested_prefetch_size:
-                break
+            return outer_fsdp_group.size() > 1
 
+        def all_gather_size(bucket_id):
+            if not (
+                needs_outer_gather(bucket_id) or self.get_fsdp_buffer(bucket_id).is_data_distributed
+            ):
+                return 0
+            return parameter_groups[bucket_id].model_weight_buffer.bucket_index.size
+
+        prefetched_size = 0
+        bucket_id = next_bucket_id()
+        while bucket_id is not None and prefetched_size < suggested_prefetch_size:
             if self.buffer.ddp_config.fsdp_double_buffer:
                 fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
                 double_buffer_units.add(fsdp_unit_id)
                 if len(double_buffer_units) > 2:
                     break
 
-            result.extend(self.buffer.bucket_to_bucket_group[bucket_id])
-            result = list(sorted(set(result)))
+            new_bucket_ids = set(self.buffer.bucket_to_bucket_group[bucket_id])
+            new_bucket_ids -= allgathered_bucket_ids
+            prefetched_size += sum(all_gather_size(new_id) for new_id in new_bucket_ids)
+            allgathered_bucket_ids |= new_bucket_ids
             bucket_id = next_bucket_id()
 
-        return result
+        return sorted(allgathered_bucket_ids)
 
     def _group_buckets(self, bucket_ids: List[int]) -> Dict[int, List[int]]:
         """Group selected buckets by their coalesced collective group."""
@@ -4858,7 +4887,11 @@ class AllGatherPipeline:
 
         if should_prefetch:
             ag_buckets = self._extend_by_prefetch_size(
-                ag_buckets, prefetch_order, suggested_AG_prefetch_size, double_buf_units
+                ag_buckets,
+                prefetch_order,
+                suggested_AG_prefetch_size,
+                double_buf_units,
+                outer_fsdp_group_param_gather=outer_fsdp_group_param_gather,
             )
 
         if pipeline_hfsdp_gathers and outer_fsdp_group_param_gather:

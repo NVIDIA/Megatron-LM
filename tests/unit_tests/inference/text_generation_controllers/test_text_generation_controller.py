@@ -301,6 +301,8 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         ),
         prepare_requests=mock.Mock(),
         commit_sampled_tokens=mock.Mock(),
+        capture_prompt_logprob_writes=mock.Mock(return_value=[]),
+        commit_prompt_logprob_writes=mock.Mock(),
         update_requests=mock.Mock(return_value={}),
         resolve_requests=mock.Mock(
             return_value=(torch.empty(0, dtype=torch.int32), torch.arange(metadata_len))

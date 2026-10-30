@@ -32,7 +32,7 @@ from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequ
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualRead
+from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualRead
 from megatron.core.typed_torch import apply_module
 
 # Layer symbols that may precede a shortcut MoE
@@ -509,6 +509,7 @@ class ShortcutMoEBlock(MegatronModule):
                 self.route_ready_event.record(torch.cuda.current_stream())
 
         # Launch the input and attn of the attention layer
+        paired_state = None  # initialize variable early to make pylint happy
         with quant_context_factory(attn_config, self.attn_layer_idx):
             if inference:
                 attn_layer_output = self._forward_compute_atomic(
@@ -560,6 +561,7 @@ class ShortcutMoEBlock(MegatronModule):
 
         # launch the output layer of the attention layer
         if not inference:
+            assert paired_state is not None
             with quant_context_factory(attn_config, self.attn_layer_idx):
                 if attn_recompute_context is None:
                     attn_layer_output = self.compute_layer.forward_post_core_attn(*paired_state)

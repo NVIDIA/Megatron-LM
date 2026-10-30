@@ -380,12 +380,18 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             if fp32_param is not None:
                 fp32_param.data.copy_(v["master_param"])
 
+    @torch.no_grad()
     def update_fp32_param_by_new_param(self):
         """
-        Update the fp32 parameters by the new parameters.
+        Refresh optimizer copies after loading new model parameters.
+
+        Already-FP32 parameters can also have a separate CPU copy, even though
+        they are absent from param_to_fp32_param. Leaving that copy stale would
+        overwrite the loaded model parameter on the first optimizer step.
         """
-        for param, fp32_param in self.param_to_fp32_param.items():
-            fp32_param.data.copy_(param)
+        for param, inner_param in self.param_to_inner_param.items():
+            if inner_param is not param:
+                inner_param.copy_(param)
 
     def _register_load_state_dict_hooks(self):
         def pre_load_state_dict_hook(self, state_dict):

@@ -13,6 +13,7 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
+    RuntimePolicy,
     SchedulePolicy,
     fully_shard,
     fully_shard_context,
@@ -141,8 +142,10 @@ def test_overlaps_communication_and_compute(
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
     with fully_shard_context(
         device=device,
-        use_symmetric_memory=use_symmetric_memory,
-        unify_communication_stream=unify_communication_stream,
+        runtime_policy=RuntimePolicy(
+            use_symmetric_memory=use_symmetric_memory,
+            unify_communication_stream=unify_communication_stream,
+        ),
     ) as context:
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)

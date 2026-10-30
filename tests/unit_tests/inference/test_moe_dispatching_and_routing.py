@@ -405,6 +405,13 @@ class TestNVLSAllGatherVDispatcher:
 
     @classmethod
     def setup_class(cls):
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        # Contexts built by earlier tests leave class-level dispatcher state, such as the
+        # real-token count that masks padded routing rows; start from a clean dispatcher.
+        NVLSAllGatherVDispatcher._delete_buffers()
         Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=Utils.world_size)
         _set_random_seed(seed_=123, data_parallel_random_init=False)
 

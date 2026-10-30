@@ -4,9 +4,8 @@
 
 set -euxo pipefail
 
-MOK_REVISION="${1:?Usage: install_mok.sh <git commit> <patch> <wheel directory>}"
-PATCH_FILE=$(realpath "${2:?Usage: install_mok.sh <git commit> <patch> <wheel directory>}")
-WHEEL_DIR=$(realpath -m "${3:?Usage: install_mok.sh <git commit> <patch> <wheel directory>}")
+MOK_REVISION="${1:?Usage: install_mok.sh <git commit> <wheel directory>}"
+WHEEL_DIR=$(realpath -m "${2:?Usage: install_mok.sh <git commit> <wheel directory>}")
 PYTHON="${UV_PROJECT_ENVIRONMENT:-/opt/venv}/bin/python"
 
 if [[ ! "${MOK_REVISION}" =~ ^[0-9a-f]{40}$ ]]; then
@@ -33,8 +32,6 @@ git init "${WORK_DIR}"
 git -C "${WORK_DIR}" remote add origin https://github.com/QiZhangNV/mixture-of-kittens.git
 git -C "${WORK_DIR}" fetch --depth 1 origin "${MOK_REVISION}"
 git -C "${WORK_DIR}" checkout --detach "${MOK_REVISION}"
-git -C "${WORK_DIR}" apply --check "${PATCH_FILE}"
-git -C "${WORK_DIR}" apply "${PATCH_FILE}"
 bash "${WORK_DIR}/scripts/prepare_thunderkittens.sh"
 
 export NVCC="${CUDA_HOME:-/usr/local/cuda}/bin/nvcc"

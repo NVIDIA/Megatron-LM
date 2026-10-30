@@ -1,9 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import importlib.metadata
+import itertools
 from types import SimpleNamespace
 
 import pytest
 import torch
+from packaging.version import Version
 
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.context_parallel import gdp_common
@@ -29,8 +32,11 @@ else:
     gdp_cp_module = None
 
 if HAVE_CUTEDSL_GDP_CP:
+    import cutlass.cute as cute
+
     import megatron.core.ssm.context_parallel.gdp_cutedsl as gdp_cutedsl_cp_module
 else:
+    cute = None
     gdp_cutedsl_cp_module = None
 
 
@@ -206,3 +212,65 @@ def test_cutedsl_backend_adapts_four_function_protocol(monkeypatch):
     assert calls["backward_apply"][0] is backend_backward_context
     assert calls["backward_apply"][1] is suffix.packed
     assert calls["backward_apply"][2] is None
+
+
+@pytest.mark.skipif(
+    not HAVE_CUTEDSL_GDP_CP or not torch.cuda.is_available(),
+    reason="CuTeDSL GDP CP backend or CUDA is unavailable",
+)
+def test_cutedsl_backend_compiles_boundary_variants_at_first_forward(monkeypatch):
+    """Verify no CP boundary case compiles a kernel after the first forward."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("CuTeDSL GDP requires an SM100 GPU")
+    if Version(importlib.metadata.version("gdp-attn-fused")) < Version("0.5.2"):
+        pytest.skip("gdp-attn-fused < 0.5.2 keys the backward summary on token and sequence count")
+    assert gdp_cutedsl_cp_module is not None
+    num_tokens, num_heads, num_householder, key_dim, value_dim = 512, 4, 3, 128, 64
+    widths = [
+        num_householder * num_heads * value_dim,
+        num_householder * num_heads * key_dim,
+        num_heads * key_dim,
+    ]
+    torch.manual_seed(0)
+    # Strided q/k views and a contiguous v, as GatedDeltaProductMixer passes them under CP.
+    value, key, query = torch.randn(
+        num_tokens, sum(widths), device="cuda", dtype=torch.bfloat16
+    ).split(widths, dim=-1)
+    inputs = GDPInputs(
+        q=query,
+        k=key,
+        v=value.contiguous(),
+        g=-0.1 * torch.rand(num_tokens, num_heads, device="cuda"),
+        beta=torch.rand(
+            num_tokens, num_householder * num_heads, device="cuda", dtype=torch.bfloat16
+        ),
+        cu_seqlens=torch.tensor([0, 100, 320, num_tokens], dtype=torch.int32, device="cuda"),
+        num_householder=num_householder,
+        scale=key_dim**-0.5,
+    )
+    backend = gdp_cutedsl_cp_module.CuTeDSLGatedDeltaProductCPBackend(recompute_chunk_num=1)
+    compile_calls = []
+    compile_fn = cute.compile
+
+    def counting_compile(*args, **kwargs):
+        compile_calls.append(args[0])
+        return compile_fn(*args, **kwargs)
+
+    monkeypatch.setattr(cute, "compile", counting_compile)
+
+    backend.cp_forward_prepare(inputs)
+    num_compiles = len(compile_calls)
+    if num_compiles == 0:
+        pytest.skip("gdp_attn kernels were already compiled in this process")
+    for num_preceding, num_following in itertools.product((0, 1), repeat=2):
+        forward_summary, local_context = backend.cp_forward_prepare(inputs)
+        preceding = forward_summary.packed.unsqueeze(0)[:num_preceding]
+        output, saved_context = backend.cp_forward_apply(
+            local_context, CPForwardPackedSummary(packed=preceding)
+        )
+        backward_summary, backward_context = backend.cp_backward_prepare(
+            torch.ones_like(output), saved_context
+        )
+        following = backward_summary.packed.unsqueeze(0)[:num_following]
+        backend.cp_backward_apply(backward_context, CPBackwardPackedSummary(packed=following))
+    assert len(compile_calls) == num_compiles
