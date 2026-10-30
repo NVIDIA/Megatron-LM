@@ -2316,3 +2316,110 @@ def test_disagg_engine_resolves_handoff_methods_from_mixin():
             engine_cls.add_request_with_kv_handoff
             is InferenceStateHandoffMixin.add_request_with_kv_handoff
         )
+
+
+class TestAsyncSchedHiddenChunkedPrefill(_DynamicInferenceEngineTestBase):
+    """Overlap steps keep a chunked prefill request that waits outside the active rows."""
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        delete_cuda_graphs()
+        _reset_rounder()
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_overlap_finish_keeps_hidden_chunk_blocks(self) -> None:
+        """Requests 0 and 1 (16 and 15 tokens) decode 9 tokens each. Request 2 prefills
+        a 17-token first chunk of its 47-token prompt, then waits outside the active rows
+        for KV blocks. Requests 0 and 1 finish together in an overlap step; request 2
+        must keep its prefilled blocks and finish, and every block must be freed."""
+        usable_block_count = 10
+
+        def config(**kwargs):
+            return _DynamicEngineTestConfig(
+                num_requests=0,
+                max_sequence_length=64,
+                context_block_size_tokens=8,
+                context_max_requests=4,
+                context_max_tokens=48,
+                enable_chunked_prefill=True,
+                async_sched_mode=AsyncScheduleMode.ASYNC,
+                model_provider="gpt",
+                **kwargs,
+            )
+
+        block_size_bytes = self._build_test_env(config()).engine.context.block_size_bytes
+        env = self._build_test_env(
+            config(
+                context_buffer_size_gb=(usable_block_count + 1.5) * block_size_bytes / 1024**3,
+                context_paused_buffer_size_gb=0.0,
+            )
+        )
+        engine = env.engine
+        context = engine.context
+        allocator = context.kv_block_allocator
+        assert allocator.pool_size == usable_block_count + 1
+
+        # Paged attention kernels need 256-token blocks; scheduling needs no real logits.
+        def mock_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            logits = torch.zeros(
+                *tokens.shape, env.config.vocab_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            if env.config.materialize_only_last_token_logits:
+                logits = context.last_token_logits(logits).unsqueeze(0)
+            return logits
+
+        engine.controller.inference_wrapped_model.model.forward = mock_forward
+
+        # Witness overlap steps that start while request 2 is hidden.
+        decide = engine._should_run_async_sched_overlap
+        hidden_overlaps = []
+
+        def record_overlap_decision():
+            overlap = decide()
+            active_ids = context.request_ids[: context.total_request_count].tolist()
+            hidden_overlaps.append(
+                overlap and context.chunked_prefill_request_id == 2 and 2 not in active_ids
+            )
+            return overlap
+
+        engine._should_run_async_sched_overlap = record_overlap_decision
+
+        limits = {0: 9, 1: 9, 2: 1}
+        for request_id, prompt_length in ((0, 16), (1, 15), (2, 47)):
+            engine._add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=torch.arange(
+                        1, prompt_length + 1, dtype=torch.int64, device=torch.cuda.current_device()
+                    ),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=limits[request_id], termination_id=-1
+                    ),
+                )
+            )
+
+        finished = {}
+        for _ in range(100):
+            if not engine.has_unfinished_requests():
+                break
+            for request in engine.step_modern()["finished_requests"]:
+                finished[request.request_id] = request
+
+        assert any(hidden_overlaps), "no overlap step ran while request 2 was hidden"
+        assert sorted(finished) == [0, 1, 2]
+        for request_id, request in finished.items():
+            assert request.status == Status.COMPLETED, request_id
+            assert len(request.generated_tokens) == limits[request_id], request_id
+        assert allocator.pool_avail == usable_block_count, "KV blocks leaked"

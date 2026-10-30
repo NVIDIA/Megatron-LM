@@ -4626,7 +4626,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if finished_idxs.numel() > 0:
             self.release_memory_blocks_from_request_indexes(finished_idxs)
 
-        if active_request_count == 0:
+        # A chunked prefill request waiting for its next chunk keeps its row, with its KV
+        # blocks, just past the active rows. Keep it, and pull it to the new boundary
+        # below, as update_requests does.
+        hidden_chunk_idx = self.get_index_of_chunked_prefill_request(safe=False)
+        if hidden_chunk_idx < old_active_request_count:
+            hidden_chunk_idx = -1
+
+        if active_request_count == 0 and hidden_chunk_idx == -1:
             self.request_to_kv_block_ids.fill_(-1)
             self.total_request_count = 0
             # Finished request slots were freed above. Detached handoff/import
@@ -4657,6 +4664,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.mtp_metadata.reset_request_rows(stale_slice)
         if self.is_hybrid_model:
             self.mamba_metadata.request_to_mamba_state_idx[stale_slice] = -1
+        if hidden_chunk_idx not in (-1, active_request_count):
+            self._swap_book_keeping_tensors(
+                src_idxs=torch.tensor([hidden_chunk_idx], device=self.request_ids.device),
+                dst_idxs=torch.tensor([active_request_count], device=self.request_ids.device),
+            )
         self.total_request_count = active_request_count
         return finished_request_ids, survivor_idxs
 
