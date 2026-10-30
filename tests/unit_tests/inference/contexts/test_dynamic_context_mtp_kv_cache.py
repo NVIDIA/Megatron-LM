@@ -574,6 +574,48 @@ class TestMtpMainExecutionState:
             assert (m._max_seqlen_q, m._max_seqlen_k) == (max_seqlen_q, max_seqlen_k), name
         assert mha.state_data["max_seqlen_q"] == 64
 
+    def test_mtp_forwards_select_their_own_nccl_ep_dispatch_path(self, monkeypatch):
+        """The NCCL EP dispatcher follows each MTP forward's CUDA-graph flag, not the step's.
+
+        On a graphed step the draft-KV commit pass, and the EP dummy forward that mirrors it on
+        ranks without a commit, still run eagerly with a different row count on each EP rank, so
+        they need the variable-count all-gather. Graphed draft depths take the fixed-count one
+        again, and leaving the MTP phase restores the main step's choice.
+        """
+        from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
+
+        context = _make_context()
+        device = torch.cuda.current_device()
+        _seed_requests(context, [[3, 4]])
+        table = torch.full(
+            (1, context.max_kv_block_count),
+            3,
+            dtype=context.gpu_view.mha_block_table.dtype,
+            device=device,
+        )
+        # Stand in for a graphed step of an NCCL EP > 1 deployment.
+        context._nccl_ep_dispatcher = True
+        context._using_cuda_graph_this_step = True
+        monkeypatch.setattr(NCCLAllGatherDispatcher, "_use_allgather_v", False)
+
+        with context._mtp_forward_phase():
+            context._mtp_setup_prefill_step(
+                append_counts=torch.tensor([2], device=device), block_table_prefill=table
+            )
+            assert NCCLAllGatherDispatcher._use_allgather_v is True
+            context.mtp_metadata.end_forward()
+            context._mtp_begin_decode(1, 1, torch.tensor([5], device=device), graphed=True)
+            context._mtp_setup_decode_step()
+            assert NCCLAllGatherDispatcher._use_allgather_v is False
+        assert NCCLAllGatherDispatcher._use_allgather_v is False
+
+        # The EP dummy of the commit pass: an eager draft staged on the dummy block.
+        with context._mtp_forward_phase(preserve_step_bookkeeping=True):
+            context.mtp_metadata.begin_decode_for_capture(1, graphed=False)
+            context._mtp_setup_decode_step()
+            assert NCCLAllGatherDispatcher._use_allgather_v is True
+        assert NCCLAllGatherDispatcher._use_allgather_v is False
+
     def test_state_is_restored_when_a_draft_forward_raises(self):
         """A failed draft must not leave its counts behind for the log-prob code."""
         context = _make_context()

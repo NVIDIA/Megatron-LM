@@ -302,6 +302,29 @@ class TestMoeAlignBlockSize:
         actual_pairs = set(real_ids.cpu().tolist())
         assert actual_pairs == expected_pairs
 
+    def test_valid_tokens_past_routing_map_rows(self):
+        """A valid-token count above the routing-map rows indexes only the pairs of those rows."""
+        from megatron.core.inference.moe.vllm_fused_moe import _moe_align_block_size_cuda_graphable
+
+        max_tokens, topk, num_experts, block_size = 6, 2, 8, 16
+        torch.manual_seed(42)
+        # The routing map views the head of a larger buffer whose tail rows each route one slot
+        # to the last expert, so a pair read past the view would be counted and placed.
+        buffer = torch.full((4 * max_tokens, topk), -1, dtype=torch.int64, device="cuda")
+        buffer[:, 0] = num_experts - 1
+        buffer[:max_tokens] = torch.randint(0, num_experts - 1, (max_tokens, topk), device="cuda")
+        routing_map = buffer[:max_tokens]
+        sorted_ids, _, num_post_padded = _moe_align_block_size_cuda_graphable(
+            routing_map, block_size, num_experts, 0, _vt(max_tokens + 4)
+        )
+
+        counts = torch.bincount(routing_map.flatten(), minlength=num_experts)
+        aligned = (counts + block_size - 1) // block_size * block_size
+        assert num_post_padded.item() == aligned.sum().item()
+        sentinel = max_tokens * topk
+        placed = sorted_ids[sorted_ids != sentinel]
+        assert sorted(placed.tolist()) == list(range(sentinel))
+
     @pytest.mark.parametrize("block_size", [16, 32, 64, 128])
     def test_expert_ids_cover_all_blocks(self, block_size):
         """expert_ids has a valid expert index for every block in [0, num_post_padded/block_size)."""
@@ -651,6 +674,44 @@ class TestVllmFusedMoe:
         torch.testing.assert_close(
             result[:valid_tokens], expected[:valid_tokens], atol=5e-2, rtol=5e-2
         )
+
+    def test_valid_tokens_past_input_rows(self):
+        """A valid-token count above the input rows writes only the output rows."""
+        from megatron.core.inference.moe.fused_moe import ActivationType
+        from megatron.core.inference.moe.vllm_fused_moe import vllm_fused_moe
+
+        max_tokens, hidden_size, ffn_hidden, topk, num_experts = 6, 64, 64, 2, 4
+        hidden, probs, routing_map, fc1_weight, fc2_weight = _make_moe_inputs(
+            max_tokens, hidden_size, ffn_hidden, topk, num_experts
+        )
+        # The routing map and the output view the head of larger buffers. The routing tail
+        # routes nowhere, so rows past the inputs could only show up as stores past the output.
+        routing_buffer = torch.full((4 * max_tokens, topk), -1, dtype=torch.int64, device="cuda")
+        routing_buffer[:max_tokens] = routing_map
+        routing_map = routing_buffer[:max_tokens]
+        sentinel = 12345.0
+        out_buffer = torch.full(
+            (4 * max_tokens, hidden_size), sentinel, dtype=torch.float32, device="cuda"
+        )
+
+        vllm_fused_moe(
+            hidden,
+            probs,
+            fc1_weight,
+            fc2_weight,
+            ActivationType.SQUARED_RELU,
+            num_experts,
+            0,
+            _vt(max_tokens + 4),
+            routing_map,
+            out=out_buffer[:max_tokens],
+        )
+        expected = _ref_sequential_moe(
+            hidden, probs, fc1_weight, fc2_weight, routing_map, num_experts, 0, max_tokens
+        )
+
+        torch.testing.assert_close(out_buffer[:max_tokens], expected, atol=5e-2, rtol=5e-2)
+        assert torch.all(out_buffer[max_tokens:] == sentinel)
 
     def test_output_buffer_reuse(self):
         """Output is written to provided buffer when out= is specified."""

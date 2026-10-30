@@ -357,7 +357,7 @@ def _init_sorted_ids_kernel(
         tl.store(pre_initialized_output_buffer_ptr + offs, 0, mask=offs < num_local_experts)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["max_pairs"])
 def _scatter_token_indices_kernel(
     routing_map_ptr,
     sorted_token_ids_ptr,
@@ -376,7 +376,7 @@ def _scatter_token_indices_kernel(
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
-    valid_pairs = valid_tokens * topk
+    valid_pairs = tl.minimum(valid_tokens * topk, max_pairs)
     if pid * BLOCK_SIZE >= valid_pairs:
         return
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -573,7 +573,7 @@ def _invoke_fused_moe_kernel(
 # ---------------------------------------------------------------------------
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["max_tokens"])
 def _moe_sum_kernel(
     input_ptr,
     output_ptr,
@@ -582,6 +582,7 @@ def _moe_sum_kernel(
     routing_map_ptr,
     local_expert_start,
     num_local_experts: tl.constexpr,
+    max_tokens,
     K,
     topk: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -604,12 +605,13 @@ def _moe_sum_kernel(
     Routing weight multiplication and accumulation in fp32 for numerical accuracy.
 
     Persistent grid: launches BLOCK_M CTAs that stride over valid_tokens.
-    CUDA-graph safe (grid is static); the loop bound is loaded device-side.
+    CUDA-graph safe (grid is static); the loop bound is loaded device-side and
+    clamped to max_tokens.
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
 
-    for token_id in tl.range(pid, valid_tokens, BLOCK_M):
+    for token_id in tl.range(pid, tl.minimum(valid_tokens, max_tokens), BLOCK_M):
         token_id_i64 = token_id.to(tl.int64)
         base = token_id_i64 * topk * K
 
@@ -687,6 +689,7 @@ def _moe_sum(
         routing_map,
         local_expert_start,
         num_local_experts,
+        max_tokens,
         K,
         topk=topk,
         BLOCK_M=BLOCK_M,

@@ -276,11 +276,11 @@ class MTPContextMixin:
         """Scope one step's MTP forwards and undo their effects on the context on the way out.
 
         Every MTP forward republishes the active attention metadata, token counts and CUDA-graph
-        flag, and leaves `forward_mode` set so KV append/read route to the draft plane. Log-prob
-        computation runs after this scope and reads those fields expecting the MAIN forward's
-        values, and a `forward_mode` left set would keep `is_decode_only` False and KV routing on
-        the draft plane for the rest of the run. Both are undone on exit, including when a draft
-        forward raises.
+        flag (with the NCCL EP dispatch path that follows it), and leaves `forward_mode` set so
+        KV append/read route to the draft plane. Log-prob computation runs after this scope and
+        reads those fields expecting the MAIN forward's values, and a `forward_mode` left set
+        would keep `is_decode_only` False and KV routing on the draft plane for the rest of the
+        run. Both are undone on exit, including when a draft forward raises.
 
         Args:
             preserve_step_bookkeeping (bool): Also restore the step's attention bookkeeping: the
@@ -319,6 +319,7 @@ class MTPContextMixin:
                 self.padded_active_token_count,
                 self._using_cuda_graph_this_step,
             ) = saved
+            self._select_nccl_ep_dispatch_path()
             if preserve_step_bookkeeping:
                 self.gpu_view._buf.copy_(saved_bookkeeping)
                 for mha, state_data, max_seqlen_q, max_seqlen_k in saved_mha_state:
@@ -354,6 +355,9 @@ class MTPContextMixin:
         self.active_token_count = token_count
         self.padded_active_token_count = padded_token_count
         self._using_cuda_graph_this_step = graphed
+        # The eager commit pass and its dummy carry different row counts per EP rank even on a
+        # graphed step, so the NCCL EP dispatcher must follow this forward, not the main step.
+        self._select_nccl_ep_dispatch_path()
         return mha
 
     def _mtp_begin_decode(

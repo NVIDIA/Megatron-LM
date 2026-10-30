@@ -785,6 +785,47 @@ def test_vllm_moe_align_block_size_replays():
     )
 
 
+def test_vllm_fused_moe_clamps_valid_tokens_to_rows_replay():
+    """The count, scatter and top-k sum kernels clamp ``valid_tokens`` to the input rows: a larger
+    count replays bit-exactly and gives the ``valid_tokens == rows`` result bit for bit."""
+    from megatron.core.inference.moe.fused_moe import ActivationType
+    from megatron.core.inference.moe.vllm_fused_moe import vllm_fused_moe
+
+    seeded()
+    rows, hidden, ffn, topk, experts = 1024, 1024, 512, 8, 32
+    hidden_states = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    probs = torch.rand(rows, topk, device="cuda")
+    # The routing map and the output view the head of larger buffers. The routing tail routes
+    # nowhere, so rows past the inputs could only show up as stores past the output.
+    routing_buffer = torch.full((2 * rows, topk), -1, device="cuda", dtype=torch.int64)
+    routing_buffer[:rows] = torch.randint(0, experts, (rows, topk), device="cuda")
+    routing_map = routing_buffer[:rows]
+    fc1 = torch.randn(experts, ffn, hidden, device="cuda", dtype=torch.bfloat16) * 0.02
+    fc2 = torch.randn(experts, hidden, ffn, device="cuda", dtype=torch.bfloat16) * 0.02
+    out_buffer = torch.empty(2 * rows, hidden, device="cuda")
+
+    def fn(h, p, valid_tokens=2 * rows):
+        out_buffer.fill_(-1.0)
+        vllm_fused_moe(
+            h,
+            p,
+            fc1,
+            fc2,
+            ActivationType.SQUARED_RELU,
+            experts,
+            0,
+            _dev_scalar(valid_tokens),
+            routing_map,
+            out=out_buffer[:rows],
+        )
+        return out_buffer.clone()
+
+    assert_replays_bit_exact(
+        fn, (hidden_states, probs), replays=4, backward=False, what="vllm_fused_moe clamp"
+    )
+    assert torch.equal(fn(hidden_states, probs), fn(hidden_states, probs, valid_tokens=rows))
+
+
 # --- batch-invariant kernels -----------------------------------------------------------------
 
 
