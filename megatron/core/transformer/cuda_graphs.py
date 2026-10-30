@@ -2468,6 +2468,16 @@ class TECudaGraphHelper:
                         uses_mla = False
                     elif config_type in (MLALayerConfig, DSALayerConfig, CSALayerConfig):
                         uses_mla = True
+                if transformer_module.position_embedding_type == 'mrope' and not uses_mla:
+                    # Capture the tensor input; replay provides the actual position embeddings.
+                    position_ids = torch.zeros(
+                        (3, self.micro_batch_size, self.seq_length),
+                        device=transformer_input.device,
+                        dtype=torch.long,
+                    )
+                    return transformer_module.rotary_pos_emb(
+                        position_ids, transformer_module.mrope_section
+                    )
                 if transformer_module.position_embedding_type == 'rope' and not uses_mla:
                     rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
                         None, transformer_module.decoder, transformer_input, self.config, None
@@ -2792,7 +2802,7 @@ class TECudaGraphHelper:
                 kwargs['fp8_recipe'] = (
                     get_fp8_recipe(self.config) if self.config.fp8 else get_fp4_recipe(self.config)
                 )
-                kwargs['fp8_weight_caching'] = True
+                kwargs['fp8_weight_caching'] = not self.config.disable_parameter_transpose_cache
                 if (
                     is_te_min_version("1.14.0")
                     and self.pg_collection is not None
