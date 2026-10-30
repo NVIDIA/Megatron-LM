@@ -2177,6 +2177,8 @@ class ParamAndGradBuffer:
                 f"[ParamAndGradBuffer] FSDP UBRegistration Groups ({len(self.ubr_groups)}):",
             )
             # All ranks in each group must participate in the collective to avoid deadlock.
+            # Only these groups' communicators are registered, so ranks outside this
+            # buffer's groups (e.g. another model's mesh) do not take part.
             for i, group in enumerate(self.ubr_groups):
                 log_single_rank(
                     logger,
@@ -2191,9 +2193,6 @@ class ParamAndGradBuffer:
                     f"Call Success with the group [{i+1}/{len(self.ubr_groups)}] "
                     f"group.group_desc: {group.group_desc}",
                 )
-            # Call barrier from the global communitcator group
-            torch.distributed.barrier(async_op=False)
-            log_single_rank(logger, logging.INFO, "Call Success with the global communicator group")
 
         # If using nccl_ub, it returns a function that registers buffers to the NCCL memory pool
         # Buffer is registered to data_parallel_group and expert_data_parallel_group if it exists
@@ -2308,7 +2307,10 @@ class ParamAndGradBuffer:
 
         global NCCL_MEMORY_POOL
         torch.cuda.synchronize()
-        torch.distributed.barrier(async_op=False)
+        # Synchronize the ranks that register on each group, in the same group order on
+        # every rank. Ranks outside this buffer's groups do not take part.
+        for group in self.ubr_groups:
+            torch.distributed.barrier(group=group, async_op=False)
         torch.cuda.synchronize()
 
         for group in self.ubr_groups:
