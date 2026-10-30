@@ -1339,7 +1339,7 @@ class TestMoEModules:
         import transformer_engine_torch as tex
         from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
-        from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+        from megatron.core.transformer.moe.training_matches_inference import mxfp8_training_stack
 
         seeded()
         quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
@@ -1356,7 +1356,7 @@ class TestMoEModules:
             )
 
         def build_stack(_unused):
-            stack = InferenceGroupedMLP._mxfp8_training_stack(module, "linear_fc1", "triton")
+            stack = mxfp8_training_stack(module, "linear_fc1", "triton")
             return stack.data.view(torch.uint8), stack.scale.view(torch.uint8)
 
         # The stack is derived from the module's parameters, not from an argument; the
@@ -1370,7 +1370,7 @@ class TestMoEModules:
 
     @pytest.mark.parametrize("recipe", ["nvfp4-squared_relu", "nvfp4-swiglu"])
     def test_inference_kernel_value_pass_replays(self, recipe):
-        """``moe_match_generation_forward``: value pass, recompute and backward replay.
+        """``moe_training_matches_inference``: value pass, recompute and backward replay.
 
         The value pass runs the FlashInfer kernel on weights requantized from the
         parameters and the backward comes from the TE recompute, so this covers both
@@ -1386,7 +1386,7 @@ class TestMoEModules:
         from megatron.core.transformer.moe.token_dispatcher_inference import (
             InferenceAllGatherDispatcherBase,
         )
-        from tests.unit_tests.inference.test_moe_match_generation_forward import (
+        from tests.unit_tests.inference.test_moe_training_matches_inference import (
             _build_layer,
             _config,
             _hidden,
@@ -1405,7 +1405,7 @@ class TestMoEModules:
                 recipe,
                 expert_model_parallel_size=1,
                 inference_moe_token_dispatcher_type="nccl",
-                moe_match_generation_forward=True,
+                moe_training_matches_inference=True,
             )
             layer = _build_layer(config)
             hidden = _hidden(config, seed=1, tokens=512).requires_grad_()

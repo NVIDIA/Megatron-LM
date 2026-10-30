@@ -1541,7 +1541,7 @@ class TransformerConfig(ModelParallelConfig):
       grouped-GEMM path, allowing per-layer mixed BF16/MXFP8 policies.
     """
 
-    moe_match_generation_forward: bool = False
+    moe_training_matches_inference: bool = False
     """Run the training MoE forward through generation's FlashInfer routed MXFP8 or
     per-token NVFP4 expert kernel, so training log-probs match generation bitwise.
     The backward comes from the TE recompute pass. Requires
@@ -1549,7 +1549,7 @@ class TransformerConfig(ModelParallelConfig):
     batch_invariant_mode and selective 'moe' recompute. The kernel weights are rebuilt
     from the parameters on the first microbatch of each forward-backward call, as TE
     refreshes its quantized weights, and held until the next call unless the model's
-    release_match_generation_weights() frees them first. A forward that bypasses the
+    release_inference_value_pass_weights() frees them first. A forward that bypasses the
     pipeline schedules after the parameters change must call the model's
     set_is_first_microbatch() first."""
     inference_moe_disable_fused_quant_kernels: bool = False
@@ -2388,10 +2388,10 @@ class TransformerConfig(ModelParallelConfig):
                         "parallelism requires inference_moe_token_dispatcher_type='nvls'."
                     )
 
-        if self.moe_match_generation_forward:
+        if self.moe_training_matches_inference:
             if self.transformer_impl != "inference_optimized":
                 raise ValueError(
-                    "moe_match_generation_forward requires "
+                    "moe_training_matches_inference requires "
                     f"transformer_impl='inference_optimized'; got '{self.transformer_impl}'."
                 )
             # Not yet converted to the enum on every path.
@@ -2400,7 +2400,7 @@ class TransformerConfig(ModelParallelConfig):
                 backend = backend.value
             if backend != InferenceGroupedGemmBackend.FLASHINFER.value:
                 raise ValueError(
-                    "moe_match_generation_forward supports only "
+                    "moe_training_matches_inference supports only "
                     f"inference_grouped_gemm_backend='flashinfer'; got '{backend}'. "
                     "The torch and vLLM kernels already match TE training under "
                     "batch_invariant_mode."
@@ -2410,17 +2410,17 @@ class TransformerConfig(ModelParallelConfig):
                 and self.inference_moe_nvfp4_recipe is None
             ):
                 raise ValueError(
-                    "moe_match_generation_forward requires FlashInfer routed MXFP8 "
+                    "moe_training_matches_inference requires FlashInfer routed MXFP8 "
                     "(fp8_recipe='mxfp8') or per-token NVFP4 (inference_moe_nvfp4_recipe). "
                     "The FlashInfer BF16 kernel is not batch invariant."
                 )
             if self.expert_tensor_parallel_size > 1:
                 raise ValueError(
-                    "moe_match_generation_forward does not support expert tensor parallelism."
+                    "moe_training_matches_inference does not support expert tensor parallelism."
                 )
             if not self.batch_invariant_mode:
                 raise ValueError(
-                    "moe_match_generation_forward requires batch_invariant_mode, so "
+                    "moe_training_matches_inference requires batch_invariant_mode, so "
                     "that a token's output does not depend on how many tokens share the "
                     "kernel launch."
                 )
@@ -2430,19 +2430,19 @@ class TransformerConfig(ModelParallelConfig):
                 or "moe" not in (self.recompute_modules or [])
             ):
                 raise ValueError(
-                    "moe_match_generation_forward requires "
+                    "moe_training_matches_inference requires "
                     "recompute_granularity='selective' with 'moe' in recompute_modules: "
                     "the value pass stores no activations, so the backward must come "
                     "from a recompute pass."
                 )
             if self.cuda_graph_impl == "local":
                 raise ValueError(
-                    "moe_match_generation_forward is incompatible with "
+                    "moe_training_matches_inference is incompatible with "
                     "cuda_graph_impl='local', which disables MoE-layer recompute."
                 )
             if self.overlap_moe_expert_parallel_comm:
                 raise ValueError(
-                    "moe_match_generation_forward is incompatible with "
+                    "moe_training_matches_inference is incompatible with "
                     "overlap_moe_expert_parallel_comm: the overlapped schedule does "
                     "not go through MoELayer.forward, where the value pass is chosen."
                 )
@@ -2452,20 +2452,20 @@ class TransformerConfig(ModelParallelConfig):
             unsupported = {"sinkhorn", "quantile_balancing"}.intersection(balancing)
             if unsupported:
                 raise ValueError(
-                    f"moe_match_generation_forward does not support "
+                    f"moe_training_matches_inference does not support "
                     f"moe_router_load_balancing_type={sorted(unsupported)}: generation "
                     "routes with plain top-k, so the training forward would select "
                     "different experts."
                 )
             if self.moe_input_jitter_eps is not None:
                 raise ValueError(
-                    "moe_match_generation_forward is incompatible with "
+                    "moe_training_matches_inference is incompatible with "
                     "moe_input_jitter_eps: jitter perturbs the router input in "
                     "training only, so the two forwards would route differently."
                 )
             if self.moe_router_force_load_balancing or self.moe_router_force_biased is not None:
                 raise ValueError(
-                    "moe_match_generation_forward is incompatible with "
+                    "moe_training_matches_inference is incompatible with "
                     "moe_router_force_load_balancing / moe_router_force_biased, which "
                     "overwrite the training router's logits."
                 )

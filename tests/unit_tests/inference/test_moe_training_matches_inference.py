@@ -1,8 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Tests for ``moe_match_generation_forward``.
+"""Tests for ``moe_training_matches_inference``.
 
-``moe_match_generation_forward`` runs the training MoE forward through the
+``moe_training_matches_inference`` runs the training MoE forward through the
 FlashInfer routed MXFP8 or per-token NVFP4 kernel generation uses, and takes its
 backward from a TE recompute pass. Those kernels are batch invariant but do not
 match TE training, so without this a training log-prob and a generation log-prob of
@@ -17,9 +17,7 @@ cover:
    FlashInfer kernel rather than silently falling back to TE (which still gives
    finite outputs and gradients).
 3. The value pass keeps reproducing the generation forward bitwise after the weights
-   change, and independently of how many tokens share the launch. Single-batch
-   parity is ``test_flashinfer_value_pass_matches_generation`` in
-   ``test_moe_dispatching_and_routing.py``, next to the TE comparison it replaces.
+   change, and independently of how many tokens share the launch.
 4. A value pass larger than the NVLS symmetric heap, which cannot grow, is split
    into heap-sized launches with unchanged output; and without generation in its
    process, as when the two run apart, the value pass allocates its own heap and
@@ -57,6 +55,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     set_batch_invariant_mode,
 )
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.moe import training_matches_inference
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceAllGatherDispatcherBase,
     NCCLAllGatherDispatcher,
@@ -161,7 +160,7 @@ def _generation_and_training_configs(recipe, **overrides):
     """``(generation, training)`` configs differing only in the parity flag."""
     return (
         _config(recipe, **overrides),
-        _config(recipe, **overrides, moe_match_generation_forward=True),
+        _config(recipe, **overrides, moe_training_matches_inference=True),
     )
 
 
@@ -237,7 +236,7 @@ def _layer_pair(recipe, gen_config, train_config, max_tokens=LOCAL_TOKENS):
         train_layer = _build_layer(train_config).eval()
     train_layer.load_state_dict(gen_layer.state_dict())
     if recipe == "mxfp8":
-        assert train_layer.experts._expert_params_use_te_mxfp8()
+        assert training_matches_inference.expert_params_use_te_mxfp8(train_layer.experts)
         quantize_model_to_mxfp8(gen_layer, backend="triton")
     return gen_layer, train_layer
 
@@ -261,17 +260,18 @@ def _elements_that_differ(got, want) -> int:
     return int(differing.item())
 
 
-def _spy_on_value_pass(experts):
-    """Count value passes and record the routing map each one is handed."""
-    original = experts._match_generation_forward_pass
-    seen = []
+@pytest.fixture
+def spy_on_value_pass(monkeypatch):
+    """Record the routing map each value pass of an experts module is handed."""
+    original = training_matches_inference.expert_value_pass
+    seen = {}
 
-    def spy(hidden_states, probs, routing_map):
-        seen.append(routing_map)
-        return original(hidden_states, probs, routing_map=routing_map)
+    def spy(experts, hidden_states, probs, routing_map):
+        seen.setdefault(id(experts), []).append(routing_map)
+        return original(experts, hidden_states, probs, routing_map)
 
-    experts._match_generation_forward_pass = spy
-    return seen
+    monkeypatch.setattr(training_matches_inference, "expert_value_pass", spy)
+    return lambda experts: seen.setdefault(id(experts), [])
 
 
 @pytest.fixture
@@ -336,7 +336,7 @@ def _validated_config(**overrides):
         attention_dropout=0.0,
         batch_invariant_mode=True,
         batch_invariant_backend="te_native",
-        moe_match_generation_forward=True,
+        moe_training_matches_inference=True,
         # The value pass stores no activations, so the backward has to come from
         # a recompute pass. Validated, not assumed.
         recompute_granularity="selective",
@@ -353,7 +353,7 @@ class TestBackendAllowList:
     def test_flashinfer_quantized_recipes_are_accepted(self, recipe):
         """MXFP8 needs no extra opt-in: its TE recompute is MXFP8 too."""
         overrides = dict(inference_moe_nvfp4_recipe=None, **_MXFP8) if recipe == "mxfp8" else {}
-        assert _validated_config(**overrides).moe_match_generation_forward
+        assert _validated_config(**overrides).moe_training_matches_inference
 
     @pytest.mark.parametrize("backend", ["vllm", "torch"])
     def test_backends_that_already_match_training_are_rejected(self, backend):
@@ -452,7 +452,7 @@ class TestGenerationRouteOrder:
     def test_value_pass_keeps_generation_top_k_order(self):
         from types import SimpleNamespace
 
-        from megatron.core.transformer.moe.moe_layer import MoELayer
+        from megatron.core.transformer.moe.training_matches_inference import _route
 
         probs = torch.tensor([[0.5, 0.1, 0.3]])
         ids = torch.tensor([[5, 1, 3]])
@@ -462,15 +462,22 @@ class TestGenerationRouteOrder:
             seen["shape"], seen["input_ids"] = hidden_states.shape, input_ids
             return probs, ids
 
-        stub = SimpleNamespace(
-            router=SimpleNamespace(_forward=generation_route),
-            token_dispatcher=SimpleNamespace(wrap_layer_input=lambda x: x),
-        )
+        stub = SimpleNamespace(route=generation_route)
         input_ids = torch.tensor([[7, 8], [9, 10], [11, 12]])
-        out_probs, out_ids = MoELayer._route_as_generation(stub, torch.zeros(2, 3, 4), input_ids)
+        out_probs, out_ids = _route(stub, torch.zeros(2, 3, 4), input_ids)
 
         assert out_ids is ids and out_probs is probs
         assert seen["shape"] == (6, 1, 4) and seen["input_ids"] is input_ids
+
+    def test_generation_router_path_under_inference_mode(self):
+        """Under InferenceMode the router skips the training path and returns generation's."""
+        from types import SimpleNamespace
+
+        from megatron.core.transformer.moe.router import InferenceTopKRouter
+
+        stub = SimpleNamespace(_forward=lambda *args: "generation")
+        with InferenceMode.active():
+            assert InferenceTopKRouter.forward(stub, torch.zeros(6, 1, 4)) == "generation"
 
 
 # ---------------------------------------------------------------------------
@@ -484,16 +491,16 @@ class TestValuePassRuns:
 
     @pytest.mark.parametrize("mode", ["train", "eval"])
     @pytest.mark.parametrize("recipe", ["nvfp4-squared_relu", "nvfp4-swiglu"])
-    def test_forward_backward_runs(self, recipe, mode):
+    def test_forward_backward_runs(self, recipe, mode, spy_on_value_pass):
         """NVFP4 keeps BF16 parameters, so the TE recompute gives every weight a gradient.
 
         ``eval()`` disables training behavior, not autograd: a grad-enabled eval
         forward still needs the recompute for its backward.
         """
         _skip_unless_supported(recipe)
-        config = _config(recipe, moe_match_generation_forward=True)
+        config = _config(recipe, moe_training_matches_inference=True)
         layer = _build_layer(config).train(mode == "train")
-        seen = _spy_on_value_pass(layer.experts)
+        seen = spy_on_value_pass(layer.experts)
         hidden = _hidden(config, seed=0).requires_grad_(True)
 
         out, _ = layer(hidden)
@@ -513,7 +520,7 @@ class TestValuePassRuns:
         assert fc1_grad.abs().sum() > 0
 
     @pytest.mark.parametrize("recipe", list(RECIPES))
-    def test_eval_forward_takes_the_flashinfer_kernel(self, recipe):
+    def test_eval_forward_takes_the_flashinfer_kernel(self, recipe, spy_on_value_pass):
         """The log-prob pass runs under ``eval()`` and must not fall back to TE.
 
         RL frameworks compute the training log-prob under ``model.eval()``, so a
@@ -525,13 +532,13 @@ class TestValuePassRuns:
         # The routed MXFP8 kernel runs on the whole heap and has no tile config for
         # one sized to a few tokens per rank.
         _, layer = _layer_pair(recipe, gen_config, train_config, max_tokens=HEAP_TOKENS)
-        seen = _spy_on_value_pass(layer.experts)
+        seen = spy_on_value_pass(layer.experts)
         with torch.no_grad(), _fp8_context(train_config):
             layer(_hidden(train_config, seed=0))
         assert len(seen) == 1, "the eval forward did not take the FlashInfer kernel"
 
     @pytest.mark.parametrize("recipe", list(RECIPES))
-    def test_kernel_weights_are_built_once_per_forward_backward_call(self, recipe):
+    def test_kernel_weights_are_built_once_per_forward_backward_call(self, recipe, monkeypatch):
         """Later microbatches reuse the kernel weights; the next call rebuilds them.
 
         Each build first runs the expert linears' pre-forward hooks, which is where DDP
@@ -542,8 +549,12 @@ class TestValuePassRuns:
         _, layer = _layer_pair(recipe, gen_config, train_config, max_tokens=HEAP_TOKENS)
         experts = layer.experts
         builds, hook_calls = [], []
-        build = experts._build_match_generation_weights
-        experts._build_match_generation_weights = lambda: builds.append(1) or build()
+        build = training_matches_inference._build_value_pass_weights
+        monkeypatch.setattr(
+            training_matches_inference,
+            "_build_value_pass_weights",
+            lambda module: builds.append(1) or build(module),
+        )
         experts.linear_fc1.register_forward_pre_hook(lambda *_: hook_calls.append(1))
         hidden = _hidden(train_config, seed=0)
         with torch.no_grad(), _fp8_context(train_config):
@@ -567,11 +578,11 @@ class TestValuePassRuns:
         hidden = _hidden(train_config, seed=0)
         with torch.no_grad(), _fp8_context(train_config):
             before = layer(hidden)[0].clone()
-            assert layer.experts._match_generation_weights is not None
-            layer.release_match_generation_weights()
-            assert layer.experts._match_generation_weights is None
+            assert layer.experts._inference_value_pass_weights is not None
+            layer.release_inference_value_pass_weights()
+            assert layer.experts._inference_value_pass_weights is None
             after = layer(hidden)[0]
-        assert layer.experts._match_generation_weights is not None
+        assert layer.experts._inference_value_pass_weights is not None
         assert torch.equal(before, after)
 
 
@@ -702,7 +713,7 @@ class TestSymmetricHeapSizing:
         _skip_unless_supported(self.RECIPE)
         if _dispatcher() != "nvls":
             pytest.skip("the symmetric heap is only used by the NVLS dispatcher (EP > 1)")
-        config = _config(self.RECIPE, moe_match_generation_forward=True)
+        config = _config(self.RECIPE, moe_training_matches_inference=True)
         layer = _build_layer(config, for_inference=True, max_tokens=self.SMALL).eval()
         hidden = _hidden(config, seed=1, tokens=self.LARGE)
         with torch.no_grad():
@@ -721,15 +732,15 @@ class TestSymmetricHeapSizing:
         _skip_unless_supported(recipe)
         if _dispatcher() != "nvls":
             pytest.skip("the symmetric heap is only used by the NVLS dispatcher (EP > 1)")
-        config = _config(recipe, moe_match_generation_forward=True)
+        config = _config(recipe, moe_training_matches_inference=True)
         with _fp8_context(config, is_init=True):
             layer = _build_layer(config, for_inference=True, max_tokens=max_tokens).eval()
         return config, layer
 
-    def test_each_launch_covers_only_rows_that_hold_tokens(self):
+    def test_each_launch_covers_only_rows_that_hold_tokens(self, spy_on_value_pass):
         """The kernel's cost follows the microbatch, not the generation-sized heap."""
         config, layer = self._heap_sized_layer()
-        seen = _spy_on_value_pass(layer.experts)
+        seen = spy_on_value_pass(layer.experts)
         group_size = torch.distributed.get_world_size(layer._inference_token_dispatcher.tp_ep_group)
         with torch.no_grad():
             layer(_hidden(config, seed=3, tokens=self.SMALL + self.SMALL // 2))
@@ -738,14 +749,14 @@ class TestSymmetricHeapSizing:
             group_size * (self.SMALL // 2),
         ]
 
-    def test_mxfp8_launches_keep_the_largest_kernel_tile(self):
+    def test_mxfp8_launches_keep_the_largest_kernel_tile(self, spy_on_value_pass):
         """MXFP8 launches follow the microbatch down to the kernel's largest-tile floor.
 
         The routed MXFP8 kernel has no tile config for a launch of a few tokens per
         rank at these shapes, so a small microbatch launches on the floor's rows.
         """
         config, layer = self._heap_sized_layer("mxfp8", max_tokens=HEAP_TOKENS)
-        seen = _spy_on_value_pass(layer.experts)
+        seen = spy_on_value_pass(layer.experts)
         group_size = torch.distributed.get_world_size(layer._inference_token_dispatcher.tp_ep_group)
         floor = 128 * layer.num_local_experts // config.moe_router_topk + 1
         assert group_size * LOCAL_TOKENS < floor < group_size * (HEAP_TOKENS // 2)
@@ -833,7 +844,7 @@ class TestSeparateGeneration:
         _skip_unless_supported(recipe)
         if _dispatcher() != "nvls":
             pytest.skip("only the NVLS dispatcher has sized buffers (EP > 1)")
-        config = _config(recipe, moe_match_generation_forward=True)
+        config = _config(recipe, moe_training_matches_inference=True)
         layer = _build_layer(config, for_inference=True, max_tokens=HEAP_TOKENS).eval()
         # The same rows split over half the ranks: buffers of a generation at EP / 2.
         monkeypatch.setattr(
@@ -1021,7 +1032,7 @@ def measure_forward_mismatch(recipe, seeds=MISMATCH_SEEDS):
     MXFP8: the layer whose gradient both recipes' backward computes, since it ignores
     the forward's quantization.
     """
-    value_pass_config = _config(recipe, moe_match_generation_forward=True)
+    value_pass_config = _config(recipe, moe_training_matches_inference=True)
     torch.manual_seed(2028)
     torch.cuda.manual_seed(2028)
     with _fp8_context(value_pass_config, is_init=True):

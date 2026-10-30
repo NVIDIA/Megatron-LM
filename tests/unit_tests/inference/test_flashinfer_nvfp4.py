@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import functools
 from types import SimpleNamespace
 
 import pytest
@@ -216,9 +215,6 @@ def test_flashinfer_forward_dispatches_to_nvfp4(monkeypatch):
         _flashinfer_mxfp8_token_capacity=64,
         num_local_experts=2,
         ep_group=SimpleNamespace(size=lambda: 4, rank=lambda: 3),
-    )
-    grouped_mlp._flashinfer_routed_forward = functools.partial(
-        experts.InferenceGroupedMLP._flashinfer_routed_forward, grouped_mlp
     )
     monkeypatch.setattr(experts.InferenceMode, "_use_bounded_mxfp8_rows", True)
 

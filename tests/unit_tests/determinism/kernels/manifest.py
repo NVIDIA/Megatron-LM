@@ -398,20 +398,21 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=(
             "megatron/core/transformer/moe/token_dispatcher.py",
             "megatron/core/transformer/moe/moe_layer.py",
+            "megatron/core/transformer/moe/training_matches_inference.py",
         ),
         tests=(K + "test_moe_kernels.py",),
         kind="torch-op",
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
         "virtual-expert routing metadata and probability gradients replay under stream contention; "
-        "the FlashInfer per-token NVFP4 value pass (moe_match_generation_forward) with recompute "
-        "backward.",
+        "the FlashInfer per-token NVFP4 value pass (moe_training_matches_inference) with recompute "
+        "backward, and its MXFP8 training-stack quantization.",
     ),
     KernelEntry(
         name="moe_experts",
         sources=("megatron/core/transformer/moe/experts.py",),
         tests=(K + "test_moe_kernels.py",),
         kind="te-wrapper",
-        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert; the MXFP8 training-stack quantization of the FlashInfer value pass.",
+        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
     ),
     KernelEntry(
         name="moe_fused_a2a",
