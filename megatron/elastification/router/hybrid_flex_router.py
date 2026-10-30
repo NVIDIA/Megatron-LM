@@ -22,7 +22,7 @@ from megatron.core.process_groups_config import (
 # from megatron.training import get_args, print_rank_0
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import get_pg_rank, get_pg_size, init_method_normal
+from megatron.core.utils import get_pg_rank, get_pg_size, get_pg_src_rank, init_method_normal
 
 # Import TE parallel linear layers
 try:
@@ -47,13 +47,14 @@ class FlextronRouter(MegatronModule):
     Args:
         config: Transformer config of the model, with the Flextron router fields.
         pg_collection: Process groups of the model that the router belongs to. Its linear layers
-            are sharded over the ``tp`` group. The Gumbel-softmax seeds and the number of
-            gradient-accumulation steps use the rank and size of the ``dp_gtp_remat`` group,
-            whose ranks train on distinct samples. None falls back to the global process groups
-            with a deprecation warning.
+            are sharded over the ``tp`` group, and each shard starts from the weights of its
+            first replica in the ``pp`` and ``dp_cp`` groups. The Gumbel-softmax seeds and the
+            number of gradient-accumulation steps use the rank and size of the ``dp_gtp_remat``
+            group, whose ranks train on distinct samples. None falls back to the global process
+            groups with a deprecation warning.
 
     Raises:
-        ValueError: ``pg_collection`` does not set ``tp`` or ``dp_gtp_remat``.
+        ValueError: ``pg_collection`` does not set ``tp``, ``pp``, ``dp_cp`` or ``dp_gtp_remat``.
     """
 
     def __init__(
@@ -66,7 +67,9 @@ class FlextronRouter(MegatronModule):
                 "FlextronRouter", deprecated_in="0.21", removed_in="0.23"
             )
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        require_process_groups(pg_collection, ("tp", "dp_gtp_remat"), owner="FlextronRouter")
+        require_process_groups(
+            pg_collection, ("tp", "pp", "dp_cp", "dp_gtp_remat"), owner="FlextronRouter"
+        )
         self.pg_collection = pg_collection
         self.config = config
         self.input_dim = len(self.config.budget_list)
@@ -107,20 +110,24 @@ class FlextronRouter(MegatronModule):
         self.gumbel_base_seed = base_seed
 
     def _sync_router_weights(self):
-        """
-        Synchronize router weights across all pipeline parallel groups by broadcasting
-        from global rank 0 to all other ranks.
+        """Copy each router shard from its first replica to the other replicas.
+
+        The linear layers are sharded over ``tp`` (and over ``gtp_remat`` when it is active), so
+        a shard is broadcast only among the ranks that hold the same shard: first over ``pp``,
+        whose stages each build a router, then over ``dp_cp``, the replica group of dense weights.
+        Every rank of the model builds the same routers in the same order, so all members of
+        each group enter the same broadcasts.
         """
         if not torch.distributed.is_initialized():
             return
 
-        # Get global rank 0 as the source
-        source_rank = 0
-
-        # Broadcast all router parameters from rank 0
-        for name, param in self.named_parameters():
-            if param is not None:
-                torch.distributed.broadcast(param.data, src=source_rank)
+        for group in (self.pg_collection.pp, self.pg_collection.dp_cp):
+            # A group of one rank, or an axis that is off (None), has no other replica.
+            if get_pg_size(group) == 1:
+                continue
+            source_rank = get_pg_src_rank(group)
+            for param in self.parameters():
+                torch.distributed.broadcast(param.data, src=source_rank, group=group)
 
     def _mark_router_params_for_pp_sync(self):
         """
