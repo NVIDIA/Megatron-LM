@@ -740,7 +740,7 @@ class DistributedDataParallel(_BaseDataParallel):
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.free_overlap_buffers()
 
-    def scale_gradients(self, scaling_factor: float):
+    def scale_gradients(self, scaling_factor: torch.Tensor):
         """Scale all gradients inside the buffers by `scaling_factor`."""
         for buffer in self.buffers + self.expert_parallel_buffers:
             buffer.scale_gradients(scaling_factor)

@@ -128,7 +128,6 @@ def _patch_fake_shared_expert_te(monkeypatch, linear_cls=_FakeTELinear):
     monkeypatch.setattr(shared_experts_module, "HAVE_TE", True)
     monkeypatch.setattr(shared_experts_module, "te", fake_te)
     monkeypatch.setattr(shared_experts_module, "is_te_min_version", lambda *args, **kwargs: True)
-    monkeypatch.setattr(shared_experts_module, "get_pg_size", lambda group: 1)
     monkeypatch.setattr(
         shared_experts_module,
         "get_cuda_rng_tracker",
@@ -294,6 +293,21 @@ def test_make_fused_grouped_swiglu_ops_selects_situ_glu(monkeypatch):
     assert activation_op.glu_interleave_size == 32
     assert activation_op.beta1 == 4.0
     assert activation_op.beta2 == 25.0
+
+
+def test_make_fused_grouped_swiglu_ops_uses_local_shard_sizes_with_tp(monkeypatch):
+    """With TP > 1, FC1 out_features must be the local shard size, so TE can fuse the MLP."""
+    _patch_fake_shared_expert_te(monkeypatch)
+    # Report TP=2 to a TP size lookup. The FC1 and FC2 weights are the TP shards of this rank.
+    monkeypatch.setattr(shared_experts_module, "get_pg_size", lambda group: 2, raising=False)
+    shared_expert = _fake_shared_expert()
+
+    fc1_op, _, fc2_op = list(shared_expert._make_fused_grouped_swiglu_ops().children())
+
+    assert fc1_op.kwargs["out_features"] == shared_expert.linear_fc1.weight.size(0)
+    assert fc2_op.kwargs["in_features"] == shared_expert.linear_fc2.weight.size(1)
+    # TE fuses GroupedLinear + GLU activation + GroupedLinear only if FC1 out == 2 * FC2 in.
+    assert fc1_op.kwargs["out_features"] == 2 * fc2_op.kwargs["in_features"]
 
 
 def test_make_fused_grouped_swiglu_ops_builds_clamped_activation(monkeypatch):

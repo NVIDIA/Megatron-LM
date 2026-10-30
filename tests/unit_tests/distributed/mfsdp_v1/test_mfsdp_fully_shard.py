@@ -65,27 +65,166 @@ MXFP8_BLOCKWISE_RECIPE = "mxfp8_blockwise"
 SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
 
 
-def test_all_gather_pipeline_prefetch_size():
-    """The extracted prefetch heuristic stops after reaching the requested size."""
+def _prefetch_size_pipeline(sizes, sharded):
     pipeline = AllGatherPipeline.__new__(AllGatherPipeline)
     pipeline.buffer = SimpleNamespace(
-        num_buckets=4,
+        num_buckets=len(sizes),
         ddp_config=SimpleNamespace(fsdp_double_buffer=False),
         parameter_groups=[
             SimpleNamespace(
                 fsdp_unit_id=bucket_id,
-                model_weight_buffer=SimpleNamespace(bucket_index=SimpleNamespace(size=6)),
+                transpose_weight_buffer=None,
+                hfsdp_helper_wbuf=None,
+                model_weight_buffer=SimpleNamespace(
+                    bucket_index=SimpleNamespace(size=size), is_data_distributed=is_sharded
+                ),
             )
-            for bucket_id in range(4)
+            for bucket_id, (size, is_sharded) in enumerate(zip(sizes, sharded))
         ],
-        bucket_to_bucket_group={bucket_id: [bucket_id] for bucket_id in range(4)},
+        bucket_to_bucket_group={bucket_id: [bucket_id] for bucket_id in range(len(sizes))},
     )
+    return pipeline
+
+
+def test_all_gather_pipeline_prefetch_size():
+    """The extracted prefetch heuristic stops after reaching the requested size."""
+    pipeline = _prefetch_size_pipeline([6] * 4, [True] * 4)
 
     actual = pipeline._extend_by_prefetch_size(
         [0], PrefetchOrder.FORWARD_PASS_ORDER, suggested_prefetch_size=10, bwd=False
     )
 
     assert actual == [0, 1, 2]
+
+
+def _recompute_prefetch_pipeline(extended_buckets, double_buffer=False):
+    """Three buckets, of which 0 and 1 have a transpose buffer. `_all_gather_bucket_window` is
+    replaced by a recorder that returns `extended_buckets`."""
+    params = [object() for _ in range(3)]
+    pipeline = AllGatherPipeline.__new__(AllGatherPipeline)
+    pipeline.buffer = SimpleNamespace(
+        param_to_param_group={param: bucket_id for bucket_id, param in enumerate(params)},
+        parameter_groups=[
+            SimpleNamespace(
+                params=[param], transpose_weight_buffer=object() if bucket_id < 2 else None
+            )
+            for bucket_id, param in enumerate(params)
+        ],
+        ddp_config=SimpleNamespace(fsdp_double_buffer=double_buffer),
+    )
+    pipeline.recompute_buckets = set()
+    pipeline.bucket_status = {
+        key: BucketStatus.EMPTY
+        for bucket_id in range(3)
+        for key in ((bucket_id, False), (bucket_id, True))
+    }
+    calls = []
+
+    def all_gather(params, prefetch=False, bwd=False, **kwargs):
+        calls.append(([pipeline.buffer.param_to_param_group[p] for p in params], prefetch, bwd))
+        return extended_buckets
+
+    pipeline._all_gather_bucket_window = all_gather
+    return pipeline, params, calls
+
+
+def test_recompute_gather_records_transpose_buckets():
+    """A recompute forward records only the buckets whose row-wise copy is separate."""
+    pipeline, params, _ = _recompute_prefetch_pipeline(extended_buckets=[1, 2])
+
+    pipeline.all_gather_params(params[1:], recompute=True)
+    assert pipeline.recompute_buckets == {1}
+
+    pipeline.all_gather_params(params[:1])
+    assert pipeline.recompute_buckets == {1}
+
+
+def test_backward_gather_prefetches_recompute_buckets():
+    """A backward gather also gathers the row-wise copy of recorded buckets it covers."""
+    pipeline, params, calls = _recompute_prefetch_pipeline(extended_buckets=[0, 1])
+    pipeline.recompute_buckets = {0, 1}
+    pipeline.bucket_status[(0, False)] = BucketStatus.READY_TO_USE
+
+    pipeline.all_gather_params(params[1:2], prefetch=True, bwd=True)
+
+    assert calls == [([1], True, True), ([1], False, False)]
+
+
+def test_backward_gather_without_recompute_buckets_gathers_once():
+    pipeline, params, calls = _recompute_prefetch_pipeline(extended_buckets=[0, 1])
+
+    pipeline.all_gather_params(params[1:2], prefetch=True, bwd=True)
+
+    assert calls == [([1], True, True)]
+
+
+def test_recompute_prefetch_is_off_with_double_buffer():
+    """The double-buffer pool holds two FSDP units, not their row- and column-wise copies."""
+    pipeline, params, calls = _recompute_prefetch_pipeline(
+        extended_buckets=[0, 1], double_buffer=True
+    )
+
+    pipeline.all_gather_params(params[:1], recompute=True)
+    pipeline.all_gather_params(params[:1], prefetch=True, bwd=True)
+
+    assert pipeline.recompute_buckets == set()
+    assert calls == [([0], False, False), ([0], True, True)]
+
+
+def test_recompute_gather_is_row_wise():
+    pipeline, params, _ = _recompute_prefetch_pipeline(extended_buckets=[0])
+
+    with pytest.raises(AssertionError):
+        pipeline.all_gather_params(params[:1], bwd=True, recompute=True)
+
+
+@pytest.mark.parametrize(
+    ("order", "unsharded_bucket", "start_buckets", "expected_buckets"),
+    [
+        (PrefetchOrder.FORWARD_PASS_ORDER, 1, [0], [0, 1, 2, 3]),
+        (PrefetchOrder.BACKWARD_PASS_ORDER, 3, [4], [1, 2, 3, 4]),
+    ],
+)
+def test_all_gather_pipeline_prefetch_size_skips_unsharded_buckets(
+    order, unsharded_bucket, start_buckets, expected_buckets
+):
+    """Buckets that need no all-gather do not use up the prefetch size."""
+    sizes = [100 if b == unsharded_bucket else 6 for b in range(5)]
+    pipeline = _prefetch_size_pipeline(sizes, [b != unsharded_bucket for b in range(5)])
+
+    actual = pipeline._extend_by_prefetch_size(
+        start_buckets, order, suggested_prefetch_size=10, bwd=False
+    )
+
+    assert actual == expected_buckets
+
+
+@pytest.mark.parametrize(
+    ("outer_size", "outer_gather", "expected_buckets"),
+    [(2, True, [0, 1, 2]), (1, True, [0, 1, 2, 3]), (2, False, [0, 1, 2, 3])],
+)
+def test_all_gather_pipeline_prefetch_size_counts_outer_gathers(
+    outer_size, outer_gather, expected_buckets
+):
+    """Buckets replicated on DP-Shard still use up the prefetch size when they need a
+    DP-Outer all-gather."""
+    pipeline = _prefetch_size_pipeline([6] * 4, [False] * 4)
+    for group in pipeline.buffer.parameter_groups:
+        group.is_expert_param = False
+        group.hfsdp_helper_wbuf = SimpleNamespace(is_data_distributed=False)
+    pipeline.buffer.dist_index = SimpleNamespace(
+        get_outer_fsdp_group=lambda is_expert_parallel: SimpleNamespace(size=lambda: outer_size)
+    )
+
+    actual = pipeline._extend_by_prefetch_size(
+        [0],
+        PrefetchOrder.FORWARD_PASS_ORDER,
+        suggested_prefetch_size=10,
+        bwd=False,
+        outer_fsdp_group_param_gather=outer_gather,
+    )
+
+    assert actual == expected_buckets
 
 
 @pytest.mark.parametrize(
@@ -134,8 +273,8 @@ def test_hfsdp_pipeline_preserves_inner_prefetch_size_policy():
     }
     calls = []
 
-    def extend_by_size(bucket_ids, order, suggested_size, bwd):
-        calls.append(("inner", bucket_ids, order, suggested_size, bwd))
+    def extend_by_size(bucket_ids, order, suggested_size, bwd, **kwargs):
+        calls.append(("inner", bucket_ids, order, suggested_size, bwd, kwargs))
         return [0, 1]
 
     def extend_by_units(bucket_ids, order, num_units):
@@ -153,7 +292,14 @@ def test_hfsdp_pipeline_preserves_inner_prefetch_size_policy():
     )
 
     assert calls == [
-        ("inner", [0], PrefetchOrder.FORWARD_PASS_ORDER, 123, False),
+        (
+            "inner",
+            [0],
+            PrefetchOrder.FORWARD_PASS_ORDER,
+            123,
+            False,
+            {"outer_fsdp_group_param_gather": True},
+        ),
         ("outer", [0, 1], PrefetchOrder.FORWARD_PASS_ORDER, 1),
         ("launch_outer", [0, 1, 2], False),
     ]

@@ -24,7 +24,6 @@ from megatron.core.models.T5.t5_spec import (
     get_t5_encoder_with_local_block_spec,
     get_t5_encoder_with_transformer_engine_block_spec,
 )
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
@@ -32,6 +31,7 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.global_vars import (
     get_run_config,
+    get_tokenizer,
     set_run_config,
 )
 from pretrain_gpt import loss_func
@@ -93,6 +93,7 @@ def model_provider(
     """
 
     args = get_args()
+    cfg = get_run_config()
 
     if config is None:
         config = core_transformer_config_from_args(args)
@@ -125,7 +126,7 @@ def model_provider(
         encoder_config=encoder_config,
         transformer_encoder_layer_spec=en_block_spec,
         transformer_decoder_layer_spec=de_block_spec,
-        vocab_size=args.padded_vocab_size,
+        vocab_size=cfg.tokenizer.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
         post_process=post_process,
@@ -209,8 +210,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples: int):
     """
     cfg = get_run_config()
     args = get_args()
-
-    tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
 
     config = T5MaskedWordPieceDatasetConfig(
         random_seed=cfg.rng.seed,

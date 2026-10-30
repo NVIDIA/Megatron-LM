@@ -9,6 +9,7 @@ import torch
 from megatron.core import tensor_parallel
 from megatron.core.context_parallel.utils import ContextParallelBatch
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
+from megatron.core.models.hybrid.hybrid_layer_allocation import PipelineSplit
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 from megatron.core.models.hybrid.hybrid_model import (
@@ -17,8 +18,10 @@ from megatron.core.models.hybrid.hybrid_model import (
     _validate_hash_moe_pipeline_placement,
 )
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
+from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.moe import router as router_module
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
@@ -356,6 +359,7 @@ def test_hybrid_model_passes_ids_to_decoder_only_for_hash_routing(
     )
     model = SimpleNamespace(
         config=config,
+        hybrid_layer_config_list=None,
         decoder=decoder,
         position_embedding_type='none',
         pre_process=True,
@@ -398,6 +402,7 @@ def test_hybrid_model_sequence_shards_hash_ids_with_decoder_input(monkeypatch, p
         fake_scatter,
     )
     model = SimpleNamespace(
+        hybrid_layer_config_list=None,
         config=SimpleNamespace(
             fine_grained_activation_offloading=False,
             moe_paged_stash=False,
@@ -481,6 +486,7 @@ def test_hybrid_model_scatters_embedding_for_sequence_parallel(monkeypatch):
         ),
         decoder=decoder,
         embedding=embedding,
+        hybrid_layer_config_list=None,
         position_embedding_type="none",
         pre_process=True,
         post_process=False,
@@ -548,6 +554,7 @@ def test_hybrid_model_shards_each_layout_padding_mask(
             freeze_base_model_for_mtp=False,
         ),
         decoder=decoder,
+        hybrid_layer_config_list=None,
         position_embedding_type="none",
         pre_process=pre_process,
         post_process=False,
@@ -669,6 +676,25 @@ def test_hash_moe_threshold_rejects_count_larger_than_pattern():
         _get_hash_moe_layer_threshold("-E-E", 3)
 
 
+def test_hash_moe_config_list_threshold_and_placement():
+    config = TransformerConfig(
+        num_layers=8, hidden_size=8, num_attention_heads=2, num_moe_experts=2
+    )
+    mlp = MLPLayerConfig.from_config(config)
+    moe = MoELayerConfig.from_config(config)
+    layers = [mlp, moe, PipelineSplit] * 4
+    assert _get_hash_moe_layer_threshold(layers, 3) == 6
+    with pytest.raises(ValueError, match="exceeds the 4 MoE layers"):
+        _get_hash_moe_layer_threshold(layers, 5)
+    _validate_hash_moe_pipeline_placement(
+        [mlp, moe], layer_offset=6, hash_moe_layer_threshold=6, pre_process=False
+    )
+    with pytest.raises(ValueError, match="non-embedding stage contains hash MoE"):
+        _validate_hash_moe_pipeline_placement(
+            [mlp, moe], layer_offset=4, hash_moe_layer_threshold=6, pre_process=False
+        )
+
+
 def test_hash_moe_pipeline_placement_allows_later_learned_moe_stage():
     _validate_hash_moe_pipeline_placement(
         [LayerSymbols.MOE], layer_offset=6, hash_moe_layer_threshold=4, pre_process=False
@@ -723,7 +749,6 @@ def test_hybrid_stack_marks_mtp_moe_and_propagates_mtp_depth(monkeypatch):
 
 def test_mtp_layer_passes_its_depth_to_nested_hybrid_stack(monkeypatch):
     import megatron.core.models.hybrid.hybrid_block as hybrid_block_module
-    import megatron.core.models.hybrid.hybrid_layer_allocation as allocation_module
     import megatron.core.transformer.multi_token_prediction as mtp_module
 
     captured_stack_kwargs = {}
@@ -742,9 +767,6 @@ def test_mtp_layer_passes_its_depth_to_nested_hybrid_stack(monkeypatch):
             self.layers = torch.nn.ModuleList([torch.nn.Identity()])
 
     monkeypatch.setattr(hybrid_block_module, "HybridStack", _RecordingHybridStack)
-    monkeypatch.setattr(
-        allocation_module, "validate_segment_layers", lambda _pattern, _config: [LayerSymbols.MOE]
-    )
     monkeypatch.setattr(mtp_module, "build_module", lambda *_args, **_kwargs: torch.nn.Identity())
 
     config = TransformerConfig(

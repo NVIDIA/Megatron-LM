@@ -33,7 +33,6 @@ from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
 )
@@ -60,7 +59,7 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
-from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.global_vars import get_run_config, get_tokenizer, set_run_config
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import (
     get_blend_and_blend_per_split,
@@ -102,11 +101,28 @@ BATCH_KEYS = [
 ]
 
 
+# The args object and the transformer config built from it, reused until the args object
+# is replaced.
+_transformer_config_cache = None
+
+
+def _get_transformer_config(args):
+    """Return the transformer config for args, building it only when args is a new object.
+
+    get_batch runs every microbatch, and rebuilding the config there re-runs
+    TransformerConfig.__post_init__, which repeats its validation warnings in the log.
+    """
+    global _transformer_config_cache
+    if _transformer_config_cache is None or _transformer_config_cache[0] is not args:
+        _transformer_config_cache = (args, core_transformer_config_from_args(args))
+    return _transformer_config_cache[1]
+
+
 def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroupCollection] = None):
     """Generate a batch."""
 
     args = get_args()
-    config = core_transformer_config_from_args(args)
+    config = _get_transformer_config(args)
 
     if args.sequence_packing_scheduler is not None:
         if pg_collection is None:
@@ -418,22 +434,23 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
-    elif args.sequence_packing_scheduler is not None:
-        # The scheduler sends packing metadata to middle PP stages itself and requires that
-        # only the first and last stages hold a data iterator.
-        return is_first_or_last_pipeline_stage(vp_stage)
-    elif is_packed_sequence or (
-        # NOTE(nightly-sync 26_10_2026): restored dev-only disjunct, the second half of the
-        # same dropped feature as needs_padding_mask in get_batch above. Main's DCP V2
-        # rewrite (ea99fdfce) kept only `is_packed_sequence`, which leaves middle PP stages
-        # without a data iterator -- but varlen SBHD validation needs its padding metadata
-        # on every stage, and dev's
-        # tests/unit_tests/data/test_get_batch.py::
-        # test_hybrid_sbhd_validation_broadcasts_padding_mask_on_all_pp_stages asserts
-        # exactly that (is_dataset_built_on_rank() == (tp_rank == 0) under TP2 x PP4).
-        getattr(args, 'use_varlen_dataset', False)
-        and getattr(args, 'varlen_sbhd_validation', False)
+    elif (
+        is_packed_sequence
+        or args.sequence_packing_scheduler is not None
+        or (
+            # NOTE(nightly-sync 26_10_2026): restored dev-only disjunct, the second half of the
+            # same dropped feature as needs_padding_mask in get_batch above. Main's DCP V2
+            # rewrite (ea99fdfce) kept only `is_packed_sequence`, which leaves middle PP stages
+            # without a data iterator -- but varlen SBHD validation needs its padding metadata
+            # on every stage, and dev's
+            # tests/unit_tests/data/test_get_batch.py::
+            # test_hybrid_sbhd_validation_broadcasts_padding_mask_on_all_pp_stages asserts
+            # exactly that (is_dataset_built_on_rank() == (tp_rank == 0) under TP2 x PP4).
+            getattr(args, 'use_varlen_dataset', False)
+            and getattr(args, 'varlen_sbhd_validation', False)
+        )
     ):
+        # The sequence-packing scheduler runs on every PP stage and reads its input there.
         # Every PP stage needs its padding metadata, even without packed THD inputs.
         return True
     return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank_func(
@@ -447,7 +464,7 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
 def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
     """Build the GPT dataset config from parsed CLI args."""
     cfg = get_run_config()
-    tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]

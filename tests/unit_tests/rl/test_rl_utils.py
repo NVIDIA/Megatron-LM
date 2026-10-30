@@ -30,6 +30,7 @@ from megatron.core.num_microbatches_calculator import (
     get_num_microbatches,
 )
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -47,7 +48,7 @@ from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphS
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.utils import get_pg_size
-from megatron.rl import rl_utils
+from megatron.rl import rl_utils, training_setup
 from megatron.rl.agent.api import Rollout, RolloutGroup, TokenRollout
 from megatron.rl.inference import ReturnsRaw
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
@@ -56,6 +57,7 @@ from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import parse_args, validate_args
+from megatron.training.callbacks import CallbackContext
 from megatron.training.config import RLConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from megatron.training.state import TrainState
@@ -97,6 +99,165 @@ def test_disagg_refit_reads_migrated_rl_config(monkeypatch):
     )
     with rl_utils.inference_model_alloc_context():
         pass
+
+
+@pytest.mark.parametrize(
+    "skip_train, rollout_only, optimizer",
+    [
+        (False, False, "optimizer"),
+        (False, True, "optimizer"),
+        (False, True, None),  # --rl-rollout-only --no-load-optim still builds the GRPO state
+        (True, False, None),
+    ],
+)
+def test_setup_callback(monkeypatch, skip_train, rollout_only, optimizer):
+    """on_data_init_start keeps the loop's model and optimizer, builds the inference model, and
+    loads the reference weights and reinitializes the GRPO calculator unless --skip-train makes
+    the run eval-only."""
+    calls = []
+    args = SimpleNamespace()
+    run_config = SimpleNamespace(validation=SimpleNamespace(skip_train=skip_train))
+    monkeypatch.setattr(training_setup, "get_args", lambda: args)
+    monkeypatch.setattr(training_setup, "get_run_config", lambda: run_config)
+    monkeypatch.setattr(training_setup, "get_model_config", lambda chunk: f"config({chunk})")
+    monkeypatch.setattr(training_setup.mpu, "get_data_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(
+        training_setup,
+        "build_rl_inference_model",
+        lambda *a: calls.append(("inference", a)) or "inference_model",
+    )
+    monkeypatch.setattr(
+        training_setup,
+        "load_reference_state_dict",
+        lambda *a, **k: calls.append(("ref", a, k)) or {"w": 1},
+    )
+    monkeypatch.setattr(
+        training_setup,
+        "reinitialize_grpo_microbatch_calculator",
+        lambda *a: calls.append(("mb", a)),
+    )
+    cfg = RLConfig(rl_rollout_only=rollout_only)
+    callback = training_setup.RLSetupCallback(cfg, model_provider="provider", model_type="type")
+
+    callback.on_data_init_start(
+        CallbackContext(model=["chunk"], optimizer=optimizer, checkpointing_context={"ckpt": 1})
+    )
+
+    loop_runs = not skip_train
+    expected = [("inference", (cfg, args, "config(chunk)", "provider", "type"))]
+    if loop_runs:
+        expected += [
+            ("ref", (["chunk"], {"ckpt": 1}, args), {"rollout_only": rollout_only}),
+            ("mb", (args, 4)),
+        ]
+    assert calls == expected
+    assert (callback.model, callback.optimizer) == (["chunk"], optimizer)
+    assert callback.inference_model == "inference_model"
+    assert callback.ref_state_dict == ({"w": 1} if loop_runs else None)
+
+
+@pytest.mark.parametrize(
+    "optimizer, packing, correction, offload",
+    [(None, True, False, True), ("optimizer", False, True, False)],
+)
+def test_next_rollout_iterator_forwards_the_grpo_schedule(
+    monkeypatch, optimizer, packing, correction, offload
+):
+    """The data hook rebuilds rollouts through get_grpo_data_iterator with the section's knobs,
+    the current iterator as the buffer and grad disabled; the CUDA cache is released only when
+    the run has no optimizer (--rl-rollout-only --no-load-optim)."""
+    seen = {}
+
+    def grpo_iterator(model, inference_model, opt, iteration, ref, **kwargs):
+        seen.update(kwargs, head=(model, inference_model, opt, iteration, ref))
+        seen["grad_enabled"] = torch.is_grad_enabled()
+        return "iterator"
+
+    empty_cache = MagicMock()
+    monkeypatch.setattr(rl_utils, "get_grpo_data_iterator", grpo_iterator)
+    monkeypatch.setattr(rl_utils.torch.cuda, "empty_cache", empty_cache)
+    rl_config = RLConfig(
+        grpo_iterations=1,
+        grpo_prompts_per_step=4,
+        grpo_group_size=3,
+        rl_use_sequence_packing=packing,
+        rl_inference_logprobs_is_correction=correction,
+        rl_offload_optimizer_during_inference=offload,
+    )
+
+    result = rl_utils.next_rollout_iterator(
+        7,
+        "buffer",
+        model=["model"],
+        inference_model=None,
+        optimizer=optimizer,
+        ref_state_dict={"ref": 1},
+        rl_config=rl_config,
+        train_config=SimpleNamespace(global_batch_size=12),
+    )
+
+    assert result == "iterator"
+    assert seen == dict(
+        head=(["model"], None, optimizer, 7, {"ref": 1}),
+        grad_enabled=False,
+        grpo_iterations=1,
+        grpo_prompts_per_step=4,
+        grpo_group_size=3,
+        global_batch_size=12,
+        sequence_packing=packing,
+        buffered_rollouts="buffer",
+        is_correction=correction,
+        optimizer_is_on_cpu=offload,
+    )
+    assert empty_cache.called is (optimizer is None)
+
+
+@pytest.mark.parametrize("separate", [False, True])
+def test_evaluate_rollouts_refits_before_scoring(monkeypatch, separate):
+    """With a separate inference model the eval hook prefetches its weights and refits them from
+    the training model before scoring, then scores the inference model with the training model
+    attached; without one it scores the training model as-is."""
+    calls = []
+    inf_core = object()
+    monkeypatch.setattr(rl_utils, "get_args", lambda: "args")
+    monkeypatch.setattr(
+        rl_utils, "unwrap_model", lambda chunk: calls.append(("unwrap", chunk)) or inf_core
+    )
+    monkeypatch.setattr(
+        rl_utils,
+        "_maybe_prefetch_separate_inference_model_weights",
+        lambda core, *, to_cpu: calls.append(("prefetch", core, to_cpu)),
+    )
+    monkeypatch.setattr(
+        rl_utils, "refit_inference_model", lambda m, im, a: calls.append(("refit", m, im, a))
+    )
+
+    def evaluate(*args, **kwargs):
+        # The positional tail is (model, optimizer, iteration); anything before it is not contract.
+        calls.append(("eval", args[-3:], kwargs))
+
+    monkeypatch.setattr(rl_utils, "evaluate_and_print_results_rl", evaluate)
+
+    rl_utils.evaluate_rollouts(
+        model=["train"],
+        inference_model=["inf"] if separate else None,
+        optimizer="optimizer",
+        prefix="iteration 3 on validation set",
+        iteration=3,
+        verbose=True,
+        write_to_tensorboard=False,
+    )
+
+    eval_kwargs = {"write_to_tensorboard": False, "training_model": ["train"] if separate else None}
+    if separate:
+        assert calls == [
+            ("unwrap", "inf"),
+            ("prefetch", inf_core, False),
+            ("refit", ["train"], ["inf"], "args"),
+            ("eval", (["inf"], "optimizer", 3), eval_kwargs),
+        ]
+    else:
+        assert calls == [("eval", (["train"], "optimizer", 3), eval_kwargs)]
 
 
 class MockModel(LanguageModule):
@@ -248,22 +409,24 @@ def cleanup_global_state():
     destroy_num_microbatches_calculator()
 
 
-# (dtype, chunk_tokens, sliced) cases shared by the in-process and spawned-TP2 parity runs.
+# (dtype, chunk_tokens, sliced, batch_invariant) cases shared by the in-process and spawned-TP2
+# parity runs.
 _VP_CASES = [
-    (dtype, chunk_tokens, sliced)
+    (dtype, chunk_tokens, sliced, batch_invariant)
     for dtype in (torch.float32, torch.bfloat16)
     for chunk_tokens in (None, 3)
     for sliced in (False, True)
+    for batch_invariant in (False, True)
 ]
 
 
-def _vp_inputs(dtype, sliced):
+def _vp_inputs(dtype, sliced, out_dtype):
     """Deterministic parity inputs; the spawned TP2 workers rebuild the identical tensors."""
     torch.manual_seed(0)
     batch, seq, vocab = 2, 17, 64
     logits = torch.randn(batch, seq, vocab, dtype=dtype)
     tokens = torch.randint(0, vocab, (batch, seq))
-    grad_out = torch.randn(batch, seq - 1 if sliced else seq, dtype=dtype)
+    grad_out = torch.randn(batch, seq - 1 if sliced else seq, dtype=out_dtype)
     return logits, tokens, grad_out
 
 
@@ -279,16 +442,30 @@ def _vp_tp2_worker(rank, world_size, store_path, result_queue):
         dist.init_process_group(backend="gloo", store=store, rank=rank, world_size=world_size)
         tp_group = dist.new_group(ranks=list(range(world_size)), backend="gloo")
         results = {}
-        for dtype, chunk_tokens, sliced in _VP_CASES:
-            logits, tokens, grad_out = _vp_inputs(dtype, sliced)
+        for dtype, chunk_tokens, sliced, batch_invariant in _VP_CASES:
+            out_dtype = torch.float32 if batch_invariant else dtype
+            logits, tokens, grad_out = _vp_inputs(dtype, sliced, out_dtype)
             partition = logits.size(-1) // world_size
             shard = slice(rank * partition, (rank + 1) * partition)
             local = logits[..., shard].clone().requires_grad_(True)
-            got = rl_utils.vocab_parallel_selective_log_softmax(
-                *_vp_view(local, tokens, sliced), tp_group=tp_group, chunk_tokens=chunk_tokens
-            )
+            with patch.object(
+                rl_utils, "is_batch_invariant_mode_enabled", return_value=batch_invariant
+            ):
+                got = rl_utils.vocab_parallel_selective_log_softmax(
+                    *_vp_view(local, tokens, sliced), tp_group=tp_group, chunk_tokens=chunk_tokens
+                )
+                with torch.no_grad():  # the first sequence alone, for the batch-invariance check
+                    prefix = rl_utils.vocab_parallel_selective_log_softmax(
+                        *_vp_view(local[:1], tokens[:1], sliced),
+                        tp_group=tp_group,
+                        chunk_tokens=chunk_tokens,
+                    )
             got.backward(grad_out)
-            results[(dtype, chunk_tokens, sliced)] = (got.detach(), local.grad)
+            results[(dtype, chunk_tokens, sliced, batch_invariant)] = (
+                got.detach(),
+                local.grad,
+                prefix,
+            )
         # Ship plain bytes: shared-memory tensor handles would dangle once this process exits.
         buffer = io.BytesIO()
         torch.save(results, buffer)
@@ -674,8 +851,9 @@ class TestRLUtils:
         [pytest.param(True, id="shared-config"), pytest.param(False, id="distinct-config")],
     )
     @pytest.mark.parametrize("num_experts", [None, 8], ids=["dense", "moe"])
+    @pytest.mark.parametrize("has_optimizer", [False, True], ids=["no-optimizer", "optimizer"])
     def test_megatron_rl_inference_mode_restores_training_cuda_graph_state(
-        self, monkeypatch, share_config, num_experts
+        self, monkeypatch, share_config, num_experts, has_optimizer
     ):
         config = SimpleNamespace(
             cuda_graph_impl="none",
@@ -705,7 +883,9 @@ class TestRLUtils:
         toggle_cuda_graphs = self._make_toggle_cuda_graphs_mock()
         monkeypatch.setattr(rl_utils, "toggle_cuda_graphs", toggle_cuda_graphs)
 
-        with rl_utils.megatron_rl_inference_mode(model, MagicMock(), "local", False) as result:
+        # --rl-rollout-only --no-load-optim runs the loop with no optimizer: no param sync.
+        optimizer = MagicMock() if has_optimizer else None
+        with rl_utils.megatron_rl_inference_mode(model, optimizer, "local", False) as result:
             assert result is interface
             for current_config in (config, layer_config):
                 assert current_config.cuda_graph_impl == "local"
@@ -733,24 +913,15 @@ class TestRLUtils:
             assert current_config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
         lang_module.eval.assert_called_once()
         lang_module.train.assert_called_once()
+        if has_optimizer:
+            optimizer.prepare_model_params_for_param_sync.assert_called_once_with()
 
-    @pytest.mark.parametrize(
-        "do_train, skip_train, expect_train_branch",
-        [
-            pytest.param(True, False, True, id="training"),
-            pytest.param(True, True, True, id="inference_only"),
-            pytest.param(False, False, False, id="eval_only"),
-        ],
-    )
-    def test_evaluate_and_print_results_rl_wandb_step_handling(
-        self, monkeypatch, do_train, skip_train, expect_train_branch
-    ):
-        """Only eval-only mode (--skip-train --train-iters 0, do_train=False) takes the decoupled
-        eval_only/* wandb path. --skip-train alone still runs the RL loop with monotonically
-        advancing iteration, so its evals log against the global step (see PR #6043)."""
-        args = SimpleNamespace(
-            skip_train=skip_train, world_size=1, cuda_graph_impl="none", seq_length=SEQ
-        )
+    @pytest.mark.parametrize("do_train", [True, False], ids=["training", "eval_only"])
+    def test_evaluate_and_print_results_rl_wandb_step_handling(self, monkeypatch, do_train):
+        """Only eval-only runs (--skip-train never enters the loop, so do_train=False) take the
+        decoupled eval_only/* wandb path; training and --rl-rollout-only runs log against the
+        global step (see PR #6043)."""
+        args = SimpleNamespace(world_size=1, cuda_graph_impl="none", seq_length=SEQ)
         train_state = TrainState(do_train=do_train)
         rl_config = RLConfig(
             rl_prompts_per_eval=1,
@@ -786,14 +957,10 @@ class TestRLUtils:
         )
 
         rl_utils.evaluate_and_print_results_rl(
-            data_iterator=None,
-            model=[MagicMock()],
-            optimizer=MagicMock(),
-            iteration=7,
-            write_to_tensorboard=False,
+            model=[MagicMock()], optimizer=MagicMock(), iteration=7, write_to_tensorboard=False
         )
 
-        if expect_train_branch:
+        if do_train:
             wandb_writer.log.assert_called_once_with({"env_eval_mean_reward": 0.75}, step=7)
             wandb_writer.define_metric.assert_not_called()
         else:
@@ -874,8 +1041,8 @@ class TestRLUtils:
         self, initialize_model_parallel, use_sequence_packing, batch_invariant, monkeypatch
     ):
         """get_logprobs runs end to end and honors the output-dtype contract that
-        compute_logprobs_batch asserts: fp32 under --batch-invariant-mode (where it falls back to
-        the gathered path), the logits dtype otherwise."""
+        compute_logprobs_batch asserts: fp32 under --batch-invariant-mode, the logits dtype
+        otherwise."""
         self.create_test_args(rl_use_sequence_packing=use_sequence_packing)
         monkeypatch.setattr(rl_utils, "is_batch_invariant_mode_enabled", lambda: batch_invariant)
 
@@ -896,8 +1063,9 @@ class TestRLUtils:
             # Uniform logits: every token has logprob -log(VOCAB), whichever rank owns its id.
             torch.testing.assert_close(logprobs, torch.full_like(logprobs, -math.log(VOCAB)))
         else:
-            # Non-last stages return the model output as is: vocab-sharded unless gathered.
-            vocab = VOCAB if batch_invariant else VOCAB // get_pg_size(model.pg_collection.tp)
+            # Non-last stages return the model output as is: get_logprobs never gathers the
+            # logits, so they stay vocab-sharded in either mode.
+            vocab = VOCAB // get_pg_size(model.pg_collection.tp)
             assert logprobs.shape == (BATCH, SEQ, vocab)
 
     @pytest.mark.parametrize(
@@ -905,14 +1073,14 @@ class TestRLUtils:
         [pytest.param((tp, 1), id=f"tp{tp}-pp1") for tp in [1, 2, 4] if tp <= Utils.world_size],
         indirect=["initialize_model_parallel"],
     )
-    def test_get_logprobs_mtp(self, initialize_model_parallel, monkeypatch):
-        """An MTP model trained through get_logprobs must give the same MTP loss, acceptance
-        counts and MTP-layer gradients whether the main logits stay vocab-parallel (the default
-        path) or are gathered (the --batch-invariant-mode fallback): process_mtp_loss keeps its
-        own logits vocab-sharded either way, so the vocab-parallel cross-entropy never sees a
-        TP-times larger vocabulary (loss +ln(TP), wrong gradients). RL derives the MTP labels
-        from the tokens, so the metrics must cover every position but the two rolled off the
-        end of the sequence."""
+    def test_get_logprobs_mtp(self, initialize_model_parallel):
+        """An MTP model trained through get_logprobs (main logits kept vocab-parallel) must give
+        the same logprobs, MTP loss, acceptance counts and MTP-layer gradients as the same
+        forward with the main logits gathered across TP: process_mtp_loss keeps its own logits
+        vocab-sharded either way, so the vocab-parallel cross-entropy never sees a TP-times
+        larger vocabulary (loss +ln(TP), wrong gradients). RL derives the MTP labels from the
+        tokens, so the metrics must cover every position but the two rolled off the end of the
+        sequence."""
         _, _, tp, _ = initialize_model_parallel
         self.create_test_args(tensor_model_parallel_size=tp, bf16=True)
 
@@ -948,25 +1116,45 @@ class TestRLUtils:
         tokens = torch.randint(0, VOCAB, (batch_size, seq_length), dtype=torch.long).cuda()
         position_ids = torch.arange(seq_length).unsqueeze(0).expand(batch_size, -1).cuda()
 
-        results = {}
-        for batch_invariant in (False, True):
-            monkeypatch.setattr(
-                rl_utils, "is_batch_invariant_mode_enabled", lambda flag=batch_invariant: flag
+        def gathered_reference():
+            """The forward get_logprobs issues (one thd sequence, bf16 logits), but with the
+            logits gathered across TP and the logprobs read off the gathered rows."""
+            cu_seqlens = torch.tensor([0, seq_length], dtype=torch.int32, device=tokens.device)
+            packed_seq_params = PackedSeqParams(
+                qkv_format='thd',
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=seq_length,
+                max_seqlen_kv=seq_length,
+                pad_between_seqs=False,
             )
+            logits = model(
+                tokens,
+                position_ids,
+                None,
+                packed_seq_params=packed_seq_params,
+                runtime_gather_output=True,
+                fp32_output=False,
+            )
+            return rl_utils.selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
+
+        def train_step(forward):
             model.zero_grad(set_to_none=True)
             MTPLossLoggingHelper.clean_metrics_in_tracker()
-            logprobs = rl_utils.get_logprobs(model, tokens, position_ids=position_ids)
+            logprobs = forward()
             logprobs.sum().backward()
             tracker = MTPLossLoggingHelper.tracker
             assert all(p.grad is not None for p in mtp_params.values())
-            results[batch_invariant] = (
+            return (
                 logprobs.detach().float(),
                 {k: tracker[k].clone() for k in ("loss_sums", "correct_values", "total_values")},
                 {name: p.grad.clone() for name, p in mtp_params.items()},
             )
 
-        vp_logprobs, vp_metrics, vp_grads = results[False]
-        gathered_logprobs, gathered_metrics, gathered_grads = results[True]
+        vp_logprobs, vp_metrics, vp_grads = train_step(
+            lambda: rl_utils.get_logprobs(model, tokens, position_ids=position_ids)
+        )
+        gathered_logprobs, gathered_metrics, gathered_grads = train_step(gathered_reference)
         assert vp_logprobs.shape == (batch_size, seq_length - 1)
         # bf16 logits: the same tolerance as test_vocab_parallel_selective_log_softmax.
         torch.testing.assert_close(vp_logprobs, gathered_logprobs, atol=5e-2, rtol=5e-2)
@@ -979,25 +1167,28 @@ class TestRLUtils:
         for name, grad in vp_grads.items():
             torch.testing.assert_close(grad, gathered_grads[name], atol=1e-5, rtol=2e-2)
 
-    @pytest.mark.parametrize("dtype, chunk_tokens, sliced", _VP_CASES)
+    @pytest.mark.parametrize("dtype, chunk_tokens, sliced, batch_invariant", _VP_CASES)
     @pytest.mark.parametrize("tp_world", [1, 2])
     def test_vocab_parallel_selective_log_softmax(
-        self, dtype, chunk_tokens, sliced, tp_world, vp_tp2_results
+        self, dtype, chunk_tokens, sliced, batch_invariant, tp_world, vp_tp2_results, monkeypatch
     ):
-        """vocab_parallel_selective_log_softmax must be a numerically-safe drop-in for
-        selective_log_softmax: forward/backward parity with the gathered-path implementation,
-        in-process on full logits (tp_world=1) and on TP-sharded logits over a spawned gloo
-        group (tp_world=2: every rank must return the full-sequence logprobs and its own vocab
-        shard of the reference gradient), with and without chunking, on the non-contiguous
-        ``logits[:, :-1, :]`` view get_logprobs actually passes (whose sliced-away position must
-        receive no gradient), and without mutating the input."""
-        logits, tokens, grad_out = _vp_inputs(dtype, sliced)
-        # fp32 stats vs selective_log_softmax's native bf16 log_softmax diverge by more than
-        # reduction-order noise; vp is the more accurate one (see commit message).
-        atol = 1e-5 if dtype == torch.float32 else 5e-2
+        """Parity with selective_log_softmax (forward, backward, output dtype), in-process and
+        on TP-sharded logits over a spawned gloo pair, where both ranks must agree bitwise and
+        the first sequence alone must reproduce its rows bitwise (batch invariance). Covers
+        chunking, the sliced view get_logprobs passes and --batch-invariant-mode."""
+        monkeypatch.setattr(rl_utils, "is_batch_invariant_mode_enabled", lambda: batch_invariant)
+        out_dtype = torch.float32 if batch_invariant else dtype
+        logits, tokens, grad_out = _vp_inputs(dtype, sliced, out_dtype)
+        # Outputs: under batch-invariant mode both paths compute fp32 statistics and agree
+        # tightly; otherwise selective_log_softmax's native bf16 log_softmax diverges from the
+        # vp path's fp32 statistics by more than reduction-order noise (vp is the accurate one).
+        out_atol = 1e-5 if out_dtype == torch.float32 else 5e-2
+        # Grads land in the (bf16) input dtype on both sides, so they can differ by a bf16 ulp.
+        grad_atol = 1e-5 if dtype == torch.float32 else 5e-2
 
         reference = logits.clone().requires_grad_(True)
         want = rl_utils.selective_log_softmax(*_vp_view(reference, tokens, sliced))
+        assert want.dtype == out_dtype
         want.backward(grad_out)
 
         if tp_world == 1:
@@ -1005,19 +1196,30 @@ class TestRLUtils:
             got = rl_utils.vocab_parallel_selective_log_softmax(
                 *_vp_view(local, tokens, sliced), chunk_tokens=chunk_tokens
             )
+            with torch.no_grad():  # the first sequence alone, for the batch-invariance check
+                prefix = rl_utils.vocab_parallel_selective_log_softmax(
+                    *_vp_view(local[:1], tokens[:1], sliced), chunk_tokens=chunk_tokens
+                )
             got.backward(grad_out)
             torch.testing.assert_close(local.detach(), logits)  # forward must not mutate the input
-            shards = {0: (got.detach(), local.grad)}
+            shards = {0: (got.detach(), local.grad, prefix)}
         else:
-            case = (dtype, chunk_tokens, sliced)
+            case = (dtype, chunk_tokens, sliced, batch_invariant)
             shards = {rank: results[case] for rank, results in vp_tp2_results.items()}
+            # The cross-rank combine is deterministic and identical on every rank, so the ranks
+            # must agree bitwise, not merely within tolerance.
+            assert torch.equal(shards[0][0], shards[1][0])
 
         partition = logits.size(-1) // len(shards)
-        for rank, (got, grad) in shards.items():
-            assert got.dtype == dtype
-            torch.testing.assert_close(got.float(), want.float(), atol=atol, rtol=atol)
+        for rank, (got, grad, prefix) in shards.items():
+            # Batch invariance: a sequence's logprobs do not depend on what else is in the batch.
+            assert torch.equal(got[:1], prefix)
+            assert got.dtype == out_dtype
+            torch.testing.assert_close(got.float(), want.float(), atol=out_atol, rtol=out_atol)
             want_grad = reference.grad[..., rank * partition : (rank + 1) * partition]
-            torch.testing.assert_close(grad.float(), want_grad.float(), atol=atol, rtol=atol)
+            torch.testing.assert_close(
+                grad.float(), want_grad.float(), atol=grad_atol, rtol=grad_atol
+            )
             if sliced:
                 assert torch.all(grad[:, -1, :] == 0)
 

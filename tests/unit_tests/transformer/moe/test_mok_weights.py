@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.megakernel.mok import weights
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 
 
 def _mok_transformer_config(**overrides):
@@ -26,6 +27,7 @@ def _mok_transformer_config(**overrides):
         "expert_model_parallel_size": 4,
         "gated_linear_unit": True,
         "activation_func": F.silu,
+        "add_bias_linear": False,
         "gradient_accumulation_fusion": True,
         "moe_megakernel_backend": "mok",
     }
@@ -55,7 +57,19 @@ def test_mxfp8_shared_expert_config_expresses_bf16_module(monkeypatch, recwarn):
     "overrides",
     [
         {},
+        {"moe_token_dispatcher_type": "alltoall"},
+        {"moe_token_dispatcher_type": "flex", "moe_flex_dispatcher_backend": "hybridep"},
+        {
+            "moe_token_dispatcher_type": "flex",
+            "moe_flex_dispatcher_backend": "hybridep",
+            "sequence_packing_scheduler": "dp_balanced",
+            "max_seqlen_per_dp_cp_rank": 1024,
+            "calculate_per_token_loss": True,
+            "variable_seq_lengths": True,
+        },
         {"moe_shared_expert_gate": True},
+        {"moe_router_dtype": None},
+        {"moe_router_dtype": "fp32"},
         {"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": True, "moe_shared_expert_gate": True},
         {
             "fp8": "hybrid",
@@ -71,18 +85,53 @@ def test_mok_accepts_key_supported_configurations(overrides):
     assert _mok_transformer_config(**overrides).moe_megakernel_backend == "mok"
 
 
+def test_native_moe_still_accepts_fp64_router():
+    config = _mok_transformer_config(moe_megakernel_backend=None, moe_router_dtype="fp64")
+    assert config.moe_router_dtype == "fp64"
+
+
+@pytest.mark.skipif(not is_te_min_version("2.14.0"), reason="single grouped weights need TE>=2.14")
+def test_native_single_grouped_weights_do_not_require_op_fuser():
+    config = _mok_transformer_config(
+        moe_megakernel_backend=None,
+        moe_single_grouped_weight=True,
+        moe_use_grouped_tensor=True,
+        use_transformer_engine_op_fuser=False,
+    )
+    assert config.moe_single_grouped_weight
+    assert not config.use_transformer_engine_op_fuser
+
+
 @pytest.mark.parametrize(
     ("overrides", "error"),
     [
         ({"bf16": False, "fp16": True}, "FP32, FP16, and FP4 are not supported"),
         ({"fp4": "e2m1"}, "FP32, FP16, and FP4 are not supported"),
         ({"moe_grouped_gemm": False}, "moe_grouped_gemm=True"),
+        ({"moe_router_dtype": "fp64"}, "MOK does not support moe_router_dtype='fp64'"),
+        ({"moe_virtual_expert_load_balance": True}, "MOK does not support MoonEP"),
+        ({"use_transformer_engine_op_fuser": True}, "use_transformer_engine_op_fuser=False"),
         (
             {"overlap_moe_expert_parallel_comm": True},
             "does not support overlap_moe_expert_parallel_comm",
         ),
         ({"gradient_accumulation_fusion": False}, "gradient_accumulation_fusion=True"),
         ({"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": False}, "fp8_param=True"),
+        ({"moe_shortcut_connection": True}, "does not support moe_shortcut_connection"),
+        ({"add_bias_linear": True}, "add_bias_linear"),
+        ({"moe_apply_probs_on_input": True}, "moe_apply_probs_on_input"),
+        ({"glu_linear_offset": 1.0}, "glu_linear_offset"),
+        ({"activation_func_tanh_clamp_scale": 1.0}, "activation_func_tanh_clamp_scale"),
+        ({"gtp_weight_remat_size": 2}, "GTP"),
+        ({"expert_gtp_weight_remat_size": 2}, "GTP"),
+        (
+            {
+                "transformer_impl": "inference_optimized",
+                "moe_router_dtype": "fp32",
+                "inference_grouped_gemm_backend": "torch",
+            },
+            "does not support inference_optimized",
+        ),
     ],
 )
 def test_mok_rejects_key_incompatible_configurations(overrides, error):

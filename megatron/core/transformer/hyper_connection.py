@@ -8,10 +8,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
-from megatron.core.transformer.residual_recompute_plan import (
+from megatron.core.transformer.residual_recompute import (
     build_recompute_block_end_plan,
     build_recompute_layer_managers,
     finalize_recompute_block,
@@ -69,7 +70,10 @@ class SinkhornKnopp(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input_logits: Tensor, num_iterations: int, eps: float = 1e-6) -> Tensor:
         """Run Sinkhorn iterations and save inputs for backward recomputation."""
-        M = _sinkhorn_iterations(input_logits, num_iterations, eps)
+        # This forward is always no-grad. Canonicalize the input's requires_grad flag
+        # too, so checkpointing reuses the same compiled specialization even when
+        # Dynamo's cache is full instead of mixing compiled and eager arithmetic.
+        M = _sinkhorn_iterations(input_logits.detach(), num_iterations, eps)
         ctx.save_for_backward(input_logits)
         ctx.num_iterations = num_iterations
         ctx.eps = eps
@@ -95,7 +99,7 @@ def native_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6
 @torch.compile
 def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
     """Native n-stream weighted aggregation: out = sum_j(h_pre_j * x_j)."""
-    return (x * h_pre.unsqueeze(-1)).sum(dim=2)
+    return (x * h_pre.unsqueeze(-1)).sum(dim=2).to(x.dtype)
 
 
 @torch.compile
@@ -171,25 +175,45 @@ def native_h_post_bda(
     """Native H_res.T @ residual + H_post * (x [+ bias])."""
     s, b, n, C = original_residual.shape
     h_res_batched = h_res.view(s * b, n, n)
-    residual_batched = original_residual.view(s * b, n, C)
-    mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched).view(s, b, n, C)
+    residual_batched = original_residual.view(s * b, n, C).to(h_res.dtype)
+    with torch.autocast(device_type=h_res_batched.device.type, enabled=False):
+        mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched).view(s, b, n, C)
     x_expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)
     if bias is not None:
         bias_expanded = h_post.unsqueeze(-1) * bias.view(1, 1, 1, C)
-        return x_expanded + bias_expanded + mixed
-    return x_expanded + mixed
+        return (x_expanded + bias_expanded + mixed).to(original_residual.dtype)
+    return (x_expanded + mixed).to(original_residual.dtype)
+
+
+def _proj_rms_impl(
+    x: Tensor, weight: Tensor, eps: float = 1e-6, eps_inside_sqrt: bool = False
+) -> Tuple[Tensor, Tensor]:
+    """FP32 projection + RMS normalization from an activation-dtype input."""
+    x = x.to(torch.float32)
+    weight = weight.to(torch.float32)
+    # Casting the operands is not sufficient under CUDA/CPU autocast: matmul and
+    # reductions are still eligible to downcast float32 inputs.  Keep the whole
+    # projection/RMS recipe in FP32; the caller controls the output cast.
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        proj = torch.matmul(x, weight.t())
+        if eps_inside_sqrt:
+            norm = torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
+        else:
+            norm = 1.0 / (x.norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1]) + eps)
+    return proj, norm
 
 
 # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
 @torch.compile
-def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
-    """Native fused projection + RMS normalization."""
-    proj = torch.matmul(x, weight.t())
-    norm = x.norm(dim=-1, keepdim=True)
-    K = x.shape[-1]
-    v = norm / math.sqrt(K) + eps
-    r = 1.0 / v
-    return proj, r
+def native_proj_rms(
+    x: Tensor, weight: Tensor, eps: float = 1e-6, eps_inside_sqrt: bool = False
+) -> Tuple[Tensor, Tensor]:
+    """Compiled FP32 projection + RMS normalization.
+
+    ``x`` may retain the activation dtype so callers can checkpoint this function without
+    saving an FP32 upcast of the residual stream.
+    """
+    return _proj_rms_impl(x, weight, eps, eps_inside_sqrt)
 
 
 # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
@@ -300,7 +324,7 @@ class HyperConnectionModule(MegatronModule):
         mark_keep_in_fp32(self.alpha_post)
         mark_keep_in_fp32(self.alpha_res)
         mark_keep_in_fp32(self.bias)
-        self.norm_eps = 1e-6
+        self.norm_eps = config.layernorm_epsilon if config.mhc_norm_eps_inside_sqrt else 1e-6
 
         # Choose implementation: unified fused kernels vs reference modules.
         # The fused public API selects the backend per operation internally.
@@ -312,9 +336,13 @@ class HyperConnectionModule(MegatronModule):
         # The fused path computes the projection and compute_h in one op, so
         # _projection_and_get_norm — and therefore _proj_rms_op — is only ever
         # reached on the unfused path.
-        self._proj_rms_op = native_proj_rms
+        # Full recompute forwards run under no_grad and replay with gradients. Use the
+        # same FP32 arithmetic in both passes; compiling only one changes norm reductions.
+        self._proj_rms_op = partial(_proj_rms_impl, eps_inside_sqrt=config.mhc_norm_eps_inside_sqrt)
 
         if config.use_fused_mhc:
+            if config.mhc_norm_eps_inside_sqrt or config.mhc_keep_mappings_in_fp32:
+                raise ValueError("Fused mHC does not support FP32 mixing or epsilon inside sqrt.")
             from megatron.core.fusions.fused_mhc_kernels import (
                 fused_h_aggregate,
                 fused_h_aggregate_into,
@@ -366,12 +394,21 @@ class HyperConnectionModule(MegatronModule):
             x: [s, b, n*C] - n-stream hidden states
         """
         s, b, nC = x.shape
-        # The mHC mapping computation runs in FP32: the parameters are kept in
-        # FP32 and the activations are upcast here, then compute_mappings casts
-        # the bounded mixing weights back to the activation dtype.
-        x_2d = x.reshape(s * b, nC).to(torch.float32)
-        weight = self.mapping_proj.weight.to(torch.float32)
-        proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
+        # Keep the activation-dtype input in autograd and upcast inside the recomputed
+        # projection. This avoids retaining a full FP32 copy of the residual stream.
+        x_2d = x.reshape(s * b, nC)
+        weight = self.mapping_proj.weight
+        if torch.is_grad_enabled() and (x_2d.requires_grad or weight.requires_grad):
+            proj, r = checkpoint(
+                self._proj_rms_op,
+                x_2d,
+                weight,
+                self.norm_eps,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+        else:
+            proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
         return proj.view(s, b, proj.shape[-1]), r.view(s, b, 1)
 
     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
@@ -454,10 +491,7 @@ class HyperConnectionModule(MegatronModule):
             h_res, self.sinkhorn_iterations, self.sinkhorn_eps
         )  # [s, b, n, n]
 
-        # The mixing weights are bounded (sigmoid outputs / doubly stochastic
-        # matrix), so after the FP32 computation they are safe to apply to the
-        # streams in the activation dtype.
-        dtype = x.dtype
+        dtype = torch.float32 if self.config.mhc_keep_mappings_in_fp32 else x.dtype
         return h_pre.to(dtype), h_post.to(dtype), h_res.to(dtype)
 
     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
@@ -581,10 +615,11 @@ class HyperConnectionModule(MegatronModule):
         # Reshape for bmm: [s, b, n, n] -> [s*b, n, n]
         h_res_batched = h_res.view(s * b, n, n)
         # [s, b, n*C] -> [s, b, n, C] -> [s*b, n, C]
-        residual_batched = residual.view(s, b, n, C).view(s * b, n, C)
+        residual_batched = residual.view(s * b, n, C).to(h_res.dtype)
 
         # Batch matrix multiply: [s*b, n, n].T @ [s*b, n, C] -> [s*b, n, C]
-        mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched)
+        with torch.autocast(device_type=h_res_batched.device.type, enabled=False):
+            mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched)
 
         return mixed.view(s, b, n * C)
 
@@ -751,9 +786,10 @@ class HyperConnectionModule(MegatronModule):
         """
         s, b, nC = x.shape
         C = nC // n
-        # Average all streams
+        # Average all streams. Accumulate the reduction in fp32 (then downcast to
+        # the input dtype) to avoid bf16 accumulation drift in the final contracted stream.
         x_streams = x.view(s, b, n, C)
-        contracted = x_streams.mean(dim=2)
+        contracted = x_streams.float().mean(dim=2).to(x.dtype)
         return contracted
 
     # ==================== Fused kernel placeholder ====================
@@ -868,7 +904,7 @@ class HyperConnectionModule(MegatronModule):
         bda_func = get_bias_dropout_add(training, fused)
         with torch.cuda.nvtx.range("HyperConnection::bda"):
             output = bda_func((x_expanded, bias_expanded), mixed, dropout_prob)
-        return output
+        return output.to(original_residual.dtype)
 
     @nvtx_decorator(message="HyperConnection::fused_h_res_h_post_bda_with_checkpoint")
     def _fused_h_res_h_post_bda_with_checkpoint(
@@ -943,7 +979,7 @@ class HyperConnectionModule(MegatronModule):
                         bias_expanded = None
                 with torch.cuda.nvtx.range("HyperConnection::bda"):
                     output = bda_func((x_expanded, bias_expanded), mixed, dropout_prob)
-                return output
+                return output.to(original_residual.dtype)
 
             ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
             if has_bias:

@@ -36,12 +36,18 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     is_checkpointing,
 )
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.cuda_graph_config import (
     is_whole_moe_cuda_graph_scope,
     validate_moe_cuda_graph_support,
 )
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.experimental_attention_variant import dsa_logging
+from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
+from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
+    CSALayerConfig,
+)
+from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
@@ -2951,10 +2957,15 @@ class TECudaGraphHelper:
                 # THD with CP>1 needs a full (not CP-sliced) RoPE table. Keep the legacy
                 # sample behavior unchanged here and warn below when one of those
                 # unsupported contracts is actually captured.
-                if (
-                    transformer_module.position_embedding_type == 'rope'
-                    and not self.config.multi_latent_attention
-                ):
+                uses_mla = self.config.multi_latent_attention
+                if getattr(transformer_module, "hybrid_layer_config_list", None) is not None:
+                    # Config types select the layer implementation; copied flags may differ.
+                    config_type = type(layer.config)
+                    if config_type is AttentionLayerConfig:
+                        uses_mla = False
+                    elif config_type in (MLALayerConfig, DSALayerConfig, CSALayerConfig):
+                        uses_mla = True
+                if transformer_module.position_embedding_type == 'rope' and not uses_mla:
                     rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
                         None, transformer_module.decoder, transformer_input, self.config, None
                     )
