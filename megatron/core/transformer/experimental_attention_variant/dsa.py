@@ -315,6 +315,7 @@ class DSAIndexerLossLoggingHelper:
         num_layers: int,
         reduce_group: torch.distributed.ProcessGroup = None,
         avg_group: torch.distributed.ProcessGroup = None,
+        raw_loss: Optional[torch.Tensor] = None,
     ):
         """Save the indexer loss for logging.
 
@@ -324,6 +325,9 @@ class DSAIndexerLossLoggingHelper:
             num_layers: The number of total layers.
             reduce_group: The group for reducing the loss.
             avg_group: The group for averaging the loss.
+            raw_loss: The unscaled loss, before the indexer loss coefficient is applied.
+                Optional so call sites that do not track it (the fused-kernel path) keep
+                working; it is appended last to preserve the positional order above.
         """
         # Skip indexer loss logging if layer_number is None.
         if layer_number is None:
@@ -342,6 +346,15 @@ class DSAIndexerLossLoggingHelper:
             grown[: tracker["values"].shape[0]] = tracker["values"]
             tracker["values"] = grown
         tracker["values"][layer_number - 1] += loss.detach()
+        if raw_loss is not None:
+            if "raw_values" not in tracker or tracker["raw_values"].shape[0] < needed:
+                grown = torch.zeros(
+                    needed, device=tracker["values"].device, dtype=tracker["values"].dtype
+                )
+                if "raw_values" in tracker:
+                    grown[: tracker["raw_values"].shape[0]] = tracker["raw_values"]
+                tracker["raw_values"] = grown
+            tracker["raw_values"][layer_number - 1] += raw_loss.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
@@ -353,6 +366,8 @@ class DSAIndexerLossLoggingHelper:
         avg_group = tracker.get("avg_group") if preserve_groups else None
         if "values" in tracker:
             tracker["values"].zero_()
+        if "raw_values" in tracker:
+            tracker["raw_values"].zero_()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
@@ -393,19 +408,38 @@ class DSAIndexerLossLoggingHelper:
             )
             grown[: tracker["values"].shape[0]] = tracker["values"]
             tracker["values"] = grown
-        values = tracker["values"]
-
-        torch.distributed.all_reduce(values, group=pp_group)
-        # Reduce indexer losses across ranks.
-        if tracker.get('reduce_group') is not None:
-            torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
-        if tracker.get('avg_group') is not None:
-            torch.distributed.all_reduce(
-                values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+        # raw_values must exist on every pipeline rank before the collectives below,
+        # since ranks that own no indexer still have to contribute zeros.
+        if "raw_values" not in tracker or tracker["raw_values"].shape[0] < size:
+            grown = torch.zeros(
+                size, device=tracker["values"].device, dtype=tracker["values"].dtype
             )
-        torch.distributed.all_reduce(
-            values, group=pg_collection.dp, op=torch.distributed.ReduceOp.AVG
-        )
+            if "raw_values" in tracker:
+                grown[: tracker["raw_values"].shape[0]] = tracker["raw_values"]
+            tracker["raw_values"] = grown
+        for values in (tracker["values"], tracker["raw_values"]):
+            torch.distributed.all_reduce(values, group=pp_group)
+            # Reduce indexer losses across ranks.
+            if tracker.get('reduce_group') is not None:
+                torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
+            if tracker.get('avg_group') is not None:
+                torch.distributed.all_reduce(
+                    values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+                )
+            # Sum over every rank holding a distinct micro-batch, then divide once. gtp_remat
+            # ranks each carry their own, so they are a second data dimension beside dp. CP is
+            # excluded on purpose: the loss is already summed across it before it gets here.
+            contributing_ranks = pg_collection.dp.size()
+            torch.distributed.all_reduce(
+                values, group=pg_collection.dp, op=torch.distributed.ReduceOp.SUM
+            )
+            gtp_remat_group = getattr(pg_collection, "gtp_remat", None)
+            if gtp_remat_group is not None and gtp_remat_group.size() > 1:
+                torch.distributed.all_reduce(
+                    values, group=gtp_remat_group, op=torch.distributed.ReduceOp.SUM
+                )
+                contributing_ranks *= gtp_remat_group.size()
+            values /= contributing_ranks
 
     @staticmethod
     def track_indexer_metrics(
@@ -454,6 +488,19 @@ class DSAIndexerLossLoggingHelper:
                 total_loss_dict["indexer loss"] += avg_indexer_loss
             else:
                 total_loss_dict["indexer loss"] = avg_indexer_loss
+
+        if "raw_values" in tracker:
+            raw_values = tracker["raw_values"] * loss_scale
+            avg_raw_indexer_loss = raw_values.sum() / max(num_indexer_layers, 1)
+            if total_loss_dict is not None:
+                if "indexer raw loss" in total_loss_dict:
+                    total_loss_dict["indexer raw loss"] += avg_raw_indexer_loss
+                else:
+                    total_loss_dict["indexer raw loss"] = avg_raw_indexer_loss
+            if writer is not None:
+                writer.add_scalar("indexer raw loss", avg_raw_indexer_loss, iteration)
+            if wandb_writer is not None:
+                wandb_writer.log({"indexer raw loss": avg_raw_indexer_loss}, iteration)
 
         if writer is not None:
             writer.add_scalar("indexer loss", avg_indexer_loss, iteration)
@@ -1282,6 +1329,68 @@ def fused_qk_topk_kpool(
         token_topk = _mask_topk_tokens_with_token_mask(token_topk, mask)
 
     return index_scores, token_topk
+
+
+def _merge_topk_scores(
+    running_scores: Optional[torch.Tensor],
+    running_indices: Optional[torch.Tensor],
+    block_scores: torch.Tensor,
+    block_indices: torch.Tensor,
+    topk_k: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Merge two candidate top-k sets into an exact top-k set."""
+    if running_scores is None or running_indices is None:
+        return block_scores, block_indices
+
+    merged_scores = torch.cat((running_scores, block_scores), dim=-1)
+    merged_indices = torch.cat((running_indices, block_indices), dim=-1)
+    keep_k = min(topk_k, merged_scores.size(-1))
+    keep = merged_scores.topk(keep_k, dim=-1)[1]
+    running_scores = torch.gather(merged_scores, -1, keep)
+    running_indices = torch.gather(merged_indices, -1, keep)
+    return running_scores, running_indices
+
+
+def fused_qk_topk_chunked(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    index_topk: int,
+    mask: Optional[torch.Tensor] = None,
+    key_chunk_size: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Exact top-k routing over key chunks.
+
+    Returns the exact same top-k result as the dense implementation, but avoids materializing the
+    full score tensor when `key_chunk_size` is set.
+    """
+    sk = k.size(0)
+    topk_k = min(index_topk, sk)
+    if key_chunk_size is None or key_chunk_size <= 0 or key_chunk_size >= sk:
+        index_scores, topk_indices = fused_qk_topk_naive(q, k, weights, index_topk, mask)
+        topk_scores = torch.gather(index_scores, -1, topk_indices)
+        return topk_scores, topk_indices
+
+    running_scores = None
+    running_indices = None
+    for k_start in range(0, sk, key_chunk_size):
+        k_end = min(k_start + key_chunk_size, sk)
+        block_scores = _compute_index_scores(q, weights, k[k_start:k_end])
+        if mask is not None:
+            block_mask = mask[..., k_start:k_end]
+            assert (
+                block_mask.dtype == block_scores.dtype
+            ), "Mask dtype must match index scores dtype"
+            block_scores = block_scores + block_mask
+
+        block_topk_k = min(topk_k, k_end - k_start)
+        block_scores, block_indices = block_scores.topk(block_topk_k, dim=-1)
+        block_indices = block_indices + k_start
+        running_scores, running_indices = _merge_topk_scores(
+            running_scores, running_indices, block_scores, block_indices, topk_k
+        )
+
+    return running_scores, running_indices
 
 
 def fwd_fused_indexer_loss_naive(
@@ -3145,6 +3254,7 @@ class DSAttention(MegatronModule):
                     raise RuntimeError("Fused DSA attention did not produce a valid indexer loss.")
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
+                    raw_loss=indexer_loss / indexer_loss_coeff,
                     layer_number=self.layer_number,
                     num_layers=self.config.num_layers,
                     reduce_group=indexer_reduce_group,
@@ -3232,6 +3342,7 @@ class DSAttention(MegatronModule):
             if indexer_loss_coeff > 0:
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
+                    raw_loss=indexer_loss / indexer_loss_coeff,
                     layer_number=self.layer_number,
                     num_layers=self.config.num_layers,
                     reduce_group=indexer_reduce_group,

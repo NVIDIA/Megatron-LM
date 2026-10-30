@@ -26,6 +26,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext, current_fully_shard_context
 from .module import FsdpModule
+from .placement import ShardLayout
 from .schedule import SchedulePolicy
 
 # TODO(wujingyue): Separate fully_shard_context from FsdpContext in a follow-up PR.
@@ -72,6 +73,7 @@ def fully_shard(
     schedule_policy: SchedulePolicy = SchedulePolicy(),
     register_hooks: bool = True,
     grad_accumulation_count: int | None = None,
+    shard_layout: ShardLayout = ShardLayout.PADDED,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -107,6 +109,10 @@ def fully_shard(
             window, including contributions from separate GraphTasks and delayed
             weight gradients. Defaults to one per owned trainable parameter.
             The scheduler must declare the complete count before sharding the unit.
+        shard_layout: How RowAtomic/BlockAtomic parameter groups are split across ranks.
+            ``ShardLayout.PADDED`` (default) pads every group to equal shards;
+            ``ShardLayout.UNPADDED`` packs each group without padding and splits it at row
+            boundaries (32-row block boundaries for MXFP8) into generally unequal shards.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -139,6 +145,7 @@ def fully_shard(
             use_symmetric_memory=context.use_symmetric_memory,
             register_hooks=register_hooks,
             grad_accumulation_count=grad_accumulation_count,
+            shard_layout=shard_layout,
         )
     except Exception:
         module.__class__ = original_cls
@@ -177,13 +184,13 @@ def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
 def microbatch(context: FsdpContext, is_last: bool) -> Iterator[None]:
     """Mark an FSDP microbatch as the last accumulation microbatch.
 
-    At present, this is only needed for HSDP/HFSDP gradient accumulation, so
-    FSDP finalizes gradients only on the last backward. Plain all-``Shard(0)`` data
-    parallelism finalizes gradients on every backward and does not need it.
+    Non-final microbatches still release unsharded weights, but defer automatic
+    gradient synchronization. HSDP/HFSDP also defer DP-outer gradient reduction
+    until the last microbatch. Wrap both forward and backward in this scope.
 
     Args:
         context: FSDP context whose roots should use this microbatch state.
-        is_last: Whether forwards in this scope are for the last microbatch.
+        is_last: Whether this scope contains the last accumulation microbatch.
     """
     context.ensure_finalized()
     previous_state = context.is_last_microbatch

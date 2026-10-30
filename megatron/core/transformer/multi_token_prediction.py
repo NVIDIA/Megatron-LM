@@ -6,7 +6,7 @@ import warnings
 from contextlib import AbstractContextManager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Callable, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -216,6 +216,51 @@ def tie_output_layer_state_dict(
     )
 
 
+def _exchange_cp_roll_boundaries(first_boundary, second_boundary, cp_group):
+    """Exchange both roll boundaries with the adjacent context-parallel ranks."""
+    first_boundary = first_boundary.contiguous()
+    second_boundary = second_boundary.contiguous()
+    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
+    local_rank = torch.distributed.get_rank(group=cp_group)
+    first_received = (
+        torch.empty_like(first_boundary) if local_rank != len(global_ranks) - 1 else second_boundary
+    )
+    second_received = (
+        torch.empty_like(second_boundary) if local_rank != 0 else torch.zeros_like(second_boundary)
+    )
+
+    # Keep boundary exchanges on the CP communicator so independent DP lanes
+    # can issue different packed P2P sequences without coupling through WORLD.
+    ops = []
+    if local_rank != 0:
+        previous_rank = global_ranks[local_rank - 1]
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend, first_boundary, previous_rank, group=cp_group
+            )
+        )
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.irecv, second_received, previous_rank, group=cp_group
+            )
+        )
+    if local_rank != len(global_ranks) - 1:
+        next_rank = global_ranks[local_rank + 1]
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.irecv, first_received, next_rank, group=cp_group
+            )
+        )
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend, second_boundary, next_rank, group=cp_group
+            )
+        )
+    for request in torch.distributed.batch_isend_irecv(ops):
+        request.wait()
+    return first_received, second_received
+
+
 def roll_tensor(
     tensor,
     shifts=-1,
@@ -226,28 +271,21 @@ def roll_tensor(
     cp_layout: CPLayout = "zigzag",
     fill_value=0,
 ):
-    """Roll the tensor input along the sequence dimension with Context Parallelism (CP) support.
+    """Roll a tensor along the sequence dimension, exchanging CP boundary tokens when needed.
 
-    This function extends the original roll_tensor to support Context Parallelism, which allows
-    MTP to work with CP > 1. When CP is enabled, the sequence dimension is split across CP ranks,
-    and tensor rolling requires communication between adjacent CP ranks to properly handle the
-    boundary conditions.
-
-    For CP=1 (default behavior): Uses standard torch.roll with zero padding
-    For zigzag CP>1: Rolls within each chunk, then exchanges boundary elements between
-    adjacent CP ranks. The contiguous layout exchanges shard boundaries and honors fill_value.
-
-    For packed sequences: Respects sequence boundaries when rolling to avoid mixing tokens
-    from different sequences.
+    Packed rolls respect document boundaries. With zigzag CP > 1, each physical document
+    length must be divisible by twice the CP size so every rank receives two equal chunks.
+    In the zigzag path, slots after the final physical document roll as a separate trailing
+    segment, with its last slot zeroed. The contiguous layout honors fill_value.
 
     Args:
         tensor (Tensor): The input tensor to roll. If None, returns (None, None).
         shifts (int): The shift of the tensor (typically -1 for MTP).
         dims (int): The dimension to roll (typically -1 for sequence dimension).
-        cp_group (ProcessGroup): The context parallelism process group. If None or size=1,
-                               falls back to standard rolling behavior.
-        packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
-                                            If provided, respects sequence boundaries.
+        cp_group (ProcessGroup): The context parallelism process group. None or size 1
+            uses a local roll.
+        packed_seq_params (PackedSeqParams): Logical and optional physical document
+            boundaries for packed sequences.
         return_sum (bool): Whether to calculate and return the rolled tensor sum.
                            Defaults to True.
         cp_layout (CPLayout): "contiguous" selects contiguous CP shards and requires
@@ -289,68 +327,16 @@ def roll_tensor(
     for i in range(len(tensor_list)):
         rolled_tensor_list.append(torch.roll(tensor_list[i], shifts=shifts, dims=dims))
 
-    # Prepare tensors for communication between CP ranks
-    # Each CP rank needs to send boundary elements to adjacent ranks
-    tensor_send_list = []
-    tensor_recv_list = []
-    for i in range(len(rolled_tensor_list)):
-        tensor_send_list.append(rolled_tensor_list[i].select(dims, shifts).contiguous())
-        empty_tensor = torch.empty(
-            tensor_send_list[i].shape,
-            dtype=tensor_send_list[i].dtype,
-            device=torch.cuda.current_device(),
-        )
-        tensor_recv_list.append(empty_tensor)
-
-    # Get the global rank of next and prev process in the cp group
-    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
-    local_rank = torch.distributed.get_rank(group=cp_group)
-    next_rank = global_ranks[(local_rank + 1) % len(global_ranks)]
-    prev_rank = global_ranks[(local_rank - 1) % len(global_ranks)]
-
-    # Keep each boundary exchange on its CP communicator. Using the default WORLD
-    # communicator couples otherwise independent DP lanes and can deadlock when
-    # packed batches issue different P2P sequences.
-    ops = []
-    if local_rank != 0:
-        ops.append(
-            torch.distributed.P2POp(
-                torch.distributed.isend, tensor_send_list[0], prev_rank, group=cp_group
-            )
-        )
-        ops.append(
-            torch.distributed.P2POp(
-                torch.distributed.irecv, tensor_recv_list[1], prev_rank, group=cp_group
-            )
-        )
-    else:
-        # Inserted elements are set to be 0.0.
-        tensor_recv_list[1] = 0
-    if local_rank != len(global_ranks) - 1:
-        ops.append(
-            torch.distributed.P2POp(
-                torch.distributed.irecv, tensor_recv_list[0], next_rank, group=cp_group
-            )
-        )
-        ops.append(
-            torch.distributed.P2POp(
-                torch.distributed.isend, tensor_send_list[1], next_rank, group=cp_group
-            )
-        )
-    else:
-        # For the last CP rank, the removed elements of second part go into the first part
-        tensor_recv_list[0] = tensor_send_list[1]
-
-    # Wait for all communication operations to complete
-    for request in torch.distributed.batch_isend_irecv(ops):
-        request.wait()
+    first_received, second_received = _exchange_cp_roll_boundaries(
+        rolled_tensor_list[0].select(dims, shifts),
+        rolled_tensor_list[1].select(dims, shifts),
+        cp_group,
+    )
 
     # Splicing: Replace boundary elements with received elements from adjacent ranks
     # This ensures proper sequence continuity across CP boundaries
-    index = [slice(None)] * rolled_tensor_list[0].dim()
-    index[dims] = shifts
-    for i in range(len(rolled_tensor_list)):
-        rolled_tensor_list[i][tuple(index)] = tensor_recv_list[i]
+    rolled_tensor_list[0].select(dims, shifts).copy_(first_received)
+    rolled_tensor_list[1].select(dims, shifts).copy_(second_received)
 
     # Concatenate the processed chunks back into a single tensor
     rolled_tensor = torch.cat(rolled_tensor_list, dim=dims)
@@ -362,149 +348,76 @@ def roll_tensor(
 def _roll_tensor_packed_seq(
     tensor, shifts, dims, packed_seq_params, cp_group=None, return_sum=True
 ):
-    """Roll tensor with packed sequence support.
-    This function handles rolling for packed sequences by respecting sequence boundaries
+    """Roll packed documents one token left, exchanging CP boundary tokens when needed.
+
+    With CP > 1, each physical document length must be divisible by ``2 * cp_size``.
+    Slots after the final physical boundary roll as a separate segment and end in zero.
     """
 
-    # Notice: This is a naive implementation to test the correctness,
-    # a better solution will only sync the boundary tokens once.
     ndim = tensor.dim()
     sequence_dim = dims if dims >= 0 else ndim + dims
     assert sequence_dim in (
         0,
         ndim - 1,
     ), f"Packed sequence roll only supports the first or last dimension, got dims={dims}."
+    mask_shape = [1] * ndim
+    mask_shape[sequence_dim] = -1
     assert shifts == -1, "Packed sequence roll only supports a single-token left shift."
     cu_seqlens = packed_seq_params.cu_seqlens_q
     assert cu_seqlens is not None, "Packed sequence parameters must provide cu_seqlens_q."
     physical_cu_seqlens = packed_seq_params.cu_seqlens_q_padded
     if physical_cu_seqlens is None:
         physical_cu_seqlens = cu_seqlens
-
-    rolled_tensor = tensor.clone()
-
-    def slice_sequence(tensor, start, end):
-        index = [slice(None)] * tensor.dim()
-        index[sequence_dim] = slice(start, end)
-        return tensor[tuple(index)]
-
-    def assign_sequence(tensor, start, end, value):
-        index = [slice(None)] * tensor.dim()
-        index[sequence_dim] = slice(start, end)
-        tensor[tuple(index)] = value
+    physical_cu_seqlens = physical_cu_seqlens.to(device=tensor.device)
 
     cp_size = cp_group.size() if cp_group is not None else 1
+    rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
+    rolled_tensor.select(dims, shifts).zero_()
     if cp_size == 1:
-        # CP disabled: roll each packed sequence independently within its boundaries
-        for i in range(len(cu_seqlens) - 1):
-            start_idx = physical_cu_seqlens[i]
-            valid_length = cu_seqlens[i + 1] - cu_seqlens[i]
-            end_idx = start_idx + valid_length
-            physical_end_idx = physical_cu_seqlens[i + 1]
-            # Shard-local packed boundaries can collapse documents outside this
-            # SP rank to empty slices. They have no boundary token to clear.
-            if end_idx > start_idx:
-                seq_slice = slice_sequence(tensor, start_idx, end_idx)
-                rolled_seq = torch.roll(seq_slice, shifts=shifts, dims=sequence_dim)
-                # Zero out the last position that would cross a document boundary.
-                rolled_seq.select(sequence_dim, shifts).zero_()
-                assign_sequence(rolled_tensor, start_idx, end_idx, rolled_seq)
-            assign_sequence(rolled_tensor, end_idx, physical_end_idx, 0)
+        cu_seqlens = cu_seqlens.to(device=tensor.device)
+        if cu_seqlens.numel() == 1:
+            return rolled_tensor, rolled_tensor.sum() if return_sum else None
+        # Mask each document's last valid position and physical padding; slots
+        # after the final document roll as a separate trailing segment.
+        positions = torch.arange(
+            tensor.size(sequence_dim), device=tensor.device, dtype=physical_cu_seqlens.dtype
+        )
+        document_ids = torch.searchsorted(physical_cu_seqlens[1:], positions, right=True)
+        # Clamp the lookup for positions beyond the final document.
+        trailing = positions >= physical_cu_seqlens[-1]
+        document_ids.clamp_max_(len(cu_seqlens) - 2)
+        valid_ends = physical_cu_seqlens[:-1] + torch.diff(cu_seqlens)
+        invalid = (positions >= valid_ends.index_select(0, document_ids) - 1) & ~trailing
+        rolled_tensor.masked_fill_(invalid.view(mask_shape), 0)
         rolled_sum = rolled_tensor.sum() if return_sum else None
         return rolled_tensor, rolled_sum
 
-    # CP enabled: each rank owns two chunks per sequence (front and mirrored tail).
-    local_rank = torch.distributed.get_rank(group=cp_group)
-    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
-    next_rank = global_ranks[(local_rank + 1) % cp_size]
-    prev_rank = global_ranks[(local_rank - 1) % cp_size]
+    # CP attention requires two equal chunks per rank for every physical document.
+    aligned = (torch.diff(physical_cu_seqlens) % (2 * cp_size) == 0).all()
+    local_boundaries = torch.div(physical_cu_seqlens, cp_size, rounding_mode='floor').long()
+    local_lengths = torch.diff(local_boundaries)
+    # Exchange one boundary vector per neighbour for all nonempty documents.
+    # RL packing may repeat the final boundary in fixed-size metadata.
+    nonempty = torch.nonzero(local_lengths > 0).flatten()
+    # nonzero already waits for CUDA, so validate on the host before indexing or communication.
+    if not bool(aligned):
+        raise ValueError("Packed document lengths must be divisible by twice the CP size")
+    if nonempty.numel() == 0:
+        return rolled_tensor, rolled_tensor.sum() if return_sum else None
+    local_starts = local_boundaries[:-1].index_select(0, nonempty)
+    local_ends = local_boundaries[1:].index_select(0, nonempty)
+    chunk_lengths = local_lengths.index_select(0, nonempty) // 2
+    second_starts = local_starts + chunk_lengths
+    first_ends = second_starts - 1
+    second_ends = local_ends - 1
+    first_boundary = tensor.index_select(sequence_dim, local_starts)
+    second_boundary = tensor.index_select(sequence_dim, second_starts)
+    first_received, second_received = _exchange_cp_roll_boundaries(
+        first_boundary, second_boundary, cp_group
+    )
 
-    # Iterate over each sequence individually
-    for i in range(len(cu_seqlens) - 1):
-        start_idx = physical_cu_seqlens[i]
-        end_idx = physical_cu_seqlens[i + 1]
-
-        # the idx has been multiplied by cp_size, need to divide it by cp_size to get the local idx
-        local_start_idx = start_idx // cp_size
-        local_end_idx = end_idx // cp_size
-
-        # Skip empty sequences - this can happen when a sequence is very short and
-        # after dividing by cp_size, the local slice has zero length
-        local_seq_len = local_end_idx - local_start_idx
-        if local_seq_len == 0:
-            continue
-
-        tensor_slice = slice_sequence(rolled_tensor, local_start_idx, local_end_idx).clone()
-
-        # The following code is very similar as the code in roll_tensor function
-        local_chunks = tensor_slice.chunk(2, dim=sequence_dim)
-        rolled_chunks = [
-            torch.roll(chunk, shifts=shifts, dims=sequence_dim) for chunk in local_chunks
-        ]
-
-        tensor_send_list = []
-        tensor_recv_list = []
-        for chunk in rolled_chunks:
-            # Skip empty chunks that can occur when the sequence slice is very small
-            if chunk.size(sequence_dim) == 0:
-                boundary_shape = list(chunk.shape)
-                del boundary_shape[sequence_dim]
-                tensor_send_list.append(
-                    torch.empty(boundary_shape, dtype=chunk.dtype, device=chunk.device)
-                )
-                tensor_recv_list.append(
-                    torch.empty(boundary_shape, dtype=chunk.dtype, device=chunk.device)
-                )
-                continue
-            boundary = chunk.select(sequence_dim, shifts).contiguous().clone()
-            tensor_send_list.append(boundary)
-            tensor_recv_list.append(torch.empty_like(boundary))
-
-        ops = []
-        if local_rank != 0:
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.isend, tensor_send_list[0], prev_rank, group=cp_group
-                )
-            )
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.irecv, tensor_recv_list[1], prev_rank, group=cp_group
-                )
-            )
-        else:
-            tensor_recv_list[1].zero_()
-
-        if local_rank != cp_size - 1:
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.irecv, tensor_recv_list[0], next_rank, group=cp_group
-                )
-            )
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.isend, tensor_send_list[1], next_rank, group=cp_group
-                )
-            )
-        else:
-            tensor_recv_list[0].copy_(tensor_send_list[1])
-
-        for request in torch.distributed.batch_isend_irecv(ops):
-            request.wait()
-
-        index = [slice(None)] * rolled_chunks[0].dim()
-        index[sequence_dim] = shifts
-        for chunk, recv in zip(rolled_chunks, tensor_recv_list):
-            # Skip empty chunks
-            if chunk.size(sequence_dim) == 0:
-                continue
-            chunk[tuple(index)] = recv
-
-        seq_result = torch.cat(rolled_chunks, dim=sequence_dim)
-
-        # update the rolled tensor
-        assign_sequence(rolled_tensor, local_start_idx, local_end_idx, seq_result)
-
+    rolled_tensor.index_copy_(sequence_dim, first_ends, first_received)
+    rolled_tensor.index_copy_(sequence_dim, second_ends, second_received)
     rolled_sum = rolled_tensor.sum() if return_sum else None
     return rolled_tensor, rolled_sum
 
@@ -573,26 +486,33 @@ def _packed_seq_params_for_local_hsm_roll(
     if padded is not None and padded is not cu_seqlens:
         cp_size = get_pg_size(cp_group)
         cp_rank = get_pg_rank(cp_group)
-        boundaries = [padded.new_zeros(())]
-        local_offset = padded.new_zeros(())
-        for doc_idx in range(len(cu_seqlens) - 1):
-            padded_length = padded[doc_idx + 1] - padded[doc_idx]
-            valid_length = cu_seqlens[doc_idx + 1] - cu_seqlens[doc_idx]
-            chunk_length = torch.div(padded_length, 2 * cp_size, rounding_mode='floor')
-            if cp_rank == cp_size - 1:
-                owned_length = 2 * chunk_length
-                valid = torch.minimum(
-                    (valid_length - cp_rank * chunk_length).clamp_min(0), owned_length
-                )
-                boundaries.extend([local_offset + valid, local_offset + owned_length])
-                local_offset = local_offset + owned_length
-                continue
-            starts = (cp_rank * chunk_length, (2 * cp_size - cp_rank - 1) * chunk_length)
-            for start in starts:
-                valid = torch.minimum((valid_length - start).clamp_min(0), chunk_length)
-                boundaries.extend([local_offset + valid, local_offset + chunk_length])
-                local_offset = local_offset + chunk_length
-        cp_local = torch.stack(boundaries).unique_consecutive()
+        chunk_lengths = torch.div(torch.diff(padded), 2 * cp_size, rounding_mode='floor')
+        valid_lengths = torch.diff(cu_seqlens)
+        owned_lengths = 2 * chunk_lengths
+        local_starts = torch.cumsum(owned_lengths, dim=0, dtype=padded.dtype) - owned_lengths
+        if cp_rank == cp_size - 1:
+            valid = torch.minimum(
+                (valid_lengths - cp_rank * chunk_lengths).clamp_min(0), owned_lengths
+            )
+            boundaries = torch.stack(
+                (local_starts + valid, local_starts + owned_lengths), dim=1
+            ).flatten()
+        else:
+            front_valid = torch.minimum(
+                (valid_lengths - cp_rank * chunk_lengths).clamp_min(0), chunk_lengths
+            )
+            back_start = (2 * cp_size - cp_rank - 1) * chunk_lengths
+            back_valid = torch.minimum((valid_lengths - back_start).clamp_min(0), chunk_lengths)
+            boundaries = torch.stack(
+                (
+                    local_starts + front_valid,
+                    local_starts + chunk_lengths,
+                    local_starts + chunk_lengths + back_valid,
+                    local_starts + owned_lengths,
+                ),
+                dim=1,
+            ).flatten()
+        cp_local = torch.cat((padded.new_zeros(1), boundaries))
         add_zigzag_midpoints = False
     else:
         cp_size = get_pg_size(cp_group)
@@ -605,7 +525,7 @@ def _packed_seq_params_for_local_hsm_roll(
     # A document's local slots are its two zigzag chunks, which are adjacent locally but
     # usually far apart globally, so the midpoint between them is a boundary too: the
     # token after the front chunk's last one lives on another rank, not in the next local
-    # slot. Splitting there is what roll_tensor's CP branch used chunk(2) for.
+    # slot. The local roll must stop at that seam.
     #
     # The exception is the last CP rank. The zigzag hands rank r chunks r and
     # 2 * cp_size - 1 - r, which for r == cp_size - 1 are chunks cp_size - 1 and cp_size:
@@ -1086,6 +1006,28 @@ class MTPLossAutoScaler(torch.autograd.Function):
         MTPLossAutoScaler.main_loss_backward_scale = scale
 
 
+class _MTPHeadGradInjector(torch.autograd.Function):
+    """Route a gradient that was already computed for an MTP head input into the main graph.
+
+    Used by ``mtp_loss_early_backward``: the head's projection + loss + backward have already
+    run, producing ``head_grad`` for the (detached) head input. This node is a no-op in forward
+    and, in backward, hands ``head_grad`` to ``head_hidden`` so it flows into the MTP layers and
+    the main model exactly as the deferred path would have delivered it.
+    """
+
+    @staticmethod
+    def forward(ctx, output: torch.Tensor, head_hidden: torch.Tensor, head_grad: torch.Tensor):
+        """Pass ``output`` through; stash the precomputed gradient for ``head_hidden``."""
+        ctx.save_for_backward(head_grad)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Return the pass-through gradient and the precomputed head-input gradient."""
+        (head_grad,) = ctx.saved_tensors
+        return grad_output, head_grad, None
+
+
 def _accepts_return_argmax(compute_language_model_loss: Callable) -> bool:
     """Whether the loss callable takes ``return_argmax`` (LanguageModule's loss does)."""
     try:
@@ -1205,12 +1147,16 @@ def process_mtp_loss(
         )
         mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
 
-    for mtp_layer_number in range(config.mtp_num_layers):
-        mtp_logits, _ = output_layer(
-            hidden_states_list[mtp_layer_number + 1],
-            weight=output_weight,
-            runtime_gather_output=False,
-        )
+    def _mtp_head_loss(
+        mtp_layer_number: int, head_hidden: Tensor, head_labels: Tensor, layer_loss_mask: Tensor
+    ):
+        """Project one MTP depth to the vocabulary and compute its masked per-token loss.
+
+        Returns ``(masked_loss, correct, total)``. ``correct``/``total`` are the acceptance
+        counts (``None`` when not training). Everything that allocates [s, b, v] tensors for
+        one head lives here so ``mtp_loss_early_backward`` can run and release it as a unit.
+        """
+        mtp_logits, _ = output_layer(head_hidden, weight=output_weight, runtime_gather_output=False)
         if scale_logits_fn is not None:
             mtp_logits = scale_logits_fn(mtp_logits)
         if is_observing_tensor("mtp_logits"):
@@ -1223,6 +1169,30 @@ def process_mtp_loss(
                 sequence_dim=0,
                 batch_dim=1,
             )
+        mtp_preds = None
+        if loss_returns_argmax:
+            head_loss, mtp_preds = compute_language_model_loss(
+                head_labels, mtp_logits, return_argmax=True
+            )
+        else:
+            head_loss = compute_language_model_loss(head_labels, mtp_logits)
+        correct = total = None
+        if is_training:
+            correct, total = _compute_mtp_acceptance_counts(
+                mtp_logits, head_labels, layer_loss_mask, tp_group=tp_group, preds=mtp_preds
+            )
+        head_loss = layer_loss_mask * head_loss
+        return head_loss, correct, total
+
+    # Early backward: fwd(head) -> bwd(head) per depth so at most one head's logits/softmax is
+    # resident at a time. Needs a live graph and cannot run inside CUDA-graph capture/warmup.
+    early_backward = False
+    if getattr(config, "mtp_loss_early_backward", False) and torch.is_grad_enabled():
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
+
+        early_backward = not (is_graph_capturing() or is_graph_warmup())
+
+    for mtp_layer_number in range(config.mtp_num_layers):
         if config.attention_cp_layout == "contiguous":
             mtp_labels, loss_mask, mtp_input_mask = roll_contiguous_fields(
                 (mtp_labels, loss_mask, mtp_input_mask), cp_group, packed_seq_params
@@ -1280,23 +1250,19 @@ def process_mtp_loss(
                 # no-mask fast path for all non-multimodal MTP callers.
                 num_tokens = rolled_num_tokens
 
-        mtp_preds = None
-        if loss_returns_argmax:
-            mtp_loss, mtp_preds = compute_language_model_loss(
-                mtp_labels, mtp_logits, return_argmax=True
-            )
-        else:
-            mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
-
-        mtp_loss = layer_loss_mask * mtp_loss
+        head_hidden = hidden_states_list[mtp_layer_number + 1]
+        # In early-backward mode the head runs on a detached leaf so its backward stops at the
+        # head input; the resulting gradient is re-injected into the main graph below.
+        head_input = head_hidden.detach().requires_grad_(True) if early_backward else head_hidden
+        mtp_loss, correct, total = _mtp_head_loss(
+            mtp_layer_number, head_input, mtp_labels, layer_loss_mask
+        )
 
         if is_training:
+            # Logging only: detach so nothing here keeps this head's graph alive.
             mtp_loss_for_log = (
-                torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
+                torch.sum(mtp_loss.detach()) * (num_tokens > 0).to(mtp_loss.dtype)
             ) / num_tokens.clamp(min=1)
-            correct, total = _compute_mtp_acceptance_counts(
-                mtp_logits, mtp_labels, layer_loss_mask, tp_group=tp_group, preds=mtp_preds
-            )
 
             if metric_avg_group is None:
                 # Compatibility fallback for callers that have not migrated to explicit groups.
@@ -1325,12 +1291,24 @@ def process_mtp_loss(
             mtp_loss_normalized = (
                 mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
             )
-            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
         else:
             safe_num_tokens = num_tokens.clamp(min=1)
-            hidden_states = MTPLossAutoScaler.apply(
-                hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens
+            mtp_loss_normalized = mtp_loss_scale * mtp_loss / safe_num_tokens
+
+        if early_backward:
+            # Same upstream gradient MTPLossAutoScaler.backward would supply, applied now. This
+            # frees this head's logits/softmax and accumulates the output-layer weight gradient
+            # before the next head (or the main head) allocates its own logits.
+            torch.autograd.backward(
+                mtp_loss_normalized,
+                torch.ones_like(mtp_loss_normalized) * MTPLossAutoScaler.main_loss_backward_scale,
             )
+            head_grad = head_input.grad
+            head_input.grad = None
+            del mtp_loss, mtp_loss_normalized, head_input
+            hidden_states = _MTPHeadGradInjector.apply(hidden_states, head_hidden, head_grad)
+        else:
+            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
 
     return hidden_states
 
@@ -1362,12 +1340,13 @@ class MultiTokenPredictionLayer(MegatronModule):
         layer_number: int = 1,
         vp_stage: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        # For hybrid path - pattern and submodules to build inner layers directly
+        # For hybrid path - architecture and submodules to build inner layers directly
         mtp_layer_pattern: Optional[str] = None,
         hybrid_submodules: Optional[HybridStackSubmodules] = None,
         mamba_submodules: Optional[HybridStackSubmodules] = None,
         hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
+        mtp_layer_config_list: Optional[Sequence[TransformerConfig]] = None,
     ):
         """
         Args:
@@ -1390,12 +1369,31 @@ class MultiTokenPredictionLayer(MegatronModule):
                 stacklevel=2,
             )
             hybrid_submodules = mamba_submodules
+        if mtp_layer_pattern is not None and mtp_layer_config_list is not None:
+            raise ValueError(
+                "Exactly one of mtp_layer_pattern or mtp_layer_config_list may be provided"
+            )
+        if mtp_layer_pattern is not None:
+            from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
+
+            mtp_layer_config_list = validate_segment_layers(mtp_layer_pattern, self.config)
+        self.mtp_layer_config_list = (
+            tuple(mtp_layer_config_list) if mtp_layer_config_list is not None else None
+        )
+        self.is_hybrid_mtp = self.mtp_layer_config_list is not None
+        if self.is_hybrid_mtp and not self.mtp_layer_config_list:
+            raise ValueError("Hybrid MTP layer config list must be non-empty")
+        if self.is_hybrid_mtp and hybrid_submodules is None:
+            raise ValueError(
+                "Hybrid MTP requires hybrid_submodules with either mtp_layer_pattern "
+                "or mtp_layer_config_list"
+            )
         if self.config.enable_mhc_connections and (
-            mtp_layer_pattern is None or hybrid_submodules is None
+            not self.is_hybrid_mtp or hybrid_submodules is None
         ):
             raise ValueError(
                 "Multi-token prediction with hyper connections requires the HybridModel "
-                "MTP contract: both mtp_layer_pattern and hybrid_submodules must be provided."
+                "MTP contract: hybrid layer configuration and hybrid_submodules must be provided."
             )
         self.sequence_parallel = config.sequence_parallel
         self.submodules = submodules
@@ -1405,7 +1403,6 @@ class MultiTokenPredictionLayer(MegatronModule):
         self.vp_stage = vp_stage
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp if pg_collection is not None else None
-        self.mtp_layer_pattern = mtp_layer_pattern
         self.mhc_enabled = self.config.enable_mhc_connections
 
         # Validate attention mask type if using transformer-based inner layers
@@ -1509,16 +1506,26 @@ class MultiTokenPredictionLayer(MegatronModule):
                 self.eh_proj.set_barrier_before_all_gather(True)
 
         # Build inner layers: two possible paths
-        # 1. Hybrid path: use HybridStack for hybrid pattern support
+        # 1. Hybrid path: use HybridStack for hybrid architecture support
         # 2. GPT path: single TransformerLayer
-        if mtp_layer_pattern is not None and hybrid_submodules is not None:
+        if self.is_hybrid_mtp:
             from megatron.core.models.hybrid.hybrid_block import HybridStack
-            from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
+            from megatron.core.models.hybrid.hybrid_layer_allocation import (
+                clone_hybrid_layer_config_list,
+            )
 
+            layer_config_list = clone_hybrid_layer_config_list(self.mtp_layer_config_list)
+            for layer_config in layer_config_list:
+                layer_config.num_layers = self.config.num_layers
+                layer_config.mtp_num_layers = self.config.mtp_num_layers
+                layer_config.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
+                if self.config.keep_mtp_in_bf16:
+                    layer_config.fp4 = None
+                    layer_config.fp8 = None
             self.mtp_model_layer = HybridStack(
                 config=self.config,
                 submodules=hybrid_submodules,
-                layer_config_list=validate_segment_layers(mtp_layer_pattern, self.config),
+                layer_config_list=layer_config_list,
                 pp_layer_offset=0,
                 pre_process=True,  # Always receives input from eh_proj
                 post_layer_norm=False,  # MTP has its own final_layernorm
@@ -1550,7 +1557,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         # between, so it must barrier before overwriting. Later all-gathers in the inner
         # block are each preceded by a reduce-scatter and need no barrier. modules() yields
         # in forward order, so the first inference column-parallel linear is that all-gather.
-        if self.mtp_layer_pattern is not None:
+        if self.is_hybrid_mtp:
             # Hybrid path: HybridStack of layers.
             first_inner_layer = self.mtp_model_layer.layers[0]
         else:
@@ -1570,14 +1577,15 @@ class MultiTokenPredictionLayer(MegatronModule):
         if self.mhc_enabled:
             hc_mult = self.config.mhc_num_residual_streams
             hc_dim = self.config.hidden_size * hc_mult
-            self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
-            self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
-            self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
-            nn.init.xavier_uniform_(self.hc_head_fn)
-            if self.config.sequence_parallel:
-                setattr(self.hc_head_fn, "sequence_parallel", True)
-                setattr(self.hc_head_base, "sequence_parallel", True)
-                setattr(self.hc_head_scale, "sequence_parallel", True)
+            if self.config.mhc_learned_output_contract:
+                self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
+                self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
+                self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
+                nn.init.xavier_uniform_(self.hc_head_fn)
+                if self.config.sequence_parallel:
+                    setattr(self.hc_head_fn, "sequence_parallel", True)
+                    setattr(self.hc_head_base, "sequence_parallel", True)
+                    setattr(self.hc_head_scale, "sequence_parallel", True)
         self.offload_context = nullcontext()
 
     def get_inner_quantization_context(self) -> AbstractContextManager:
@@ -1844,7 +1852,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             # FP8GlobalStateManager.is_first_fp8_module() is True so that the fp8 weight caching
             # can be triggered correctly.
             with transformer_layer_quantization_context:
-                if self.mtp_layer_pattern is not None:
+                if self.is_hybrid_mtp:
                     hidden_states = self.mtp_model_layer(
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
@@ -1883,14 +1891,25 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
 
         if self.mhc_enabled:
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.mhc_num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
+            if self.config.mhc_learned_output_contract:
+                hidden_states = learned_output_contract(
+                    hidden_states,
+                    self.hc_head_fn,
+                    self.hc_head_base,
+                    self.hc_head_scale,
+                    self.config.mhc_num_residual_streams,
+                    self.config.layernorm_epsilon,
+                )
+            else:
+                n = self.config.mhc_num_residual_streams
+                # fp32 accumulation for the stream-average contract (slime-align;
+                # see HyperConnectionModule.output_contract for the rationale).
+                hidden_states = (
+                    hidden_states.unflatten(-1, (n, self.config.hidden_size))
+                    .float()
+                    .mean(dim=-2)
+                    .to(hidden_states.dtype)
+                )
 
         # Layer norm before shared head layer.
         hidden_states = apply_module(self.final_layernorm)(hidden_states)
@@ -1980,7 +1999,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
 
         assert (
-            self.mtp_layer_pattern is None
+            not self.is_hybrid_mtp
         ), "Hybrid MTP delegates full activation recomputation to its nested HybridStack."
 
         def custom_forward(
@@ -2163,9 +2182,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         # layer. Hybrid MTP instead delegates full recompute to the nested HybridStack so
         # that ``recompute_num_layers`` controls its layer chunks without nesting checkpoints.
         use_outer_recompute = (
-            self.config.recompute_granularity == 'full'
-            and self.training
-            and self.mtp_layer_pattern is None
+            self.config.recompute_granularity == 'full' and self.training and not self.is_hybrid_mtp
         )
         if use_outer_recompute:
             hidden_states = self._checkpointed_forward(
@@ -2225,9 +2242,9 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         # Backward compatibility: GPT MTP checkpoints were saved with the submodule
         # named 'transformer_layer'. Remap checkpoint keys so old checkpoints load
-        # correctly. Mamba MTP models keep 'mtp_model_layer' as their native format
+        # correctly. Hybrid MTP models keep 'mtp_model_layer' as their native format
         # since no older checkpoints exist for them.
-        if self.mtp_layer_pattern is None:
+        if not self.is_hybrid_mtp:
             apply_prefix_mapping(
                 sharded_state_dict, {f'{prefix}mtp_model_layer.': f'{prefix}transformer_layer.'}
             )
@@ -2326,13 +2343,14 @@ class MultiTokenPredictionBlock(MegatronModule):
         spec: Union[TransformerBlockSubmodules, ModuleSpec],
         vp_stage: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        # New: For hybrid path with unified pattern syntax
+        # For the hybrid path with either pattern or config-list architecture
         mtp_layer_pattern: Optional[str] = None,
         mtp_num_depths: int = 0,
         hybrid_submodules: Optional["HybridStackSubmodules"] = None,
         mamba_submodules: Optional["HybridStackSubmodules"] = None,
         hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
+        mtp_layer_config_list: Optional[Sequence[TransformerConfig]] = None,
     ):
         """
         Args:
@@ -2357,10 +2375,28 @@ class MultiTokenPredictionBlock(MegatronModule):
                 stacklevel=2,
             )
             hybrid_submodules = mamba_submodules
+        if mtp_layer_pattern is not None and mtp_layer_config_list is not None:
+            raise ValueError(
+                "Exactly one of mtp_layer_pattern or mtp_layer_config_list may be provided"
+            )
+        if mtp_layer_pattern is not None:
+            from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
+
+            mtp_layer_config_list = validate_segment_layers(mtp_layer_pattern, self.config)
+        self.mtp_layer_config_list = (
+            tuple(mtp_layer_config_list) if mtp_layer_config_list is not None else None
+        )
+        self.is_hybrid_mtp = self.mtp_layer_config_list is not None
+        if self.is_hybrid_mtp and not self.mtp_layer_config_list:
+            raise ValueError("Hybrid MTP layer config list must be non-empty")
+        if self.is_hybrid_mtp and hybrid_submodules is None:
+            raise ValueError(
+                "Hybrid MTP requires hybrid_submodules with either mtp_layer_pattern "
+                "or mtp_layer_config_list"
+            )
         self.submodules = _get_mtp_block_submodules(config, spec)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self.vp_stage = vp_stage
-        self.mtp_layer_pattern = mtp_layer_pattern
         self.mtp_num_depths = mtp_num_depths
         self.hybrid_submodules = hybrid_submodules
         self.hash_moe_layer_threshold = hash_moe_layer_threshold
@@ -2535,17 +2571,15 @@ class MultiTokenPredictionBlock(MegatronModule):
                     layer_number=layer_number,
                     vp_stage=self.vp_stage,
                     pg_collection=pg_collection,
-                    mtp_layer_pattern=self.mtp_layer_pattern,
+                    mtp_layer_pattern=None,
                     name=(
                         self.name + f".layers.{layer_number - 1}" if self.name is not None else None
                     ),
                 )
             return module
 
-        def build_layer_with_pattern(
-            layer_spec, layer_number, mtp_layer_pattern, hybrid_submodules
-        ):
-            """Build layer using pattern-based approach (new Mamba path)."""
+        def build_hybrid_layer(layer_spec, layer_number):
+            """Build a hybrid MTP layer from the canonical config list."""
             if self.config.fp8:
                 quant_init_context = get_fp8_context(self.config, is_init=True)
             elif self.config.fp4:
@@ -2559,8 +2593,8 @@ class MultiTokenPredictionBlock(MegatronModule):
                     layer_number=layer_number,
                     vp_stage=self.vp_stage,
                     pg_collection=pg_collection,
-                    mtp_layer_pattern=mtp_layer_pattern,
-                    hybrid_submodules=hybrid_submodules,
+                    hybrid_submodules=self.hybrid_submodules,
+                    mtp_layer_config_list=self.mtp_layer_config_list,
                     hash_moe_layer_threshold=self.hash_moe_layer_threshold,
                     name=(
                         self.name + f".layers.{layer_number - 1}" if self.name is not None else None
@@ -2568,29 +2602,22 @@ class MultiTokenPredictionBlock(MegatronModule):
                 )
             return module
 
-        # New Mamba path: use mtp_layer_pattern and hybrid_submodules
-        if self.mtp_layer_pattern is not None and self.hybrid_submodules is not None:
+        # Hybrid path: use layer configs with hybrid submodules.
+        if self.is_hybrid_mtp:
             if self.mtp_use_repeated_layer:
                 # Shared/repeated layer: build one layer, use it for all depths
                 layer_spec = self.submodules.layer_specs[0]
-                shared_layer = build_layer_with_pattern(
-                    layer_spec,
-                    layer_number=1,
-                    mtp_layer_pattern=self.mtp_layer_pattern,
-                    hybrid_submodules=self.hybrid_submodules,
-                )
+                shared_layer = build_hybrid_layer(layer_spec, layer_number=1)
                 self.layers = torch.nn.ModuleList([shared_layer])
             else:
                 # Non-shared: each depth gets its own layers
                 self.layers = torch.nn.ModuleList(
                     [
-                        build_layer_with_pattern(
+                        build_hybrid_layer(
                             self.submodules.layer_specs[
                                 min(i, len(self.submodules.layer_specs) - 1)
                             ],
                             layer_number=i + 1,
-                            mtp_layer_pattern=self.mtp_layer_pattern,
-                            hybrid_submodules=self.hybrid_submodules,
                         )
                         for i in range(num_depths)
                     ]

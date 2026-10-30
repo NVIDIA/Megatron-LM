@@ -14,13 +14,15 @@
 
 """Shared runtime state for Megatron-FSDP modules."""
 
+from collections.abc import Callable
 from contextvars import ContextVar, Token
 from weakref import WeakKeyDictionary
 
 import torch
 from torch import nn
 
-from .indexed_order import IndexedOrder
+from .execution_order import ExecutionOrder
+from .runtime_policy import RuntimePolicy
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
 
@@ -37,16 +39,11 @@ class FsdpContext:
     use_symmetric_memory: bool
     unify_communication_stream: bool
     caller_managed_grad_sync: bool
-    """Leave gradient synchronization to the caller instead of an autograd callback.
-
-    The caller must call ``finish_grad_sync()`` after all gradient producers,
-    including delayed weight-gradient computation, and before consuming gradients.
-    """
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
-    # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
-    forward_order: IndexedOrder[nn.Module]
-    backward_order: IndexedOrder[nn.Module]
+    # parameter group tracks readiness alongside its gathered weight storage.
+    forward_order: ExecutionOrder[nn.Module]
+    backward_order: ExecutionOrder[nn.Module]
     # Topology metadata must not keep modules alive after construction.
     _roots: WeakKeyDictionary[nn.Module, None]
     # Names are relative to each FSDP root and absent until finalization.
@@ -59,30 +56,21 @@ class FsdpContext:
     def __init__(
         self,
         device: torch.device | None = None,
-        use_symmetric_memory: bool = False,
-        unify_communication_stream: bool = False,
+        runtime_policy: RuntimePolicy = RuntimePolicy(),
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
-        caller_managed_grad_sync: bool = False,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
         Args:
             device: CUDA device on which this context schedules communication. Defaults to
                 the current CUDA device.
-            use_symmetric_memory: Whether modules constructed in this context allocate
-                communication staging buffers from PyTorch's NCCL symmetric-memory pool.
-            unify_communication_stream: Whether all-gathers and reduce-scatters share one
-                communication stream to reduce peak transient memory. See
-                https://github.com/NVIDIA/Megatron-LM/issues/6471.
+            runtime_policy: Communication allocation, stream, and gradient-synchronization
+                settings shared by all modules constructed in this context.
             parameter_to_owner: Construction-time owner assignments for TensorAtomic
                 parameters, keyed by the original parameters before sharding. Owners are
                 ranks in each parameter group's 1-D data-parallel mesh and must agree across
                 that mesh. Every TensorAtomic parameter needs an entry; other entries are
                 ignored. Tensors are packed by owner without changing logical parameter order.
-            caller_managed_grad_sync: Disable the automatic autograd completion callback,
-                allowing delayed weight gradients or custom backward schedules. The caller must
-                call ``finish_grad_sync()`` after all backward work and before reading or
-                modifying gradients.
         """
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -92,12 +80,15 @@ class FsdpContext:
             )
 
         self.is_last_microbatch = True
-        self.use_symmetric_memory = use_symmetric_memory
-        self.unify_communication_stream = unify_communication_stream
-        self.caller_managed_grad_sync = caller_managed_grad_sync
-        self.forward_order = IndexedOrder()
-        self.backward_order = IndexedOrder()
+        self.use_symmetric_memory = runtime_policy.use_symmetric_memory
+        self.unify_communication_stream = runtime_policy.unify_communication_stream
+        self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
+        self.forward_order = ExecutionOrder()
+        self.backward_order = ExecutionOrder()
         self._post_backward_hook_registered = False
+        self._delayed_post_backward_callbacks: list[
+            tuple[nn.Module, Callable[[nn.Module], None]]
+        ] = []
         # Construction-only; empty after finalization.
         self._registered_modules: list[nn.Module] = []
         self._roots = WeakKeyDictionary()
@@ -106,7 +97,7 @@ class FsdpContext:
         self._is_finalized = False
         self._context_token: Token[FsdpContext | None] | None = None
         self.allgather_stream = torch.cuda.Stream(device)
-        if unify_communication_stream:
+        if self.unify_communication_stream:
             # A unified stream lets an all-gather reuse the storage released by a
             # preceding reduce-scatter.
             self.reduce_scatter_stream = self.allgather_stream
@@ -194,13 +185,13 @@ class FsdpContext:
             return
         raise RuntimeError(
             "Gradient reduction has no pending autograd completion callback. "
-            "Use fully_shard_context(caller_managed_grad_sync=True) and call "
-            "context.finish_grad_sync() after all backward work, including "
+            "Use fully_shard_context(runtime_policy=RuntimePolicy(caller_managed_grad_sync=True)) "
+            "and call context.finish_grad_sync() after all backward work, including "
             "delayed weight-gradient computation, before consuming gradients."
         )
 
     def finish_grad_sync(self) -> None:
-        """Order current-stream consumers after all gradient reductions submitted so far.
+        """Wait on submitted gradient reductions.
 
         Call after all backward work, including delayed weight-gradient computation,
         and before reading or modifying gradients. This enqueues a stream dependency;
@@ -209,12 +200,25 @@ class FsdpContext:
         self.current_stream().wait_stream(self.reduce_scatter_stream)
 
     def post_backward(self) -> None:
-        """Order current-stream consumers after this backward's gradient reductions."""
-        self.finish_grad_sync()
+        """Finish backward cleanup and automatically synchronize the last microbatch."""
+        self._run_delayed_post_backward_callbacks()
+        # Standalone training can call optimizer.step() immediately after backward.
+        # Wait for reductions on the last microbatch; earlier microbatches keep
+        # overlapping reduction with compute. MCore calls finish_grad_sync() itself
+        # after its schedule completes, including delayed weight gradients.
+        if not self.caller_managed_grad_sync and self.is_last_microbatch:
+            self.finish_grad_sync()
         self._post_backward_hook_registered = False
 
+    def _run_delayed_post_backward_callbacks(self) -> None:
+        """Run deferred module completion callbacks once."""
+        # Finish children before parents to close nested backward NVTX ranges.
+        while self._delayed_post_backward_callbacks:
+            module, callback = self._delayed_post_backward_callbacks.pop()
+            callback(module)
+
     def register_post_backward_hook(self) -> None:
-        """Register one final callback unless the caller manages gradient synchronization.
+        """Register one final callback for deferred cleanup and optional gradient sync.
 
         Multiple FSDP roots can share this context. Waiting for the
         reduce-scatter stream in each root's ``post_backward()`` would prevent
@@ -222,10 +226,6 @@ class FsdpContext:
         reductions. Wait once at context-level autograd completion instead.
         """
 
-        if self.caller_managed_grad_sync:
-            # Leave the wait to the caller's finish_grad_sync(), after all backward work,
-            # including delayed weight-gradient computation, has been launched.
-            return
         if self._post_backward_hook_registered:
             # Another root sharing this context already queued the completion wait.
             return
@@ -250,7 +250,7 @@ def current_fully_shard_context() -> FsdpContext | None:
 
 
 def _collect_backward_order(
-    module: nn.Module, registered_modules: set[nn.Module], order: IndexedOrder[nn.Module]
+    module: nn.Module, registered_modules: set[nn.Module], order: ExecutionOrder[nn.Module]
 ) -> None:
     """Collect one root's static backward prefetch order."""
     if module in registered_modules:

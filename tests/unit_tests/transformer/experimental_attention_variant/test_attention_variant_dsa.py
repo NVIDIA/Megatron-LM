@@ -443,6 +443,13 @@ def test_dsa_kernel_backend_selects_optional_kernel_module():
         == "megatron.core.transformer.experimental_attention_variant.dsa_cudnn_kernels"
     )
 
+    # The DSA-over-GQA backends load no module, so they behave like "none" here.
+    for backend in ("reference", "min-memory-torch", "min-memory-triton"):
+        config.dsa_kernel_backend = backend
+        assert dsa_kernels._get_backend_module_name(config) is None
+        assert not dsa_kernels.use_fused_dsa_kernels(config)
+
+    config.dsa_kernel_backend = "cudnn"
     config.attention_backend = "unfused"
     assert not dsa_kernels.use_fused_dsa_kernels(config)
 
