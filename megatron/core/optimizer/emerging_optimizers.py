@@ -11,7 +11,7 @@ To add a new emerging optimizer:
 import inspect
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Literal, get_args
+from typing import Any, Callable, Dict, Literal, Optional, get_args
 
 import torch
 from torch.optim.optimizer import ParamsT
@@ -92,7 +92,7 @@ def _eopt_init_state_fn(opt, config=None):
         opt._init_group(group, skip_non_grad_params=False)
 
 
-def _default_param_overrides_factory() -> dict[ParamKey, dict[str, Any]]:
+def _default_param_overrides_factory() -> Dict[ParamKey, Dict[str, Any]]:
     """Default param overrides: route non-linear/embedding params to Adam."""
     return {
         ParamKey(
@@ -120,7 +120,7 @@ class EmergingOptimizerEntry:
     init_state_fn: Callable = _eopt_init_state_fn
     config_to_kwargs: Callable | None = None
     config_to_cls: Callable | None = None
-    default_param_overrides: dict[ParamKey, dict[str, Any]] = field(
+    default_param_overrides: Dict[ParamKey, Dict[str, Any]] = field(
         default_factory=_default_param_overrides_factory
     )
 
@@ -203,7 +203,7 @@ def _qkv_split_groups_are_complete(
 # Registry – populated below only when emerging_optimizers is installed.
 # ===========================================================================
 
-_EMERGING_OPTIMIZERS: dict[str, EmergingOptimizerEntry] = {}
+_EMERGING_OPTIMIZERS: Dict[str, EmergingOptimizerEntry] = {}
 
 
 # ===========================================================================
@@ -234,7 +234,7 @@ _PROFILES = {
 }
 
 
-def _hardware_profile() -> HardwareProfile | None:
+def _hardware_profile() -> Optional[HardwareProfile]:
     """Profile for the local GPU, or None when the hardware is not in the registry."""
     try:
         name = torch.cuda.get_device_properties(0).name
@@ -251,7 +251,7 @@ def _select_tp_mode(
     use_syrk: bool,
     elem_size: int,
     communication_crosses_domain: bool,
-    profile: HardwareProfile | None = None,
+    profile: Optional[HardwareProfile] = None,
     candidates: tuple[str, ...] = _AUTO_TP_MODES,
 ) -> str:
     """Cost model for per weight tp_mode selection. Mirrors the op sequence in
@@ -366,7 +366,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.num_ns_steps = num_ns_steps
         self.use_syrk = use_syrk
         self.elem_size = 2 if fp32_matmul_prec == "medium" else 4  # bf16 vs tf32/fp32
-        self._tp_mode_cache: dict[tuple, str] = {}
+        self._tp_mode_cache: Dict[tuple, str] = {}
         self._hw_profile = _hardware_profile() if tp_mode == "auto" else None
         self._warned_distributed_qkv_fallback = False
 
@@ -934,12 +934,12 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             group.setdefault("eps", eps)
 
     @torch.no_grad()  # type: ignore[misc]
-    def step(self, closure: Callable | None = None) -> float | None:
+    def step(self, closure: Optional[Callable] = None) -> Optional[float]:
         """Step function"""
         return AdaptiveMuon.step(self, closure)
 
 
-def _kwargs_from_config(optimizer_cls: type, prefix: str, config) -> dict[str, Any]:
+def _kwargs_from_config(optimizer_cls: type, prefix: str, config) -> Dict[str, Any]:
     """Match ``optimizer_cls.__init__`` parameters to config attributes.
 
     For each init parameter, looks for ``{prefix}_{name}`` on *config* first,
@@ -948,7 +948,7 @@ def _kwargs_from_config(optimizer_cls: type, prefix: str, config) -> dict[str, A
     """
     skip_params = {"self", "params"}
     sig = inspect.signature(optimizer_cls.__init__)
-    kwargs: dict[str, Any] = {}
+    kwargs: Dict[str, Any] = {}
     for name in sig.parameters:
         if name in skip_params:
             continue
@@ -989,7 +989,7 @@ def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> dict[str, Any
     return kwargs
 
 
-def _muon_registry_config_to_kwargs(config, model_chunks, pg_collection) -> dict[str, Any]:
+def _muon_registry_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
     """``config_to_kwargs`` for the ``muon`` registry entry.
 
     TensorParallelMuon kwargs, plus LayerShardedMuon's own when
@@ -1011,7 +1011,7 @@ def _muon_registry_config_to_kwargs(config, model_chunks, pg_collection) -> dict
     return kwargs
 
 
-def _adaptive_muon_config_to_kwargs(config, model_chunks, pg_collection) -> dict[str, Any]:
+def _adaptive_muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
     """Convert OptimizerConfig to TensorParallelAdaptiveMuon constructor kwargs."""
     kwargs = _muon_config_to_kwargs(config, model_chunks, pg_collection)
     kwargs.update(_kwargs_from_config(TensorParallelAdaptiveMuon, "adaptive_muon", config))
@@ -1020,7 +1020,7 @@ def _adaptive_muon_config_to_kwargs(config, model_chunks, pg_collection) -> dict
 
 def _default_adam_based_eopt_config_to_kwargs(
     eopt_name, config, model_chunks, pg_collection
-) -> dict[str, Any]:
+) -> Dict[str, Any]:
     """Convert OptimizerConfig to default emerging optimizer constructor kwargs."""
     kwargs = _kwargs_from_config(registry.get_optimizer_cls(eopt_name), eopt_name, config)
     kwargs["betas"] = (config.adam_beta1, config.adam_beta2)

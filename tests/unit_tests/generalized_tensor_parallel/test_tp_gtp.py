@@ -501,11 +501,15 @@ class TestTPGTPMuonQKVPadding:
         )
 
 
-def _worker_muon_split_sentinels(
-    rank, world_size, port, combined_gtp, mla, per_head, constructor_layout=False
-):
+def _worker_muon_split_sentinels(world_size, combined_gtp, mla, per_head, constructor_layout=False):
     """Inspect exact NS inputs after gathering fragments and removing GTP padding."""
-    del port
+    actual_world_size = dist.get_world_size()
+    if actual_world_size != world_size:
+        pytest.skip(
+            f"Requires world_size={world_size}, got {actual_world_size} "
+            f"(launch with torchrun --nproc-per-node={world_size})"
+        )
+    rank = dist.get_rank()
     tp_size = 2 if combined_gtp else world_size
     gtp_size = world_size // tp_size
     tp_group, gtp_group, tp_rank, gtp_rank = _build_groups(rank, world_size, tp_size, gtp_size)
@@ -603,11 +607,13 @@ class TestTPGTPMuonSplitSentinels:
         if not HAVE_EMERGING_OPTIMIZERS:
             pytest.skip("emerging_optimizers package is not installed")
         _requires_multi_gpu(world_size)
-        _run_distributed(_worker_muon_split_sentinels, world_size, combined_gtp, mla, per_head)
+        _worker_muon_split_sentinels(world_size, combined_gtp, mla, per_head)
 
     @pytest.mark.parametrize("world_size", [4, 8])
     def test_constructor_global_layout_overrides_sharded_local_splits(self, world_size):
         if not HAVE_EMERGING_OPTIMIZERS:
             pytest.skip("emerging_optimizers package is not installed")
         _requires_multi_gpu(world_size)
-        _run_distributed(_worker_muon_split_sentinels, world_size, False, True, True, True)
+        _worker_muon_split_sentinels(
+            world_size, combined_gtp=False, mla=True, per_head=True, constructor_layout=True
+        )
