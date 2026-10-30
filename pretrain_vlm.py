@@ -46,20 +46,14 @@ from megatron.training.vocab_utils import model_vocab_size
 from pretrain_gpt import loss_func
 
 
-def vlm_data_inputs_from_args(args: Namespace, model_config: LLaVAModelConfig) -> tuple[int, str]:
-    """Resolve mock-VLM data inputs before runtime initialization.
-
-    Preserve the legacy decoder-specific padding rule at the CLI boundary. Runtime
-    consumers then need only the resolved length and the model's overlap setting.
-    The decoder length remains in args until the data sequence-length migration.
-    """
+def set_vlm_sequence_lengths(args: Namespace, model_config: LLaVAModelConfig) -> None:
+    """Set text and padded decoder lengths before initialization sizes TP user buffers."""
     if not isinstance(model_config, LLaVAModelConfig):
         raise TypeError(
             f"Expected LLaVAModelConfig, got {type(model_config).__name__}"
         )
-    sequence_length = getattr(args, "dataloader_seq_length", None)
-    if sequence_length is None:
-        sequence_length = args.seq_length
+    if getattr(args, "dataloader_seq_length", None) is None:
+        args.dataloader_seq_length = args.seq_length
     image_tokens = get_num_image_embeddings(
         model_config.img_h,
         model_config.img_w,
@@ -70,7 +64,7 @@ def vlm_data_inputs_from_args(args: Namespace, model_config: LLaVAModelConfig) -
         pixel_shuffle=False,
         use_tile_tags=False,
     )
-    decoder_length = sequence_length + image_tokens
+    decoder_length = args.dataloader_seq_length + image_tokens
     transformer = model_config.transformer
     args.decoder_seq_length = decoder_length + context_parallel.get_padding(
         decoder_length,
@@ -80,7 +74,6 @@ def vlm_data_inputs_from_args(args: Namespace, model_config: LLaVAModelConfig) -
         getattr(args, "decoder_tp_comm_overlap", False),
         args.decoder_seq_length,
     )
-    return sequence_length, "thd" if getattr(args, "use_packed_sequence", False) else "sbhd"
 
 
 def model_provider(
@@ -91,9 +84,6 @@ def model_provider(
     parallel_output=True,
     config=None,
     pg_collection=None,
-    *,
-    data_sequence_length: int,
-    qkv_format: str = "sbhd",
 ) -> LLaVAModel:
     """Builds the model.
 
@@ -107,8 +97,6 @@ def model_provider(
         add_decoder (bool): Construct the decoder module (used with pipeline parallelism). Defaults to True. When we use pipelining, the decoder
             will live on only a subset of the pipeline stages (specifically, every stage after the first one).
         parallel_output (bool): Enable model parallel output.
-        data_sequence_length: Resolved text length supplied by the data callback's caller.
-        qkv_format: Requested attention layout (sbhd or thd).
 
     Returns:
         model (megatron.core.models.multimodal.llava_model.LLaVAModel): A multimodal model
@@ -142,7 +130,7 @@ def model_provider(
 
     old_seq_length = args.seq_length
     # decoder_seq_len denotes the language model sequence length.
-    decoder_seq_len = data_sequence_length + num_image_embeddings
+    decoder_seq_len = args.dataloader_seq_length + num_image_embeddings
 
     # seq_length and encoder_seq_length denote the vision model sequence length. Override if the user provided something else.
     args.seq_length = args.encoder_seq_length = num_image_embeddings
@@ -237,7 +225,7 @@ def model_provider(
 
     language_max_sequence_length = args.decoder_seq_length
     if language_transformer_config.context_parallel_size > 1:
-        if qkv_format == "thd" or mp_padding_needed > 0:
+        if getattr(args, "use_packed_sequence", False) or mp_padding_needed > 0:
             # Use THD data format
             language_max_sequence_length = args.decoder_seq_length * args.micro_batch_size
     model = LLaVAModel(
@@ -280,12 +268,11 @@ def model_provider(
     return model
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples, *, sequence_length: int):
+def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build the train test and validation datasets.
 
     Args:
         train_val_test_num_samples : A list containing the number of samples in train, validation, and test sets.
-        sequence_length: Text sequence length before image embeddings are inserted.
 
     Returns:
         train_ds, val_ds, test_ds (megatron.core.datasets.multimodal_dataset.MockMultimodalDataset): Train, validation, and test datasets, respectively.
@@ -300,7 +287,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, *, sequence_l
     config = MultimodalDatasetConfig(
         random_seed=cfg.rng.seed,
         split=args.split,
-        sequence_length=sequence_length,
+        sequence_length=args.dataloader_seq_length,
         tokenizer=get_tokenizer(),
         reset_position_ids=args.reset_position_ids,
         reset_attention_mask=args.reset_attention_mask,
@@ -362,12 +349,11 @@ def _preprocess_data_for_llava(data):
     return data
 
 
-def get_batch(data_iterator, *, qkv_format: str = "sbhd"):
+def get_batch(data_iterator):
     """Generate a batch.
 
     Args:
         data_iterator: Iterable dataset.
-        qkv_format: Requested attention layout; CP padding can also require thd.
 
     Returns:
         sample: A data sample with images, tokens, etc.
@@ -430,7 +416,7 @@ def get_batch(data_iterator, *, qkv_format: str = "sbhd"):
                 for item in (tokens, position_ids, labels, loss_mask)
             ]
         packed_seq_params = context_parallel.get_packed_seq_params(
-            tokens, img_seq_len, mp_padding_needed_for_text, cp_size, qkv_format == "thd"
+            tokens, img_seq_len, mp_padding_needed_for_text, cp_size, args.use_packed_sequence
         )
 
         if packed_seq_params.qkv_format == 'thd':
@@ -449,12 +435,11 @@ def get_batch(data_iterator, *, qkv_format: str = "sbhd"):
     return tokens, position_ids, labels, images, loss_mask, attention_mask, packed_seq_params
 
 
-def forward_step(data_iterator, model: LLaVAModel, *, qkv_format: str = "sbhd"):
+def forward_step(data_iterator, model: LLaVAModel):
     """Forward training step.
 
     Args:
         data_iterator: Iterable dataset.
-        qkv_format: Requested attention layout (sbhd or thd).
         model (megatron.core.models.multimodal.llava_model.LLaVAModel): Multimodal model
 
     Returns:
@@ -466,7 +451,7 @@ def forward_step(data_iterator, model: LLaVAModel, *, qkv_format: str = "sbhd"):
     # Get the batch.
     timers('batch-generator', log_level=2).start()
     tokens, position_ids, labels, images, loss_mask, attention_mask, packed_seq_params = get_batch(
-        data_iterator, qkv_format=qkv_format
+        data_iterator
     )
     timers('batch-generator').stop()
 
@@ -553,17 +538,14 @@ if __name__ == "__main__":
     model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
-    data_sequence_length, qkv_format = vlm_data_inputs_from_args(args, model_cfg)
-    dataset_provider = partial(
-        train_valid_test_datasets_provider, sequence_length=data_sequence_length
-    )
-    dataset_provider.is_distributed = True
+    set_vlm_sequence_lengths(args, model_cfg)
+    train_valid_test_datasets_provider.is_distributed = True
     pretrain(
         full_config,
-        dataset_provider,
+        train_valid_test_datasets_provider,
         ModelType.encoder_or_decoder,
-        partial(forward_step, qkv_format=qkv_format),
-        partial(model_provider, data_sequence_length=data_sequence_length, qkv_format=qkv_format),
+        forward_step,
+        model_provider,
         get_embedding_ranks=llava_embedding_ranks,
         get_position_embedding_ranks=llava_position_embedding_ranks,
     )

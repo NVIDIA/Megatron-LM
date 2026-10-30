@@ -977,10 +977,10 @@ def test_vlm_consumers_reject_incompatible_model_config(
     args = Namespace()
     monkeypatch.setattr(pretrain_vlm, "get_args", lambda: args)
     calls = {
-        "model": lambda: pretrain_vlm.model_provider(data_sequence_length=16),
-        "dataset": lambda: pretrain_vlm.train_valid_test_datasets_provider([], sequence_length=16),
+        "model": lambda: pretrain_vlm.model_provider(),
+        "dataset": lambda: pretrain_vlm.train_valid_test_datasets_provider([]),
         "batch": lambda: pretrain_vlm.get_batch(None),
-        "data_inputs": lambda: pretrain_vlm.vlm_data_inputs_from_args(args, run_config.model),
+        "data_inputs": lambda: pretrain_vlm.set_vlm_sequence_lengths(args, run_config.model),
         "mimo_data": lambda: build_train_valid_test_data_loaders(args, None),
         "radio": lambda: radio_vision_encoder_spec(args, None, None),
     }
@@ -1025,7 +1025,8 @@ def test_llava_callback_consumes_its_model_config(
     args.use_rope_scaling = False
     args.padded_vocab_size = 999
 
-    data_sequence_length, _ = pretrain_vlm.vlm_data_inputs_from_args(args, cfg.model)
+    pretrain_vlm.set_vlm_sequence_lengths(args, cfg.model)
+    args.use_packed_sequence = qkv_format == "thd"
     for name in (
         "img_h",
         "img_w",
@@ -1034,11 +1035,9 @@ def test_llava_callback_consumes_its_model_config(
         "freeze_LM",
         "freeze_ViT",
         "decoder_tp_comm_overlap",
-        "dataloader_seq_length",
-        "use_packed_sequence",
     ):
         delattr(args, name)
-    pretrain_vlm.model_provider(data_sequence_length=data_sequence_length, qkv_format=qkv_format)
+    pretrain_vlm.model_provider()
 
     assert build.call_args.kwargs["language_vocab_size"] == 128
     assert build.call_args.kwargs["language_rotary_base"] == 12345
@@ -1088,8 +1087,9 @@ def test_vision_objective_preserves_cli_master_switch(enabled, objective):
         (False, False, None, 2048),
     ],
 )
+@pytest.mark.parametrize("explicit_text_length", [False, True])
 def test_mock_vlm_resolves_legacy_padding_before_startup(
-    global_overlap, decoder_overlap, decoder_length, expected
+    global_overlap, decoder_overlap, decoder_length, expected, explicit_text_length
 ):
     import pretrain_vlm
 
@@ -1118,11 +1118,14 @@ def test_mock_vlm_resolves_legacy_padding_before_startup(
     args.max_position_embeddings, args.params_dtype = 4096, torch.float32
     args.tp_comm_overlap, args.decoder_tp_comm_overlap = global_overlap, decoder_overlap
     args.decoder_seq_length = decoder_length
+    if not explicit_text_length:
+        # The inference caller does not register the mock-training data-length flag.
+        del args.dataloader_seq_length
+        args.seq_length = 1792
     model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
-    length, qkv_format = pretrain_vlm.vlm_data_inputs_from_args(args, model)
+    pretrain_vlm.set_vlm_sequence_lengths(args, model)
     assert model.transformer.tp_comm_overlap == (global_overlap or decoder_overlap)
-    assert length == 1792
-    assert qkv_format == "sbhd"
+    assert args.dataloader_seq_length == 1792
     assert args.decoder_seq_length == expected
 
 
