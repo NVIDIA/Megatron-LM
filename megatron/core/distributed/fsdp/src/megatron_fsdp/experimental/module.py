@@ -32,7 +32,7 @@ from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
 from .execution_order import ExecutionOrder
-from .module_utils import get_parameter_owner
+from .module_utils import get_parameter_owner, is_in_backward
 from .parameter_group import (
     FsdpParameter,
     FsdpParameterGroup,
@@ -42,11 +42,6 @@ from .parameter_group import (
 from .phase import Phase
 from .placement import BlockAtomic, RowAtomic, ShardLayout
 from .schedule import SchedulePolicy
-
-
-def _is_in_backward() -> bool:
-    """Return whether the current thread is executing an autograd GraphTask."""
-    return torch._C._current_graph_task_id() != -1
 
 
 class FsdpModule:
@@ -277,7 +272,7 @@ class FsdpModule:
         context.ensure_finalized()
         # A reentrant checkpoint recomputes before the child module's backward-pre
         # hook runs. The active autograd GraphTask identifies that recomputation.
-        is_recomputing = self.phase is Phase.BACKWARD or _is_in_backward()
+        is_recomputing = self.phase is Phase.BACKWARD or is_in_backward()
         if self.phase is not Phase.BACKWARD:
             self.phase = Phase.FORWARD
         # forward/backward each span multiple lifecycle methods (pre_forward ->
@@ -288,9 +283,8 @@ class FsdpModule:
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
 
-        # TODO: Recomputation gathers sharded MXFP8 rowwise planes on demand here, because
-        # backward prefetch gathers only columnwise planes. Recording recomputation in the
-        # backward prefetch order would let the preceding module prefetch them.
+        # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
+        # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
         self.unshard(Phase.FORWARD, prefetch=not is_recomputing)
 
     def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
@@ -376,7 +370,7 @@ class FsdpModule:
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
-        is_recomputing = self.phase is Phase.BACKWARD or _is_in_backward()
+        is_recomputing = self.phase is Phase.BACKWARD or is_in_backward()
         if is_recomputing:
             self._release_unsharded_storage(rowwise_only=True)
         else:
