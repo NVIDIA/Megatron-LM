@@ -1848,12 +1848,15 @@ class SequentialMLP(MegatronModule):
         self.dp_group = pg_collection.expt_dp
 
         for expert_idx in range(self.num_local_experts):
+            # The expert linears take their GTP-remat group (expt_gtp_remat) and the checkpoint
+            # replica group of their GTP shards (expt_dp) from the collection.
             expert = MLP(
                 self.config,
                 submodules,
                 ffn_hidden_size=self.config.moe_ffn_hidden_size,
                 is_expert=True,
                 tp_group=pg_collection.expt_tp,
+                pg_collection=pg_collection,
                 name=(name + f".local_experts.{expert_idx}") if name is not None else None,
             )
             self.local_experts.append(expert)
