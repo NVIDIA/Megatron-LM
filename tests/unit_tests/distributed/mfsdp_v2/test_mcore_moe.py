@@ -13,6 +13,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataPa
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -62,7 +63,28 @@ def process_group_collections(distributed_setup):
     destroy_model_parallel()
 
 
-def test_build_train_step_and_clip(process_group_collections, distributed_setup):
+@pytest.mark.parametrize(
+    "shortcut, shard_norms, overlap, recompute_norms",
+    [
+        (False, False, False, False),
+        (True, False, False, False),
+        (True, True, False, False),
+        (True, True, True, False),
+        (True, True, False, True),
+        (True, True, True, True),
+    ],
+    ids=[
+        "standard",
+        "shortcut",
+        "shortcut-norms",
+        "shortcut-norms-overlap",
+        "shortcut-norms-recompute",
+        "shortcut-norms-overlap-recompute",
+    ],
+)
+def test_build_train_step_and_clip(
+    process_group_collections, distributed_setup, shortcut, shard_norms, overlap, recompute_norms
+):
     """Shard experts over expert-DP and clip their combined gradients."""
     process_group_collection, reference_process_group_collection = process_group_collections
     world_size = distributed_setup.world_size
@@ -79,6 +101,10 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
         moe_router_topk=2,
         moe_grouped_gemm=True,
         moe_ffn_hidden_size=128,
+        moe_shortcut_connection=shortcut,
+        moe_shortcut_parallel=overlap,
+        moe_shortcut_post_norm=shortcut,
+        moe_shared_expert_intermediate_size=128 if shortcut else None,
         add_bias_linear=False,
         use_cpu_initialization=True,
         params_dtype=torch.float32,
@@ -86,6 +112,8 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
         hidden_dropout=0.0,
         gradient_accumulation_fusion=False,
         attention_backend=AttnBackend.unfused,
+        recompute_granularity="selective" if recompute_norms else None,
+        recompute_modules=["layernorm", "shortcut_pre_mlp_layernorm"] if recompute_norms else None,
     )
     # Pair CPU initialization with an explicit common seed for the reference and EP model.
     torch.manual_seed(123)
@@ -108,6 +136,9 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
     ).cuda()
     model.load_state_dict(reference_model.state_dict(), strict=False)
     for model_layer, reference_layer in zip(model.decoder.layers, reference_model.decoder.layers):
+        if isinstance(model_layer, ShortcutMoEBlock):
+            model_layer = model_layer.moe_layer
+            reference_layer = reference_layer.moe_layer
         if not isinstance(model_layer, MoETransformerLayer):
             continue
         for fc in ("linear_fc1", "linear_fc2"):
@@ -120,6 +151,11 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
                     if model_parameter is not None:
                         model_parameter.data.copy_(reference_parameter.data)
     reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+    # Explicitly wrap the shortcut block to isolate registration order from the
+    # adapter's default layer selection. Its helper-called containers are not units.
+    fsdp_unit_modules = [ShortcutMoEBlock] if shortcut else None
+    if shard_norms:
+        fsdp_unit_modules.append(type(model.decoder.layers[0].shortcut_pre_mlp_layernorm))
     model = FullyShardedDataParallel(
         config=config,
         ddp_config=DistributedDataParallelConfig(
@@ -130,10 +166,19 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
             fsdp_all_gather_in_start_param_sync=False,
         ),
         module=model,
+        fsdp_unit_modules=fsdp_unit_modules,
         pg_collection=process_group_collection,
     )
     assert isinstance(model.module, FsdpModule)
-    assert isinstance(model.module.decoder.layers[1].mlp.experts, FsdpModule)
+    if shortcut:
+        block = model.module.decoder.layers[0]
+        assert isinstance(block, FsdpModule)
+        assert isinstance(block.shortcut_pre_mlp_layernorm, FsdpModule) == shard_norms
+        assert isinstance(block.moe_layer.pre_mlp_layernorm, FsdpModule) == shard_norms
+        experts = block.moe_layer.mlp.experts
+    else:
+        experts = model.module.decoder.layers[1].mlp.experts
+    assert isinstance(experts, FsdpModule)
 
     optimizer_config = OptimizerConfig(
         lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
@@ -182,6 +227,11 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
     for _ in range(5):
         optimizer.zero_grad(set_to_none=True)
         (loss,) = run_forward_backward_on_microbatches(model, forward)
+        assert all(
+            not unit._unshard_events
+            for unit in model.module.modules()
+            if isinstance(unit, FsdpModule)
+        ), "Static prefetch must not leave unused full weights after backward."
         success, _, _ = optimizer.step()
         assert success
         torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
