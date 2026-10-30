@@ -255,6 +255,16 @@ class ProcessGroupCollection:
     # _INTRA_EXPERT_DATA_PARALLEL_GROUP
     intra_expt_dp: torch.distributed.ProcessGroup = field(init=False)
 
+    # Gloo mirrors of the two groups the distributed optimizer shards over (dp_cp and expt_dp,
+    # or intra_dp_cp and intra_expt_dp with more than one distributed optimizer instance), used
+    # for checkpoint I/O. Each must hold the same ranks, in the same order, as the group it
+    # mirrors. May be None when the job was built without Gloo groups (including GTP remat jobs).
+    # _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
+    intra_dp_cp_gloo: Optional[torch.distributed.ProcessGroup] = field(init=False)
+
+    # _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO
+    intra_expt_dp_gloo: Optional[torch.distributed.ProcessGroup] = field(init=False)
+
     # _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     inter_dist_opt: torch.distributed.ProcessGroup = field(init=False)
 
@@ -385,6 +395,17 @@ class ProcessGroupCollection:
                 with_gtp_remat=False,
                 partial_expert_data_parallel=True,
             ),
+            'intra_dp_cp_gloo': partial(
+                parallel_state.get_data_parallel_group_gloo,
+                with_context_parallel=True,
+                partial_data_parallel=True,
+                check_initialized=False,
+            ),
+            'intra_expt_dp_gloo': partial(
+                parallel_state.get_expert_data_parallel_group_gloo,
+                partial_expert_data_parallel=True,
+                check_initialized=False,
+            ),
             'inter_dist_opt': partial(
                 parallel_state.get_inter_distributed_optimizer_instance_group,
                 check_initialized=False,
@@ -450,9 +471,14 @@ class ProcessGroupCollection:
         and fallbacks.
 
         Args:
-            pg_collection: Optional process group collection. If None, uses parallel_state groups.
+            pg_collection: Optional process group collection. If None, uses parallel_state groups;
+                that fallback is deprecated and emits a ``ProcessGroupFallbackWarning``.
             model_chunks: List of model chunks to extract configuration from.
-            use_gloo_process_groups: Whether to set up gloo process groups.
+            use_gloo_process_groups: Whether to set up gloo process groups. With a
+                pg_collection, they come from its intra_dp_cp_gloo and intra_expt_dp_gloo fields
+                (the expert one only when the collection has an expert data-parallel group),
+                and a missing group or one whose ranks differ from the group it mirrors raises
+                ValueError.
 
         Returns:
             Dictionary containing all required process groups:
@@ -472,6 +498,11 @@ class ProcessGroupCollection:
         from megatron.core.utils import get_model_config
 
         if pg_collection is None:
+            warn_global_process_group_fallback(
+                "ProcessGroupCollection.setup_process_groups_for_optimizer",
+                deprecated_in="0.21",
+                removed_in="0.23",
+            )
             # Use parallel_state groups
             dp_group = parallel_state.get_data_parallel_group(
                 with_context_parallel=False, with_gtp_remat=False, partial_data_parallel=False
@@ -591,17 +622,22 @@ class ProcessGroupCollection:
                     if 'intra_dist_opt' not in pg_set:
                         raise ValueError(
                             "intra_dist_opt process group is required but not provided in "
-                            "pg_collection. Please explicitly set it to None if you don't need it."
+                            "pg_collection. Set it to the ranks of one distributed-optimizer "
+                            "instance, over which the gradient statistics are reduced. None "
+                            "reduces them over the default (WORLD) group, which is deprecated."
                         )
                     intra_dist_opt_group = pg_collection.intra_dist_opt
                 else:
-                    intra_dist_opt_group = None
+                    # Megatron-FSDP leaves ddp_config.use_distributed_optimizer False but still
+                    # reduces gradient statistics over this group when OptimizerConfig enables
+                    # the distributed optimizer, so pass it through like the parallel_state path.
+                    intra_dist_opt_group = pg_set.get('intra_dist_opt')
             else:
                 # No ddp_config available - use simple fallback
                 intra_dp_cp_group = dp_cp_group
                 intra_expt_dp_group = expt_dp_group
                 inter_dist_opt_group = None
-                intra_dist_opt_group = None
+                intra_dist_opt_group = pg_set.get('intra_dist_opt')
 
             # 5. Model communication groups
             if 'mp' not in pg_set:
@@ -631,14 +667,34 @@ class ProcessGroupCollection:
             gtp_remat_group = getattr(pg_collection, 'gtp_remat', None)
             expt_gtp_remat_group = getattr(pg_collection, 'expt_gtp_remat', None)
 
-            # Gloo groups - not supported when pg_collection is provided
-            if use_gloo_process_groups:
-                raise ValueError(
-                    "Gloo process groups are not supported when pg_collection is "
-                    "provided. Please set use_gloo_process_groups to False."
+            # Gloo groups come from the collection. GTP_remat jobs build no Gloo groups (their
+            # optimizer uses DCP), so only those may enable Gloo without supplying the groups.
+            gtp_active = (gtp_remat_group is not None and gtp_remat_group.size() > 1) or (
+                expt_gtp_remat_group is not None and expt_gtp_remat_group.size() > 1
+            )
+            if use_gloo_process_groups and not gtp_active:
+                intra_dp_cp_group_gloo = _get_gloo_mirror_group(
+                    pg_set,
+                    'intra_dp_cp_gloo',
+                    intra_dp_cp_group,
+                    "the data-parallel group (dp_cp, or intra_dp_cp with more than one "
+                    "distributed optimizer instance)",
                 )
-            intra_dp_cp_group_gloo = None
-            intra_expt_dp_group_gloo = None
+                # Only expert parameters use the expert Gloo group, so a collection without an
+                # expert data-parallel group (a dense model) does not need one.
+                if intra_expt_dp_group is None:
+                    intra_expt_dp_group_gloo = None
+                else:
+                    intra_expt_dp_group_gloo = _get_gloo_mirror_group(
+                        pg_set,
+                        'intra_expt_dp_gloo',
+                        intra_expt_dp_group,
+                        "the expert data-parallel group (expt_dp, or intra_expt_dp with more "
+                        "than one distributed optimizer instance)",
+                    )
+            else:
+                intra_dp_cp_group_gloo = None
+                intra_expt_dp_group_gloo = None
 
         return {
             'dp_group': dp_group,
@@ -665,7 +721,8 @@ class ProcessGroupCollection:
         Helper method to set up process groups for DDP with proper validation and fallbacks.
 
         Args:
-            pg_collection: Optional process group collection. If None, uses parallel_state groups.
+            pg_collection: Optional process group collection. If None, uses parallel_state groups;
+                that fallback is deprecated and emits a ``ProcessGroupFallbackWarning``.
             config: Model config to extract context_parallel_size from.
             ddp_config: DDP config to extract num_distributed_optimizer_instances from.
 
@@ -682,6 +739,9 @@ class ProcessGroupCollection:
         logger = logging.getLogger(__name__)
 
         if pg_collection is None:
+            warn_global_process_group_fallback(
+                "DistributedDataParallel", deprecated_in="0.21", removed_in="0.23"
+            )
             # Use parallel_state groups
             return {
                 'dp_group': parallel_state.get_data_parallel_group(
@@ -795,9 +855,39 @@ class ProcessGroupCollection:
             return result
 
 
+def _get_gloo_mirror_group(
+    pg_set: Dict,
+    gloo_group_name: str,
+    group: torch.distributed.ProcessGroup,
+    group_description: str,
+) -> torch.distributed.ProcessGroup:
+    """Return the collection's Gloo group ``gloo_group_name`` after checking it mirrors ``group``.
+
+    The distributed optimizer shards its state over ``group`` and gathers that state over the
+    Gloo group for checkpoint I/O, so both must hold the same ranks in the same order.
+    """
+    gloo_group = pg_set.get(gloo_group_name)
+    if gloo_group is None:
+        raise ValueError(
+            f"use_gloo_process_groups=True requires pg_collection.{gloo_group_name}. Build the "
+            "job with Gloo process groups or pass use_gloo_process_groups=False."
+        )
+    gloo_group_ranks = torch.distributed.get_process_group_ranks(gloo_group)
+    group_ranks = torch.distributed.get_process_group_ranks(group)
+    if gloo_group_ranks != group_ranks:
+        raise ValueError(
+            f"pg_collection.{gloo_group_name} has ranks {gloo_group_ranks}, but "
+            f"{group_description}, which the distributed optimizer shards over, has ranks "
+            f"{group_ranks}. The Gloo group must hold the same ranks in the same order."
+        )
+    return gloo_group
+
+
 def resolve_gtp_remat_group(
     pg_collection: Optional[Union["ProcessGroupCollection", "MultiModuleProcessGroupCollection"]],
     is_expert: bool,
+    *,
+    owner: Optional[str] = "resolve_gtp_remat_group",
 ) -> Optional[torch.distributed.ProcessGroup]:
     """Resolve the gtp_remat / expt_gtp_remat group for a weight-owning module.
 
@@ -805,6 +895,11 @@ def resolve_gtp_remat_group(
     caller passed no collection, or one predating the gtp_remat fields. The fallback keeps
     pre-pg_collection callers working — a collection that does carry the field is always
     honored, including when it holds a custom (non-MPU) group.
+
+    The fallback is deprecated. It warns when the global group shards weights (more than one
+    rank), the only case in which the result differs from the axis being off. Every caller
+    treats a missing or single-rank group as GTP off, which is what an absent field will mean
+    once the fallback is removed.
 
     A ``MultiModuleProcessGroupCollection`` is unwrapped to the language model's collection
     first: only the per-module collections carry the GTP axes, so the wrapper would
@@ -814,6 +909,8 @@ def resolve_gtp_remat_group(
     Args:
         pg_collection: Collection supplied by the caller, or None.
         is_expert: Select the expert axis (``expt_gtp_remat``) instead of the dense one.
+        owner: Name of the class or function the fallback warning names. None when the caller
+            has already warned about its own fallback.
     """
     attr = 'expt_gtp_remat' if is_expert else 'gtp_remat'
     if isinstance(pg_collection, MultiModuleProcessGroupCollection):
@@ -829,7 +926,15 @@ def resolve_gtp_remat_group(
     mpu_pgs = ProcessGroupCollection.use_mpu_process_groups(
         required_pgs=['gtp_remat', 'expt_gtp_remat']
     )
-    return getattr(mpu_pgs, attr)
+    group = getattr(mpu_pgs, attr)
+    if owner is not None and group is not None and group.size() > 1:
+        warn_global_process_group_fallback(
+            owner,
+            "pg_collection" if pg_collection is None else f"pg_collection.{attr}",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+    return group
 
 
 @dataclass

@@ -312,7 +312,7 @@ class MoELayer(BaseMoELayer):
             else:
                 linear_cls = TELinear
             gtp_remat_group = (
-                resolve_gtp_remat_group(pg_collection, is_expert=False)
+                resolve_gtp_remat_group(pg_collection, is_expert=False, owner=type(self).__name__)
                 if "moe_latent_proj" in self.config.gtp_remat_opt_in_modules
                 else None
             )

@@ -36,6 +36,7 @@ from typing import Callable, Dict, List, Optional
 import torch
 from packaging.version import Version
 
+from megatron.core.process_groups_config import resolve_process_groups
 from megatron.core.tensor_parallel.gtp_cuda_graphs import (
     allocate_graph_wgrad_rings,
     clear_graph_wgrad_rings,
@@ -3014,7 +3015,8 @@ def gtp_replica_rank(param, explicit_group=None):
     1. ``explicit_group`` passed by the caller,
     2. ``param.gtp_replica_group``, stamped at wrap time from the caller's collection
        (``expt_dp`` for expert modules, ``dp_cp`` otherwise),
-    3. the MPU globals, picking the expert or dense axis by the param's ``allreduce`` tag.
+    3. the MPU globals, picking the expert or dense axis by the param's ``allreduce`` tag. This
+       fallback is deprecated and emits a ``ProcessGroupFallbackWarning``.
 
     A caller on an explicit process-group grid that never initializes ``parallel_state`` must
     supply that group in its collection; step 3 cannot serve it and raises instead of guessing.
@@ -3030,19 +3032,26 @@ def gtp_replica_rank(param, explicit_group=None):
     from megatron.core import parallel_state  # noqa: E402
 
     if parallel_state.is_initialized():
-        if not getattr(param, 'allreduce', True):  # routed-expert weight
-            return parallel_state.get_expert_data_parallel_rank(with_gtp_remat=False)
-        return parallel_state.get_data_parallel_rank(
-            with_context_parallel=True, with_gtp_remat=False
+        is_expert = not getattr(param, 'allreduce', True)  # routed-expert weight
+        global_groups = resolve_process_groups(
+            None,
+            owner="gtp_replica_rank",
+            required=("expt_dp",) if is_expert else ("dp_cp",),
+            argument="explicit_group",
+            deprecated_in="0.21",
+            removed_in="0.23",
         )
-    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        group = global_groups.expt_dp if is_expert else global_groups.dp_cp
+    elif not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return 0  # single-process save: this rank is the only replica.
-    raise RuntimeError(
-        "GTP distributed checkpointing needs the gtp_remat-excluded DP x CP group to elect a "
-        "shard writer, but parallel_state is not initialized and the param carries no "
-        "gtp_replica_group. Pass a pg_collection containing `dp_cp` when building the model "
-        "(it is stamped onto GTP params at wrap time)."
-    )
+    if group is None:
+        raise RuntimeError(
+            "GTP distributed checkpointing needs the gtp_remat-excluded DP x CP group to elect a "
+            "shard writer, but the param carries no gtp_replica_group and parallel_state has no "
+            "such group to fall back to. Pass a pg_collection containing `dp_cp` (`expt_dp` for "
+            "expert weights) when building the model (it is stamped onto GTP params at wrap time)."
+        )
+    return get_pg_rank(group)
 
 
 def make_sharded_tensors_for_checkpoint_with_gtp_remat(
