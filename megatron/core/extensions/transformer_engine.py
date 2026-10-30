@@ -1114,7 +1114,10 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         return op
 
     def _make_te_ops_activation(
-        activation_func: Callable, gated_linear_unit: bool, cache_quantized_input: bool
+        activation_func: Callable,
+        gated_linear_unit: bool,
+        cache_quantized_input: bool,
+        clamp_value: Optional[float] = None,
     ) -> te.pytorch.ops.FusibleOperation:
         """Construct a TE activation op."""
         op_type = None
@@ -1143,6 +1146,11 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         kwargs = {}
         if is_te_min_version("2.3"):
             kwargs["cache_quantized_input"] = cache_quantized_input
+        if clamp_value is not None and op_type is te.pytorch.ops.SwiGLU:
+            # Same as the clamped SwiGLU in MLP: silu(min(x1, c)) * clamp(x2, -c, c).
+            return te.pytorch.ops.ClampedSwiGLU(
+                limit=clamp_value, alpha=1.0, glu_linear_offset=0.0, **kwargs
+            )
         return op_type(**kwargs)
 
     class TEFusedResidualRMSNorm(TEFusedOpsMixin, te.pytorch.RMSNorm):
@@ -3350,6 +3358,21 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         @copy_signature(MLP.__init__)
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
+            if self.config.activation_func_tanh_clamp_scale is not None:
+                raise ValueError(
+                    f"{self.__class__.__name__} does not support "
+                    "activation_func_tanh_clamp_scale: the Transformer Engine fused MLP does not "
+                    "implement the tanh soft clamp or SiTU-GLU. Set "
+                    "use_transformer_engine_op_fuser=False to use MLP."
+                )
+            if self.config.activation_func_clamp_value is not None and not is_te_min_version(
+                "2.17.0.dev0"
+            ):
+                raise RuntimeError(
+                    f"{self.__class__.__name__} requires Transformer Engine >= 2.17.0.dev0 "
+                    "(pytorch.ops.ClampedSwiGLU with glu_linear_offset) when "
+                    "activation_func_clamp_value is set."
+                )
 
         def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
             """Construct fused module matching MLP."""
@@ -3404,6 +3427,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 self.activation_func,
                 self.config.gated_linear_unit,
                 self.config.activation_func_fp8_input_store,
+                clamp_value=self.config.activation_func_clamp_value,
             )
             fused_impl.append(op)
 
@@ -3593,7 +3617,16 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             # ScaledSwiGLU with glu_interleave_size=32
             # Required by ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8
-            fused_impl.append(te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=32))
+            # With activation_func_clamp_value, use the same clamped op as FusedSharedExpertMLP.
+            clamp_value = self.config.activation_func_clamp_value
+            if clamp_value is None:
+                fused_impl.append(te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=32))
+            else:
+                fused_impl.append(
+                    te.pytorch.ops.ScaledClampedQGeGLU(
+                        glu_interleave_size=32, alpha=1.0, limit=clamp_value, glu_linear_offset=0.0
+                    )
+                )
 
             # FC2: GroupedLinear(num_groups=1) instead of BasicLinear
             weight = self.linear_fc2.weight

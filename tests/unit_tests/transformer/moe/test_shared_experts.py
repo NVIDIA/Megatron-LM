@@ -133,6 +133,7 @@ def _fake_shared_expert(**config_kwargs):
         gated_linear_unit=True,
         activation_func=F.silu,
         activation_func_clamp_value=None,
+        activation_func_tanh_clamp_scale=None,
         moe_shared_expert_glu_interleave_size=32,
         delay_wgrad_compute=False,
         sequence_parallel=False,
@@ -217,6 +218,7 @@ def test_validate_fused_grouped_swiglu_requires_clamped_te_support(monkeypatch, 
         ({"add_bias_linear": True}, None, "add_bias_linear"),
         ({"activation_func": F.gelu}, None, "SwiGLU activation"),
         ({"gated_linear_unit": False}, None, "SwiGLU activation"),
+        ({"activation_func_tanh_clamp_scale": 4.0}, None, "activation_func_tanh_clamp_scale"),
         ({"moe_shared_expert_glu_interleave_size": None}, None, "glu_interleave_size"),
         ({}, "linear_fc1", "FC1"),
         ({}, "linear_fc2", "FC2"),
@@ -495,6 +497,42 @@ class TestSharedExperts:
         for tensor in (hidden, *shared_expert.parameters()):
             assert tensor.grad is not None
             assert torch.isfinite(tensor.grad).all()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_fused_shared_expert_rejects_situ_glu(self):
+        """The fused grouped SwiGLU path must not silently replace SiTU-GLU with SwiGLU."""
+        from megatron.core.extensions.transformer_engine import (
+            HAVE_TE,
+            TEColumnParallelLinear,
+            TERowParallelLinear,
+        )
+        from megatron.core.process_groups_config import ProcessGroupCollection
+        from megatron.core.transformer.mlp import MLPSubmodules
+        from megatron.core.utils import is_te_min_version
+
+        if not HAVE_TE or not is_te_min_version("2.14.0"):
+            pytest.skip("FusedSharedExpertMLP requires Transformer Engine >= 2.14.0")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=1)
+        config = dataclasses.replace(
+            self.config,
+            use_grouped_gemm_for_shared_expert=True,
+            moe_shared_expert_glu_interleave_size=32,
+            bias_activation_fusion=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            fp8="e4m3",
+            fp8_recipe="mxfp8",
+            activation_func_tanh_clamp_scale=4.0,
+            activation_func_tanh_clamp_scale_linear=25.0,
+        )
+
+        with pytest.raises(ValueError, match="activation_func_tanh_clamp_scale"):
+            FusedSharedExpertMLP(
+                config,
+                MLPSubmodules(linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear),
+                gate=False,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
