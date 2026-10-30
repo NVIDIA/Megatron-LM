@@ -5,7 +5,7 @@
 One EncoderSpec per `vision_model_type` carries everything callers need to
 instantiate the encoder without hard-coding numbers in multiple places:
 
-  * patch_dim, default image size, class_token_len, native-spatial-merge flag
+  * patch_dim, default image size, class_token_len, native spatial merge geometry
   * implementation model type, default converted checkpoint directory
   * pixel_mean / pixel_std (ImageNet-style normalisation)
   * the full TransformerConfig arch (num_layers, hidden_size, ffn_hidden_size,
@@ -106,6 +106,43 @@ class EncoderSpec:
     rotary_interleaved: bool = False
     # internvit rounds its 24 heads up to the next multiple of TP at build time.
     tp_round_up_heads: bool = False
+
+    spatial_merge_size: int = 1
+    """Per-axis patch-grid reduction performed by the encoder's native spatial merger."""
+
+    @property
+    def spatial_reduction(self) -> int:
+        """Return the per-axis native-merge and pixel-shuffle reduction under this spec."""
+        if type(self.spatial_merge_size) is not int or self.spatial_merge_size <= 0:
+            raise ValueError("spatial_merge_size must be a positive integer")
+        return self.spatial_merge_size * (2 if self.pixel_shuffle else 1)
+
+    def num_spatial_embeddings(self, img_h: int, img_w: int) -> int:
+        """Count spatial outputs for one processed image using the spec's default geometry.
+
+        Dimensions must already be resized and aligned to the patch grid and its spatial
+        reduction. For example, patch14 with a 2x2 merger maps a 112x224 image to 32 outputs.
+        This counts spatial outputs only: class tokens, tile tags, attention pooling, tiling
+        totals and temporal compression remain the responsibility of image/video accounting.
+        Separately overridden model geometry is not reflected in the registry defaults.
+
+        Args:
+            img_h: Processed image height in pixels.
+            img_w: Processed image width in pixels.
+
+        Returns:
+            Number of spatial image embeddings after native merging and pixel shuffle.
+
+        Raises:
+            ValueError: Dimensions or geometry are nonpositive/noninteger, or either image
+                axis is not divisible by the patch size times the spatial reduction.
+        """
+        if any(type(value) is not int or value <= 0 for value in (img_h, img_w, self.patch_dim)):
+            raise ValueError("Image dimensions and patch_dim must be positive integers")
+        stride = self.patch_dim * self.spatial_reduction
+        if img_h % stride or img_w % stride:
+            raise ValueError(f"Image dimensions must be divisible by {stride}, got {img_h}x{img_w}")
+        return (img_h // stride) * (img_w // stride)
 
     def apply_to_config(self, config, apply_query_key_layer_scaling: bool = False):
         """Write this spec onto an existing TransformerConfig and return it."""
@@ -313,6 +350,7 @@ REGISTRY: Dict[str, EncoderSpec] = {
         default_img_h=1540,
         default_img_w=1540,
         has_native_spatial_merge=True,
+        spatial_merge_size=2,
         checkpoint_dir="pixtral_large",
         dynamic_resolution=True,
         conv_merging=True,
@@ -338,6 +376,7 @@ REGISTRY: Dict[str, EncoderSpec] = {
         default_img_h=768,
         default_img_w=768,
         has_native_spatial_merge=True,
+        spatial_merge_size=2,
         checkpoint_dir="qwen35vl_moe",
         dynamic_resolution=True,
         conv_merging=True,
@@ -360,6 +399,7 @@ REGISTRY: Dict[str, EncoderSpec] = {
         default_img_h=896,
         default_img_w=896,
         has_native_spatial_merge=True,
+        spatial_merge_size=2,
         checkpoint_dir="kimi_k26",
         dynamic_resolution=True,
         conv_merging=True,
