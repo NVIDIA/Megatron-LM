@@ -1776,7 +1776,7 @@ def _gtp_split_tensor_factory(
             device=sub_state_dict[0].device,
         )
         if valid_rows:
-            merged[:valid_rows] = torch.cat(sub_state_dict)
+            torch.cat(sub_state_dict, out=merged[:valid_rows])
         merged[valid_rows:].zero_()
         return merged
 
