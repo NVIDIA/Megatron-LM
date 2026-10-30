@@ -37,6 +37,8 @@ from megatron.energon import (
 )
 from megatron.energon.task_encoder.base import stateless
 from megatron.training import get_args, get_tokenizer
+from megatron.training.global_vars import get_run_config
+from megatron.training.models import LLaVAModelConfig
 
 
 @dataclass
@@ -198,15 +200,25 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         super().__init__()
 
         self.args = get_args()
+        cfg = get_run_config()
+        if not isinstance(cfg.model, LLaVAModelConfig):
+            raise TypeError(
+                "Expected cfg.model to be LLaVAModelConfig, "
+                f"got {type(cfg.model).__name__}"
+            )
+        # Workers retain serializable preprocessing inputs, not the runtime config.
+        self.img_h = cfg.model.img_h
+        self.img_w = cfg.model.img_w
+        self.patch_dim = cfg.model.patch_dim
+        self.drop_vision_class_token = cfg.model.drop_vision_class_token
+        self.freeze_language_model = cfg.model.freeze_language_model
 
         self.tokenizer = get_tokenizer()
         self.manual_prompts = {}
         if self.args.prompt_path:
             with open(self.args.prompt_path, "r") as f:
                 self.manual_prompts = json.load(f)
-        self.dataloader_seq_length = (
-            self.args.dataloader_seq_length
-        )  # Always return samples of this length.
+        self.dataloader_seq_length = self.args.dataloader_seq_length  # Always return samples of this length.
         self.packing_seq_length = (
             self.args.packing_seq_length
         )  # Packing sequence length, if packing is enabled.
@@ -223,11 +235,11 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             assert self.packing_seq_length > 0, "packing sequence length must be set"
 
         self.num_image_embeddings_per_tile = get_num_image_embeddings(
-            img_h=self.args.img_h,
-            img_w=self.args.img_w,
-            patch_dim=self.args.patch_dim,
+            img_h=self.img_h,
+            img_w=self.img_w,
+            patch_dim=self.patch_dim,
             vision_model_type=self.args.vision_model_type,
-            disable_vision_class_token=self.args.disable_vision_class_token,
+            disable_vision_class_token=self.drop_vision_class_token,
             class_token_len=1,
             pixel_shuffle=self.args.pixel_shuffle,
             use_tile_tags=self.args.use_tile_tags,
@@ -239,9 +251,9 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         # Only img_h and img_w need to be specified when calling this function
         self._get_num_image_embeddings = functools.partial(
             get_num_image_embeddings,
-            patch_dim=self.args.patch_dim,
+            patch_dim=self.patch_dim,
             vision_model_type=self.args.vision_model_type,
-            disable_vision_class_token=self.args.disable_vision_class_token,
+            disable_vision_class_token=self.drop_vision_class_token,
             class_token_len=1,
             pixel_shuffle=self.args.pixel_shuffle,
             use_tile_tags=self.args.use_tile_tags,
@@ -251,7 +263,6 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
 
         self.txt_to_token_dict = {}
 
-        self.img_h, self.img_w = self.args.img_h, self.args.img_w
         self.img_token_id = self.tokenizer.image_token_index
         # This map is used to reduce the number of tiles used per image if the number of tokens is
         # larger than the decoder_seq_length.
@@ -267,11 +278,11 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             self.img_h,
             self.args.vision_model_type,
             dynamic_resolution=self.args.dynamic_resolution,
-            res_step=self.args.patch_dim,
+            res_step=self.patch_dim,
             min_num_patches=self.args.dynamic_resolution_min_patches,
             max_num_patches=self.args.seq_length
             - (
-                1 if not self.args.disable_vision_class_token else 0
+                1 if not self.drop_vision_class_token else 0
             ),  # TODO: handle class toekn length correctly(not just use 1)
             pixel_shuffle=self.args.pixel_shuffle,
             min_side=self.args.dynamic_resolution_min_side,
@@ -531,8 +542,8 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         if hasattr(sample, "images") and not has_video:
             # If this is a text-only sample and we are freezing the LM,
             # then use a dummy input image.
-            if len(sample.images) == 0 and self.args.freeze_LM:
-                empty_img = Image.new('RGB', (self.args.img_w, self.args.img_h), (255, 255, 255))
+            if len(sample.images) == 0 and self.freeze_language_model:
+                empty_img = Image.new('RGB', (self.img_w, self.img_h), (255, 255, 255))
                 sample.images.append(empty_img)
             if len(sample.images) > 0:
                 has_image = True
@@ -1096,8 +1107,8 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         if has_fp8 and self.args.dynamic_resolution and no_cp:
             img_seq_len = 0
             for img in imgs:
-                img_seq_len += (img.shape[1] // self.args.patch_dim) * (
-                    img.shape[2] // self.args.patch_dim
+                img_seq_len += (img.shape[1] // self.patch_dim) * (
+                    img.shape[2] // self.patch_dim
                 )
             padding_needed = get_padding(
                 img_seq_len,
@@ -1110,13 +1121,13 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             )
             if padding_needed > 0:
                 pad_img = torch.zeros(
-                    [3, self.args.patch_dim, padding_needed * self.args.patch_dim]
+                    [3, self.patch_dim, padding_needed * self.patch_dim]
                 )
                 imgs.append(pad_img)
                 has_pad_img = torch.tensor(True)
 
         imgs, imgs_sizes, vision_cu_lengths, vision_max_lengths = process_images(
-            imgs, self.args.patch_dim, self.args.dynamic_resolution, batch_mode=True
+            imgs, self.patch_dim, self.args.dynamic_resolution, batch_mode=True
         )
 
         # Set default values if no vision metadata was returned (static resolution case)

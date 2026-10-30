@@ -47,6 +47,7 @@ from megatron.training.global_vars import (
     set_run_config,
 )
 from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.models import LLaVAModelConfig
 
 
 def is_first_rank():
@@ -162,14 +163,18 @@ def get_evaluation_dataloader(
 def generate_samples(model, config: EvaluationConfig, print_output):
     """Text generation using a trained vision language model."""
     cfg = get_run_config()
+    if not isinstance(cfg.model, LLaVAModelConfig):
+        raise TypeError(
+            f"Expected cfg.model to be LLaVAModelConfig, got {type(cfg.model).__name__}"
+        )
     args = get_args()
 
     dataloader = get_evaluation_dataloader(
         config.task,
         config.input_image_path,
         config.gt_path,
-        args.img_h,
-        args.img_w,
+        cfg.model.img_h,
+        cfg.model.img_w,
         args.use_tiling,
         args.max_num_tiles,
         args.use_thumbnail,
@@ -183,11 +188,11 @@ def generate_samples(model, config: EvaluationConfig, print_output):
     )
 
     num_img_embeddings_per_tile = get_num_image_embeddings(
-        args.img_h,
-        args.img_w,
-        args.patch_dim,
+        cfg.model.img_h,
+        cfg.model.img_w,
+        cfg.model.patch_dim,
         args.vision_model_type,
-        args.disable_vision_class_token,
+        cfg.model.drop_vision_class_token,
         1,
         args.pixel_shuffle,
         args.use_tile_tags,
@@ -850,7 +855,6 @@ def run_evaluation_loop(model, configs, output_dir_override=None, iteration=None
 def eval_tasks():
     """Vision language model text generation for single or batch tasks."""
     from megatron.training.argument_utils import model_config_from_args
-    from megatron.training.models import LLaVAModelConfig
 
     args = parse_and_validate_args(extra_args_provider=add_text_generation_args)
     model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)

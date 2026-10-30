@@ -7,6 +7,7 @@ import time
 _PROGRAM_START_TIME = time.time()
 
 import warnings
+from argparse import Namespace
 from copy import deepcopy
 from functools import partial
 
@@ -38,13 +39,41 @@ from megatron.training import (
     set_startup_timestamps,
 )
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
-from megatron.training.vocab_utils import model_vocab_size
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.global_vars import (
-    get_run_config,
-    set_run_config,
-)
+from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.models import LLaVAModelConfig
+from megatron.training.vocab_utils import model_vocab_size
 from pretrain_gpt import loss_func
+
+
+def set_vlm_sequence_lengths(args: Namespace, model_config: LLaVAModelConfig) -> None:
+    """Set text and padded decoder lengths before initialization sizes TP user buffers."""
+    if not isinstance(model_config, LLaVAModelConfig):
+        raise TypeError(
+            f"Expected LLaVAModelConfig, got {type(model_config).__name__}"
+        )
+    if getattr(args, "dataloader_seq_length", None) is None:
+        args.dataloader_seq_length = args.seq_length
+    image_tokens = get_num_image_embeddings(
+        model_config.img_h,
+        model_config.img_w,
+        model_config.patch_dim,
+        "clip",
+        model_config.drop_vision_class_token,
+        class_token_len=1,
+        pixel_shuffle=False,
+        use_tile_tags=False,
+    )
+    decoder_length = args.dataloader_seq_length + image_tokens
+    transformer = model_config.transformer
+    args.decoder_seq_length = decoder_length + context_parallel.get_padding(
+        decoder_length,
+        transformer.context_parallel_size,
+        transformer.tensor_model_parallel_size,
+        transformer.sequence_parallel,
+        getattr(args, "decoder_tp_comm_overlap", False),
+        args.decoder_seq_length,
+    )
 
 
 def model_provider(
@@ -74,6 +103,10 @@ def model_provider(
     """
     args = get_args()
     cfg = get_run_config()
+    if not isinstance(cfg.model, LLaVAModelConfig):
+        raise TypeError(
+            f"Expected cfg.model to be LLaVAModelConfig, got {type(cfg.model).__name__}"
+        )
     vision_model_type = "clip"
 
     assert (
@@ -85,21 +118,17 @@ def model_provider(
     Current mock dataset does not support natively packed sequence dataset required for correct PP comm shapes."
 
     num_image_embeddings = get_num_image_embeddings(
-        args.img_h,
-        args.img_w,
-        args.patch_dim,
+        cfg.model.img_h,
+        cfg.model.img_w,
+        cfg.model.patch_dim,
         vision_model_type,
-        args.disable_vision_class_token,
+        cfg.model.drop_vision_class_token,
         class_token_len=1,
         pixel_shuffle=False,
         use_tile_tags=False,
     )
 
     old_seq_length = args.seq_length
-    # dataloader-seq-length is required to determine the length of text seq len
-    if args.dataloader_seq_length is None:
-        args.dataloader_seq_length = args.seq_length
-
     # decoder_seq_len denotes the language model sequence length.
     decoder_seq_len = args.dataloader_seq_length + num_image_embeddings
 
@@ -109,15 +138,7 @@ def model_provider(
         warnings.warn(
             f"Changed seq_length and encoder_seq_length (vision model sequence length) from {old_seq_length} to num_image_tokens ({num_image_embeddings})"
         )
-    mp_padding_needed = context_parallel.get_padding(
-        decoder_seq_len,
-        cfg.model.transformer.context_parallel_size,
-        cfg.model.transformer.tensor_model_parallel_size,
-        cfg.model.transformer.sequence_parallel,
-        args.decoder_tp_comm_overlap,
-        args.decoder_seq_length,
-    )
-    args.decoder_seq_length = decoder_seq_len + mp_padding_needed
+    mp_padding_needed = args.decoder_seq_length - decoder_seq_len
 
     args.max_position_embeddings = max(args.max_position_embeddings, args.decoder_seq_length)
 
@@ -128,11 +149,10 @@ def model_provider(
         language_transformer_config = deepcopy(config)
     if args.decoder_num_layers is not None:
         language_transformer_config.num_layers = args.decoder_num_layers
-    if args.decoder_tp_comm_overlap:
+    if language_transformer_config.tp_comm_overlap:
         assert (
             language_transformer_config.transformer_impl == "transformer_engine"
         ), "TransformerEngine is needed to support Decoder TP Comm overlap"
-        language_transformer_config.tp_comm_overlap = args.decoder_tp_comm_overlap
 
     if args.spec is not None:
         language_transformer_layer_spec = import_module(args.spec)
@@ -205,7 +225,7 @@ def model_provider(
 
     language_max_sequence_length = args.decoder_seq_length
     if language_transformer_config.context_parallel_size > 1:
-        if args.use_packed_sequence or mp_padding_needed > 0:
+        if getattr(args, "use_packed_sequence", False) or mp_padding_needed > 0:
             # Use THD data format
             language_max_sequence_length = args.decoder_seq_length * args.micro_batch_size
     model = LLaVAModel(
@@ -220,7 +240,7 @@ def model_provider(
         language_max_sequence_length=language_max_sequence_length,
         vision_transformer_config=vision_transformer_config,
         vision_transformer_layer_spec=vision_transformer_layer_spec,
-        drop_vision_class_token=args.disable_vision_class_token,
+        drop_vision_class_token=cfg.model.drop_vision_class_token,
         vision_projection_config=vision_projection_config,
         vision_projection_layer_spec=vision_projection_modules,
         vision_projection_type=vision_projection_type,
@@ -234,14 +254,14 @@ def model_provider(
         post_process=parallel_state.is_pipeline_last_stage(),
         add_encoder=parallel_state.is_pipeline_first_stage(),
         add_decoder=True,
-        img_h=args.img_h,
-        img_w=args.img_w,
-        patch_dim=args.patch_dim,
+        img_h=cfg.model.img_h,
+        img_w=cfg.model.img_w,
+        patch_dim=cfg.model.patch_dim,
     )
 
     model.freeze(
-        freeze_language_model=args.freeze_LM,
-        freeze_vision_model=args.freeze_ViT,
+        freeze_language_model=cfg.model.freeze_language_model,
+        freeze_vision_model=cfg.model.freeze_vision_model,
         freeze_vision_projection=False,
     )
 
@@ -258,6 +278,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         train_ds, val_ds, test_ds (megatron.core.datasets.multimodal_dataset.MockMultimodalDataset): Train, validation, and test datasets, respectively.
     """
     cfg = get_run_config()
+    if not isinstance(cfg.model, LLaVAModelConfig):
+        raise TypeError(
+            f"Expected cfg.model to be LLaVAModelConfig, got {type(cfg.model).__name__}"
+        )
     args = get_args()
 
     config = MultimodalDatasetConfig(
@@ -268,8 +292,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         reset_position_ids=args.reset_position_ids,
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
-        image_h=args.img_h,
-        image_w=args.img_w,
+        image_h=cfg.model.img_h,
+        image_w=cfg.model.img_w,
         preprocess_func=_preprocess_data_for_llava,
         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
         allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
@@ -335,7 +359,12 @@ def get_batch(data_iterator):
         sample: A data sample with images, tokens, etc.
     """
     args = get_args()
-    cp_size = args.context_parallel_size
+    cfg = get_run_config()
+    if not isinstance(cfg.model, LLaVAModelConfig):
+        raise TypeError(
+            f"Expected cfg.model to be LLaVAModelConfig, got {type(cfg.model).__name__}"
+        )
+    cp_size = cfg.model.transformer.context_parallel_size
     # Broadcast data.
     if data_iterator is not None:
         data = next(data_iterator)
@@ -359,11 +388,11 @@ def get_batch(data_iterator):
         vision_model_type = "clip"
         # Calculate the number of image embedding tokens will be added to text tokens
         num_image_embeddings_per_tile = get_num_image_embeddings(
-            args.img_h,
-            args.img_w,
-            args.patch_dim,
+            cfg.model.img_h,
+            cfg.model.img_w,
+            cfg.model.patch_dim,
             vision_model_type,
-            args.disable_vision_class_token,
+            cfg.model.drop_vision_class_token,
             1,
             False,
         )
@@ -378,7 +407,7 @@ def get_batch(data_iterator):
             args.context_parallel_size,
             args.tensor_model_parallel_size,
             args.sequence_parallel,
-            args.decoder_tp_comm_overlap,
+            cfg.model.transformer.tp_comm_overlap,
             args.decoder_seq_length,
         )
         if mp_padding_needed_for_text > 0:
@@ -502,17 +531,15 @@ if __name__ == "__main__":
     # Register startup timestamps for timing report in pretrain()
     set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
 
-    train_valid_test_datasets_provider.is_distributed = True
-
     args = parse_and_validate_args(
         extra_args_provider=add_vlm_extra_args, args_defaults={'tokenizer_type': 'GPT2BPETokenizer'}
     )
     from megatron.training.argument_utils import model_config_from_args
-    from megatron.training.models import LLaVAModelConfig
-
     model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
+    set_vlm_sequence_lengths(args, model_cfg)
+    train_valid_test_datasets_provider.is_distributed = True
     pretrain(
         full_config,
         train_valid_test_datasets_provider,

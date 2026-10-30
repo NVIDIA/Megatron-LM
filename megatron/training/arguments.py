@@ -2826,7 +2826,8 @@ def _add_training_args(parser):
                        help='Enable nsys profiling. When using this option, nsys '
                        'options should be specified in commandline.')
 
-    train_factory = ArgumentGroupFactory(TrainingConfig)
+    # Keep the legacy vision CLI master switch/defaults at their existing boundary.
+    train_factory = ArgumentGroupFactory(TrainingConfig, exclude=["vision_pretraining_type"])
     group = train_factory.build_group(parser, "training")
 
     # Keep this CLI-only until dataset options have their own config dataclass.
