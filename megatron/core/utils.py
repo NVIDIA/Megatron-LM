@@ -955,6 +955,13 @@ def log_on_each_pipeline_stage(
 
         args (Tuple[Any]): Message format arguments.
 
+        tp_group (torch.distributed.ProcessGroup, optional): Tensor-parallel group of the model
+            that logs. Pass it together with ``dp_cp_group``. Omitting both is deprecated: the
+            groups of the global parallel state are used, with a ``ProcessGroupFallbackWarning``.
+
+        dp_cp_group (torch.distributed.ProcessGroup, optional): Data-parallel group, including
+            the context-parallel ranks, of the model that logs.
+
         kwargs (Dict[str, Any]): All logging.Logger.log keyword arguments
     """
     assert torch.distributed.is_initialized()
@@ -965,20 +972,35 @@ def log_on_each_pipeline_stage(
     if not logger.isEnabledFor(level):
         return
 
-    if tp_group is None and dp_cp_group is None:
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        dp_cp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-    else:
-        assert tp_group is not None and dp_cp_group is not None
-        tp_rank = tp_group.rank()
-        dp_cp_rank = dp_cp_group.rank()
+    if tp_group is None:
+        # Import here to avoid a circular import: process_groups_config imports parallel_state,
+        # which imports this module.
+        from megatron.core.process_groups_config import resolve_process_groups
+
+        # Deprecated fallback: the groups behind get_tensor_model_parallel_rank() and
+        # get_data_parallel_rank(with_context_parallel=True) of the global parallel state.
+        pg_collection = resolve_process_groups(
+            None,
+            owner="log_on_each_pipeline_stage",
+            required=("tp", "dp_cp_gtp_remat"),
+            argument="tp_group/dp_cp_group",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        tp_group, dp_cp_group = pg_collection.tp, pg_collection.dp_cp_gtp_remat
+    tp_rank = tp_group.rank()
+    dp_cp_rank = dp_cp_group.rank()
 
     if tp_rank == 0 and dp_cp_rank == 0:
         logger.log(level, msg, *args, **kwargs)
 
 
 def check_param_hashes_across_dp_replicas(
-    model: List[torch.nn.Module], cross_check: bool = False
+    model: List[torch.nn.Module],
+    cross_check: bool = False,
+    *,
+    dp_group: Optional[torch.distributed.ProcessGroup] = None,
+    expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> bool:
     """Computes hashes of all parameters in model, all-gathers hashes across DP replicas,
     and then checks for equality between the locally-computed hashes and those of other ranks.
@@ -987,15 +1009,47 @@ def check_param_hashes_across_dp_replicas(
     tensors from GPU to CPU first; as a result, this function is not intended to be called
     very frequently in the main training loop.
 
+    The DP replicas are given by the model's data-parallel groups. If neither group is passed,
+    the replicate data-parallel groups of the global parallel state are used; this fallback is
+    deprecated and emits a ``ProcessGroupFallbackWarning``.
+
     Args:
         model (List[torch.nn.Module]): List of model chunks whose parameter hashes need to
             be checked.
         cross_check (bool): If true, will check whether hashes match across all DP replicas.
+        dp_group (torch.distributed.ProcessGroup, optional): The model's data-parallel
+            replicate group (``pg_collection.dp``), across which the hashes of non-expert
+            parameters are compared.
+        expt_dp_group (torch.distributed.ProcessGroup, optional): The model's expert
+            data-parallel replicate group (``pg_collection.expt_dp``), across which the hashes
+            of expert parameters (``param.allreduce`` is False) are compared. May be None for a
+            model without expert parameters.
 
     Returns:
         True if all param hashes match with corresponding hash on DP replica 0 or
         across all replicas if cross_check is enabled, False otherwise.
+
+    Raises:
+        ValueError: If a group is passed, but this rank holds non-expert parameters and
+            ``dp_group`` is None, or expert parameters and ``expt_dp_group`` is None.
     """
+    if dp_group is None and expt_dp_group is None:
+        # Import here to avoid a circular import: process_groups_config imports parallel_state,
+        # which imports this module.
+        from megatron.core.process_groups_config import resolve_process_groups
+
+        # Deprecated fallback for callers that do not pass the model's groups: the replicate
+        # data-parallel groups of the global parallel state. A missing expert group is
+        # rejected below if this rank holds expert parameters.
+        pg_collection = resolve_process_groups(
+            None,
+            owner="check_param_hashes_across_dp_replicas",
+            required=("dp", "expt_dp"),
+            argument="dp_group/expt_dp_group",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        dp_group, expt_dp_group = pg_collection.dp, pg_collection.expt_dp
 
     # Compute per-parameter hashes on this rank.
     # Keep track of expert and non-expert parameters separately since they need to be
@@ -1017,16 +1071,26 @@ def check_param_hashes_across_dp_replicas(
                 expert_params.append((model_chunk_id, param_name, param))
                 local_expert_param_hashes.append(param_hash)
 
+    # Before the first collective, make sure there is a group for each kind of parameter that
+    # this rank holds.
+    if non_expert_params and dp_group is None:
+        raise ValueError(
+            "check_param_hashes_across_dp_replicas: dp_group is None, but the model has "
+            "non-expert parameters; pass the model's pg_collection.dp."
+        )
+    if expert_params and expt_dp_group is None:
+        raise ValueError(
+            "check_param_hashes_across_dp_replicas: expt_dp_group is None, but the model has "
+            "expert parameters; pass the model's pg_collection.expt_dp."
+        )
+
     # Use data-modulo-expert parallel group to all-gather expert param hashes, regular
     # data-parallel group for non-expert param hashes.
     all_param_hashes_match = True
     for params, local_param_hashes, all_gather_group in zip(
         [non_expert_params, expert_params],
         [local_non_expert_param_hashes, local_expert_param_hashes],
-        [
-            parallel_state.get_data_parallel_group(with_gtp_remat=False),
-            parallel_state.get_expert_data_parallel_group(with_gtp_remat=False),
-        ],
+        [dp_group, expt_dp_group],
     ):
         # Collect per-parameter hashes across all ranks in group.
         assert len(params) == len(local_param_hashes)

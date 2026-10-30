@@ -48,15 +48,15 @@
       "TEFusedMLPWithGroupedLinear._register_hooks_on_fused_impl:accessor:parallel_state.get_tensor_model_parallel_world_size",
       "TEFusedMLPWithGroupedLinear.forward:accessor:parallel_state.get_tensor_model_parallel_world_size",
       "TEGroupedLinear.__init__:shim:use_mpu_process_groups",
-      "_get_fp8_autocast_for_quant_recipe:accessor:parallel_state.get_amax_reduction_group",
+      "_get_fp8_autocast_for_quant_recipe:guarded:resolve_process_groups",
       "_get_te_ops_tensor_parallel_context:accessor:parallel_state.get_tensor_model_parallel_group",
       "_get_te_ops_tensor_parallel_context:accessor:parallel_state.get_tensor_model_parallel_world_size"
     ],
     "megatron/core/fp4_utils.py": [
-      "get_fp4_context:accessor:parallel_state.get_amax_reduction_group"
+      "get_fp4_context:guarded:resolve_process_groups"
     ],
     "megatron/core/fp8_utils.py": [
-      "get_fp8_context:accessor:parallel_state.get_amax_reduction_group"
+      "get_fp8_context:guarded:resolve_process_groups"
     ],
     "megatron/core/inference/apis/_llm_base.py": [
       "_MegatronLLMBase.__init__:accessor:parallel_state.get_expert_model_parallel_world_size"
@@ -97,7 +97,7 @@
       "tokenize_prompts:accessor:parallel_state.get_data_parallel_src_rank"
     ],
     "megatron/core/models/common/embeddings/rope_utils.py": [
-      "apply_rotary_pos_emb:accessor:parallel_state.get_context_parallel_group"
+      "apply_rotary_pos_emb:guarded:resolve_process_groups"
     ],
     "megatron/core/models/common/embeddings/rotary_pos_embedding.py": [
       "MultimodalRotaryEmbedding.__init__:accessor:parallel_state.get_context_parallel_group",
@@ -107,12 +107,11 @@
       "LanguageModule.__init__:shim:use_mpu_process_groups"
     ],
     "megatron/core/models/mimo/partition/utils.py": [
-      "PartitionConfig.from_mp_config:accessor:parallel_state.get_context_parallel_group",
-      "PartitionConfig.from_mp_config:accessor:parallel_state.get_tensor_model_parallel_group"
+      "PartitionConfig.from_mp_config:guarded:resolve_process_groups",
+      "PartitionConfig.from_mp_config:guarded:resolve_process_groups"
     ],
     "megatron/core/models/multimodal/context_parallel.py": [
-      "_gather_along_second_dim:accessor:parallel_state.get_context_parallel_group",
-      "_reduce_scatter_along_second_dim:accessor:parallel_state.get_context_parallel_group",
+      "_gather_cp_group:guarded:resolve_process_groups",
       "gather_from_context_parallel_ranks_dynamic_res:accessor:parallel_state.get_context_parallel_group",
       "split_to_context_parallel_ranks:accessor:parallel_state.get_context_parallel_rank",
       "split_to_context_parallel_ranks:accessor:parallel_state.get_context_parallel_world_size",
@@ -184,8 +183,8 @@
       "Attention.__init__:shim:use_mpu_process_groups"
     ],
     "megatron/core/transformer/cuda_graphs.py": [
-      "CudaGraphManager.__init__:shim:use_mpu_process_groups",
-      "TECudaGraphHelper.__init__:shim:use_mpu_process_groups"
+      "CudaGraphManager._resolve_reuse_cudagraphs:guarded:resolve_process_groups",
+      "TECudaGraphHelper.__init__:guarded:resolve_process_groups"
     ],
     "megatron/core/transformer/dot_product_attention.py": [
       "DotProductAttention.__init__:shim:use_mpu_process_groups"
@@ -209,7 +208,7 @@
       "MegatronModule.sharded_state_dict:accessor:parallel_state.get_tensor_model_parallel_group"
     ],
     "megatron/core/transformer/moe/batch_invariant.py": [
-      "unpermute:accessor:parallel_state.get_expert_model_parallel_world_size"
+      "unpermute:guarded:resolve_process_groups"
     ],
     "megatron/core/transformer/moe/moe_logging.py": [
       "MoEMetricsTracker._sync_metrics:accessor:parallel_state.get_data_parallel_group",
@@ -260,17 +259,15 @@
       "make_sharded_tensors_for_checkpoint:accessor:parallel_state.get_data_parallel_group"
     ],
     "megatron/core/utils.py": [
-      "check_param_hashes_across_dp_replicas:accessor:parallel_state.get_data_parallel_group",
-      "check_param_hashes_across_dp_replicas:accessor:parallel_state.get_expert_data_parallel_group",
+      "check_param_hashes_across_dp_replicas:guarded:resolve_process_groups",
       "get_tensor_model_parallel_group_if_none:accessor:parallel_state.get_expert_tensor_parallel_group",
       "get_tensor_model_parallel_group_if_none:accessor:parallel_state.get_tensor_model_parallel_group",
-      "log_on_each_pipeline_stage:accessor:parallel_state.get_data_parallel_rank",
-      "log_on_each_pipeline_stage:accessor:parallel_state.get_tensor_model_parallel_rank",
+      "log_on_each_pipeline_stage:guarded:resolve_process_groups",
       "make_sharded_tensor_for_checkpoint:accessor:parallel_state.get_data_parallel_group",
       "make_sharded_tensor_for_checkpoint:accessor:parallel_state.get_tensor_model_parallel_group",
       "make_tp_sharded_tensor_for_checkpoint:accessor:parallel_state.get_data_parallel_group",
       "make_tp_sharded_tensor_for_checkpoint:accessor:parallel_state.get_tensor_model_parallel_group"
     ]
   },
-  "total": 170
+  "total": 167
 }
