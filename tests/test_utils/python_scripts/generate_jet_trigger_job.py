@@ -121,7 +121,11 @@ def main(
     # Treat empty string as "no cadence filter" so callers can wire shell
     # variables in directly without conditional flag emission.
     cadence_arg = cadence or None
-    job_timeout = "24 hours" if platform == "dgx_gb300" else "7 days"
+    # Release and weekly convergence can resume over multiple SLURM windows.
+    # Retain the shorter deadline for the asynchronous GB300 nightly matrix.
+    job_timeout = "7 days"
+    if platform == "dgx_gb300" and scope not in ("weekly", "L3", "release"):
+        job_timeout = "24 hours"
 
     list_of_test_cases = [
         test_case

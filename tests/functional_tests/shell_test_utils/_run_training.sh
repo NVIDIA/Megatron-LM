@@ -234,6 +234,9 @@ DISTRIBUTED_ARGS=(
 FT_LAUNCHER_ARGS=(
     --max-restarts=3
 )
+if [[ -n "${FT_NODE_SEGMENT_SIZE:-}" ]]; then
+    FT_LAUNCHER_ARGS+=(--ft-segment "$FT_NODE_SEGMENT_SIZE")
+fi
 
 # Start training
 if [[ "$IS_NEMO_TEST" == "true" ]]; then

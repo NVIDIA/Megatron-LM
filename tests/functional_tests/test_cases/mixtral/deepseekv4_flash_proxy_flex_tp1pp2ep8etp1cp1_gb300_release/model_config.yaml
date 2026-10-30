@@ -1,0 +1,236 @@
+# DeepSeek-V4 Flash convergence proxy on Blackwell.
+# Keep the Flash dimensions and components with 14 logical layers and 64 experts.
+# Run with pretrain_hybrid.py: each attention/MoE pair is two physical layers.
+ENV_VARS:
+  TORCH_NCCL_AVOID_RECORD_STREAMS: 0
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  NCCL_NVLS_ENABLE: 0
+  NVTE_FUSED_ATTN: 1
+  NVTE_NORM_FWD_USE_CUDNN: 1
+  NVTE_NORM_BWD_USE_CUDNN: 1
+  PYTHONWARNINGS: ignore
+  NCCL_DEBUG: VERSION
+  NON_DETERMINSTIC_RESULTS: 1
+  NVSHMEM_IB_ENABLE_IBGDA: 0
+  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: 8
+  USE_MNNVL: 1
+  NVLINK_DOMAIN_SIZE: 72
+  NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: 128
+  # Preserve each eight-rank expert group within a two-node NVLink segment.
+  FT_NODE_SEGMENT_SIZE: 2
+BEFORE_SCRIPT: |
+  # Hash routing needs the real vocabulary before HybridModel config validation.
+  # Write a private runtime config per node; the harness's .tmp file is shared.
+  TRAINING_PARAMS_PATH=$(uv run --no-sync python - <<'PY'
+  import contextlib
+  import os
+  import sys
+  import tempfile
+  from pathlib import Path
+
+  import yaml
+
+  config = yaml.safe_load(Path(os.environ["TRAINING_PARAMS_PATH"]).read_text())
+  args = config["MODEL_ARGS"]
+  with contextlib.redirect_stdout(sys.stderr):
+      from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+      from megatron.training.config import TokenizerConfig
+
+      tokenizer = build_tokenizer(TokenizerConfig(
+          tokenizer_type=args["--tokenizer-type"],
+          tokenizer_model=args["--tokenizer-model"],
+      ))
+  args["--vocab-size"] = tokenizer.vocab_size
+  output = Path(os.environ["OUTPUT_PATH"])
+  output.mkdir(parents=True, exist_ok=True)
+  with tempfile.NamedTemporaryFile(mode="w", dir=output, prefix="dsv4-", suffix=".yaml", delete=False) as runtime:
+      yaml.safe_dump(config, runtime, sort_keys=False)
+  print(runtime.name)
+  PY
+  )
+  export TRAINING_PARAMS_PATH
+TEST_TYPE: "release"
+LAUNCHER: ft_launcher
+MODEL_ARGS:
+  # Distributed args
+  --distributed-timeout-minutes: 60
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 2
+  --expert-model-parallel-size: 8
+  --context-parallel-size: 1
+  --expert-tensor-parallel-size: 1
+  --use-distributed-optimizer: true
+  --overlap-grad-reduce: true
+  --overlap-param-gather: true
+
+  # Training args
+  --use-mcore-models: true
+  --use-flash-attn: true
+  --disable-bias-linear: true
+  --micro-batch-size: 1
+  --global-batch-size: 512
+  --train-samples: 24414062
+  --exit-duration-in-mins: 220
+  --cross-entropy-loss-fusion: true
+  --cross-entropy-fusion-impl: native
+  --manual-gc: true
+  --manual-gc-interval: 10
+
+  # Transformer Engine args
+  --transformer-impl: transformer_engine
+
+  # SlimPajama preprocessed with the paired DeepSeek-V4 Flash tokenizer.
+  --seq-length: 4096
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --tokenizer-type: HuggingFaceTokenizer
+  --tokenizer-model: ${DATA_PATH}/model/DeepSeek-V4-Flash
+  --data-path: $DATA_BLEND
+  --split: 99,1,0
+  --no-mmap-bin-files: true
+  --no-create-attention-mask-in-dataloader: true
+  --num-workers: 6
+
+  # DSv4 hybrid attention and MoE composition. Keep the first three hash MoE
+  # layers on the embedding stage; /WE supplies the MTP inner layers.
+  --spec: "[megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec]"
+  --hybrid-layer-pattern: "WEWECEHECEHECE|HECEHECEHECEHE/WE"
+  --experimental-attention-variant: dsv4_hybrid
+  --enable-mhc-connections: true
+  --mhc-num-residual-streams: 4
+  --mhc-sinkhorn-iterations: 20
+  --use-fused-mhc: true
+  --recompute-granularity: selective
+  --recompute-modules: "[mhc mla_up_proj]"
+
+  # Add network size args
+  --num-layers: 28 # 14 attention/MoE pairs; full Flash has 43 pairs
+  --hidden-size: 4096
+  --ffn-hidden-size: 2048
+  --num-attention-heads: 64
+  --kv-channels: 512
+  --max-position-embeddings: 4096
+  --position-embedding-type: rope
+  --rotary-base: 10000
+  --make-vocab-size-divisible-by: 1280
+  --normalization: RMSNorm
+  --norm-epsilon: 1e-6
+  --swiglu: true
+  --activation-func-clamp-value: 10
+  --no-bias-swiglu-fusion: true
+  --untie-embeddings-and-output-weights: true
+  --multi-latent-attention: true
+  --mtp-num-layers: 1
+  --mtp-loss-scaling-factor: 0.1
+
+  # Add regularization args
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --clip-grad: 1.0
+  --weight-decay: 0.1
+  --qk-layernorm: true
+
+  # Add learning rate args
+  --lr-decay-samples: 24413696
+  --lr-warmup-samples: 1536000
+  --lr-warmup-init: 1e-7
+  --lr: 1e-5
+  --min-lr: 1e-6
+  --lr-decay-style: cosine
+  --adam-beta1: 0.9
+  --adam-beta2: 0.95
+
+  # Natural routing is required for convergence; do not force load balancing.
+  # BEFORE_SCRIPT supplies the convergence tokenizer vocabulary size.
+  --moe-num-hash-layers: 3
+  # Add MoE args
+  --num-experts: 64 # full Flash has 256 experts
+  --moe-layer-freq: 1
+  --moe-ffn-hidden-size: 2048
+  --moe-shared-expert-intermediate-size: 2048
+  --moe-router-load-balancing-type: seq_aux_loss
+  --moe-router-topk: 6
+  --moe-token-dispatcher-type: flex
+  --moe-flex-dispatcher-backend: hybridep
+  --moe-grouped-gemm: true
+  --moe-aux-loss-coeff: 1e-4
+  --moe-router-topk-scaling-factor: 1.5
+  --moe-router-score-function: sqrtsoftplus
+  --moe-router-enable-expert-bias: true
+  --moe-router-bias-update-rate: 1e-3
+  --moe-router-dtype: fp32
+  --moe-permute-fusion: true
+
+  # DSv4 window, compressed sparse, and heavily compressed attention.
+  # Compression ratios are derived from W/C/H in the hybrid pattern.
+  --rope-type: yarn
+  --original-max-position-embeddings: 65536
+  --csa-compress-rotary-base: 40000
+  --csa-window-size: 128
+  --output-projection-groups: 8
+  --output-projection-lora-rank: 1024
+  --dsa-indexer-n-heads: 64
+  --dsa-indexer-head-dim: 128
+  --dsa-indexer-topk: 512
+  --dsa-indexer-loss-coeff: 0.01
+  --dsa-indexer-use-sparse-loss: true
+  --dsa-kernel-backend: cudnn
+
+  # Add MLA args
+  --q-lora-rank: 1024
+  --kv-lora-rank: 448
+  --qk-head-dim: 448
+  --qk-pos-emb-head-dim: 64
+  --v-head-dim: 512
+  --rotary-scaling-factor: 4
+  --mscale: 1.0
+  --mscale-all-dim: 1.0
+
+  # Add validation args
+  --eval-iters: 32
+  --eval-interval: 200
+
+  # Add checkpointing args
+  --auto-detect-ckpt-format: true
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
+  --save-interval: 250
+  --save-retain-interval: 5000
+  --dist-ckpt-strictness: log_all
+
+  # Add initialization args
+  --init-method-std: 0.02
+
+  # Add logging args
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  --log-num-zeros-in-grad: true
+  --log-params-norm: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-throughput: true
+  --log-interval: 1
+  --logging-level: 40
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --wandb-project: megatron-core-release-runs
+  --wandb-entity: adlr
+  --wandb-exp-name: ${WANDB_EXPERIMENT}
+  --wandb-save-dir: ${WANDB_SAVE_PATH}
+
+  # Add mixed precision args
+  --bf16: true
+  --fp8-format: e4m3
+  --fp8-recipe: mxfp8
+  --fp8-param-gather: true
+  --reuse-grad-buf-for-mxfp8-param-ag: true
+  --moe-router-padding-for-quantization: true
+
+  # enable experimental
+  --enable-experimental: true
+  # Initial golden onboarding budget; retain the training LR schedule.
+  --exit-interval: 1000
+METRICS:
+  - "iteration-time"
+  - "lm loss"
+  - "mtp_1 loss"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"
