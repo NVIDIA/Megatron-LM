@@ -45,9 +45,19 @@ def _model():
     return model
 
 
+def _stub_global_process_groups(monkeypatch):
+    """Stand in for the MPU fallback, since these tests never initialize model parallelism."""
+    monkeypatch.setattr(
+        ProcessGroupCollection,
+        'use_mpu_process_groups',
+        classmethod(lambda cls, required_pgs=None: SimpleNamespace()),
+    )
+
+
 @pytest.mark.parametrize('path', ['muon', 'adam', 'sgd', 'fsdp', 'fsdp_overlap'])
 def test_factory_clears_initializers_after_all_master_weights(monkeypatch, path):
     """Optimizer builders finish before releasing saved initializers."""
+    _stub_global_process_groups(monkeypatch)
     chunks = [_model(), _model()]
     config = OptimizerConfig(
         optimizer=path if path in ('muon', 'adam', 'sgd') else 'adam',
@@ -116,6 +126,7 @@ def test_factory_clears_initializers_after_all_master_weights(monkeypatch, path)
 
 def test_failed_construction_preserves_initializers(monkeypatch):
     """Do not sweep initializers if optimizer construction raises."""
+    _stub_global_process_groups(monkeypatch)
     model = _model()
 
     def fail(**kwargs):
