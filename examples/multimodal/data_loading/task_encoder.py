@@ -327,13 +327,7 @@ class MultiModalTaskEncoder(
         ),
     ]
 
-    def __init__(
-        self,
-        is_val: bool = False,
-        tiling_augment_prob: float = 0.4,
-        *,
-        sequence_length: int | None = None,
-    ):
+    def __init__(self, is_val: bool = False, tiling_augment_prob: float = 0.4):
         super().__init__()
         self.is_val = is_val
         self.args = get_args()
@@ -354,7 +348,7 @@ class MultiModalTaskEncoder(
         # TODO: There is four seq lengths now: seq_length, decoder_seq_length, dataloader_seq_length, packing_seq_length
         # Why do we need all of these? Can we simplify?
         # The docs are not clear.
-        self.dataloader_seq_length = sequence_length
+        self.dataloader_seq_length = self.args.dataloader_seq_length
         # TODO: It's unclear why we need this separately. This should be the same as dataloader_seq_length which should be decoder_seq_length?
         self.packing_seq_length = self.args.packing_seq_length
         self.is_packing_enabled = (

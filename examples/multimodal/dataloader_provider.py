@@ -39,16 +39,16 @@ def use_new_dataloader_path():
     return args.packing_buffer_size is not None or getattr(args, "use_new_dataloader_path", False)
 
 
-def datasets_provider(task_encoder, worker_config=None, *, sequence_length: int | None = None):
+def datasets_provider(task_encoder, worker_config=None):
     """Create multimodal train, validation and test datasets."""
     args = get_args()
 
     if use_new_dataloader_path():
-        train_task_encoder = MultiModalTaskEncoder(sequence_length=sequence_length)
-        val_task_encoder = MultiModalTaskEncoder(is_val=True, sequence_length=sequence_length)
+        train_task_encoder = MultiModalTaskEncoder()
+        val_task_encoder = MultiModalTaskEncoder(is_val=True)
     else:
-        train_task_encoder = TaskEncoder(sequence_length=sequence_length)
-        val_task_encoder = TaskEncoder(sequence_length=sequence_length)
+        train_task_encoder = TaskEncoder()
+        val_task_encoder = TaskEncoder()
 
     dname = args.data_path[0] if type(args.data_path) is list else args.data_path
     train_dataset = get_train_dataset(
@@ -139,9 +139,8 @@ def train_valid_test_dataloaders_provider(
             f"got {dataloader_prefetch_factor}"
         )
 
-    sequence_length = args.dataloader_seq_length
     if task_encoder is None:
-        task_encoder = TaskEncoder(sequence_length=sequence_length)
+        task_encoder = TaskEncoder()
 
     # Dataloader is only on specific ranks.
     if not is_dataloader_rank(
@@ -170,9 +169,7 @@ def train_valid_test_dataloaders_provider(
         global_error_handler=compact_sample_error_handler,
         restore_error_handler=compact_sample_error_handler,
     )
-    train_ds, valid_ds1, test_ds = datasets_provider(
-        task_encoder, worker_config, sequence_length=sequence_length
-    )
+    train_ds, valid_ds1, test_ds = datasets_provider(task_encoder, worker_config)
 
     if use_new_dataloader_path():
         prefetch_kwargs = {}

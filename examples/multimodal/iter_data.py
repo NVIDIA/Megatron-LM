@@ -52,7 +52,7 @@ def main():
     train_dataset = get_train_dataset(
         dname,
         batch_size=1,
-        task_encoder=MultiModalTaskEncoder(sequence_length=args.dataloader_seq_length),
+        task_encoder=MultiModalTaskEncoder(),
         worker_config=worker_config,
         packing_buffer_size=args.packing_buffer_size,
         shuffle_buffer_size=None,

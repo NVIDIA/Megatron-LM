@@ -45,7 +45,6 @@ def test_new_dataloader_prefetch_factor(
 ):
     values = {
         "dataloader_seed": 0,
-        "dataloader_seq_length": 128,
         "encoder_pipeline_model_parallel_size": 0,
         "load": None,
         "num_workers": num_workers,
@@ -66,8 +65,11 @@ def test_new_dataloader_prefetch_factor(
         dataloader_provider.parallel_state, "get_data_parallel_group", lambda: object()
     )
     monkeypatch.setattr(dataloader_provider, "WorkerConfig", lambda **kwargs: kwargs)
-    datasets = Mock(return_value=("train-dataset", None, None))
-    monkeypatch.setattr(dataloader_provider, "datasets_provider", datasets)
+    monkeypatch.setattr(
+        dataloader_provider,
+        "datasets_provider",
+        lambda task_encoder, worker_config: ("train-dataset", None, None),
+    )
     monkeypatch.setattr(dataloader_provider, "use_new_dataloader_path", lambda: True)
     monkeypatch.setattr(dataloader_provider, "FileStoreCachePool", lambda **kwargs: kwargs)
 
@@ -84,7 +86,6 @@ def test_new_dataloader_prefetch_factor(
     )
 
     assert train_loader._dataloader == ["train-dataset"]
-    assert datasets.call_args.kwargs["sequence_length"] == args.dataloader_seq_length
     assert valid_loader is None
     assert test_loader._dataloader is None
     if expected_prefetch_factor is None:
@@ -104,24 +105,6 @@ def test_new_dataloader_rejects_non_positive_prefetch_factor(monkeypatch):
         )
 
 
-@pytest.mark.parametrize("new_path", [False, True])
-def test_dataset_provider_passes_explicit_sequence_length(monkeypatch, new_path):
-    # No dataloader_seq_length in legacy args: the caller owns this data input.
-    args = SimpleNamespace(
-        data_path=["dataset"], micro_batch_size=1, packing_buffer_size=None, eval_iters=1
-    )
-    monkeypatch.setattr(dataloader_provider, "get_args", lambda: args)
-    monkeypatch.setattr(dataloader_provider, "use_new_dataloader_path", lambda: new_path)
-    encoder = Mock()
-    monkeypatch.setattr(dataloader_provider, "MultiModalTaskEncoder", encoder)
-    monkeypatch.setattr(dataloader_provider, "TaskEncoder", encoder)
-    monkeypatch.setattr(dataloader_provider, "get_train_dataset", Mock())
-    monkeypatch.setattr(dataloader_provider, "get_val_datasets", Mock(return_value=[]))
-    dataloader_provider.datasets_provider(None, sequence_length=128)
-    assert encoder.call_count == 2
-    assert all(call.kwargs["sequence_length"] == 128 for call in encoder.call_args_list)
-
-
 @pytest.fixture
 def strict_resume_provider(monkeypatch):
     args = SimpleNamespace(
@@ -130,7 +113,6 @@ def strict_resume_provider(monkeypatch):
         strict_dataloader_state_load=True,
         num_workers=0,
         dataloader_seed=0,
-        dataloader_seq_length=128,
         packing_buffer_size=10000,
     )
     train_state = SimpleNamespace(iteration=100)
@@ -148,9 +130,7 @@ def strict_resume_provider(monkeypatch):
     ):
         monkeypatch.setattr(dataloader_provider.parallel_state, name, Mock(return_value=value))
     monkeypatch.setattr(dataloader_provider, "WorkerConfig", lambda **kw: kw)
-    monkeypatch.setattr(
-        dataloader_provider, "datasets_provider", lambda *a, **kw: (object(), None, None)
-    )
+    monkeypatch.setattr(dataloader_provider, "datasets_provider", lambda *a: (object(), None, None))
     monkeypatch.setattr(dataloader_provider, "use_new_dataloader_path", lambda: True)
     monkeypatch.setattr(dataloader_provider, "FileStoreCachePool", lambda **kw: None)
     monkeypatch.setattr(dataloader_provider, "get_savable_loader", lambda *a, **kw: loader)

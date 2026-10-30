@@ -196,7 +196,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             structured_conversation.append(turn)
         return structured_conversation
 
-    def __init__(self, *, sequence_length: int | None = None):
+    def __init__(self):
         super().__init__()
 
         self.args = get_args()
@@ -218,7 +218,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         if self.args.prompt_path:
             with open(self.args.prompt_path, "r") as f:
                 self.manual_prompts = json.load(f)
-        self.dataloader_seq_length = sequence_length  # Always return samples of this length.
+        self.dataloader_seq_length = self.args.dataloader_seq_length  # Always return samples of this length.
         self.packing_seq_length = (
             self.args.packing_seq_length
         )  # Packing sequence length, if packing is enabled.
