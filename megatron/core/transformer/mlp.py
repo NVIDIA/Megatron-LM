@@ -25,6 +25,7 @@ from megatron.core.fusions.fused_bias_geglu import (
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
+from megatron.core.inference.tp_buffer_order import skip_all_gather_barrier_after_reduce_scatter
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -255,6 +256,14 @@ class MLP(MegatronModule):
             pg_collection=pg_collection,
             name=(name + ".linear_fc2") if name is not None else None,
         )
+
+    def declare_tp_buffer_order(self, preceding_reduce_scatter):
+        """See megatron.core.inference.tp_buffer_order.
+
+        linear_fc1's all-gather of the input comes first; linear_fc2's reduce-scatter comes last.
+        """
+        skip_all_gather_barrier_after_reduce_scatter(preceding_reduce_scatter, self.linear_fc1)
+        return self.linear_fc2
 
     def forward(
         self, hidden_states: torch.Tensor, per_token_scale: torch.Tensor | None = None, **kwargs
