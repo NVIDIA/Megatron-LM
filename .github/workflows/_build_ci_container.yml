@@ -297,6 +297,7 @@ jobs:
               docker/patches/mok.patch
               docker/patches/deepep.patch
               docker/patches/deepep-nvshmem.patch
+              docker/patches/transformer-engine-gtp-wgrad.patch
               megatron/core/__init__.py
               megatron/core/package_info.py
               pyproject.toml
