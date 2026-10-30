@@ -22,7 +22,8 @@ from weakref import WeakKeyDictionary
 import torch
 from torch import nn
 
-from .execution_order import ExecutionOrder
+from .execution_order import ExecutionEvent, ExecutionOrder
+from .phase import Phase
 from .runtime_policy import RuntimePolicy
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
@@ -48,8 +49,7 @@ class FsdpContext:
     unify_communication_stream: bool
     caller_managed_grad_sync: bool
     # Prefetch uses construction order unless execution-order recording is enabled.
-    forward_order: ExecutionOrder[nn.Module]
-    backward_order: ExecutionOrder[nn.Module]
+    execution_order: ExecutionOrder
     # Topology metadata must not keep modules alive after construction.
     _roots: WeakKeyDictionary[nn.Module, None]
     # Names are relative to each FSDP root and absent until finalization.
@@ -78,12 +78,12 @@ class FsdpContext:
                 ranks in each parameter group's 1-D data-parallel mesh and must agree across
                 that mesh. Every TensorAtomic parameter needs an entry; other entries are
                 ignored. Tensors are packed by owner without changing logical parameter order.
-            prefetch_order: ``REGISTRATION`` uses module registration order. ``RECORDED``
-                gathers parameters on demand and records module calls until the first
-                ``post_backward()``. Subsequent passes prefetch using those orders and must
-                repeat them consistently across data-parallel ranks. Recording currently
-                requires the ordinary module hooks; combined 1F1B bypasses them. Discard
-                the context if the recorded pass raises.
+            prefetch_order: ``REGISTRATION`` expects a forward/backward pass matching module
+                registration order. ``RECORDED`` gathers parameters on demand and records
+                module calls until the first ``post_backward()``. Subsequent passes must
+                repeat the complete sequence consistently across data-parallel ranks.
+                Recording currently requires the ordinary module hooks; combined 1F1B
+                bypasses them. Discard the context if the recorded pass raises.
         """
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -96,8 +96,7 @@ class FsdpContext:
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
         self.unify_communication_stream = runtime_policy.unify_communication_stream
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
-        self.forward_order = ExecutionOrder()
-        self.backward_order = ExecutionOrder()
+        self.execution_order = ExecutionOrder()
         self._recording_execution_order = prefetch_order is PrefetchOrder.RECORDED
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
@@ -169,11 +168,11 @@ class FsdpContext:
                     continue
                 self._module_names[module] = name
                 if not self._recording_execution_order:
-                    self.forward_order.append(module)
+                    self.execution_order.append(ExecutionEvent(module, Phase.FORWARD))
 
         if not self._recording_execution_order:
             for root in reversed(list(self._roots)):
-                _collect_backward_order(root, registered_modules, self.backward_order)
+                _collect_backward_order(root, registered_modules, self.execution_order)
 
         self._registered_modules.clear()
         self.parameter_to_owner = None
@@ -272,11 +271,11 @@ def current_fully_shard_context() -> FsdpContext | None:
 
 
 def _collect_backward_order(
-    module: nn.Module, registered_modules: set[nn.Module], order: ExecutionOrder[nn.Module]
+    module: nn.Module, registered_modules: set[nn.Module], order: ExecutionOrder
 ) -> None:
     """Collect one root's static backward prefetch order."""
     if module in registered_modules:
-        order.append(module)
+        order.append(ExecutionEvent(module, Phase.BACKWARD))
 
     for child in reversed(list(module.children())):
         _collect_backward_order(child, registered_modules, order)
