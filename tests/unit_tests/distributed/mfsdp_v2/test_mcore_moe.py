@@ -74,8 +74,6 @@ def test_build_train_step_and_clip(
     """Shard experts over expert-DP and clip their combined gradients."""
     process_group_collection, reference_process_group_collection = process_group_collections
     world_size = distributed_setup.world_size
-    if optimizer_name == "muon":
-        pytest.importorskip("emerging_optimizers")
     # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
     # initialization instead uses the globally configured EP=2 rank in its RNG seed.
     config = TransformerConfig(

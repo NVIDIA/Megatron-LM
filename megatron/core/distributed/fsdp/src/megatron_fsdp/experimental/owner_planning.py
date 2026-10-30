@@ -34,8 +34,13 @@ def assign_owner_work(buffers: Iterable[DBuffer]) -> list[dict[int, int]]:
     holder. Equal-cost tensors follow input buffer order and tensor index; equal-load holders
     follow buffer offset order. Buffers on one mesh must be identical across its ranks.
 
-    Each mesh is planned independently, because a joint plan would depend on buffers a rank
-    cannot see, such as another expert data-parallel group's experts.
+    Each mesh is planned independently. A rank only sees the buffers it holds, and with expert
+    parallelism the experts of other EP ranks are not among them, so a plan across meshes would
+    differ between ranks.
+
+    TODO: Independent planning does not balance load across meshes. Balancing would need every
+    rank to know every parameter, for example by all-gathering the parameter metadata, at the
+    cost of extra communication.
 
     Costs estimate five Newton-Schulz iterations from each tensor's full shape. View the
     tensor as `(rows, cols) = (shape[0], shape[1:].numel())`. After normalization and

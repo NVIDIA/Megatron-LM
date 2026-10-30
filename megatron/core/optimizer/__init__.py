@@ -1090,12 +1090,12 @@ def _get_megatron_fsdp_emerging_optimizer(
                 optimizer, config, None, None, model_chunks=model_chunks
             )
             # WORLD is correct: get_grad_norm divides each gradient by its replication factor.
-            setattr(optimizer, 'grad_stats_parallel_group', torch.distributed.group.WORLD)
+            optimizer.grad_stats_parallel_group = torch.distributed.group.WORLD
             tp_group = pg_collection.tp
-            setattr(optimizer, 'tp_group', tp_group)
-            setattr(optimizer, 'expert_tp_group', getattr(pg_collection, 'expt_tp', tp_group))
-            setattr(optimizer, 'gtp_group', getattr(pg_collection, 'gtp_remat', None))
-            setattr(optimizer, 'expert_gtp_group', getattr(pg_collection, 'expt_gtp_remat', None))
+            optimizer.tp_group = tp_group
+            optimizer.expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
+            optimizer.gtp_group = getattr(pg_collection, 'gtp_remat', None)
+            optimizer.expert_gtp_group = getattr(pg_collection, 'expt_gtp_remat', None)
         else:
             fallback_config = copy.copy(config)
             fallback_config.optimizer = opt_name
