@@ -1987,6 +1987,7 @@ def pretrain(
                 ep_size=cfg_container.rl.rl_inference_expert_model_parallel_size,
                 expt_tp_size=cfg_container.rl.rl_inference_expert_tensor_model_parallel_size,
                 use_tp_pp_dp_mapping=cfg_container.dist.use_tp_pp_dp_mapping,
+                training_pg_collection=pg_collection,
             )
 
             # Build an isolated inference config so training config remains unchanged

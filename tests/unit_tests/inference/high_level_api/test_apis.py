@@ -4,6 +4,7 @@
 
 import asyncio
 import contextlib
+import warnings
 from unittest.mock import MagicMock
 
 import pytest
@@ -11,14 +12,14 @@ import pytest
 import megatron.core.inference.apis._llm_base as base_mod
 import megatron.core.inference.apis.async_llm as async_llm_mod
 import megatron.core.inference.apis.llm as llm_mod
-from megatron.core import parallel_state
+from megatron.core import parallel_state, process_groups_config
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.inference.apis._llm_base import _MegatronLLMBase
 from megatron.core.inference.apis.async_llm import MegatronAsyncLLM
 from megatron.core.inference.apis.llm import MegatronLLM
 from megatron.core.inference.apis.serve_config import ServeConfig
 from megatron.core.inference.config import InferenceConfig
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 
 
 class _StubGroup:
@@ -50,8 +51,8 @@ def mock_pipeline(monkeypatch):
     # None and resolve it in their public modules at call time.
     monkeypatch.setattr(llm_mod, "GPTInferenceWrapper", MagicMock())
     monkeypatch.setattr(async_llm_mod, "GPTInferenceWrapper", MagicMock())
-    # The EP precondition reads the model's process groups, not the global grid. Tests of a
-    # model without a collection override this.
+    # The EP precondition reads the configured or the model's process groups, never the global
+    # EP size directly.
     monkeypatch.setattr(
         parallel_state, "get_expert_model_parallel_world_size", _forbidden_global_read
     )
@@ -150,21 +151,49 @@ class TestConstructorValidation:
             )
 
     @pytest.mark.parametrize("global_ep_size", [1, 4])
-    def test_model_without_collection_uses_global_ep_size(
+    def test_model_without_collection_uses_inference_config_fallback(
         self, mock_pipeline, monkeypatch, global_ep_size
     ):
-        """A model that carries no collection falls back to the global EP size."""
-        monkeypatch.setattr(
-            parallel_state, "get_expert_model_parallel_world_size", lambda: global_ep_size
+        """A model that carries no collection takes the EP group from the inference config's
+        warned fallback to the global groups, which the engine then runs on as well."""
+        global_groups = ProcessGroupCollection(
+            tp=_StubGroup(1),
+            pp=_StubGroup(1),
+            dp=_StubGroup(1),
+            mp=_StubGroup(1),
+            cp=None,
+            expt_tp=None,
+            expt_dp=None,
+            ep=_StubGroup(global_ep_size),
         )
+        monkeypatch.setattr(
+            ProcessGroupCollection,
+            "use_mpu_process_groups",
+            classmethod(lambda cls, required_pgs=None: global_groups),
+        )
+        monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+        inference_config = InferenceConfig()
         model = MagicMock(spec=["config"])
         expectation = (
             pytest.raises(ValueError, match="expert_model_parallel_size > 1")
             if global_ep_size > 1
             else contextlib.nullcontext()
         )
-        with expectation:
-            MegatronLLM(model=model, tokenizer=MagicMock(), use_coordinator=False)
+        with warnings.catch_warnings(record=True) as record, expectation:
+            warnings.simplefilter("always")
+            MegatronLLM(
+                model=model,
+                tokenizer=MagicMock(),
+                inference_config=inference_config,
+                use_coordinator=False,
+            )
+
+        fallbacks = [
+            str(w.message) for w in record if issubclass(w.category, ProcessGroupFallbackWarning)
+        ]
+        assert len(fallbacks) == 1, fallbacks
+        assert "InferenceConfig was called without `pg_collection`" in fallbacks[0]
+        assert inference_config.pg_collection is global_groups
 
 
 class TestLifecycleGuards:
