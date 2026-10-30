@@ -6175,6 +6175,7 @@ def should_disable_forward_pre_hook(args, optimizer):
     # The forward pre-hooks are part of the distributed optimizer's overlapped param-gather;
     # so in order to disable them, we must check that the optimizer actually exists.
     has_optimizer = optimizer is not None
+    cfg = get_run_config()
     return (
         not args.use_megatron_fsdp
         and has_optimizer
