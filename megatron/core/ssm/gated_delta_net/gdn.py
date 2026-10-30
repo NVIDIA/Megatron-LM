@@ -277,9 +277,8 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
-            assert (
-                not self.config.deterministic_mode
-            ), "Packed sequence does not support deterministic mode."
+            # Deterministic mode runs the torch backend (enforced at construction), whose
+            # chunked recurrence and segmented causal conv handle packed documents.
 
             # cu_seqlens *values* only exist on the device, so every check below is a
             # D2H sync. They are skipped while a CUDA graph is being captured; the
@@ -775,7 +774,15 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             if self.conv_bias
             else None
         )
-        if self.config.deterministic_mode:
+        if self.config.deterministic_mode and cu_seqlens_q is not None:
+            # Packed input: a plain conv would mix the tail of one document into the head of
+            # the next. Each tap only reads tokens of the output token's own document.
+            qkv = self.act_fn(
+                segmented_causal_conv1d(
+                    qkv.transpose(1, 2), conv1d_weight, conv1d_bias, cu_seqlens_q
+                )
+            ).transpose(1, 2)
+        elif self.config.deterministic_mode:
             qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
             conv_out = F.conv1d(
                 input=qkv,  # Torch-native only accept [b, d, s] format input
@@ -904,6 +911,31 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 ####################
 # Torch native gated delta rule
 ####################
+def segmented_causal_conv1d(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor], cu_seqlens: torch.Tensor
+) -> torch.Tensor:
+    """Depthwise causal convolution of a packed sequence, one document at a time.
+
+    ``x`` is ``[1, d, s]``, ``weight`` ``[d, 1, w]`` and ``cu_seqlens`` the packed document
+    offsets. Tap ``j`` (lag ``j``) contributes only when token ``t - j`` belongs to the same
+    document as ``t``. Elementwise ops only (static shapes, no atomics in the backward), for
+    deterministic mode.
+    """
+    seq_len = x.shape[-1]
+    width = weight.shape[-1]
+    positions = torch.arange(seq_len, device=x.device)
+    doc = torch.searchsorted(cu_seqlens[1:].to(torch.long), positions, right=True)
+    out = None
+    for lag in range(width):
+        shifted = F.pad(x, (lag, 0))[..., :seq_len]
+        same_doc = F.pad(doc, (lag, 0), value=-1)[:seq_len] == doc
+        term = weight[:, 0, width - 1 - lag].view(1, -1, 1) * shifted * same_doc.to(x.dtype)
+        out = term if out is None else out + term
+    if bias is not None:
+        out = out + bias.view(1, -1, 1)
+    return out
+
+
 def torch_chunk_gated_delta_rule(
     q,
     k,
@@ -928,11 +960,19 @@ def torch_chunk_gated_delta_rule(
     kernel, which takes several options this implementation does not model.
 
     Reference: https://github.com/huggingface/transformers/blob/144c8ce2809a2e21914017652700e1ecb450501e/src/transformers/models/qwen3_next/modeling_qwen3_next.py#L470-L547
-    '''
 
-    assert (
-        cu_seqlens is None
-    ), "cu_seqlens is not supported for torch_chunk_gated_delta_rule for now."
+    Packed (THD) input: with ``cu_seqlens`` (batch 1), every document runs its own recurrence.
+    Document boundaries are handled with device-side masks instead of a per-document loop, so
+    the shapes stay static and the function can be captured in a CUDA graph: interactions inside
+    a chunk are restricted to one document, the incoming chunk state only reaches tokens of the
+    document the chunk starts with, and the outgoing state is built from the chunk's last
+    document alone (reset when a document ends inside or at the end of the chunk).
+    '''
+    if cu_seqlens is not None:
+        assert q.shape[0] == 1, "Packed (cu_seqlens) input expects batch size 1."
+        assert (
+            initial_state is None and not output_final_state
+        ), "Per-document initial / final states are not supported with cu_seqlens."
 
     query, key, value = q, k, v
     initial_dtype = query.dtype
@@ -968,9 +1008,29 @@ def torch_chunk_gated_delta_rule(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0
     )
 
+    num_chunks = total_sequence_length // chunk_size
+    if cu_seqlens is not None:
+        # Document id per (padded) position; the chunk-padding tail is its own document.
+        positions = torch.arange(total_sequence_length, device=query.device)
+        doc = torch.searchsorted(cu_seqlens[1:].to(torch.long), positions, right=True)
+        doc = doc.view(num_chunks, chunk_size)
+        same_doc = (doc.unsqueeze(-1) == doc.unsqueeze(-2)).float()  # [N, C, C]
+        # Tokens in the document the chunk starts with (they see the incoming state) and in
+        # the document the chunk ends with (they build the outgoing state).
+        from_start = (doc == doc[:, :1]).float()  # [N, C]
+        in_last = (doc == doc[:, -1:]).float()  # [N, C]
+        # The incoming state survives into chunk i only if chunk i continues the document
+        # chunk i-1 ended with.
+        keeps_state = torch.ones(num_chunks, device=query.device)
+        keeps_state[1:] = (doc[1:, 0] == doc[:-1, -1]).float()
+
     # chunk decay
     g = g.cumsum(dim=-1)
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+    g_exp = g.exp()
+    if cu_seqlens is not None:
+        decay_mask = decay_mask * same_doc
+        g_exp = g_exp * from_start
     attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
     for i in range(1, chunk_size):
         row = attn[..., i, :i].clone()
@@ -978,7 +1038,7 @@ def torch_chunk_gated_delta_rule(
         attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
     attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
     value = attn @ v_beta
-    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+    k_cumdecay = attn @ (k_beta * g_exp.unsqueeze(-1))
     last_recurrent_state = (
         value.new_zeros((batch_size, num_heads, k_head_dim, v_head_dim))
         if initial_state is None
@@ -990,16 +1050,23 @@ def torch_chunk_gated_delta_rule(
     )
 
     # for each chunk
-    for i in range(0, total_sequence_length // chunk_size):
+    for i in range(0, num_chunks):
+        if cu_seqlens is not None:
+            last_recurrent_state = last_recurrent_state * keeps_state[i]
         q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
         attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
         v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
         v_new = v_i - v_prime
-        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
+        attn_inter = (q_i * g_exp[:, :, i, :, None]) @ last_recurrent_state
         core_attn_out[:, :, i] = attn_inter + attn @ v_new
+        state_decay = g[:, :, i, -1, None, None].exp()
+        write_decay = (g[:, :, i, -1, None] - g[:, :, i]).exp()
+        if cu_seqlens is not None:
+            state_decay = state_decay * from_start[i, -1]
+            write_decay = write_decay * in_last[i]
         last_recurrent_state = (
-            last_recurrent_state * g[:, :, i, -1, None, None].exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+            last_recurrent_state * state_decay
+            + (k_i * write_decay[..., None]).transpose(-1, -2) @ v_new
         )
 
     if not output_final_state:
