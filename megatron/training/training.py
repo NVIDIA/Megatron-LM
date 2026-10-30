@@ -103,6 +103,7 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+from megatron.core.pipeline_parallel.parallel_prewarm import prewarm_pipeline_model_parallel
 from megatron.core.pipeline_parallel.utils import (
     get_pp_last_rank,
     is_pp_first_stage,
@@ -6254,6 +6255,15 @@ def train(
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
+    if config.pipeline_model_parallel_prewarm and (
+        cfg.ddp.use_megatron_fsdp or cfg.dist.use_torch_fsdp2
+    ):
+        raise ValueError(
+            "pipeline_model_parallel_prewarm does not support Megatron-FSDP or Torch-FSDP2 "
+            "because it bypasses the FSDP module hooks. Disable pipeline_model_parallel_prewarm "
+            "when using FSDP."
+        )
+
     timers = get_timers()
     train_state = get_train_state()
 
@@ -6619,6 +6629,16 @@ def train(
             ), "Parameter hashes not matching across DP replicas"
             torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
+
+    if config.pipeline_model_parallel_prewarm:
+        prewarm_pipeline_model_parallel(
+            model=model,
+            config=config,
+            seq_length=args.seq_length,
+            micro_batch_size=cfg.train.micro_batch_size,
+            optimizers=[optimizer],
+            pg_collection=model_pg_collection,
+        )
 
     # Initialize CUDA Graphs helper.
     if args.cuda_graph_impl == "transformer_engine":
