@@ -373,6 +373,7 @@ def test_distributed_optimizer_with_cpu_offload_and_fp32_marked_param():
 
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+    from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.transformer import TransformerConfig
     from tests.unit_tests.test_utilities import Utils
     from tests.unit_tests.test_utils import _init_distributed
@@ -402,7 +403,11 @@ def test_distributed_optimizer_with_cpu_offload_and_fp32_marked_param():
             optimizer_offload_fraction=1.0,
         )
 
-        optimizer = get_megatron_optimizer(optimizer_config, [ddp_model])
+        optimizer = get_megatron_optimizer(
+            optimizer_config,
+            [ddp_model],
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+        )
 
         inputs = torch.ones(2, 4, device="cuda", dtype=torch.bfloat16)
         output = ddp_model(inputs)

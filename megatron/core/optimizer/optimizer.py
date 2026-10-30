@@ -47,7 +47,12 @@ from ..dist_checkpointing.optimizer import (
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..optimizer_param_scheduler import ParamGroupOverride as _ParamGroupOverride
-from ..process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
+from ..process_groups_config import (
+    ProcessGroupCollection,
+    require_process_groups,
+    resolve_gtp_remat_group,
+    resolve_process_groups,
+)
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
@@ -929,7 +934,11 @@ def _strip_module_prefix(name: str) -> str:
 
 
 def _backfill_gtp_sharded_param_map(
-    id_to_sharded_param_map: dict, float16_groups, model_sharded_state_dict=None
+    id_to_sharded_param_map: dict,
+    float16_groups,
+    model_sharded_state_dict=None,
+    *,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> None:
     """Backfill the optimizer id->ShardedTensor map with GTP_remat shards it is missing (in place).
 
@@ -953,6 +962,21 @@ def _backfill_gtp_sharded_param_map(
     and is unaffected.
 
     No-op when GTP is unavailable or when every param already matched.
+
+    Args:
+        id_to_sharded_param_map: Map from optimizer param id to model ShardedTensor, completed
+            in place.
+        float16_groups: The optimizer's float16 param groups, in optimizer-state order.
+        model_sharded_state_dict: The model's sharded state dict, whose entries case 1 reuses.
+        pg_collection: Process groups of the model that owns the params. The rebuild in case 2
+            takes the tensor-parallel group ``tp`` and the data- and context-parallel group
+            (``dp_cp_gtp_remat``, or ``dp_cp`` when that is unset) from it, as the model's own
+            checkpoint entries do. Only a rebuild needs the groups. Omitting it is deprecated:
+            a rebuild then warns and uses the global groups in ``parallel_state``.
+
+    Raises:
+        ValueError: If a rebuild is needed and ``pg_collection`` does not set ``tp``, or has no
+            ``dp_cp_gtp_remat`` group and does not set ``dp_cp`` to a group.
     """
     try:
         from megatron.core.tensor_parallel.gtp_api import (
@@ -987,10 +1011,9 @@ def _backfill_gtp_sharded_param_map(
                 # Grouped-expert entries share one key (offsets differ) -> ambiguous, drop.
                 key_to_entry[key] = None if key in key_to_entry else entry
 
-    # Groups sourced lazily (below) only when a rebuild is needed, so GTP models on
-    # explicit grids (e.g. MiMo) don't require the global MPU groups unless they hit it.
-    tp_group = None
-    dp_cp_gtp_remat_group = None
+    # The groups are resolved only when a rebuild needs them, so a model whose GTP params all
+    # match its own entries needs neither them nor the global grid.
+    rebuild_groups = None
     for param_id, p in unmatched:
         # Case 1: reuse the model's own entry (native-FP8 dequantized copy broke the id match).
         entry = src_id_to_entry.get(id(p))
@@ -1016,12 +1039,31 @@ def _backfill_gtp_sharded_param_map(
                 "has no matching model ShardedTensor; refusing the EP-unaware rebuild (it would "
                 "write duplicate shards across expert-parallel groups)."
             )
-        if tp_group is None:
-            tp_group = parallel_state.get_tensor_model_parallel_group()
-            # Required kwarg, unused for GTP-sharded params (offset/replica from the gtp axis).
-            dp_cp_gtp_remat_group = parallel_state.get_data_parallel_group(
-                with_context_parallel=True
-            )
+        if rebuild_groups is None:
+            owner = "Float16OptimizerWithFloat16Params"
+            if pg_collection is None:
+                pg_collection = resolve_process_groups(
+                    None,
+                    owner=owner,
+                    required=("tp", "dp_cp", "dp_cp_gtp_remat"),
+                    deprecated_in="0.21",
+                    removed_in="0.23",
+                )
+            (tp_group,) = require_process_groups(pg_collection, ("tp",), owner=owner)
+            # The data- and context-parallel group the model's own entries use: the one with
+            # the GTP-remat peers when the collection sets it, otherwise dp_cp. The helper
+            # requires a group, but a GTP shard elects its writer over the group stamped on the
+            # param instead.
+            dp_cp_name = "dp_cp" if pg_collection.dp_cp_gtp_remat is None else "dp_cp_gtp_remat"
+            (dp_cp_group,) = require_process_groups(pg_collection, (dp_cp_name,), owner=owner)
+            if dp_cp_group is None:
+                raise ValueError(
+                    f"{owner}: rebuilding the checkpoint entry of GTP param "
+                    f"'{getattr(p, '_debug_name', '')}' needs a data- and context-parallel "
+                    "group, but pg_collection sets dp_cp to None and has no dp_cp_gtp_remat."
+                )
+            rebuild_groups = (tp_group, dp_cp_group)
+        tp_group, dp_cp_group = rebuild_groups
         # Key by the param's dotted name (set in prod by tag_gtp_params_with_names); the fallback
         # keeps the function usable in tests where the name was not tagged.
         key = p._debug_name or f'_gtp_optim_param_{param_id}'
@@ -1030,7 +1072,7 @@ def _backfill_gtp_sharded_param_map(
             prefix='',
             tensor_parallel_layers_axis_map={key: 0},
             tp_group=tp_group,
-            dp_cp_group=dp_cp_gtp_remat_group,
+            dp_cp_group=dp_cp_group,
         )
         id_to_sharded_param_map[param_id] = rebuilt[key]
 
@@ -1047,6 +1089,11 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             a constant gradient scaler. Also for `bf16 = False`, we
             always require a grad scaler.
         init_state_fn (Callable, optional): function to initialize state in the optimizer.
+        pg_collection (ProcessGroupCollection, optional): process groups of the model whose
+            parameters the optimizer updates. ``sharded_state_dict`` describes a GTP_remat
+            shard without a matching model entry with its tensor- and data-parallel groups.
+            Omitting it is deprecated: such a shard then warns and is described with the global
+            groups in ``parallel_state``.
     """
 
     def __init__(
@@ -1055,9 +1102,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         config: OptimizerConfig,
         grad_scaler: MegatronGradScaler,
         init_state_fn: Callable,
+        *,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
 
         super().__init__(optimizer, config, grad_scaler, init_state_fn)
+        self.pg_collection = pg_collection
 
         # Handle main parameters.
 
@@ -1262,7 +1312,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         )
 
         _backfill_gtp_sharded_param_map(
-            id_to_sharded_param_map, self.float16_groups, model_sharded_state_dict
+            id_to_sharded_param_map,
+            self.float16_groups,
+            model_sharded_state_dict,
+            pg_collection=self.pg_collection,
         )
 
         # Convert fp32_from_fp16_params

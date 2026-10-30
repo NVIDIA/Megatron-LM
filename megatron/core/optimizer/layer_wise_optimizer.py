@@ -696,7 +696,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 ):
                     wrapper = GraphedGradCopyFloat16Optimizer
                 optimizers[i] = wrapper(
-                    opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
+                    opt,
+                    config,
+                    None,
+                    init_state_fn_list[i] if init_state_fn_list else None,
+                    pg_collection=self.pg_collection,
                 )
 
         # The module's own TP and GTP axes: a MIMO module's grid carries these, and MPU has no
