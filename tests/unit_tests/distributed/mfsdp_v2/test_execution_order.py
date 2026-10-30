@@ -1,9 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Coverage for occurrence-based FSDP prefetch and weak module ownership."""
+"""Coverage for ExecutionOrder lookahead, repeated calls, and weak module ownership."""
 
 import gc
-from unittest.mock import Mock
 from weakref import ref
 
 import pytest
@@ -12,37 +11,22 @@ from torch import nn
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
     ExecutionOrder,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
 
-@pytest.mark.parametrize(
-    'budget, expected',
-    [
-        (None, [[1], [0], [0], [2], []]),
-        (0, [[], [], [], [], []]),
-        (2, [[1, 0], [0, 0], [0, 2], [2], []]),
-    ],
-)
-def test_prefetch_replays_occurrences(budget, expected):
-    """Reused modules have occurrence-specific successors under every prefetch budget."""
-    modules = [Mock(spec=FsdpModule, num_parameter_elements=1) for _ in range(3)]
-    prefetched = []
-    for module in modules:
-        # Prefetch passes the successor's compute phase; record only which module it targets.
-        module._unshard_parameter_groups.side_effect = (
-            lambda _phase, target=module: prefetched.append(target)
-        )
-    sequence = [modules[index] for index in (0, 1, 0, 0, 2)]
-    order = ExecutionOrder()
-    for module in sequence:
-        order.append(module)
-    # A second cycle checks cursor reset; each lookahead must leave demand calls intact.
+def test_lookahead_tracks_repeated_module_calls():
+    """Lookahead follows each call's position without consuming later calls."""
+    first, second, third = nn.Module(), nn.Module(), nn.Module()
+    calls = [first, second, first, first, third]
+    order = ExecutionOrder(calls)
+
+    # Run twice to check that finishing the sequence resets the execution cursor.
     for _ in range(2):
-        for module, targets, successor in zip(sequence, expected, sequence[1:] + [None]):
-            prefetched.clear()
-            FsdpModule._prefetch_parameter_groups(module, order, budget)
-            assert prefetched == [modules[index] for index in targets]
-            assert order.next_item() is successor
+        for index, module in enumerate(calls):
+            order.advance(module)
+            successors = calls[index + 1 :]
+            for offset, successor in enumerate(successors, start=1):
+                assert order.next_item(offset) is successor
+            assert order.next_item(len(successors) + 1) is None
 
 
 def test_unique_calls_resynchronize_and_repeated_calls_validate():
