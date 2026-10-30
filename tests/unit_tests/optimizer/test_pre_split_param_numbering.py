@@ -31,8 +31,12 @@ def test_tagged_indices_match_the_numbering_a_pre_split_run_wrote():
     # Model order: the two overrides interleave, and within each the indexer sits between
     # backbone parameters, as it does inside a real attention block.
     spec = [
-        (override_a, False), (override_a, True), (override_b, False),
-        (override_a, False), (override_b, True), (override_b, False),
+        (override_a, False),
+        (override_a, True),
+        (override_b, False),
+        (override_a, False),
+        (override_b, True),
+        (override_b, False),
     ]
     params = [torch.nn.Parameter(torch.zeros(1)) for _ in spec]
     model_order = {id(p): i for i, p in enumerate(params)}

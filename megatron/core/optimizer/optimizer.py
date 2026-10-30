@@ -263,9 +263,7 @@ def find_saved_param_group(identifier: tuple, saved_groups: Dict[tuple, Dict]) -
         return group
     if _is_dsa_indexer_identifier(identifier):
         pre_split = (
-            identifier[:_IS_DSA_INDEXER_INDEX]
-            + (False,)
-            + identifier[_IS_DSA_INDEXER_INDEX + 1 :]
+            identifier[:_IS_DSA_INDEXER_INDEX] + (False,) + identifier[_IS_DSA_INDEXER_INDEX + 1 :]
         )
         return saved_groups.get(pre_split)
     return None
@@ -875,9 +873,7 @@ class MegatronOptimizer(ABC):
             _is_dsa_indexer_identifier(key) and key not in loaded_groups_map
             for key in needed_groups
         ):
-            return _expand_pre_split_param_groups(
-                current_groups, needed_groups, loaded_groups_map
-            )
+            return _expand_pre_split_param_groups(current_groups, needed_groups, loaded_groups_map)
 
         # Every current group has to be in the checkpoint, and that is checked here rather
         # than inside the loop below because the loop zips against the saved groups: a group
