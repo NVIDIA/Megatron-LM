@@ -1026,6 +1026,9 @@ def validate_args(args, defaults={}):
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
 
+    if args.moe_megakernel_backend == "mok" and (args.use_megatron_fsdp or args.use_torch_fsdp2):
+        raise ValueError("MOK has not been validated with Megatron-FSDP or Torch FSDP2")
+
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
@@ -1291,11 +1294,39 @@ def validate_args(args, defaults={}):
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
 
     if args.hybrid_context_parallel:
-        assert not args.pipeline_model_parallel_size > 1, 'Hybrid context parallelism not supported with pipeline parallelism'
-        assert args.cuda_graph_impl == "none", 'Hybrid context parallelism not supported with CUDA Graph'
-        assert not args.use_megatron_fsdp, 'Hybrid context parallelism not supported with Megatron FSDP'
-        assert args.dataloader_type == 'single', 'Hybrid context parallelism only supported with single dataloader type'
-        assert args.calculate_per_token_loss, 'Hybrid context parallelism must be used with --calculate-per-token-loss'
+        warn_rank_0(
+            "--hybrid-context-parallel is deprecated. Use --dynamic-context-parallel instead.",
+            args.rank,
+        )
+        if args.dynamic_context_parallel:
+            raise ValueError(
+                "Cannot set both --hybrid-context-parallel and --dynamic-context-parallel"
+            )
+        args.dynamic_context_parallel = True
+        args.hybrid_context_parallel = False
+
+    if args.dynamic_context_parallel:
+        assert not args.use_megatron_fsdp, 'Dynamic context parallelism not supported with Megatron FSDP'
+        assert args.dataloader_type == 'single', 'Dynamic context parallelism only supported with single dataloader type'
+        if args.sequence_packing_scheduler is None:
+            args.sequence_packing_scheduler = 'default_dynamic_cp'
+        if args.sequence_packing_scheduler != 'default_dynamic_cp':
+            raise ValueError(
+                "Dynamic context parallelism requires "
+                "--sequence-packing-scheduler default_dynamic_cp"
+            )
+        dp_cp_size = args.data_parallel_size * args.context_parallel_size
+        from megatron.core.parallel_state import (
+            get_valid_dynamic_context_parallel_group_sizes,
+        )
+
+        valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(dp_cp_size)
+        if args.min_dynamic_context_parallel_size not in valid_group_sizes:
+            raise ValueError(
+                "--min-dynamic-context-parallel-size="
+                f"{args.min_dynamic_context_parallel_size} is invalid for DPxCP size "
+                f"{dp_cp_size}; expected one of {valid_group_sizes}"
+            )
 
     # Support for variable sequence lengths across batches/microbatches.
     # set it if the dataloader supports generation of variable sequence lengths
@@ -1554,13 +1585,24 @@ def validate_args(args, defaults={}):
             # samples into THD batches. Auto-pick ``dp_balanced`` when the
             # user did not request one explicitly.
             if args.sequence_packing_scheduler is None:
-                args.sequence_packing_scheduler = 'dp_balanced'
+                args.sequence_packing_scheduler = (
+                    'default_dynamic_cp' if args.dynamic_context_parallel else 'dp_balanced'
+                )
 
     # Runs after the varlen auto-select above so it sees the final resolved
     # scheduler. Scheduler-name and max-seqlen validation live in
     # ModelParallelConfig.__post_init__; only the buffer-size check stays here
     # because seq_length is not a core config field. The None case for
     # max_seqlen_per_dp_cp_rank is rejected by the config check.
+    if (
+        args.sequence_packing_scheduler == 'default_dynamic_cp'
+        and not args.dynamic_context_parallel
+    ):
+        raise ValueError(
+            "--sequence-packing-scheduler default_dynamic_cp requires "
+            "--dynamic-context-parallel"
+        )
+
     if args.sequence_packing_scheduler is not None:
         args.variable_seq_lengths = True
         # Packed microbatches carry different numbers of valid tokens, so the
@@ -1572,6 +1614,8 @@ def validate_args(args, defaults={}):
         )
         if args.max_seqlen_per_dp_cp_rank is not None:
             total_cp_ranks = args.context_parallel_size
+            if args.sequence_packing_scheduler == 'default_dynamic_cp':
+                total_cp_ranks *= args.data_parallel_size
             assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
                 f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
                 f'must be >= single sequence max length ({args.seq_length})'
@@ -1829,19 +1873,22 @@ def validate_args(args, defaults={}):
             warn_rank_0('enabling --no-load-rng for upcycling.')
 
     # --skip-train checks.
-    # In RL inference-only mode, --no-load-optim is user-controlled: it determines whether the
-    # optimizer is created (needed for --rl-offload-optimizer-during-inference) or skipped entirely.
-    if args.skip_train and not args.perform_rl_step and not args.no_load_optim:
+    if args.skip_train and not args.no_load_optim:
         args.no_load_optim = True
         warn_rank_0('enabling --no-load-optim when skipping training.')
     rl_cfg.validate_run(
         cuda_graph_impl=args.cuda_graph_impl,
         micro_batch_size=args.micro_batch_size,
         global_batch_size=args.global_batch_size,
+        train_iters=args.train_iters,
+        train_samples=args.train_samples,
         skip_train=args.skip_train,
         load_optim=not args.no_load_optim,
         save_interval=args.save_interval,
         exit_interval=args.exit_interval,
+        separate_inference_model=rl_cfg.uses_separate_inference_model(
+            context_parallel_size=args.context_parallel_size, inference_shards=args.inference_shards
+        ),
     )
 
     # Optimizer CPU offload check
@@ -2290,11 +2337,6 @@ def _add_inference_args(parser):
                        help='Dtype for the Mamba inference SSM states tensor')
     group.add_argument('--inference-use-synchronous-zmq-collectives', action=argparse.BooleanOptionalAction,
                        required=False, default=False, help='Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for MoEs.')
-    group.add_argument('--inference-disable-ep-consensus', action=argparse.BooleanOptionalAction,
-                       required=False, default=False,
-                       help='Skip the EP-group consensus all-reduce in the inference engine control loop and step on local state only. '
-                            'Pause/unpause take effect as soon as the signal is delivered to a rank. '
-                            'Only safe when EP coordination is not required (e.g. ep_world_size == 1).')
     group.add_argument('--inference-shards', type=str, default=None, metavar='SPEC',
                        help='Partition the world into independent inference models, each with '
                             'its own parallelism, e.g. "tp=2,role=prefill+tp=1,dp=2,role=decode". '
@@ -2337,6 +2379,8 @@ def _add_network_size_args(parser):
         "csa_compress_ratios",
         "moe_router_load_balancing_type",
         "moe_aux_loss_coeff",
+        "moe_router_quantile_balancing_estimation_scope",
+        "moe_router_qb_num_bins",
         "cp_comm_type",
         "cuda_graph_modules",
         "cuda_graph_scope",  # deprecated alias; handled manually by --cuda-graph-scope flag
@@ -2390,6 +2434,8 @@ def _add_network_size_args(parser):
         "hash_moe_vocab_size",
         "fp8_param",
         "fp4_param",
+        # filled from the explicit --seq-length argument below
+        "max_seq_length_per_sample",
         # incompatible defaults in dataclass
         "gradient_accumulation_fusion",
         "overlap_p2p_comm",
@@ -2400,7 +2446,10 @@ def _add_network_size_args(parser):
         "apply_rope_fusion",
         "mamba_training_ssm_states_dtype",
         "max_seqlen_per_dp_cp_rank",
+        "pad_packed_seq_alignment",  # integer/max CLI parsing is handled explicitly
         "hybrid_context_parallel",
+        "dynamic_context_parallel",
+        "min_dynamic_context_parallel_size",
         "sequence_packing_scheduler",
         # internal/derived: controlled only via --tensor-parallel-num-weight-shards
         "gtp_weight_remat_size",
@@ -2408,12 +2457,18 @@ def _add_network_size_args(parser):
         "expert_gtp_weight_remat_size",
         # Constructed from the dedicated flat CLI arguments below.
         "wide_residual",
-        "max_seqlen_per_dp_cp_rank",
-        "hybrid_context_parallel",
-        "sequence_packing_scheduler",
+        # Parsed manually as a JSON object below.
+        "moe_megakernel_backend_config",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
+    transformer_group.add_argument(
+        "--moe-megakernel-backend-config",
+        type=json.loads,
+        default=None,
+        metavar="JSON",
+        help="Backend-specific MoE megakernel options as a JSON object.",
+    )
 
     group = parser.add_argument_group(title='network size')
 
@@ -2769,7 +2824,7 @@ def _add_training_args(parser):
         ProfilingConfig, exclude=["use_nsys_profiler", "run_workload_inspector_server"]
     )
     prof_group = prof_factory.build_group(parser, "profiling")
-    prof_group.add_argument('--profile', action='store_true', 
+    prof_group.add_argument('--profile', action='store_true',
                        help='Enable nsys profiling. When using this option, nsys '
                        'options should be specified in commandline.')
 
@@ -3170,10 +3225,16 @@ def _add_distributed_args(parser):
                        help='Maximum sequence length per CP rank. This is used to calculate the '
                        'number of sub-samples assigned to each CP rank when using heterogeneous context parallel.')
     group.add_argument('--hybrid-context-parallel', action='store_true', default=False,
-                       help='Enables hybrid context parallel. This is used to balance the workload '
-                       'of each CP rank when we use packed samples with variable sequence lengths. '
-                       'Requires --max-seqlen-per-dp-cp-rank to be set.')
-    group.add_argument('--sequence-packing-scheduler', type=str, default=None, choices=['dp_balanced'])
+                       help='Deprecated alias for --dynamic-context-parallel.')
+    group.add_argument('--dynamic-context-parallel', action='store_true', default=False,
+                       help='Enable variable-sized CP groups selected per packed microbatch.')
+    group.add_argument('--min-dynamic-context-parallel-size', type=int, default=1,
+                       help='Minimum runtime CP group size used by dynamic CP.')
+    group.add_argument('--sequence-packing-scheduler', type=str, default=None,
+                       choices=['dp_balanced', 'default_dynamic_cp'])
+    group.add_argument('--pad-packed-seq-alignment', default=None,
+                       help="Pad packed THD inputs to a CP-local multiple or 'max'. "
+                       "MXFP8 additionally aligns to 32 tokens after SP sharding.")
     return parser
 
 
@@ -3421,9 +3482,14 @@ def _add_moe_args(parser):
     group.add_argument('--moe-router-load-balancing-type', nargs='+', type=str,
                        choices=['aux_loss', 'seq_aux_loss', 'global_aux_loss', 'sinkhorn', 'quantile_balancing', 'none'],
                        default='aux_loss',
-                       help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE; "quantile_balancing" (QB) uses dual coordinate descent on a per-expert bias to handle load balance internally; "none" implies no load balancing. The default is "aux_loss".')
+                       help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE; "quantile_balancing" selects either the exact micro-batch estimator or Kimi K3 global-batch histogram estimator via --moe-router-quantile-balancing-estimation-scope; "none" implies no load balancing. The default is "aux_loss".')
     group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
+    group.add_argument('--moe-router-quantile-balancing-estimation-scope', type=str,
+                       choices=['micro_batch', 'global_batch'], default='micro_batch',
+                       help='Population used to estimate quantile-balancing biases. "micro_batch" preserves the existing exact estimator; "global_batch" uses Kimi K3 histogram accumulation.')
+    group.add_argument('--moe-router-qb-num-bins', type=int, default=1000,
+                       help='Number of uniform histogram bins per expert for global-batch quantile balancing.')
     # Token dispatcher arguments
     # MoE communication overlap arguments
 
@@ -3610,6 +3676,12 @@ def _add_experimental_args(parser):
                              "model gradients during FSDP. If 'auto', then the main gradient data-type will "
                              "be used for the gradient communication / reduction data-type. When using NCCL "
                              "v2.27+, reduction is always computed in FP32 if using NCCL Symmetric kernels.")
+    group.add_argument("--no-megatron-fsdp-padded-shards", action="store_false",
+                       dest="megatron_fsdp_padded_shards",
+                       help="Megatron-FSDP v2 only. If not set, pad every parameter group so each "
+                       "rank gets an equal shard. If set, pack each group without padding and split "
+                       "it into generally unequal per-rank shards at row boundaries (32-row block "
+                       "boundaries for MXFP8).")
     group.add_argument(
             '--megatron-fsdp-enable-fine-grained-param-gather',
             action='store_true',
@@ -3684,8 +3756,6 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
 def _add_sft_args(parser):
     group = parser.add_argument_group(title='sft')
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
-    group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
-                       help='SFT prompt format.')
     group.add_argument(
         '--sft-loss-log-mode',
         type=str,

@@ -13,6 +13,7 @@ from megatron.core.fp8_utils import get_fp8_recipe_for_a2a
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.jit import jit_fuser
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel import (
     all_to_all,
     gather_from_sequence_parallel_region,
@@ -892,7 +893,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         This method un-permutes the tokens back to their original order,
         reshapes the tensor to its original shape, and adds the shared
-        expert output if enabled.
+        expert output if enabled. It then releases the router probabilities
+        stored by `dispatch_preprocess`, which this forward no longer needs.
 
         Args:
             permutated_local_input_tokens (torch.Tensor): Permuted hidden states from token combine.
@@ -919,6 +921,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         if self.shared_experts is not None:
             shared_expert_output = self.shared_experts.get_output()
             output += shared_expert_output
+        # combine_preprocess is the last consumer of router probs. Retaining them
+        # here pins the recomputed MoE forward graph until the next iteration.
+        self.probs = None
         return output
 
     def _maybe_update_cuda_sync_point(self, point: str):
@@ -986,8 +991,18 @@ class _DispatchManager(ABC):
     """
 
     @abstractmethod
-    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
-        """Set up metadata of routing_map and probs."""
+    def setup_metadata(
+        self,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
+        """Set up metadata of routing_map and probs.
+
+        padding_mask is the batch-first [b, s] mask of padding tokens and packed_seq_params the
+        packed-sequence metadata of the microbatch; backends that do not need them ignore them.
+        """
         pass
 
     @abstractmethod
@@ -1106,6 +1121,7 @@ class _HybridEPManager(_DispatchManager):
         routing_map: torch.Tensor,
         probs: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         num_tokens = routing_map.shape[0]
         self._original_num_tokens = num_tokens
@@ -1351,7 +1367,13 @@ class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager)
             self.dense_routing_supported
         ), "Virtual experts require HybridEP's dense top-k routing API for runtime experts."
 
-    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor, padding_mask=None):
+    def setup_metadata(
+        self,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
         """Consume compact router metadata and start the planner and weight push."""
         if (
             routing_map.dtype not in (torch.int16, torch.int32, torch.int64)
@@ -1476,7 +1498,13 @@ class _DeepepManager(_DispatchManager):
             else 20
         )
 
-    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
+    def setup_metadata(
+        self,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
         num_tokens = routing_map.shape[0]
 
         probs = probs.reshape(num_tokens, -1)
@@ -1905,24 +1933,91 @@ class _NCCLEPManager(_DispatchManager):
         self.dispatched_probs: Optional[torch.Tensor] = None
         self.tokens_per_expert: Optional[torch.Tensor] = None
         self.num_local_tokens: Optional[int] = None
+        self._is_thd: bool = False
 
-    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
+    def setup_metadata(
+        self,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
         num_tokens = routing_map.shape[0]
         probs = probs.reshape(num_tokens, -1)
+        padding_rows = None
+        if padding_mask is not None:
+            # The mask is batch-first [b, s] while tokens are flattened from sequence-first
+            # [s, b, h] hidden states, so transpose before flattening to line up token rows.
+            padding_rows = padding_mask.transpose(0, 1).reshape(-1, 1)
+            assert (
+                padding_rows.shape[0] == num_tokens
+            ), f"padding_mask has {padding_rows.shape[0]} tokens, routing_map has {num_tokens}"
         if routing_map.dtype == torch.bool:
             # Convert the multihot routing map to (topk weights, topk indices).
             self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
+            if padding_rows is not None:
+                # topk still returns valid ids for a padded row; -1 makes NCCL EP skip the route
+                # and combine writes zeros back for the row.
+                self.token_indices = self.token_indices.masked_fill(padding_rows, -1)
+                self.token_probs = self.token_probs.masked_fill(padding_rows, 0)
         else:
             # Dense top-k indices (TE's fused router output) paired with the full-width
             # [num_tokens, num_experts] probs; select the weights at those indices here.
             self.token_indices = routing_map.reshape(num_tokens, -1).contiguous()
             if self.token_indices.dtype != torch.int64:
                 self.token_indices = self.token_indices.to(torch.int64)
+            if padding_rows is not None:
+                self.token_indices = self.token_indices.masked_fill(padding_rows, -1)
             # -1 marks an invalid route (padding rows, dropped tokens); give it zero weight.
             invalid_routes = self.token_indices < 0
             self.token_probs = probs.gather(1, self.token_indices.masked_fill(invalid_routes, 0))
             self.token_probs = self.token_probs.masked_fill(invalid_routes, 0)
         self.num_local_tokens = num_tokens
+        # tokens_per_sample marks fixed-length samples (inter-document masking), whose per-rank
+        # count is fixed like BSHD; only variable-length packing needs the config bound.
+        self._is_thd = (
+            packed_seq_params is not None
+            and packed_seq_params.qkv_format == "thd"
+            and packed_seq_params.tokens_per_sample is None
+        )
+
+    def _dispatch_token_bound(self) -> int:
+        """Upper bound on the tokens one rank feeds into a dispatch, fixed at bootstrap.
+
+        BSHD microbatches all have the first microbatch's shape. Packed (THD) microbatches vary
+        per rank and per step, so the bound comes from the config: max_seqlen_per_dp_cp_rank is
+        the per-CP-rank ceiling the mcore packing schedulers enforce, otherwise seq_length is the
+        packed length, split over CP. Both are sequence-parallel slices under TP. The bound is
+        identical on every rank, as NCCL EP bootstrap requires, so a rank whose input exceeds it
+        is a configuration error.
+        """
+        if not self._is_thd:
+            return self.num_local_tokens
+        config = self.config
+        tp_size = config.tensor_model_parallel_size if config.sequence_parallel else 1
+        if config.max_seqlen_per_dp_cp_rank is not None:
+            bound = -(-config.max_seqlen_per_dp_cp_rank // tp_size)
+            source = "max_seqlen_per_dp_cp_rank"
+        elif config.max_seq_length_per_sample is not None:
+            bound = -(-config.max_seq_length_per_sample // (config.context_parallel_size * tp_size))
+            source = "max_seq_length_per_sample"
+        else:
+            raise ValueError(
+                "The 'ncclep' backend sizes its buffers once from an upper bound on the tokens "
+                "per rank, and packed (THD) inputs vary per rank: set "
+                "TransformerConfig.max_seq_length_per_sample (the packed sequence length) or "
+                "max_seqlen_per_dp_cp_rank."
+            )
+        if self.num_local_tokens > bound:
+            raise RuntimeError(
+                f"'ncclep' got {self.num_local_tokens} packed tokens on this rank, above the "
+                f"{bound} per-rank bound from {source}; raise max_seqlen_per_dp_cp_rank or "
+                "max_seq_length_per_sample to the real per-rank maximum."
+            )
+        utils.log_single_rank(
+            logger, logging.INFO, f"ncclep: max dispatch tokens per rank {bound} from {source}"
+        )
+        return bound
 
     def _ensure_bootstrap(self):
         """
@@ -1940,12 +2035,8 @@ class _NCCLEPManager(_DispatchManager):
         # chunk size (64); ncclEpCreateGroup otherwise fails with "invalid usage".
         # (nccl_ep device/hybridep_adapter.cu).
         _HT_TOKENS_PER_CHUNK = 64
-        # TODO: support THD/Dynamic CP when different ranks might have different number of tokens
-        self._max_tokens_per_rank = (
-            (self.num_local_tokens + _HT_TOKENS_PER_CHUNK - 1)
-            // _HT_TOKENS_PER_CHUNK
-            * _HT_TOKENS_PER_CHUNK
-        )
+        bound = self._dispatch_token_bound()
+        self._max_tokens_per_rank = bound + -bound % _HT_TOKENS_PER_CHUNK
         if self.eager:
             self._recv_capacity = None
         else:
@@ -2011,6 +2102,19 @@ class _NCCLEPManager(_DispatchManager):
         # Note: this needs to stay out of the torch.compile region because TE's ep_bootstrap does
         # opaque ProcessGroup._get_backend()._comm_ptr() access that dynamo cannot trace.
         self._ensure_bootstrap()
+        if hidden_states.shape[0] > self._max_tokens_per_rank:
+            remedy = (
+                "raise max_seqlen_per_dp_cp_rank or max_seq_length_per_sample to the real "
+                "per-rank maximum"
+                if self._is_thd
+                else "non-packed (BSHD) inputs are sized from the first microbatch, so later "
+                "microbatches must not carry more tokens per rank"
+            )
+            raise RuntimeError(
+                f"'ncclep' dispatch got {hidden_states.shape[0]} tokens on this rank, above the "
+                f"{self._max_tokens_per_rank} its NCCL EP buffers were sized for at bootstrap; "
+                f"{remedy}."
+            )
         # Fresh buffer per dispatch; held until the matching combine consumes it.
         self._buffer = new_nccl_ep_buffer(
             top_k=self.router_topk,
@@ -2037,7 +2141,9 @@ class _NCCLEPManager(_DispatchManager):
             topk_idx,
             topk_weights,
             recv_tokens=_NCCLEPManager._zc_fwd_token_buf if self._zc_quant else None,
-            recv_topk_weights=_NCCLEPManager._zc_recv_topk_weights_buf,
+            recv_topk_weights=(
+                _NCCLEPManager._zc_recv_topk_weights_buf if self._zc_quant else None
+            ),
         )
         self.tokens_per_expert = tokens_per_expert.to(torch.int64)
         if not self.eager:
@@ -2278,6 +2384,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         routing_map: torch.Tensor,
         probs: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """Initializes routing metadata and prepares tensors for fused dispatch.
 
@@ -2291,8 +2398,11 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             probs (torch.Tensor): Routing probabilities for each token-expert pair
             padding_mask (torch.Tensor, optional): Batch-first [b, s] bool mask of padding
                 tokens, as given to the router. Backends that consume routing metadata directly
-                (dropless HybridEP) drop those rows before dispatch; the other backends keep
-                their fixed-route layout.
+                (dropless HybridEP, NCCL EP) drop those rows before dispatch; the other backends
+                keep their fixed-route layout.
+            packed_seq_params (PackedSeqParams, optional): Packed-sequence metadata of the
+                microbatch. NCCL EP sizes its per-rank buffers from the config for THD inputs,
+                whose token counts vary per rank.
 
         Returns:
             A tuple of reshaped hidden states and token probabilities.
@@ -2304,10 +2414,9 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         if not self.config.moe_virtual_expert_load_balance:
             routing_map, probs = self._initialize_metadata(routing_map, probs)
 
-        if isinstance(self._comm_manager, _HybridEPManager):
-            self._comm_manager.setup_metadata(routing_map, probs, padding_mask=padding_mask)
-        else:
-            self._comm_manager.setup_metadata(routing_map, probs)
+        self._comm_manager.setup_metadata(
+            routing_map, probs, padding_mask=padding_mask, packed_seq_params=packed_seq_params
+        )
         return hidden_states, self._comm_manager.token_probs
 
     def token_dispatch(

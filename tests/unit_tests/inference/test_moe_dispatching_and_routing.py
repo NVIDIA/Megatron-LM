@@ -34,6 +34,22 @@ requires_torch_grouped_mm = pytest.mark.skipif(
     reason="Requires PyTorch >= 2.10 with torch._grouped_mm",
 )
 
+
+_NVFP4_ACTIVATIONS = {
+    "squared_relu": dict(activation_func=squared_relu, gated_linear_unit=False),
+    "swiglu": dict(activation_func=torch.nn.functional.silu, gated_linear_unit=True),
+}
+
+
+def _skip_unless_flashinfer_nvfp4():
+    from megatron.core.inference.moe.flashinfer_nvfp4 import HAVE_FLASHINFER_ROUTED_NVFP4
+
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("per-token NVFP4 MoE requires Blackwell")
+    if not HAVE_FLASHINFER_ROUTED_NVFP4:
+        pytest.skip("FlashInfer >= 0.7.0 per-token NVFP4 MoE is unavailable")
+
+
 # ──────────────────────────────────────────────────────────────────────
 # NanoV3-like config (scaled down from 2688→128 hidden, 128→8 experts)
 # ──────────────────────────────────────────────────────────────────────
@@ -389,6 +405,13 @@ class TestNVLSAllGatherVDispatcher:
 
     @classmethod
     def setup_class(cls):
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        # Contexts built by earlier tests leave class-level dispatcher state, such as the
+        # real-token count that masks padded routing rows; start from a clean dispatcher.
+        NVLSAllGatherVDispatcher._delete_buffers()
         Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=Utils.world_size)
         _set_random_seed(seed_=123, data_parallel_random_init=False)
 
@@ -423,7 +446,7 @@ class TestNVLSAllGatherVDispatcher:
             per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
             topk=NANOV3_BASE["moe_router_topk"],
             hidden_size=NANOV3_BASE["hidden_size"],
-            ep_group=ep_group,
+            tp_ep_group=ep_group,
         )
 
         return NVLSAllGatherVDispatcher(
@@ -651,7 +674,7 @@ class TestNVLSAllGatherVDispatcher:
             per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
             topk=config.moe_router_topk,
             hidden_size=config.hidden_size,
-            ep_group=ep_group,
+            tp_ep_group=ep_group,
         )
 
         layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
@@ -845,7 +868,7 @@ class TestNVLSAllGatherVDispatcher:
             per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
             topk=config.moe_router_topk,
             hidden_size=config.hidden_size,
-            ep_group=get_expert_model_parallel_group(),
+            tp_ep_group=get_expert_model_parallel_group(),
         )
 
         if mxfp8_swiglu:
@@ -920,6 +943,205 @@ class TestNVLSAllGatherVDispatcher:
                     inference_output, _ = layer(hidden_states.clone())
 
         torch.testing.assert_close(inference_output, training_output, atol=0, rtol=0)
+
+    @staticmethod
+    def _make_nvfp4_inference_layer(**overrides):
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        _skip_unless_flashinfer_nvfp4()
+        if Utils.world_size < 2:
+            pytest.skip("NVLS batch-invariant MoE requires expert parallelism.")
+        if Utils.world_size & (Utils.world_size - 1):
+            pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
+        config = _make_base_config(
+            expert_model_parallel_size=Utils.world_size,
+            inference_grouped_gemm_backend="flashinfer",
+            inference_moe_nvfp4_recipe="per_token",
+            inference_moe_token_dispatcher_type="nvls",
+            batch_invariant_mode=True,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+            moe_shared_expert_intermediate_size=None,
+            **overrides,
+        )
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+            topk=config.moe_router_topk,
+            hidden_size=config.hidden_size,
+            tp_ep_group=get_expert_model_parallel_group(),
+        )
+        return get_inference_optimized_moe_spec()(config=config).cuda().eval()
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize("activation", _NVFP4_ACTIVATIONS)
+    def test_cuda_graph_batch_invariant_nvfp4_moe_layer_uses_ordered_rsv(
+        self, monkeypatch, activation
+    ):
+        """A captured per-token NVFP4 MoE layer replays like eager in batch-invariant mode.
+
+        The FlashInfer kernel writes local partials into the symmetric RSV buffer and the
+        combine reduces them in rank order, as for the torch MXFP8 path.
+        """
+        from megatron.core.inference.moe import batch_invariant
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        torch.manual_seed(2027)
+        torch.cuda.manual_seed(2027)
+        layer = self._make_nvfp4_inference_layer(**_NVFP4_ACTIVATIONS[activation])
+        assert isinstance(layer._inference_token_dispatcher, NVLSAllGatherVDispatcher)
+
+        used_rsv = {"value": False}
+        orig_get_rsv_tensor = NVLSAllGatherVDispatcher._get_rsv_tensor.__func__
+
+        def _tracked_get_rsv_tensor(cls):
+            tensor = orig_get_rsv_tensor(cls)
+            used_rsv["value"] = used_rsv["value"] or tensor is not None
+            return tensor
+
+        monkeypatch.setattr(
+            NVLSAllGatherVDispatcher, "_get_rsv_tensor", classmethod(_tracked_get_rsv_tensor)
+        )
+        ordered_calls = {"value": 0}
+        orig_ordered_reduce_scatter_v = batch_invariant.ordered_reduce_scatter_v
+
+        def _tracked_ordered_reduce_scatter_v(*args, **kwargs):
+            ordered_calls["value"] += 1
+            return orig_ordered_reduce_scatter_v(*args, **kwargs)
+
+        monkeypatch.setattr(
+            batch_invariant, "ordered_reduce_scatter_v", _tracked_ordered_reduce_scatter_v
+        )
+
+        local_tokens = 16 + torch.distributed.get_rank()
+        static_hidden = torch.randn(
+            local_tokens, 1, layer.config.hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+
+        def _eager(hidden):
+            output, _ = layer(hidden.clone())
+            return output
+
+        with torch.no_grad(), InferenceMode.active(), set_batch_invariant_mode(True):
+            # The first forward builds the NVFP4 weights and kernel wrappers eagerly.
+            _eager(static_hidden)
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    layer(static_hidden)
+            torch.cuda.current_stream().wait_stream(s)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_output, _ = layer(static_hidden)
+
+            static_hidden.copy_(torch.randn_like(static_hidden))
+            graph.replay()
+            eager_output = _eager(static_hidden)
+
+        assert used_rsv["value"]
+        assert ordered_calls["value"] > 0
+        torch.testing.assert_close(graph_output, eager_output, atol=0, rtol=0)
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize("activation", _NVFP4_ACTIVATIONS)
+    def test_batch_invariant_nvfp4_moe_matches_training(self, monkeypatch, activation):
+        """Per-token NVFP4 generation against TE row-scaled NVFP4 training.
+
+        TE's NVFP4 recipe with row-scaled activations, 1D weight blocks and no random
+        Hadamard transform or stochastic rounding is the training-side form of this recipe,
+        as TE MXFP8 is for the MXFP8 inference path. Generation must be much closer to it
+        than to BF16 training. Bitwise parity is not reached yet: training applies routing
+        probabilities before the FC2-input quantization (generation applies them in the
+        finalize), the fused FC2-input quantization uses approximate reciprocals regardless
+        of FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH, and the GEMMs differ in rounding of the
+        FC1 output and accumulation order.
+        Until those are aligned the exact comparison is an expected failure.
+        """
+        from megatron.core import fp4_utils
+        from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+
+        recipe_module = pytest.importorskip("transformer_engine.common.recipe")
+        if "row_scaled_activation" not in getattr(
+            recipe_module.NVFP4BlockScaling, "__dataclass_fields__", {}
+        ):
+            pytest.skip("Requires Transformer Engine with row-scaled NVFP4 activations.")
+        # IEEE scale rounding, which the TE quantizer uses; fast math is approximate.
+        monkeypatch.setenv("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", "1")
+        recipe = recipe_module.NVFP4BlockScaling(
+            disable_rht=True,
+            disable_stochastic_rounding=True,
+            disable_2d_quantization=True,
+            row_scaled_activation=True,
+        )
+        monkeypatch.setattr(fp4_utils, "get_fp4_recipe", lambda config: recipe)
+
+        torch.manual_seed(2028)
+        torch.cuda.manual_seed(2028)
+        activation_overrides = dict(_NVFP4_ACTIVATIONS[activation])
+        if activation == "squared_relu":
+            activation_overrides["use_fused_weighted_squared_relu"] = True
+        layer = self._make_nvfp4_inference_layer(**activation_overrides)
+        # Batch-invariant MoE configs reject fp4, so training gets its own config.
+        training_config = _make_base_config(
+            expert_model_parallel_size=Utils.world_size,
+            transformer_impl="transformer_engine",
+            moe_token_dispatcher_type="alltoall",
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+            moe_shared_expert_intermediate_size=None,
+            fp4="e2m1",
+            fp4_recipe="nvfp4",
+            **activation_overrides,
+        )
+        training_layer = (
+            get_moe_module_spec(
+                use_te=True, num_experts=training_config.num_moe_experts, moe_grouped_gemm=True
+            )(config=training_config)
+            .cuda()
+            .eval()
+        )
+        layer.load_state_dict(training_layer.state_dict())
+
+        local_tokens = 17 + torch.distributed.get_rank()
+        hidden_states = torch.randn(
+            local_tokens, 1, training_config.hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        with torch.no_grad():
+            bf16_output, _ = training_layer(hidden_states.clone())
+            with fp4_utils.get_fp4_context(training_config, 0):
+                training_output, _ = training_layer(hidden_states.clone())
+            with set_batch_invariant_mode(True), InferenceMode.active():
+                inference_output, _ = layer(hidden_states.clone())
+
+        def _relative_error(output, reference):
+            diff = (output.float() - reference.float()).norm()
+            return (diff / reference.float().norm()).item()
+
+        train_gen_error = _relative_error(inference_output, training_output)
+        recipe_error = _relative_error(inference_output, bf16_output)
+        assert not torch.equal(training_output, bf16_output), "TE NVFP4 training did not run"
+        assert train_gen_error < 0.5 * recipe_error, (train_gen_error, recipe_error)
+        if not torch.equal(inference_output, training_output):
+            pytest.xfail(
+                "per-token NVFP4 generation is not bitwise equal to TE row-scaled NVFP4 "
+                f"training: relative error {train_gen_error:.3g} (vs BF16: {recipe_error:.3g}), "
+                f"max abs diff {(inference_output - training_output).abs().max().item():.3g}"
+            )
 
     def test_batch_invariant_mxfp8_moe_matches_training_with_outlier_tokens(self):
         """Qwen3-30B-A3B experts and router, fed tokens with outlier scales.
