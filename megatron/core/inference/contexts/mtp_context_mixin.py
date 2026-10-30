@@ -50,6 +50,11 @@ class MTPContextMixin:
         ):
             return False
 
+        # The draft plane assumes keys without RoPE, and MLA always applies its own RoPE to the
+        # keys' positional part. An MLA head drafts without the plane, as a per-depth head does.
+        if getattr(model_config, "multi_latent_attention", False):
+            return False
+
         if mtp_layer_type_list is None:
             # Non-hybrid model -- `HybridModel` builds a head only when the pattern has an MTP
             # section, so a hybrid head always exposes one. That layer is cloned from the last

@@ -619,7 +619,11 @@ class MultiLatentAttention(Attention):
             )
 
         # We are doing absorption with cache mla latents and decode mode.
-        if self.cache_mla_latents and inference_context.is_decode_only():
+        if (
+            self.cache_mla_latents
+            and inference_context is not None
+            and inference_context.is_decode_only()
+        ):
             # core_attn_out = self.self.up_v_layer(core_attn_out)
             core_attn_out = torch.einsum("sbhc,hdc->sbhd", core_attn_out, self.up_v_weight)
             core_attn_out = core_attn_out.contiguous()
@@ -932,22 +936,33 @@ class MLASelfAttention(MultiLatentAttention):
         # QKV down projection and layernorm
         # =========================================
         q_compressed, kv_combined = self._qkv_down_projection(hidden_states)
+        # With sequence parallelism, kv_compressed can stay split along the sequence, since the
+        # column-parallel linear_kv_up_proj gathers it. The latent KV cache instead stores every
+        # token's latent on each TP rank (latents are shared by all heads), so when caching
+        # latents, kv_compressed keeps the full sequence, as k_pos_emb does.
         if kv_combined.size(-1) != self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim:
             # kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim)]
-            kv_combined = gather_from_tensor_model_parallel_region(kv_combined)
+            kv_combined = gather_from_tensor_model_parallel_region(kv_combined, group=self.tp_group)
             # kv_compressed:[s, b, kv_lora_rank], k_pos_emb: [s, b, qk_pos_emb_head_dim]
             kv_compressed, k_pos_emb = torch.split(
                 kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
             )
-            if self.config.sequence_parallel:
+            if self.config.sequence_parallel and not self.cache_mla_latents:
                 # kv_compressed:[s / TP, b, kv_lora_rank]
-                kv_compressed = scatter_to_sequence_parallel_region(kv_compressed)
+                kv_compressed = scatter_to_sequence_parallel_region(
+                    kv_compressed, group=self.tp_group
+                )
         else:
+            sequence_parallel = get_pg_size(self.tp_group) > 1 and self.config.sequence_parallel
+            if sequence_parallel and self.cache_mla_latents:
+                # kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim)]
+                kv_combined = gather_from_sequence_parallel_region(kv_combined, group=self.tp_group)
             # kv_compressed:[s / TP, b, kv_lora_rank], k_pos_emb: [s / TP, b, qk_pos_emb_head_dim]
+            # (both [s, ...] if gathered above)
             kv_compressed, k_pos_emb = torch.split(
                 kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
             )
-            if get_pg_size(self.tp_group) > 1 and self.config.sequence_parallel:
+            if sequence_parallel and not self.cache_mla_latents:
                 # k_pos_emb: [s, b, qk_pos_emb_head_dim]
                 k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=self.tp_group)
 
@@ -1102,8 +1117,17 @@ class MLASelfAttention(MultiLatentAttention):
                 # q: [num_tokens, n, q_head_dim]
                 q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
 
-            # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
-            kv, _ = self.linear_kv_up_proj(_up_proj_input(self.linear_kv_up_proj, kv_compressed))
+            if self.cache_mla_latents:
+                # Cached-latent mode keeps kv_compressed whole on every TP rank, and
+                # prepare_for_absorption has replaced linear_kv_up_proj (a fused KV norm is now
+                # kv_layernorm above).
+                # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
+                kv = self.up_project_whole_latents(kv_compressed)
+            else:
+                # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
+                kv, _ = self.linear_kv_up_proj(
+                    _up_proj_input(self.linear_kv_up_proj, kv_compressed)
+                )
 
             # kv: [num_tokens, n, (qk_head_dim + v_head_dim)]
             kv = kv.view(
@@ -1265,19 +1289,47 @@ class MLASelfAttention(MultiLatentAttention):
                 qkv_up_proj_and_rope_apply, q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
             )
         else:
-            if self.cache_mla_latents:
+            if self.cache_mla_latents and inference_context is not None:
                 assert (
-                    inference_context and not inference_context.is_static_batching()
+                    not inference_context.is_static_batching()
                 ), "Caching MLA latents only works with dynamic backend inference"
                 query, key, value = qkv_up_proj_and_rope_apply_for_cached_latent_kv(
                     q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
                 )
             else:
+                # A forward without an inference context, such as an MTP draft step, has no
+                # latent cache to attend over: it runs the unabsorbed attention training uses.
                 query, key, value = qkv_up_proj_and_rope_apply(
                     q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
                 )
 
         return query, key, value, q_compressed, kv_compressed
+
+    def up_project_whole_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        """Up-project KV latents that every TP rank holds in full to this rank's heads.
+
+        With cached latents, each TP rank holds the normalized latent of every token: the latent
+        KV cache stores them so, and get_query_key_value_tensors gathers them along the sequence
+        under sequence parallelism. Their up-projection is a local GEMM on this rank's column
+        shard of the KV up-projection weight, whatever module linear_kv_up_proj_linear is; running
+        that module could all-gather its input along the sequence first. As in the absorbed decode
+        path (up_k_weight, up_v_weight), the GEMM runs in high precision: quantized (FP8 or MXFP8)
+        weight storage is dequantized, and the latents are not quantized.
+
+        Use it wherever such latents are up-projected without absorption, such as the latent
+        cache in prefill and mixed steps.
+
+        Args:
+            latents: [..., kv_lora_rank] normalized KV latents, the same on every TP rank.
+
+        Returns:
+            [..., num_attention_heads_per_partition * (qk_head_dim + v_head_dim)]: for each head
+            of this rank, the key without its RoPE part followed by the value.
+        """
+        weight = self.linear_kv_up_proj_linear.weight
+        if HAVE_TE and isinstance(weight, QuantizedTensor):
+            weight = weight.dequantize()
+        return F.linear(latents, weight)
 
     def uncompress_kv_from_cache(self, kv_cached):
         """
@@ -1287,8 +1339,8 @@ class MLASelfAttention(MultiLatentAttention):
             kv_cached, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
         )
 
-        # Seperated out the norm and linear
-        kv, _ = self.linear_kv_up_proj_linear(kv_compressed)
+        # The cache holds every token's latent on each TP rank.
+        kv = self.up_project_whole_latents(kv_compressed)
 
         kv = kv.view(
             *kv.size()[:-1],
