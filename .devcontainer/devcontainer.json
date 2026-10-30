@@ -1,0 +1,44 @@
+{
+	"name": "Megatron Development Container",
+	"image": "nvcr.io/nvidia/pytorch:25.02-py3",
+	"runArgs": [
+		"--gpus=all",
+		"--shm-size=4g"
+	],
+
+	"mounts": [
+		"source=${localEnv:HOME}/.ngc,target=/home/ubuntu/.ngc,type=bind,consistency=cached",
+		"source=${localEnv:HOME}/.cache,target=/home/ubuntu/.cache,type=bind,consistency=cached",
+		"source=${localEnv:HOME}/.ssh,target=/home/ubuntu/.ssh,readonly,type=bind,consistency=cached",
+		"source=${localEnv:HOME}/.netrc,target=/home/ubuntu/.netrc,readonly,type=bind,consistency=cached"
+	],
+	"containerEnv": {
+		"TMPDIR": "/tmp",
+		"NUMBA_CACHE_DIR": "/tmp/",
+		"PYTHONPATH": "${PYTHONPATH}:/workspace/megatron"
+	},
+	"workspaceMount": "source=${localWorkspaceFolder},target=/workspace/megatron,type=bind,consistency=cached",
+	"workspaceFolder": "/workspace/megatron",
+	"initializeCommand": "./.devcontainer/initializeCommand.sh",
+	"remoteUser": "ubuntu",
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"ms-python.python",
+				"ms-python.vscode-pylance",
+				"eamodio.gitlens",
+				"streetsidesoftware.code-spell-checker",
+				"ms-azuretools.vscode-docker",
+				"charliermarsh.ruff",
+				"njpwerner.autodocstring",
+				"ms-toolsai.jupyter",
+				"tamasfe.even-better-toml"
+			],
+			"settings": {
+				"python.defaultInterpreterPath": "/usr/bin/python",
+				"python.testing.pytestEnabled": true,
+				"python.analysis.typeCheckingMode": "standard"
+			}
+		}
+	}
+}
