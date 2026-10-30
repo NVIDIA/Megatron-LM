@@ -1195,7 +1195,7 @@ def resolve_gtp_pad_for_alignment(*, fp4=False, fp8_recipe=None, fp8=False):
     """
     if fp4:
         return 16
-    if fp8_recipe == "mxfp8":
+    if fp8 and fp8_recipe == "mxfp8":
         return 32
     if fp8:
         return 16

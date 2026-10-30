@@ -2802,6 +2802,8 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
 
     kwargs = {}
     for f in dataclasses.fields(OptimizerConfig):
+        if f.name == "fp8_recipe" and not getattr(args, "fp8", None):
+            continue
         if hasattr(args, f.name):
             kwargs[f.name] = getattr(args, f.name)
     config = OptimizerConfig(**kwargs)
