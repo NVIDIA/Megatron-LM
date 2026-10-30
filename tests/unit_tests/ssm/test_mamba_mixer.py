@@ -82,6 +82,53 @@ class TestMambaMixer:
         assert output.shape[2] == mixer.config.hidden_size
         assert output.dtype == torch.float32
 
+    @pytest.mark.parametrize("two_stage", [False, True], ids=["forward", "two_stage"])
+    def test_batch_first_ssm_matches_sequence_first(self, two_stage, monkeypatch):
+        """The batch-first training layout gives the same outputs and gradients."""
+        mixer = self.get_mixer()
+        assert mixer._use_batch_first_ssm(inference_mode=False)
+        # TF32 would make the two GEMM layouts differ by more than the layout change itself.
+        monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+
+        # Two SSM chunks and a batch that differs from both other dims, so a swapped
+        # sequence/batch dim fails loudly.
+        sequence_length, micro_batch_size = 2 * mixer.chunk_size, 3
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        shape = (sequence_length, micro_batch_size, mixer.config.hidden_size)
+        hidden_states = torch.randn(shape, device="cuda", generator=generator)
+        output_grad = torch.randn(shape, device="cuda", generator=generator)
+
+        def run(batch_first):
+            monkeypatch.setattr(mixer, "_use_batch_first_ssm", lambda inference_mode: batch_first)
+            mixer.zero_grad(set_to_none=True)
+            x = hidden_states.clone().requires_grad_()
+            if two_stage:
+                output, _ = mixer.forward_post_core_attn(mixer.forward_pre_attn_and_core_attn(x))
+            else:
+                output, _ = mixer(x)
+            output.backward(output_grad)
+            param_grads = {name: param.grad.clone() for name, param in mixer.named_parameters()}
+            return output.detach(), x.grad, param_grads
+
+        ref_output, ref_input_grad, ref_param_grads = run(batch_first=False)
+        output, input_grad, param_grads = run(batch_first=True)
+
+        assert output.shape == shape
+        torch.testing.assert_close(output, ref_output)
+        torch.testing.assert_close(input_grad, ref_input_grad)
+        # Weight gradients reduce over tokens, which the batch-first layout visits in a
+        # different order, so they match only up to fp32 summation error (~1e-6 of the max).
+        assert param_grads.keys() == ref_param_grads.keys()
+        for name, grad in param_grads.items():
+            ref_grad = ref_param_grads[name]
+            torch.testing.assert_close(
+                grad,
+                ref_grad,
+                rtol=0,
+                atol=1e-5 * ref_grad.abs().max().item(),
+                msg=lambda m: f"{name}: {m}",
+            )
+
     def test_variable_batch_size_inference(self):
         mixer = self.get_mixer()
 
