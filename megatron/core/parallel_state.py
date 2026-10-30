@@ -168,6 +168,20 @@ _GLOBAL_MEMORY_BUFFER = None
 # None represents the default process group
 _global_process_group_list = None
 
+# Process groups created by create_group(), keyed by their membership and creation options.
+# initialize_model_parallel() asks for many groups whose membership is identical (for example
+# with tp=pp=cp=ep=1 the dp, dp-cp, tp-dp, tp-dp-cp, expert-dp and distributed-optimizer groups
+# all span the same ranks, and the tp, pp, cp, ep, ... groups are all the singleton {rank}).
+# Backends that create their communicator when the group is created (e.g. the nccl2 c10d
+# backend) allocate NCCL resources for each duplicate even if it never communicates. Reusing
+# the existing group for an identical request avoids that. Every rank takes part in every
+# new_group() call and the key only uses globally known values, so all ranks make the same
+# reuse decision and keep the collective order in sync.
+_PROCESS_GROUP_CACHE: dict[
+    tuple[tuple[int, ...], timedelta | None, str, str | None], torch.distributed.ProcessGroup | int
+] = {}
+_PROCESS_GROUP_REUSE_STATS = {"created": 0, "reused": 0}
+
 
 def get_nccl_options(pg_name, nccl_comm_cfgs):
     """Set the NCCL process group options.
@@ -233,6 +247,31 @@ def update_pg_timeout(
             raise e
 
 
+def _process_group_cache_key(
+    ranks: Sequence[int] | None,
+    timeout: timedelta | None,
+    backend: str | None,
+    pg_options: object | None,
+    use_local_synchronization: bool,
+) -> tuple[tuple[int, ...], timedelta | None, str, str | None] | None:
+    """Return the key under which an identical create_group() request can share a group.
+
+    Only plain NCCL groups are shared: groups with custom options (high-priority streams, CTA
+    limits, ...), non-NCCL backends and locally synchronized groups always get their own
+    ProcessGroup. NCCL_COLLNET_ENABLE is part of the key because SHARP is enabled per
+    communicator at creation time.
+    """
+    if ranks is None or pg_options is not None or use_local_synchronization:
+        return None
+    # An omitted backend inherits WORLD's backend, which need not be NCCL.
+    backend = backend if backend is not None else torch.distributed.get_backend()
+    if backend != "nccl":
+        return None
+    if os.environ.get("MEGATRON_DISABLE_PROCESS_GROUP_REUSE", "0") == "1":
+        return None
+    return (tuple(sorted(ranks)), timeout, backend, os.environ.get("NCCL_COLLNET_ENABLE"))
+
+
 def create_group(
     ranks=None,
     timeout=None,
@@ -240,8 +279,26 @@ def create_group(
     pg_options=None,
     use_local_synchronization=False,
     group_desc=None,
+    reuse_existing: bool = True,
 ):
-    """Creates a ProcessGroup."""
+    """Creates a ProcessGroup.
+
+    If ``reuse_existing`` is True and a plain NCCL group with the same ranks and timeout was
+    already created through this function, that group is returned instead of creating a new
+    one. Pass ``reuse_existing=False`` when a separate communicator is required, e.g. to overlap
+    collectives on otherwise identical groups. Set ``MEGATRON_DISABLE_PROCESS_GROUP_REUSE=1``
+    to disable reuse globally. Reused requests retain the first group's description.
+    All ranks must use the same reuse setting and creation options.
+    """
+    cache_key = (
+        _process_group_cache_key(ranks, timeout, backend, pg_options, use_local_synchronization)
+        if reuse_existing
+        else None
+    )
+    if cache_key is not None and cache_key in _PROCESS_GROUP_CACHE:
+        _PROCESS_GROUP_REUSE_STATS["reused"] += 1
+        return _PROCESS_GROUP_CACHE[cache_key]
+    _PROCESS_GROUP_REUSE_STATS["created"] += 1
     kwargs = {
         "ranks": ranks,
         "timeout": timeout,
@@ -267,6 +324,10 @@ def create_group(
         _global_process_group_list = [None]
     if torch.distributed.get_rank() in ranks:
         _global_process_group_list.append(group)
+    if cache_key is not None:
+        # Cache on every rank (including non-members, which get GroupMember.NON_GROUP_MEMBER)
+        # so that all ranks skip the same later new_group() calls.
+        _PROCESS_GROUP_CACHE[cache_key] = group
     return group
 
 
@@ -905,6 +966,10 @@ def initialize_model_parallel(
         _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = virtual_pipeline_model_parallel_size
 
     rank = torch.distributed.get_rank()
+
+    # Groups are only shared within one initialization.
+    _PROCESS_GROUP_CACHE.clear()
+    _PROCESS_GROUP_REUSE_STATS.update(created=0, reused=0)
 
     nccl_comm_cfgs = {}
     if nccl_communicator_config_path is not None:
@@ -1733,6 +1798,13 @@ def initialize_model_parallel(
                     _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = intra_dist_opt_instance_group
                 intra_dist_opt_ranks = []
 
+    if rank == 0:
+        logger.info(
+            "initialize_model_parallel: created %d process groups, reused %d identical requests",
+            _PROCESS_GROUP_REUSE_STATS["created"],
+            _PROCESS_GROUP_REUSE_STATS["reused"],
+        )
+
     # Initialize global memory buffer
     # This isn't really "parallel state" but there isn't another good place to
     # put this. If we end up with a more generic initialization of megatron-core
@@ -1786,6 +1858,8 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
             timeout=timeout,
             pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs or {}),
             group_desc='DATA_PARALLEL_GROUP_WITH_CP_AG',
+            # A separate communicator is the point of the AG group (AG/RS overlap).
+            reuse_existing=False,
         )
         if rank in ranks_with_cp:
             dp_cp_ag_group = group_with_cp_ag
@@ -1814,6 +1888,7 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
                 timeout=timeout,
                 pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs or {}),
                 group_desc='EXPERT_DATA_PARALLEL_GROUP_AG',
+                reuse_existing=False,
             )
             if rank in expert_dp_ranks:
                 expt_dp_ag_group = expert_dp_ag
@@ -2908,5 +2983,7 @@ def destroy_model_parallel():
 
     global _global_process_group_list
     _global_process_group_list = None
+
+    _PROCESS_GROUP_CACHE.clear()
 
     SymmetricMemoryManager.destroy()
