@@ -27,7 +27,9 @@ def test_scaling_composes_amp_and_restores_callback(custom):
     config = SimpleNamespace(moe_grad_scale_func=original, grad_scale_func=lambda x: x * 8)
     with pytest.raises(RuntimeError, match="schedule failed"):
         with input_token_moe_loss_scaling(config, torch.tensor(0.25)):
-            torch.testing.assert_close(config.moe_grad_scale_func(), torch.tensor(2.0))
+            torch.testing.assert_close(
+                torch.as_tensor(config.moe_grad_scale_func()), torch.tensor(8.0 if custom else 2.0)
+            )
             raise RuntimeError("schedule failed")
     assert config.moe_grad_scale_func is original
 
@@ -85,7 +87,11 @@ def test_router_gradients_use_input_count_not_target_count(
             iter(batches), num_microbatches, pad_token_id=0, tp_group=groups.tp, dp_group=groups.dp
         )
         replay = list(iterator)
-        assert all(a is b for a, b in zip(replay, batches))
+        # Isolate frontend dict assignments without copying CPU tensor payloads.
+        assert all(
+            a is not b and a.keys() == b.keys() and all(a[key] is b[key] for key in a)
+            for a, b in zip(replay, batches)
+        )
         counts = torch.tensor(
             [
                 sum(int(b["loss_mask"].sum()) for b in batches),
@@ -112,7 +118,7 @@ def test_router_gradients_use_input_count_not_target_count(
                     scale = _get_moe_loss_scale(config, hidden.device)
                     if not per_token:
                         # A DP replica's CP-reduced router mean has denominator n.
-                        weight = n if kind == "aux_loss" else int((~padding).sum()) * cp_size
+                        weight = n
                         scale = scale * weight / counts[1]
                     MoEAuxLossAutoScaler.set_loss_scale(scale)
                     scores, _ = router(hidden, padding_mask=padding)
@@ -180,5 +186,107 @@ def test_prefetch_consumes_one_step_only_on_tp_source(tp_size):
         if tp_rank == 0:
             with pytest.raises(StopIteration):
                 next(original)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("pp_size", [2, 4])
+@pytest.mark.parametrize("virtual", [False, True])
+def test_output_stage_counts_broadcast_across_pipeline(pp_size, virtual):
+    """Source counts from the logical output stage; other iterators stay untouched."""
+    Utils.initialize_model_parallel(pipeline_model_parallel_size=pp_size)
+    try:
+        groups = ProcessGroupCollection.use_mpu_process_groups()
+        dp_rank = groups.dp.rank()
+        dp_size = groups.dp.size()
+        batches = [
+            {"tokens": torch.ones(1, 8 + dp_rank, dtype=torch.int64), "loss_mask": torch.ones(1, 2)}
+        ] * 3
+        original = [iter(batches), iter(batches)] if virtual else iter(batches)
+        prepared, ratio = prepare_moe_loss_normalization(
+            original,
+            2,
+            pad_token_id=None,
+            tp_group=groups.tp,
+            dp_group=groups.dp,
+            pp_group=groups.pp,
+        )
+        expected = 2 * dp_size / sum(8 + rank for rank in range(dp_size))
+        torch.testing.assert_close(ratio, ratio.new_tensor(expected))
+        if groups.pp.rank() == pp_size - 1:
+            result = prepared[-1] if virtual else prepared
+            assert len(list(result)) == 2
+            if virtual:
+                assert next(original[0]) is batches[0]
+            source = original[-1] if virtual else original
+            assert next(source) is batches[2]
+            with pytest.raises(StopIteration):
+                next(source)
+        else:
+            assert prepared is original
+            source = original[-1] if virtual else original
+            assert next(source) is batches[0]
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_graph_replay_reads_current_normalization_ratio():
+    """A captured scale operation must see a new target fraction on the next step."""
+    Utils.initialize_model_parallel()
+    try:
+        config = SimpleNamespace(moe_grad_scale_func=None, grad_scale_func=None)
+        value = torch.ones((), device="cuda", requires_grad=True)
+        MoEAuxLossAutoScaler.main_loss_backward_scale = torch.ones(1, device="cuda")
+
+        def backward():
+            MoEAuxLossAutoScaler.set_loss_scale(_get_moe_loss_scale(config, value.device))
+            output = MoEAuxLossAutoScaler.apply(value, value.square())
+            (output * 0).backward()
+
+        with input_token_moe_loss_scaling(config, value.new_tensor(0.25)):
+            backward()
+            value.grad.zero_()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                backward()
+        for ratio in [0.25, 0.75, 0.125]:
+            with input_token_moe_loss_scaling(config, value.new_tensor(ratio)):
+                value.grad.zero_()
+                graph.replay()
+            torch.testing.assert_close(value.grad, value.new_tensor(2 * ratio))
+    finally:
+        MoEAuxLossAutoScaler.main_loss_backward_scale = None
+        Utils.destroy_model_parallel()
+
+
+def test_virtual_chunk_context_preserves_explicit_overrides():
+    """All chunk configs get the default, while an explicit public hook stays authoritative."""
+    first = SimpleNamespace(moe_grad_scale_func=None, grad_scale_func=lambda x: x * 2)
+    override = lambda: torch.tensor(7.0)
+    second = SimpleNamespace(moe_grad_scale_func=override, grad_scale_func=None)
+    with input_token_moe_loss_scaling([first, second, first], torch.tensor(0.25)):
+        torch.testing.assert_close(first.moe_grad_scale_func(), torch.tensor(0.5))
+        assert second.moe_grad_scale_func is override
+    assert first.moe_grad_scale_func is None
+    assert second.moe_grad_scale_func is override
+
+
+def test_prefetched_batches_do_not_retain_frontend_cuda_assignments():
+    """The frontend mutates batch dicts; buffered/replayed records must stay on CPU."""
+    Utils.initialize_model_parallel()
+    try:
+        groups = ProcessGroupCollection.use_mpu_process_groups()
+        batches = [
+            {"tokens": torch.ones(1, 8, dtype=torch.int64), "loss_mask": torch.ones(1, 8)}
+            for _ in range(2)
+        ]
+        prepared, _ = prepare_moe_loss_normalization(
+            iter(batches), 2, pad_token_id=0, tp_group=groups.tp, dp_group=groups.dp
+        )
+        batch = next(prepared)
+        batch["tokens"] = batch["tokens"].cuda()
+        batch["loss_mask"] = batch["loss_mask"].cuda()
+        assert batches[0]["tokens"].device.type == "cpu"
+        assert batches[0]["loss_mask"].device.type == "cpu"
     finally:
         Utils.destroy_model_parallel()

@@ -176,6 +176,7 @@ from megatron.training.logging.packed_sequence_stats import (
 from megatron.training.moe_loss_normalization import (
     input_token_moe_loss_scaling,
     prepare_moe_loss_normalization,
+    uses_moe_auxiliary_losses,
 )
 from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
@@ -3434,33 +3435,43 @@ def train_step(
             forward_backward_data_iterator = data_iterator
 
         moe_normalization_context = nullcontext()
-        if getattr(args, "moe_aux_loss_input_token_normalization", False):
-            # Re-prefetch on a rerun from the rewound original RerunDataIterator.
-            # The batches here still precede TP broadcast and CP slicing.
-            if not (
-                args.sft
-                and config.calculate_per_token_loss
-                and config.pipeline_model_parallel_size == 1
-                and config.sequence_packing_scheduler is None
-                and config.gtp_weight_remat_size == 1
-                and getattr(forward_step_func, "supports_moe_input_token_normalization", False)
-            ):
-                raise ValueError(
-                    "Input-token MoE normalization requires the standard GPT SFT iterator, "
-                    "calculate_per_token_loss, PP=1, and no sequence scheduler or GTP remat."
+        if config.calculate_per_token_loss and uses_moe_auxiliary_losses(config):
+            # Target-masked regularizers already use the main loss's token domain.
+            # Otherwise their summed gradient needs a separate input-token divisor.
+            if not config.moe_aux_loss_masking and config.moe_grad_scale_func is None:
+                if not getattr(forward_step_func, "supports_moe_token_normalization", False):
+                    raise ValueError(
+                        "This frontend must supply MoE token-count metadata or a custom "
+                        "moe_grad_scale_func; default normalization is wired for GPT/Hybrid text."
+                    )
+                if config.mtp_num_layers:
+                    raise ValueError(
+                        "MoE input-token normalization with MTP needs per-router counts"
+                    )
+                if (
+                    config.sequence_packing_scheduler is not None
+                    or config.gtp_weight_remat_size != 1
+                ):
+                    raise ValueError(
+                        "Input-token MoE normalization needs step counts from the sequence "
+                        "scheduler/GTP rematerialization plan; these paths are not supported yet."
+                    )
+                tokenizer = get_tokenizer()
+                pad_id = tokenizer.pad if args.sft else None
+                if args.sft and pad_id == tokenizer.eod:
+                    raise ValueError("SFT MoE normalization requires distinct PAD and EOD IDs.")
+                normalization_groups = get_attr_wrapped_model(model[0], "pg_collection")
+                forward_backward_data_iterator, ratio = prepare_moe_loss_normalization(
+                    forward_backward_data_iterator,
+                    scheduled_num_microbatches,
+                    pad_token_id=pad_id,
+                    tp_group=normalization_groups.tp,
+                    dp_group=normalization_groups.dp,
+                    pp_group=normalization_groups.pp,
                 )
-            tokenizer = get_tokenizer()
-            if tokenizer.pad == tokenizer.eod:
-                raise ValueError("Input-token MoE normalization requires distinct PAD and EOD IDs.")
-            normalization_groups = get_attr_wrapped_model(model[0], "pg_collection")
-            forward_backward_data_iterator, ratio = prepare_moe_loss_normalization(
-                forward_backward_data_iterator,
-                scheduled_num_microbatches,
-                pad_token_id=tokenizer.pad,
-                tp_group=normalization_groups.tp,
-                dp_group=normalization_groups.dp,
-            )
-            moe_normalization_context = input_token_moe_loss_scaling(config, ratio)
+                moe_normalization_context = input_token_moe_loss_scaling(
+                    [config, *[get_model_config(chunk) for chunk in model]], ratio
+                )
 
         # Forward pass.
         if save_activations_in_this_iteration:

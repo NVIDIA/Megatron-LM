@@ -1647,15 +1647,20 @@ def validate_args(args, defaults={}):
         "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
     )
 
-    if getattr(args, "moe_aux_loss_input_token_normalization", False):
-        assert args.sft and args.calculate_per_token_loss, (
-            "--moe-aux-loss-input-token-normalization requires --sft --calculate-per-token-loss"
-        )
-        assert args.pipeline_model_parallel_size == 1, "Input-token MoE normalization requires PP=1"
-        assert args.sequence_packing_scheduler is None, (
-            "Input-token MoE normalization requires the standard SFT iterator"
-        )
-        assert args.gtp_weight_remat_size == 1, "Input-token MoE normalization does not support GTP remat"
+    if args.moe_aux_loss_masking:
+        assert (
+            args.sequence_packing_scheduler is None
+        ), "Auxiliary target masking is not yet wired through sequence packing schedulers"
+        assert (
+            not args.overlap_moe_expert_parallel_comm
+        ), "Auxiliary target masking is not yet wired through overlap schedule plans"
+        assert (
+            not args.enable_mhc_connections
+        ), "Auxiliary target masking is not yet wired through mHC wrappers"
+        assert not args.mtp_num_layers, "MoE auxiliary masking does not yet support MTP"
+        assert (
+            args.cuda_graph_impl == "none"
+        ), "MoE auxiliary masking does not yet register target masks as CUDA graph inputs"
 
     # Deterministic mode — env vars + config overrides + torch global state.
     # Implementation lives in ``megatron/training/determinism.py`` so the
@@ -3764,14 +3769,6 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
 def _add_sft_args(parser):
     group = parser.add_argument_group(title='sft')
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
-    group.add_argument(
-        '--moe-aux-loss-input-token-normalization',
-        action='store_true',
-        help='Normalize GPT SFT MoE auxiliary losses over real input tokens independently '
-             'of the scored-target count. Requires --sft --calculate-per-token-loss, PP=1, '
-             'a distinct padding token, and the standard (non-scheduler) SFT iterator. '
-             'Buffers one optimizer step of CPU batches. Disabled for backward compatibility.',
-    )
     group.add_argument(
         '--sft-loss-log-mode',
         type=str,

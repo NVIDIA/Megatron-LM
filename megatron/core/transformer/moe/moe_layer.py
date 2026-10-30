@@ -146,6 +146,7 @@ class RouterInterface(Protocol):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        moe_aux_loss_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass of the router.
 
@@ -556,6 +557,7 @@ class MoELayer(BaseMoELayer):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        moe_aux_loss_mask: Optional[torch.Tensor] = None,
     ):
         """Compute token routing for preprocessing.
 
@@ -567,8 +569,15 @@ class MoELayer(BaseMoELayer):
             padding_mask = padding_mask.transpose(0, 1).bool()
         if self.token_dispatcher is not None:
             hidden_states = self.token_dispatcher.wrap_layer_input(hidden_states)
+        router_kwargs = {}
+        if moe_aux_loss_mask is not None:
+            router_kwargs["moe_aux_loss_mask"] = moe_aux_loss_mask.transpose(0, 1).contiguous()
         probs, routing_map = apply_module(self.router)(
-            hidden_states, padding_mask, input_ids=input_ids, packed_seq_params=packed_seq_params
+            hidden_states,
+            padding_mask,
+            input_ids=input_ids,
+            packed_seq_params=packed_seq_params,
+            **router_kwargs,
         )
         return probs, routing_map
 
@@ -750,6 +759,7 @@ class MoELayer(BaseMoELayer):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        moe_aux_loss_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass for the MoE layer.
 
@@ -785,7 +795,11 @@ class MoELayer(BaseMoELayer):
 
             def megakernel_forward(hidden_states, padding_mask):
                 probs, routing_map = self.route(
-                    hidden_states, padding_mask, input_ids, packed_seq_params=packed_seq_params
+                    hidden_states,
+                    padding_mask,
+                    input_ids,
+                    packed_seq_params=packed_seq_params,
+                    moe_aux_loss_mask=moe_aux_loss_mask,
                 )
                 return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
 
@@ -809,7 +823,11 @@ class MoELayer(BaseMoELayer):
                         shared_expert_output = self.shared_experts_compute(layer_input)
 
                     probs, routing_map = self.route(
-                        layer_input, padding_mask, input_ids, packed_seq_params=packed_seq_params
+                        layer_input,
+                        padding_mask,
+                        input_ids,
+                        packed_seq_params=packed_seq_params,
+                        moe_aux_loss_mask=moe_aux_loss_mask,
                     )
                     hidden_states, probs = self.preprocess(
                         layer_input,

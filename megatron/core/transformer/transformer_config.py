@@ -1093,6 +1093,14 @@ class TransformerConfig(ModelParallelConfig):
     If a list of load balancing types is provided for `moe_router_load_balancing_type`,
     a corresponding list of coefficients should be provided here."""
 
+    moe_aux_loss_masking: bool = False
+    """Restrict router load-balancing and z losses to positions selected by the SFT
+    target loss mask. Routing and expert computation still include prompt tokens.
+    The mask must be binary and aligned with the main next-token prediction positions.
+    With per-token loss, normalize over scored tokens across the optimizer step;
+    otherwise preserve equal-microbatch weighting, with zero for empty microbatches.
+    """
+
     moe_z_loss_coeff: Optional[float] = None  # 1e-3 would be a good start value for z-loss
     """Scaling coefficient for the z-loss. A starting value of 1e-3 is recommended."""
 
@@ -1793,6 +1801,25 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
         self._validate_cp_layouts()
+
+        if self.moe_aux_loss_masking:
+            unsupported = {
+                "sequence packing scheduler": self.sequence_packing_scheduler is not None,
+                "MTP": bool(self.mtp_num_layers),
+                "CUDA graphs": (
+                    self.cuda_graph_impl != "none"
+                    or self.enable_cuda_graph
+                    or self.external_cuda_graph
+                ),
+                "overlap schedule plans": self.overlap_moe_expert_parallel_comm,
+                "mHC": self.enable_mhc_connections,
+                "training MLP chunking": self.mlp_chunks_for_training > 1,
+            }
+            for feature, enabled in unsupported.items():
+                if enabled:
+                    raise ValueError(
+                        f"MoE auxiliary target masking is not yet supported with {feature}"
+                    )
 
         if self.attn_logit_softcapping is not None and not (
             math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0

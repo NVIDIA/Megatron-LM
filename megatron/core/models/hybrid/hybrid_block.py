@@ -556,6 +556,8 @@ class HybridStack(MegatronModule):
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
         input_ids: Optional[Tensor] = None,
+        moe_aux_loss_mask: Optional[Tensor] = None,
+        moe_aux_loss_mask_by_layout: Optional[dict[CPLayout, Tensor | None]] = None,
     ):
         """
         Forward function of the HybridStack class.
@@ -682,6 +684,14 @@ class HybridStack(MegatronModule):
             else [None] * self.num_layers_per_pipeline_rank
         )
 
+        if (moe_aux_loss_mask is not None or moe_aux_loss_mask_by_layout) and any(
+            isinstance(layer, (ShortcutMoEBlock, HyperConnectionHybridLayer))
+            for layer in self.layers
+        ):
+            raise NotImplementedError(
+                "Auxiliary target masking is not yet wired through hybrid shortcut/mHC wrappers"
+            )
+
         with outer_fp8_context:
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = checkpointed_forward(
@@ -695,6 +705,8 @@ class HybridStack(MegatronModule):
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
                     input_ids=input_ids,
+                    moe_aux_loss_mask=moe_aux_loss_mask,
+                    moe_aux_loss_mask_by_layout=moe_aux_loss_mask_by_layout,
                     padding_mask_by_layout=padding_mask_by_layout,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                     cp_layout_state=cp_layout_state,
@@ -757,6 +769,11 @@ class HybridStack(MegatronModule):
                             layer_padding_mask = cp_layout_state.get_layer_padding_mask(
                                 physical_layer_idx, padding_mask, padding_mask_by_layout
                             )
+                        layer_aux_mask = moe_aux_loss_mask
+                        if cp_layout_state is not None:
+                            layer_aux_mask = cp_layout_state.get_layer_padding_mask(
+                                physical_layer_idx, moe_aux_loss_mask, moe_aux_loss_mask_by_layout
+                            )
                         # Layers have 1-indexed layer numbers attribute.
                         inner_quant_context = get_inner_quant_context(
                             layer_config, layer.layer_number - 1
@@ -772,6 +789,8 @@ class HybridStack(MegatronModule):
                                     packed_seq_params=layer_packed_seq_params,
                                     padding_mask=layer_padding_mask,
                                 )
+                                if layer_aux_mask is not None:
+                                    layer_kwargs["moe_aux_loss_mask"] = layer_aux_mask
                                 if layer_cp_metadata is not None:
                                     layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
                                 if residual_stream_recompute_context is not None:

@@ -539,6 +539,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         dynamic_inference_decode_only: Optional[bool] = None,
+        moe_aux_loss_mask: Optional[Tensor] = None,
     ):
         """
         Perform the forward pass through the transformer block.
@@ -704,6 +705,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     padding_mask=padding_mask,
                     extract_layer_indices=extract_layer_indices,
                     layer_offset=layer_offset,
+                    moe_aux_loss_mask=moe_aux_loss_mask,
                 )
                 # Handle return value from _checkpointed_forward
                 if len(extract_layer_indices) > 0:
@@ -743,6 +745,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     extra_layer_kwargs = (
                         {"mhc_recompute_manager": mhc_manager} if mhc_manager is not None else {}
                     )
+                    if moe_aux_loss_mask is not None:
+                        extra_layer_kwargs["moe_aux_loss_mask"] = moe_aux_loss_mask
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
