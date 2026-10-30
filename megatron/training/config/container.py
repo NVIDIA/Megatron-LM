@@ -3,7 +3,7 @@ import copy
 import os
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
-from dataclasses import is_dataclass, replace
+from dataclasses import is_dataclass
 from typing import Any, Type, TypeVar
 
 try:
@@ -73,6 +73,8 @@ class ConfigContainerBase:
         derivations again. After finalization, treat layout and RNG policy as fixed;
         create a new container for a differently configured run. The lifecycle flag
         is private and is not saved in YAML/checkpoint configuration metadata.
+        Unlike validate(), finalization mutates configuration; a failure may leave
+        derived values populated, but does not mark the container finalized.
         """
         if self._finalized:
             return
@@ -496,16 +498,13 @@ class PretrainConfigContainer(ConfigContainerBase):
         # TODO: Use get_batch_parallel_size(self) once topology inputs are config-owned.
         # Keep this temporary args dependency in framework finalization, not validation.
         batch_sizes = self._resolve_batch_sizes(get_batch_parallel_size(get_args()))
-        # Check the resolved batch before mutating the caller's configuration.
-        replace(
-            self, train=replace(self.train, global_batch_size=batch_sizes[0])
-        )._validate_rl_config()
-        self._validate_scheduler()
         (
             self.train.global_batch_size,
             self.validation.eval_global_batch_size,
             self.validation.eval_micro_batch_size,
         ) = batch_sizes
+        self._validate_rl_config()
+        self._validate_scheduler()
         super()._finalize()
         if self.scheduler.weight_decay_incr_style == "constant":
             self.scheduler.start_weight_decay = self.optimizer.weight_decay

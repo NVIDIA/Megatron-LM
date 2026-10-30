@@ -121,14 +121,17 @@ def test_scheduler_uses_recipe_edits_without_mutating_during_validation(monkeypa
     assert run_config.scheduler.lr_warmup_steps == 16
 
 
-def test_invalid_resolved_rl_batch_does_not_modify_recipe(monkeypatch, run_config):
+def test_invalid_resolved_rl_batch_leaves_container_unfinalized(monkeypatch, run_config):
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=3))
     run_config.train.micro_batch_size = 1
     run_config.train.global_batch_size = None
     run_config.rl = RLConfig(perform_rl_step=True)
     before = copy.deepcopy(run_config.to_dict())
     run_config.validate()
+    assert run_config.to_dict() == before
     with pytest.raises(ValueError, match="divisible by global_batch_size"):
         run_config.finalize()
-    assert run_config.to_dict() == before
+    assert run_config.train.global_batch_size == 3
+    assert run_config.validation.eval_global_batch_size == 3
+    assert run_config.validation.eval_micro_batch_size == 1
     assert not run_config._finalized
