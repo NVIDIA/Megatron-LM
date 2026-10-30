@@ -2778,6 +2778,8 @@ def get_optimizer_param_scheduler(optimizer):
         override_opt_param_scheduler=cfg.scheduler.override_opt_param_scheduler,
         wsd_decay_steps=cfg.scheduler.wsd_decay_steps,
         lr_wsd_decay_style=cfg.scheduler.lr_wsd_decay_style,
+        step_lr_rescale_schedule=cfg.scheduler.step_lr_rescale_schedule,
+        step_lr_rescale_warmup_samples=cfg.scheduler.step_lr_rescale_warmup_samples,
     )
 
     return opt_param_scheduler
