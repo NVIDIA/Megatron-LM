@@ -19,7 +19,6 @@ from megatron.core.num_microbatches_calculator import (
     unset_num_microbatches_calculator,
 )
 from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 from megatron.training.state import TrainState
 
@@ -165,16 +164,28 @@ def _graceful_shutdown(signum, frame):
 
 
 def set_global_variables(args, cfg_container, build_tokenizer=True):
-    """Register caller-provided args/config and construct training runtime services."""
+    """Register caller-provided args/config and construct their runtime services."""
+
+    from megatron.training.config import PretrainConfigContainer
 
     assert args is not None
     assert cfg_container is not None
 
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
+    training = isinstance(cfg_container, PretrainConfigContainer)
     cfg_container.validate()
     set_run_config(cfg_container)
     set_args(args)
-    initialize_runtime_services(args, build_tokenizer=build_tokenizer, training=True)
+    if training:
+        cfg_container.finalize()
+    initialize_runtime_services(
+        args,
+        build_tokenizer=build_tokenizer,
+        training=training,
+    )
+    if not training:
+        # Legacy checkpoint converters preserve progress without training services.
+        _set_train_state()
 
 
 def initialize_runtime_services(
@@ -185,8 +196,8 @@ def initialize_runtime_services(
 
     cfg = get_run_config()
     if build_tokenizer:
-        _build_tokenizer(args)
-    resolve_tokenizer_vocab_size(cfg, getattr(args, "padded_vocab_size", None))
+        _build_tokenizer(cfg, args)
+    resolve_tokenizer_vocab_size(cfg)
     _set_wandb_writer(args)
     _set_telemetry(args, include_training=training)
 
@@ -202,20 +213,21 @@ def initialize_runtime_services(
 
 def initialize_training_runtime_services(args: Namespace) -> None:
     """Initialize training-only services after the shared runtime services."""
-    if args.step_batch_size_schedule is not None:
+    cfg = get_run_config()
+    if cfg.train.step_batch_size_schedule is not None:
         # Imported here, as elsewhere in this module: megatron.training.utils imports back
         # into megatron.training, which imports this module.
         from megatron.training.utils import print_rank_0
-        print_rank_0(f'> using step batch size schedule: {args.step_batch_size_schedule}')
+        print_rank_0(f'> using step batch size schedule: {cfg.train.step_batch_size_schedule}')
 
     init_num_microbatches_calculator(
         rank=args.rank,
-        global_batch_size=args.global_batch_size,
-        micro_batch_size=args.micro_batch_size,
+        global_batch_size=cfg.train.global_batch_size,
+        micro_batch_size=cfg.train.micro_batch_size,
         # Independent sequences, including when CP and weight sharding share ranks.
         data_parallel_size=get_batch_parallel_size(args),
-        decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
-        step_batch_size_schedule=args.step_batch_size_schedule,
+        decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
+        step_batch_size_schedule=cfg.train.step_batch_size_schedule,
         seq_length=args.seq_length,
     )
     _set_tensorboard_writer(args)
@@ -225,10 +237,10 @@ def initialize_training_runtime_services(args: Namespace) -> None:
     _set_energy_monitor(args)
     _set_train_state()
 
-    if args.exit_signal_handler:
-        _set_signal_handler(args.exit_signal)
+    if cfg.train.exit_signal_handler:
+        _set_signal_handler(cfg.train.exit_signal)
 
-    if args.exit_signal_handler_for_training:
+    if cfg.train.exit_signal_handler_for_training:
         signal.signal(signal.SIGINT, _graceful_shutdown)
         signal.signal(signal.SIGTERM, _graceful_shutdown)
 
@@ -288,11 +300,29 @@ def _set_train_state():
     _GLOBAL_TRAIN_STATE = TrainState()
 
 
-def _build_tokenizer(args):
+def _build_tokenizer(cfg, args):
     """Initialize tokenizer."""
+    from megatron.training.models.gpt import GPTModelConfig
+    from megatron.training.models.hybrid import HybridModelConfig
+    from megatron.training.vocab_utils import build_tokenizer_and_pad_vocab_size
+
     global _GLOBAL_TOKENIZER
     _ensure_var_is_not_initialized(_GLOBAL_TOKENIZER, 'tokenizer')
-    _GLOBAL_TOKENIZER = build_tokenizer(args)
+
+    if isinstance(cfg.model, (GPTModelConfig, HybridModelConfig)):
+        make_vocab_size_divisible_by = cfg.model.make_vocab_size_divisible_by
+        tp_size = cfg.model.transformer.tensor_model_parallel_size
+    else:
+        make_vocab_size_divisible_by = args.make_vocab_size_divisible_by
+        tp_size = args.tensor_model_parallel_size
+
+    _GLOBAL_TOKENIZER = build_tokenizer_and_pad_vocab_size(cfg.tokenizer, make_vocab_size_divisible_by, tp_size)
+
+    # TODO (@maanug): remove this WAR once all reads from args.padded_vocab_size 
+    # have been updated to read from cfg.tokenizer.padded_vocab_size
+    if getattr(args, "padded_vocab_size", None) is None:
+        args.padded_vocab_size = cfg.tokenizer.padded_vocab_size
+
     # Resolve the declared model field once, before any args-to-config conversion.
     # The tokenizer includes added tokens; padded_vocab_size also includes TP padding.
     if (
@@ -305,10 +335,10 @@ def _build_tokenizer(args):
     return _GLOBAL_TOKENIZER
 
 
-def rebuild_tokenizer(args):
+def rebuild_tokenizer(cfg, args):
     global _GLOBAL_TOKENIZER
     _GLOBAL_TOKENIZER = None
-    return _build_tokenizer(args)
+    return _build_tokenizer(cfg, args)
 
 
 def _set_tensorboard_writer(args):

@@ -37,6 +37,7 @@ from megatron.training.config import (
     TokenizerConfig,
     TrainingConfig,
     ValidationConfig,
+    MultiModalTokenizerConfig,
 )
 from megatron.training.models import GPTModelConfig, HybridModelConfig
 
@@ -148,11 +149,11 @@ class ArgumentGroupFactory:
             return {"type": config_type}
 
         if origin in [types.UnionType, typing.Union]:
-            # Handle Optional and Union
-            if type_tuple[1] == type(None): # Optional type. First element is value inside Optional[]
-                return self._extract_type(type_tuple[0])
-            else:
-                raise TypeInferenceError(f"Unions not supported by argparse: {config_type}")
+            # Optional may place None anywhere; multiple value types need CLI metadata.
+            value_types = [value_type for value_type in type_tuple if value_type is not type(None)]
+            if len(value_types) == 1:
+                return self._extract_type(value_types[0])
+            raise TypeInferenceError(f"Unions not supported by argparse: {config_type}")
 
         elif origin is list:
             if len(type_tuple) == 1:
@@ -216,15 +217,15 @@ class ArgumentGroupFactory:
                 if argparse_kwargs["action"] == "store_false":
                     argparse_kwargs["arg_names"] = [self._format_arg_name(name, prefix="no"), self._format_arg_name(name, prefix="disable")] 
         except TypeInferenceError as e:
-            if attr_argparse_meta is not None:
+            if attr_argparse_meta is None:
+                raise e
+            if "type" not in attr_argparse_meta:
                 print(
                     f"WARNING: Inferring the appropriate argparse argument type from {self.src_cfg_class} "
                     f"failed for {attribute.name}: {attribute.type}.\n"
                     "Deferring to attribute metadata. If the metadata is incomplete, 'parser.add_argument()' may fail.\n"
                     f"Original failure: {e}"
                 )
-            else:
-                raise e
 
         # metadata provided by field takes precedence 
         if attr_argparse_meta is not None:
@@ -405,6 +406,9 @@ def core_transformer_config_from_args(args, config_class=None):
     for f in dataclasses.fields(config_class):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
+    # The training sequence length, not max_position_embeddings (which GPTModelConfig.seq_length
+    # carries): core modules that size buffers per sample (NCCL EP) read it from the config.
+    kw_args['max_seq_length_per_sample'] = args.seq_length
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
     kw_args['deallocate_pipeline_outputs'] = not _mfsdp_v2_disables_pipeline_output_dealloc(args)
     kw_args['pipeline_dtype'] = args.params_dtype
@@ -564,21 +568,21 @@ def _default_config_from_args(
 
 
 def resolve_tokenizer_vocab_size(
-    cfg: PretrainConfigContainer | InferenceConfigContainer, padded_vocab_size: int | None
-) -> None:
+    cfg: PretrainConfigContainer | InferenceConfigContainer) -> None:
     """Bind tokenizer-derived vocabulary after runtime tokenizer construction.
+        
+    Final padded_vocab_size value is resolved by tokenizer initialization,
+        and updated on cfg.tokenizer. including any CLI/checkpoint override.
+        None is valid only when the model does not require a tokenizer-derived size.
 
     Args:
         cfg: Previously constructed run configuration. Explicit model
             vocabulary is preserved; only unresolved GPT/Hybrid sizes are bound.
-        padded_vocab_size: Final size resolved by tokenizer initialization,
-            including any CLI/checkpoint override. None is valid only when the
-            model does not require a tokenizer-derived size.
 
     Raises:
         ValueError: A GPT/Hybrid model's vocabulary remains unresolved.
     """
-    cfg.tokenizer.padded_vocab_size = padded_vocab_size
+    padded_vocab_size = cfg.tokenizer.padded_vocab_size
     if isinstance(cfg.model, (GPTModelConfig, HybridModelConfig)) and cfg.model.vocab_size is None:
         if padded_vocab_size is None:
             raise ValueError('Model vocabulary must be resolved before model construction')
@@ -758,6 +762,13 @@ def hybrid_config_from_args(
     return model_config_cls(**kwargs)
 
 
+def tokenizer_config_from_args(args: Namespace) -> TokenizerConfig:
+    if hasattr(args, "image_tag_type"):
+        return _default_config_from_args(MultiModalTokenizerConfig, args)
+    else:
+        return _default_config_from_args(TokenizerConfig, args)
+
+
 def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
     """Normalize legacy CLI/YAML profiling inputs at the configuration boundary."""
     # Legacy args retain these fields temporarily during the training-loop refactor;
@@ -808,7 +819,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
         checkpoint=CheckpointConfig(**ckpt_kwargs),
         profiling=profiling_config_from_args(args),
-        tokenizer=_default_config_from_args(TokenizerConfig, args),
+        tokenizer=tokenizer_config_from_args(args),
         rl=_default_config_from_args(RLConfig, args),
 
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
@@ -870,7 +881,7 @@ def inference_cfg_container_from_args(
         inference=inference_cfg_from_args(args),
         dist=deepcopy(_default_config_from_args(DistributedInitConfig, args)),
         rng=_default_config_from_args(RNGConfig, args),
-        tokenizer=_default_config_from_args(TokenizerConfig, args),
+        tokenizer=tokenizer_config_from_args(args),
         logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
         profiling=profiling_config_from_args(args),
     )

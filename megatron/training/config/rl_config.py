@@ -4,6 +4,8 @@ import argparse
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
+from megatron.core.inference.shards_spec import spec_declares_disaggregation
+
 if TYPE_CHECKING:
     from megatron.core.distributed import DistributedDataParallelConfig
 
@@ -19,6 +21,10 @@ class RLConfig:
 
     perform_rl_step: bool = False
     """Use the RL training step."""
+
+    rl_rollout_only: bool = False
+    """Iterate the RL loop collecting rollouts without optimizer updates.
+    The optimizer stays resident unless --no-load-optim is also set, which skips optimizer build."""
 
     rl_prompts_per_eval: int = 32
     """Number of prompts to evaluate for each RL task. This evaluation can be very expensive when
@@ -281,16 +287,33 @@ class RLConfig:
         if self.requires_grad_buffer_offload:
             ddp_config.grad_buffer_offload = True
 
+    def uses_separate_inference_model(
+        self, *, context_parallel_size: int, inference_shards: str | None
+    ) -> bool:
+        """Whether rollouts run on their own copy of the model: disaggregated shards, any
+        --rl-inference-* parallelism override, or CP>1 (RL inference does not support CP)."""
+        return (
+            spec_declares_disaggregation(inference_shards)
+            or self.rl_inference_tensor_model_parallel_size is not None
+            or self.rl_inference_pipeline_model_parallel_size is not None
+            or self.rl_inference_expert_model_parallel_size is not None
+            or self.rl_inference_expert_tensor_model_parallel_size is not None
+            or context_parallel_size > 1
+        )
+
     def validate_run(
         self,
         *,
         cuda_graph_impl: str | None,
         micro_batch_size: int | None,
         global_batch_size: int | None,
+        train_iters: int | None,
+        train_samples: int | None,
         skip_train: bool,
         load_optim: bool,
         save_interval: int | None,
         exit_interval: int | None,
+        separate_inference_model: bool | None,
     ) -> None:
         """Check this section against the rest of the run it belongs to."""
         if not self.perform_rl_step:
@@ -306,32 +329,54 @@ class RLConfig:
                 "micro batch increase the sequence length."
             )
 
-        if global_batch_size is None:
-            raise ValueError("global_batch_size must be resolved before validating the RL run.")
-        # Ensure that the number of samples we collect is a multiple of the global batch size.
-        samples_per_inference_iteration = self.grpo_samples_per_iteration * self.grpo_iterations
-        if samples_per_inference_iteration % global_batch_size != 0:
+        # A native config can leave this default unresolved during user validation.
+        # Framework finalization repeats these checks with the resolved batch size.
+        if global_batch_size is not None:
+            # Ensure that collected samples are a multiple of the global batch size.
+            samples_per_inference_iteration = self.grpo_samples_per_iteration * self.grpo_iterations
+            if samples_per_inference_iteration % global_batch_size != 0:
+                raise ValueError(
+                    "grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by "
+                    "global_batch_size"
+                )
+            # Only exit/checkpoint on iterations where we generate data: generated
+            # data cannot currently be checkpointed.
+            iterations_per_inference_iteration = samples_per_inference_iteration // global_batch_size
+            if exit_interval is not None and exit_interval % iterations_per_inference_iteration != 0:
+                raise ValueError(
+                    "exit_interval should be divisible by number of global batches per inference "
+                    "iteration."
+                )
+            if save_interval is not None and save_interval % iterations_per_inference_iteration != 0:
+                raise ValueError(
+                    "save_interval should be divisible by number of global batches per inference "
+                    "iteration."
+                )
+
+        has_horizon = bool(train_iters) or bool(train_samples)
+        if self.rl_rollout_only and not has_horizon:
             raise ValueError(
-                "grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by "
-                "global_batch_size"
+                "--rl-rollout-only iterates the RL loop; it needs --train-iters or --train-samples."
             )
-        # For now only exit/checkpoint on iterations where we generate data. We don't currently
-        # have a way to checkpoint the generated data.
-        iterations_per_inference_iteration = samples_per_inference_iteration // global_batch_size
-        if exit_interval is not None and exit_interval % iterations_per_inference_iteration != 0:
+        if skip_train and (has_horizon or self.rl_rollout_only):
+            # Unlike pretraining, RL rejects a horizon under --skip-train: that spelling used to
+            # collect rollouts, and evaluating instead would change a launch's meaning silently.
             raise ValueError(
-                "exit_interval should be divisible by number of global batches per inference "
-                "iteration."
+                "--skip-train only evaluates: drop --train-iters/--train-samples; "
+                "--rl-rollout-only collects rollouts without updates."
             )
-        if save_interval is not None and save_interval % iterations_per_inference_iteration != 0:
+        if self.rl_offload_optimizer_during_inference and (
+            skip_train or (self.rl_rollout_only and not load_optim)
+        ):
             raise ValueError(
-                "save_interval should be divisible by number of global batches per inference "
-                "iteration."
+                "--skip-train and --rl-rollout-only --no-load-optim build no optimizer; "
+                "--rl-offload-optimizer-during-inference has nothing to offload."
             )
 
-        # In inference-only mode the optimizer is created only when it is loaded.
-        if skip_train and not load_optim and self.rl_offload_optimizer_during_inference:
+        # Offloading inference weights that are the training weights would be a no-op.
+        if separate_inference_model is False and self.rl_offload_inference_model_weights:
             raise ValueError(
-                "--no-load-optim with --skip-train --perform-rl-step skips the optimizer; "
-                "--rl-offload-optimizer-during-inference is incompatible (no optimizer to offload)."
+                "--rl-offload-inference-model-weights requires a separate inference model. "
+                "This flag is only useful when doing refit since the weights are shared with "
+                "the training model."
             )

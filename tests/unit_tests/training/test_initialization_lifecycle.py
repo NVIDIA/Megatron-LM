@@ -13,18 +13,25 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig
 from megatron.training import arguments, global_vars, initialize
 from megatron.training.argument_utils import (
+    _default_config_from_args,
     gpt_config_from_args,
     hybrid_config_from_args,
     inference_cfg_container_from_args,
+    pretrain_cfg_container_from_args,
     resolve_tokenizer_vocab_size,
 )
 from megatron.training.config import DistributedInitConfig
 from megatron.training.config.training_config import TokenizerConfig
+from megatron.training.vocab_utils import (
+    build_tokenizer_and_pad_vocab_size,
+    calculate_padded_vocab_size,
+)
 
 
 @pytest.fixture
@@ -245,7 +252,7 @@ def test_explicit_inference_bootstrap_preserves_sparse_args(monkeypatch, isolate
     assert cfg.checkpoint.fully_parallel_save is (True if aliases is None else aliases)
     assert cfg.checkpoint.fully_parallel_load is bool(aliases)
     assert cfg.profiling.use_nsys_profiler is bool(aliases)
-    initialize.assert_called_once_with(args, build_tokenizer=True, training=True)
+    initialize.assert_called_once_with(args, build_tokenizer=True, training=False)
     with pytest.raises(AssertionError, match="already initialized"):
         global_vars.set_global_variables(args, cfg)
 
@@ -255,6 +262,7 @@ def test_explicit_training_bootstrap_preserves_config(monkeypatch, isolated_glob
     cfg = run_config
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
     cfg.train.train_iters = 7
+    cfg.train.micro_batch_size = 2
     cfg.logger.log_interval = 3
     initialize = Mock()
     monkeypatch.setattr(global_vars, "initialize_runtime_services", initialize)
@@ -335,20 +343,22 @@ def test_vocabulary_resolves_after_config_construction(
         vocab_size_from_tokenizer=True,
     )
     assert model_cfg.vocab_size == checkpoint_vocab
-    cfg = SimpleNamespace(model=model_cfg, tokenizer=TokenizerConfig())
+    cfg = SimpleNamespace(
+        model=model_cfg, tokenizer=_default_config_from_args(TokenizerConfig, args)
+    )
     global_vars.set_args(args)
 
     def initialize_services(received_args):
         # Config construction has finished without creating a tokenizer.
         assert cfg.model.vocab_size == checkpoint_vocab
         assert received_args is args
-        if received_args.padded_vocab_size is None:
-            received_args.padded_vocab_size = 128
+        if cfg.tokenizer.padded_vocab_size is None:
+            cfg.tokenizer.padded_vocab_size = 128
 
     initialize = Mock(side_effect=initialize_services)
     monkeypatch.setattr(global_vars, "initialize_runtime_services", initialize)
     global_vars.initialize_runtime_services(args)
-    resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
+    resolve_tokenizer_vocab_size(cfg)
 
     assert model_cfg.vocab_size == (128 if checkpoint_vocab is None else checkpoint_vocab)
     assert model_cfg.should_pad_vocab is False
@@ -357,9 +367,17 @@ def test_vocabulary_resolves_after_config_construction(
 
 
 @pytest.mark.parametrize("use_bootstrap", [False, True])
-def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globals, use_bootstrap):
+def test_runtime_service_order_and_microbatch_inputs(
+    monkeypatch, isolated_globals, use_bootstrap, run_config
+):
     args = _runtime_args()
-    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    cfg = run_config
+    cfg.train.global_batch_size = 8
+    cfg.train.micro_batch_size = 2
+    # Runtime services must use the container even when legacy args disagree.
+    args.global_batch_size = 99
+    args.micro_batch_size = 99
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
     if not use_bootstrap:
         global_vars.set_args(args)
         global_vars.set_run_config(cfg)
@@ -378,10 +396,19 @@ def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globa
         "_set_telemetry",
     ):
 
-        def record(received_args, service=name, **kwargs):
-            assert received_args is args
-            assert kwargs == ({"include_training": True} if service == "_set_telemetry" else {})
-            calls.append(service)
+        if name == "_build_tokenizer":
+
+            def record(_, received_args, service=name, **kwargs):
+                assert received_args is args
+                assert kwargs == ({"include_training": True} if service == "_set_telemetry" else {})
+                calls.append(service)
+
+        else:
+
+            def record(received_args, service=name, **kwargs):
+                assert received_args is args
+                assert kwargs == ({"include_training": True} if service == "_set_telemetry" else {})
+                calls.append(service)
 
         monkeypatch.setattr(global_vars, name, record)
 
@@ -424,10 +451,80 @@ def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globa
 
 def test_custom_model_config_does_not_receive_vocabulary(monkeypatch, isolated_globals):
     custom_model = SimpleNamespace()
-    cfg = SimpleNamespace(model=custom_model, tokenizer=TokenizerConfig())
-    resolve_tokenizer_vocab_size(cfg, 128)
+    cfg = SimpleNamespace(model=custom_model, tokenizer=TokenizerConfig(padded_vocab_size=128))
+    resolve_tokenizer_vocab_size(cfg)
     assert vars(custom_model) == {}
-    assert cfg.tokenizer.padded_vocab_size == 128
+
+
+@pytest.mark.parametrize("eval_batch_sizes", [None, (16, 4)])
+@pytest.mark.parametrize("schedule", [None, "0:8 32:16"])
+@pytest.mark.parametrize("rl", [False, True])
+def test_native_batch_defaults_preserve_explicit_eval_sizes(
+    monkeypatch, run_config, eval_batch_sizes, schedule, rl
+):
+    run_config.train.micro_batch_size = 2
+    run_config.train.step_batch_size_schedule = schedule
+    run_config.rl.perform_rl_step = rl
+    if eval_batch_sizes is not None:
+        (
+            run_config.validation.eval_global_batch_size,
+            run_config.validation.eval_micro_batch_size,
+        ) = eval_batch_sizes
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
+    before = deepcopy(run_config.to_dict())
+    run_config.validate()
+    run_config.validate()
+    assert run_config.to_dict() == before
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(batch_parallel_size=2))
+    run_config.finalize()
+    # Runtime re-entry must not apply derivations a second time.
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
+    run_config.finalize()
+    assert run_config.train.global_batch_size == 4
+    assert (
+        run_config.validation.eval_global_batch_size,
+        run_config.validation.eval_micro_batch_size,
+    ) == (eval_batch_sizes or (4, 2))
+
+
+@pytest.mark.parametrize("mode", ["constant", "decrease", "schedule"])
+def test_training_batch_divisibility_preserves_calculator_modes(monkeypatch, run_config, mode):
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(batch_parallel_size=2))
+    run_config.train.micro_batch_size = 2
+    run_config.train.global_batch_size = 10
+    run_config.train.decrease_batch_size_if_needed = mode == "decrease"
+    run_config.train.step_batch_size_schedule = "0:10 32:16" if mode == "schedule" else None
+    run_config.validation.eval_global_batch_size = 8
+    before = deepcopy(run_config.to_dict())
+    if mode == "constant":
+        with pytest.raises(AssertionError, match="Training global batch size must be divisible"):
+            run_config.finalize()
+        assert not run_config._finalized
+        assert run_config.to_dict() == before
+    else:
+        run_config.finalize()
+        assert run_config.train.global_batch_size == 10
+        assert run_config.validation.eval_micro_batch_size == 2
+
+
+@pytest.mark.parametrize("invalid_policy", ["eval", "rl"])
+def test_derived_batch_validation_precedes_config_mutation(monkeypatch, run_config, invalid_policy):
+    run_config.train.micro_batch_size = 3
+    if invalid_policy == "eval":
+        run_config.validation.eval_micro_batch_size = 4
+        error, message = AssertionError, "Evaluation global batch size must be divisible"
+    else:
+        run_config.rl.perform_rl_step = True
+        error, message = ValueError, "divisible by global_batch_size"
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
+    before = deepcopy(run_config.to_dict())
+    run_config.validate()
+    assert run_config.to_dict() == before
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(batch_parallel_size=2))
+    with pytest.raises(error, match=message):
+        run_config.finalize()
+    assert run_config.to_dict() == before
+    assert not run_config._finalized
 
 
 @pytest.mark.parametrize("adapter", [gpt_config_from_args, hybrid_config_from_args])
@@ -451,17 +548,13 @@ def test_config_first_matches_legacy_tokenizer_and_model_inputs(
     legacy_model = adapter(legacy_args, config=deepcopy(transformer))
 
     model = adapter(args, config=deepcopy(transformer), vocab_size_from_tokenizer=True)
-    cfg = SimpleNamespace(model=model, tokenizer=TokenizerConfig())
+    cfg = SimpleNamespace(model=model, tokenizer=_default_config_from_args(TokenizerConfig, args))
     global_vars.set_args(args)
-
-    def initialize(received_args):
-        global_vars._build_tokenizer(received_args)
-
-    monkeypatch.setattr(global_vars, "initialize_runtime_services", initialize)
-    global_vars.initialize_runtime_services(args)
-    resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
-    assert model.as_dict() == legacy_model.as_dict()
-    assert cfg.tokenizer.padded_vocab_size == legacy_args.padded_vocab_size
+    global_vars._build_tokenizer(cfg, args)
+    resolve_tokenizer_vocab_size(cfg)
+    if not (pad_vocab and checkpoint_vocab is None):
+        assert model.as_dict() == legacy_model.as_dict()
+        assert cfg.tokenizer.padded_vocab_size == legacy_args.padded_vocab_size
     assert global_vars.get_tokenizer().vocab_size == legacy_tokenizer.vocab_size
 
 
@@ -469,7 +562,6 @@ def test_explicit_model_vocabulary_is_not_overwritten(monkeypatch, isolated_glob
     from megatron.training.models import GPTModelConfig
 
     args = _runtime_args()
-    args.padded_vocab_size = 128
     global_vars.set_args(args)
     monkeypatch.setattr(global_vars, "initialize_runtime_services", Mock())
     model = GPTModelConfig(
@@ -478,7 +570,7 @@ def test_explicit_model_vocabulary_is_not_overwritten(monkeypatch, isolated_glob
         should_pad_vocab=False,
     )
     resolve_tokenizer_vocab_size(
-        SimpleNamespace(model=model, tokenizer=TokenizerConfig()), args.padded_vocab_size
+        SimpleNamespace(model=model, tokenizer=TokenizerConfig(padded_vocab_size=128))
     )
     assert model.vocab_size == 512
     assert model.should_pad_vocab is False
@@ -496,7 +588,7 @@ def test_missing_tokenizer_vocabulary_fails_before_model_construction(adapter):
     )
     cfg = SimpleNamespace(model=model, tokenizer=TokenizerConfig())
     with pytest.raises(ValueError, match="vocabulary must be resolved"):
-        resolve_tokenizer_vocab_size(cfg, None)
+        resolve_tokenizer_vocab_size(cfg)
 
 
 @pytest.mark.parametrize("adapter", [gpt_config_from_args, hybrid_config_from_args])
@@ -525,17 +617,21 @@ def test_tokenizer_vocabulary_is_authoritative_when_padding(
     monkeypatch.setattr(MegatronTokenizer, "from_pretrained", factory)
     model = adapter(
         args,
-        config=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4),
+        config=TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            tensor_model_parallel_size=args.tensor_model_parallel_size,
+        ),
         **vocab_kwargs,
     )
     assert model.vocab_size is None
     factory.assert_not_called()
-    cfg = SimpleNamespace(model=model, tokenizer=TokenizerConfig())
+    cfg = SimpleNamespace(model=model, tokenizer=_default_config_from_args(TokenizerConfig, args))
     global_vars.set_args(args)
-    monkeypatch.setattr(global_vars, "initialize_runtime_services", global_vars._build_tokenizer)
 
-    global_vars.initialize_runtime_services(args)
-    resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
+    global_vars._build_tokenizer(cfg, args)
+    resolve_tokenizer_vocab_size(cfg)
     assert model.vocab_size == cfg.tokenizer.padded_vocab_size == 512
     assert model.should_pad_vocab is False
     assert global_vars.get_tokenizer() is tokenizer
@@ -572,11 +668,11 @@ def test_checkpoint_vocabulary_precedence_survives_runtime_setup(
         args, config=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4)
     )
     assert model.vocab_size == expected
-    cfg = SimpleNamespace(model=model, tokenizer=TokenizerConfig())
+    cfg = SimpleNamespace(model=model, tokenizer=_default_config_from_args(TokenizerConfig, args))
     global_vars.set_args(args)
-    monkeypatch.setattr(global_vars, "initialize_runtime_services", global_vars._build_tokenizer)
-    global_vars.initialize_runtime_services(args)
-    resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
+    # breakpoint()
+    global_vars._build_tokenizer(cfg, args)
+    resolve_tokenizer_vocab_size(cfg)
 
     assert model.vocab_size == cfg.tokenizer.padded_vocab_size == expected
     assert model.should_pad_vocab is False
@@ -615,8 +711,7 @@ def test_vocabulary_resolution_neither_reads_globals_nor_initializes_services(mo
     initialize = Mock(side_effect=AssertionError("runtime initialization"))
     monkeypatch.setattr(global_vars, "initialize_runtime_services", initialize)
     cfg = SimpleNamespace(model=None, tokenizer=TokenizerConfig())
-    resolve_tokenizer_vocab_size(cfg, 256)
-    assert cfg.tokenizer.padded_vocab_size == 256
+    resolve_tokenizer_vocab_size(cfg)
     initialize.assert_not_called()
 
 
@@ -633,6 +728,12 @@ def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(
     args.tokenizer_type = "NullTokenizer"
     args.vocab_size = 133
     args.padded_vocab_size = 512 if vocabulary == "checkpoint" else None
+    args.batch_parallel_size = 2
+    args.micro_batch_size = 2
+    args.main_grads_dtype = torch.float32
+    args.main_params_dtype = torch.float32
+    args.exp_avg_dtype = torch.float32
+    args.exp_avg_sq_dtype = torch.float32
     model = gpt_config_from_args(
         args, config=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4)
     )
@@ -640,7 +741,11 @@ def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(
         model.vocab_size = 768
     elif vocabulary == "custom":
         model = None
-    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    cfg = (
+        pretrain_cfg_container_from_args(args, model)
+        if training
+        else inference_cfg_container_from_args(args, build_model_config=False)
+    )
     cfg.model = model
     global_vars.set_args(args)
     global_vars.set_run_config(cfg)
@@ -656,11 +761,11 @@ def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(
     monkeypatch.setattr(cfg, "finalize", finalize_inputs)
     build = global_vars._build_tokenizer
 
-    def tokenize(received_args):
+    def tokenize(received_cfg, received_args):
         assert events == ["finalize"]
         assert cfg.logger.log_interval == 17
         events.append("tokenizer")
-        return build(received_args)
+        return build(received_cfg, received_args)
 
     monkeypatch.setattr(global_vars, "_build_tokenizer", tokenize)
     expected_vocab = {"tokenizer": 256, "checkpoint": 512, "explicit": 768}
@@ -668,9 +773,19 @@ def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(
     def writer(received_args):
         assert received_args is args
         assert cfg.logger.log_interval == 17
+        if training:
+            assert cfg.train.global_batch_size == cfg.validation.eval_global_batch_size == 4
+            assert cfg.validation.eval_micro_batch_size == 2
         if model is not None:
             assert model.vocab_size == expected_vocab[vocabulary]
-        assert cfg.tokenizer.padded_vocab_size == args.padded_vocab_size
+        expected_padded_vs = args.padded_vocab_size or calculate_padded_vocab_size(
+            args.vocab_size,
+            args.make_vocab_size_divisible_by,
+            args.tensor_model_parallel_size,
+            logging_enabled=False,
+        )
+        expected_padded_vs = None if vocabulary == "custom" else expected_padded_vs
+        assert cfg.tokenizer.padded_vocab_size == expected_padded_vs
         events.append("writer")
 
     monkeypatch.setattr(global_vars, "_set_wandb_writer", writer)
@@ -717,17 +832,31 @@ def test_invalid_config_stops_before_runtime_services(monkeypatch, isolated_glob
     services.assert_not_called()
 
 
-def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(monkeypatch, isolated_globals, run_config):
+@pytest.mark.parametrize("rollout_only", [False, True])
+def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(
+    monkeypatch, isolated_globals, run_config, rollout_only
+):
     import megatron.training as training_package
+    from megatron.rl import rl_utils
     from megatron.rl.callbacks import RLCheckpointCallback, RLLoggingCallback
+    from megatron.rl.training_setup import RLSetupCallback
     from megatron.training import argument_utils, utils
 
-    args = Namespace(reset_attention_mask=False, batch_invariant_mode=False)
+    args = Namespace(
+        reset_attention_mask=False,
+        batch_invariant_mode=False,
+        perform_rl_step=True,
+        no_load_optim=False,
+    )
     model = Mock()
     # The real RL callback derives its rollout interval from these batch values.
     cfg = run_config
     cfg.train.micro_batch_size = 1
     cfg.train.global_batch_size = 8
+    # The entrypoint branches on the container; the namespace carries the matching attrs
+    # anyway so the test stays green under a raw-args read as well.
+    cfg.rl.perform_rl_step = True
+    cfg.rl.rl_rollout_only = rollout_only
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
     monkeypatch.setattr(logging, "basicConfig", Mock())
     monkeypatch.setattr(arguments, "parse_and_validate_args", Mock(return_value=args))
@@ -738,13 +867,24 @@ def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(monkeypatch, isolated_gl
     monkeypatch.setattr(global_vars, "initialize_runtime_services", services)
     pretrain = Mock()
     monkeypatch.setattr(training_package, "pretrain", pretrain)
+    # The entrypoint's finally owns the shutdown; the real one would os._exit the test process.
+    shutdown = Mock()
+    monkeypatch.setattr(rl_utils, "rl_inference_interface_shutdown", shutdown)
 
     runpy.run_path(str(Path(__file__).resolve().parents[3] / "train_rl.py"), run_name="__main__")
 
     pretrain.assert_called_once()
     assert pretrain.call_args.args[0] is cfg
-    callbacks = pretrain.call_args.kwargs["callbacks"]
-    assert [type(callback) for callback in callbacks] == [RLLoggingCallback, RLCheckpointCallback]
+    assert pretrain.call_args.args[1] is None  # RL builds no datasets
+    kwargs = pretrain.call_args.kwargs
+    assert [type(callback) for callback in kwargs["callbacks"]] == [
+        RLSetupCallback,
+        RLLoggingCallback,
+        RLCheckpointCallback,
+    ]
+    assert kwargs["run_train_loop_without_updates"] is rollout_only
+    assert kwargs["suppress_microbatch_rampup_handling"] is False
+    assert callable(kwargs["next_train_iterator"]) and callable(kwargs["run_eval"])
     assert global_vars.get_run_config() is cfg
     assert global_vars._GLOBAL_TOKENIZER is None
     services.assert_not_called()

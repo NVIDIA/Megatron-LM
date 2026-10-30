@@ -234,9 +234,7 @@ def initialize_megatron(
             _initialize_tp_communicators(
                 transformer_config,
                 sequence_length=sequence_length,
-                micro_batch_size=(
-                    cfg.train.micro_batch_size if hasattr(cfg, "train") else args.micro_batch_size
-                ),
+                micro_batch_size=cfg.train.micro_batch_size,
                 tp_comm_overlap_cfg=tp_comm_overlap_cfg,
             )
 
@@ -467,7 +465,8 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 gtp_remat_num_sequence_shards=args.gtp_remat_num_sequence_shards,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
-                hybrid_context_parallel=args.hybrid_context_parallel,
+                dynamic_context_parallel=args.dynamic_context_parallel,
+                min_dynamic_context_parallel_size=args.min_dynamic_context_parallel_size,
                 expert_model_parallel_size=args.expert_model_parallel_size,
                 num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
                 expert_tensor_parallel_size=args.expert_tensor_parallel_size,
@@ -600,6 +599,7 @@ def set_jit_fusion_options(tp_size=None):
 
 def _warmup_jit_function(tp_size=None):
     """Compilie JIT functions before the main training steps"""
+    cfg = get_run_config()
     args = get_args()
     if args.bf16:
         dtype = torch.bfloat16
@@ -649,7 +649,7 @@ def _warmup_jit_function(tp_size=None):
     input = torch.rand(
         (
             args.seq_length // args.context_parallel_size,
-            args.micro_batch_size,
+            cfg.train.micro_batch_size,
             args.ffn_hidden_size // args.tensor_model_parallel_size,
         ),
         dtype=dtype,
@@ -693,12 +693,12 @@ def _warmup_jit_function(tp_size=None):
     else:
         seq_length = args.seq_length
     input = torch.rand(
-        (seq_length // args.context_parallel_size, args.micro_batch_size, args.hidden_size),
+        (seq_length // args.context_parallel_size, cfg.train.micro_batch_size, args.hidden_size),
         dtype=dtype,
         device="cuda",
     )
     residual = torch.rand(
-        (seq_length // args.context_parallel_size, args.micro_batch_size, args.hidden_size),
+        (seq_length // args.context_parallel_size, cfg.train.micro_batch_size, args.hidden_size),
         dtype=dtype,
         device="cuda",
     )
