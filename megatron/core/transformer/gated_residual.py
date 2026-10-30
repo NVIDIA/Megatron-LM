@@ -28,7 +28,7 @@ from torch import Tensor
 
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import nvtx_decorator
+from megatron.core.utils import ensure_params_ready, nvtx_decorator
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
@@ -334,6 +334,11 @@ class GatedResidualModule(MegatronModule):
                 "GatedResidualModule always returns the residual with the 4-tuple; "
                 "return_residual=False is not supported."
             )
+
+        # The gate kernels read the child modules' weights (hc_norm, the mix projections,
+        # block_inject) directly, so those children's forward pre-hooks never run: publish
+        # their overlapped parameter all-gathers before the read.
+        ensure_params_ready(self.parameters())
 
         self._pending_residual_grad_link = None
         if mhc_recompute_manager is not None:

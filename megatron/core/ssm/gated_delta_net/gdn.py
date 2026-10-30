@@ -51,7 +51,12 @@ from megatron.core.ssm.ops.gdp import (
     fused_recurrent_gated_delta_rule_update,
 )
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
-from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import (
+    deprecate_inference_params,
+    ensure_params_ready,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 
 def get_parameter_local_cp_headwise(
@@ -247,6 +252,9 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         Return:
             torch.Tensor: Normalized recurrence output.
         """
+        # The causal-conv kernels take conv1d.weight / .bias directly instead of calling the
+        # Conv1d module, whose forward pre-hook would publish an overlapped all-gather.
+        ensure_params_ready(self.conv1d.parameters())
         if packed_sequence_cp_metadata is not None and not self.chunkwise_context_parallel:
             raise ValueError(
                 "GDN received packed-sequence chunkwise CP metadata, but it runs without "

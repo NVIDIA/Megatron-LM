@@ -19,7 +19,13 @@ from megatron.core.tensor_parallel.mappings import (
     scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_pg_rank, get_pg_size, nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import (
+    ensure_params_ready,
+    get_pg_rank,
+    get_pg_size,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 from .config import EngramConfig
 from .cp_layout import (
@@ -788,6 +794,16 @@ class Engram(MegatronModule):
         message = "engram.fused-dense"
         nvtx_range_push(message)
         try:
+            # The fused kernels read the norm and short-conv weights without calling those
+            # modules, whose forward pre-hooks would publish an overlapped all-gather.
+            ensure_params_ready(
+                [
+                    self.key_norm.weight,
+                    self.query_norm.weight,
+                    self.conv_norm.weight,
+                    self.short_conv.weight,
+                ]
+            )
             output = fused_engram_dense(
                 key,
                 hidden_states,

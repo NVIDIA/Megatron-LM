@@ -45,7 +45,13 @@ from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualEx
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import precision_aware_checkpoint
 from megatron.core.typed_torch import apply_module, not_none
-from megatron.core.utils import internal_api, nvtx_decorator, nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import (
+    ensure_params_ready,
+    internal_api,
+    nvtx_decorator,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 try:
     import flashinfer  # pylint: disable=unused-import
@@ -797,6 +803,9 @@ class MoELayer(BaseMoELayer):
                 )
 
             def megakernel_forward(hidden_states, padding_mask):
+                # The megakernel reads the routed and shared experts' weights without calling
+                # those modules, whose forward pre-hooks would publish an overlapped all-gather.
+                ensure_params_ready(self.parameters())
                 store = self.cudagraph_tensor_store
                 if not store.is_empty():
                     # Replay of a ``moe_router`` partial CUDA graph: the graph ran the router
