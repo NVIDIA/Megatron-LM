@@ -11,7 +11,7 @@ from torch import testing
 from torch.testing import assert_close
 
 import megatron.core.parallel_state as mpu
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import FullyShardedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
@@ -95,15 +95,14 @@ class TestFullyShardedDataParallel:
         self, main_params_dtype=torch.float32, main_grads_dtype=None, grad_comm_dtype=None
     ):
         """Helper to construct a FullyShardedDataParallel with the given dtype args."""
-        fsdp_config = DistributedDataParallelConfig(
+        fsdp_config = FullyShardedDataParallelConfig(
             data_parallel_sharding_strategy="optim_grads_params",
             overlap_grad_reduce=True,
             overlap_param_gather=True,
             bucket_size=10000,
-            use_megatron_fsdp=True,
-            megatron_fsdp_main_params_dtype=main_params_dtype,
-            megatron_fsdp_main_grads_dtype=main_grads_dtype,
-            megatron_fsdp_grad_comm_dtype=grad_comm_dtype,
+            main_params_dtype=main_params_dtype,
+            main_grads_dtype=main_grads_dtype,
+            grad_comm_dtype=grad_comm_dtype,
         )
         model = TestModel(input_dim=13, output_dim=17).cuda()
         transformer_config = TransformerConfig(
@@ -111,7 +110,7 @@ class TestFullyShardedDataParallel:
         )
         fsdp_model = FullyShardedDataParallel(
             config=transformer_config,
-            ddp_config=fsdp_config,
+            fsdp_config=fsdp_config,
             module=model,
             fsdp_unit_modules=[torch.nn.Linear],
         )
@@ -123,6 +122,8 @@ class TestFullyShardedDataParallel:
             pytest.skip("Megatron FSDP requires torch >= 2.4.0")
 
         fsdp_model = self._build_fsdp_model()
+        assert not hasattr(fsdp_model, "ddp_config")
+        assert fsdp_model.module.fsdp_config is fsdp_model.fsdp_config
         assert fsdp_model.mp_policy.main_params_dtype == torch.float32
         assert fsdp_model.mp_policy.main_grads_dtype is None
         assert fsdp_model.mp_policy.grad_comm_dtype is None
@@ -185,12 +186,11 @@ class TestFullyShardedDataParallel:
         output_dim = 17
 
         # Setup FSDP config - using optim_grads_params for full sharding test
-        fsdp_config = DistributedDataParallelConfig(
+        fsdp_config = FullyShardedDataParallelConfig(
             data_parallel_sharding_strategy="optim_grads_params",
             overlap_grad_reduce=True,
             overlap_param_gather=True,
             bucket_size=10000,
-            use_megatron_fsdp=True,
         )
 
         # Create two identical models
@@ -206,7 +206,7 @@ class TestFullyShardedDataParallel:
         )
         fsdp_model1 = FullyShardedDataParallel(
             config=transformer_config,
-            ddp_config=fsdp_config,
+            fsdp_config=fsdp_config,
             module=model1,
             fsdp_unit_modules=[torch.nn.Linear],
         )
@@ -214,7 +214,7 @@ class TestFullyShardedDataParallel:
         # Wrap second model with explicit process groups
         fsdp_model2 = FullyShardedDataParallel(
             config=transformer_config,
-            ddp_config=fsdp_config,
+            fsdp_config=fsdp_config,
             module=model2,
             pg_collection=pg_collection,
             fsdp_unit_modules=[torch.nn.Linear],
@@ -299,12 +299,11 @@ class TestFullyShardedDataParallel:
         if not is_torch_min_version("2.4.0"):
             pytest.skip("Megatron FSDP requires torch >= 2.4.0")
 
-        fsdp_config = DistributedDataParallelConfig(
+        fsdp_config = FullyShardedDataParallelConfig(
             data_parallel_sharding_strategy="optim_grads_params",
             overlap_grad_reduce=True,
             overlap_param_gather=True,
             bucket_size=10000,
-            use_megatron_fsdp=True,
         )
         input_dim, output_dim = 13, 17
 
@@ -315,7 +314,7 @@ class TestFullyShardedDataParallel:
         dense_model = TestModel(input_dim=input_dim, output_dim=output_dim).cuda()
         fsdp_dense = FullyShardedDataParallel(
             config=dense_config,
-            ddp_config=fsdp_config,
+            fsdp_config=fsdp_config,
             module=dense_model,
             fsdp_unit_modules=[torch.nn.Linear],
         )
@@ -331,7 +330,7 @@ class TestFullyShardedDataParallel:
         moe_model = TestModel(input_dim=input_dim, output_dim=output_dim).cuda()
         fsdp_moe = FullyShardedDataParallel(
             config=moe_config,
-            ddp_config=fsdp_config,
+            fsdp_config=fsdp_config,
             module=moe_model,
             fsdp_unit_modules=[torch.nn.Linear],
         )
@@ -361,14 +360,13 @@ class TestFullyShardedDataParallel:
         )
         from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import get_global_memory_buffer
 
-        fsdp_config = DistributedDataParallelConfig(
+        fsdp_config = FullyShardedDataParallelConfig(
             data_parallel_sharding_strategy="optim_grads_params",
             overlap_grad_reduce=True,
             overlap_param_gather=True,
             bucket_size=10000,
-            use_megatron_fsdp=True,
-            fsdp_double_buffer=True,
-            fsdp_db_use_persist_buf_on_alloc_fail=True,
+            double_buffer=True,
+            db_use_persist_buf_on_alloc_fail=True,
         )
 
         input_dim, output_dim = 13, 17
@@ -378,7 +376,7 @@ class TestFullyShardedDataParallel:
         )
         fsdp_model = FullyShardedDataParallel(
             config=transformer_config,
-            ddp_config=fsdp_config,
+            fsdp_config=fsdp_config,
             module=model,
             fsdp_unit_modules=[torch.nn.Linear],
         )
@@ -498,29 +496,27 @@ class TestFullyShardedDataParallel:
         hidden_dim = 16
 
         # Setup FSDP config - baseline fsdp config
-        baseline_fsdp_config = DistributedDataParallelConfig(
+        baseline_fsdp_config = FullyShardedDataParallelConfig(
             data_parallel_sharding_strategy="optim_grads_params",
             overlap_grad_reduce=True,
             overlap_param_gather=True,
             bucket_size=10000,
-            use_megatron_fsdp=True,
             nccl_ub=False,
-            fsdp_double_buffer=False,
-            fsdp_manual_registration=False,
-            megatron_fsdp_max_pool_double_buffer=megatron_fsdp_max_pool_double_buffer,
+            double_buffer=False,
+            manual_registration=False,
+            max_pool_double_buffer=megatron_fsdp_max_pool_double_buffer,
         )
 
         # Setup FSDP config - target fsdp config
-        target_fsdp_config = DistributedDataParallelConfig(
+        target_fsdp_config = FullyShardedDataParallelConfig(
             data_parallel_sharding_strategy="optim_grads_params",
             overlap_grad_reduce=True,
             overlap_param_gather=True,
             bucket_size=10000,
-            use_megatron_fsdp=True,
             nccl_ub=nccl_ub,
-            fsdp_double_buffer=fsdp_double_buffer,
-            fsdp_manual_registration=fsdp_manual_registration,
-            megatron_fsdp_max_pool_double_buffer=megatron_fsdp_max_pool_double_buffer,
+            double_buffer=fsdp_double_buffer,
+            manual_registration=fsdp_manual_registration,
+            max_pool_double_buffer=megatron_fsdp_max_pool_double_buffer,
         )
 
         # Create two identical models
@@ -536,14 +532,14 @@ class TestFullyShardedDataParallel:
         )
         baseline_fsdp_model = FullyShardedDataParallel(
             config=transformer_config,
-            ddp_config=baseline_fsdp_config,
+            fsdp_config=baseline_fsdp_config,
             module=model1,
             fsdp_unit_modules=[torch.nn.Linear],
         )
 
         target_fsdp_model = FullyShardedDataParallel(
             config=transformer_config,
-            ddp_config=target_fsdp_config,
+            fsdp_config=target_fsdp_config,
             module=model2,
             fsdp_unit_modules=[torch.nn.Linear],
         )
@@ -643,12 +639,11 @@ class TestFullyShardedDataParallel:
             model = TestModel(input_dim=input_dim, output_dim=output_dim).cuda()
 
             # Setup FSDP config - using optim_grads_params for full sharding test
-            fsdp_config = DistributedDataParallelConfig(
+            fsdp_config = FullyShardedDataParallelConfig(
                 data_parallel_sharding_strategy="optim_grads_params",
                 overlap_grad_reduce=True,
                 overlap_param_gather=True,
                 bucket_size=10000,
-                use_megatron_fsdp=True,
                 num_distributed_optimizer_instances=num_fsdp_group,
             )
 
@@ -658,7 +653,7 @@ class TestFullyShardedDataParallel:
             )
             fsdp_model = FullyShardedDataParallel(
                 config=transformer_config,
-                ddp_config=fsdp_config,
+                fsdp_config=fsdp_config,
                 module=model,
                 fsdp_unit_modules=[torch.nn.Linear],
             )
@@ -1367,12 +1362,11 @@ class TestFsdpNonUnitBucketPreservation:
         # matches the production default in mcore_fsdp_adapter.py.
         fsdp_model = FullyShardedDataParallel(
             config=config,
-            ddp_config=DistributedDataParallelConfig(
+            fsdp_config=FullyShardedDataParallelConfig(
                 data_parallel_sharding_strategy="optim_grads_params",
                 overlap_grad_reduce=True,
                 overlap_param_gather=True,
                 bucket_size=4096,
-                use_megatron_fsdp=True,
             ),
             module=model,
             fsdp_unit_modules=[TransformerLayer],
@@ -1473,12 +1467,11 @@ class TestFsdpMambaConvParamGather:
 
         fsdp_model = FullyShardedDataParallel(
             config=config,
-            ddp_config=DistributedDataParallelConfig(
+            fsdp_config=FullyShardedDataParallelConfig(
                 data_parallel_sharding_strategy="optim_grads_params",
                 overlap_grad_reduce=True,
                 overlap_param_gather=True,
                 bucket_size=4096,
-                use_megatron_fsdp=True,
             ),
             module=model,
             fsdp_unit_modules=[TransformerLayer],
@@ -1572,14 +1565,13 @@ class TestFsdpHybridModelDoubleBuffer:
 
         fsdp_model = FullyShardedDataParallel(
             config=config,
-            ddp_config=DistributedDataParallelConfig(
+            fsdp_config=FullyShardedDataParallelConfig(
                 data_parallel_sharding_strategy="optim_grads_params",
                 overlap_grad_reduce=True,
                 overlap_param_gather=True,
                 bucket_size=4096,
-                use_megatron_fsdp=True,
-                fsdp_double_buffer=True,
-                megatron_fsdp_max_pool_double_buffer=True,
+                double_buffer=True,
+                max_pool_double_buffer=True,
             ),
             module=model,
             fsdp_unit_modules=[TransformerLayer, MambaLayer],
@@ -1629,10 +1621,9 @@ class TestMegatronFsdpGradStatsGroup:
                 config=TransformerConfig(
                     num_attention_heads=1, num_layers=1, context_parallel_size=1
                 ),
-                ddp_config=DistributedDataParallelConfig(
+                fsdp_config=FullyShardedDataParallelConfig(
                     data_parallel_sharding_strategy="optim_grads_params",
                     bucket_size=10000,
-                    use_megatron_fsdp=True,
                     num_distributed_optimizer_instances=cls.NUM_OPTIMIZER_INSTANCES,
                     outer_dp_sharding_strategy=outer_dp_sharding_strategy,
                 ),
@@ -1684,11 +1675,10 @@ class TestMegatronFsdpSynchronousGradReduce:
                 config=TransformerConfig(
                     num_attention_heads=1, num_layers=1, context_parallel_size=1
                 ),
-                ddp_config=DistributedDataParallelConfig(
+                fsdp_config=FullyShardedDataParallelConfig(
                     data_parallel_sharding_strategy=sharding_strategy,
                     overlap_grad_reduce=False,
                     bucket_size=10000,
-                    use_megatron_fsdp=True,
                 ),
                 module=TestModel(input_dim=13, output_dim=17).cuda(),
                 fsdp_unit_modules=[torch.nn.Linear],

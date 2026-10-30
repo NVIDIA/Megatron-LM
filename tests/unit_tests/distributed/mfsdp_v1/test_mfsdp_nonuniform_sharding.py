@@ -11,12 +11,12 @@ import pytest
 import torch
 from torch.nn.functional import mse_loss
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.distributed_data_parallel_config import (
-    DistributedDataParallelConfig,
-)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
     fully_shard_model,
     fully_shard_optimizer,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_sharded_data_parallel_config import (
+    FullyShardedDataParallelConfig,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
     all_sharding_strategies_in,
@@ -141,7 +141,7 @@ class TestShardingStrategyResolution:
     @staticmethod
     def make_config(strategy, experts_strategy=None):
         """Build a DDP config carrying the given pair of DP-Shard strategies."""
-        return DistributedDataParallelConfig(
+        return FullyShardedDataParallelConfig(
             data_parallel_sharding_strategy=strategy,
             expert_data_parallel_sharding_strategy=experts_strategy,
         )
@@ -172,7 +172,7 @@ class TestShardingStrategyResolution:
     )
     def test_invalid_strategy_is_rejected(self, field_name):
         with pytest.raises(ValueError, match=f"Invalid {field_name}"):
-            DistributedDataParallelConfig(**{field_name: "zero_3"})
+            FullyShardedDataParallelConfig(**{field_name: "zero_3"})
 
 
 class TestNonUniformSharding:

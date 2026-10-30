@@ -1,4 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
 import os
 from dataclasses import fields
@@ -11,7 +12,7 @@ import torch
 import torch.distributed.checkpoint
 import yaml
 
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import FullyShardedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
@@ -772,11 +773,7 @@ def test_save_checkpoint(
     optimizer = MockState({"optimizer": "optimizer_state"})
     if ckpt_format == "fsdp_dtensor":
         model = FullyShardedDataParallel(
-            config=config,
-            ddp_config=DistributedDataParallelConfig(
-                use_distributed_optimizer=True, use_megatron_fsdp=True
-            ),
-            module=model,
+            config=config, fsdp_config=FullyShardedDataParallelConfig(), module=model
         )
         optimizer = MockState({"state": {}})
     opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})

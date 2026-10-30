@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+
 """Full-iteration and optimizer CUDA graph integration tests for the MFSDP v2 adapter."""
 
 from dataclasses import replace
@@ -7,7 +8,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import FullyShardedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
@@ -73,18 +74,16 @@ def test_full_iteration_and_optimizer_cuda_graph_match_eager(
         )
         model = FullyShardedDataParallel(
             config=config,
-            ddp_config=DistributedDataParallelConfig(
-                use_megatron_fsdp=True,
-                megatron_fsdp_version=2,
-                use_distributed_optimizer=False,
+            fsdp_config=FullyShardedDataParallelConfig(
+                version=2,
                 data_parallel_sharding_strategy=inner_strategy,
                 num_distributed_optimizer_instances=outer_dp_size,
                 outer_dp_sharding_strategy="optim" if outer_dp_size > 1 else "no_shard",
                 # With the default None, MFSDP v2 uses BF16 main grads with FP32 main
                 # params. Capturable FusedAdam in the TE revision under test requires
                 # matching dtypes (https://github.com/NVIDIA/TransformerEngine/issues/3358).
-                megatron_fsdp_main_grads_dtype=torch.float32,
-                megatron_fsdp_cuda_graph_mode=enable_cuda_graph,
+                main_grads_dtype=torch.float32,
+                cuda_graph_mode=enable_cuda_graph,
             ),
             module=model,
             pg_collection=process_group_collection,

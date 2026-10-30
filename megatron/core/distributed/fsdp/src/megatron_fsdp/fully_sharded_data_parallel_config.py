@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import torch
@@ -11,10 +11,9 @@ VALID_SHARDING_STRATEGIES = ("no_shard", "optim", "optim_grads", "optim_grads_pa
 
 
 @dataclass
-class DistributedDataParallelConfig:
+class FullyShardedDataParallelConfig:
     """
-    Megatron-FSDP `fully_shard` API sub-configuration
-    derived from Megatron-Core DistributedDataParallel.
+    Configuration for the standalone Megatron-FSDP `fully_shard` API.
     """
 
     overlap_grad_reduce: bool = False
@@ -88,7 +87,7 @@ class DistributedDataParallelConfig:
       | IB                   | True      | 1 / 1               |
     """
 
-    fsdp_double_buffer: bool = False
+    double_buffer: bool = False
     """If true, use persistently allocated double buffers for the 
       temporary memory needed in the Megatron FSDP communications.
       This option will cause additional memory overhead, however, it is necessary for
@@ -96,7 +95,7 @@ class DistributedDataParallelConfig:
       This option will be automatically set to True when nccl_ub=True.
     """
 
-    fsdp_all_gather_in_start_param_sync: bool = True
+    all_gather_in_start_param_sync: bool = True
     """
     If True, use all-gather during the initial Megatron-FSDP parameter
     synchronization step. This can increase overlap between the first
@@ -106,7 +105,7 @@ class DistributedDataParallelConfig:
     CG capture scope but is waited on during the capture scope.
     """
 
-    fsdp_db_use_persist_buf_on_alloc_fail: bool = False
+    db_use_persist_buf_on_alloc_fail: bool = False
     """Whether to fall back to persistent buffer when a bucket does not
        fit FSDP double buffer size. If true, FSDP will use the persistently 
        allocated buffer for the bucket that does not fit, it will enable NCCL 
@@ -127,7 +126,7 @@ class DistributedDataParallelConfig:
       when nccl_ub is set.
     """
 
-    fsdp_manual_registration: bool = False
+    manual_registration: bool = False
     """If true, manually register the FSDP communication buffers to NCCL user buffer.
       This option is only effective when use_megatron_fsdp and nccl_ub is set.
       For symmetric registration with large models, the registration itself can take 
@@ -135,20 +134,20 @@ class DistributedDataParallelConfig:
       to minimize the registration time.
     """
 
-    megatron_fsdp_main_params_dtype: Optional[torch.dtype] = torch.float32
+    main_params_dtype: Optional[torch.dtype] = torch.float32
     """Data type for the main weight buffer utilized for distributed optimization
       and quantization with Megatron-FSDP. If set to None, the model compute weight
       buffer will take the role of the main weights, or when no sharding is applied,
       the native model weights become the main weights. Defaults to torch.float32.
     """
 
-    megatron_fsdp_main_grads_dtype: Optional[torch.dtype] = None
+    main_grads_dtype: Optional[torch.dtype] = None
     """Data type for the main gradient buffer utilized for distributed optimization with
       Megatron-FSDP. If set to None, main gradients will match the dtype of the model
       compute parameters specified by the user model. Defaults to None.
     """
 
-    megatron_fsdp_grad_comm_dtype: Optional[torch.dtype] = None
+    grad_comm_dtype: Optional[torch.dtype] = None
     """Data type for gradient gather / scatter communications. Can be utilized to reduce
       communication latency, but adds overhead for type-casting and copy operations.
       If using NCCL UBR v2.27+, gradient reduction may be performed in high-precision
@@ -157,29 +156,29 @@ class DistributedDataParallelConfig:
       `FP32` reduction even though we have `BF16` input and output communication buffers.
       If set to None, the `main_grads_dtype` is used. If using HSDP (either DP-Replicate
       or DP-Outer in `outer_dp_sharding_strategy`), `no_shard`, `optim`, or a
-      `FixedPoolAllocator` (`fsdp_double_buffer`), allocating `dtype`-custom gradient
+      `FixedPoolAllocator` (`double_buffer`), allocating `dtype`-custom gradient
       communication buffers (per FSDP group) adds memory overhead. Defaults to None.
       No additional memory is allocated when `grad_comm_dtype == main_grads_dtype`.
     """
 
-    megatron_fsdp_use_decoupled_grad: bool = False
+    use_decoupled_grad: bool = False
     """If true, Megatron-FSDP's ParamAndGradBuffer uses the precision-aware optimizer
       gradient path (e.g. `decoupled_grad` on optimizer parameters) instead of casting
       main gradients to parameter dtype for `.grad`.
     """
 
-    megatron_fsdp_cuda_graph_mode: bool = False
+    cuda_graph_mode: bool = False
     """If set to True, Megatron-FSDP will practice CUDA graph-safe operations, such as
     not dereferencing `param.grad` after the optimizer step to preserve references for
     CUDA graph replay. Can affect memory utilization in some cases, such as when the
     gradient shard is not a view of the Megatron-FSDP sharded gradient buffer, so
-    FusedAdam(use_decoupled_grad=True) + megatron_fsdp_use_decoupled_grad=True or
-    setting megatron_fsdp_main_params_dtype == megatron_fsdp_main_grads_dtype is
+    FusedAdam(use_decoupled_grad=True) + use_decoupled_grad=True or
+    setting main_params_dtype == main_grads_dtype is
     recommended to avoid casting the gradient to the parameter precision and creating
     a casted-copy of the gradient shard that cannot be dereferenced due to replay.
     """
 
-    megatron_fsdp_enable_fine_grained_param_gather: bool = False
+    enable_fine_grained_param_gather: bool = False
     """If set to True, enables fine-grained parameter gathering for Megatron-FSDP.
       This feature increases the overlap between parameter all-gather and forward computation,
       at the cost of more frequent communication calls.
@@ -190,16 +189,16 @@ class DistributedDataParallelConfig:
       will be unsharded.
     """
 
-    megatron_fsdp_max_pool_double_buffer: bool = False
+    max_pool_double_buffer: bool = False
     """
     Builds a double buffer maxpool that can be recycled across asymmetric / hybrid
     FSDP units, instead of the symmetrical FixedPoolAllocator that requires exact
-    parity between FSDP units, when using fsdp_double_buffer=True. Enables NCCL
+    parity between FSDP units, when using double_buffer=True. Enables NCCL
     user buffer registration and CUDA graph replay for models with asymmetrical
     FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
     """
 
-    megatron_fsdp_padded_shards: bool = True
+    padded_shards: bool = True
     """Megatron-FSDP v2 only. If true (default), pad each parameter group so every rank
     gets an equal shard. If false, pack the group without padding and split it into
     generally unequal per-rank shards at row boundaries (32-row block boundaries for
@@ -213,6 +212,10 @@ class DistributedDataParallelConfig:
     DP-Outer is prefetched one additional FSDP unit beyond the DP-Inner frontier.
     Only effective with ``outer_dp_sharding_strategy='optim'``.
     """
+
+    def resolved(self) -> "FullyShardedDataParallelConfig":
+        """Return a copy with inherited sharding and buffer defaults applied."""
+        return replace(self)
 
     def __post_init__(self):
         import os
@@ -238,6 +241,6 @@ class DistributedDataParallelConfig:
                     "with nccl_ub due to compatibility issue with torch.cuda.MemPool API."
                 )
 
-        if self.megatron_fsdp_max_pool_double_buffer:
+        if self.max_pool_double_buffer:
             # MaxPoolAllocator is a type of double-buffer allocator.
-            self.fsdp_double_buffer = True
+            self.double_buffer = True

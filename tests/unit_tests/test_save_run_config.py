@@ -1,4 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
 """Unit tests for run_config.yaml being written as part of checkpoint save."""
 
 import os
@@ -7,7 +8,7 @@ from unittest import mock
 import pytest
 import yaml
 
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import FullyShardedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
@@ -166,11 +167,7 @@ def test_save_checkpoint_writes_run_config_other_formats(
     optimizer = MockState({"optimizer": "optimizer_state"})
     if ckpt_format == "fsdp_dtensor":
         model = FullyShardedDataParallel(
-            config=config,
-            ddp_config=DistributedDataParallelConfig(
-                use_distributed_optimizer=True, use_megatron_fsdp=True
-            ),
-            module=model,
+            config=config, fsdp_config=FullyShardedDataParallelConfig(), module=model
         )
         optimizer = MockState({"state": {}})
     opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})

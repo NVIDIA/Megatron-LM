@@ -1775,7 +1775,7 @@ class ChainedOptimizer(MegatronOptimizer):
         for optimizer in self.chained_optimizers:
             if not isinstance(optimizer, DistributedOptimizer):
                 continue
-            if not optimizer.ddp_config.overlap_param_gather:
+            if optimizer.ddp_config is not None and not optimizer.ddp_config.overlap_param_gather:
                 return True
         return False
 

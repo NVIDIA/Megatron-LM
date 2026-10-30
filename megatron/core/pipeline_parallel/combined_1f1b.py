@@ -408,7 +408,7 @@ def combined_forward_backward_step(
             "is not yet supported together with Megatron FSDP."
         )
         if forward_fsdp_wrapper is not None and any_sharding_strategy_in(
-            forward_fsdp_wrapper.ddp_config, ["optim_grads_params"]
+            forward_fsdp_wrapper.fsdp_config, ["optim_grads_params"]
         ):
             for i in range(f_schedule_plan.num_layers()):
                 layer_plan = f_schedule_plan.get_layer(i)

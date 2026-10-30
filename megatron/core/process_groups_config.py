@@ -395,6 +395,10 @@ class ProcessGroupCollection:
         from megatron.core import parallel_state
         from megatron.core.utils import get_model_config
 
+        data_parallel_config = getattr(model_chunks[0], 'fsdp_config', None)
+        if data_parallel_config is None:
+            data_parallel_config = getattr(model_chunks[0], 'ddp_config', None)
+
         if pg_collection is None:
             # Use parallel_state groups
             dp_group = parallel_state.get_data_parallel_group(
@@ -440,9 +444,8 @@ class ProcessGroupCollection:
             )
 
             # Inter distributed optimizer group
-            if hasattr(model_chunks[0], 'ddp_config'):
-                ddp_config = model_chunks[0].ddp_config
-                if ddp_config.num_distributed_optimizer_instances > 1:
+            if data_parallel_config is not None:
+                if data_parallel_config.num_distributed_optimizer_instances > 1:
                     inter_dist_opt_group = (
                         parallel_state.get_inter_distributed_optimizer_instance_group()
                     )
@@ -484,9 +487,8 @@ class ProcessGroupCollection:
             expt_dp_group = pg_collection.expt_dp
 
             # 4. Handle intra_dp_cp, intra_expt_dp, and inter_dist_opt based on optimizer instances
-            if hasattr(model_chunks[0], 'ddp_config'):
-                ddp_config = model_chunks[0].ddp_config
-                if ddp_config.num_distributed_optimizer_instances == 1:
+            if data_parallel_config is not None:
+                if data_parallel_config.num_distributed_optimizer_instances == 1:
                     # With a single optimizer instance:
                     # - intra_dp_cp is same as dp_cp
                     # - intra_expt_dp is same as expt_dp
@@ -511,7 +513,7 @@ class ProcessGroupCollection:
                     intra_expt_dp_group = pg_collection.intra_expt_dp
                     inter_dist_opt_group = pg_collection.inter_dist_opt
 
-                if ddp_config.use_distributed_optimizer:
+                if getattr(data_parallel_config, 'use_distributed_optimizer', False):
                     if 'intra_dist_opt' not in pg_set:
                         raise ValueError(
                             "intra_dist_opt process group is required but not provided in "
@@ -521,7 +523,7 @@ class ProcessGroupCollection:
                 else:
                     intra_dist_opt_group = None
             else:
-                # No ddp_config available - use simple fallback
+                # No data-parallel config available - use simple fallback
                 intra_dp_cp_group = dp_cp_group
                 intra_expt_dp_group = expt_dp_group
                 inter_dist_opt_group = None

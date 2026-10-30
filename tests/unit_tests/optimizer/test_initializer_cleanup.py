@@ -9,6 +9,8 @@ import pytest
 import torch
 
 import megatron.core.optimizer as optimizer_module
+from megatron.core.distributed import FullyShardedDataParallelConfig
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.test_utilities import Utils
@@ -33,22 +35,29 @@ def _parameter(device='cpu', requires_grad=True):
     return param
 
 
-def _model():
-    model = torch.nn.Module()
+class _FSDPModel(FullyShardedDataParallelV1):
+    """Expose the FSDP wrapper contract without allocating distributed buffers."""
+
+    def __init__(self):
+        torch.nn.Module.__init__(self)
+        self.fsdp_config = FullyShardedDataParallelConfig()
+
+
+def _model(fsdp=False):
+    model = _FSDPModel() if fsdp else torch.nn.Module()
     model.owned = _parameter()
     model.non_owned = _parameter()
     model.frozen = _parameter(requires_grad=False)
     model.plain = torch.nn.Parameter(torch.zeros(1))
-    model.ddp_config = SimpleNamespace(
-        use_megatron_fsdp=False, data_parallel_sharding_strategy='no_shard'
-    )
+    if not fsdp:
+        model.ddp_config = SimpleNamespace(data_parallel_sharding_strategy='no_shard')
     return model
 
 
 @pytest.mark.parametrize('path', ['muon', 'adam', 'sgd', 'fsdp', 'fsdp_overlap'])
 def test_factory_clears_initializers_after_all_master_weights(monkeypatch, path):
     """Optimizer builders finish before releasing saved initializers."""
-    chunks = [_model(), _model()]
+    chunks = [_model(fsdp=path.startswith('fsdp')), _model(fsdp=path.startswith('fsdp'))]
     config = OptimizerConfig(
         optimizer=path if path in ('muon', 'adam', 'sgd') else 'adam',
         lr=0.1,
@@ -95,9 +104,6 @@ def test_factory_clears_initializers_after_all_master_weights(monkeypatch, path)
     monkeypatch.setattr(
         optimizer_module, '_get_param_groups_and_buffers', lambda *args, **kwargs: ([], {})
     )
-    for chunk in chunks:
-        chunk.ddp_config.use_megatron_fsdp = path.startswith('fsdp')
-
     result = get_megatron_optimizer(config, chunks, config_overrides={})
 
     if path in ('muon', 'fsdp'):

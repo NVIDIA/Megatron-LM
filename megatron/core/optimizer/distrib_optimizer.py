@@ -806,9 +806,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         super().__init__(optimizer, config, grad_scaler, init_state_fn)
         self.model_chunks = model_chunks
-        self.ddp_config = self.model_chunks[0].ddp_config
+        self.fsdp_config = getattr(self.model_chunks[0], "fsdp_config", None)
+        self.ddp_config = None if self.fsdp_config is not None else self.model_chunks[0].ddp_config
         for model_chunk in self.model_chunks:
-            assert self.ddp_config == model_chunk.ddp_config
+            if self.fsdp_config is not None:
+                assert self.fsdp_config == model_chunk.fsdp_config
+            else:
+                assert self.ddp_config == model_chunk.ddp_config
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
         # Retained only between loading-template creation and load_state_dict().
         self._checkpoint_version_for_load = None
@@ -829,7 +833,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return
 
         self.is_stub_optimizer = False
-        if self.ddp_config.use_megatron_fsdp:
+        if self.fsdp_config is not None:
             # Megatron-FSDP will manage optimizer weights and gradients.
             return
 
@@ -1051,7 +1055,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         - state_order : The index of a parameter within the shared parameter
             list.
         """
-        if self.ddp_config.use_megatron_fsdp:
+        if self.fsdp_config is not None:
             # When using Megatron-FSDP, directly load the optimizer state
             # into the wrapped optimizer.
             if "param_to_group_meta" in state_dict:
@@ -1671,7 +1675,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self._checkpoint_version_for_load = checkpoint_version
 
         # Handle FSDP DistributedOptimizer States
-        if self.ddp_config.use_megatron_fsdp and sharding_type != "fsdp_dtensor":
+        if self.fsdp_config is not None and sharding_type != "fsdp_dtensor":
             raise NotImplementedError(
                 f"sharding_type {sharding_type} is not supported with Megatron FSDP."
             )
@@ -1795,7 +1799,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Sharded state dict where each parameter is a separate PyTorch DTensor.
         """
         assert (
-            self.ddp_config.use_megatron_fsdp
+            self.fsdp_config is not None
         ), "fsdp_dtensor sharding type is only supported with Megatron FSDP."
 
         # Initialize optimizer states with dummy values if loading.
@@ -2763,7 +2767,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Args:
             set_to_none (bool): if true, set grads to None.
         """
-        if self.ddp_config.use_megatron_fsdp:
+        if self.fsdp_config is not None:
             for model_chunk in self.model_chunks:
                 # Zero gradients managed by Megatron-FSDP.
                 model_chunk.zero_grad_buffer()
@@ -2829,7 +2833,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         shard_fp32_from_fp8 = []
         shard_offsets_in_fp8 = []
 
-        if self.ddp_config.use_megatron_fsdp:
+        if self.fsdp_config is not None:
             # Retrieve Megatron-FSDP compute weights.
             buffers = []
             for m in self.model_chunks:
@@ -2881,7 +2885,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         shard_fp32_from_nvfp4 = []
         shard_offsets_in_nvfp4 = []
 
-        buffers = self.buffers if not self.ddp_config.use_megatron_fsdp else []
+        buffers = self.buffers if self.fsdp_config is None else []
 
         # Map param to index in lists
         nvfp4_param_to_idx_map = {}
@@ -2952,7 +2956,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.is_stub_optimizer:
             return
 
-        if self.ddp_config.use_megatron_fsdp:
+        if self.fsdp_config is not None:
             # Megatron-FSDP manages unsharded gradient buffer allocation
             # (with zero-copy if using NCCL UB and wgrad accum fusion)
             # during the backward pass.
@@ -3018,7 +3022,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.is_stub_optimizer:
             return
 
-        if self.ddp_config.use_megatron_fsdp:
+        if self.fsdp_config is not None:
             # Update Megatron-FSDP's compute weights with optimized main weights.
             # If using quantized parameters, this will also perform quantization.
             for model_chunk in self.model_chunks:
@@ -3139,7 +3143,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         param buffer is not mapped to model params for MXFP8 case.
 
         """
-        if self.ddp_config.use_megatron_fsdp:
+        if self.fsdp_config is not None:
             raise NotImplementedError(
                 "_copy_main_params_to_param_buffer not supported for Megatron-FSDP."
             )
@@ -3355,7 +3359,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer.update_fp32_param_by_new_param()
             return
 
-        if self.ddp_config.use_megatron_fsdp:
+        if self.fsdp_config is not None:
             raise NotImplementedError(
                 "Megatron-FSDP does not implement a model-to-main parameter update."
             )
@@ -3441,13 +3445,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         update_successful = super().step_with_ready_grads()
 
-        should_sync_params = not self.ddp_config.overlap_param_gather and not getattr(
+        parallel_config = self.fsdp_config if self.fsdp_config is not None else self.ddp_config
+        should_sync_params = not parallel_config.overlap_param_gather and not getattr(
             self, '_defer_param_sync', False
         )
         timers = self.config.timers
-        if timers is not None and (self.ddp_config.use_megatron_fsdp or should_sync_params):
+        if timers is not None and (self.fsdp_config is not None or should_sync_params):
             timers('params-all-gather', log_level=1).start(barrier=self.config.barrier_with_L1_time)
-        if self.ddp_config.use_megatron_fsdp:
+        if self.fsdp_config is not None:
             # Optionally all-gather Megatron-FSDP sharded main weights
             # early in preparation for the subsequent forward pass.
             for model_chunk in self.model_chunks:
@@ -3462,7 +3467,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 # LayerWiseDistributedOptimizer's own ``start_param_sync`` call
                 # is not duplicated for the same buckets.
                 self.start_param_sync_for_bucket_group_subset()
-        if timers is not None and (self.ddp_config.use_megatron_fsdp or should_sync_params):
+        if timers is not None and (self.fsdp_config is not None or should_sync_params):
             timers('params-all-gather').stop()
 
         return update_successful
