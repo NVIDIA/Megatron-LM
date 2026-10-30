@@ -6,6 +6,7 @@ import pytest
 import torch.nn.functional as F
 
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_gated_delta_net_module_spec,
     get_transformer_block_with_experimental_attention_variant_spec,
 )
 from megatron.core.ssm.gated_delta_net import HAVE_FLA, HAVE_FLA_GDN2
@@ -61,6 +62,17 @@ def test_gdn_runtime_parallel_correctness(
     )
     is_gdn2 = variant == "gdn2"
     tolerance = 3e-2 if is_gdn2 else 5e-3
+
+    def static_control_factory(static_config, static_groups):
+        static_spec = get_gated_delta_net_module_spec(static_config)
+        return (
+            static_spec.module(
+                static_config, static_spec.submodules, layer_number=1, pg_collection=static_groups
+            )
+            .cuda()
+            .bfloat16()
+        )
+
     _test_parallel_attention_correctness(
         transformer_config=config,
         transformer_layer_spec=spec,
@@ -76,7 +88,9 @@ def test_gdn_runtime_parallel_correctness(
         sequence_packing=True,
         dynamic_cp=dynamic_cp,
         check_parameter_gradients=True,
-        # Local BF16 gradients round before the FP32 CP/SP reduction.
-        parameter_atol=2e-2,
+        # Local BF16 projection gradients round before the FP32 CP/SP reduction;
+        # GDN2 shows larger serial-vs-partitioned differences on GB200 and A6000.
+        parameter_atol=1e-1 if is_gdn2 else 2e-2,
         parameter_rtol=2e-2,
+        static_control_factory=static_control_factory,
     )

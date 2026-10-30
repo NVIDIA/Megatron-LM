@@ -4,6 +4,7 @@
 
 import os
 from contextlib import contextmanager
+from copy import copy
 from dataclasses import replace
 from unittest import mock
 
@@ -138,6 +139,7 @@ def _test_parallel_attention_correctness(
     check_parameter_gradients=False,
     parameter_atol=None,
     parameter_rtol=None,
+    static_control_factory=None,
 ):
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size < tp * cp or world_size % (tp * cp):
@@ -147,6 +149,7 @@ def _test_parallel_attention_correctness(
         assert sequence_packing, "Runtime Dynamic CP parity requires packed THD input"
         if int(os.environ.get("WORLD_SIZE", "1")) < tp * cp:
             pytest.skip(f"Runtime CP={cp} parity requires at least {cp} distributed ranks")
+    assert static_control_factory is None or check_parameter_gradients
 
     # Model initialization function
     def initialize_gpt_model(
@@ -296,8 +299,54 @@ def _test_parallel_attention_correctness(
                 tp_group=parallel_state.get_tensor_model_parallel_group(),
             )
 
+        static_control = None
+        if static_control_factory is not None and dynamic_cp:
+            # The same partitioned inputs and kernels isolate runtime-group routing
+            # from serial-versus-partitioned BF16 accumulation differences.
+            static_groups = copy(parallel_attention.pg_collection)
+            static_groups.cp = cp_group
+            static_config = replace(
+                transformer_config, context_parallel_size=cp, dynamic_context_parallel=False
+            )
+            static_attention = static_control_factory(static_config, static_groups)
+            static_attention.load_state_dict(parallel_attention.state_dict())
+            static_input = input_hidden_states.detach().clone().requires_grad_(True)
+            static_packed = replace(packed_seq_params, cp_group=None, local_cp_size=None)
+            static_output, _ = static_attention(
+                static_input, attention_mask=None, packed_seq_params=static_packed
+            )
+            static_output.sum().backward()
+            static_gradients = parameter_gradient_shards(
+                static_attention,
+                cp_group=cp_group,
+                tp_group=parallel_state.get_tensor_model_parallel_group(),
+            )
+            static_control = (static_output.detach(), static_input.grad.detach(), static_gradients)
+
         try:
             with synchronized_assertions():
+                if static_control is not None:
+                    static_output, static_input_grad, static_gradients = static_control
+                    torch.testing.assert_close(
+                        output_hidden_states_parallel, static_output, atol=5e-3, rtol=5e-3
+                    )
+                    torch.testing.assert_close(
+                        input_grad_parallel, static_input_grad, atol=5e-3, rtol=5e-3
+                    )
+                    assert static_gradients.keys() == parameter_grads_parallel.keys()
+                    assert static_gradients, "static CP control must exercise parameter gradients"
+                    for name, (static_grad, static_offset) in static_gradients.items():
+                        runtime_grad, runtime_offset = parameter_grads_parallel[name]
+                        assert static_offset == runtime_offset, name
+                        torch.testing.assert_close(
+                            runtime_grad,
+                            static_grad,
+                            atol=5e-3,
+                            rtol=5e-3,
+                            msg=lambda msg, param_name=name: (
+                                f"Mismatch in runtime/static parameter gradient {param_name}: {msg}"
+                            ),
+                        )
                 # Check if the output is close
                 output_hidden_states_baseline = get_tensor_on_this_rank(
                     output_hidden_states_baseline
