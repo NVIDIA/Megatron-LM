@@ -20,7 +20,11 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    require_process_groups,
+    resolve_process_groups,
+)
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
@@ -30,11 +34,16 @@ from megatron.core.transformer.hyper_connection import (
     build_mhc_recompute_layer_plan,
     finalize_mhc_recompute_layer,
 )
-from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
+from megatron.core.transformer.module import (
+    GraphableMegatronModule,
+    MegatronModule,
+    _require_pipeline_group,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
+    _LAYER_PROCESS_GROUPS,
     BaseTransformerLayer,
     get_transformer_layer_offset,
 )
@@ -266,7 +275,17 @@ def _get_block_submodules(
 
 
 class TransformerBlock(GraphableMegatronModule, MegatronModule):
-    """Transformer class."""
+    """Transformer class.
+
+    Args:
+        pg_collection (ProcessGroupCollection | None): process groups of the model that this
+            block belongs to, passed on to its layers. It must set ``tp``. With
+            ``config.pipeline_model_parallel_size > 1`` it must also set ``pp`` to the
+            pipeline-parallel group of this rank; without pipeline parallelism ``pp`` may be
+            unset or None. Omitting the collection falls back to the global groups in
+            ``parallel_state`` with a ``ProcessGroupFallbackWarning``; the fallback is
+            deprecated.
+    """
 
     def __init__(
         self,
@@ -282,11 +301,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         super().__init__(config=config)
 
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            # Build every field that the layers read, not only the ones checked below.
+            pg_collection = resolve_process_groups(
+                None,
+                owner=type(self).__name__,
+                required=_LAYER_PROCESS_GROUPS,
+                deprecated_in="0.21",
+                removed_in="0.23",
+            )
+        (self.tp_group,) = require_process_groups(pg_collection, ('tp',), owner=type(self).__name__)
+        pp_group = _require_pipeline_group(pg_collection, config, type(self).__name__)
         self.pg_collection = pg_collection
-        self.tp_group = pg_collection.tp
 
-        pp_group = self.pg_collection.pp if hasattr(self.pg_collection, 'pp') else None
         pp_rank = get_pg_rank(pp_group)
 
         self.submodules = _get_block_submodules(config, spec, vp_stage, pp_rank)
@@ -599,9 +625,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         # Calculate the global layer offset for this pipeline stage
         # This is needed to convert local layer indices to global indices for feature extraction
-        pp_group = self.pg_collection.pp if hasattr(self.pg_collection, 'pp') else None
         layer_offset = get_transformer_layer_offset(
-            self.config, self.vp_stage, get_pg_rank(pp_group)
+            self.config, self.vp_stage, get_pg_rank(self.pg_collection.pp)
         )
 
         # Delete the obsolete reference to the initial input tensor if necessary
