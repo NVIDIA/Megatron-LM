@@ -38,8 +38,9 @@ _CHECKER_SPEC.loader.exec_module(_checker)
 
 # Fields that MoELayer validates: the ones it, its router and its token dispatchers read.
 LAYER_FIELDS = ("ep", "tp", "cp", "expt_tp", "tp_ep", "tp_cp", "tp_dp_cp")
-# Fields of the default collection: the layer fields and the experts' data-parallel groups.
-DEFAULT_FIELDS = LAYER_FIELDS + ("expt_dp", "expt_dp_gtp_remat")
+# Fields of the default collection: the layer fields, the experts' data-parallel groups, and the
+# GTP weight-remat groups that the experts' linear layers read.
+DEFAULT_FIELDS = LAYER_FIELDS + ("expt_dp", "expt_dp_gtp_remat", "gtp_remat", "expt_gtp_remat")
 
 _FALLBACK_MESSAGE = re.compile(r"^(\S+) was called without `([^`]+)`")
 
@@ -89,6 +90,8 @@ def _global_moe_groups():
         "tp_ep": parallel_state.get_expert_tensor_and_model_parallel_group(),
         "tp_cp": parallel_state.get_tensor_and_context_parallel_group(),
         "tp_dp_cp": parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
+        "gtp_remat": parallel_state.get_gtp_weight_remat_group(),
+        "expt_gtp_remat": parallel_state.get_expert_gtp_weight_remat_group(),
     }
 
 
@@ -231,15 +234,12 @@ def test_moe_layer_without_collection_warns_once_per_owner(tp, ep, grouped_gemm)
             MoELayer(config, submodules),
             CustomMoELayer(config, submodules),
         ]
-    expected_fallbacks = [("CustomMoELayer", "pg_collection"), ("MoELayer", "pg_collection")]
-    if not grouped_gemm:
-        # The default collection sets no GTP_remat axes, so the local experts' linear layers
-        # read theirs from the global grid as well, and say so.
-        expected_fallbacks += [
-            ("ColumnParallelLinear", "pg_collection.expt_gtp_remat"),
-            ("RowParallelLinear", "pg_collection.expt_gtp_remat"),
-        ]
-    assert sorted(_fallback_warnings(record)) == sorted(expected_fallbacks)
+    # The default collection sets the GTP_remat groups, so the experts' linear layers do not
+    # fall back and warn as well.
+    assert sorted(_fallback_warnings(record)) == [
+        ("CustomMoELayer", "pg_collection"),
+        ("MoELayer", "pg_collection"),
+    ]
 
     expected = _global_moe_groups()
     for layer in layers:

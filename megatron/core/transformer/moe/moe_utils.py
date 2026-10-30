@@ -1699,6 +1699,10 @@ def skip_routed_expert_padding(config: TransformerConfig) -> bool:
 
 # Process groups that MoELayer, its router and its token dispatchers read from the collection.
 MOE_LAYER_PROCESS_GROUPS = ("ep", "tp", "cp", "expt_tp", "tp_ep", "tp_cp", "tp_dp_cp")
+# The GTP weight-rematerialization groups that the linear layers of MoE read: gtp_remat for the
+# shared experts and the latent projections, expt_gtp_remat for the routed experts. None means
+# that the axis is off.
+_MOE_GTP_REMAT_GROUPS = ("gtp_remat", "expt_gtp_remat")
 
 
 def get_default_pg_collection(
@@ -1708,8 +1712,12 @@ def get_default_pg_collection(
 
     This is the deprecated fallback for callers that do not pass the owning model's collection.
     It emits a ``ProcessGroupFallbackWarning`` that names ``owner``, once per process. It sets
-    the fields in ``MOE_LAYER_PROCESS_GROUPS`` and the experts' data-parallel groups ``expt_dp``
-    and ``expt_dp_gtp_remat``; every other field stays unset.
+    the fields in ``MOE_LAYER_PROCESS_GROUPS``, the experts' data-parallel groups ``expt_dp``
+    and ``expt_dp_gtp_remat``, and the GTP weight-rematerialization groups ``gtp_remat`` and
+    ``expt_gtp_remat``, so the linear layers built on the collection do not fall back and warn
+    again for those groups; every other field stays unset. With GTP weight remat on, the
+    Transformer Engine linears of the shared experts still fall back for their ``dp_cp`` replica
+    group, with a warning of their own.
 
     Args:
         owner: Name of the class or function whose caller omitted ``pg_collection``.
@@ -1718,17 +1726,26 @@ def get_default_pg_collection(
         ProcessGroupCollection: The default process groups for MoE.
 
     Raises:
-        RuntimeError: ``parallel_state`` has not created one of these groups.
+        RuntimeError: ``parallel_state`` has not created one of these groups, other than the
+            GTP weight-rematerialization groups, which may be None (meaning that the axis is off)
+            when ``parallel_state`` did not set them, for example after registering a collection
+            without them.
     """
     pg_collection = resolve_process_groups(
         None,
         owner=owner,
-        required=MOE_LAYER_PROCESS_GROUPS + ("expt_dp", "expt_dp_gtp_remat"),
+        required=MOE_LAYER_PROCESS_GROUPS
+        + ("expt_dp", "expt_dp_gtp_remat")
+        + _MOE_GTP_REMAT_GROUPS,
         deprecated_in="0.21",
         removed_in="0.23",
     )
     # The shim returns None for a group that parallel_state has not created.
-    missing = [name for name, group in vars(pg_collection).items() if group is None]
+    missing = [
+        name
+        for name, group in vars(pg_collection).items()
+        if group is None and name not in _MOE_GTP_REMAT_GROUPS
+    ]
     if missing:
         raise RuntimeError(
             f"{owner} was called without pg_collection, and parallel_state has not created the "
