@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.models.mimo.optimizer import (
@@ -15,6 +16,7 @@ from megatron.core.models.mimo.optimizer import (
     _optimizer_config_for_module,
     get_mimo_optimizer,
 )
+from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.optimizer.optimizer import MixedPrecisionOptimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 
@@ -111,13 +113,22 @@ def test_encoder_optimizer_uses_nonoverlapped_mxfp8_param_copy():
     global_config = OptimizerConfig(
         fp8_recipe='mxfp8', reuse_grad_buf_for_mxfp8_param_ag=True, overlap_param_gather=True
     )
-    module = SimpleNamespace(ddp_config=SimpleNamespace(overlap_param_gather=False))
+    module = SimpleNamespace(
+        ddp_config=DistributedDataParallelConfig(
+            overlap_param_gather=False,
+            use_distributed_optimizer=True,
+            fp8_param_gather=True,
+            reuse_grad_buf_for_mxfp8_param_ag=True,
+        )
+    )
     module_config = _optimizer_config_for_module(global_config, module)
     assert module_config is not global_config
     assert global_config.reuse_grad_buf_for_mxfp8_param_ag
     assert global_config.overlap_param_gather
     assert module_config.reuse_grad_buf_for_mxfp8_param_ag
     assert not module_config.overlap_param_gather
+    assert module_config.use_distributed_optimizer
+    assert not global_config.use_distributed_optimizer
     optimizer = SimpleNamespace(
         config=module_config,
         timers=None,
@@ -133,34 +144,55 @@ def test_encoder_optimizer_uses_nonoverlapped_mxfp8_param_copy():
 
 
 def test_optimizer_config_rejects_module_without_ddp_config():
-    with pytest.raises(ValueError, match="must be DDP-wrapped"):
+    with pytest.raises(ValueError, match="must have a ddp_config"):
         _optimizer_config_for_module(OptimizerConfig(), SimpleNamespace())
 
 
-def test_mimo_optimizer_scopes_param_group_alignment_to_module(mocker):
+@pytest.mark.parametrize("optimizer_type", [MixedPrecisionOptimizer, FullyShardedOptimizer])
+def test_mimo_optimizer_scopes_param_group_alignment_to_module(mocker, optimizer_type):
     intra_dist_opt = object()
+    full_module_group = object()
+    original_grad_group = object()
     pg_collection = SimpleNamespace(intra_dist_opt=intra_dist_opt)
     module = SimpleNamespace(
         pg_collection=pg_collection,
-        ddp_config=SimpleNamespace(
-            overlap_param_gather=True, num_distributed_optimizer_instances=1
-        ),
+        ddp_config=DistributedDataParallelConfig(overlap_param_gather=True),
         parameters=lambda: iter((SimpleNamespace(requires_grad=True),)),
     )
-    grid = SimpleNamespace(is_current_rank_in_grid=lambda: True)
+    grid = SimpleNamespace(
+        is_current_rank_in_grid=lambda: True,
+        dim_names=["tp", "cp", "dp", "pp"],
+        get_pg=MagicMock(return_value=full_module_group),
+    )
     mimo_model = SimpleNamespace(
         mimo_config=SimpleNamespace(module_to_grid_map={MIMO_LANGUAGE_MODULE_KEY: grid}),
-        language_model=module,
+        language_model=object(),
         modality_submodules={},
     )
+    inner_optimizer = MagicMock(spec=optimizer_type)
+    inner_optimizer.grad_stats_parallel_group = original_grad_group
     optimizer_factory = mocker.patch(
-        "megatron.core.optimizer.get_megatron_optimizer", return_value=MagicMock()
+        "megatron.core.optimizer.get_megatron_optimizer", return_value=inner_optimizer
     )
 
-    get_mimo_optimizer(mimo_model, OptimizerConfig())
+    get_mimo_optimizer(
+        mimo_model,
+        OptimizerConfig(use_distributed_optimizer=True, reuse_grad_buf_for_mxfp8_param_ag=True),
+        module_overrides={MIMO_LANGUAGE_MODULE_KEY: module},
+    )
 
     assert optimizer_factory.call_args.kwargs['param_group_process_group'] is intra_dist_opt
     assert optimizer_factory.call_args.kwargs['pg_collection'] is pg_collection
+    assert optimizer_factory.call_args.kwargs["model_chunks"] == [module]
+    module_config = optimizer_factory.call_args.kwargs["config"]
+    assert not module_config.use_distributed_optimizer
+    assert not module_config.reuse_grad_buf_for_mxfp8_param_ag
+    expected_grad_group = (
+        full_module_group if optimizer_type is FullyShardedOptimizer else original_grad_group
+    )
+    assert inner_optimizer.grad_stats_parallel_group is expected_grad_group
+    if optimizer_type is FullyShardedOptimizer:
+        grid.get_pg.assert_called_once_with(grid.dim_names)
 
 
 def test_mimo_optimizer_stages_each_active_optimizer_before_param_sync():
