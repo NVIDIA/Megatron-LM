@@ -11,6 +11,9 @@ import torch
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    get_containing_parameter_group,
+)
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
@@ -27,6 +30,26 @@ from tests.unit_tests.distributed.mfsdp_v2.mcore_utils import destroy_model_para
 from tests.unit_tests.test_utilities import Utils
 
 logger = logging.getLogger(__name__)
+
+
+def _assert_shard_matches_reference(parameter, reference, *, gradient=False):
+    """Compare the owned packed-buffer slice, including empty parameter shards."""
+    group = get_containing_parameter_group(parameter)
+    index = next(i for i, item in enumerate(group.fsdp_parameters) if item.sharded is parameter)
+    buffer = group.pre_optimizer_main_grad if gradient else group.main_weight
+    actual = parameter.grad if gradient else parameter.detach()
+    owned = buffer._get_owned_range(index)
+    local = actual.to_local().reshape(-1)
+    if owned is None:
+        assert local.numel() == 0
+    else:
+        expected = (
+            reference.detach()
+            .contiguous()
+            .view(-1)
+            .narrow(0, owned.tensor_relative_offset, owned.numel)
+        )
+        torch.testing.assert_close(local, expected)
 
 
 @pytest.fixture
@@ -202,7 +225,8 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup,
             actual, expected = parameters[name].grad, reference_parameters[reference_name].grad
             assert (actual is None) == (expected is None), name
             if expected is not None:
-                torch.testing.assert_close(actual.full_tensor(), expected)
+                assert not any(placement.is_partial() for placement in actual.placements), name
+                _assert_shard_matches_reference(parameters[name], expected, gradient=True)
         # A plain reference model has no DDP hooks maintaining main_grad aliases.
         for parameter in reference_parameters.values():
             if hasattr(parameter, "main_grad"):
@@ -215,9 +239,7 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup,
         success, _, _ = optimizer.step()
         assert success
         for name, reference_name in parameter_mapping.items():
-            torch.testing.assert_close(
-                parameters[name].detach().full_tensor(), reference_parameters[reference_name]
-            )
+            _assert_shard_matches_reference(parameters[name], reference_parameters[reference_name])
         torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
         losses.append(loss)
         reference_losses.append(reference_loss)
