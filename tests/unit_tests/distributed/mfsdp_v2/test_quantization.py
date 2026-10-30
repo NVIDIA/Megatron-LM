@@ -25,6 +25,9 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module_utils import (
+    is_in_backward,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
     BlockAtomic,
     ShardLayout,
@@ -127,16 +130,21 @@ requires_mxfp8 = pytest.mark.skipif(
 )
 
 
-def _allocated_planes(module):
-    """Return whether the module's unsharded (rowwise, columnwise) MXFP8 planes are allocated."""
-    [group] = [g for g in module.parameter_groups if isinstance(g.model_weight, QuantizedDBuffer)]
-    unsharded = group._unsharded_model_weight
-    return unsharded.is_rowwise_allocated, unsharded.is_columnwise_allocated
+def _unsharded_mxfp8_weight(module):
+    """Return the unsharded buffer of the module's single MXFP8 parameter group."""
+    groups = [g for g in module.parameter_groups if isinstance(g.model_weight, QuantizedDBuffer)]
+    assert len(groups) == 1, f"Expected one MXFP8 parameter group, got {len(groups)}."
+    return groups[0]._unsharded_model_weight
 
 
-def _is_recomputing():
-    """Return whether forward runs inside autograd, i.e. as a backward recomputation."""
-    return torch._C._current_graph_task_id() != -1
+def _is_rowwise_allocated(module):
+    """Return whether the module's unsharded MXFP8 rowwise planes are allocated."""
+    return _unsharded_mxfp8_weight(module).is_rowwise_allocated
+
+
+def _is_columnwise_allocated(module):
+    """Return whether the module's unsharded MXFP8 columnwise planes are allocated."""
+    return _unsharded_mxfp8_weight(module).is_columnwise_allocated
 
 
 def _check_recompute_matches_no_recompute(distributed_setup, recipe, build, use_reentrant):
@@ -323,14 +331,16 @@ def test_mxfp8_unshard_gathers_rowwise_for_forward_and_columnwise_for_backward(d
     def check_forward(_module, _args):
         # fc1 runs forward GEMMs and prefetches fc2 for its forward GEMMs.
         for module in (model.fc1, model.fc2):
-            assert _allocated_planes(module) == (True, False)
+            assert _is_rowwise_allocated(module)
+            assert not _is_columnwise_allocated(module)
             assert installed_planes(module) == (True, False)
         checked_phases.append("forward")
 
     def check_backward(_module, _grad_output):
         # fc2 runs data-gradient GEMMs and prefetches fc1 for its data-gradient GEMMs.
         for module in (model.fc2, model.fc1):
-            assert _allocated_planes(module) == (False, True)
+            assert not _is_rowwise_allocated(module)
+            assert _is_columnwise_allocated(module)
             assert installed_planes(module) == (False, True)
         checked_phases.append("backward")
 
@@ -344,7 +354,8 @@ def test_mxfp8_unshard_gathers_rowwise_for_forward_and_columnwise_for_backward(d
 
     assert checked_phases == ["forward", "backward"]
     for module in (model.fc1, model.fc2):
-        assert _allocated_planes(module) == (False, False)
+        assert not _is_rowwise_allocated(module)
+        assert not _is_columnwise_allocated(module)
 
 
 @pytest.mark.launch_on_gb200
@@ -394,7 +405,7 @@ def test_mxfp8_recompute_inside_fsdp_module_matches_no_recompute(distributed_set
         with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
             torch.manual_seed(2026)
             model = _RecomputedBlockWithOwnedProj(device, use_reentrant)
-        with fully_shard_context(device=device):
+        with fully_shard_context(FsdpContext(device=device)):
             fully_shard(model, mesh=mesh, placements=_ZERO3_PLACEMENTS, schedule_policy=policy)
         optimizer = FusedAdam(model.parameters(), lr=0.01)
         fully_shard_optimizer(optimizer)
@@ -426,7 +437,7 @@ def test_mxfp8_backward_unshard_gathers_rowwise_for_recompute_inside_fsdp_module
         model = _RecomputedBlockWithOwnedProj(device, use_reentrant)
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     policy = SchedulePolicy(unshard_all_planes_in_backward=unshard_all_planes_in_backward)
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model, mesh=mesh, placements=_ZERO3_PLACEMENTS, schedule_policy=policy)
 
     # Reentrant checkpointing produces gradients only for inputs requiring grad.
@@ -442,11 +453,13 @@ def test_mxfp8_backward_unshard_gathers_rowwise_for_recompute_inside_fsdp_module
     recomputed = []
 
     def check_recompute(_module, _args):
-        if _is_recomputing():
-            assert _allocated_planes(model) == (True, True)
+        if is_in_backward():
+            assert _is_rowwise_allocated(model)
+            assert _is_columnwise_allocated(model)
             recomputed.append(True)
 
     model.proj.register_forward_pre_hook(check_recompute)
     loss.backward()
     assert recomputed == [True]
-    assert _allocated_planes(model) == (False, False)
+    assert not _is_rowwise_allocated(model)
+    assert not _is_columnwise_allocated(model)
