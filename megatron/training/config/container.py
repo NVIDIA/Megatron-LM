@@ -503,8 +503,7 @@ class PretrainConfigContainer(ConfigContainerBase):
             self.validation.eval_global_batch_size,
             self.validation.eval_micro_batch_size,
         ) = batch_sizes
-        self._validate_rl_config()
-        self._validate_scheduler()
+        self.validate()
         super()._finalize()
         if self.scheduler.weight_decay_incr_style == "constant":
             self.scheduler.start_weight_decay = self.optimizer.weight_decay
@@ -541,7 +540,6 @@ class PretrainConfigContainer(ConfigContainerBase):
 
         # Apply the RL-required layout before DDP allocates its buffers.
         if self.rl.perform_rl_step:
-            self._validate_rl_ddp()
             if self.rl.requires_grad_buffer_offload:
                 self.ddp.grad_buffer_offload = True
 
