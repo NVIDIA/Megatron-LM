@@ -15,6 +15,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
     fused_multimem_rs_add_norm_ag,
     multimem_all_gather,
     multimem_reduce_scatter,
+    pull_reduce_scatter,
 )
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.quantization.utils import mm_mxfp8
@@ -60,6 +61,17 @@ def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
     )
     out = out.view(*x_shape[:-1], -1)
     return out.to(x.dtype)
+
+
+def _use_bi_pull_reduce_scatter(tp_size: int) -> bool:
+    """Batch-invariant TP=2 reduce-scatter over symmetric memory instead of NCCL.
+
+    At two ranks every element is one addition, and the pull kernel's FP32 add rounded
+    once to BF16 is the correctly rounded sum, bitwise equal to NCCL's reduce-scatter that
+    training uses. The NVLS multimem reduction is not: the switch's BF16 addition does not
+    round to nearest even. At TP >= 3 the order matters and NCCL is kept.
+    """
+    return is_batch_invariant_mode_enabled() and tp_size == 2
 
 
 def _apply_linear(
@@ -487,6 +499,21 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             and not is_batch_invariant_mode_enabled()
         )
 
+        if (
+            not can_use_nvls
+            and _use_bi_pull_reduce_scatter(self.tp_size)
+            and self.triton_nvls_kernels_allowed
+            and x.dtype == torch.bfloat16
+            and are_tensors_nvls_eligible(x)
+            and symm_mem_buffer["handle"] is not None
+        ):
+            x = _apply_linear(x, self.weight, self.config, out=symm_mem_buffer["tensor"])
+            output_dims = list(x.size())
+            output_dims[0] = x.size(0) // self.tp_size
+            output = torch.empty(output_dims, dtype=x.dtype, device=x.device)
+            pull_reduce_scatter(output, x, symm_mem_buffer["handle"])
+            return output
+
         if can_use_nvls:
             # Write output of matmul directly onto the symmetric memory buffer
 
@@ -651,6 +678,23 @@ def inference_reduce_scatter_to_sequence_parallel_region(
             output_dims[0] = x.size(0) // tp_size
             output = torch.empty(output_dims, dtype=x.dtype, device=x.device)
             multimem_reduce_scatter(output, symm_mem_buffer["tensor"], symm_mem_buffer["handle"])
+            return output
+
+    if (
+        triton_nvls_kernels_allowed
+        and _use_bi_pull_reduce_scatter(tp_size)
+        and SymmetricMemoryManager.is_initialized("tp")
+        and x.dtype == torch.bfloat16
+        and are_tensors_nvls_eligible(x)
+    ):
+        buf = SymmetricMemoryManager.get_buffer("tp", process_group=tp_group)
+        symm_mem_buffer = buf.maybe_get_tensor(list(x.size()), dtype=x.dtype)
+        if symm_mem_buffer["handle"] is not None:
+            symm_mem_buffer["tensor"].copy_(x)
+            output_dims = list(x.size())
+            output_dims[0] = x.size(0) // tp_size
+            output = torch.empty(output_dims, dtype=x.dtype, device=x.device)
+            pull_reduce_scatter(output, symm_mem_buffer["tensor"], symm_mem_buffer["handle"])
             return output
 
     return reduce_scatter_to_sequence_parallel_region(x, group=tp_group)

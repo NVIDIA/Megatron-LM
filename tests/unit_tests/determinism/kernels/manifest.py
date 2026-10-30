@@ -724,6 +724,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "order is hardware defined and needs an NVLink peer group. Batch-invariant mode routes around them.",
     ),
     KernelEntry(
+        name="inference_pull_reduce_scatter",
+        sources=("megatron/core/inference/communication/torch_symm_triton/pull_collectives.py",),
+        tests=("tests/unit_tests/inference/test_pull_reduce_scatter.py",),
+        kind="triton",
+        training_path=False,
+        notes="Batch-invariant TP=2 reduce-scatter: FP32 rank-order sum of plain NVLink loads, "
+        "checked bitwise against NCCL's reduce-scatter on activations and on every BF16 bit "
+        "pattern against a set of edge cases (signed zeros, subnormals, overflow, ties, NaN).",
+    ),
+    KernelEntry(
         name="unified_memory_allocator",
         sources=("megatron/core/inference/unified_memory.py",),
         kind="cuda-ext",
