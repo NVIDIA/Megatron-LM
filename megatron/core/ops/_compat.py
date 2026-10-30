@@ -50,7 +50,9 @@ class _ForwarderModule(ModuleType):
     the value they saved, so nested patches unwind by assignment, and remove a name it did not
     hold by deleting it. Deleting the name, or assigning the original back as ``monkeypatch``
     does before pytest 9.2, ends the write and restores what the implementation held before
-    it. Reads of a written name still come from the implementation.
+    it. A first write starts one even when it assigns the value the name already has, so the
+    deletion that undoes it has a write to end. Reads of a written name still come from the
+    implementation.
     """
 
     def __getattribute__(self, name: str) -> object:
@@ -72,10 +74,10 @@ class _ForwarderModule(ModuleType):
             super().__setattr__(name, value)
             return
         owner = namespace[_OWNER](name)
-        original = originals.setdefault(name, vars(owner).get(name, _MISSING))
-        if value is original:
+        if name in originals and value is originals[name]:
             del originals[name], namespace[name]
         else:
+            originals.setdefault(name, vars(owner).get(name, _MISSING))
             namespace[name] = value
         setattr(owner, name, value)
 

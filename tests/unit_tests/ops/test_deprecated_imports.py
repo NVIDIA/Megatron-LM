@@ -187,6 +187,32 @@ def test_synthetic_forwarder_writes_reach_the_implementation(synthetic_forwarder
     assert first.public is original and 'public' not in vars(module)
 
 
+@pytest.mark.parametrize('create', [False, True], ids=['existing', 'create'])
+def test_synthetic_forwarder_same_value_writes(synthetic_forwarder, monkeypatch, create):
+    """Writing the value a name already holds through the old path starts a write like any other."""
+    package, targets = synthetic_forwarder
+    if len(targets) == 2:
+        pytest.skip('a forwarder with several targets refuses writes')
+    with pytest.warns(DeprecationWarning):
+        module = importlib.import_module(f'{package}.legacy')
+    first = importlib.import_module(targets[0])
+    original = first.public
+    with mock.patch.object(module, 'public', module.public, create=create):
+        assert first.public is original and module.public is original
+    assert first.public is original and 'public' not in vars(module)
+    with mock.patch(f'{package}.legacy.public', original, create=create):
+        assert first.public is original
+    assert first.public is original and 'public' not in vars(module)
+    monkeypatch.setattr(module, 'public', original)
+    assert first.public is original
+    monkeypatch.undo()
+    assert first.public is original and 'public' not in vars(module)
+    module.public = module.public
+    assert first.public is original
+    del module.public
+    assert first.public is original and 'public' not in vars(module)
+
+
 def test_specs_load_through_forwarders(tmp_path, monkeypatch):
     """``--spec`` and ``(module, name)`` specs resolve names a forwarder serves lazily.
 
