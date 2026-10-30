@@ -89,6 +89,9 @@ class PartitionAdapter:
         cu_seqlens: Optional[torch.Tensor] = None,
         cu_seqlens_padded: Optional[torch.Tensor] = None,
         max_seqlen: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
+        cp_group: Optional[ProcessGroup] = None,
+        tp_cp_group: Optional[ProcessGroup] = None,
     ) -> ContextParallelBatch:
         """Apply CP to all inputs and SP to decoder embeddings.
 
@@ -96,12 +99,23 @@ class PartitionAdapter:
         batch-first as ``[B, S, ...]`` except multi-axis position IDs, which arrive as
         ``[rope_dim, B, S]``. Under dual-layout CP, the boundary view follows the linear layer
         layout and the second view follows the attention/MTP layout.
+
+        An explicit ``cp_group`` selects this packed microbatch's runtime group, including
+        a singleton for CP1. Omitting it retains the configured static partition.
         """
+        runtime_cp = cp_group is not None
+        if runtime_cp and cu_seqlens is None:
+            raise ValueError("Runtime CP requires packed THD sequence metadata")
+        if tp_cp_group is not None and not runtime_cp:
+            raise ValueError("A runtime TP x CP group requires an explicit runtime CP group")
+        if runtime_cp and self.cfg.seq_parallel and get_pg_size(self.cfg.tp_group) > 1:
+            if tp_cp_group is None:
+                raise ValueError("Runtime CP with sequence parallelism requires a TP x CP group")
+        cp_group = cp_group if runtime_cp else self.cfg.cp_group
+        use_cp = cp_group.size() > 1 if runtime_cp else self.cfg.use_cp
         self._validate_sequence_length(embeddings, is_packed=cu_seqlens is not None)
 
-        is_multiaxis_position_ids = (
-            self.cfg.use_cp and position_ids is not None and position_ids.dim() == 3
-        )
+        is_multiaxis_position_ids = use_cp and position_ids is not None and position_ids.dim() == 3
         position_metadata = (
             position_ids.movedim(0, -1).contiguous() if is_multiaxis_position_ids else position_ids
         )
@@ -111,28 +125,33 @@ class PartitionAdapter:
             "labels": labels,
             "loss_mask": loss_mask,
             "mtp_input_mask": mtp_input_mask,
+            "padding_mask": padding_mask,
             "decoder_input": (
                 embeddings.transpose(0, 1).contiguous()
-                if self.cfg.use_cp and embeddings is not None
+                if use_cp and embeddings is not None
                 else embeddings
             ),
             "cu_seqlens": cu_seqlens,
             "cu_seqlens_padded": cu_seqlens_padded,
             "max_seqlen": max_seqlen,
         }
+        if runtime_cp:
+            batch["local_cp_size"] = torch.tensor(cp_group.size(), dtype=torch.int32)
+            batch["hybrid_cp_group"] = cp_group
 
         additional_layouts = set()
-        if self.cfg.use_cp and self.cfg.linear_cp_layout != self.cfg.attention_cp_layout:
+        if use_cp and self.cfg.linear_cp_layout != self.cfg.attention_cp_layout:
             additional_layouts.add(self.cfg.attention_cp_layout)
         cp_batch = get_batches_on_this_cp_rank(
             batch,
             boundary_layout=self.cfg.linear_cp_layout,
-            dynamic_cp=False,
-            cp_group=self.cfg.cp_group,
+            dynamic_cp=runtime_cp,
+            cp_group=cp_group,
             additional_layouts=additional_layouts,
+            use_per_sequence_balancing=cu_seqlens is not None,
             sequence_parallel=self.cfg.seq_parallel,
             tp_group=self.cfg.tp_group,
-            tp_cp_group=self.cfg.tp_cp_group,
+            tp_cp_group=tp_cp_group if runtime_cp else self.cfg.tp_cp_group,
             tokens_per_sample=self.cfg.max_seq_len,
         )
 
@@ -148,7 +167,7 @@ class PartitionAdapter:
         # between layouts after each layer instead. Drop these references before model forward.
         for layout_batch in cp_batch.batches_by_layout.values():
             layout_batch.pop("decoder_input", None)
-        if self.cfg.use_cp and local_embeddings is not None:
+        if use_cp and local_embeddings is not None:
             local_embeddings = local_embeddings.transpose(0, 1).contiguous()
         if self.cfg.seq_parallel and local_embeddings is not None:
             local_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(

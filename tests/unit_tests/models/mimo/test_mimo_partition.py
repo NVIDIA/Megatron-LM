@@ -359,6 +359,143 @@ def _expected_cp_zigzag_shard(tensor: torch.Tensor, cp_size: int, cp_rank: int) 
 
 
 @pytest.mark.experimental
+def test_runtime_cp_switch_preserves_packed_positions_masks_and_gradients():
+    """One adapter follows CP4/CP1/CP2, keeping logical lengths and both physical layouts."""
+    Utils.initialize_distributed()
+    world = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank()
+    sizes = [size for size in (1, 2, 4) if world % size == 0]
+    groups = {}
+    for size in sizes:
+        for start in range(0, world, size):
+            group = torch.distributed.new_group(list(range(start, start + size)))
+            if start <= rank < start + size:
+                groups[size] = group
+    device = torch.device("cuda", torch.cuda.current_device())
+    tokens = torch.arange(16, device=device).unsqueeze(0)
+    positions = torch.stack((tokens + 17, tokens * 3 + 41))
+    padding = torch.tensor([[False] * 5 + [True] * 3 + [False] * 7 + [True]], device=device)
+    tokens = tokens.masked_fill(padding, 0)
+    embedding_table = torch.arange(1, 33, device=device).float().reshape(16, 2)
+    labels = tokens + 101
+    loss_mask = (~padding).float()
+    mtp_mask = (tokens % 3 != 0) & ~padding
+    logical = torch.tensor([0, 5, 12], dtype=torch.int32, device=device)
+    physical = torch.tensor([0, 8, 16], dtype=torch.int32, device=device)
+    try:
+        for boundary in ("contiguous", "zigzag"):
+            adapter = PartitionAdapter(
+                PartitionConfig(
+                    seq_parallel=False,
+                    use_cp=world > 1,
+                    tp_comm_overlap=False,
+                    max_seq_len=16,
+                    kv_format="thd",
+                    linear_cp_layout=boundary,
+                    attention_cp_layout="zigzag",
+                    cp_group=torch.distributed.group.WORLD,
+                )
+            )
+            for size in [sizes[-1], *sizes, sizes[-1]]:
+                cp_group = groups[size]
+                cp_rank = cp_group.rank()
+                embeddings = torch.nn.functional.embedding(tokens, embedding_table).transpose(0, 1)
+                embeddings.requires_grad_()
+                result = adapter.partition(
+                    embeddings,
+                    tokens,
+                    positions,
+                    labels,
+                    loss_mask,
+                    mtp_mask,
+                    logical,
+                    physical,
+                    torch.tensor(8, dtype=torch.int32, device=device),
+                    padding_mask=padding,
+                    cp_group=cp_group,
+                    tp_cp_group=cp_group,
+                )
+                boundary_indices = None
+                for layout, batch in result.batches_by_layout.items():
+                    if layout == "contiguous" or size == 1:
+                        indices = torch.arange(16, device=device).chunk(size)[cp_rank]
+                    else:
+                        chunks = torch.arange(16, device=device).reshape(2, 2 * size, -1)
+                        indices = chunks[:, [cp_rank, 2 * size - cp_rank - 1]].reshape(-1)
+                    valid = ~padding[:, indices]
+                    zero_padding = layout == "zigzag" and size > 1
+                    for key, source in (
+                        ("tokens", tokens),
+                        ("labels", labels),
+                        ("loss_mask", loss_mask),
+                        ("mtp_input_mask", mtp_mask),
+                    ):
+                        expected = source[:, indices]
+                        if zero_padding:
+                            expected = expected.masked_fill(~valid, 0)
+                        torch.testing.assert_close(batch[key], expected, rtol=0, atol=0)
+                    expected_positions = positions[:, :, indices]
+                    if zero_padding:
+                        expected_positions = expected_positions.masked_fill(~valid.unsqueeze(0), 0)
+                    torch.testing.assert_close(batch["position_ids"], expected_positions)
+                    torch.testing.assert_close(batch["padding_mask"], ~valid)
+                    params = result.get_packed_seq_params(layout)
+                    assert params.local_cp_size == size
+                    assert params.cp_group is cp_group
+                    assert params.tp_cp_group is cp_group
+                    torch.testing.assert_close(batch["cu_seqlens"].squeeze(0), logical)
+                    torch.testing.assert_close(
+                        params.cu_seqlens_q, logical if size > 1 else physical
+                    )
+                    if layout == boundary:
+                        boundary_indices = indices
+                        expected_embeddings = embeddings[indices]
+                        torch.testing.assert_close(batch["decoder_input"], expected_embeddings)
+                        # MIMO embeds before CP; text-only embeds the already partitioned IDs.
+                        # Both must preserve token 0's nonzero embedding at existing padding.
+                        text_embeddings = torch.nn.functional.embedding(
+                            batch["tokens"], embedding_table
+                        ).transpose(0, 1)
+                        torch.testing.assert_close(
+                            batch["decoder_input"], text_embeddings, rtol=0, atol=0
+                        )
+                batch = result.get_batch()
+                (batch["decoder_input"] * (~batch["padding_mask"]).T.unsqueeze(-1)).sum().backward()
+                expected_gradient = torch.zeros_like(embeddings)
+                expected_gradient[boundary_indices] = (
+                    (~padding[:, boundary_indices]).T.unsqueeze(-1).to(expected_gradient.dtype)
+                )
+                torch.testing.assert_close(embeddings.grad, expected_gradient, rtol=0, atol=0)
+                assert adapter.cfg.cp_group is torch.distributed.group.WORLD
+            if boundary == "zigzag" and size > 1:
+                # Removing the final source padding row makes CP insert a new row. It has no
+                # source embedding and must stay zero instead of copying clamped index zero.
+                inserted = adapter.partition(
+                    embeddings[:-1],
+                    tokens[:, :-1],
+                    None,
+                    None,
+                    None,
+                    None,
+                    logical,
+                    torch.tensor([0, 8, 15], dtype=torch.int32, device=device),
+                    torch.tensor(8, dtype=torch.int32, device=device),
+                    cp_group=cp_group,
+                    tp_cp_group=cp_group,
+                )
+                expected = torch.cat((embeddings[:-1], torch.zeros_like(embeddings[:1])))
+                torch.testing.assert_close(
+                    inserted.get_batch()["decoder_input"],
+                    expected[boundary_indices],
+                    rtol=0,
+                    atol=0,
+                )
+    finally:
+        for group in groups.values():
+            torch.distributed.destroy_process_group(group)
+
+
+@pytest.mark.experimental
 @pytest.mark.skipif(
     int(os.environ.get('WORLD_SIZE', '1')) != 8,
     reason="Real MIMO CP/SP sharding tests require an 8-GPU world",
