@@ -137,14 +137,14 @@ def test_setup_callback(monkeypatch, skip_train, rollout_only, optimizer):
         lambda *a: calls.append(("mb", a)),
     )
     cfg = RLConfig(rl_rollout_only=rollout_only)
-    callback = training_setup.RLSetupCallback(cfg, model_provider="provider", model_type="type")
+    callback = training_setup.RLSetupCallback(cfg, model_provider="provider")
 
     callback.on_data_init_start(
         CallbackContext(model=["chunk"], optimizer=optimizer, checkpointing_context={"ckpt": 1})
     )
 
     loop_runs = not skip_train
-    expected = [("inference", (cfg, args, "config(chunk)", "provider", "type"))]
+    expected = [("inference", (cfg, args, "config(chunk)", "provider"))]
     if loop_runs:
         expected += [
             ("ref", (["chunk"], {"ckpt": 1}, args), {"rollout_only": rollout_only}),

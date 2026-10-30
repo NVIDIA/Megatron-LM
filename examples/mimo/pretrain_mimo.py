@@ -31,7 +31,6 @@ from examples.mimo.training.encoder_prefetch import (
 )
 from examples.mimo.training.step import mimo_forward_step
 from examples.mimo.training.topology import create_topology
-from megatron.core.enums import ModelType
 from megatron.core.utils import unwrap_model
 from megatron.training.argument_utils import (
     model_config_from_args,
@@ -156,7 +155,6 @@ def main() -> None:
     pretrain(
         cfg,
         train_valid_test_data_provider,
-        ModelType.encoder_or_decoder,
         mimo_forward_step,
         model_provider=None,
         skip_model_parallel_init=True,
