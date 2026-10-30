@@ -6316,6 +6316,79 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             assert context.request_last_kv_block_id[0].item() == next_block_id
             assert torch.count_nonzero(context.memory_buffer[1, :, next_block_id]) == 0
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("kv_cache_management_mode", ["recompute", "persist"])
+    @torch.inference_mode()
+    def test_abort_while_suspended_keeps_generated_tokens(self, kv_cache_management_mode):
+        """An abort that reaches a suspended engine finishes the request, after resume,
+        with exactly the tokens it had generated.
+
+        A RECOMPUTE suspend without static KV pointers deletes the context's request
+        tensors, so the abort handler must not read them; PERSIST keeps its rows.
+        """
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                kv_cache_management_mode=kv_cache_management_mode,
+                static_kv_memory_pointers=False,
+            )
+        )
+        engine = env.engine
+
+        # Scheduling needs no real logits.
+        def mock_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            logits = torch.zeros(
+                *tokens.shape, env.config.vocab_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            if env.config.materialize_only_last_token_logits:
+                logits = engine.context.last_token_logits(logits).unsqueeze(0)
+            return logits
+
+        engine.controller.inference_wrapped_model.model.forward = mock_forward
+
+        engine._add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.arange(
+                    1, 9, dtype=torch.int64, device=torch.cuda.current_device()
+                ),
+                sampling_params=SamplingParams(num_tokens_to_generate=8, termination_id=-1),
+            )
+        )
+        # A prefill and two decode steps generate 3 of the 8 tokens.
+        for _ in range(3):
+            assert engine.step_modern()["finished_requests"] == []
+        generated = list(engine.get_request(0).generated_tokens)
+        assert len(generated) == 3
+
+        engine.suspend()
+        assert not engine.context.is_tensor_state_allocated
+
+        # The abort arrives through the coordinator socket, as a client cancellation does.
+        engine.is_mp_coordinator = True
+        engine.socket_for_receiving_requests = mock.Mock()
+        engine.socket_for_receiving_requests.recv_multipart.side_effect = [
+            [msgpack.packb([Headers.ABORT_REQUEST.value, 0], use_bin_type=True)],
+            dynamic_engine.zmq.Again,
+        ]
+        engine.model_parallel_publisher_socket = mock.Mock()
+        assert engine.schedule_requests() == 1
+
+        engine.resume()
+        finished = []
+        for _ in range(10):
+            if not engine.has_unfinished_requests():
+                break
+            finished.extend(engine.step_modern()["finished_requests"])
+        assert not engine.has_unfinished_requests()
+        (request,) = finished
+        assert request.status == Status.COMPLETED
+        assert request.generated_tokens == generated
+
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
