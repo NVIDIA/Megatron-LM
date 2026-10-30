@@ -734,11 +734,7 @@ class MLASelfAttention(MultiLatentAttention):
                 is_expert=False,
                 tp_comm_buffer_name='q_down_proj',
                 skip_weight_param_allocation=False,
-                tp_group=(
-                    pg_collection.tp
-                    if q_down_proj_kwargs.get('parallel_mode') != 'duplicated'
-                    else None
-                ),
+                tp_group=pg_collection.tp,
                 name=(name + ".linear_q_down_proj") if name is not None else None,
                 **q_down_proj_kwargs,
             )
@@ -781,11 +777,7 @@ class MLASelfAttention(MultiLatentAttention):
             is_expert=False,
             tp_comm_buffer_name='kv_down_proj',
             skip_weight_param_allocation=False,
-            tp_group=(
-                pg_collection.tp
-                if kv_down_proj_kwargs.get('parallel_mode') != 'duplicated'
-                else None
-            ),
+            tp_group=pg_collection.tp,
             name=(name + ".linear_kv_down_proj") if name is not None else None,
             **kv_down_proj_kwargs,
         )
@@ -1580,11 +1572,7 @@ class FusedMLASelfAttention(MLASelfAttention):
             is_expert=False,
             tp_comm_buffer_name='qkv_down_proj',
             skip_weight_param_allocation=False,
-            tp_group=(
-                pg_collection.tp
-                if qkv_down_proj_kwargs.get('parallel_mode') != 'duplicated'
-                else None
-            ),
+            tp_group=pg_collection.tp,
             name=(name + ".linear_qkv_down_proj") if name is not None else None,
             **qkv_down_proj_kwargs,
         )

@@ -325,6 +325,7 @@ class MoELayer(BaseMoELayer):
                 skip_bias_add=False,
                 skip_weight_param_allocation=False,
                 is_expert=False,
+                tp_group=pg_collection.tp,
                 name=(name + ".fc1_latent_proj") if name is not None else None,
                 **linear_gtp_kwargs,
             )
@@ -344,14 +345,10 @@ class MoELayer(BaseMoELayer):
                 skip_bias_add=False,
                 skip_weight_param_allocation=False,
                 is_expert=False,
+                tp_group=pg_collection.tp,
                 name=(name + ".fc2_latent_proj") if name is not None else None,
                 **linear_gtp_kwargs,
             )
-            if linear_cls is TELinear:
-                # The duplicated operation has no TP execution group. TELinear uses
-                # `_tp_group` only to encode the owning TP replica coordinate in checkpoints.
-                self.fc1_latent_proj._tp_group = pg_collection.tp
-                self.fc2_latent_proj._tp_group = pg_collection.tp
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":

@@ -559,7 +559,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             is_expert=False,
             tp_comm_buffer_name='q_down_proj',
             skip_weight_param_allocation=False,
-            tp_group=None,
+            tp_group=pg_collection.tp,
             name=(name + ".linear_q_down_proj") if name is not None else None,
             **q_down_proj_kwargs,
         )

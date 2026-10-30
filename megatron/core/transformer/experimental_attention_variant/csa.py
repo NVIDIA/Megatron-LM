@@ -493,6 +493,7 @@ class Compressor(MegatronModule):
                 skip_bias_add=False,
                 skip_weight_param_allocation=False,
                 parallel_mode="duplicated",
+                tp_group=self.pg_collection.tp,
                 name=(name + ".linear_wkv") if name is not None else None,
             )
 
@@ -506,6 +507,7 @@ class Compressor(MegatronModule):
                 skip_bias_add=False,
                 skip_weight_param_allocation=False,
                 parallel_mode="duplicated",
+                tp_group=self.pg_collection.tp,
                 name=(name + ".linear_wgate") if name is not None else None,
             )
 
@@ -804,6 +806,7 @@ class CSAIndexer(MegatronModule):
             skip_bias_add=False,
             skip_weight_param_allocation=False,
             parallel_mode="duplicated",
+            tp_group=self.pg_collection.tp,
             name=(name + ".linear_wq_b") if name is not None else None,
         )
 
@@ -819,6 +822,7 @@ class CSAIndexer(MegatronModule):
                 skip_bias_add=False,
                 skip_weight_param_allocation=False,
                 parallel_mode="duplicated",
+                tp_group=self.pg_collection.tp,
                 name=(name + ".linear_weights_proj") if name is not None else None,
             )
 
