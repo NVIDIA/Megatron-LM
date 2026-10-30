@@ -22,6 +22,7 @@ from megatron.core.num_microbatches_calculator import (
     update_num_microbatches,
 )
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.tensor_parallel.gtp_parallel_layout import GTPParallelLayout
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
@@ -256,9 +257,15 @@ class PretrainConfigContainer(ConfigContainerBase):
             raise ValueError("Training model world size must fit within the global launch")
         return world_size
 
-    def get_data_parallel_size(self) -> int:
-        """Return replica DP, excluding batch partitions within GTP weight groups."""
-        world_size = self.get_model_world_size()
+    def get_parallel_layout(self, model_world_size: int) -> GTPParallelLayout:
+        """Build the model's parallel layout without discovering the launch environment.
+
+        ``model_world_size`` is the number of ranks assigned to this model, not
+        necessarily the global launch size. Runtime callers resolve it through
+        ``get_model_world_size()``; callers inspecting a hypothetical layout may
+        supply it directly. Transformer CP already includes GTP sequence shards,
+        whereas the layout's CP excludes them.
+        """
         transformer = self.model.transformer
         tp = transformer.tensor_model_parallel_size
         pp = transformer.pipeline_model_parallel_size
@@ -269,24 +276,22 @@ class PretrainConfigContainer(ConfigContainerBase):
         sequence_shards = transformer.gtp_remat_num_sequence_shards
         if cp % sequence_shards:
             raise ValueError("Runtime context-parallel size must contain the GTP sequence shards")
-        # Runtime CP already includes sequence shards inside each GTP weight group.
-        model_parallel_size = tp * pp * (cp // sequence_shards) * weight_size
-        if world_size % model_parallel_size:
-            raise ValueError(
-                f"world_size ({world_size}) must be divisible by TP x PP x "
-                f"CP x weight-remat size ({model_parallel_size})"
-            )
-        return world_size // model_parallel_size
+        return GTPParallelLayout(
+            world_size=model_world_size,
+            tp=tp,
+            pp=pp,
+            cp=cp // sequence_shards,
+            weight_size=weight_size,
+            num_sequence_shards=sequence_shards,
+        )
+
+    def get_data_parallel_size(self) -> int:
+        """Return replica DP, excluding batch partitions within GTP weight groups."""
+        return self.get_parallel_layout(self.get_model_world_size()).dp
 
     def get_batch_parallel_size(self) -> int:
         """Return independent batch partitions, including GTP batch shards but not CP."""
-        data_parallel_size = self.get_data_parallel_size()
-        transformer = self.model.transformer
-        return (
-            data_parallel_size
-            * transformer.gtp_weight_remat_size
-            // transformer.gtp_remat_num_sequence_shards
-        )
+        return self.get_parallel_layout(self.get_model_world_size()).batch_parallel_size
 
     def finalize_optimizer_config(self, optimizer: OptimizerConfig) -> OptimizerConfig:
         """Derive configured or legacy-built optimizer precision from the finalized model."""

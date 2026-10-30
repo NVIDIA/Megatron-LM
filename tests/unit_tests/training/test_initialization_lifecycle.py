@@ -648,6 +648,17 @@ def test_training_batch_topology_uses_model_config(
     assert telemetry[0]['megatron.train_iters'] == 10
     assert telemetry[0] == global_vars.build_telemetry_resource_attrs(args)
 
+    # Explicit layout inspection must not depend on the actual launch or mutate the config.
+    monkeypatch.setattr(
+        "megatron.training.config.container.safe_get_world_size",
+        Mock(side_effect=AssertionError("Explicit layout must not discover world size")),
+    )
+    before = deepcopy(run_config.to_dict())
+    layout = run_config.get_parallel_layout(2 * (mimo_llm_world_size or world_size))
+    assert layout.dp == 2 * expected_dp
+    assert layout.batch_parallel_size == 2 * expected_batch
+    assert run_config.to_dict() == before
+
 
 @pytest.mark.parametrize("spec", [None, ["local"], ["custom_module", "custom_spec"]])
 def test_bert_spec_is_resolved_at_config_boundary(monkeypatch, tmp_path, run_config, spec):
@@ -1125,10 +1136,20 @@ def test_parallel_size_helpers_reject_invalid_topology(monkeypatch, run_config, 
     for name, value in overrides.items():
         monkeypatch.setattr(run_config.model.transformer, name, value)
     before = deepcopy(run_config.to_dict())
-    for helper in (run_config.get_data_parallel_size, run_config.get_batch_parallel_size):
+    for helper in (
+        run_config.get_data_parallel_size,
+        run_config.get_batch_parallel_size,
+        lambda: run_config.get_parallel_layout(8),
+    ):
         with pytest.raises(ValueError, match=error):
             helper()
     assert run_config.to_dict() == before
+
+
+@pytest.mark.parametrize("model_world_size", [0, -1])
+def test_parallel_layout_rejects_nonpositive_world_size(run_config, model_world_size):
+    with pytest.raises(ValueError, match="Parallel sizes must be positive"):
+        run_config.get_parallel_layout(model_world_size)
 
 
 @pytest.mark.parametrize("adapter", [gpt_config_from_args, hybrid_config_from_args])
