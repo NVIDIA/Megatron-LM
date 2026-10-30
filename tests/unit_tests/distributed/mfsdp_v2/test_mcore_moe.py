@@ -49,7 +49,9 @@ def _assert_shard_matches_reference(parameter, reference, *, gradient=False):
             .view(-1)
             .narrow(0, owned.tensor_relative_offset, owned.numel)
         )
-        torch.testing.assert_close(local, expected)
+        torch.testing.assert_close(
+            local, expected, msg=lambda message: f"{group.fsdp_parameters[index].fqns}: {message}"
+        )
 
 
 @pytest.fixture
@@ -86,9 +88,13 @@ def process_group_collections(distributed_setup):
 
 
 @pytest.mark.parametrize("enable_mhc", [False, True])
-def test_build_train_step_and_clip(process_group_collections, distributed_setup, enable_mhc):
+def test_build_train_step_and_clip(
+    process_group_collections, distributed_setup, enable_mhc, monkeypatch
+):
     """Match dense training with expert-DP sharding, including mHC branch calls."""
     process_group_collection, reference_process_group_collection = process_group_collections
+    # mHC's native mapping matmuls must use FP32 for different local/global batch shapes.
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     world_size = distributed_setup.world_size
     # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
     # initialization instead uses the globally configured EP=2 rank in its RNG seed.
