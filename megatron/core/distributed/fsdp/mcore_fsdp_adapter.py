@@ -45,7 +45,6 @@ from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
-from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
@@ -635,6 +634,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         # Optimizer construction reads this attribute; retain the v1 contract for compatibility.
         self.ddp_config = ddp_config
+
+        # Importing experts at module load creates a cycle through pipeline schedules
+        # and fsdp_dtensor_checkpoint, which then incorrectly marks MFSDP unavailable.
+        from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
 
         if fsdp_unit_modules is None:
             fsdp_unit_modules = [
