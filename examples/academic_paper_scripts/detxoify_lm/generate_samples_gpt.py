@@ -6,42 +6,62 @@
 import json
 import os
 import sys
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir, os.path.pardir)))
-import torch
-from megatron.training import get_args
-from megatron.training import get_tokenizer
-from megatron.training import print_rank_0
-from megatron.training.checkpointing import load_checkpoint
-from megatron.core import mpu
-from megatron.training.arguments import parse_and_validate_args
-from megatron.training.initialize import initialize_megatron
-from megatron.training import get_model
-from megatron.inference.text_generation import generate_and_post_process
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.models.gpt import GPTModel
 from typing import Union
-from megatron.core.transformer.spec_utils import import_module
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.global_vars import set_run_config
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec, get_gpt_layer_local_spec
-from megatron.training.argument_utils import inference_cfg_container_from_args
 
-def model_provider(pre_process=True, post_process=True) -> GPTModel:
+import torch
+
+from megatron.core import mpu
+from megatron.core.models.gpt import GPTModel
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
+from megatron.core.parallel_state import get_registered_process_groups
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    global_process_group_fallback,
+)
+from megatron.core.transformer.spec_utils import import_module
+from megatron.inference.text_generation import generate_and_post_process
+from megatron.training import get_args, get_model, get_tokenizer, print_rank_0
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.checkpointing import load_checkpoint
+from megatron.training.global_vars import set_run_config
+from megatron.training.initialize import initialize_megatron
+
+
+def model_provider(
+    pre_process=True, post_process=True, config=None, pg_collection=None
+) -> GPTModel:
     """Builds the model.
 
     Args:
         pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
         post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
+        config (TransformerConfig, optional): Transformer configuration of the model. Defaults
+            to the one of the arguments.
+        pg_collection (ProcessGroupCollection, optional): Process groups the model is built on;
+            get_model() passes the run's. Omitting it is deprecated: the groups are then built
+            from the global parallel state, with a ProcessGroupFallbackWarning.
 
 
     Returns:
         GPTModel: The returned model
     """
     args = get_args()
+    if pg_collection is None:
+        with global_process_group_fallback(
+            "generate_samples_gpt.model_provider", deprecated_in="0.21", removed_in="0.23"
+        ):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     print_rank_0('building GPT model ...')
-    config = core_transformer_config_from_args(args)
+    if config is None:
+        config = core_transformer_config_from_args(args)
 
     if args.spec is None:
         if args.transformer_impl == 'local':
@@ -76,7 +96,8 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
         parallel_output=False,
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
         position_embedding_type=args.position_embedding_type,
-        rotary_percent=args.rotary_percent
+        rotary_percent=args.rotary_percent,
+        pg_collection=pg_collection,
     )
 
     return model
@@ -231,8 +252,11 @@ def main():
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_megatron()
 
-    # Set up model and load checkpoint
-    model = get_model(model_provider, wrap_with_ddp=False)
+    # Set up model and load checkpoint. The model is built on the groups that
+    # initialize_megatron() registered.
+    model = get_model(
+        model_provider, wrap_with_ddp=False, pg_collection=get_registered_process_groups()
+    )
 
     args = get_args()
 

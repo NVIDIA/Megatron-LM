@@ -45,6 +45,10 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_layer_maps_from_layer_type_list,
 )
 from megatron.core.package_info import __version__ as mcore_version
+from megatron.core.process_groups_config import (
+    resolve_process_groups,
+    warn_global_process_group_fallback,
+)
 from megatron.core.ssm.ops.gdp.metadata import max_gdp_chunk_counts
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.moe.token_dispatcher_inference import (
@@ -428,13 +432,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # Per partition num heads and hidden size.
         num_attention_heads = model_config.num_query_groups or model_config.num_attention_heads
         projection_size = model_config.kv_channels * num_attention_heads
-        pg_collection = inference_config.pg_collection
-        if pg_collection is not None:
-            tp_size = get_pg_size(pg_collection.tp)
-            pp_size = get_pg_size(pg_collection.pp)
-        else:
-            tp_size = model_config.tensor_model_parallel_size
-            pp_size = model_config.pipeline_model_parallel_size
+        # The wrapper, controller and engine built on this context use the same collection.
+        pg_collection = inference_config.resolve_pg_collection()
+        tp_size = get_pg_size(pg_collection.tp)
+        pp_size = get_pg_size(pg_collection.pp)
+        # Token and request padding (`round_up_tokens`, `round_up_requests`) aligns to this
+        # TP size so that each padded batch splits evenly across the model's TP ranks.
+        self.tp_size = tp_size
         self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
         if num_attention_heads >= tp_size:
             self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
@@ -450,23 +454,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self._async_sched_token_offsets = None
 
         # Cache the PP group we should use for PP collectives inside the context.
-        # If the model provides a pg_collection with a pp group, prefer it.
-        # Otherwise:
-        # - for PP=1 we don't need a PP group at all
-        # - for PP>1 we require Megatron parallel_state to be initialized
-        if pg_collection is not None and get_pg_size(pg_collection.pp) > 1:
+        # For PP=1 we don't need a PP group at all.
+        if pp_size > 1:
             self.pipeline_parallel_group = pg_collection.pp
-        elif pp_size > 1:
-            self.pipeline_parallel_group = parallel_state.get_pipeline_model_parallel_group()
         else:
             self.pipeline_parallel_group = None
 
-        if pg_collection is not None:
-            self.expert_model_parallel_group = pg_collection.ep
-        elif parallel_state.get_expert_model_parallel_world_size() > 1:
-            self.expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
-        else:
-            self.expert_model_parallel_group = None
+        self.expert_model_parallel_group = pg_collection.ep
 
         # Optional CPU-side collective for EP batch-dimension sync. Populated by
         # the engine via set_ep_zmq_communicator() when available. When set,
@@ -532,13 +526,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             # AbstractModelInferenceWrapper: Iterable models are rejected). Always pass
             # vp_stage=None into get_num_layers_to_build, consistent with attention inference
             # (e.g. get_transformer_layer_offset(..., vp_stage=None, pp_rank=...)).
-            # When pg_collection is set, use the PP group's rank (same as attention.py).
-            if pg_collection is not None:
-                pp_rank = get_pg_rank(pg_collection.pp)
-            else:
-                pp_rank = None
+            # Use the PP group's rank (same as attention.py).
             self.num_attention_layers = get_num_layers_to_build(
-                model_config, vp_stage=None, pp_rank=pp_rank
+                model_config, vp_stage=None, pp_rank=get_pg_rank(pg_collection.pp)
             )
             self.num_mamba_layers = 0
             self.mamba_conv_states_shape, self.mamba_ssm_states_shape = (None, None)
@@ -918,13 +908,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # exist). The EP>1 dispatchers below reallocate it as part of their own buffer
         # setup, which is harmless.
         InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
+        per_rank_worst_case_token_count = self.round_up_tokens(self.max_tokens, tp_size) // tp_size
         if self._nccl_ep_dispatcher:
             NCCLAllGatherDispatcher.allocate_buffers()
         elif self._nvls_dispatcher:
             # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
             NVLSAllGatherVDispatcher.allocate_buffers(
-                per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens) // tp_size,
+                per_rank_worst_case_token_count=per_rank_worst_case_token_count,
                 topk=model_config.moe_router_topk,
                 hidden_size=moe_hidden_size,
                 ep_group=self.expert_model_parallel_group,
@@ -942,9 +933,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
             # Worst-case rows entering the MoE: the fixed NVLS AGV buffer height
             # (per-rank worst case * ep_size); max_tokens covers the EP=1 / NCCL paths.
-            moe_max_rows = max(
-                self.max_tokens, self.round_up_tokens(self.max_tokens) // tp_size * ep_size
-            )
+            moe_max_rows = max(self.max_tokens, per_rank_worst_case_token_count * ep_size)
             VllmFusedMoeBuffers.allocate_buffers(
                 max_tokens=moe_max_rows,
                 topk=model_config.moe_router_topk,
@@ -1768,30 +1757,58 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             # The MTP scratch buffers hang off `self.mtp_metadata`, so the sweep above misses them.
             self.mtp_metadata.deallocate()
 
+    @staticmethod
+    def _global_tp_size(owner: str) -> int:
+        """Return the global tensor model parallel size, for a caller of `owner` without `tp_size`.
+
+        This compatibility fallback is deprecated and warns once per `owner`. It returns 1 when
+        `parallel_state` is not initialized.
+        """
+        if not parallel_state.is_initialized():
+            warn_global_process_group_fallback(
+                owner, "tp_size", deprecated_in="0.21", removed_in="0.23"
+            )
+            return 1
+        pg_collection = resolve_process_groups(
+            None,
+            owner=owner,
+            required=("tp",),
+            argument="tp_size",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        return get_pg_size(pg_collection.tp)
+
     @classmethod
     def round_up_tokens(cls, value, tp_size=None):
-        """Round up to nearest multiple of `TOKEN_ROUNDER` that is also divisible by tensor model parallel size."""
+        """Round up to nearest multiple of `TOKEN_ROUNDER` that is also divisible by tensor model parallel size.
+
+        Args:
+            value (int): Token count to round up.
+            tp_size (Optional[int]): Tensor model parallel size to align to. A context passes its
+                own `tp_size`. If None, the global tensor model parallel size is used (1 when
+                `parallel_state` is not initialized); that fallback is deprecated.
+        """
         # Make sure divisible by TP size
         if tp_size is None:
-            # Check if parallel state is initialized before trying to get TP size
-            if parallel_state.is_initialized():
-                tp_size = parallel_state.get_tensor_model_parallel_world_size()
-            else:
-                tp_size = 1
+            tp_size = cls._global_tp_size(f"{cls.__name__}.round_up_tokens")
         token_rounder = math.ceil(cls.TOKEN_ROUNDER / tp_size) * tp_size
 
         return token_rounder * int(math.ceil(int(value) / token_rounder))
 
     @classmethod
     def round_up_requests(cls, value, tp_size=None):
-        """Round up to nearest multiple of `REQUEST_ROUNDER` that is also divisible by tensor model parallel size."""
+        """Round up to nearest multiple of `REQUEST_ROUNDER` that is also divisible by tensor model parallel size.
+
+        Args:
+            value (int): Request count to round up.
+            tp_size (Optional[int]): Tensor model parallel size to align to. A context passes its
+                own `tp_size`. If None, the global tensor model parallel size is used (1 when
+                `parallel_state` is not initialized); that fallback is deprecated.
+        """
         # Make sure divisible by TP size
         if tp_size is None:
-            # Check if parallel state is initialized before trying to get TP size
-            if parallel_state.is_initialized():
-                tp_size = parallel_state.get_tensor_model_parallel_world_size()
-            else:
-                tp_size = 1
+            tp_size = cls._global_tp_size(f"{cls.__name__}.round_up_requests")
         request_rounder = math.ceil(cls.REQUEST_ROUNDER / tp_size) * tp_size
 
         return request_rounder * int(math.ceil(int(value) / request_rounder))
@@ -2636,22 +2653,25 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             if self.is_decode_only():
                 if self.num_speculative_tokens > 0:
                     padded_decode_req_count = min(
-                        self.max_requests, self.round_up_requests(self.num_decode_requests)
+                        self.max_requests,
+                        self.round_up_requests(self.num_decode_requests, self.tp_size),
                     )
                     padded_token_count = padded_decode_req_count * (self.num_speculative_tokens + 1)
                 else:
                     padded_token_count = min(
                         self.max_tokens,
                         self.max_requests,
-                        self.round_up_tokens(self.active_token_count),
+                        self.round_up_tokens(self.active_token_count, self.tp_size),
                     )
                     padded_decode_req_count = padded_token_count
                 padded_prefill_req_count = 0
             else:
-                padded_token_count = self.round_up_tokens(self.active_token_count)
+                padded_token_count = self.round_up_tokens(self.active_token_count, self.tp_size)
                 target_padding_req_count = min(
                     self.max_requests,
-                    self.round_up_requests(self.total_request_count - self.paused_request_count),
+                    self.round_up_requests(
+                        self.total_request_count - self.paused_request_count, self.tp_size
+                    ),
                 )
                 padded_decode_req_count = self.num_decode_requests
                 padded_prefill_req_count = target_padding_req_count - padded_decode_req_count

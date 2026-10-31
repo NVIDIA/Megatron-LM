@@ -6,6 +6,7 @@ import os
 import random
 import time
 import warnings
+from dataclasses import fields
 from datetime import timedelta
 from typing import Optional
 
@@ -17,7 +18,12 @@ from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_trai
 from megatron.core.fusions.fused_bias_geglu import bias_geglu
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
-from megatron.core.parallel_state import create_group
+from megatron.core.parallel_state import ParallelStateDeprecationWarning, create_group
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    enable_strict_process_group_fallbacks,
+    global_process_group_fallback,
+)
 from megatron.core.rerun_state_machine import (
     RerunDiagnostic,
     RerunErrorInjector,
@@ -52,6 +58,23 @@ from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
 logger = logging.getLogger(__name__)
 
+# --lazy-mpu-init sets rank and size overrides of the global grid, which Megatron Core 0.21
+# deprecates with the accessors that read them, under the N+2 policy in
+# docs/api-backwards-compatibility-check.md.
+_LAZY_MPU_INIT_DEPRECATION = (
+    "megatron.core.parallel_state.set_tensor_model_parallel_world_size() and "
+    "set_tensor_model_parallel_rank() are deprecated since Megatron Core 0.21 and will be removed "
+    "in 0.23. --lazy-mpu-init calls them so that the parallel_state accessors return the "
+    "tensor-model-parallel size and rank before the function that initialize_megatron() returns "
+    "builds the parallel grid. Build the model after calling that function instead, on the "
+    "process groups that it registers: "
+    "megatron.core.parallel_state.get_registered_process_groups()."
+)
+
+# The data-parallel groups that a collection of the parallel grid must set: the parallel_state
+# accessors that ProcessGroupCollection.use_mpu_process_groups() reads them with assert it.
+_REQUIRED_GRID_GROUPS = ("dp", "dp_gtp_remat", "dp_cp", "dp_cp_gtp_remat", "intra_dp_cp")
+
 
 def initialize_megatron(
     allow_no_cuda=False,
@@ -70,6 +93,7 @@ def initialize_megatron(
     *,
     training: bool = False,
     build_tokenizer: bool = True,
+    seed_pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -81,6 +105,11 @@ def initialize_megatron(
     `training` enables training rerun, checkpoint workers, autoresume and dataset
     compilation in addition to the shared distributed execution and RNG setup.
     `build_tokenizer` is False for workloads that provide their own tokenization.
+    `seed_pg_collection` seeds the random number generators from the process
+    groups of the model being trained. Without it, they are seeded from the
+    collection of the parallel grid that this function builds or that was
+    initialized before this call, or from the mpu globals when there is no
+    grid (for example with `skip_model_parallel_init`).
     Returns a function to finalize distributed env initialization
     (optionally, only when cfg.dist.lazy_mpu_init == True)
     """
@@ -112,6 +141,11 @@ def initialize_megatron(
 
     # set logging level
     setup_logging()
+
+    if args.strict_process_group_fallbacks:
+        # Ahead of distributed initialization, seeding and model construction, so that any
+        # fallback to the global process groups from here on raises on the rank that reaches it.
+        enable_strict_process_group_fallbacks()
 
     if training and args.async_save and args.use_persistent_ckpt_worker:
         init_persistent_async_worker(args.rank, 'forkserver')
@@ -153,11 +187,13 @@ def initialize_megatron(
         cfg = get_run_config()
         args = get_args()
         # Pytorch distributed.
-        _initialize_distributed(
+        grid_pg_collection = _initialize_distributed(
             get_embedding_ranks,
             get_position_embedding_ranks,
             store,
             skip_model_parallel_init=skip_model_parallel_init,
+            # Only seeding from the grid reads the groups of a grid set up before this call.
+            read_initialized_grid=not skip_random_seed and seed_pg_collection is None,
         )
 
         # Single-rank log helpers write on rank 0 by default. Non-colocated MIMO puts the
@@ -183,6 +219,9 @@ def initialize_megatron(
                 tp_group=seed_tp_group,
                 ep_group=seed_ep_group,
                 etp_group=seed_etp_group,
+                pg_collection=(
+                    seed_pg_collection if seed_pg_collection is not None else grid_pg_collection
+                ),
             )
 
         # Setup MoE aux loss scale value.
@@ -199,11 +238,17 @@ def initialize_megatron(
         # TODO is this still a necessary option?
         args.use_cpu_initialization = True
         # delayed initialization of DDP-related stuff
-        # We only set basic DDP globals
-        mpu.set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
+        # We only set basic DDP globals. Until the external DDP manager builds the grid, these
+        # overrides are the only source of the tensor-parallel size and rank that the deprecated
+        # parallel_state accessors return. They are deprecated with those accessors: one warning
+        # reports both setters, which therefore do not warn themselves.
+        warnings.warn(_LAZY_MPU_INIT_DEPRECATION, ParallelStateDeprecationWarning, stacklevel=2)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ParallelStateDeprecationWarning)
+            mpu.set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
+            mpu.set_tensor_model_parallel_rank(args.rank)
         # and return function for external DDP manager
         # to call when it has DDP initialized
-        mpu.set_tensor_model_parallel_rank(args.rank)
         return finish_mpu_init
     else:
         # Megatron's MPU is the master. Complete initialization right away.
@@ -341,9 +386,66 @@ def _initialize_tp_communicators(
         )
 
 
+def _registered_pg_collection(owner, argument="pg_collection"):
+    """Return a new collection of the process groups registered for this run.
+
+    The groups are those of ``parallel_state.get_registered_process_groups()``: the collection
+    that initialize_model_parallel() builds and registers, or that a framework registers with
+    register_process_groups(). The registered collection is not returned itself, so the caller
+    can add groups, such as ``dp_cp_ag``, to the one it gets. Every field is set, as
+    ProcessGroupCollection.use_mpu_process_groups() sets them from the registered groups: a
+    field that the registered collection leaves unset is None, ``dynamic_cp`` and
+    ``dynamic_tp_cp`` are new dictionaries, ``dynamic_tp_cp`` holds the ``dynamic_cp`` groups
+    when the tensor-parallel size is 1, and ``dp_cp_ag`` and ``expt_dp_ag`` are None.
+
+    A grid that was set up without registering a collection is read from the global parallel
+    state, with a ProcessGroupFallbackWarning that names ``owner`` and ``argument``. This
+    fallback is deprecated in Megatron Core 0.21 and removed in 0.23.
+
+    Args:
+        owner: The function whose caller omitted ``argument``, named by the fallback warning.
+        argument: The argument that would have supplied the process groups.
+
+    Raises:
+        ValueError: The registered collection does not set a data-parallel group (``dp``,
+            ``dp_gtp_remat``, ``dp_cp``, ``dp_cp_gtp_remat`` or ``intra_dp_cp``), or, with
+            dynamic context parallelism, the tensor-parallel group.
+    """
+    registered = mpu.get_registered_process_groups()
+    if registered is None:
+        with global_process_group_fallback(
+            owner, argument, deprecated_in="0.21", removed_in="0.23"
+        ):
+            return ProcessGroupCollection.use_mpu_process_groups()
+    dynamic_cp = dict(registered.dynamic_cp or {})
+    required = _REQUIRED_GRID_GROUPS + (("tp",) if dynamic_cp else ())
+    missing = [name for name in required if getattr(registered, name) is None]
+    if missing:
+        raise ValueError(f"The registered process groups must set {missing}")
+    groups = {
+        field.name: getattr(registered, field.name) for field in fields(ProcessGroupCollection)
+    }
+    groups.update(dp_cp_ag=None, expt_dp_ag=None, dynamic_cp=dynamic_cp)
+    if not dynamic_cp:
+        groups["dynamic_tp_cp"] = {}
+    elif registered.tp.size() == 1:
+        # The runtime context-parallel groups are already the TP x runtime-CP groups.
+        groups["dynamic_tp_cp"] = dict(dynamic_cp)
+    else:
+        groups["dynamic_tp_cp"] = dict(registered.dynamic_tp_cp or {})
+    return ProcessGroupCollection(**groups)
+
+
 def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store,
-                            skip_model_parallel_init=False):
-    """Initialize torch.distributed and core model parallel."""
+                            skip_model_parallel_init=False, read_initialized_grid=True):
+    """Initialize torch.distributed and core model parallel.
+
+    Returns the ProcessGroupCollection of the parallel grid that this call
+    builds, or of the grid that the caller already initialized. Returns None
+    when model-parallel setup is skipped or no CUDA device is present, and,
+    when `read_initialized_grid` is False, for a grid that the caller already
+    initialized.
+    """
     cfg = get_run_config()
     args = get_args()
 
@@ -439,9 +541,16 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
     # (skipped when caller owns model-parallel setup)
+    pg_collection = None
     if device_count > 0 and not skip_model_parallel_init:
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
+            # The groups that the caller registered. Seeding requires each group it reads to be
+            # set, to None when its axis is off, which a framework's collection may leave unset.
+            if read_initialized_grid:
+                pg_collection = _registered_pg_collection(
+                    "initialize_megatron", "seed_pg_collection"
+                )
         else:
             if args.gtp_weight_remat_size > 1 or args.expert_gtp_weight_remat_size > 1:
                 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
@@ -454,7 +563,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             # Dense grid: world_size must be divisible by
             # TP * PP * (runtime_CP / gtp_remat_num_sequence_shards) * GTP_remat.
             # Expert grid: world_size must be divisible by ETP * EP * PP * EGTP_remat.
-            mpu.initialize_model_parallel(
+            pg_collection = mpu.initialize_model_parallel(
                 args.tensor_model_parallel_size,
                 args.pipeline_model_parallel_size,
                 args.virtual_pipeline_model_parallel_size,
@@ -480,17 +589,17 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 sharp_enabled_group=cfg.dist.sharp_enabled_group,
             )
             print_rank_0(
-                f"> initialized tensor model parallel with size "
-                f"{mpu.get_tensor_model_parallel_world_size()}"
+                f"> initialized tensor model parallel with size {get_pg_size(pg_collection.tp)}"
             )
             print_rank_0(
                 f"> initialized gtp weight remat with size "
-                f"{mpu.get_gtp_weight_remat_world_size()}"
+                f"{get_pg_size(pg_collection.gtp_remat)}"
             )
             print_rank_0(
                 f"> initialized pipeline model parallel with size "
-                f"{mpu.get_pipeline_model_parallel_world_size()}"
+                f"{get_pg_size(pg_collection.pp)}"
             )
+    return pg_collection
 
 
 def _init_autoresume():
@@ -515,20 +624,50 @@ def _set_random_seed(
     etp_group: Optional[torch.distributed.ProcessGroup] = None,
     gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
     egtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
+    *,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """Set random seed for reproducability.
 
     The optional parallel groups let a caller without an initialized mpu
     (e.g. a disjoint-grid run) supply the parallel ranks explicitly; each falls
     back to the mpu group when None.
+
+    `pg_collection`, the process groups of the model being seeded, supplies
+    every group that is not passed explicitly, and the mpu globals are not
+    read. Its data-parallel group is `dp_gtp_remat`, the data-distribution
+    group that `mpu.get_data_parallel_rank()` uses by default. Reading a rank
+    from the mpu globals, without the group or the collection, is deprecated
+    and warns with a ProcessGroupFallbackWarning.
     """
     if seed_ is not None and seed_ > 0:
-        # Ensure that different pipeline MP stages get different seeds.
-        pp_rank = get_pg_rank(pp_group) if pp_group is not None else mpu.get_pipeline_model_parallel_rank()
+        if pg_collection is not None:
+            if pp_group is None:
+                pp_group = pg_collection.pp
+            if dp_group is None:
+                dp_group = pg_collection.dp_gtp_remat
+            if pp_group is None or (data_parallel_random_init and dp_group is None):
+                raise ValueError(
+                    "pg_collection must set pp, and dp_gtp_remat when "
+                    "data_parallel_random_init is set, to seed the random number generators"
+                )
+        # Ensure that different pipeline MP stages get different seeds, and with
+        # data_parallel_random_init different data parallel ranks too.
+        pp_rank = get_pg_rank(pp_group) if pp_group is not None else None
+        dp_rank = None
+        if data_parallel_random_init and dp_group is not None:
+            dp_rank = get_pg_rank(dp_group)
+        if pp_rank is None or (data_parallel_random_init and dp_rank is None):
+            # The ranks that no group gives come from the global parallel grid.
+            with global_process_group_fallback(
+                "_set_random_seed", deprecated_in="0.21", removed_in="0.23"
+            ):
+                if pp_rank is None:
+                    pp_rank = mpu.get_pipeline_model_parallel_rank()
+                if data_parallel_random_init and dp_rank is None:
+                    dp_rank = mpu.get_data_parallel_rank()
         seed = seed_ + (100 * pp_rank)
-        # Ensure different data parallel ranks get different seeds
         if data_parallel_random_init:
-            dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
             seed = seed + (10 * dp_rank)
         random.seed(seed)
         np.random.seed(seed)
@@ -559,6 +698,7 @@ def _set_random_seed(
                 egtp_remat_rank=egtp_remat_rank,
                 gtp_remat_world_size=gtp_remat_world_size,
                 egtp_remat_world_size=egtp_remat_world_size,
+                pg_collection=pg_collection,
             )
     else:
         raise ValueError("Seed ({}) should be a positive integer.".format(seed_))
@@ -574,7 +714,12 @@ def write_args_to_tensorboard():
 
 
 def set_jit_fusion_options(tp_size=None):
-    """Set PyTorch JIT layer fusion options."""
+    """Set PyTorch JIT layer fusion options.
+
+    tp_size: tensor-parallel size of the model, which sizes the sequence-parallel warmup
+        shapes. Omitting it is deprecated: with sequence parallelism, the size is then read
+        from the global parallel state, with a ProcessGroupFallbackWarning.
+    """
     # flags required to enable jit fusion kernels
     if is_torch_min_version("2.2.0a0"):
         pass  # we're using torch.compile for jit fusion
@@ -688,8 +833,12 @@ def _warmup_jit_function(tp_size=None):
     # dropout mask, and conditioning them would shift downstream determinism
     # relative to the historical behavior encoded in the golden values.
     if args.sequence_parallel:
-        # tp_size threaded by the caller (hetero MIMO language PGC); None -> mpu.
-        seq_length = args.seq_length // (tp_size or mpu.get_tensor_model_parallel_world_size())
+        if tp_size is None:
+            with global_process_group_fallback(
+                "set_jit_fusion_options", "tp_size", deprecated_in="0.21", removed_in="0.23"
+            ):
+                tp_size = mpu.get_tensor_model_parallel_world_size()
+        seq_length = args.seq_length // tp_size
     else:
         seq_length = args.seq_length
     input = torch.rand(

@@ -13,7 +13,8 @@ import torch
 import torch.nn.functional as F
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
-from megatron.core import mpu, parallel_state
+from megatron.core.pipeline_parallel.utils import is_pp_last_stage
+from megatron.core.utils import get_pg_rank
 from megatron.elastification.arguments import convert_per_lists_to_int_lists
 from megatron.elastification.flextron_config import inject_flextron_config
 from megatron.elastification.flextron_elasticity_hooks import apply_flextron_elasticity_to_model
@@ -55,10 +56,10 @@ class FlextronModelManager:
     def setup_router(self):
         """Initialize the Flextron router if enabled."""
         if getattr(self.config, 'enable_router', False):  # and self.model.pre_process:
-            self.router = FlextronRouter(config=self.config)
+            self.router = FlextronRouter(config=self.config, pg_collection=self.model.pg_collection)
 
             # Make router name pipeline-stage-aware to avoid naming conflicts in PP>1
-            pp_rank = mpu.get_pipeline_model_parallel_rank()
+            pp_rank = get_pg_rank(self.model.pg_collection.pp)
             router_name = f"router_pp{pp_rank}"
 
             # Set the router with pipeline-specific name
@@ -461,7 +462,7 @@ def inject_flextron_forward_logic(model):
                 and getattr(self.config, 'flextron', False)
                 and not getattr(self.config, 'is_flex_eval', False)
             ):
-                if mpu.is_pipeline_last_stage():
+                if is_pp_last_stage(self.pg_collection.pp):
                     return loss, budget_loss
                 else:
                     return loss
