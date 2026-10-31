@@ -305,6 +305,15 @@ EOF
 COPY README.md /workspace/
 RUN uv pip install --no-build-isolation --no-deps -e /workspace
 
+# TE 2.21's LayerNormLinear refactor returns a gathered-size dummy gradient for GTP
+# weights. Match TE Linear's local-parameter shape until the upstream module is fixed.
+# Apply this Python-only patch after native builds so their cache remains reusable.
+COPY docker/patches/transformer-engine-gtp-wgrad.patch /opt/transformer-engine-build-info/
+RUN te_site_packages="$("${UV_PROJECT_ENVIRONMENT}/bin/python" -c \
+        'from importlib.metadata import distribution; print(distribution("transformer-engine").locate_file(""))')" && \
+    patch --batch --forward --fuzz=0 -p1 -d "${te_site_packages}" \
+        < /opt/transformer-engine-build-info/transformer-engine-gtp-wgrad.patch
+
 COPY assets/ /opt/data/
 ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python
 

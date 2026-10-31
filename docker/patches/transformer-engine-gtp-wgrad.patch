@@ -1,0 +1,23 @@
+--- a/transformer_engine/pytorch/module/layernorm_linear.py
++++ b/transformer_engine/pytorch/module/layernorm_linear.py
+@@ -1427,15 +1427,18 @@
+         # Handle custom DDP from mcore.
+         if args.fuse_wgrad_accumulation and hasattr(origin_weight, "grad_added_to_main_grad"):
+             origin_weight.grad_added_to_main_grad = True
++            # Match the local parameter shape, as Linear does for distributed weights.
++            # GTP's main_grad is an unsharded scratch buffer, not the autograd input.
++            wgrad_shape = list(origin_weight.shape)
+             if getattr(origin_weight, "zero_out_wgrad", False):
+                 wgrad = get_dummy_wgrad(
+-                    list(main_grad.shape),
++                    wgrad_shape,
+                     origin_weight.dtype,
+                     zero=True,
+                 )
+             else:
+                 wgrad = get_dummy_wgrad(
+-                    list(main_grad.shape),
++                    wgrad_shape,
+                     origin_weight.dtype,
+                     zero_tensor=getattr(origin_weight, "zero_tensor_dummy_wgrad", False),
+                 )
