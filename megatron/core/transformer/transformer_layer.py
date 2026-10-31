@@ -1742,7 +1742,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         """
         static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
 
-        if not isinstance(self.self_attention, IdentityOp) and (
+        if getattr(self.config, "sequence_packing_scheduler", None) is not None:
+            capacity = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+            offsets = torch.zeros(
+                self.config.cuda_graph_thd_max_packed_sequences + 1,
+                dtype=torch.int32,
+                device=static_inputs["hidden_states"].device,
+            )
+            offsets[1:] = capacity
+            for name in (
+                "cu_seqlens_q",
+                "cu_seqlens_kv",
+                "cu_seqlens_q_padded",
+                "cu_seqlens_kv_padded",
+            ):
+                static_inputs[name] = offsets.clone()
+        elif not isinstance(self.self_attention, IdentityOp) and (
             not self.config.cuda_graph_modules
             or CudaGraphModule.attn in self.config.cuda_graph_modules
         ):
@@ -1835,6 +1850,24 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 submodules += [self.mlp.shared_experts]
         return submodules
 
+    def _reconstruct_packed_graph_inputs(self, kwargs):
+        """Rebuild THD metadata inside capture using graph-static scalar capacities."""
+        if "cu_seqlens_q" not in kwargs:
+            return
+        capacity = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+        kwargs["packed_seq_params"] = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=kwargs.pop("cu_seqlens_q"),
+            cu_seqlens_kv=kwargs.pop("cu_seqlens_kv"),
+            cu_seqlens_q_padded=kwargs.pop("cu_seqlens_q_padded"),
+            cu_seqlens_kv_padded=kwargs.pop("cu_seqlens_kv_padded"),
+            max_seqlen_q=capacity,
+            max_seqlen_kv=capacity,
+            # Runtime packs can contain valid/physical gaps. A fixed True value
+            # avoids a CUDA-to-host tensor comparison during attention capture.
+            pad_between_seqs=True,
+        )
+
     def _te_cuda_graph_capture(self, *args, **kwargs):
         """
         CUDA Graph capture for this layer using TE interface.
@@ -1843,6 +1876,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
            attribute can be set to control the scope of the CUDA graph.
         2. If context is None, it cannot be returned as output.
         """
+        self._reconstruct_packed_graph_inputs(kwargs)
+
         # Record the backward event on cuda graph stream in backward pass.
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
         # and overlaps with the H2D transfer on reload stream.
@@ -1919,6 +1954,26 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             if input_ids is not None:
                 kwargs["input_ids"] = input_ids
 
+        packed = kwargs.get("packed_seq_params")
+        if packed is not None and self.config.sequence_packing_scheduler is not None:
+            kwargs = dict(kwargs)
+            kwargs.pop("packed_seq_params")
+            for name in (
+                "cu_seqlens_q",
+                "cu_seqlens_kv",
+                "cu_seqlens_q_padded",
+                "cu_seqlens_kv_padded",
+            ):
+                offsets = getattr(packed, name)
+                if (
+                    offsets is None
+                    or offsets.numel() != self.config.cuda_graph_thd_max_packed_sequences + 1
+                ):
+                    raise ValueError(
+                        "Packed CUDA graph inputs must use the configured metadata capacity."
+                    )
+                kwargs[name] = offsets
+
         assert (kwargs.get('inference_context') is None) and (
             kwargs.get('packed_seq_params') is None
         ), (
@@ -1927,6 +1982,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             "For inference cuda graph, please use cuda_graph_impl=local instead."
         )
 
+        kwargs["packed_seq_params"] = packed
         if self.config.delay_offload_until_cuda_graph:
             self.off_interface.enter_replay()
 
@@ -1940,7 +1996,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         """Implementation of _te_cuda_graph_replay, separated for replay mode cleanup."""
         # The graph only takes padding_mask when it was captured with that input; the eager MoE
         # steps after the graph keep using the caller's mask from `kwargs`.
-        graph_kwargs = {k: v for k, v in kwargs.items() if k != "padding_mask"}
+        graph_kwargs = {
+            k: v for k, v in kwargs.items() if k not in ("padding_mask", "packed_seq_params")
+        }
         hidden_states = args[0] if args else kwargs["hidden_states"]
         graph_padding_mask = self._te_cuda_graph_padding_mask(
             kwargs.get("padding_mask"), hidden_states.device
@@ -2066,6 +2124,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 *cuda_graph_output,
                 padding_mask=kwargs.get("padding_mask"),
                 input_ids=kwargs.get("input_ids", None),
+                packed_seq_params=kwargs.get("packed_seq_params"),
             )
         return output, context
 
@@ -2117,9 +2176,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 # The attention_mask can be None when there is no padding to the input sequence.
                 # However, an attention_mask Tensor must be passed into cudagraph for replay, so
                 # we create an equivalent zero Tensor as the attention_mask.
-                cudagraph_kwargs["attention_mask"] = get_zero_attention_mask(
-                    hidden_states.size(0), hidden_states.size(1)
-                )
+                if self.config.sequence_packing_scheduler is not None:
+                    cudagraph_kwargs.pop("attention_mask")
+                else:
+                    cudagraph_kwargs["attention_mask"] = get_zero_attention_mask(
+                        hidden_states.size(0), hidden_states.size(1)
+                    )
         except ImportError:
             raise RuntimeError("CUDAGraph requires TransformerEngine, but not installed")
         return tuple(cudagraph_args), cudagraph_kwargs
