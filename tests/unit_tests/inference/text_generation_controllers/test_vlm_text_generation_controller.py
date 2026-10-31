@@ -479,7 +479,7 @@ class TestVLMTextGenerationController:
 
         language_config.language_model_type = "dummy"
         vision_config.vision_model_type = "clip"
-        self.model = LLaVAModel(
+        self.llava_model = LLaVAModel(
             language_transformer_config=language_config,
             language_transformer_layer_spec=ModuleSpec(
                 module=TransformerLayer, submodules=language_layer_submodules
@@ -495,8 +495,8 @@ class TestVLMTextGenerationController:
             img_w=self.img_w,
             patch_dim=14,
         ).cuda()
-        self.image_token_index = self.model.image_token_index
-        self.model = Float16Module(self.model.config, self.model)
+        self.image_token_index = self.llava_model.image_token_index
+        self.model = Float16Module(self.llava_model.config, self.llava_model)
 
         inference_context = StaticInferenceContext(max_batch_size=8, max_sequence_length=2560)
 
@@ -558,9 +558,19 @@ class TestVLMTextGenerationController:
             active_requests[request_id] = inference_request
             all_prompt_tokens[request_id] = copy.deepcopy(prompt_tokens)
 
-        requests = self.text_generation_controller.generate_all_output_tokens_static_batch(
-            active_requests
+        projection_events = []
+        handle = self.llava_model.vision_projection.register_forward_hook(
+            lambda _module, _args, output: projection_events.append(tuple(output.shape))
         )
+        try:
+            requests = self.text_generation_controller.generate_all_output_tokens_static_batch(
+                active_requests
+            )
+        finally:
+            handle.remove()
+
+        assert self.llava_model.img_seq_len == 577
+        assert projection_events == [(577, 1, self.language_hidden_size)]
 
         for request_id, request in requests.items():
             assert (
