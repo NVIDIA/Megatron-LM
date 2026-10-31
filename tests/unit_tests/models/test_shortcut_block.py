@@ -109,7 +109,7 @@ class _FakeMoE(torch.nn.Module):
         """Stand-in for the layer protocol: norm output, residual, and an empty payload."""
         return hidden_states, hidden_states, ()
 
-    def _get_mlp_residual_connection(self, operation):
+    def _get_residual_connection_for_mlp(self, operation):
         if self.config.wide_residual is None:
             return None
         match operation:
