@@ -140,6 +140,7 @@ class LazyMimoStepRuntime(MimoStepRuntime):
         self.live_chunks = {}
         self.encode = self.empty_template = None
         self._round_chunks = ()
+        self._ready_backward = []
 
     def begin_lazy_step(
         self,
@@ -164,21 +165,13 @@ class LazyMimoStepRuntime(MimoStepRuntime):
         self.round_plans = tuple(tuple(plans) for plans in feature_plans)
         self.chunks, self.encode, self.empty_template = chunks, encode, empty_template
 
-    def route(
-        self, plans: Sequence[PackFeaturePlan], cp_group: Optional[ProcessGroup] = None
-    ) -> PackFeatureTransfer:
-        """Encode first-use chunks and rebase this round's source row offsets."""
-        if not self.active or self.pending is not None or self.completed_rounds == self.num_rounds:
-            raise RuntimeError("Routing requires an active step with no pending or exhausted round")
-        index = self.completed_rounds
-        if tuple(plans) != self.round_plans[index]:
-            raise ValueError("Feature plans must follow the source step's saved round order")
-        active = [chunk for chunk in self.chunks if chunk.first_round <= index <= chunk.last_round]
-        self._round_chunks = tuple(
-            chunk for chunk in active if chunk.producer_rank == self.bridge.rank
-        )
-        for chunk in self._round_chunks:
-            if chunk.first_round == index:
+    def _encode_round(self, index: int) -> None:
+        for chunk in self.chunks:
+            if (
+                chunk.producer_rank == self.bridge.rank
+                and chunk.first_round == index
+                and chunk not in self.live_chunks
+            ):
                 with torch.set_grad_enabled(not self.forward_only):
                     features = self.encode(chunk.media_ids)
                 if (
@@ -193,6 +186,37 @@ class LazyMimoStepRuntime(MimoStepRuntime):
                     None if self.forward_only else torch.zeros_like(features, dtype=torch.float32)
                 )
                 self.live_chunks[chunk] = (features, gradient)
+
+    def prefetch_next_round(self) -> None:
+        """Prepare at most one future round on a producer-only rank, without communication.
+
+        Call after sending the current round and draining earlier encoder
+        backwards, so this work can overlap the disjoint decoder's computation.
+        Repeated calls are idempotent; the final round has nothing to prefetch.
+        """
+        if not self.active or self.pending is None:
+            raise RuntimeError("Prefetch requires an active pending round")
+        if self.bridge.rank in self.bridge.decoder_ranks:
+            raise ValueError("Prefetch requires a producer-only rank")
+        if self._ready_backward:
+            raise RuntimeError("Drain ready encoder backwards before prefetching")
+        if self.completed_rounds + 1 < self.num_rounds:
+            self._encode_round(self.completed_rounds + 1)
+
+    def route(
+        self, plans: Sequence[PackFeaturePlan], cp_group: Optional[ProcessGroup] = None
+    ) -> PackFeatureTransfer:
+        """Encode first-use chunks and rebase this round's source row offsets."""
+        if not self.active or self.pending is not None or self.completed_rounds == self.num_rounds:
+            raise RuntimeError("Routing requires an active step with no pending or exhausted round")
+        index = self.completed_rounds
+        if tuple(plans) != self.round_plans[index]:
+            raise ValueError("Feature plans must follow the source step's saved round order")
+        active = [chunk for chunk in self.chunks if chunk.first_round <= index <= chunk.last_round]
+        self._round_chunks = tuple(
+            chunk for chunk in active if chunk.producer_rank == self.bridge.rank
+        )
+        self._encode_round(index)
 
         offsets, rebased = {}, {}
         for chunk in active:
@@ -215,12 +239,21 @@ class LazyMimoStepRuntime(MimoStepRuntime):
             cp_group,
         )
 
-    def complete_round(self, transfer: PackFeatureTransfer) -> None:
-        """Return visual gradients and immediately backward completed chunks."""
+    def complete_round(
+        self, transfer: PackFeatureTransfer, *, defer_encoder_backward: bool = False
+    ) -> None:
+        """Return visual gradients, optionally retaining completed graphs until the next send.
+
+        Deferred graphs belong to one completed round at most. The host must
+        call ``backward_ready`` before completing another round or prefetching.
+        Evaluation releases completed chunks immediately in either mode.
+        """
         if not self.active or transfer is not self.pending or transfer is None:
             raise RuntimeError(
                 "Expected the current pending transfer, not a stale or completed one"
             )
+        if self._ready_backward:
+            raise RuntimeError("Drain ready encoder backwards before completing another round")
         if not self.forward_only:
             gradient = self.bridge.backward(transfer)
             offset = 0
@@ -231,15 +264,26 @@ class LazyMimoStepRuntime(MimoStepRuntime):
             if chunk.last_round == self.completed_rounds:
                 features, gradient = self.live_chunks.pop(chunk)
                 if not self.forward_only and features.requires_grad:
-                    features.backward(gradient.to(features.dtype))
+                    self._ready_backward.append((features, gradient))
         self.pending = None
         self.local_features = self.empty_template
         self._round_chunks = ()
         self.completed_rounds += 1
+        if not defer_encoder_backward:
+            self.backward_ready()
+
+    def backward_ready(self) -> None:
+        """Backpropagate completed chunks locally, optionally while the next transfer is pending."""
+        if not self.active:
+            raise RuntimeError("Encoder backward requires an active source step")
+        for features, gradient in self._ready_backward:
+            features.backward(gradient.to(features.dtype))
+        self._ready_backward.clear()
 
     def finish_backward(self) -> None:
-        """Finish after all chunk graphs have already been backpropagated."""
+        """Drain the last completed chunks before native gradient finalization."""
         self._check_finished(forward_only=False)
         if self.live_chunks:
             raise RuntimeError("Encoder chunks remain live after all decoder rounds")
+        self.backward_ready()
         self._clear()
