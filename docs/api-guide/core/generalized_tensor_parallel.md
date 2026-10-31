@@ -48,7 +48,7 @@ Both `GTP_remat` collectives are prefetched one step ahead, so they overlap the 
     - [2.4 Minimal end-to-end example](#24-minimal-end-to-end-example)
     - [2.5 Tuning knobs](#25-tuning-knobs)
     - [2.6 FP32-accumulation wgrad reduce-scatter (optional)](#26-fp32-accumulation-wgrad-reduce-scatter-optional)
-    - [2.7 NCCL symmetric-memory wgrad reduce-scatter (optional)](#27-nccl-symmetric-memory-wgrad-reduce-scatter-optional)
+    - [2.7 NCCL symmetric-memory GTP communication (optional)](#27-nccl-symmetric-memory-gtp-communication-optional)
     - [2.8 Batch and sequence partitioning within GTP_remat](#28-batch-and-sequence-partitioning-within-gtp_remat)
   - [3. Implementation details](#3-implementation-details)
     - [3.1 GTP\_remat architecture (Mcore ↔ TE integration)](#31-gtp_remat-architecture-mcore--te-integration)
@@ -244,8 +244,8 @@ The table below covers every GTP-related CLI flag and Python knob. "Required" me
 | `--expert-tensor-parallel-num-weight-shards` | **Required** | MoE models (to shard routed-expert weights) | — | Total ETP×EGTP_remat shards per expert weight; EGTP_remat degree = value ÷ ETP. Independent of dense axis. [§2.2](#22-required-flags) |
 | `--tensor-parallel-num-sequence-shards` | **Optional** | Split sequences within dense GTP groups | TP with SP, otherwise 1 | Includes TP/SP. Within each GTP_remat group, ranks are partitioned into batch-shard groups. Each group processes an independent microbatch, with its ranks handling different sequence partitions. [§2.8](#28-batch-and-sequence-partitioning-within-gtp_remat) |
 | `--gtp-remat-reduce-scatter-with-fp32-accumulation` | **Optional** | BF16 wgrads **and** GTP_remat axis ≥ 4 | off | Replaces the ring RS with an all-to-all + local FP32 sum to eliminate per-hop rounding error. Auto-bypassed at axis size ≤ 2. [§2.6](#26-fp32-accumulation-wgrad-reduce-scatter-optional) |
-| `--gtp-remat-nccl-ub` | **Optional** | For enabling symmetric-memory NCCL kernels on supported systems | off | Enables symmetric memory registration for the dense gtp_remat wgrad reduce-scatter path. Takes precedence over fp32-accum on its group; incompatible with `--disable-symmetric-registration`. [§2.7](#27-nccl-symmetric-memory-wgrad-reduce-scatter-optional) |
-| `--gtp-expert-remat-nccl-ub` | **Optional** | For enabling symmetric-memory NCCL kernels on supported systems | off | Enables symmetric memory registration for the routed-expert egtp_remat wgrad reduce-scatter path. [§2.7](#27-nccl-symmetric-memory-wgrad-reduce-scatter-optional) |
+| `--gtp-remat-nccl-ub [ag] [rs]` | **Optional** | For enabling symmetric-memory NCCL kernels on supported systems | off | Enables symmetric memory registration on the dense gtp_remat group. Takes a subset of `{ag, rs}`: `ag` covers the weight all-gather buffers, `rs` the wgrad reduce-scatter send buffers; bare flag enables both. `rs` takes precedence over fp32-accum on its group; incompatible with `--disable-symmetric-registration`. [§2.7](#27-nccl-symmetric-memory-gtp-communication-optional) |
+| `--gtp-expert-remat-nccl-ub [ag] [rs]` | **Optional** | For enabling symmetric-memory NCCL kernels on supported systems | off | Like `--gtp-remat-nccl-ub` but for the routed-expert egtp_remat group. [§2.7](#27-nccl-symmetric-memory-gtp-communication-optional) |
 | `--gtp-remat-opt-in-modules` | **Optional** | MoE models with large `--moe-latent-size` | `[]` | Space-separated list of module tokens to opt in to GTP_remat sharding. Currently supported: `moe_latent_proj` (shards `fc1_latent_proj` / `fc2_latent_proj`; only beneficial when the latent size is large enough to amortize the all-gather). [§1.5](#15-opt-in-minimally-invasive-integration) |
 | `--fp8-param-gather` | **Required** | GTP + `--fp8-recipe mxfp8` | off | Gathers native MXFP8 shard directly; without it the grad-buffer reuse path is unavailable and `arguments.py` asserts. Always paired with `--reuse-grad-buf-for-mxfp8-param-ag`. [§1.3](#13-low-precision-gather-native-fp8--nvfp4-param) |
 | `--reuse-grad-buf-for-mxfp8-param-ag` | **Required** | GTP + `--fp8-recipe mxfp8` | off | Reuses the grad buffer for the MXFP8 all-gather (MXFP8 cannot map into the contiguous param buffer). Must accompany `--fp8-param-gather`. [§1.3](#13-low-precision-gather-native-fp8--nvfp4-param) |
@@ -396,14 +396,20 @@ it** — a different collective over a different process group, so enable either
   `async_op=True`: for this primitive that flag defers the sum, it does not merely return a
   handle. (DDP's own flag sidesteps all this by asserting a single bucket.)
 
-### 2.7 NCCL symmetric-memory wgrad reduce-scatter (optional)
+### 2.7 NCCL symmetric-memory GTP communication (optional)
 
 ```bash
---gtp-remat-nccl-ub         # dense gtp_remat group           default: off
---gtp-expert-remat-nccl-ub  # routed-expert egtp_remat group  default: off
+--gtp-remat-nccl-ub [ag] [rs]         # dense gtp_remat group           default: off
+--gtp-expert-remat-nccl-ub [ag] [rs]  # routed-expert egtp_remat group  default: off
 ```
 
-**Allocates the wgrad reduce-scatter send buffers from an NCCL-window-registered memory pool on the gtp_remat / egtp_remat group, so NCCL runs the reduce-scatter as a single symmetric device kernel — NVLS multimem within an NVLink domain, rail kernels when the group spans domains — instead of a ring.** Only the send side needs registration; the sharded output lands in the ordinary `main_grad`.
+**Allocates GTP communication buffers from an NCCL-window-registered memory pool on the gtp_remat / egtp_remat group, so NCCL runs the collectives as single symmetric device kernels — NVLS multimem within an NVLink domain, rail kernels when the group spans domains — instead of rings.** Each flag takes a subset of `{ag, rs}`; a bare flag enables both.
+
+- **`rs`** registers the wgrad reduce-scatter send buffers. Only the send side needs
+  registration; the sharded output lands in the ordinary `main_grad`.
+- **`ag`** registers the weight all-gather on both sides: the input (the pre-sharded weight
+  storage; under the distributed optimizer, the DDP param buffer the optimizer re-homes params
+  into) and the output (the gathered-weight cache buffers).
 
 | | |
 |---|---|
@@ -425,14 +431,15 @@ it** — a different collective over a different process group, so enable either
   out its own reduce-scatter and reuses the buffer, giving up one overlap to avoid a permanent
   allocation. The wait is skipped under CUDA-graph capture, where the branch would bake into the
   graph.
-- **FP32-accumulation interplay.** A registered pool takes precedence over §2.6 on its group:
+- **FP32-accumulation interplay.** A pool registered with `rs` takes precedence over §2.6 on its group:
   NVLS symmetric reduce-scatters accumulate in fp32 in-switch (NCCL's `multimem.ld_reduce` uses
   `.acc::f32` for bf16), so the group keeps the symmetric reduce-scatter and the fp32-accum
   all-to-all applies only to axes without a pool. E.g. `--gtp-remat-nccl-ub` + §2.6 gives a
   symmetric dense-GTP reduce-scatter and the fp32-accum all-to-all on the EGTP axis.
 - **Independent of `--use-nccl-ub`.** That flag registers DP-group (DDP bucket) buffers; these
   flags cover the gtp_remat axes only.
-- **Pool allocator.** The pools are backed by a VMM allocator implementing [NCCL's
+- **Pool allocator.** The pools, and under `ag` the DDP param buffer, are backed by a VMM
+  allocator implementing [NCCL's
   memory-allocator requirements](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#memory-allocator)
   minimally: unlike `ncclMemAlloc`, memory is mapped only on the allocation's device.
   `ncclMemAlloc` additionally maps every allocation on all P2P-visible peer GPUs, and those

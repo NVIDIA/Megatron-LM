@@ -13,6 +13,7 @@ import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from torch.distributed import _coalescing_manager
 
+import megatron.core.allocator.vmm_symm_allocator as vmm_symm_allocator
 import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -1236,6 +1237,17 @@ class _ParamAndGradBuffer:
             tmp_warmup_tensor = torch.zeros([1], device="cuda")
             torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
             torch.distributed.barrier()
+        elif self.ddp_config.use_distributed_optimizer and any(
+            getattr(p, 'needs_nccl_mem', False) for p in self.params
+        ):
+            # Params opted into symmetric-pool backing so the caller can window-register this
+            # buffer on other comm groups; it registers and warms them itself, so this branch
+            # only allocates. Distopt-gated: without it there is no param_data to back.
+            # Always symmetric: --disable-symmetric-registration is rejected in combination
+            # with --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub at argument validation.
+            pool = vmm_symm_allocator.create_symm_mem_pool()
+            self.nccl_mem_pool = pool
+            mem_alloc_context = functools.partial(torch.cuda.use_mem_pool, pool)
         else:
             # If nccl_ub is False, the allocation context is nullcontext.
             mem_alloc_context = nullcontext
@@ -1761,6 +1773,11 @@ class _ParamAndGradBuffer:
 
     def deregister_nccl_mem_pools(self) -> None:
         """Deregister every live NCCL memory pool owned by this buffer."""
+        if not self.nccl_ub:
+            # Only nccl_ub buffers register their pools on the DP group. A pool created for
+            # params opted in via needs_nccl_mem is registered on other groups by its caller,
+            # which also deregisters it.
+            return
         for pool in self.get_nccl_mem_pools():
             nccl_allocator.deregister_mem_pool(pool, self.data_parallel_group)
 
