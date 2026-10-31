@@ -18,6 +18,7 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from tests.unit_tests.amax_reduction_group_utils import global_amax_groups
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -153,11 +154,11 @@ class TestMimoModelTEQuantizationConfig:
             dtype=torch.bfloat16,
             requires_grad=True,
         )
-        with get_fp8_context(language_config):
+        with get_fp8_context(language_config, pg_collection=global_amax_groups()):
             language_output, _ = language_linear(language_input)
 
         images = torch.randn(1, 3, 224, 224, device="cuda", requires_grad=True)
-        with get_fp8_context(vision_config):
+        with get_fp8_context(vision_config, pg_collection=global_amax_groups()):
             vision_output = model.modality_submodules["images"](
                 encoder_inputs={"clip_encoder": {"x": images}}
             )

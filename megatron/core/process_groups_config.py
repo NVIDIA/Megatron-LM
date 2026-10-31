@@ -604,7 +604,8 @@ class ProcessGroupCollection:
         and fallbacks.
 
         Args:
-            pg_collection: Optional process group collection. If None, uses parallel_state groups.
+            pg_collection: Optional process group collection. If None, uses parallel_state groups;
+                that fallback is deprecated and emits a ``ProcessGroupFallbackWarning``.
             model_chunks: List of model chunks to extract configuration from.
             use_gloo_process_groups: Whether to set up gloo process groups. With a
                 pg_collection, they come from its intra_dp_cp_gloo and intra_expt_dp_gloo fields
@@ -630,6 +631,11 @@ class ProcessGroupCollection:
         from megatron.core.utils import get_model_config
 
         if pg_collection is None:
+            warn_global_process_group_fallback(
+                "ProcessGroupCollection.setup_process_groups_for_optimizer",
+                deprecated_in="0.21",
+                removed_in="0.23",
+            )
             # Use parallel_state groups
             dp_group = parallel_state.get_data_parallel_group(
                 with_context_parallel=False, with_gtp_remat=False, partial_data_parallel=False
@@ -749,7 +755,9 @@ class ProcessGroupCollection:
                     if 'intra_dist_opt' not in pg_set:
                         raise ValueError(
                             "intra_dist_opt process group is required but not provided in "
-                            "pg_collection. Please explicitly set it to None if you don't need it."
+                            "pg_collection. Set it to the ranks of one distributed-optimizer "
+                            "instance, over which the gradient statistics are reduced. None "
+                            "reduces them over the default (WORLD) group, which is deprecated."
                         )
                     intra_dist_opt_group = pg_collection.intra_dist_opt
                 else:
@@ -788,9 +796,10 @@ class ProcessGroupCollection:
             else:
                 expt_tp_pp_with_egtp_remat_group = expt_tp_pp_group
 
-            # GTP weight-shard groups (None when inactive); used to detect whether GTP is on.
-            gtp_remat_group = getattr(pg_collection, 'gtp_remat', None)
-            expt_gtp_remat_group = getattr(pg_collection, 'expt_gtp_remat', None)
+            # GTP weight-shard groups, used to detect whether GTP is on. A collection that does
+            # not set one, or sets it to None, has that axis off.
+            gtp_remat_group = pg_set.get('gtp_remat')
+            expt_gtp_remat_group = pg_set.get('expt_gtp_remat')
 
             # Gloo groups come from the collection. GTP_remat jobs build no Gloo groups (their
             # optimizer uses DCP), so only those may enable Gloo without supplying the groups.
@@ -846,7 +855,8 @@ class ProcessGroupCollection:
         Helper method to set up process groups for DDP with proper validation and fallbacks.
 
         Args:
-            pg_collection: Optional process group collection. If None, uses parallel_state groups.
+            pg_collection: Optional process group collection. If None, uses parallel_state groups;
+                that fallback is deprecated and emits a ``ProcessGroupFallbackWarning``.
             config: Model config to extract context_parallel_size from.
             ddp_config: DDP config to extract num_distributed_optimizer_instances from.
 
@@ -863,6 +873,9 @@ class ProcessGroupCollection:
         logger = logging.getLogger(__name__)
 
         if pg_collection is None:
+            warn_global_process_group_fallback(
+                "DistributedDataParallel", deprecated_in="0.21", removed_in="0.23"
+            )
             # Use parallel_state groups
             return {
                 'dp_group': parallel_state.get_data_parallel_group(
@@ -924,8 +937,8 @@ class ProcessGroupCollection:
                         "but not provided in pg_collection"
                     )
 
-            # 3. Handle expert data parallel group (DDP-specific: create if missing)
-            if hasattr(pg_collection, 'expt_dp') and pg_collection.expt_dp is not None:
+            # 3. Handle expert data parallel group (DDP-specific: create if unset or None)
+            if pg_set.get('expt_dp') is not None:
                 result['expt_dp_group'] = pg_collection.expt_dp
             else:
                 # Create a new group with just the current rank for DDP
@@ -969,9 +982,10 @@ class ProcessGroupCollection:
             result['pp_group'] = pg_collection.pp
             result['ep_group'] = pg_collection.ep
 
-            # GTP weight-shard groups (None when inactive); used to detect whether GTP is on.
-            result['gtp_remat_group'] = getattr(pg_collection, 'gtp_remat', None)
-            result['expt_gtp_remat_group'] = getattr(pg_collection, 'expt_gtp_remat', None)
+            # GTP weight-shard groups, used to detect whether GTP is on. A collection that does
+            # not set one, or sets it to None, has that axis off.
+            result['gtp_remat_group'] = pg_set.get('gtp_remat')
+            result['expt_gtp_remat_group'] = pg_set.get('expt_gtp_remat')
 
             return result
 
@@ -1007,6 +1021,8 @@ def _get_gloo_mirror_group(
 def resolve_gtp_remat_group(
     pg_collection: Optional[Union["ProcessGroupCollection", "MultiModuleProcessGroupCollection"]],
     is_expert: bool,
+    *,
+    owner: Optional[str] = "resolve_gtp_remat_group",
 ) -> Optional[torch.distributed.ProcessGroup]:
     """Resolve the gtp_remat / expt_gtp_remat group for a weight-owning module.
 
@@ -1014,6 +1030,18 @@ def resolve_gtp_remat_group(
     caller passed no collection, or one predating the gtp_remat fields. The fallback keeps
     pre-pg_collection callers working — a collection that does carry the field is always
     honored, including when it holds a custom (non-MPU) group.
+
+    The fallback is deprecated. When the caller names an ``owner``, the fallback warns before it
+    reads the grid, once per owner and argument like every other
+    ``warn_global_process_group_fallback`` call. Under an ``error`` filter on
+    ``ProcessGroupFallbackWarning`` the warning raises before the read and is not recorded, so
+    later fallbacks raise as well. An owner and argument that already warned in this process
+    before the filter was installed do not warn again, so their fallback still reads the grid
+    without raising. The fallback also warns when GTP is off or the grid is not initialized,
+    since the group then comes from the grid as well. With ``owner=None`` it reads the grid
+    without warning (see ``owner`` below). Every caller treats a missing or single-rank group as
+    GTP off, which is what an absent field will mean once the fallback is removed. A collection
+    that sets the field, to None when the axis is off, never reaches the fallback.
 
     A ``MultiModuleProcessGroupCollection`` is unwrapped to the language model's collection
     first: only the per-module collections carry the GTP axes, so the wrapper would
@@ -1023,6 +1051,10 @@ def resolve_gtp_remat_group(
     Args:
         pg_collection: Collection supplied by the caller, or None.
         is_expert: Select the expert axis (``expt_gtp_remat``) instead of the dense one.
+        owner: Name of the class or function the fallback warning names. None only for a
+            caller whose own fallback has already emitted a ``ProcessGroupFallbackWarning``
+            before this call, which covers this read; the fallback then reads the grid without
+            warning again.
     """
     attr = 'expt_gtp_remat' if is_expert else 'gtp_remat'
     if isinstance(pg_collection, MultiModuleProcessGroupCollection):
@@ -1035,10 +1067,48 @@ def resolve_gtp_remat_group(
     # would be unreachable.
     if pg_collection is not None and attr in vars(pg_collection):
         return getattr(pg_collection, attr)
+    if owner is not None:
+        # Warn before reading the grid, so that an error filter raises without reading it.
+        warn_global_process_group_fallback(
+            owner,
+            "pg_collection" if pg_collection is None else f"pg_collection.{attr}",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
     mpu_pgs = ProcessGroupCollection.use_mpu_process_groups(
         required_pgs=['gtp_remat', 'expt_gtp_remat']
     )
     return getattr(mpu_pgs, attr)
+
+
+def amax_reduction_group(
+    pg_collection: ProcessGroupCollection, tp_only_amax_red: bool
+) -> torch.distributed.ProcessGroup:
+    """Return the FP8/FP4 amax reduction group from a model's process-group collection.
+
+    This is the collection counterpart of
+    ``parallel_state.get_amax_reduction_group(with_context_parallel=True, ...)``: amaxes are
+    reduced over ``tp_cp`` (TP x CP) when ``tp_only_amax_red`` is set, and over ``tp_dp_cp``
+    (TP x DP x CP, which also spans the gtp_remat axis like the data-parallel group) otherwise.
+
+    Args:
+        pg_collection: Process groups of the model that owns the quantized modules.
+        tp_only_amax_red: Reduce amaxes only across the tensor- and context-parallel ranks.
+
+    Returns:
+        The group to pass to Transformer Engine as the amax reduction group.
+
+    Raises:
+        ValueError: If the selected group is not set in ``pg_collection`` or is None.
+    """
+    group = pg_collection.tp_cp if tp_only_amax_red else pg_collection.tp_dp_cp
+    if group is None:
+        field_name = 'tp_cp' if tp_only_amax_red else 'tp_dp_cp'
+        raise ValueError(
+            f"FP8/FP4 amax reduction with tp_only_amax_red={tp_only_amax_red} needs "
+            f"pg_collection.{field_name}, but it is not set or is None."
+        )
+    return group
 
 
 @dataclass
@@ -1302,9 +1372,14 @@ def _warn_fallback_to_uninitialized_grid(
 ) -> None:
     """Warn that ``owner`` fell back to an uninitialized grid, naming the groups that are None.
 
-    ``pg_collection`` is the collection built from that grid.
+    ``pg_collection`` is the collection built from that grid. A None GTP weight-remat group
+    means that the axis is off, not the WORLD group, so the warning leaves those groups out.
     """
-    none_groups = [name for name, group in vars(pg_collection).items() if group is None]
+    none_groups = [
+        name
+        for name, group in vars(pg_collection).items()
+        if group is None and name not in ("gtp_remat", "expt_gtp_remat")
+    ]
     if not none_groups:
         warn_global_process_group_fallback(
             owner, argument, deprecated_in=deprecated_in, removed_in=removed_in

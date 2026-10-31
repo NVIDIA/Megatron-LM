@@ -30,6 +30,17 @@ SHIM_CALL = "ProcessGroupCollection.use_mpu_process_groups()"
 GUARDED_IMPORT = "from megatron.core.process_groups_config import resolve_process_groups\n"
 GUARDED_ARGS = "(None, owner='Model', required=('tp',))"
 GUARDED_CALL = "resolve_process_groups" + GUARDED_ARGS
+GTP_IMPORT = "from megatron.core.process_groups_config import resolve_gtp_remat_group\n"
+GTP_CALL = "resolve_gtp_remat_group(None, is_expert=False)"
+WARN_IMPORT = "from megatron.core.process_groups_config import warn_global_process_group_fallback\n"
+WARN = "warn_global_process_group_fallback('f')"
+WARNED_HIT = "f:accessor:parallel_state.get_tensor_model_parallel_group:warned"
+UNWARNED_HIT = "f:accessor:parallel_state.get_tensor_model_parallel_group"
+
+# Allowlisted reads that no fallback warning dominates, although each runs only after one: the
+# read sits under an ``if`` on a value that only a warned fallback leaves None, which the check
+# does not follow. Remove an entry once its read follows the warning in the same block.
+UNWARNED_READS = {}
 
 
 class TestDetection(unittest.TestCase):
@@ -112,6 +123,55 @@ class TestDetection(unittest.TestCase):
                     self.hits(prefix + call), ["<module>:guarded:resolve_process_groups"]
                 )
 
+    def test_flags_the_other_grid_helpers_as_guarded(self):
+        cases = [
+            (GTP_IMPORT, GTP_CALL, "resolve_gtp_remat_group"),
+            (
+                "from ..process_groups_config import resolve_gtp_remat_group as resolve\n",
+                "resolve(pg_collection, True)",
+                "resolve_gtp_remat_group",
+            ),
+            (
+                "from megatron.core import process_groups_config as pgc\n",
+                "pgc.resolve_gtp_remat_group(None, False, owner=None)",
+                "resolve_gtp_remat_group",
+            ),
+            (
+                SHIM_IMPORT,
+                "ProcessGroupCollection.setup_process_groups_for_ddp(None, config, ddp_config)",
+                "setup_process_groups_for_ddp",
+            ),
+            (
+                "from megatron.core.process_groups_config import ProcessGroupCollection as PGC\n",
+                "PGC.setup_process_groups_for_optimizer(pg_collection, model_chunks)",
+                "setup_process_groups_for_optimizer",
+            ),
+        ]
+        for prefix, call, helper in cases:
+            with self.subTest(call=call):
+                self.assertEqual(self.hits(prefix + call), [f"<module>:guarded:{helper}"])
+
+    def test_counts_every_grid_reading_helper_of_process_groups_config(self):
+        # process_groups_config.py is exempt, so each helper there that calls a deprecated
+        # parallel_state function or use_mpu_process_groups() counts at its calls instead.
+        path = REPO_ROOT / "megatron" / "core" / "process_groups_config.py"
+        readers = set()
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+                    continue
+                name = call.func.attr
+                deprecated = (
+                    checker._is_deprecated_accessor(name) or name in checker.DEPRECATED_FUNCTIONS
+                )
+                if name == "use_mpu_process_groups" or (
+                    ast.unparse(call.func.value) == "parallel_state" and deprecated
+                ):
+                    readers.add(node.name)
+        self.assertEqual(readers, {helper.rpartition(".")[2] for helper in checker.GUARDED_HELPERS})
+
     def test_guarded_calls_are_keyed_by_enclosing_scope(self):
         self.assertEqual(
             self.hits(
@@ -128,6 +188,8 @@ class TestDetection(unittest.TestCase):
                 "from megatron.core import process_groups_config as pgc\n"
                 "pgc.require_process_groups(pg_collection, ('tp',), owner='Model')\n"
                 "pgc.warn_global_process_group_fallback('Model')\n"
+                "pgc.ProcessGroupCollection.is_gtp_remat_active({})\n"
+                "pgc.amax_reduction_group(pg_collection, True)\n"
                 "from unrelated import resolve_process_groups\n" + GUARDED_CALL
             ),
             [],
@@ -255,6 +317,7 @@ class TestDetection(unittest.TestCase):
         names = [
             "initialize_model_parallel",
             "destroy_model_parallel",
+            "register_model_parallel_teardown",
             "is_initialized",
             "model_parallel_is_initialized",
             "register_process_groups",
@@ -264,6 +327,56 @@ class TestDetection(unittest.TestCase):
         self.assertEqual(
             self.hits(IMPORT + "\n".join(f"parallel_state.{name}()" for name in names)), []
         )
+
+    def test_registered_collection_is_a_shim_not_an_accessor(self):
+        # The registry replaces the accessors outside Megatron Core and is not deprecated, but it
+        # returns the same global groups: Megatron Core still takes its groups from callers.
+        self.assertFalse(checker._is_deprecated_accessor("get_registered_process_groups"))
+        for prefix, call in [
+            (IMPORT, "parallel_state.get_registered_process_groups()"),
+            ("from megatron.core import mpu\n", "mpu.get_registered_process_groups()"),
+            (
+                "from ..parallel_state import get_registered_process_groups as registered\n",
+                "registered()",
+            ),
+        ]:
+            with self.subTest(call=call):
+                self.assertEqual(
+                    self.hits(prefix + call),
+                    ["<module>:shim:parallel_state.get_registered_process_groups"],
+                )
+
+    def test_counts_only_the_deprecated_parallel_state_functions_as_accessors(self):
+        # A function that parallel_state does not deprecate is not an accessor or a function
+        # entry, even when the accessor naming rule matches it.
+        source = (REPO_ROOT / "megatron" / "core" / "parallel_state.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        retained = [
+            node.name
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and not any("_deprecated_accessor" in ast.unparse(d) for d in node.decorator_list)
+        ]
+        self.assertIn("get_registered_process_groups", retained)
+        counted = [
+            name
+            for name in retained
+            if checker._is_deprecated_accessor(name) or name in checker.DEPRECATED_FUNCTIONS
+        ]
+        self.assertEqual(counted, [])
+
+    def test_forbid_helpers_stub_the_accessors_and_the_registry_getter(self):
+        # The test helpers that forbid the global grid stub what _returns_global_groups selects:
+        # every deprecated accessor, and the registry getter, which returns the same groups.
+        source = (REPO_ROOT / "megatron" / "core" / "parallel_state.py").read_text(encoding="utf-8")
+        functions = [
+            node.name for node in ast.parse(source).body if isinstance(node, ast.FunctionDef)
+        ]
+        selected = {name for name in functions if checker._returns_global_groups(name)}
+        accessors = {name for name in functions if checker._is_deprecated_accessor(name)}
+        self.assertIn("get_tensor_model_parallel_group", accessors)
+        self.assertEqual(selected - accessors, {"get_registered_process_groups"})
+        self.assertEqual(checker.REGISTRY_GETTERS, {"get_registered_process_groups"})
 
     def test_flags_other_deprecated_functions(self):
         names = [
@@ -303,9 +416,9 @@ class TestDetection(unittest.TestCase):
                         self.hits(prefix + call), [f"<module>:function:parallel_state.{name}"]
                     )
 
-    def test_call_after_a_fallback_warning_is_not_guarded(self):
-        # Only resolve_process_groups() is guarded: a direct call keeps its kind even when
-        # warn_global_process_group_fallback() precedes it.
+    def test_call_after_a_fallback_warning_is_warned_not_guarded(self):
+        # Only resolve_process_groups() is guarded: a direct call keeps its kind when
+        # warn_global_process_group_fallback() precedes it, and is classified as warned.
         self.assertEqual(
             self.hits(
                 "from megatron.core import parallel_state, process_groups_config as pgc\n"
@@ -314,7 +427,88 @@ class TestDetection(unittest.TestCase):
                 "        pgc.warn_global_process_group_fallback('schedule', 'vp_size')\n"
                 "        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()\n"
             ),
-            ["schedule:function:parallel_state.get_virtual_pipeline_model_parallel_world_size"],
+            [
+                "schedule:function:parallel_state.get_virtual_pipeline_model_parallel_world_size"
+                ":warned"
+            ],
+        )
+
+    def test_reads_that_a_fallback_warning_dominates_are_warned(self):
+        cases = {
+            "later in the same block": f"def f():\n    {WARN}\n    {CALL}\n",
+            "in a block nested after the warning": (
+                f"def f(group):\n    {WARN}\n    if group is None:\n"
+                f"        for _ in range(1):\n            {CALL}\n"
+            ),
+            "in the same branch": (
+                f"def f(group):\n    if group is None:\n        {WARN}\n        {CALL}\n"
+            ),
+            "in a comprehension": f"def f():\n    {WARN}\n    return [{CALL} for _ in ()]\n",
+            "in a global_process_group_fallback block": (
+                "from megatron.core.process_groups_config import global_process_group_fallback\n"
+                f"def f():\n    with global_process_group_fallback('f'):\n        {CALL}\n"
+            ),
+            "after a warning through a module alias": (
+                "import megatron.core.process_groups_config as pgc\n"
+                f"def f():\n    pgc.{WARN}\n    {CALL}\n"
+            ),
+            "after a function-local relative import": (
+                "from other import warn_global_process_group_fallback\n"
+                "def f(group):\n    if group is None:\n"
+                "        from ..process_groups_config import warn_global_process_group_fallback\n"
+                f"        {WARN}\n        {CALL}\n"
+            ),
+        }
+        for case, body in cases.items():
+            with self.subTest(case=case):
+                self.assertEqual(self.hits(IMPORT + WARN_IMPORT + body), [WARNED_HIT])
+
+    def test_reads_that_no_fallback_warning_dominates_are_unwarned(self):
+        cases = {
+            "before the warning": f"def f():\n    {CALL}\n    {WARN}\n",
+            "after a branch that warns": (
+                f"def f(group):\n    if group is None:\n        {WARN}\n    {CALL}\n"
+            ),
+            "in the other branch": (
+                f"def f(group):\n    if group is None:\n        {WARN}\n"
+                f"    else:\n        {CALL}\n"
+            ),
+            "under a test of a value that only the warned branch sets": (
+                f"def f(group):\n    size = 1\n    if group is None:\n        {WARN}\n"
+                f"        size = None\n    if size is None:\n        {CALL}\n"
+            ),
+            "in a handler of the block that warns": (
+                f"def f():\n    try:\n        {WARN}\n    except ValueError:\n        {CALL}\n"
+            ),
+            "in a function defined after the warning": (
+                f"def f():\n    {WARN}\n    def inner():\n        {CALL}\n"
+            ),
+            "in a lambda defined after the warning": (
+                f"def f():\n    {WARN}\n    return lambda: {CALL}\n"
+            ),
+            "after a warning in another function": f"def g():\n    {WARN}\ndef f():\n    {CALL}\n",
+            "after a warning that is not a statement": (
+                f"def f(group):\n    group or {WARN}\n    {CALL}\n"
+            ),
+            "after an unrelated function of the same name": (
+                "from other import warn_global_process_group_fallback\n"
+                f"def f():\n    {WARN}\n    {CALL}\n"
+            ),
+            "in a block that warns about something else": (
+                f"def f():\n    with other_fallback('f'):\n        {CALL}\n"
+            ),
+        }
+        for case, body in cases.items():
+            with self.subTest(case=case):
+                scope = "f.inner" if "def inner" in body else "f"
+                self.assertEqual(
+                    self.hits(IMPORT + WARN_IMPORT + body), [scope + UNWARNED_HIT.removeprefix("f")]
+                )
+
+    def test_guarded_calls_take_no_warned_suffix(self):
+        self.assertEqual(
+            self.hits(WARN_IMPORT + GUARDED_IMPORT + f"def f():\n    {WARN}\n    {GUARDED_CALL}"),
+            ["f:guarded:resolve_process_groups"],
         )
 
     def test_counts_every_deprecated_parallel_state_function(self):
@@ -481,21 +675,86 @@ class TestRatchet(unittest.TestCase):
         self.assertEqual(self.run_check("--stats"), 0)
         self.assertEqual(self.run_check(), 1)
 
-    def test_stats_reports_guarded_reads_separately(self):
+    def test_stats_reports_guarded_and_warned_reads_separately(self):
         self.source.write_text(
-            IMPORT + CALL + "\n" + GUARDED_IMPORT + GUARDED_CALL, encoding="utf-8"
+            IMPORT
+            + SHIM_IMPORT
+            + GUARDED_IMPORT
+            + WARN_IMPORT
+            + f"{CALL}\n{GUARDED_CALL}\ndef f():\n    {WARN}\n    {CALL}; {SHIM_CALL}\n",
+            encoding="utf-8",
         )
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             self.assertEqual(checker.main(["--stats"]), 0)
         lines = output.getvalue().splitlines()
         self.assertEqual(
-            lines[0], "2 use(s) of global parallel_state across 1 file(s) in megatron/core"
+            lines[0], "4 use(s) of global parallel_state across 1 file(s) in megatron/core"
         )
         self.assertEqual(
-            [line.split() for line in lines[1:]],
-            [["accessor", "1"], ["function", "0"], ["shim", "0"], ["guarded", "1"]],
+            [line.split() for line in lines[1:5]],
+            [["accessor", "2"], ["function", "0"], ["shim", "1"], ["guarded", "1"]],
         )
+        self.assertEqual(
+            lines[5],
+            "3 accessor, function and shim use(s), by whether a fallback warning precedes them",
+        )
+        self.assertEqual([line.split() for line in lines[6:]], [["warned", "2"], ["unwarned", "1"]])
+
+    def test_read_that_loses_its_warning_fails(self):
+        self.write_baseline(IMPORT + WARN_IMPORT + f"def f():\n    {WARN}\n    {CALL}\n")
+        original = self.allowlist.read_bytes()
+        self.assertEqual(json.loads(original)["allowed"], {"megatron/core/sample.py": [WARNED_HIT]})
+        for case, source in {
+            "warning removed": f"def f():\n    {CALL}\n",
+            "warning moved into a branch": (
+                f"def f(group):\n    if group is None:\n        {WARN}\n    {CALL}\n"
+            ),
+        }.items():
+            with self.subTest(case=case):
+                self.source.write_text(IMPORT + WARN_IMPORT + source, encoding="utf-8")
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(checker.main([]), 1)
+                self.assertIn(
+                    "ERROR: 1 allowlisted use(s) of global parallel_state in megatron/core no "
+                    "longer follow a fallback warning",
+                    output.getvalue(),
+                )
+                self.assertIn("megatron/core/sample.py:", output.getvalue())
+                self.assertNotIn("new use(s)", output.getvalue())
+                self.assertEqual(self.run_check("--update"), 1)
+                self.assertEqual(self.allowlist.read_bytes(), original)
+
+    def test_read_that_gains_a_warning_is_recorded(self):
+        self.write_baseline(IMPORT + f"def f():\n    {CALL}\n")
+        self.source.write_text(
+            IMPORT + WARN_IMPORT + f"def f():\n    {WARN}\n    {CALL}\n", encoding="utf-8"
+        )
+        # The unwarned entry is stale until --update records the warned one instead.
+        self.assertEqual(self.run_check(), 1)
+        self.assertEqual(self.run_check("--update"), 0)
+        self.assertEqual(
+            json.loads(self.allowlist.read_text())["allowed"],
+            {"megatron/core/sample.py": [WARNED_HIT]},
+        )
+        self.assertEqual(self.run_check(), 0)
+
+    def test_a_reclassified_read_is_not_spent_by_a_guarded_call(self):
+        # The warned read replaces its own unwarned entry, so the guarded call next to it is new.
+        self.write_baseline(IMPORT + f"def f():\n    {CALL}\n")
+        self.source.write_text(
+            IMPORT
+            + WARN_IMPORT
+            + GUARDED_IMPORT
+            + f"def f():\n    {WARN}\n    {CALL}\n    {GUARDED_CALL}\n",
+            encoding="utf-8",
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(checker.main(["--update"]), 1)
+        self.assertIn("ERROR: 1 new use(s)", output.getvalue())
+        self.assertIn("f:guarded:resolve_process_groups", output.getvalue())
 
     def test_conversion_to_resolve_process_groups_swaps_the_entry(self):
         # One guarded call may replace the shim, or several accessor reads, of its scope.
@@ -515,6 +774,16 @@ class TestRatchet(unittest.TestCase):
                 )
                 self.assertEqual(allowlist["total"], 1)
                 self.assertEqual(self.run_check(), 0)
+
+    def test_conversion_to_another_guarded_helper_swaps_the_entry(self):
+        self.write_baseline(SHIM_IMPORT + "def build():\n    " + SHIM_CALL)
+        self.source.write_text(GTP_IMPORT + "def build():\n    " + GTP_CALL, encoding="utf-8")
+        self.assertEqual(self.run_check(), 1)
+        self.assertEqual(self.run_check("--update"), 0)
+        self.assertEqual(
+            json.loads(self.allowlist.read_text())["allowed"],
+            {"megatron/core/sample.py": ["build:guarded:resolve_gtp_remat_group"]},
+        )
 
     def test_guarded_call_without_a_replaced_read_is_new(self):
         other = self.core / "other.py"
@@ -549,6 +818,34 @@ class TestRatchet(unittest.TestCase):
                 self.assertEqual(self.run_check(), 1)
                 self.assertEqual(self.run_check("--update"), 1)
                 self.assertEqual(self.allowlist.read_bytes(), original)
+
+
+class TestAllowlist(unittest.TestCase):
+    """The committed allowlist grandfathers only reads that warn before they read the grid."""
+
+    def test_allowlisted_reads_are_warned_or_guarded(self):
+        path = REPO_ROOT / "tools" / "process_group_usage_allowlist.json"
+        allowed = json.loads(path.read_text(encoding="utf-8"))["allowed"]
+        unwarned = {}
+        for rel, hits in allowed.items():
+            for hit in hits:
+                if checker._kind(hit) != checker.GUARDED and not hit.endswith(checker.WARNED):
+                    unwarned.setdefault(rel, []).append(hit)
+        if unwarned == UNWARNED_READS:
+            return
+        # The locations of the allowlisted files that still exist; the checker reports the others.
+        locations = [
+            f"{rel}:{lineno}  {identity}"
+            for rel, hits in sorted(unwarned.items())
+            if (REPO_ROOT / rel).is_file()
+            for lineno, identity in checker._violations_in(REPO_ROOT / rel)
+            if identity in hits
+        ]
+        self.assertEqual(
+            unwarned,
+            UNWARNED_READS,
+            "Allowlisted reads that no fallback warning dominates:\n" + "\n".join(locations),
+        )
 
 
 if __name__ == "__main__":

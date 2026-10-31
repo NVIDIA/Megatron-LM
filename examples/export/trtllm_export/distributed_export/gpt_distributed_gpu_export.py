@@ -108,6 +108,7 @@ if __name__ == "__main__":
         on_device_distributed_conversion=True, 
         vocab_size=_VOCAB_SIZE, 
         gpus_per_node=2,
+        pg_collection=gpt_model.pg_collection,
     )
 
     trtllm_helper.build_and_save_engine(

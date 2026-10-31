@@ -8,6 +8,7 @@ import torch
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -126,6 +127,7 @@ class Linear(torch.nn.Linear):
         parallel_mode: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,  # Not used
+        pg_collection: Optional[ProcessGroupCollection] = None,  # Not used
     ):
         if parallel_mode not in (None, "duplicated"):
             raise ValueError(

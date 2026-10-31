@@ -16,9 +16,10 @@ from torch.distributed import ProcessGroup
 
 from megatron.core.fp8_utils import is_float8tensor
 
-from .. import parallel_state, tensor_parallel
+from .. import tensor_parallel
 from ..models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from ..models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from ..process_groups_config import resolve_process_groups
 from ..transformer.transformer_config import TransformerConfig
 from ..transformer.transformer_layer import TransformerLayer
 from .data_parallel_base import _BaseDataParallel
@@ -47,9 +48,10 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
 
             User can set _fsdp_modules attribute on submodules to set additional
             submodules to shard with FSDP.
-        process_group: Optional ProcessGroup to use for distributed operations.
-            If None (default), the data parallel process group will be obtained from
-            parallel_state.get_data_parallel_group(with_context_parallel=True).
+        process_group: The data- and context-parallel group to shard over, including the GTP
+            weight-remat ranks when the model has them (``pg_collection.dp_cp_gtp_remat``). If
+            None, the group comes from the global grid in ``parallel_state``; this fallback is
+            deprecated and emits a ``ProcessGroupFallbackWarning``.
     """
 
     def __init__(
@@ -74,9 +76,16 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         super().__init__(config=config, module=module)
 
         if process_group is None:
-            self.process_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
-        else:
-            self.process_group = process_group
+            # Migration fallback for callers that do not pass process_group.
+            process_group = resolve_process_groups(
+                None,
+                owner=type(self).__name__,
+                argument="process_group",
+                required=("dp_cp_gtp_remat",),
+                deprecated_in="0.21",
+                removed_in="0.23",
+            ).dp_cp_gtp_remat
+        self.process_group = process_group
 
         self.device_mesh = DeviceMesh.from_group(self.process_group, "cuda")
         kwargs = {

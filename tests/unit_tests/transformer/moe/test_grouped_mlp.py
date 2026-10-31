@@ -26,6 +26,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import _add_network_size_args, parse_args
 from megatron.training.initialize import _set_random_seed
+from tests.unit_tests.amax_reduction_group_utils import global_amax_groups
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -1391,7 +1392,7 @@ class TestTEGroupedMLP:
             requires_grad=True,
         )
         probs = torch.rand(hidden.size(0), device="cuda", dtype=torch.float32, requires_grad=True)
-        with get_fp8_context(config):
+        with get_fp8_context(config, pg_collection=global_amax_groups()):
             output, _ = experts(hidden, tokens_per_expert, probs)
         output.backward(torch.randn_like(output))
 

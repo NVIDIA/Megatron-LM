@@ -175,7 +175,12 @@ class LLaVAModel(MegatronModule):
         super().__init__(config=language_transformer_config)
 
         if has_config_logger_enabled(language_transformer_config):
-            log_config_to_disk(language_transformer_config, locals(), prefix=type(self).__name__)
+            log_config_to_disk(
+                language_transformer_config,
+                locals(),
+                prefix=type(self).__name__,
+                pg_collection=pg_collection,
+            )
 
         log_single_rank(
             logging.getLogger(__name__),
@@ -540,7 +545,7 @@ class LLaVAModel(MegatronModule):
                 vision_projection_layer_spec,
                 vision_projection_type,
                 vision_projection_input_size,
-                tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
             )
             # Ignore missing weights for the vision projection during checkpoint loading.
             # This should be disabled by default but can be enabled if your checkpoint contains

@@ -181,6 +181,33 @@ def test_shard_builder_keeps_replica_process_group(monkeypatch):
     assert [call.kwargs["ranks"] for call in new_group.call_args_list] == [[0, 1], [2, 3]]
 
 
+def test_inference_collection_sets_the_gtp_remat_data_parallel_groups(monkeypatch):
+    """GTP_remat is off in an inference model, so its GTP_remat-inclusive DP groups are dp/dp_cp."""
+
+    class StandInGrid:
+        def __init__(self, shape, dim_names, rank_offset=0):
+            pass
+
+        def create_pg(self, dims):
+            return Mock(name=f"group_{dims}")
+
+        def get_rank_enum(self, dims):
+            return [[0]]
+
+    monkeypatch.setattr(shards_module, "HyperCommGrid", StandInGrid)
+    monkeypatch.setattr(shards_module.dist, "get_rank", Mock(return_value=0))
+    monkeypatch.setattr(shards_module.dist, "new_group", Mock())
+
+    pg_collection = shards_module.build_inference_pg_collection(
+        1, tp_size=1, pp_size=1, cp_size=1, ep_size=1, expt_tp_size=1
+    )
+
+    assert pg_collection.dp is not pg_collection.dp_cp
+    assert pg_collection.dp_gtp_remat is pg_collection.dp
+    assert pg_collection.dp_cp_gtp_remat is pg_collection.dp_cp
+    assert pg_collection.gtp_remat is None
+
+
 def test_checkpoint_prefix_warning_uses_replica_group(monkeypatch, caplog):
     from megatron.inference import utils
 

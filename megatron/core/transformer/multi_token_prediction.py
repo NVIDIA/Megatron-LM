@@ -858,6 +858,9 @@ def mtp_on_this_rank(
         warn_global_process_group_fallback("mtp_on_this_rank", "pp_group")
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         pp_size = None
+        if layout is None:
+            # Without a layout, MTP sits on the last pipeline stage, which needs the size.
+            pp_size = parallel_state.get_pipeline_model_parallel_world_size()
     else:
         pp_rank = get_pg_rank(pp_group)
         pp_size = get_pg_size(pp_group)
@@ -884,8 +887,6 @@ def mtp_on_this_rank(
     else:
         # without custom PP layout, we only support put all of MTP layers on the last pipeline stage
         if mtp_num_layers is not None:
-            if pp_size is None:
-                pp_size = parallel_state.get_pipeline_model_parallel_world_size()
             mtp_on_this_rank = pp_rank == pp_size - 1
             if mtp_on_this_rank and not ignore_virtual and vp_size not in (None, 1):
                 assert (
@@ -1413,6 +1414,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             self.config, vp_stage, pp_rank=pg_collection.pp.rank()
         )
         self.vp_stage = vp_stage
+        self.pg_collection = pg_collection
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp if pg_collection is not None else None
         self.mtp_layer_pattern = mtp_layer_pattern
@@ -1593,9 +1595,9 @@ class MultiTokenPredictionLayer(MegatronModule):
     def get_inner_quantization_context(self) -> AbstractContextManager:
         """Return the quantization context for fine-grained MTP execution."""
         if self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed:
-            return get_fp8_context(self.config)
+            return get_fp8_context(self.config, pg_collection=self.pg_collection)
         if self.config.fp4:
-            return get_fp4_context(self.config)
+            return get_fp4_context(self.config, pg_collection=self.pg_collection)
         return nullcontext()
 
     def _get_embeddings(
@@ -1836,11 +1838,15 @@ class MultiTokenPredictionLayer(MegatronModule):
         # different layers, currently MTP only uses a global quantization context.
         # FP8 and FP4 are mutually exclusive.
         if self.config.fp8:
-            quantization_context = get_fp8_context(self.config)
-            transformer_layer_quantization_context = get_fp8_context(self.config)
+            quantization_context = get_fp8_context(self.config, pg_collection=self.pg_collection)
+            transformer_layer_quantization_context = get_fp8_context(
+                self.config, pg_collection=self.pg_collection
+            )
         elif self.config.fp4:
-            quantization_context = get_fp4_context(self.config)
-            transformer_layer_quantization_context = get_fp4_context(self.config)
+            quantization_context = get_fp4_context(self.config, pg_collection=self.pg_collection)
+            transformer_layer_quantization_context = get_fp4_context(
+                self.config, pg_collection=self.pg_collection
+            )
         else:
             quantization_context = nullcontext()
             transformer_layer_quantization_context = nullcontext()
@@ -2037,7 +2043,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         # the inner context entered inside ``_proj_and_transformer_layer``
         # is sufficient.
         if self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed:
-            outer_quantization_context = get_fp8_context(self.config)
+            outer_quantization_context = get_fp8_context(
+                self.config, pg_collection=self.pg_collection
+            )
         else:
             outer_quantization_context = nullcontext()
 
@@ -2389,8 +2397,12 @@ class MultiTokenPredictionBlock(MegatronModule):
         # to the roll_tensor function for proper boundary communication
         if pg_collection is None:
             warn_global_process_group_fallback(type(self).__name__)
-            # hcp feeds TEDotProductAttention's a2a+p2p path in the MTP layers.
-            required_pgs = ['cp', 'hcp', 'tp', 'pp'] + (['dp'] if self.config.mtp_hsm else [])
+            # hcp feeds TEDotProductAttention's a2a+p2p path in the MTP layers. tp_cp and tp_dp_cp
+            # are the FP8/FP4 amax reduction groups of the MTP layers, and gtp_remat the GTP
+            # weight-remat group of their linear layers, which would otherwise warn again.
+            required_pgs = ['cp', 'hcp', 'tp', 'pp', 'tp_cp', 'tp_dp_cp', 'gtp_remat'] + (
+                ['dp'] if self.config.mtp_hsm else []
+            )
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
         # Ensure the provided process groups include TP, CP, and PP.
         for group_name in ('tp', 'cp', 'pp'):
@@ -2412,7 +2424,8 @@ class MultiTokenPredictionBlock(MegatronModule):
                     m.is_repeated_layer = True
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp
-        self.tp_cp_group = getattr(pg_collection, 'tp_cp', None)
+        # Only a sequence-parallel CP layout conversion needs tp_cp, and it raises without one.
+        self.tp_cp_group = vars(pg_collection).get('tp_cp')
         self.pp_rank = pg_collection.pp.rank()
         self.dp_group = pg_collection.dp if self.config.mtp_hsm else None
         self.hidden_state_mixing_rng_tracker_name = (

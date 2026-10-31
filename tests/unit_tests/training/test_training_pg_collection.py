@@ -67,14 +67,14 @@ def _ranks(group):
 
 
 def _forbid_global_grid(monkeypatch):
-    """Make the parallel_state accessors the usage checker counts, and the collection shim built
-    on them, raise when called."""
+    """Make the parallel_state accessors the usage checker counts, the registry getter, and the
+    collection shim built on them, raise when called."""
 
     def read_global_grid(*args, **kwargs):
         raise AssertionError("read a process group of the global parallel grid")
 
     for name, value in list(vars(parallel_state).items()):
-        if callable(value) and _checker._is_deprecated_accessor(name):
+        if callable(value) and _checker._returns_global_groups(name):
             monkeypatch.setattr(parallel_state, name, read_global_grid)
     monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", read_global_grid)
 
