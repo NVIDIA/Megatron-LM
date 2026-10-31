@@ -107,8 +107,8 @@ def test_pinned_offload_buffer_config(size_gib, offload, error):
         assert config.fine_grained_offloading_buffer_size_gib == size_gib
 
 
-def _make_overlap_config(mtp_num_layers: int | None) -> TransformerConfig:
-    return TransformerConfig(
+def _make_overlap_config(mtp_num_layers: int | None, **overrides) -> TransformerConfig:
+    kwargs = dict(
         num_layers=1,
         hidden_size=128,
         num_attention_heads=4,
@@ -119,19 +119,50 @@ def _make_overlap_config(mtp_num_layers: int | None) -> TransformerConfig:
         bf16=True,
         mtp_num_layers=mtp_num_layers,
     )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
 
 
-@pytest.mark.parametrize("mtp_num_layers", [None, 0, 1])
+_FULL_RECOMPUTE_OVERRIDES = dict(
+    recompute_granularity="full",
+    recompute_method="uniform",
+    recompute_num_layers=1,
+    attention_dropout=0.0,
+    hidden_dropout=0.0,
+)
+
+
+@pytest.mark.parametrize("mtp_num_layers", [None, 0, 1, 2, 3])
 def test_ep_a2a_overlap_accepts_supported_mtp_layer_counts(mtp_num_layers: int | None):
     config = _make_overlap_config(mtp_num_layers)
 
     assert config.mtp_num_layers == mtp_num_layers
 
 
-@pytest.mark.parametrize("mtp_num_layers", [-1, 2])
-def test_ep_a2a_overlap_rejects_unsupported_mtp_layer_counts(mtp_num_layers: int):
-    with pytest.raises(AssertionError, match="MTP supports at most one layer"):
-        _make_overlap_config(mtp_num_layers)
+def test_ep_a2a_overlap_rejects_negative_mtp_layer_count():
+    with pytest.raises(AssertionError, match="mtp_num_layers must be non-negative"):
+        _make_overlap_config(-1)
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        ({"mtp_use_repeated_layer": True}, "mtp_use_repeated_layer with mtp_num_layers > 1"),
+        ({"mtp_hsm": True}, "mtp_hsm is not yet supported"),
+        ({"enable_mhc_connections": True}, "enable_mhc_connections with mtp_num_layers > 1"),
+        (_FULL_RECOMPUTE_OVERRIDES, "full recompute with mtp_num_layers > 1"),
+    ],
+)
+def test_ep_a2a_overlap_rejects_unsupported_multi_mtp_features(overrides: dict, match: str):
+    with pytest.raises(AssertionError, match=match):
+        _make_overlap_config(2, **overrides)
+
+
+@pytest.mark.parametrize("overrides", [{"mtp_use_repeated_layer": True}, _FULL_RECOMPUTE_OVERRIDES])
+def test_ep_a2a_overlap_keeps_single_mtp_layer_features(overrides: dict):
+    config = _make_overlap_config(1, **overrides)
+
+    assert config.mtp_num_layers == 1
 
 
 def test_batch_invariant_backend_rejects_unknown_value_at_construction():
