@@ -1599,19 +1599,28 @@ def test_get_batch_caches_config_until_args_replaced(script, monkeypatch):
         for _ in range(2)
     ]
     build_config = MagicMock(side_effect=configs)
-    result = object()
+    # NOTE(nightly-sync 30_10_2026): main's #8525 (51039e527) wrote this test against main's
+    # get_batch, which returns the scheduler result untouched. Dev keeps its frontend
+    # prepare_packed_seq_params hook (see the 26_10_2026 notes in pretrain_gpt.py and
+    # pretrain_hybrid.py), which reads the result's packed-seq metadata, so a bare object()
+    # is not a valid scheduler result on dev. Stub the hook and return a MagicMock: every
+    # main assertion is kept, and the hook must also receive the same cached config.
+    result = MagicMock()
     fetch_batch = MagicMock(return_value=result)
+    prepare = MagicMock()
     monkeypatch.setattr(script, "_transformer_config_cache", None)
     monkeypatch.setattr(script, "get_args", lambda: args)
     monkeypatch.setattr(script, "core_transformer_config_from_args", build_config)
     monkeypatch.setattr(script, "mtp_on_this_rank_func", lambda **kwargs: False)
     monkeypatch.setattr(script, "get_batch_on_this_rank_for_sequence_packing", fetch_batch)
+    monkeypatch.setattr(script, "prepare_packed_seq_params", prepare)
     pg_collection = ProcessGroupCollection(pp=object())
 
     # Repeated microbatches with the same args object reuse one config.
     for _ in range(2):
         assert script.get_batch(None, pg_collection=pg_collection) is result
         assert fetch_batch.call_args.kwargs["config"] is configs[0]
+        assert prepare.call_args.args[1] is configs[0]
     build_config.assert_called_once_with(args)
 
     # Replacing args with an equal but distinct object rebuilds the config.
@@ -1621,6 +1630,7 @@ def test_get_batch_caches_config_until_args_replaced(script, monkeypatch):
     for _ in range(2):
         assert script.get_batch(None, pg_collection=pg_collection) is result
         assert fetch_batch.call_args.kwargs["config"] is configs[1]
+        assert prepare.call_args.args[1] is configs[1]
     assert build_config.call_count == 2
     assert build_config.call_args.args[0] is args
 
