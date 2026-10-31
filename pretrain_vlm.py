@@ -27,8 +27,11 @@ from megatron.core.models.vision.vit_layer_specs import (
     get_vit_layer_with_local_spec,
     get_vit_layer_with_transformer_engine_spec,
 )
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import get_submodules, import_module
+from megatron.core.utils import get_attr_wrapped_model
 from megatron.training import (
     get_args,
     get_timers,
@@ -73,6 +76,11 @@ def model_provider(
     """
     args = get_args()
     vision_model_type = "clip"
+
+    if pg_collection is None:
+        # LLaVAModel requires an explicit process-group collection; this script trains on the
+        # global parallel grid, so resolve that fallback here rather than inside megatron/core.
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     assert (
         args.ckpt_format == 'torch'
@@ -225,13 +233,14 @@ def model_provider(
         language_rotary_base=args.rotary_base,
         language_rope_scaling=args.use_rope_scaling,
         language_rope_scaling_factor=args.rope_scaling_factor,
-        pre_process=parallel_state.is_pipeline_first_stage(),
-        post_process=parallel_state.is_pipeline_last_stage(),
-        add_encoder=parallel_state.is_pipeline_first_stage(),
+        pre_process=is_pp_first_stage(pg_collection.pp),
+        post_process=is_pp_last_stage(pg_collection.pp),
+        add_encoder=is_pp_first_stage(pg_collection.pp),
         add_decoder=True,
         img_h=args.img_h,
         img_w=args.img_w,
         patch_dim=args.patch_dim,
+        pg_collection=pg_collection,
     )
 
     model.freeze(
@@ -320,25 +329,38 @@ def _preprocess_data_for_llava(data):
     return data
 
 
-def get_batch(data_iterator):
+def get_batch(data_iterator, pg_collection=None):
     """Generate a batch.
 
     Args:
         data_iterator: Iterable dataset.
+        pg_collection: Process groups of the model. The batch is broadcast from the first
+            rank of its tensor-parallel group. None builds the group from the global parallel
+            state.
 
     Returns:
         sample: A data sample with images, tokens, etc.
     """
     args = get_args()
     cp_size = args.context_parallel_size
+    if pg_collection is None:
+        # Compatibility for direct entrypoint callers; forward_step passes the model's groups.
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
+    if vars(pg_collection).get("tp") is None:
+        raise ValueError("get_batch requires pg_collection.tp")
+    tp_group = pg_collection.tp
     # Broadcast data.
     if data_iterator is not None:
         data = next(data_iterator)
     else:
         data = None
 
-    data_i = tensor_parallel.broadcast_data(["tokens", "position_ids", "labels"], data, torch.int64)
-    data_f = tensor_parallel.broadcast_data(["image", "loss_mask"], data, torch.float32)
+    data_i = tensor_parallel.broadcast_data(
+        ["tokens", "position_ids", "labels"], data, torch.int64, tp_group=tp_group
+    )
+    data_f = tensor_parallel.broadcast_data(
+        ["image", "loss_mask"], data, torch.float32, tp_group=tp_group
+    )
 
     batch = dict()
     packed_seq_params = None
@@ -417,7 +439,7 @@ def forward_step(data_iterator, model: LLaVAModel):
     # Get the batch.
     timers('batch-generator', log_level=2).start()
     tokens, position_ids, labels, images, loss_mask, attention_mask, packed_seq_params = get_batch(
-        data_iterator
+        data_iterator, pg_collection=get_attr_wrapped_model(model, "pg_collection")
     )
     timers('batch-generator').stop()
 
