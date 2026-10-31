@@ -31,6 +31,11 @@ class KDALayerConfig(GDNLayerConfig):
     """Use low-rank f_b(f_a(x)) and g_b(g_a(x)) gates with a QKV-only input projection."""
 
     def __post_init__(self) -> None:
+        # Validate the KDA contract before the shared TransformerConfig checks, which also
+        # cover GDN-family fields with generic assertions, so invalid KDA settings raise the
+        # KDA-specific ValueError. An unset linear_cp_mode skips the CP-mode checks here; it is
+        # normalized by super().__post_init__() and validated again afterwards.
+        self.validate_kda()
         super().__post_init__()
         self.validate_kda()
 

@@ -471,7 +471,13 @@ def test_kda_layer_config_preserves_settings(explicit_settings):
 
     assert type(layer_config) is KDALayerConfig
     assert layer_config is not config
-    assert set(expected).isdisjoint(field.name for field in fields(TransformerConfig))
+    # dev keeps kda_safe_gate/kda_lower_bound on TransformerConfig for the
+    # --kda-safe-gate/--kda-lower-bound CLI flags (#6556); the other KDA-only
+    # settings must stay off the stack config.
+    dev_stack_fields = {"kda_safe_gate", "kda_lower_bound"}
+    transformer_fields = {field.name for field in fields(TransformerConfig)}
+    assert dev_stack_fields <= transformer_fields
+    assert (set(expected) - dev_stack_fields).isdisjoint(transformer_fields)
     assert set(expected) <= {field.name for field in fields(KDALayerConfig)}
     for name, value in expected.items():
         assert getattr(layer_config, name) == value
@@ -634,11 +640,15 @@ def test_parallel_kda_correctness(
 @pytest.mark.parametrize("recompute_module", ["gdn_norm_out", "gdn"])
 @pytest.mark.parametrize("variant", [None, "kda"])
 def test_kda_layer_config_accepts_recompute_modules(recompute_module, variant):
+    # dev (#6556) registers "kda" as a GDN-family variant, so a non-hybrid KDA config is a
+    # standalone linear-attention model and must declare its LA/SDPA layer pattern.
+    linear_attention_freq = [1] if variant == "kda" else None
     config = _make_config(
         recompute_granularity="selective",
         recompute_modules=[recompute_module],
         experimental_attention_variant=variant,
         is_hybrid_model=False,
+        linear_attention_freq=linear_attention_freq,
     )
     assert config.recompute_modules == [recompute_module]
 

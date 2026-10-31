@@ -254,16 +254,19 @@ class KimiDeltaAttention(_GDNBase):
 
         x_dtype = x.dtype
         x = x.reshape(-1, self.value_head_dim)
-        gate = gate.reshape(-1, self.value_head_dim)
         if self.two_stage_gates:
             # Round only after both normalization and sigmoid gating.
+            gate = gate.reshape(-1, self.value_head_dim)
             weight = self.out_norm.weight
             if self.config.layernorm_zero_centered_gamma:
                 weight = weight + 1
             return rms_norm_gated(
                 x, gate, weight, None, activation="sigmoid", eps=self.config.layernorm_epsilon
             )
+        # Keep the direct-gate graph order (norm, then gate reshape) so the compiled
+        # rounding matches the pinned upstream primitive.
         x = self.out_norm(x)
+        gate = gate.reshape(-1, self.value_head_dim)
         return apply_attention_output_gate(x, gate, 'elementwise', cast_mode='none').to(x_dtype)
 
     def _proj(self, proj, x):
@@ -446,14 +449,14 @@ class KimiDeltaAttention(_GDNBase):
 
                 out, out_bias = te_checkpoint(
                     _checkpointed_compute,
-                    self.config.distribute_saved_activations,
+                    False,
                     tensor_parallel.random.get_cuda_rng_tracker,
                     self.pg_collection.tp,
                     hidden_states,
                 )
             else:
                 out, out_bias = tensor_parallel.checkpoint(
-                    _checkpointed_compute, self.config.distribute_saved_activations, hidden_states
+                    _checkpointed_compute, False, hidden_states
                 )
         else:
             out, out_bias = self._forward_compute(

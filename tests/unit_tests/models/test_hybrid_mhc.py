@@ -136,7 +136,8 @@ def test_mhc_mtp_supports_gpt_contract():
         )
         assert len(mtp.layers) == 1
         layer = mtp.layers[0]
-        assert layer.mtp_layer_pattern is None
+        assert layer.mtp_layer_config_list is None
+        assert not layer.is_hybrid_mtp
         assert isinstance(layer.mtp_model_layer, TransformerLayer)
         assert layer.mhc_enabled
         assert layer.eh_proj is None

@@ -889,7 +889,7 @@ jobs:
           client_payload: |
             {
               "test_to_run": "L1",
-              "test_script_pattern": "L1_Functional_Tests_Megatron_4",
+              "test_script_pattern": "L1_Functional_Tests_Megatron_Generation",
               "test_platform": "h100",
               "megatron_lm_commit": "${{ github.sha }}"
             }

@@ -617,10 +617,10 @@ The equivalent backend-specific CLI value is a JSON object:
 
 MOK is an optional dependency, imported only when the backend is selected. The ARM64 development
 image already installs the supported
-[MCore integration snapshot](https://github.com/QiZhangNV/mixture-of-kittens/tree/a2ad2d0ce2366c1817d15498cdbaf8ead5966117)
-with `docker/patches/mok.patch` through `docker/common/install_mok.sh`. Use that image or its
-installation helper to retain the supported dependency and Blackwell build targets. The AMD64
-image skips MOK because its H100 target is unsupported.
+[MCore integration snapshot](https://github.com/QiZhangNV/mixture-of-kittens/tree/7a8cfb7fdd96a1cfba506caf4756c6c86073399a)
+through `docker/common/install_mok.sh`. Use that image or its installation helper to retain the
+supported dependency and Blackwell build targets. The AMD64 image skips MOK because its H100
+target is unsupported.
 
 | Area | Current MOK support |
 |------|---------------------|
