@@ -1,4 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from typing import Optional
+
 import torch
 from torch import Tensor
 
@@ -6,6 +8,7 @@ from megatron.core.models.backends import LocalSpecProvider
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import get_linear_layer
+from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
 
 class BertLMHead(MegatronModule):
@@ -14,10 +17,19 @@ class BertLMHead(MegatronModule):
     Args:
         hidden_size: hidden size
         config (TransformerConfig): TransformerConfig object
+        tp_group (torch.distributed.ProcessGroup, optional): Tensor-parallel group the head's
+            weights are replicated across, which sets their checkpoint replica ids. Defaults to
+            the global tensor-parallel group.
     """
 
-    def __init__(self, hidden_size: int, config: TransformerConfig):
+    def __init__(
+        self,
+        hidden_size: int,
+        config: TransformerConfig,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
         super().__init__(config=config)
+        self.tp_group = get_tensor_model_parallel_group_if_none(tp_group)
 
         # TODO: Should switch this to TE ?
         self.dense = get_linear_layer(

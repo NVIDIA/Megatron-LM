@@ -80,13 +80,15 @@ class ModalitySubmodules(ABC, nn.Module):
         parallel_state global fallback in ensure_metadata_has_dp_cp_group.
         """
         if self.pg_collection is not None:
-            assert (
-                hasattr(self.pg_collection, 'dp_cp') and self.pg_collection.dp_cp is not None
-            ), "pg_collection is missing dp_cp group"
+            groups = vars(self.pg_collection)
+            if groups.get('dp_cp') is None:
+                raise ValueError(
+                    f"{type(self).__name__} requires pg_collection.dp_cp to elect the checkpoint "
+                    "writer of each shard, but it is not set or is None."
+                )
             metadata = dict(metadata) if metadata else {}
-            metadata['dp_cp_group'] = (
-                getattr(self.pg_collection, 'dp_cp_gtp_remat', None) or self.pg_collection.dp_cp
-            )
+            # dp_cp_gtp_remat accompanies dp_cp; a collection without it elects over dp_cp.
+            metadata['dp_cp_group'] = groups.get('dp_cp_gtp_remat') or groups['dp_cp']
 
         sharded_sd = {}
         for name, container in self.named_children():

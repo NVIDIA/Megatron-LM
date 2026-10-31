@@ -265,6 +265,32 @@ def test_rejects_shared_context_without_caller_managed_grad_sync(
         assert not isinstance(layer, FsdpModule)
 
 
+@pytest.mark.parametrize("dp_cp", ["unset", "none"])
+def test_rejects_collection_without_dp_cp(process_group_collection, distributed_setup, dp_cp):
+    """A collection whose dp_cp is unset or None is rejected before a mesh is built from it."""
+    pg_collection = ProcessGroupCollection(**vars(process_group_collection))
+    if dp_cp == "unset":
+        delattr(pg_collection, "dp_cp")
+    else:
+        pg_collection.dp_cp = None
+    config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4)
+    layer = torch.nn.Linear(16, 16, device=distributed_setup.device)
+
+    with pytest.raises(ValueError, match="requires an explicit dp_cp process group"):
+        FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=layer,
+            pg_collection=pg_collection,
+        )
+    assert not isinstance(layer, FsdpModule)
+
+
 def test_finish_grad_sync_waits_for_delayed_wgrad(process_group_collection, distributed_setup):
     """Delayed-wgrad reductions must rejoin the compute stream before capture ends."""
     config = TransformerConfig(
@@ -382,6 +408,7 @@ def test_delayed_wgrad_matches_immediate(process_group_collection, distributed_s
                 clip_grad=0.0,
             ),
             [model],
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         optimizer.reload_model_params()
         losses = []
@@ -458,7 +485,11 @@ def test_build_train_and_step(process_group_collection):
         # clipping is fixed.
         clip_grad=0.0,
     )
-    reference_optimizer = get_megatron_optimizer(reference_optimizer_config, [reference_model])
+    reference_optimizer = get_megatron_optimizer(
+        reference_optimizer_config,
+        [reference_model],
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+    )
     optimizer = get_megatron_optimizer(
         replace(
             reference_optimizer_config,
@@ -468,6 +499,7 @@ def test_build_train_and_step(process_group_collection):
             exp_avg_sq_dtype=torch.bfloat16,
         ),
         [model],
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
     assert isinstance(optimizer, FullyShardedOptimizer)
     optimizer.reload_model_params()
@@ -545,7 +577,9 @@ def test_fused_sgd_casts_mismatched_grads(process_group_collection):
         use_distributed_optimizer=False,
         clip_grad=0.0,
     )
-    optimizer = get_megatron_optimizer(optimizer_config, [model])
+    optimizer = get_megatron_optimizer(
+        optimizer_config, [model], pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+    )
 
     hidden = torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
 
@@ -610,6 +644,7 @@ def test_gradient_clipping_reaches_global_norm(
             use_precision_aware_optimizer=use_precision_aware_optimizer,
         ),
         [model],
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     def global_norm(local_tensors) -> float:

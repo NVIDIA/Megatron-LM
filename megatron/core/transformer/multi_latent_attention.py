@@ -45,6 +45,7 @@ from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -712,6 +713,7 @@ class MLASelfAttention(MultiLatentAttention):
                 skip_bias_add=False,
                 is_expert=False,
                 tp_comm_buffer_name='q_proj',
+                tp_group=pg_collection.tp,
                 pg_collection=pg_collection,
                 name=(name + ".linear_q_proj") if name is not None else None,
             )
@@ -849,9 +851,13 @@ class MLASelfAttention(MultiLatentAttention):
             #   2. Scatter sequence back to s / TP if sequence-parallel since it was
             #      gathered by ColumnParallelLinear.
             if q_compressed.size(-1) != self.config.q_lora_rank:
-                q_compressed = gather_from_tensor_model_parallel_region(q_compressed)
+                q_compressed = gather_from_tensor_model_parallel_region(
+                    q_compressed, group=self.tp_group
+                )
                 if self.config.sequence_parallel:
-                    q_compressed = scatter_to_sequence_parallel_region(q_compressed)
+                    q_compressed = scatter_to_sequence_parallel_region(
+                        q_compressed, group=self.tp_group
+                    )
         else:
             q_compressed = hidden_states
 
@@ -944,14 +950,16 @@ class MLASelfAttention(MultiLatentAttention):
         q_compressed, kv_combined = self._qkv_down_projection(hidden_states)
         if kv_combined.size(-1) != self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim:
             # kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim)]
-            kv_combined = gather_from_tensor_model_parallel_region(kv_combined)
+            kv_combined = gather_from_tensor_model_parallel_region(kv_combined, group=self.tp_group)
             # kv_compressed:[s, b, kv_lora_rank], k_pos_emb: [s, b, qk_pos_emb_head_dim]
             kv_compressed, k_pos_emb = torch.split(
                 kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
             )
             if self.config.sequence_parallel:
                 # kv_compressed:[s / TP, b, kv_lora_rank]
-                kv_compressed = scatter_to_sequence_parallel_region(kv_compressed)
+                kv_compressed = scatter_to_sequence_parallel_region(
+                    kv_compressed, group=self.tp_group
+                )
         else:
             # kv_compressed:[s / TP, b, kv_lora_rank], k_pos_emb: [s / TP, b, qk_pos_emb_head_dim]
             kv_compressed, k_pos_emb = torch.split(
@@ -1668,9 +1676,13 @@ class FusedMLASelfAttention(MLASelfAttention):
         q_compressed, kv_combined = torch.split(qkv, [q_split, kv_split], dim=-1)
 
         if is_tensor_parallel:
-            q_compressed = gather_from_tensor_model_parallel_region(q_compressed)
+            q_compressed = gather_from_tensor_model_parallel_region(
+                q_compressed, group=self.tp_group
+            )
             if self.config.sequence_parallel:
-                q_compressed = scatter_to_sequence_parallel_region(q_compressed)
+                q_compressed = scatter_to_sequence_parallel_region(
+                    q_compressed, group=self.tp_group
+                )
 
         return q_compressed, kv_combined
 
@@ -1687,6 +1699,11 @@ class FusedMLASelfAttention(MLASelfAttention):
 
     def sharded_state_dict(self, prefix: str = "", sharded_offsets: tuple = (), metadata=None):
         """Return a sharded state dict compatible with pre-fusion checkpoints."""
+        # Guard for cases metadata is not provided: replica ids span the layer's GTP-inclusive
+        # DP x CP group, the group the global default stands for.
+        metadata = ensure_metadata_has_dp_cp_group(
+            metadata, self.pg_collection.dp_cp_gtp_remat or self.pg_collection.dp_cp
+        )
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
 
         def _clone_sharded_object_with_key(obj: ShardedObject, new_key: str) -> ShardedObject:
@@ -1759,10 +1776,20 @@ class FusedMLASelfAttention(MLASelfAttention):
         kv_key = f"{prefix}linear_kv_down_proj.weight"
 
         sharded_state_dict[q_key] = make_tp_sharded_tensor_for_checkpoint(
-            tensor=q_weight, key=q_key, tp_axis=0, prepend_offsets=sharded_offsets
+            tensor=q_weight,
+            key=q_key,
+            tp_axis=0,
+            prepend_offsets=sharded_offsets,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
         )
         sharded_state_dict[kv_key] = make_tp_sharded_tensor_for_checkpoint(
-            tensor=kv_weight, key=kv_key, tp_axis=0, prepend_offsets=sharded_offsets
+            tensor=kv_weight,
+            key=kv_key,
+            tp_axis=0,
+            prepend_offsets=sharded_offsets,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
         )
 
         return sharded_state_dict

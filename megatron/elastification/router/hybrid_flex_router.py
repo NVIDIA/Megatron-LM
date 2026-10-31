@@ -1,31 +1,28 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import random
+from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from megatron.core import parallel_state
 from megatron.core.num_microbatches_calculator import (
     get_current_global_batch_size,
     get_micro_batch_size,
 )
-from megatron.core.parallel_state import (
-    get_data_parallel_rank,
-    get_data_parallel_world_size,
-    get_pipeline_model_parallel_rank,
-    get_pipeline_model_parallel_world_size,
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    global_process_group_fallback,
+    require_process_groups,
 )
 
 # Remove top-level import to avoid circular imports
 # from megatron.training import get_args, print_rank_0
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import init_method_normal
+from megatron.core.utils import get_pg_rank, get_pg_size, get_pg_src_rank, init_method_normal
 
 # Import TE parallel linear layers
 try:
@@ -45,9 +42,35 @@ except ImportError:
 # Use router to determine #heads, MLP sizes, and layers to skip (Router_v2)
 # Only takes the budget as input
 class FlextronRouter(MegatronModule):
-    def __init__(self, config: TransformerConfig):
+    """Router that maps a parameter budget to the elastic sizes of a Flextron model.
+
+    Args:
+        config: Transformer config of the model, with the Flextron router fields.
+        pg_collection: Process groups of the model that the router belongs to. Its linear layers
+            are sharded over the ``tp`` group, and each shard starts from the weights of its
+            first replica in the ``pp`` and ``dp_cp`` groups. The Gumbel-softmax seeds and the
+            number of gradient-accumulation steps use the rank and size of the ``dp_gtp_remat``
+            group, whose ranks train on distinct samples. None falls back to the global process
+            groups with a deprecation warning.
+
+    Raises:
+        ValueError: ``pg_collection`` does not set ``tp``, ``pp``, ``dp_cp`` or ``dp_gtp_remat``.
+    """
+
+    def __init__(
+        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
+    ):
         super().__init__(config=config)
 
+        if pg_collection is None:
+            with global_process_group_fallback(
+                "FlextronRouter", deprecated_in="0.21", removed_in="0.23"
+            ):
+                pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        require_process_groups(
+            pg_collection, ("tp", "pp", "dp_cp", "dp_gtp_remat"), owner="FlextronRouter"
+        )
+        self.pg_collection = pg_collection
         self.config = config
         self.input_dim = len(self.config.budget_list)
         self.n_dim = self.config.router_inter_dim
@@ -75,7 +98,7 @@ class FlextronRouter(MegatronModule):
 
         self.add_scaler_schedule()
 
-        self.dp_size = get_data_parallel_world_size()
+        self.dp_size = get_pg_size(self.pg_collection.dp_gtp_remat)
         self.grad_accumulation_steps = get_current_global_batch_size() // (
             get_micro_batch_size() * self.dp_size
         )
@@ -83,24 +106,28 @@ class FlextronRouter(MegatronModule):
 
     def _init_dp_gumbel_softmax(self, base_seed=42):
         """Initialize DP-aware Gumbel softmax functionality"""
-        self.dp_rank = get_data_parallel_rank()
+        self.dp_rank = get_pg_rank(self.pg_collection.dp_gtp_remat)
         self.gumbel_base_seed = base_seed
 
     def _sync_router_weights(self):
-        """
-        Synchronize router weights across all pipeline parallel groups by broadcasting
-        from global rank 0 to all other ranks.
+        """Copy each router shard from its first replica to the other replicas.
+
+        The linear layers are sharded over ``tp`` (and over ``gtp_remat`` when it is active), so
+        a shard is broadcast only among the ranks that hold the same shard: first over ``pp``,
+        whose stages each build a router, then over ``dp_cp``, the replica group of dense weights.
+        Every rank of the model builds the same routers in the same order, so all members of
+        each group enter the same broadcasts.
         """
         if not torch.distributed.is_initialized():
             return
 
-        # Get global rank 0 as the source
-        source_rank = 0
-
-        # Broadcast all router parameters from rank 0
-        for name, param in self.named_parameters():
-            if param is not None:
-                torch.distributed.broadcast(param.data, src=source_rank)
+        for group in (self.pg_collection.pp, self.pg_collection.dp_cp):
+            # A group of one rank, or an axis that is off (None), has no other replica.
+            if get_pg_size(group) == 1:
+                continue
+            source_rank = get_pg_src_rank(group)
+            for param in self.parameters():
+                torch.distributed.broadcast(param.data, src=source_rank, group=group)
 
     def _mark_router_params_for_pp_sync(self):
         """
@@ -151,6 +178,8 @@ class FlextronRouter(MegatronModule):
                     bias=bias,
                     skip_bias_add=False,
                     is_expert=False,
+                    tp_group=self.pg_collection.tp,
+                    pg_collection=self.pg_collection,
                 )
             else:
                 # Second layer: TERowParallelLinear
@@ -163,6 +192,8 @@ class FlextronRouter(MegatronModule):
                     input_is_parallel=True,
                     skip_bias_add=False,
                     is_expert=False,
+                    tp_group=self.pg_collection.tp,
+                    pg_collection=self.pg_collection,
                 )
         else:
             # Fallback to regular tensor parallel layers
@@ -176,6 +207,8 @@ class FlextronRouter(MegatronModule):
                     bias=bias,
                     skip_bias_add=False,
                     is_expert=False,
+                    tp_group=self.pg_collection.tp,
+                    pg_collection=self.pg_collection,
                 )
             else:
                 return RowParallelLinear(
@@ -187,6 +220,8 @@ class FlextronRouter(MegatronModule):
                     input_is_parallel=True,
                     skip_bias_add=False,
                     is_expert=False,
+                    tp_group=self.pg_collection.tp,
+                    pg_collection=self.pg_collection,
                 )
 
     def add_router_for_mlp(self):

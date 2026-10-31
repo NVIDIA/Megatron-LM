@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import time
+import weakref
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
@@ -23,7 +24,8 @@ from torch.utils._pytree import tree_map as tree_map_pyt
 
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection, amax_reduction_group
+from megatron.core.parallel_state import TeardownStage, register_model_parallel_teardown
+from megatron.core.process_groups_config import amax_reduction_group, resolve_process_groups
 from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
     cudagraph_needs_generator_registration,
@@ -37,6 +39,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     ensure_params_ready,
     get_attr_wrapped_model,
+    get_pg_size,
     get_torch_version,
     is_te_min_version,
     log_on_each_pipeline_stage,
@@ -591,6 +594,11 @@ class _CudagraphGlobalRecord:
     _saved_tensors_observer = None
     _te_capture_started = False
 
+    # Every live runner. 'create_cudagraphs' clears 'cudagraph_record' after capture,
+    # so 'release_all_cuda_graphs' finds created graphs through this set. Weak
+    # references, so the set does not extend runner lifetimes.
+    all_runners: "weakref.WeakSet" = weakref.WeakSet()
+
     @classmethod
     def _enable_saved_tensors_observer(cls):
         """Observe Python 'save_for_backward' calls while recording and capturing graphs."""
@@ -804,8 +812,24 @@ def create_cudagraphs():
     return _CudagraphGlobalRecord.create_cudagraphs()
 
 
+def _reset_cuda_graph_runner(runner):
+    """Drop a runner's graphs and capture state so that it records and captures again."""
+    runner.cudagraph_created = False
+    runner.fwd_graph_recorded = False
+    runner.bwd_graph_recorded = False
+    runner.fwd_graph = None
+    runner.bwd_graph = None
+    runner.mempool = None
+    runner._gtp_fwd_params_to_ensure_ready = ()
+
+
 def delete_cuda_graphs():
-    """Delete all CUDA graphs."""
+    """Delete the graphs of recorded runners and reset the global capture state.
+
+    Runners whose graphs 'create_cudagraphs' already created are not in the record
+    and keep their graphs; for example, training graphs survive an inference engine's
+    suspend. 'release_all_cuda_graphs' releases those as well.
+    """
 
     _CudagraphGlobalRecord._disable_saved_tensors_observer()
 
@@ -816,14 +840,7 @@ def delete_cuda_graphs():
     ]:
         runner = record[0]
         assert isinstance(runner, _CudaGraphRunner)
-
-        runner.cudagraph_created = False
-        runner.fwd_graph_recorded = False
-        runner.bwd_graph_recorded = False
-        runner.fwd_graph = None
-        runner.bwd_graph = None
-        runner.mempool = None
-        runner._gtp_fwd_params_to_ensure_ready = ()
+        _reset_cuda_graph_runner(runner)
 
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
@@ -836,6 +853,26 @@ def delete_cuda_graphs():
     torch.cuda.empty_cache()
 
     CudaGraphManager.global_mempool = None
+
+
+def release_all_cuda_graphs():
+    """Release the graphs of every live runner and reset the global capture state.
+
+    Unlike 'delete_cuda_graphs', this includes graphs that were already created,
+    including partial captures that never reached the record. A captured graph keeps
+    the communicators of its collectives alive, and destroying such a communicator
+    waits for the graph, so model-parallel teardown must release every graph first.
+    Does nothing if no runner is alive and no graph memory pool exists.
+    """
+    runners = list(_CudagraphGlobalRecord.all_runners)
+    if not runners and CudaGraphManager.global_mempool is None:
+        return
+    for runner in runners:
+        _reset_cuda_graph_runner(runner)
+    delete_cuda_graphs()
+
+
+register_model_parallel_teardown(TeardownStage.RELEASE_CUDA_GRAPHS, release_all_cuda_graphs)
 
 
 class _GraphStatus(Enum):
@@ -1035,6 +1072,7 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fwd_graph = None
         self.bwd_graph = None
         self.bwd_graph_replay_complete_event = torch.cuda.Event()
+        _CudagraphGlobalRecord.all_runners.add(self)
 
         self.fwd_graph_recorded = False
         self.bwd_graph_recorded = False
@@ -1942,6 +1980,9 @@ class CudaGraphManager(torch.nn.Module):
         Args:
             config: TransformerConfig object containing CUDA graph settings for memory
                 pooling, graph retention, gradient accumulation, FP8/FP4, and warmup steps.
+            pg_collection: Process groups whose pipeline group decides whether graphs are
+                reused across microbatches. Defaults to the collection of the module being
+                graphed, looked up on the first call.
             inline_capture: Normally, whether the inline capture path is taken depends on whether
                 `inference_context` is present in the kwargs of the forward call.
                 Setting this argument to True always forces the inline capture path to be taken.
@@ -1949,8 +1990,9 @@ class CudaGraphManager(torch.nn.Module):
         """
         self._inline_capture = inline_capture
         self._num_warmup_steps = num_warmup_steps
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        # Modules create their manager in GraphableMegatronModule.__init__, before they store
+        # their own pg_collection, so the module's collection is looked up on the first call
+        # (see _resolve_reuse_cudagraphs).
         self.pg_collection = pg_collection
         rng_tracker = get_cuda_rng_tracker()
         self.need_backward = need_backward
@@ -1990,10 +2032,8 @@ class CudaGraphManager(torch.nn.Module):
         self.custom_cudagraphs_lookup_table: dict = defaultdict(lambda: None)
         self.is_first_microbatch = False
 
-        # Without pipeline parallelism, microbatches execute one at a time.
-        # Therefore modules will always execute in the same order, so cudagraphs
-        # can both be reused and share a single mempool.
-        self.reuse_cudagraphs = self.pg_collection.pp.size() == 1
+        # Decided on the first call; see _resolve_reuse_cudagraphs.
+        self.reuse_cudagraphs = None
         if CudaGraphManager.global_mempool is None:
             CudaGraphManager.global_mempool = torch.cuda.graph_pool_handle()
             # Register the pool so GTP allocates GRAPHED-chain buffers + quantized
@@ -2008,6 +2048,33 @@ class CudaGraphManager(torch.nn.Module):
         # idempotent, and graph creation removes the hook before capture begins.
         if need_backward:
             _CudagraphGlobalRecord._enable_saved_tensors_observer()
+
+    def _resolve_reuse_cudagraphs(self, megatron_module):
+        """Return whether cudagraphs are reused across microbatches, deciding it on the first call.
+
+        Without pipeline parallelism, microbatches execute one at a time. Therefore modules
+        will always execute in the same order, so cudagraphs can both be reused and share a
+        single mempool. The pipeline group comes from `pg_collection` if it was given, else from
+        the collection of the graphed module, where a `pp` set to None means no pipeline
+        parallelism. When neither collection sets `pp`, the global parallel state is used; this
+        fallback is deprecated and emits a `ProcessGroupFallbackWarning`.
+        """
+        if self.reuse_cudagraphs is None:
+            pg_collection = self.pg_collection
+            if pg_collection is None:
+                pg_collection = getattr(megatron_module, "pg_collection", None)
+            if pg_collection is None or "pp" not in vars(pg_collection):
+                # Deprecated fallback for graphed modules without a pipeline group.
+                pg_collection = resolve_process_groups(
+                    None,
+                    owner="CudaGraphManager",
+                    required=("pp",),
+                    argument="pg_collection.pp",
+                    deprecated_in="0.21",
+                    removed_in="0.23",
+                )
+            self.reuse_cudagraphs = get_pg_size(pg_collection.pp) == 1
+        return self.reuse_cudagraphs
 
     def call_ddp_preforward_hook(self, module):
         """Call any DDP pre-forward hooks which are used to launch async data parallel
@@ -2124,7 +2191,11 @@ class CudaGraphManager(torch.nn.Module):
                     self.call_ddp_preforward_hook(module)
 
             runner = self.get_cudagraph_runner(
-                megatron_module, args, kwargs, self.reuse_cudagraphs, cache_key=cache_key
+                megatron_module,
+                args,
+                kwargs,
+                self._resolve_reuse_cudagraphs(megatron_module),
+                cache_key=cache_key,
             )
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
         else:
@@ -2178,7 +2249,7 @@ class CudaGraphManager(torch.nn.Module):
                 out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
             elif self.training or is_in_checkpoint_fwd:
                 runner = self.get_cudagraph_runner(
-                    megatron_module, args, kwargs, self.reuse_cudagraphs
+                    megatron_module, args, kwargs, self._resolve_reuse_cudagraphs(megatron_module)
                 )
                 out = runner.record_graph_capture(args, kwargs)
             else:
@@ -2273,7 +2344,15 @@ class TECudaGraphHelper:
         self.optimizers = optimizers
         self.pg_collection = pg_collection
         if self.pg_collection is None:
-            self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            # Deprecated fallback for callers that do not pass the model's process groups: the
+            # groups this helper reads (logging, pipeline schedule and amax reduction).
+            self.pg_collection = resolve_process_groups(
+                None,
+                owner=type(self).__name__,
+                required=("tp", "dp_cp", "pp", "tp_cp", "tp_dp_cp"),
+                deprecated_in="0.21",
+                removed_in="0.23",
+            )
         self.tp_group = self.pg_collection.tp
         self.dp_cp_group = self.pg_collection.dp_cp
         self.pp_group = self.pg_collection.pp

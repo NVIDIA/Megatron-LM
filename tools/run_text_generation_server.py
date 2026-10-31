@@ -4,6 +4,7 @@
 import os
 import sys
 import warnings
+from functools import partial
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 import os
@@ -25,8 +26,10 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.inference.text_generation_server import MegatronServer
 from megatron.core.inference.text_generation_server.run_mcore_engine import run_mcore_engine
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.parallel_state import get_registered_process_groups
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.utils import get_attr_wrapped_model
 from megatron.inference.utils import get_model_builder
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_model, print_rank_0
@@ -43,7 +46,6 @@ sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 
-from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
@@ -138,7 +140,9 @@ def main(model_type: str = "gpt"):
     print_rank_0("WARNING: Forcing exit_on_missing_checkpoint to True for text " "generation.")
     args.exit_on_missing_checkpoint = True
 
-    # Set up model and load checkpoint
+    # Set up model and load checkpoint. The model is built on the groups of the grid that
+    # initialize_megatron() registered.
+    pg_collection = get_registered_process_groups()
     load_context = nullcontext()
     if args.fp8:
         from transformer_engine.pytorch.fp8 import fp8_model_init
@@ -148,12 +152,15 @@ def main(model_type: str = "gpt"):
         if HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
             # ModelOpt path keeps the legacy callable-based builder because the
             # modelopt hooks have not been ported to the new ``ModelBuilder``
-            # API yet. ``get_model`` also handles the modelopt-checkpoint
-            # auto-detection side effect.
-            model = get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
+            # API yet. ``get_model`` calls the provider with keyword arguments
+            # only, so bind ``args``.
+            model = get_model(
+                partial(modelopt_gpt_hybrid_builder, args),
+                wrap_with_ddp=False,
+                pg_collection=pg_collection,
+            )
         else:
             builder = get_model_builder(args, provider=model_type)
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
             model = builder.build_distributed_models(
                 pg_collection=pg_collection, wrap_with_ddp=False
             )
@@ -173,10 +180,13 @@ def main(model_type: str = "gpt"):
             prompts=["Test prompt"], sampling_params=SamplingParams(num_tokens_to_generate=10)
         )
 
+    # The HTTP server runs on the first rank of the model's tensor- and expert-parallel groups
+    # on the first pipeline stage.
+    model_pg_collection = get_attr_wrapped_model(model, "pg_collection")
     if (
-        mpu.is_pipeline_first_stage()
-        and mpu.get_tensor_model_parallel_rank() == 0
-        and mpu.get_expert_model_parallel_rank() == 0
+        is_pp_first_stage(model_pg_collection.pp)
+        and model_pg_collection.tp.rank() == 0
+        and model_pg_collection.ep.rank() == 0
     ):
         server = MegatronServer(inference_engine, args)
         server.run("0.0.0.0", port=args.port)

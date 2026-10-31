@@ -40,6 +40,7 @@ from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import set_args
 from megatron.training.training import get_model
 from megatron.training.utils import get_device_arch_version
+from tests.unit_tests.amax_reduction_group_utils import global_amax_groups
 from tests.unit_tests.dist_checkpointing import (
     TempNamedDir,
     init_basic_mock_args,
@@ -1512,6 +1513,7 @@ def test_parallel_multi_latent_attention_correctness(
             pre_process=pre_process,
             post_process=post_process,
             vp_stage=vp_stage,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         return gpt_model
 
@@ -1942,8 +1944,9 @@ class TestFusedMLASelfAttention:
         gathered_q = torch.cat([q_shard, torch.zeros_like(q_shard)], dim=-1)
         captured = {}
 
-        def fake_gather_from_tensor_model_parallel_region(tensor):
+        def fake_gather_from_tensor_model_parallel_region(tensor, group):
             captured["q_shard"] = tensor
+            captured["group"] = group
             return gathered_q
 
         monkeypatch.setattr(mla_module, "get_pg_size", lambda group: tp_size)
@@ -1958,6 +1961,7 @@ class TestFusedMLASelfAttention:
         q_compressed, kv_combined = self.fused_attention._qkv_down_projection(hidden)
 
         torch.testing.assert_close(captured["q_shard"], q_shard)
+        assert captured["group"] is self.fused_attention.tp_group
         torch.testing.assert_close(q_compressed, gathered_q)
         torch.testing.assert_close(kv_combined, kv_shard)
 
@@ -2465,7 +2469,7 @@ class TestFusedMLAQUpProjIntegration:
             hidden_states = torch.randn(
                 256, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda", requires_grad=True
             )
-            with get_fp8_context(config):
+            with get_fp8_context(config, pg_collection=global_amax_groups()):
                 output, _ = attention(hidden_states, None)
             output.float().square().mean().backward()
 
@@ -2590,7 +2594,7 @@ class TestFusedMLAKVRoPEQuant:
             results = []
             for attention in (reference, fused):
                 x = hidden_states.clone().requires_grad_(True)
-                with spy as kernel, get_fp8_context(config):
+                with spy as kernel, get_fp8_context(config, pg_collection=global_amax_groups()):
                     output, _ = attention(x, None)
                 output.backward(grad_output)
                 calls = kernel.call_count
@@ -2656,7 +2660,7 @@ class TestFusedMLAKVRoPEQuant:
                         "fused_mla_kv_rope_mxfp8",
                         wraps=mla_module.fused_mla_kv_rope_mxfp8,
                     ) as kernel,
-                    get_fp8_context(config),
+                    get_fp8_context(config, pg_collection=global_amax_groups()),
                 ):
                     output, _ = attention(x, None)
                 output.backward(grad_output)
@@ -2694,7 +2698,7 @@ class TestFusedMLAKVRoPEQuant:
                 mla_module, "fused_mla_kv_rope_mxfp8", wraps=mla_module.fused_mla_kv_rope_mxfp8
             ) as kernel,
             torch.no_grad(),
-            get_fp8_context(config),
+            get_fp8_context(config, pg_collection=global_amax_groups()),
         ):
             attention(hidden_states, None)
         assert kernel.call_count == 0

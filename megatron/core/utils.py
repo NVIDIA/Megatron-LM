@@ -614,7 +614,16 @@ def round_up_to_nearest_multiple(value: int, multiple: int) -> int:
 
 
 def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True):
-    """Issue a deprecation warning if tp_group is None and return the default tp group."""
+    """Return ``tp_group``, or the global tensor-parallel group when it is None.
+
+    Falling back to the global group is deprecated: pass the owning model's group, for example
+    ``pg_collection.tp``, or ``pg_collection.expt_tp`` for expert layers (``is_expert=True``).
+    The fallback emits a ``ProcessGroupFallbackWarning`` once per calling function. Its owner
+    names this helper and the function that called it, which is the one that needs the group.
+
+    Returns ``tp_group`` unchanged when ``parallel_state`` is not initialized, and None when
+    ``torch.distributed`` is not initialized.
+    """
     # TODO(zijiey): remove this function later.
     if not torch.distributed.is_initialized():
         return None
@@ -624,13 +633,17 @@ def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_ini
         return tp_group
 
     if tp_group is None:
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-            warnings.warn(
-                "Warning: tp_group is None, using default tp group. "
-                "Passing tp_group will be mandatory soon",
-                DeprecationWarning,
-                stacklevel=2,
-            )
+        # Import here to avoid a circular import: process_groups_config imports parallel_state,
+        # which imports this module.
+        from megatron.core.process_groups_config import warn_global_process_group_fallback
+
+        caller = sys._getframe(1).f_code.co_qualname
+        warn_global_process_group_fallback(
+            f"get_tensor_model_parallel_group_if_none (from {caller})",
+            "tp_group",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
         if is_expert:
             tp_group = parallel_state.get_expert_tensor_parallel_group(
                 check_initialized=check_initialized
@@ -779,6 +792,27 @@ class GlobalMemoryBuffer:
                 )
 
         return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)
+
+
+_GLOBAL_MEMORY_BUFFER: Optional[GlobalMemoryBuffer] = None
+
+
+def get_global_memory_buffer() -> GlobalMemoryBuffer:
+    """Return the process-wide GlobalMemoryBuffer, creating it on first use.
+
+    The buffer is scratch memory shared by every model in the process. It does not depend on any
+    process group, so it is available without ``parallel_state.initialize_model_parallel``.
+    """
+    global _GLOBAL_MEMORY_BUFFER
+    if _GLOBAL_MEMORY_BUFFER is None:
+        _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
+    return _GLOBAL_MEMORY_BUFFER
+
+
+def destroy_global_memory_buffer() -> None:
+    """Drop the process-wide GlobalMemoryBuffer; the next use creates an empty one."""
+    global _GLOBAL_MEMORY_BUFFER
+    _GLOBAL_MEMORY_BUFFER = None
 
 
 def _kernel_make_viewless_tensor(inp, requires_grad):
@@ -955,6 +989,13 @@ def log_on_each_pipeline_stage(
 
         args (Tuple[Any]): Message format arguments.
 
+        tp_group (torch.distributed.ProcessGroup, optional): Tensor-parallel group of the model
+            that logs. Pass it together with ``dp_cp_group``. Omitting both is deprecated: the
+            groups of the global parallel state are used, with a ``ProcessGroupFallbackWarning``.
+
+        dp_cp_group (torch.distributed.ProcessGroup, optional): Data-parallel group, including
+            the context-parallel ranks, of the model that logs.
+
         kwargs (Dict[str, Any]): All logging.Logger.log keyword arguments
     """
     assert torch.distributed.is_initialized()
@@ -965,20 +1006,35 @@ def log_on_each_pipeline_stage(
     if not logger.isEnabledFor(level):
         return
 
-    if tp_group is None and dp_cp_group is None:
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        dp_cp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-    else:
-        assert tp_group is not None and dp_cp_group is not None
-        tp_rank = tp_group.rank()
-        dp_cp_rank = dp_cp_group.rank()
+    if tp_group is None:
+        # Import here to avoid a circular import: process_groups_config imports parallel_state,
+        # which imports this module.
+        from megatron.core.process_groups_config import resolve_process_groups
+
+        # Deprecated fallback: the groups behind get_tensor_model_parallel_rank() and
+        # get_data_parallel_rank(with_context_parallel=True) of the global parallel state.
+        pg_collection = resolve_process_groups(
+            None,
+            owner="log_on_each_pipeline_stage",
+            required=("tp", "dp_cp_gtp_remat"),
+            argument="tp_group/dp_cp_group",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        tp_group, dp_cp_group = pg_collection.tp, pg_collection.dp_cp_gtp_remat
+    tp_rank = tp_group.rank()
+    dp_cp_rank = dp_cp_group.rank()
 
     if tp_rank == 0 and dp_cp_rank == 0:
         logger.log(level, msg, *args, **kwargs)
 
 
 def check_param_hashes_across_dp_replicas(
-    model: List[torch.nn.Module], cross_check: bool = False
+    model: List[torch.nn.Module],
+    cross_check: bool = False,
+    *,
+    dp_group: Optional[torch.distributed.ProcessGroup] = None,
+    expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> bool:
     """Computes hashes of all parameters in model, all-gathers hashes across DP replicas,
     and then checks for equality between the locally-computed hashes and those of other ranks.
@@ -987,15 +1043,47 @@ def check_param_hashes_across_dp_replicas(
     tensors from GPU to CPU first; as a result, this function is not intended to be called
     very frequently in the main training loop.
 
+    The DP replicas are given by the model's data-parallel groups. If neither group is passed,
+    the replicate data-parallel groups of the global parallel state are used; this fallback is
+    deprecated and emits a ``ProcessGroupFallbackWarning``.
+
     Args:
         model (List[torch.nn.Module]): List of model chunks whose parameter hashes need to
             be checked.
         cross_check (bool): If true, will check whether hashes match across all DP replicas.
+        dp_group (torch.distributed.ProcessGroup, optional): The model's data-parallel
+            replicate group (``pg_collection.dp``), across which the hashes of non-expert
+            parameters are compared.
+        expt_dp_group (torch.distributed.ProcessGroup, optional): The model's expert
+            data-parallel replicate group (``pg_collection.expt_dp``), across which the hashes
+            of expert parameters (``param.allreduce`` is False) are compared. May be None for a
+            model without expert parameters.
 
     Returns:
         True if all param hashes match with corresponding hash on DP replica 0 or
         across all replicas if cross_check is enabled, False otherwise.
+
+    Raises:
+        ValueError: If a group is passed, but this rank holds non-expert parameters and
+            ``dp_group`` is None, or expert parameters and ``expt_dp_group`` is None.
     """
+    if dp_group is None and expt_dp_group is None:
+        # Import here to avoid a circular import: process_groups_config imports parallel_state,
+        # which imports this module.
+        from megatron.core.process_groups_config import resolve_process_groups
+
+        # Deprecated fallback for callers that do not pass the model's groups: the replicate
+        # data-parallel groups of the global parallel state. A missing expert group is
+        # rejected below if this rank holds expert parameters.
+        pg_collection = resolve_process_groups(
+            None,
+            owner="check_param_hashes_across_dp_replicas",
+            required=("dp", "expt_dp"),
+            argument="dp_group/expt_dp_group",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        dp_group, expt_dp_group = pg_collection.dp, pg_collection.expt_dp
 
     # Compute per-parameter hashes on this rank.
     # Keep track of expert and non-expert parameters separately since they need to be
@@ -1017,16 +1105,26 @@ def check_param_hashes_across_dp_replicas(
                 expert_params.append((model_chunk_id, param_name, param))
                 local_expert_param_hashes.append(param_hash)
 
+    # Before the first collective, make sure there is a group for each kind of parameter that
+    # this rank holds.
+    if non_expert_params and dp_group is None:
+        raise ValueError(
+            "check_param_hashes_across_dp_replicas: dp_group is None, but the model has "
+            "non-expert parameters; pass the model's pg_collection.dp."
+        )
+    if expert_params and expt_dp_group is None:
+        raise ValueError(
+            "check_param_hashes_across_dp_replicas: expt_dp_group is None, but the model has "
+            "expert parameters; pass the model's pg_collection.expt_dp."
+        )
+
     # Use data-modulo-expert parallel group to all-gather expert param hashes, regular
     # data-parallel group for non-expert param hashes.
     all_param_hashes_match = True
     for params, local_param_hashes, all_gather_group in zip(
         [non_expert_params, expert_params],
         [local_non_expert_param_hashes, local_expert_param_hashes],
-        [
-            parallel_state.get_data_parallel_group(with_gtp_remat=False),
-            parallel_state.get_expert_data_parallel_group(with_gtp_remat=False),
-        ],
+        [dp_group, expt_dp_group],
     ):
         # Collect per-parameter hashes across all ranks in group.
         assert len(params) == len(local_param_hashes)
@@ -1075,10 +1173,11 @@ def make_tp_sharded_tensor_for_checkpoint(
         prepend_offsets: Offsets to prepend to tensor dimensions (default: ())
         **kwargs: Additional arguments. May include:
             - tp_group: Tensor parallel group. None with a dp_cp_group means the tensor is
-              not tensor-parallel (default: None, falls back to parallel_state when
-              dp_cp_group is None too)
-            - dp_cp_group: Data parallel + context parallel group, required with a tp_group
-              (default: None, falls back to parallel_state when tp_group is None too)
+              not tensor-parallel.
+            - dp_cp_group: Data parallel + context parallel group, required with a tp_group.
+              When both groups are None, the global tensor-parallel group and the global
+              GTP-inclusive DP x CP group are used, with a ``ProcessGroupFallbackWarning``.
+              That fallback is deprecated; pass the owning module's groups.
 
     Raises:
         ValueError: If tp_group is given without dp_cp_group.
@@ -1091,14 +1190,24 @@ def make_tp_sharded_tensor_for_checkpoint(
 
     new_offsets = []
 
-    # Get groups with fallback to parallel_state
     if tp_group is None and dp_cp_group is None:
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        # Import here to avoid a circular import: process_groups_config imports parallel_state,
+        # which imports this module.
+        from megatron.core.process_groups_config import resolve_process_groups
+
+        pg_collection = resolve_process_groups(
+            None,
+            owner="make_tp_sharded_tensor_for_checkpoint",
+            required=("tp", "dp_cp_gtp_remat"),
+            argument="tp_group/dp_cp_group",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        tp_group, dp_cp_group = pg_collection.tp, pg_collection.dp_cp_gtp_remat
     elif dp_cp_group is None:
         raise ValueError(
             "A tp_group without a dp_cp_group would make every data-parallel rank the main "
-            f"replica of '{key}'; pass both, or neither to use the global groups"
+            f"replica of '{key}'; pass the dp_cp_group that goes with the tp_group"
         )
 
     # Use local get_pg_rank and get_pg_size functions
@@ -1290,10 +1399,11 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
         replica_id: Replica ID for the tensor (default: None)
         **kwargs: Additional arguments. May include:
             - tp_group: Tensor parallel group. None with a dp_cp_group means the tensor is
-              not tensor-parallel (default: None, falls back to parallel_state when
-              dp_cp_group is None too)
-            - dp_cp_group: Data parallel + context parallel group, required with a tp_group
-              (default: None, falls back to parallel_state when tp_group is None too)
+              not tensor-parallel.
+            - dp_cp_group: Data parallel + context parallel group, required with a tp_group.
+              When both groups are None, the global tensor-parallel group and the global
+              GTP-inclusive DP x CP group are used, with a ``ProcessGroupFallbackWarning``.
+              That fallback is deprecated; pass the owning module's groups.
 
     Raises:
         ValueError: If tp_group is given without dp_cp_group.
@@ -1318,14 +1428,24 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
 
     new_offsets = []
 
-    # Get groups with fallback to parallel_state
     if tp_group is None and dp_cp_group is None:
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        # Import here to avoid a circular import: process_groups_config imports parallel_state,
+        # which imports this module.
+        from megatron.core.process_groups_config import resolve_process_groups
+
+        pg_collection = resolve_process_groups(
+            None,
+            owner="make_sharded_tensor_for_checkpoint",
+            required=("tp", "dp_cp_gtp_remat"),
+            argument="tp_group/dp_cp_group",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        tp_group, dp_cp_group = pg_collection.tp, pg_collection.dp_cp_gtp_remat
     elif dp_cp_group is None:
         raise ValueError(
             "A tp_group without a dp_cp_group would make every data-parallel rank the main "
-            f"replica of '{key}'; pass both, or neither to use the global groups"
+            f"replica of '{key}'; pass the dp_cp_group that goes with the tp_group"
         )
 
     # Use local get_pg_rank and get_pg_size functions
@@ -1443,8 +1563,6 @@ def drain_embedding_wgrad_compute(
     ), "Length of activation and gradient buffers need to be equal!"
 
     import fused_weight_gradient_mlp_cuda
-
-    from megatron.core.parallel_state import get_global_memory_buffer
 
     input = embedding_activation_buffer.pop(0)
     world_size = tp_group.size()

@@ -117,8 +117,8 @@ def test_checkpointed_forward_uses_layer_tp_group_not_global(precision, monkeypa
     )
     calls = []
 
-    def fake_tensor_parallel_checkpoint(function, distribute_saved_activations, *args):
-        calls.append(("tensor_parallel", None))
+    def fake_tensor_parallel_checkpoint(function, distribute_saved_activations, *args, tp_group):
+        calls.append(("tensor_parallel", tp_group))
         return function(*args)
 
     def fake_te_checkpoint(
@@ -157,7 +157,7 @@ def test_checkpointed_forward_uses_layer_tp_group_not_global(precision, monkeypa
     output = layer._checkpointed_forward(torch.ones(2, 1, 4), torch.full((2, 1, 4), 2.0))
 
     assert torch.equal(output, torch.full((2, 1, 4), 3.0))
-    expected = ("te", tp_group) if precision == "fp4" else ("tensor_parallel", None)
+    expected = ("te", tp_group) if precision == "fp4" else ("tensor_parallel", tp_group)
     assert calls == [expected]
 
 
@@ -2602,6 +2602,7 @@ class TestMultiTokenPrediction:
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         return model
@@ -4341,6 +4342,7 @@ class TestMultiTokenPredictionHybrid:
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         return model
 

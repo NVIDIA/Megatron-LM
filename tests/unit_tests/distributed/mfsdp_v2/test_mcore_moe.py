@@ -138,8 +138,14 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup)
     optimizer_config = OptimizerConfig(
         lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
     )
-    reference_optimizer = get_megatron_optimizer(optimizer_config, [reference_model])
-    optimizer = get_megatron_optimizer(optimizer_config, [model])
+    reference_optimizer = get_megatron_optimizer(
+        optimizer_config,
+        [reference_model],
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+    )
+    optimizer = get_megatron_optimizer(
+        optimizer_config, [model], pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+    )
     assert isinstance(optimizer, FullyShardedOptimizer)
     optimizer.reload_model_params()
 

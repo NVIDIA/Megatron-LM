@@ -29,6 +29,7 @@ from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
+from tests.unit_tests.amax_reduction_group_utils import global_amax_groups
 from tests.unit_tests.test_utilities import (
     Utils,
     is_nccl_ep_available,
@@ -331,7 +332,7 @@ def _forward_backward_all_layers(container: MoEModelTestContainer, hidden_states
     """Forward/backward all MoE layers; returns output, input grad, last layer routing state."""
     initial_hidden_states = hidden_states.cuda().requires_grad_(True)
     hidden_states = initial_hidden_states
-    quantization_context = get_fp8_context(container.config)
+    quantization_context = get_fp8_context(container.config, pg_collection=global_amax_groups())
     with quantization_context:
         for layer in container.moe_layers:
             hidden_states, _ = layer(hidden_states)
