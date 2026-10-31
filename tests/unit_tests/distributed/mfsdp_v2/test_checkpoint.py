@@ -591,7 +591,10 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
         def checkpoint_state(model, optimizer, *, is_loading=False):
             state = {
                 "model": handle_experts_in_state_dict(
-                    model.state_dict_for_save_checkpoint(), model.config.num_moe_experts
+                    model.state_dict_for_save_checkpoint(),
+                    model.config.num_moe_experts,
+                    ep_rank=groups.ep.rank(),
+                    ep_size=groups.ep.size(),
                 ),
                 "optimizer": optimizer.sharded_state_dict({}, is_loading=is_loading),
             }

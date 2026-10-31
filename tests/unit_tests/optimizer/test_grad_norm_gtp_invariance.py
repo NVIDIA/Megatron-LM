@@ -32,7 +32,6 @@ from megatron.core.optimizer import OptimizerConfig, _get_megatron_optimizer_bas
 from megatron.core.optimizer.clip_grads import get_grad_norm_fp32
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel import layers as tensor_parallel_layers
 from tests.unit_tests.test_utilities import Utils
 
 # Row count of every logical weight. Must stay divisible by each GTP size under test.
@@ -306,8 +305,9 @@ class _GlobalGridRead(AssertionError):
     """Raised by a patched accessor: the code under test read the global parallel grid."""
 
 
-# Every global accessor that the duplicate filters and their group resolution can reach,
-# including the names ``tensor_parallel.layers`` imports directly.
+# Every global accessor that the duplicate filters and their group resolution can reach. The
+# filters' fallbacks read the global grid through ``parallel_state``, not through names imported
+# into ``tensor_parallel.layers``.
 _GLOBAL_GRID_READS = (
     (parallel_state, 'get_tensor_model_parallel_rank'),
     (parallel_state, 'get_tensor_model_parallel_group'),
@@ -316,9 +316,6 @@ _GLOBAL_GRID_READS = (
     (parallel_state, 'get_gtp_weight_remat_group'),
     (parallel_state, 'get_expert_gtp_weight_remat_rank'),
     (parallel_state, 'get_expert_gtp_weight_remat_group'),
-    (tensor_parallel_layers, 'get_tensor_model_parallel_rank'),
-    (tensor_parallel_layers, 'get_gtp_weight_remat_rank'),
-    (tensor_parallel_layers, 'get_expert_gtp_weight_remat_rank'),
 )
 
 

@@ -202,7 +202,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             ignore_virtual=False,
             vp_stage=vp_stage,
             pp_group=self.pg_collection.pp,
-            vp_size=self.config.virtual_pipeline_model_parallel_size,
+            vp_size=self.config.virtual_pipeline_model_parallel_size or 1,
         )
 
         if self.pre_process or self.mtp_process:
@@ -405,7 +405,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             if padding_mask is not None and self.config.sequence_parallel:
                 padding_mask = (
                     tensor_parallel.scatter_to_sequence_parallel_region(
-                        padding_mask.transpose(0, 1).contiguous()
+                        padding_mask.transpose(0, 1).contiguous(), group=self.pg_collection.tp
                     )
                     .transpose(0, 1)
                     .contiguous()
@@ -819,9 +819,9 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                     input_ids=input_ids,
                     mtp_input_mask=mtp_input_mask,
+                    # dp_cp_gtp_remat accompanies dp_cp; without it, the metrics average over dp_cp.
                     metric_avg_group=(
-                        getattr(self.pg_collection, 'dp_cp_gtp_remat', None)
-                        or self.pg_collection.dp_cp
+                        vars(self.pg_collection).get('dp_cp_gtp_remat') or self.pg_collection.dp_cp
                     ),
                 )
         sequence_parallel_override = False

@@ -20,7 +20,12 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    require_process_groups,
+    resolve_process_groups,
+    warn_global_process_group_fallback,
+)
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
@@ -30,15 +35,23 @@ from megatron.core.transformer.hyper_connection import (
     build_mhc_recompute_layer_plan,
     finalize_mhc_recompute_layer,
 )
-from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
+from megatron.core.transformer.module import (
+    GraphableMegatronModule,
+    MegatronModule,
+    _require_pipeline_group,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
+    _LAYER_PROCESS_GROUPS,
     BaseTransformerLayer,
     get_transformer_layer_offset,
 )
-from megatron.core.transformer.utils import sharded_state_dict_default
+from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
+    sharded_state_dict_default,
+)
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     WrappedTensor,
@@ -82,21 +95,29 @@ def get_num_layers_to_build(
     Args:
         config (TransformerConfig): Configuration object containing transformer model parameters.
         vp_stage (Optional[int]): Virtual pipeline stage number.
-        pp_rank (Optional[int]): Pipeline parallel rank.
+        pp_rank (Optional[int]): Rank of this stage in the model's pipeline-parallel group. A
+            model with a single pipeline stage does not need it. With pipeline parallelism,
+            omitting it is deprecated: the global pipeline rank in ``parallel_state`` is used
+            instead, with a ``ProcessGroupFallbackWarning``.
 
     Returns:
         int: The number of layers to be built for the current pipeline stage.
     """
+    if pp_rank is None:
+        if config.pipeline_model_parallel_size == 1:
+            pp_rank = 0
+        else:
+            warn_global_process_group_fallback(
+                "get_num_layers_to_build", "pp_rank", deprecated_in="0.21", removed_in="0.23"
+            )
+            pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+
     # If we have a custom PP layout, straightforwardly
     # return the number of decoders in the layout array.
     if config.pipeline_model_parallel_layout is not None:
         return config.pipeline_model_parallel_layout.get_num_layers_to_build(
-            layer_type=LayerType.decoder, vp_stage=vp_stage
+            layer_type=LayerType.decoder, vp_stage=vp_stage, pp_rank=pp_rank
         )
-
-    # Fallback for legacy tests.
-    if pp_rank is None:
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
 
     is_first_pp_stage = pp_rank == 0
     is_last_pp_stage = pp_rank == config.pipeline_model_parallel_size - 1
@@ -266,7 +287,17 @@ def _get_block_submodules(
 
 
 class TransformerBlock(GraphableMegatronModule, MegatronModule):
-    """Transformer class."""
+    """Transformer class.
+
+    Args:
+        pg_collection (ProcessGroupCollection | None): process groups of the model that this
+            block belongs to, passed on to its layers. It must set ``tp``. With
+            ``config.pipeline_model_parallel_size > 1`` it must also set ``pp`` to the
+            pipeline-parallel group of this rank; without pipeline parallelism ``pp`` may be
+            unset or None. Omitting the collection falls back to the global groups in
+            ``parallel_state`` with a ``ProcessGroupFallbackWarning``; the fallback is
+            deprecated.
+    """
 
     def __init__(
         self,
@@ -282,11 +313,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         super().__init__(config=config)
 
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            # Build every field that the layers read, not only the ones checked below.
+            pg_collection = resolve_process_groups(
+                None,
+                owner=type(self).__name__,
+                required=_LAYER_PROCESS_GROUPS,
+                deprecated_in="0.21",
+                removed_in="0.23",
+            )
+        (self.tp_group,) = require_process_groups(pg_collection, ('tp',), owner=type(self).__name__)
+        pp_group = _require_pipeline_group(pg_collection, config, type(self).__name__)
         self.pg_collection = pg_collection
-        self.tp_group = pg_collection.tp
 
-        pp_group = self.pg_collection.pp if hasattr(self.pg_collection, 'pp') else None
         pp_rank = get_pg_rank(pp_group)
 
         self.submodules = _get_block_submodules(config, spec, vp_stage, pp_rank)
@@ -599,9 +637,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         # Calculate the global layer offset for this pipeline stage
         # This is needed to convert local layer indices to global indices for feature extraction
-        pp_group = self.pg_collection.pp if hasattr(self.pg_collection, 'pp') else None
         layer_offset = get_transformer_layer_offset(
-            self.config, self.vp_stage, get_pg_rank(pp_group)
+            self.config, self.vp_stage, get_pg_rank(self.pg_collection.pp)
         )
 
         # Delete the obsolete reference to the initial input tensor if necessary
@@ -859,6 +896,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     ' Setting non_homogeneous_layers=True.'
                 )
             non_homogeneous_layers = True
+
+        # Guard for cases metadata is not provided: replica ids span the block's GTP-inclusive
+        # DP x CP group, the group the global default stands for.
+        metadata = ensure_metadata_has_dp_cp_group(
+            metadata, self.pg_collection.dp_cp_gtp_remat or self.pg_collection.dp_cp
+        )
 
         sharded_state_dict = {}
 

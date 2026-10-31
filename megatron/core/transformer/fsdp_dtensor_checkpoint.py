@@ -43,9 +43,9 @@ try:
 except ImportError:
     HAVE_MEGATRON_FSDP = False
 
-from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.core import CheckpointingException
 from megatron.core.dist_checkpointing.validation import StrictHandling, parse_strict_flag
+from megatron.core.process_groups_config import resolve_process_groups
 from megatron.core.tensor_parallel.layers import copy_tensor_model_parallel_attributes
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import get_attr_wrapped_model, get_pg_rank, get_pg_size
@@ -113,26 +113,41 @@ def get_ep_layer_offset(
         ep_rank: This rank's expert-parallel rank in the model that owns the experts.
         ep_size: Expert-parallel size of that model. Pass ``ep_rank`` and ``ep_size``
             together; integers keep offline tools that have no process groups working. When
-            both are omitted, they are read from the global parallel grid.
+            both are omitted for a model with experts, they are read from the global parallel
+            grid; this fallback is deprecated and emits a ``ProcessGroupFallbackWarning``.
 
     Returns:
         The expert layer offset for the current EP rank.
 
     Raises:
         ValueError: If only one of ``ep_rank`` and ``ep_size`` is given.
+        RuntimeError: If both are omitted for a model with experts and ``parallel_state`` has
+            not created the expert-parallel group.
     """
-    if ep_rank is None and ep_size is None:
-        # Migration fallback for callers that do not pass the model's expert-parallel layout.
-        ep_size = parallel_state.get_expert_model_parallel_world_size()
-        ep_rank = parallel_state.get_expert_model_parallel_rank()
-    elif ep_rank is None or ep_size is None:
+    if (ep_rank is None) != (ep_size is None):
         raise ValueError(
             f"Pass ep_rank and ep_size together, got ep_rank={ep_rank} and ep_size={ep_size}"
         )
-    num_local_experts = num_experts // ep_size if num_experts else 0
-    local_expert_offset = ep_rank * num_local_experts
-
-    return local_expert_offset
+    if not num_experts:
+        return 0
+    if ep_rank is None:
+        # Migration fallback for callers that do not pass the model's expert-parallel layout.
+        ep_group = resolve_process_groups(
+            None,
+            owner="get_ep_layer_offset",
+            argument="ep_rank/ep_size",
+            required=("ep",),
+            deprecated_in="0.21",
+            removed_in="0.23",
+        ).ep
+        if ep_group is None:
+            raise RuntimeError(
+                "get_ep_layer_offset was called without ep_rank and ep_size, and parallel_state "
+                "has not created the expert-parallel group. Pass the expert-parallel rank and "
+                "size of the model that owns the experts."
+            )
+        ep_rank, ep_size = ep_group.rank(), ep_group.size()
+    return ep_rank * (num_experts // ep_size)
 
 
 def get_total_num_experts(num_experts: int | None = None) -> int:

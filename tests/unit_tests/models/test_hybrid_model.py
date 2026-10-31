@@ -62,20 +62,22 @@ def test_hybrid_logging_process_groups_are_paired():
     tp_group = object()
     dp_cp_group = object()
 
-    assert _hybrid_logging_pg_kwargs(SimpleNamespace()) == {}
-    assert _hybrid_logging_pg_kwargs(SimpleNamespace(tp=tp_group, dp_cp=dp_cp_group)) == {
+    assert _hybrid_logging_pg_kwargs(ProcessGroupCollection(tp=None, dp_cp=None)) == {}
+    assert _hybrid_logging_pg_kwargs(ProcessGroupCollection(tp=tp_group, dp_cp=dp_cp_group)) == {
         'tp_group': tp_group,
         'dp_cp_group': dp_cp_group,
     }
 
-    with pytest.raises(ValueError, match="tp.*dp_cp"):
-        _hybrid_logging_pg_kwargs(SimpleNamespace(tp=tp_group))
-    with pytest.raises(ValueError, match="tp.*dp_cp"):
-        _hybrid_logging_pg_kwargs(SimpleNamespace(dp_cp=dp_cp_group))
-    with pytest.raises(ValueError, match="tp.*dp_cp"):
-        _hybrid_logging_pg_kwargs(SimpleNamespace(tp=tp_group, dp_cp=None))
-    with pytest.raises(ValueError, match="tp.*dp_cp"):
-        _hybrid_logging_pg_kwargs(SimpleNamespace(tp=None, dp_cp=dp_cp_group))
+    # A field the collection never set reads as None through ProcessGroupCollection, so it must
+    # raise instead of passing for an axis that is off.
+    for groups in ({}, {'tp': tp_group}, {'dp_cp': dp_cp_group}):
+        with pytest.raises(ValueError, match="HybridModel requires pg_collection to set"):
+            _hybrid_logging_pg_kwargs(ProcessGroupCollection(**groups))
+
+    with pytest.raises(ValueError, match="tp and pg_collection.dp_cp must both be"):
+        _hybrid_logging_pg_kwargs(ProcessGroupCollection(tp=tp_group, dp_cp=None))
+    with pytest.raises(ValueError, match="tp and pg_collection.dp_cp must both be"):
+        _hybrid_logging_pg_kwargs(ProcessGroupCollection(tp=None, dp_cp=dp_cp_group))
 
 
 @pytest.mark.skipif(
@@ -394,7 +396,8 @@ class TestHybridModel:
         placement.assert_called_once()
         placement_args = placement.call_args.kwargs
         assert placement_args["pp_group"] is model.pg_collection.pp
-        assert placement_args["vp_size"] == model_config.virtual_pipeline_model_parallel_size
+        # Without a virtual pipeline the model passes a size of 1, not None.
+        assert placement_args["vp_size"] == 1
 
     def test_forward_propagates_mtp_input_mask(self, mocker):
         class CaptureMTP(torch.nn.Module):

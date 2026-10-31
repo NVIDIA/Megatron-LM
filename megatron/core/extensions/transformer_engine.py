@@ -27,14 +27,17 @@ from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
+    TeardownStage,
     get_context_parallel_group,
     get_hierarchical_context_parallel_groups,
     get_tensor_model_parallel_group,
-    get_tensor_model_parallel_world_size,
+    register_model_parallel_teardown,
 )
 from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
     amax_reduction_group,
+    require_process_groups,
     resolve_gtp_remat_group,
     resolve_process_groups,
     warn_global_process_group_fallback,
@@ -112,6 +115,38 @@ HAVE_TE_GDN = _TE_LINEAR_ATTENTION is not None
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 _EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
+
+
+def _te_autocast_depth() -> int:
+    """Return the nesting depth of Transformer Engine autocast contexts."""
+    if is_te_min_version("2.15.0"):
+        return FP8GlobalStateManager.quantization_state.autocast_depth
+    if is_te_min_version("2.9.0"):
+        return FP8GlobalStateManager.AUTOCAST_DEPTH
+    return FP8GlobalStateManager.FP8_AUTOCAST_DEPTH
+
+
+def _check_te_autocast_exited() -> None:
+    """Refuse model-parallel teardown inside a Transformer Engine autocast context.
+
+    On exit, an open context can reduce FP8 scaling statistics over its process group,
+    which teardown destroys, and it reads the global state that teardown resets. A
+    negative depth is accepted: in-process restart with NVIDIA Resiliency Extension
+    resets TE before the interrupted main thread unwinds its autocast, whose exit then
+    decrements the reset depth below zero.
+    """
+    if _te_autocast_depth() > 0:
+        raise RuntimeError("Exit Transformer Engine autocast before destroying model parallelism.")
+
+
+def _reset_te_global_state() -> None:
+    """Drop TE's FP8 reduction groups and per-model tensor caches."""
+    FP8GlobalStateManager.reset()
+
+
+if HAVE_TE:
+    register_model_parallel_teardown(TeardownStage.VALIDATE, _check_te_autocast_exited)
+    register_model_parallel_teardown(TeardownStage.RESET_STATE, _reset_te_global_state)
 
 
 def _set_expert_parameter_attributes(
@@ -641,6 +676,47 @@ def _init_gtp_remat_context(
     _gtp_attach_post_init(module, gtp_ctx, is_grouped=is_grouped, replica_group=replica_group)
 
 
+def _gtp_replica_group(
+    pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None,
+    name: str,
+    gtp_remat_group: Optional[torch.distributed.ProcessGroup],
+    *,
+    owner: str,
+) -> Optional[torch.distributed.ProcessGroup]:
+    """Return the group ``name`` of ``pg_collection`` that replicates a layer's GTP weight shards.
+
+    Distributed checkpointing elects the writer of each GTP weight shard among its replicas, the
+    data-parallel peers outside the gtp_remat axis: ``dp_cp`` for a dense layer and ``expt_dp``
+    for an expert layer. The layer stamps this group on its shards when it is built. A layer
+    without GTP weight remat (``gtp_remat_group`` is None or has a single rank) has no GTP
+    shards, so this returns None.
+
+    A layer with GTP shards whose collection does not hold the group, or that has no collection,
+    also gets None, and ``gtp_replica_rank`` then elects the writer over the global group when
+    the checkpoint is saved. That fallback is deprecated, so this emits a
+    ``ProcessGroupFallbackWarning`` while the layer is built, where the caller can still pass the
+    group.
+
+    Args:
+        pg_collection: The layer's collection, or None.
+        name: ``dp_cp`` or ``expt_dp``.
+        gtp_remat_group: The layer's gtp_remat group, from ``resolve_gtp_remat_group``.
+        owner: Name of the layer class, used in the warning.
+    """
+    if gtp_remat_group is None or gtp_remat_group.size() <= 1:
+        return None
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        # Like resolve_gtp_remat_group: only the language model's collection has GTP axes.
+        pg_collection = pg_collection.get_language_model_collection()
+    # An unset field and an explicit None both leave the shards to the global fallback.
+    group = None if pg_collection is None else vars(pg_collection).get(name)
+    if group is None:
+        warn_global_process_group_fallback(
+            owner, f"pg_collection.{name}", deprecated_in="0.21", removed_in="0.23"
+        )
+    return group
+
+
 def split_te_layernorm_column_parallel_linear(
     fused_layer,
     config,
@@ -688,6 +764,7 @@ def split_te_layernorm_column_parallel_linear(
         is_expert=False,
         tp_comm_buffer_name=fused_layer.ub_name,
         tp_group=tp_group or fused_layer.tp_group,
+        pg_collection=fused_layer._pg_collection,
     )
 
     with torch.no_grad():
@@ -999,14 +1076,20 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 f"{', '.join(missing_attrs)}."
             )
 
-    def _get_te_ops_tensor_parallel_context() -> (
-        Tuple[int, Optional[torch.distributed.ProcessGroup]]
-    ):
-        """Return tensor-parallel world size and group for TE ops."""
-        tp_world_size = get_tensor_model_parallel_world_size()
-        tp_group = None
-        if tp_world_size > 1:
-            tp_group = get_tensor_model_parallel_group()
+    def _get_te_ops_tensor_parallel_context(
+        tp_group: Optional[torch.distributed.ProcessGroup],
+    ) -> Tuple[int, Optional[torch.distributed.ProcessGroup]]:
+        """Return tensor-parallel world size and group for TE ops.
+
+        Args:
+            tp_group: Tensor-parallel group of the module that the TE ops implement.
+
+        Returns:
+            The size of ``tp_group``, and ``tp_group`` if that size is greater than 1, else None.
+        """
+        tp_world_size = get_pg_size(tp_group)
+        if tp_world_size == 1:
+            tp_group = None
         return tp_world_size, tp_group
 
     def _get_te_ops_rng_state_tracker_function() -> Optional[Callable]:
@@ -1612,6 +1695,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         # TODO: For backward compatibility, remove in v0.15.
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
+        self._pg_collection = pg_collection
 
         # TE returns a zero length Tensor when bias=False and
         # return_bias=True, but we prefer None.  So in that case we
@@ -1680,7 +1764,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = self.config.symmetric_ar_type
 
-        gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert)
+        gtp_remat_group = resolve_gtp_remat_group(
+            pg_collection, is_expert, owner=type(self).__name__
+        )
         self.stride = stride
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
@@ -1699,7 +1785,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             extra_kwargs,
             rng_via_kwarg=False,
             out_split_size=self.tp_size,
-            replica_group=getattr(pg_collection, "dp_cp", None),
+            replica_group=_gtp_replica_group(
+                pg_collection, "dp_cp", gtp_remat_group, owner=type(self).__name__
+            ),
         )
 
         with init_quant_context, init_gtp_remat_context as gtp_output_size:
@@ -1802,7 +1890,12 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        # Guard for cases metadata is not provided. A layer built with a collection supplies its
+        # GTP-inclusive DP x CP group, the group the global default stands for.
+        dp_cp_group = None
+        if self._pg_collection is not None:
+            dp_cp_group = self._pg_collection.dp_cp_gtp_remat or self._pg_collection.dp_cp
+        metadata = ensure_metadata_has_dp_cp_group(metadata, dp_cp_group)
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
             state_dict,
@@ -1875,7 +1968,9 @@ class TEColumnParallelLinear(TELinear):
         world_size = get_pg_size(tp_group)
         rank = get_pg_rank(tp_group)
         self.stride = stride
-        gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert)
+        gtp_remat_group = resolve_gtp_remat_group(
+            pg_collection, is_expert, owner=type(self).__name__
+        )
 
         super().__init__(
             input_size=input_size,
@@ -1896,7 +1991,12 @@ class TEColumnParallelLinear(TELinear):
             tp_group=tp_group,
             name=name,
             gtp_remat_group=gtp_remat_group,
-            gtp_replica_group=getattr(pg_collection, "expt_dp" if is_expert else "dp_cp", None),
+            gtp_replica_group=_gtp_replica_group(
+                pg_collection,
+                "expt_dp" if is_expert else "dp_cp",
+                gtp_remat_group,
+                owner=type(self).__name__,
+            ),
             pg_collection=pg_collection,
         )
 
@@ -2148,7 +2248,9 @@ class TERowParallelLinear(TELinear):
             )
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
-        gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert)
+        gtp_remat_group = resolve_gtp_remat_group(
+            pg_collection, is_expert, owner=type(self).__name__
+        )
 
         super().__init__(
             input_size=input_size,
@@ -2170,7 +2272,12 @@ class TERowParallelLinear(TELinear):
             tp_group=tp_group,
             name=name,
             gtp_remat_group=gtp_remat_group,
-            gtp_replica_group=getattr(pg_collection, "expt_dp" if is_expert else "dp_cp", None),
+            gtp_replica_group=_gtp_replica_group(
+                pg_collection,
+                "expt_dp" if is_expert else "dp_cp",
+                gtp_remat_group,
+                owner=type(self).__name__,
+            ),
             pg_collection=pg_collection,
         )
         if config.use_cpu_initialization:
@@ -2315,8 +2422,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
     that also has "flash attention" enabled.
 
     Note that if Megatron's parallel_state has not been initialized yet, the
-    tp_group and cp_group passed to TE will be None and must be set later
-    via set_tensor_parallel_group() and set_context_parallel_group().
+    tp_group passed to TE will be None and must be set later via
+    set_tensor_parallel_group(). With context_parallel_size > 1, the
+    context-parallel group is required at construction.
     """
 
     cp_stream: torch.cuda.Stream = None
@@ -2377,14 +2485,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 cp=get_context_parallel_group(check_initialized=False),
                 hcp=get_hierarchical_context_parallel_groups(check_initialized=False),
             )
-        else:
-            assert hasattr(
-                pg_collection, "tp"
-            ), "TEDotProductAttention pg_collection must have tp pg"
-            assert hasattr(
-                pg_collection, "cp"
-            ), "TEDotProductAttention pg_collection must have cp pg"
-        self._tp_group = pg_collection.tp
+        # An unset tp raises; a None tp reaches TE as "no group yet", to be set later through
+        # set_tensor_parallel_group(). cp is read only with context parallelism, which rejects
+        # an unset or None cp group below.
+        (self._tp_group,) = require_process_groups(
+            pg_collection, ("tp",), owner=type(self).__name__
+        )
 
         if is_te_min_version("0.10.0"):
             extra_kwargs["attention_type"] = attention_type
@@ -2396,6 +2502,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         # This check is important as CP config can be disabled while having a valid CP group
         # Example - Disabling CP for encoder while a valid CP group exists for decoder
         if self.config.context_parallel_size > 1:
+            # torch.distributed resolves a None group to the default group, so the ranks of the
+            # whole job would become the context-parallel ranks.
+            if pg_collection.cp is None:
+                raise ValueError(
+                    "TEDotProductAttention with context_parallel_size > 1 requires a "
+                    "context-parallel group in pg_collection.cp"
+                )
             assert is_te_min_version(
                 "1.0.0"
             ), "Only Transformer-Engine version >= 1.0.0 supports context parallelism!"
@@ -2859,7 +2972,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 is_expert=True,
                 is_grouped=True,
                 out_split_size=tp_size if parallel_mode == "column" else 1,
-                replica_group=getattr(pg_collection, "expt_dp", None),
+                replica_group=_gtp_replica_group(
+                    pg_collection, "expt_dp", gtp_remat_group, owner=type(self).__name__
+                ),
             )
 
             with init_quant_context, init_gtp_remat_context as output_size:
@@ -3401,7 +3516,8 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             # Container for fusible ops
             fused_impl = te.pytorch.ops.Sequential()
 
-            tp_world_size, tp_group = _get_te_ops_tensor_parallel_context()
+            # The ops alias FC1's and FC2's weights, which MLP shards over self.tp_group.
+            tp_world_size, tp_group = _get_te_ops_tensor_parallel_context(self.tp_group)
             rng_state_tracker_function = _get_te_ops_rng_state_tracker_function()
 
             # Check submodule types
@@ -3505,13 +3621,14 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             del is_mtp_layer
             if hash_moe_layer_threshold is not None and hash_moe_layer_threshold > 0:
                 raise ValueError("Dense MLP does not support hash MoE routing.")
-            assert hasattr(
-                pg_collection, 'tp'
-            ), 'TP process group is required for TEFusedMLP in TransformerLayer'
+            (tp_group,) = require_process_groups(
+                pg_collection, ('tp',), owner=f"{cls.__name__}.as_mlp_submodule"
+            )
             return cls(
                 config=config,
                 submodules=submodules,
-                tp_group=pg_collection.tp,
+                tp_group=tp_group,
+                pg_collection=pg_collection,
                 is_expert=is_expert,
                 input_size=input_size,
                 ffn_hidden_size=ffn_hidden_size,
@@ -3562,7 +3679,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
             """Construct fused module with GroupedLinear(num_groups=1) + ScaledSwiGLU."""
 
-            tp_world_size = get_tensor_model_parallel_world_size()
+            tp_world_size = get_pg_size(self.tp_group)
             if tp_world_size > 1:
                 return super()._make_fused_impl()
 
@@ -3667,7 +3784,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         ) -> None:
             """Register hook forwarding for the grouped and normalization boundaries."""
 
-            if get_tensor_model_parallel_world_size() > 1:
+            if get_pg_size(self.tp_group) > 1:
                 super()._register_hooks_on_fused_impl(
                     fused_impl, pre_forward_submodules=pre_forward_submodules
                 )
@@ -3696,7 +3813,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward pass using GroupedLinear(num_groups=1) + ScaledSwiGLU."""
 
-            if get_tensor_model_parallel_world_size() > 1:
+            if get_pg_size(self.tp_group) > 1:
                 return super().forward(hidden_states, **kwargs)
 
             orig_shape = hidden_states.shape

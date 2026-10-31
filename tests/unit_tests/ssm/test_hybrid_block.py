@@ -734,9 +734,10 @@ class TestHybridBlock:
         model_parallel_cuda_manual_seed(123)
 
     def get_pg_collection(self):
-        # tp_cp and tp_dp_cp are the FP8/FP4 amax reduction groups of the layers.
+        # MoE layers also read the expert and router groups. tp_cp and tp_dp_cp are the FP8/FP4
+        # amax reduction groups of the layers.
         return ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['tp', 'pp', 'cp', 'embd', 'tp_cp', 'tp_dp_cp']
+            required_pgs=['tp', 'pp', 'cp', 'embd', 'ep', 'expt_tp', 'tp_ep', 'tp_cp', 'tp_dp_cp']
         )
 
     def test_hybrid_mtp_rejects_expert_parallel_overlap_before_build(self, monkeypatch):

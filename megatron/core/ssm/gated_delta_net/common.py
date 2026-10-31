@@ -255,6 +255,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             is_expert=False,
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + ".in_proj") if name is not None else None,
         )
 
@@ -318,6 +319,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             is_expert=False,
             tp_comm_buffer_name="fc2",
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + ".out_proj") if name is not None else None,
         )
         self.reset_parameters()
@@ -555,8 +557,11 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
-        # Guard for cases metadata is not provided
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        # Guard for cases metadata is not provided: replica ids span the layer's GTP-inclusive
+        # DP x CP group, the group the global default stands for.
+        metadata = ensure_metadata_has_dp_cp_group(
+            metadata, self.pg_collection.dp_cp_gtp_remat or self.pg_collection.dp_cp
+        )
 
         sharded_state_dict = {}
         # Parameters

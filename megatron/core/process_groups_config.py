@@ -3,10 +3,11 @@
 """Dataclasses for organizing model parallelism and gradient communication process groups."""
 
 import os
+import threading
 import warnings
 from dataclasses import dataclass, field, fields
 from functools import partial
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, ContextManager, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 
@@ -15,7 +16,7 @@ from megatron.core import parallel_state
 # The fallbacks first warn in Megatron Core 0.21, so the N+2 policy in
 # docs/api-backwards-compatibility-check.md removes them in 0.23. These are the defaults; a
 # fallback that starts to warn in a later release passes its own versions to
-# warn_global_process_group_fallback or resolve_process_groups.
+# warn_global_process_group_fallback, global_process_group_fallback or resolve_process_groups.
 _FALLBACK_DEPRECATED_IN = "0.21"
 _FALLBACK_REMOVED_IN = "0.23"
 
@@ -28,8 +29,23 @@ _FALLBACK_WARNING_SKIP_PREFIXES = (
     os.path.dirname(torch.__file__) + os.sep,
 )
 
-# (owner, argument) pairs that have already warned in this process.
-_warned_global_process_group_fallbacks: Set[Tuple[str, str]] = set()
+# Fallbacks that have already warned in this process: (owner, argument) for a fallback to the
+# global grid, and (owner, argument, "uninitialized") for one that found the grid uninitialized.
+_warned_global_process_group_fallbacks: Set[Tuple[str, ...]] = set()
+
+# Fallbacks whose warning this thread is showing, in its "keys" attribute.
+_fallback_warnings_in_progress = threading.local()
+
+# ProcessGroupCollection.use_mpu_process_groups() builds a collection from the deprecated
+# parallel_state accessors, and is deprecated with them for callers outside Megatron Core.
+_USE_MPU_PROCESS_GROUPS_DEPRECATION = (
+    "megatron.core.process_groups_config.ProcessGroupCollection.use_mpu_process_groups() is "
+    f"deprecated since Megatron Core {parallel_state._ACCESSOR_DEPRECATED_IN} and will be "
+    f"removed in {parallel_state._ACCESSOR_REMOVED_IN}. Replace it with the "
+    "ProcessGroupCollection that the code which needs the groups receives from its caller, or "
+    "with megatron.core.parallel_state.get_registered_process_groups() for the groups that "
+    "initialize_model_parallel() or register_process_groups() registered for this run."
+)
 
 
 class ProcessGroupFallbackWarning(FutureWarning):
@@ -37,7 +53,8 @@ class ProcessGroupFallbackWarning(FutureWarning):
 
     It is a ``FutureWarning``, so filters and tests that match ``FutureWarning`` also match it.
     To turn every fallback into an error, for example in CI, call
-    ``warnings.simplefilter("error", ProcessGroupFallbackWarning)``, or run pytest with
+    ``enable_strict_process_group_fallbacks()`` (training: ``--strict-process-group-fallbacks``),
+    or run pytest with
     ``-W error::megatron.core.process_groups_config.ProcessGroupFallbackWarning``. The same option
     passed to ``python`` itself, or set in ``PYTHONWARNINGS``, has no effect: Python resolves it
     before site-packages, and so torch, can be imported, and ignores it with a note on stderr.
@@ -66,6 +83,10 @@ def warn_global_process_group_fallback(
     arguments of one owner hears about both. A warning that a filter turns into an error is not
     recorded, so under an ``error`` filter every fallback raises.
 
+    A fallback outside Megatron Core that then reads the deprecated ``parallel_state`` accessors
+    warns with ``global_process_group_fallback`` instead, which keeps those reads from emitting
+    a ``ParallelStateDeprecationWarning`` as well.
+
     Args:
         owner: Name of the class or function whose caller omitted ``argument``.
         argument: Name of the omitted process-group argument.
@@ -73,18 +94,107 @@ def warn_global_process_group_fallback(
         removed_in: Megatron Core release that removes this fallback. Under the N+2 policy, a
             fallback that starts to warn after 0.21 passes both versions.
     """
-    key = (owner, argument)
+    _warn_fallback_once(
+        (owner, argument),
+        f"{owner} was called without `{argument}` and falls back to the global process groups "
+        "in megatron.core.parallel_state.",
+        deprecated_in=deprecated_in,
+        removed_in=removed_in,
+    )
+
+
+def global_process_group_fallback(
+    owner: str,
+    argument: str = "pg_collection",
+    *,
+    deprecated_in: str = _FALLBACK_DEPRECATED_IN,
+    removed_in: str = _FALLBACK_REMOVED_IN,
+) -> ContextManager[None]:
+    """Warn that a missing argument uses the global grid, and return a block that reads it.
+
+    For a compatibility fallback outside Megatron Core that reads the ``parallel_state``
+    accessors for a caller that omitted ``argument``::
+
+        with global_process_group_fallback("my_function", "tp_group"):
+            tp_group = parallel_state.get_tensor_model_parallel_group()
+
+    It emits the ``ProcessGroupFallbackWarning`` of ``warn_global_process_group_fallback``. That
+    warning reports the fallback, so the deprecated ``parallel_state`` functions called in the
+    returned block do not also emit a ``ParallelStateDeprecationWarning`` for each call. The
+    fallbacks in Megatron Core need no block: its calls of those functions do not warn.
+
+    Keep the block to the reads of the fallback: a deprecated function that anything else in
+    the block calls, at any depth, does not warn either. Under strict mode
+    (``enable_strict_process_group_fallbacks``) the warning raises before the block reads the
+    grid.
+
+    Args:
+        owner: Name of the class or function whose caller omitted ``argument``.
+        argument: Name of the omitted process-group argument.
+        deprecated_in: Megatron Core release in which this fallback started to warn.
+        removed_in: Megatron Core release that removes this fallback.
+
+    Returns:
+        A context manager whose block reads the grid without accessor warnings.
+    """
+    warn_global_process_group_fallback(
+        owner, argument, deprecated_in=deprecated_in, removed_in=removed_in
+    )
+    return parallel_state._deprecated_calls_in_warned_fallback()
+
+
+def _warn_fallback_once(
+    key: Tuple[str, ...], fallback: str, *, deprecated_in: str, removed_in: str
+) -> None:
+    """Emit a ``ProcessGroupFallbackWarning`` that describes ``fallback``, once per ``key``.
+
+    A warning that a filter turns into an error is not recorded, so under an ``error`` filter
+    every fallback raises. A warning hook that reaches the same fallback while its warning is
+    shown, in the same thread, does not warn again, so it does not recurse.
+    """
     if key in _warned_global_process_group_fallbacks:
         return
-    warnings.warn(
-        f"{owner} was called without `{argument}` and falls back to the global process groups "
-        "in megatron.core.parallel_state. This fallback is deprecated since Megatron Core "
-        f"{deprecated_in} and will be removed in {removed_in}; pass the "
-        "owning model's process groups explicitly.",
-        ProcessGroupFallbackWarning,
-        skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES,
-    )
+    in_progress = vars(_fallback_warnings_in_progress).setdefault("keys", set())
+    if key in in_progress:
+        return
+    in_progress.add(key)
+    try:
+        warnings.warn(
+            f"{fallback} This fallback is deprecated since Megatron Core {deprecated_in} and will "
+            f"be removed in {removed_in}; pass the owning model's process groups explicitly.",
+            ProcessGroupFallbackWarning,
+            skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES,
+        )
+    finally:
+        in_progress.discard(key)
     _warned_global_process_group_fallbacks.add(key)
+
+
+def enable_strict_process_group_fallbacks() -> None:
+    """Make every global process-group fallback in this process raise instead of warn.
+
+    This installs ``warnings.filterwarnings("error", category=ProcessGroupFallbackWarning)``
+    at the front of the filter list, ahead of every filter installed before it, such as the
+    ignore filters of ``megatron.rank_log_setup.suppress_duplicate_logs_off_rank0``. Each rank
+    that reaches a fallback then raises ``ProcessGroupFallbackWarning``; other warnings are not
+    affected. It also forgets which fallbacks already warned in this process, so those raise
+    too the next time they are reached.
+
+    Training calls this for ``--strict-process-group-fallbacks``. Other frameworks call it after
+    their own warning setup: a filter installed later that also matches this class, for example
+    ``warnings.simplefilter("ignore")``, takes precedence again. A ``warnings.catch_warnings()``
+    block restores the previous filters on exit, which scopes strict mode to the block.
+
+    Unit tests opt in through pytest, which accepts a dotted class path:
+    ``pytest -W error::megatron.core.process_groups_config.ProcessGroupFallbackWarning`` for a
+    run, or the same value in the ``filterwarnings`` ini option or marker. ``python -W`` and
+    ``PYTHONWARNINGS`` cannot name this class (see ``ProcessGroupFallbackWarning``). A fallback
+    that warned in an earlier test of the same process, for example under ``pytest.warns``,
+    stays silent under those filters; a test that must catch it calls this function inside
+    ``warnings.catch_warnings()``.
+    """
+    warnings.filterwarnings("error", category=ProcessGroupFallbackWarning)
+    _warned_global_process_group_fallbacks.clear()
 
 
 class ProcessGroupHelperMeta(type):
@@ -315,6 +425,7 @@ class ProcessGroupCollection:
         return self
 
     @classmethod
+    @parallel_state._deprecated_outside_megatron_core(_USE_MPU_PROCESS_GROUPS_DEPRECATION)
     def use_mpu_process_groups(cls, required_pgs: Optional[List[str]] = None):
         """Build a collection from the global process groups in ``parallel_state``.
 
@@ -329,6 +440,17 @@ class ProcessGroupCollection:
             ``resolve_process_groups()`` in Megatron Core, or a
             ``global_process_group_fallback()`` block outside it. See
             ``docs/developer/parallel-state-deprecation.md``.
+
+        These are the groups registered with parallel_state.register_process_groups(), which
+        initialize_model_parallel() calls. Each call returns a new collection; dp_cp_ag and
+        expt_dp_ag are None.
+
+        Deprecated since Megatron Core 0.21 and removed in 0.23: called from outside Megatron
+        Core, it emits a ``ParallelStateDeprecationWarning`` once per call site, except in the
+        block of ``global_process_group_fallback()``. Pass the model's collection to the code
+        that needs it instead, or read the registered one with
+        ``parallel_state.get_registered_process_groups()``, which returns that collection
+        itself rather than a new one; set fields on a ``copy.copy()`` of it.
 
         Args:
             required_pgs (List[str], optional): List of process group names to initialize.
@@ -482,7 +604,8 @@ class ProcessGroupCollection:
         and fallbacks.
 
         Args:
-            pg_collection: Optional process group collection. If None, uses parallel_state groups.
+            pg_collection: Optional process group collection. If None, uses parallel_state groups;
+                that fallback is deprecated and emits a ``ProcessGroupFallbackWarning``.
             model_chunks: List of model chunks to extract configuration from.
             use_gloo_process_groups: Whether to set up gloo process groups. With a
                 pg_collection, they come from its intra_dp_cp_gloo and intra_expt_dp_gloo fields
@@ -508,6 +631,11 @@ class ProcessGroupCollection:
         from megatron.core.utils import get_model_config
 
         if pg_collection is None:
+            warn_global_process_group_fallback(
+                "ProcessGroupCollection.setup_process_groups_for_optimizer",
+                deprecated_in="0.21",
+                removed_in="0.23",
+            )
             # Use parallel_state groups
             dp_group = parallel_state.get_data_parallel_group(
                 with_context_parallel=False, with_gtp_remat=False, partial_data_parallel=False
@@ -627,7 +755,9 @@ class ProcessGroupCollection:
                     if 'intra_dist_opt' not in pg_set:
                         raise ValueError(
                             "intra_dist_opt process group is required but not provided in "
-                            "pg_collection. Please explicitly set it to None if you don't need it."
+                            "pg_collection. Set it to the ranks of one distributed-optimizer "
+                            "instance, over which the gradient statistics are reduced. None "
+                            "reduces them over the default (WORLD) group, which is deprecated."
                         )
                     intra_dist_opt_group = pg_collection.intra_dist_opt
                 else:
@@ -666,9 +796,10 @@ class ProcessGroupCollection:
             else:
                 expt_tp_pp_with_egtp_remat_group = expt_tp_pp_group
 
-            # GTP weight-shard groups (None when inactive); used to detect whether GTP is on.
-            gtp_remat_group = getattr(pg_collection, 'gtp_remat', None)
-            expt_gtp_remat_group = getattr(pg_collection, 'expt_gtp_remat', None)
+            # GTP weight-shard groups, used to detect whether GTP is on. A collection that does
+            # not set one, or sets it to None, has that axis off.
+            gtp_remat_group = pg_set.get('gtp_remat')
+            expt_gtp_remat_group = pg_set.get('expt_gtp_remat')
 
             # Gloo groups come from the collection. GTP_remat jobs build no Gloo groups (their
             # optimizer uses DCP), so only those may enable Gloo without supplying the groups.
@@ -724,7 +855,8 @@ class ProcessGroupCollection:
         Helper method to set up process groups for DDP with proper validation and fallbacks.
 
         Args:
-            pg_collection: Optional process group collection. If None, uses parallel_state groups.
+            pg_collection: Optional process group collection. If None, uses parallel_state groups;
+                that fallback is deprecated and emits a ``ProcessGroupFallbackWarning``.
             config: Model config to extract context_parallel_size from.
             ddp_config: DDP config to extract num_distributed_optimizer_instances from.
 
@@ -741,6 +873,9 @@ class ProcessGroupCollection:
         logger = logging.getLogger(__name__)
 
         if pg_collection is None:
+            warn_global_process_group_fallback(
+                "DistributedDataParallel", deprecated_in="0.21", removed_in="0.23"
+            )
             # Use parallel_state groups
             return {
                 'dp_group': parallel_state.get_data_parallel_group(
@@ -802,8 +937,8 @@ class ProcessGroupCollection:
                         "but not provided in pg_collection"
                     )
 
-            # 3. Handle expert data parallel group (DDP-specific: create if missing)
-            if hasattr(pg_collection, 'expt_dp') and pg_collection.expt_dp is not None:
+            # 3. Handle expert data parallel group (DDP-specific: create if unset or None)
+            if pg_set.get('expt_dp') is not None:
                 result['expt_dp_group'] = pg_collection.expt_dp
             else:
                 # Without an expert data-parallel group, that axis runs at size 1. Creating
@@ -849,9 +984,10 @@ class ProcessGroupCollection:
             result['pp_group'] = pg_collection.pp
             result['ep_group'] = pg_collection.ep
 
-            # GTP weight-shard groups (None when inactive); used to detect whether GTP is on.
-            result['gtp_remat_group'] = getattr(pg_collection, 'gtp_remat', None)
-            result['expt_gtp_remat_group'] = getattr(pg_collection, 'expt_gtp_remat', None)
+            # GTP weight-shard groups, used to detect whether GTP is on. A collection that does
+            # not set one, or sets it to None, has that axis off.
+            result['gtp_remat_group'] = pg_set.get('gtp_remat')
+            result['expt_gtp_remat_group'] = pg_set.get('expt_gtp_remat')
 
             return result
 
@@ -887,6 +1023,8 @@ def _get_gloo_mirror_group(
 def resolve_gtp_remat_group(
     pg_collection: Optional[Union["ProcessGroupCollection", "MultiModuleProcessGroupCollection"]],
     is_expert: bool,
+    *,
+    owner: Optional[str] = "resolve_gtp_remat_group",
 ) -> Optional[torch.distributed.ProcessGroup]:
     """Resolve the gtp_remat / expt_gtp_remat group for a weight-owning module.
 
@@ -894,6 +1032,18 @@ def resolve_gtp_remat_group(
     caller passed no collection, or one predating the gtp_remat fields. The fallback keeps
     pre-pg_collection callers working — a collection that does carry the field is always
     honored, including when it holds a custom (non-MPU) group.
+
+    The fallback is deprecated. When the caller names an ``owner``, the fallback warns before it
+    reads the grid, once per owner and argument like every other
+    ``warn_global_process_group_fallback`` call. Under an ``error`` filter on
+    ``ProcessGroupFallbackWarning`` the warning raises before the read and is not recorded, so
+    later fallbacks raise as well. An owner and argument that already warned in this process
+    before the filter was installed do not warn again, so their fallback still reads the grid
+    without raising. The fallback also warns when GTP is off or the grid is not initialized,
+    since the group then comes from the grid as well. With ``owner=None`` it reads the grid
+    without warning (see ``owner`` below). Every caller treats a missing or single-rank group as
+    GTP off, which is what an absent field will mean once the fallback is removed. A collection
+    that sets the field, to None when the axis is off, never reaches the fallback.
 
     A ``MultiModuleProcessGroupCollection`` is unwrapped to the language model's collection
     first: only the per-module collections carry the GTP axes, so the wrapper would
@@ -903,6 +1053,10 @@ def resolve_gtp_remat_group(
     Args:
         pg_collection: Collection supplied by the caller, or None.
         is_expert: Select the expert axis (``expt_gtp_remat``) instead of the dense one.
+        owner: Name of the class or function the fallback warning names. None only for a
+            caller whose own fallback has already emitted a ``ProcessGroupFallbackWarning``
+            before this call, which covers this read; the fallback then reads the grid without
+            warning again.
     """
     attr = 'expt_gtp_remat' if is_expert else 'gtp_remat'
     if isinstance(pg_collection, MultiModuleProcessGroupCollection):
@@ -915,6 +1069,14 @@ def resolve_gtp_remat_group(
     # would be unreachable.
     if pg_collection is not None and attr in vars(pg_collection):
         return getattr(pg_collection, attr)
+    if owner is not None:
+        # Warn before reading the grid, so that an error filter raises without reading it.
+        warn_global_process_group_fallback(
+            owner,
+            "pg_collection" if pg_collection is None else f"pg_collection.{attr}",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
     mpu_pgs = ProcessGroupCollection.use_mpu_process_groups(
         required_pgs=['gtp_remat', 'expt_gtp_remat']
     )
@@ -1157,6 +1319,14 @@ def resolve_process_groups(
     fields from ``megatron.core.parallel_state``. In both cases ``require_process_groups`` then
     checks that every field in ``required`` is set.
 
+    If ``parallel_state`` is not initialized, the collection holds what its accessors return
+    without a grid: None for most groups, which ``torch.distributed`` treats as the default
+    (WORLD) group. The warning then names those groups. It is recorded apart from the warning for
+    an initialized grid, so a process that reaches both hears about both. An accessor that needs
+    an initialized grid, such as the one for ``dp``, raises instead. On an initialized grid the
+    warning comes before any group is read, so strict mode
+    (``enable_strict_process_group_fallbacks``) raises without reading the grid.
+
     ``tools/check_process_group_usage.py`` counts each call in ``megatron/core`` as a guarded
     read of the global grid.
 
@@ -1170,11 +1340,59 @@ def resolve_process_groups(
 
     Returns:
         ``pg_collection`` itself, or the collection built from the global groups.
+
+    Raises:
+        ValueError: A field in ``required`` is absent (see ``require_process_groups``).
+        AssertionError: ``pg_collection`` is None, ``parallel_state`` is not initialized, and
+            the accessor of a field in ``required`` needs an initialized grid, such as the one
+            for ``dp``.
     """
     if pg_collection is None:
+        grid_initialized = parallel_state.model_parallel_is_initialized()
+        if grid_initialized:
+            # Warn before reading any group, so that strict mode raises without reading the grid.
+            warn_global_process_group_fallback(
+                owner, argument, deprecated_in=deprecated_in, removed_in=removed_in
+            )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=list(required))
+        if not grid_initialized:
+            # Without a grid the accessors return None for most groups; the warning names them.
+            _warn_fallback_to_uninitialized_grid(
+                pg_collection, owner, argument, deprecated_in=deprecated_in, removed_in=removed_in
+            )
+    require_process_groups(pg_collection, required, owner=owner)
+    return pg_collection
+
+
+def _warn_fallback_to_uninitialized_grid(
+    pg_collection: ProcessGroupCollection,
+    owner: str,
+    argument: str,
+    *,
+    deprecated_in: str,
+    removed_in: str,
+) -> None:
+    """Warn that ``owner`` fell back to an uninitialized grid, naming the groups that are None.
+
+    ``pg_collection`` is the collection built from that grid. A None GTP weight-remat group
+    means that the axis is off, not the WORLD group, so the warning leaves those groups out.
+    """
+    none_groups = [
+        name
+        for name, group in vars(pg_collection).items()
+        if group is None and name not in ("gtp_remat", "expt_gtp_remat")
+    ]
+    if not none_groups:
         warn_global_process_group_fallback(
             owner, argument, deprecated_in=deprecated_in, removed_in=removed_in
         )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=list(required))
-    require_process_groups(pg_collection, required, owner=owner)
-    return pg_collection
+        return
+    _warn_fallback_once(
+        (owner, argument, "uninitialized"),
+        f"{owner} was called without `{argument}` and falls back to the global process groups "
+        "in megatron.core.parallel_state, which is not initialized, so the "
+        f"{', '.join(none_groups)} groups it returns are None. torch.distributed treats a None "
+        "group as the default (WORLD) group, which spans every rank.",
+        deprecated_in=deprecated_in,
+        removed_in=removed_in,
+    )

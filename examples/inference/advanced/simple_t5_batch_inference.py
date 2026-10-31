@@ -30,6 +30,7 @@ sys.path.append(
 from typing import List
 
 from megatron.core import mpu
+from megatron.core.parallel_state import get_registered_process_groups
 from megatron.training import get_args, get_model, get_tokenizer
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
@@ -114,8 +115,11 @@ def main():
         },
     )
 
-    # Set up model and load checkpoint
-    model = get_model(model_provider, wrap_with_ddp=False)
+    # Set up model and load checkpoint. The model is built on the groups that
+    # initialize_megatron() registered.
+    model = get_model(
+        model_provider, wrap_with_ddp=False, pg_collection=get_registered_process_groups()
+    )
     load_checkpoint(model, None, None)
     model = model[0]
 

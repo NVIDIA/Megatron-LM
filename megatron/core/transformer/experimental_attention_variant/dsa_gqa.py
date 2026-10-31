@@ -14,7 +14,7 @@ from megatron.core.models.common.embeddings import (
     apply_rotary_pos_emb,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_process_groups
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
@@ -349,9 +349,13 @@ class SimplifiedDSGQAIndexer(MegatronModule):
         )
         self.index_rotary_dim -= self.index_rotary_dim % 2
 
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
-        self.pg_collection = pg_collection
+        self.pg_collection = resolve_process_groups(
+            pg_collection,
+            owner=type(self).__name__,
+            required=('tp', 'cp'),
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
 
         self.rotary_pos_emb = None
         if self.index_rotary_dim > 0:
@@ -403,6 +407,7 @@ class SimplifiedDSGQAIndexer(MegatronModule):
                 skip_weight_param_allocation=False,
                 parallel_mode="duplicated",
                 tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
             )
             self.linear_k = build_module(
                 submodules.linear_k,
@@ -415,6 +420,7 @@ class SimplifiedDSGQAIndexer(MegatronModule):
                 skip_weight_param_allocation=False,
                 parallel_mode="duplicated",
                 tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
             )
         if self.pg_collection.tp.size() > 1:
             for param in self.parameters():

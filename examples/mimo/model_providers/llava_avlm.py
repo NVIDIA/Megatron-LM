@@ -25,7 +25,10 @@ from megatron.core.models.mimo import MimoModel, MimoModelConfig
 from megatron.core.models.mimo.submodules.audio import AudioModalitySubmodules
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    global_process_group_fallback,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec
 
 
@@ -47,7 +50,14 @@ def model_provider_llava_avlm(
     • 2-layer MLP audio→language projector.
     """
     if pg_collection is None:
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        # Callers that omit the process groups get those of the global parallel grid; that
+        # fallback is deprecated.
+        with global_process_group_fallback(
+            "examples.mimo.model_providers.llava_avlm.model_provider_llava_avlm",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        ):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     # NOTE: Pipeline parallelism for the encoder/decoder is not yet supported in this
     # MIMO path, therefore *add_encoder* and *add_decoder* are currently ignored.
@@ -104,6 +114,7 @@ def model_provider_llava_avlm(
             "submodules": get_llava_projection_layer_spec().submodules,
             "projector_type": "mlp",
             "input_size": 1024,
+            "pg_collection": pg_collection,
         },
     )
     audio_projection = ModuleSpec(
@@ -113,6 +124,7 @@ def model_provider_llava_avlm(
             "submodules": get_llava_projection_layer_spec().submodules,
             "projector_type": "mlp",
             "input_size": 512,
+            "pg_collection": pg_collection,
         },
     )
 
@@ -120,7 +132,7 @@ def model_provider_llava_avlm(
     # Create modality config for vision and audio
     vision_submodule_spec = ModuleSpec(
         module=VisionModalitySubmodules,
-        params={},
+        params={"pg_collection": pg_collection},
         submodules={
             "encoders": {"clip_encoder": vision_encoder},
             "input_projections": [vision_projection],
@@ -128,7 +140,7 @@ def model_provider_llava_avlm(
     )
     audio_submodule_spec = ModuleSpec(
         module=AudioModalitySubmodules,
-        params={},
+        params={"pg_collection": pg_collection},
         submodules={
             "encoders": {"whisper_encoder": audio_encoder},
             "input_projections": [audio_projection],
@@ -160,12 +172,14 @@ def model_provider_llava_avlm(
     )
 
     # Create MIMO model
-    cp_group = pg_collection.cp if pg_collection is not None else None
-    tp_group = pg_collection.tp if pg_collection is not None else None
-    tp_cp_group = pg_collection.tp_cp if pg_collection is not None else None
     mimo_model = MimoModel(
-        mimo_model_config, cp_group=cp_group, tp_group=tp_group, tp_cp_group=tp_cp_group
+        mimo_model_config,
+        cp_group=pg_collection.cp,
+        tp_group=pg_collection.tp,
+        tp_cp_group=pg_collection.tp_cp,
     )
+    # Wrappers such as Float16Module and the training loop read the groups from the model.
+    mimo_model.pg_collection = pg_collection
     print("*"*100)
     print_mimo_structure(mimo_model)
     print("*"*100)

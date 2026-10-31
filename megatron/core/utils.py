@@ -614,7 +614,16 @@ def round_up_to_nearest_multiple(value: int, multiple: int) -> int:
 
 
 def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True):
-    """Issue a deprecation warning if tp_group is None and return the default tp group."""
+    """Return ``tp_group``, or the global tensor-parallel group when it is None.
+
+    Falling back to the global group is deprecated: pass the owning model's group, for example
+    ``pg_collection.tp``, or ``pg_collection.expt_tp`` for expert layers (``is_expert=True``).
+    The fallback emits a ``ProcessGroupFallbackWarning`` once per calling function. Its owner
+    names this helper and the function that called it, which is the one that needs the group.
+
+    Returns ``tp_group`` unchanged when ``parallel_state`` is not initialized, and None when
+    ``torch.distributed`` is not initialized.
+    """
     # TODO(zijiey): remove this function later.
     if not torch.distributed.is_initialized():
         return None
@@ -624,13 +633,17 @@ def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_ini
         return tp_group
 
     if tp_group is None:
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-            warnings.warn(
-                "Warning: tp_group is None, using default tp group. "
-                "Passing tp_group will be mandatory soon",
-                DeprecationWarning,
-                stacklevel=2,
-            )
+        # Import here to avoid a circular import: process_groups_config imports parallel_state,
+        # which imports this module.
+        from megatron.core.process_groups_config import warn_global_process_group_fallback
+
+        caller = sys._getframe(1).f_code.co_qualname
+        warn_global_process_group_fallback(
+            f"get_tensor_model_parallel_group_if_none (from {caller})",
+            "tp_group",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
         if is_expert:
             tp_group = parallel_state.get_expert_tensor_parallel_group(
                 check_initialized=check_initialized
@@ -779,6 +792,27 @@ class GlobalMemoryBuffer:
                 )
 
         return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)
+
+
+_GLOBAL_MEMORY_BUFFER: Optional[GlobalMemoryBuffer] = None
+
+
+def get_global_memory_buffer() -> GlobalMemoryBuffer:
+    """Return the process-wide GlobalMemoryBuffer, creating it on first use.
+
+    The buffer is scratch memory shared by every model in the process. It does not depend on any
+    process group, so it is available without ``parallel_state.initialize_model_parallel``.
+    """
+    global _GLOBAL_MEMORY_BUFFER
+    if _GLOBAL_MEMORY_BUFFER is None:
+        _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
+    return _GLOBAL_MEMORY_BUFFER
+
+
+def destroy_global_memory_buffer() -> None:
+    """Drop the process-wide GlobalMemoryBuffer; the next use creates an empty one."""
+    global _GLOBAL_MEMORY_BUFFER
+    _GLOBAL_MEMORY_BUFFER = None
 
 
 def _kernel_make_viewless_tensor(inp, requires_grad):
@@ -1138,9 +1172,15 @@ def make_tp_sharded_tensor_for_checkpoint(
         replica_id: Replica ID for the tensor (default: None)
         prepend_offsets: Offsets to prepend to tensor dimensions (default: ())
         **kwargs: Additional arguments. May include:
-            - tp_group: Tensor parallel group (default: None, falls back to parallel_state)
-            - dp_cp_group: Data parallel + context parallel group
-              (default: None, falls back to parallel_state)
+            - tp_group: Tensor parallel group. None with a dp_cp_group means the tensor is
+              not tensor-parallel.
+            - dp_cp_group: Data parallel + context parallel group, required with a tp_group.
+              When both groups are None, the global tensor-parallel group and the global
+              GTP-inclusive DP x CP group are used, with a ``ProcessGroupFallbackWarning``.
+              That fallback is deprecated; pass the owning module's groups.
+
+    Raises:
+        ValueError: If tp_group is given without dp_cp_group.
     """
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
@@ -1150,10 +1190,25 @@ def make_tp_sharded_tensor_for_checkpoint(
 
     new_offsets = []
 
-    # Get groups with fallback to parallel_state
     if tp_group is None and dp_cp_group is None:
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        # Import here to avoid a circular import: process_groups_config imports parallel_state,
+        # which imports this module.
+        from megatron.core.process_groups_config import resolve_process_groups
+
+        pg_collection = resolve_process_groups(
+            None,
+            owner="make_tp_sharded_tensor_for_checkpoint",
+            required=("tp", "dp_cp_gtp_remat"),
+            argument="tp_group/dp_cp_group",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        tp_group, dp_cp_group = pg_collection.tp, pg_collection.dp_cp_gtp_remat
+    elif dp_cp_group is None:
+        raise ValueError(
+            "A tp_group without a dp_cp_group would make every data-parallel rank the main "
+            f"replica of '{key}'; pass the dp_cp_group that goes with the tp_group"
+        )
 
     # Use local get_pg_rank and get_pg_size functions
     tp_rank = get_pg_rank(tp_group)
@@ -1343,9 +1398,15 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
         prepend_offsets: Offsets to prepend to tensor dimensions (default: ())
         replica_id: Replica ID for the tensor (default: None)
         **kwargs: Additional arguments. May include:
-            - tp_group: Tensor parallel group (default: None, falls back to parallel_state)
-            - dp_cp_group: Data parallel + context parallel group
-              (default: None, falls back to parallel_state)
+            - tp_group: Tensor parallel group. None with a dp_cp_group means the tensor is
+              not tensor-parallel.
+            - dp_cp_group: Data parallel + context parallel group, required with a tp_group.
+              When both groups are None, the global tensor-parallel group and the global
+              GTP-inclusive DP x CP group are used, with a ``ProcessGroupFallbackWarning``.
+              That fallback is deprecated; pass the owning module's groups.
+
+    Raises:
+        ValueError: If tp_group is given without dp_cp_group.
     """
     # Sanity guard.
     from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
@@ -1367,10 +1428,25 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
 
     new_offsets = []
 
-    # Get groups with fallback to parallel_state
     if tp_group is None and dp_cp_group is None:
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        # Import here to avoid a circular import: process_groups_config imports parallel_state,
+        # which imports this module.
+        from megatron.core.process_groups_config import resolve_process_groups
+
+        pg_collection = resolve_process_groups(
+            None,
+            owner="make_sharded_tensor_for_checkpoint",
+            required=("tp", "dp_cp_gtp_remat"),
+            argument="tp_group/dp_cp_group",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        tp_group, dp_cp_group = pg_collection.tp, pg_collection.dp_cp_gtp_remat
+    elif dp_cp_group is None:
+        raise ValueError(
+            "A tp_group without a dp_cp_group would make every data-parallel rank the main "
+            f"replica of '{key}'; pass the dp_cp_group that goes with the tp_group"
+        )
 
     # Use local get_pg_rank and get_pg_size functions
     dp_rank = get_pg_rank(dp_cp_group)
@@ -1487,8 +1563,6 @@ def drain_embedding_wgrad_compute(
     ), "Length of activation and gradient buffers need to be equal!"
 
     import fused_weight_gradient_mlp_cuda
-
-    from megatron.core.parallel_state import get_global_memory_buffer
 
     input = embedding_activation_buffer.pop(0)
     world_size = tp_group.size()

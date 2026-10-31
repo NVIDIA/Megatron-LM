@@ -331,11 +331,20 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
 
         if pg_collection is None:
             warn_global_process_group_fallback(type(self).__name__)
-            # hcp feeds TEDotProductAttention's a2a+p2p path; dp is only read by
-            # run_realtime_tests, so it is resolved only when test_mode needs it.
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=['tp', 'cp', 'hcp'] + (['dp'] if self.config.test_mode else [])
+            # hcp feeds TEDotProductAttention's a2a+p2p path. The linear projections take their
+            # GTP weight-remat group from gtp_remat, so they do not fall back for it and warn
+            # again; with dense GTP weight remat on, their Transformer Engine linears still warn
+            # for the dp_cp replica group, which this collection leaves unset.
+            # The data-parallel groups are resolved only in test_mode, so a model built outside
+            # it needs no DP group.
+            required_pgs = ['tp', 'cp', 'hcp', 'gtp_remat'] + (
+                ['dp'] if self.config.test_mode else []
             )
+            if self.config.test_mode and self.config.qk_layernorm:
+                # SelfAttention.run_realtime_tests compares the Q/K layernorm parameters across
+                # the data-parallel group as well.
+                required_pgs.append('dp_gtp_remat')
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
         for group_name in ('tp', 'cp'):
             if group_name not in vars(pg_collection):
                 raise ValueError(f"Attention pg_collection must have {group_name} process group")
@@ -1921,15 +1930,18 @@ class SelfAttention(Attention):
         if not self.config.qk_layernorm:
             return
 
+        # dp_gtp_remat holds the data-parallel replicas of these parameters, GTP-remat peers
+        # included. A missing group must not reach torch.distributed, which reads None as WORLD.
+        dp_group = self.pg_collection.dp_gtp_remat
+        if self.tp_group is None or dp_group is None:
+            raise ValueError(
+                "SelfAttention with config.test_mode and qk_layernorm compares the Q/K layernorm "
+                "parameters across the tensor- and data-parallel groups; pg_collection must set "
+                "tp and dp_gtp_remat"
+            )
+
         # check that all tensor parallel and data parallel ranks have the same
         # Q & K layernorm parameters.
-        # Only this consistency check needs the DP group, so it is required here rather than in
-        # __init__, which requires tp/cp only.
-        if vars(self.pg_collection).get('dp') is None:
-            raise ValueError(
-                "run_realtime_tests requires a dp process group; pass one via pg_collection.dp"
-            )
-        dp_group = self.pg_collection.dp
         rank = dp_group.rank()
         inputs = torch.stack(
             [
@@ -2278,6 +2290,8 @@ class CrossAttention(Attention):
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
+            tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + ".linear_q") if name is not None else None,
         )
 
@@ -2290,6 +2304,8 @@ class CrossAttention(Attention):
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
+            tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + ".linear_kv") if name is not None else None,
         )
 

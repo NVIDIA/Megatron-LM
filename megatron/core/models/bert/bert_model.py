@@ -6,7 +6,7 @@ from typing import Literal, Optional
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.bert.bert_lm_head import BertLMHead
@@ -14,6 +14,7 @@ from megatron.core.models.bert.pooler import Pooler
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import (
@@ -119,6 +120,8 @@ class BertModel(LanguageModule):
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=position_embedding_type,
                 num_tokentypes=num_tokentypes,
+                tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
             )
 
         if self.position_embedding_type == 'rope':
@@ -137,13 +140,18 @@ class BertModel(LanguageModule):
             spec=self.transformer_layer_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
+            pg_collection=self.pg_collection,
             vp_stage=vp_stage,
         )
 
         # Output
         if post_process:
             # TODO: Make sure you are passing in the mpu_vocab_size properly
-            self.lm_head = BertLMHead(config.hidden_size, config) if self.apply_lm_head else None
+            self.lm_head = (
+                BertLMHead(config.hidden_size, config, tp_group=self.pg_collection.tp)
+                if self.apply_lm_head
+                else None
+            )
 
             self.output_layer = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
@@ -158,6 +166,8 @@ class BertModel(LanguageModule):
                 skip_bias_add=False,
                 gather_output=not self.parallel_output,
                 skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights,
+                tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
             )
 
             self.binary_head = None
@@ -168,7 +178,11 @@ class BertModel(LanguageModule):
                 )
 
                 self.pooler = Pooler(
-                    config.hidden_size, config.init_method, config, config.sequence_parallel
+                    config.hidden_size,
+                    config.init_method,
+                    config,
+                    config.sequence_parallel,
+                    tp_group=self.pg_collection.tp,
                 )
 
         if self.pre_process or self.post_process:
@@ -331,7 +345,7 @@ class BertModel(LanguageModule):
 
         extended_attention_mask = self.bert_extended_attention_mask(attention_mask)
 
-        if parallel_state.is_pipeline_first_stage():
+        if is_pp_first_stage(self.pp_group):
             input_ids = input_ids
             position_ids = self.bert_position_ids(input_ids)
         else:
