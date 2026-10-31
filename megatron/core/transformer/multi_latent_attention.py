@@ -20,6 +20,7 @@ from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_row_copy import contiguous_rows
+from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -37,6 +38,7 @@ from megatron.core.tensor_parallel.mappings import (
     scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.attention import Attention, LinearProjBuilder
+from megatron.core.transformer.attention_output_gate import apply_attention_output_gate
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -249,6 +251,9 @@ class MLASelfAttentionSubmodules:
     linear_kv_up_proj: Union[ModuleSpec, type] = None
     linear_qkv_down_proj: Union[ModuleSpec, type] = None
     core_attention: Union[ModuleSpec, type] = None
+    # MLA output gating (dev #8006): projects the gate from the layer input and applies it to the
+    # core-attention output (see MultiLatentAttention.{__init__,_project_and_apply_mla_output_gate}).
+    linear_gate: Union[ModuleSpec, type] = None
 
 
 class MultiLatentAttention(Attention):
@@ -287,6 +292,10 @@ class MultiLatentAttention(Attention):
         self.config: MLATransformerConfig
 
         self.query_projection_size = self.config.v_head_dim * self.config.num_attention_heads
+        if self.config.gated_attention_proj_granularity == 'elementwise':
+            self.gate_projection_size = self.query_projection_size
+        else:
+            self.gate_projection_size = self.config.num_attention_heads
 
         self.q_head_dim = self.config.qk_head_dim + self.config.qk_pos_emb_head_dim
 
@@ -379,6 +388,26 @@ class MultiLatentAttention(Attention):
             cp_comm_type=cp_comm_type,
             pg_collection=self.pg_collection,
         )
+
+        if self.config.attention_output_gate:
+            if submodules.linear_gate is None:
+                raise ValueError("MLA output gating requires a linear_gate module spec.")
+            self.linear_gate = build_module(
+                submodules.linear_gate,
+                self.config.hidden_size,
+                self.gate_projection_size,
+                config=self.config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name='mla_gate',
+                tp_group=self.pg_collection.tp,
+                name=(name + ".linear_gate") if name is not None else None,
+            )
+        else:
+            self.linear_gate = None
 
         # Output.
         self.linear_proj = submodules.linear_proj(
@@ -491,6 +520,8 @@ class MultiLatentAttention(Attention):
         ), "cache_mla_latents conflicts with training."
 
         # hidden_states: [sq, b, h]
+
+        gate_input = hidden_states
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
         if inference_context and not inference_context.is_static_batching():
@@ -644,6 +675,9 @@ class MultiLatentAttention(Attention):
             self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
             self.qkv_up_checkpoint = None
 
+        if self.linear_gate is not None:
+            core_attn_out = self._project_and_apply_mla_output_gate(core_attn_out, gate_input)
+
         # =================
         # Output. [sq, b, h]
         # =================
@@ -653,6 +687,34 @@ class MultiLatentAttention(Attention):
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
 
         return output, bias
+
+    def _project_and_apply_mla_output_gate(
+        self, core_attn_out: torch.Tensor, gate_input: torch.Tensor
+    ) -> torch.Tensor:
+        """Project the gate after core attention, then apply it to the MLA output."""
+        gate, _ = apply_module(self.linear_gate)(gate_input)
+        return self._apply_mla_output_gate(core_attn_out, gate)
+
+    def _apply_mla_output_gate(
+        self, core_attn_out: torch.Tensor, gate: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply an MLA output gate with the configured projection granularity."""
+        granularity = self.config.gated_attention_proj_granularity
+        if granularity == 'headwise':
+            # Retain the existing fused headwise entry point.
+            return self._apply_mla_headwise_output_gate(core_attn_out, gate)
+        # Keep the FP32 sigmoid followed by native-dtype multiplication used by the
+        # released model. Do not jit-fuse this elementwise path: preserve its eager
+        # cast/multiply rounding and VJP.
+        return apply_attention_output_gate(core_attn_out, gate, granularity, cast_mode='before')
+
+    @staticmethod
+    @jit_fuser
+    def _apply_mla_headwise_output_gate(
+        core_attn_out: torch.Tensor, gate: torch.Tensor
+    ) -> torch.Tensor:
+        """Compile the shared gate arithmetic with MLA's headwise cast policy."""
+        return apply_attention_output_gate(core_attn_out, gate, 'headwise', cast_mode='before')
 
 
 class MLASelfAttention(MultiLatentAttention):
@@ -1370,6 +1432,8 @@ class MLASelfAttention(MultiLatentAttention):
         """Execute weight gradient computation"""
         self._backward_kv_proj()
         self._backward_q_proj()
+        if self.linear_gate is not None:
+            self.linear_gate.backward_dw()
         self._backward_output_proj()
 
     def _backward_kv_proj(self):
