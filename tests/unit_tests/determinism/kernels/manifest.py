@@ -965,10 +965,25 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="dsa_dispatch",
         sources=("megatron/core/transformer/experimental_attention_variant/dsa.py",),
-        tests=(K + "test_fused_triton_kernels.py",),
+        tests=(K + "test_fused_triton_kernels.py", K + "test_kpool_score_postprocess.py"),
         kind="dispatch",
         notes="DSA weights projection dispatches Transformer Engine general_gemm when available; "
-        "replay covers the selected GEMM, deterministic torch fallback, and chunked KPool top-k.",
+        "replay covers the selected GEMM, deterministic torch fallback, and chunked KPool top-k. "
+        "test_kpool_score_postprocess.py replays torch/Triton postprocessing dispatch with "
+        "packed bounds, masks and tail selection.",
+    ),
+    KernelEntry(
+        name="kpool_score_postprocess",
+        sources=(
+            "megatron/core/ops/attention/dsa/kpool_score_kernels.py",
+            "megatron/core/ops/attention/dsa/backends.py",
+            "megatron/core/ops/attention/dsa/reference.py",
+        ),
+        tests=(K + "test_kpool_score_postprocess.py",),
+        kind="triton",
+        notes="Detached FP32 optional-ReLU, weighting and 32-head reduction replay under "
+        "side-stream contention. Torch-reference and ordered-selection parity are separate "
+        "tests in ops/test_kpool_score_postprocess.py; the scoring GEMM is unchanged.",
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(

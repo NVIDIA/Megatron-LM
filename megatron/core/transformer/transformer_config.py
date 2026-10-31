@@ -457,6 +457,13 @@ class TransformerConfig(ModelParallelConfig):
     rotation. This does not change projection parameter or GEMM precision.
     """
 
+    dsa_indexer_kpool_score_backend: Literal["torch", "triton"] = "torch"
+    """Backend for detached KPool score postprocessing, bound at indexer construction.
+    ``torch`` retains the existing optional-ReLU, weighting and head reduction.
+    ``triton`` requires KPool > 1, 32 indexer heads, FP32 weights projection output,
+    and disabled indexer loss. It does not change the GEMM, masks or top-k algorithm.
+    """
+
     dsa_indexer_kpool_always_select_tail: bool = True
     """Append each query's incomplete causal pool after selected history pools.
     This widens the output to ``dsa_indexer_topk + dsa_indexer_kpool - 1``; unused slots are -1.
@@ -2027,6 +2034,21 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
+            if self.dsa_indexer_kpool_score_backend not in ("torch", "triton"):
+                raise ValueError("dsa_indexer_kpool_score_backend must be torch or triton")
+            if self.dsa_indexer_kpool_score_backend == "triton":
+                if self.dsa_indexer_kpool <= 1 or self.dsa_indexer_n_heads != 32:
+                    raise ValueError(
+                        "Triton KPool score postprocessing requires KPool > 1 and 32 heads"
+                    )
+                if self.dsa_indexer_weights_proj_output_dtype != "fp32":
+                    raise ValueError(
+                        "Triton KPool score postprocessing requires FP32 weights output"
+                    )
+                if (self.dsa_indexer_loss_coeff or 0.0) != 0.0:
+                    raise ValueError(
+                        "Triton KPool score postprocessing requires disabled indexer loss"
+                    )
             if self.dsa_indexer_kpool < 1:
                 raise ValueError(
                     f"dsa_indexer_kpool must be positive, got {self.dsa_indexer_kpool}."
