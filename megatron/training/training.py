@@ -2555,7 +2555,7 @@ def _forward_backward_grad_context(args):
 
 
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None, ddp_config=None):
-    """Build the model using a finalized DDP config, or legacy args if omitted."""
+    """Build the model using the supplied DDP config or the finalized run config."""
     cfg = get_run_config()
     args = get_args()
     args.model_type = model_type
@@ -2694,7 +2694,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         config = get_model_config(model[0])
 
         if ddp_config is None:
-            ddp_config = get_megatron_ddp_config(args, use_torch_fsdp2=cfg.dist.use_torch_fsdp2)
+            ddp_config = cfg.ddp
         if not cfg.dist.use_torch_fsdp2:
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
             ddp_config.bucket_size = resolve_ddp_bucket_size(
@@ -2709,7 +2709,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         # is on, or for non-zero pipeline-parallel ranks.
         pp_rank = get_pg_rank(pg_collection.pp)
         per_chunk_disable_bucketing = [
-            (chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step
+            (chunk_idx > 0) or cfg.optimizer.overlap_param_gather_with_optimizer_step
             for chunk_idx in range(len(model))
         ]
         per_chunk_bucket_sizes = [
@@ -2737,9 +2737,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 model,
                 config,
                 ddp_config,
-                use_layer_wise_distributed_optimizer=getattr(
-                    args, 'use_layer_wise_distributed_optimizer', False
-                ),
+                use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
                 use_layer_wise_param_layout=getattr(
                     args, 'use_layer_wise_param_layout', True
                 ),
@@ -2771,8 +2769,8 @@ def get_optimizer_param_scheduler(optimizer):
     opt_param_scheduler = OptimizerParamScheduler(
         optimizer,
         init_lr=cfg.scheduler.lr_warmup_init,
-        max_lr=args.lr,
-        min_lr=args.min_lr,
+        max_lr=cfg.optimizer.lr,
+        min_lr=cfg.optimizer.min_lr,
         lr_warmup_steps=cfg.scheduler.lr_warmup_steps,
         lr_decay_steps=cfg.scheduler.lr_decay_steps,
         lr_decay_style=cfg.scheduler.lr_decay_style,
@@ -2804,21 +2802,6 @@ def _reduce_sum_across_data_parallel_group(
     )
     return None if value.item() == 0.0 else value.item()
 
-
-def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
-    """Return a Megatron optimizer config object from Megatron's arguments."""
-
-    kwargs = {}
-    for f in dataclasses.fields(OptimizerConfig):
-        if hasattr(args, f.name):
-            kwargs[f.name] = getattr(args, f.name)
-    config = OptimizerConfig(**kwargs)
-
-    # Construct the appropriate config_overrides object. This default handles many cases, but
-    #  can be added to as needed by the user, or replaced entirely with a custom override.
-    config_overrides = get_standard_config_overrides(config=config)
-
-    return config, config_overrides
 
 def get_megatron_ddp_config(
     args: argparse.Namespace, *, use_torch_fsdp2: bool
@@ -2993,25 +2976,26 @@ def setup_model_and_optimizer(
     if not build_optimizer:
         optimizer, opt_param_scheduler = None, None
     else:
-        config, config_overrides = get_megatron_optimizer_config(args)
-        config.timers = timers
-        if getattr(args, "use_mup", False):
+        optim_cfg = cfg.optimizer
+        optim_cfg_overrides = get_standard_config_overrides(optim_cfg)
+        optim_cfg.timers = timers
+        if getattr(args, "use_mup", False): # TODO (@chencui): address in model config args->config PR
             model_config_source = (
                 unwrapped_model[0] if isinstance(unwrapped_model, list) else unwrapped_model
             )
             model_config = get_model_config(model_config_source)
             mup_overrides = get_mup_config_overrides(
-                config=config,
+                config=optim_cfg,
                 mup_width_mult=model_config.mup_width_mult,
-                optimizer_type=config.optimizer,
+                optimizer_type=optim_cfg.optimizer,
             )
             if mup_overrides:
-                config_overrides = {**(config_overrides or {}), **mup_overrides}
+                optim_cfg_overrides = {**(optim_cfg_overrides or {}), **mup_overrides}
 
         optimizer = get_megatron_optimizer(
-            config,
+            optim_cfg,
             model,
-            config_overrides=config_overrides,
+            config_overrides=optim_cfg_overrides,
             use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
@@ -3334,6 +3318,7 @@ def train_step(
     """
     cfg = get_run_config()
     args = get_args()
+    cfg = get_run_config()
     timers = get_timers()
 
     # OTel: set up per-step sub-span support.
@@ -3583,7 +3568,7 @@ def train_step(
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
     grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
-    if args.log_num_zeros_in_grad:
+    if cfg.optimizer.log_num_zeros_in_grad:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
             num_zeros_in_grad, group=mp_group
         )
@@ -4838,7 +4823,7 @@ def train(
             config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
             if len(model) == 1:
                 config.grad_sync_func = config.grad_sync_func[0]
-    if args.overlap_param_gather and args.align_param_gather:
+    if cfg.optimizer.overlap_param_gather and args.align_param_gather:
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
@@ -4920,7 +4905,7 @@ def train(
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
-        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+        copy_main_params = cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag and cfg.optimizer.overlap_param_gather
         forward_backward_func = PagedStashRunner(
             config,
             copy_main_params,
@@ -4928,7 +4913,7 @@ def train(
             optimizer,
             forward_backward_func,
         )
-    if args.optimizer_cuda_graph:
+    if cfg.optimizer.optimizer_cuda_graph:
         optimizer.step = OptimizerCudaGraphWrapper(
             optimizer.step,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
@@ -5516,7 +5501,7 @@ def train(
         cuda_graph_helper.delete_cuda_graphs()
 
     # Call OptimizerCudaGraph destructor to destroy optimizer CUDA graph
-    if args.optimizer_cuda_graph:
+    if cfg.optimizer.optimizer_cuda_graph:
         del optimizer.step
 
     one_logger_utils.track_e2e_metrics()
@@ -5610,6 +5595,7 @@ def evaluate(
     callback_manager = normalize_callbacks(callback_manager)
     cfg = get_run_config()
     args = get_args()
+    cfg = get_run_config()
     timers = get_timers()
     train_state = get_train_state()
 
@@ -5654,7 +5640,7 @@ def evaluate(
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
-        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+        copy_main_params = cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag and cfg.optimizer.overlap_param_gather
         forward_backward_func = PagedStashRunner(
             config,
             copy_main_params,
@@ -6204,12 +6190,13 @@ def should_disable_forward_pre_hook(args, optimizer):
     # The forward pre-hooks are part of the distributed optimizer's overlapped param-gather;
     # so in order to disable them, we must check that the optimizer actually exists.
     has_optimizer = optimizer is not None
+    cfg = get_run_config()
     return (
         not args.use_megatron_fsdp
         and has_optimizer
         and (
-            args.use_distributed_optimizer
-            or getattr(args, 'use_layer_wise_distributed_optimizer', False)
+            cfg.optimizer.use_distributed_optimizer
+            or cfg.optimizer.use_layer_wise_distributed_optimizer
         )
-        and args.overlap_param_gather
+        and cfg.optimizer.overlap_param_gather
     )
