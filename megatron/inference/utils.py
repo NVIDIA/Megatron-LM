@@ -4,6 +4,7 @@ import logging
 import warnings
 from argparse import ArgumentParser, Namespace
 from copy import copy
+from functools import partial
 from typing import Literal, Optional
 
 import torch
@@ -193,10 +194,12 @@ def get_model_for_inference(
             )
         # ModelOpt path keeps the legacy callable-based builder because the
         # modelopt hooks (custom layer specs, calibration, etc.) have not been
-        # ported to the new ``ModelBuilder`` API yet. ``_get_model`` also takes
-        # care of running the modelopt-checkpoint auto-detection side effect.
+        # ported to the new ``ModelBuilder`` API yet. ``_get_model`` calls the
+        # provider with keyword arguments only, so bind ``args``.
         model = _get_model(
-            modelopt_gpt_hybrid_builder, wrap_with_ddp=False, pg_collection=pg_collection
+            partial(modelopt_gpt_hybrid_builder, args),
+            wrap_with_ddp=False,
+            pg_collection=pg_collection,
         )
         # Without explicit groups, load_checkpoint takes those of the model, which holds them.
         pg_collection = None
