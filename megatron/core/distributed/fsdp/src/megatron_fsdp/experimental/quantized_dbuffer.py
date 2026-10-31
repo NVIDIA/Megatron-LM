@@ -344,6 +344,11 @@ class QuantizedDBuffer:
         """Whether every plane is backed by symmetric memory."""
         return all(plane.is_symmetric_memory for plane in self.planes)
 
+    @property
+    def holds_full_tensors(self) -> bool:
+        """Whether this rank holds every tensor in full; all planes share one partition."""
+        return self.rowwise_data.holds_full_tensors
+
     def reallocate_storage(self) -> None:
         """Restore every plane's backing storage."""
         for plane in self.planes:

@@ -187,6 +187,18 @@ class DBuffer:
         """
         return self.local_buffer.numel() == 0 or self.local_buffer.untyped_storage().nbytes() > 0
 
+    @property
+    def holds_full_tensors(self) -> bool:
+        """Whether no Shard placement spans more than one rank, so each rank holds the layout.
+
+        Comparing buffer sizes would differ across ranks when an uneven layout gives one rank
+        every element and the others none; the mesh and placements are the same on all ranks.
+        """
+        return all(
+            not isinstance(placement, Shard) or self.mesh.size(axis) == 1
+            for axis, placement in enumerate(self.placements)
+        )
+
     def reallocate_storage(self) -> None:
         """Restore the local buffer's backing storage to its logical size."""
         # The allocator may hand back a different address than release_storage() freed.

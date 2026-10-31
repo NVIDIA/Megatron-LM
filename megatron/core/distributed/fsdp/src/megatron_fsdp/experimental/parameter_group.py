@@ -350,7 +350,10 @@ class FsdpParameterGroup:
         self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
         self.sync_model_weight_from_main_weight()
         unsharded_placements = (Replicate(),) * self.mesh.ndim
-        if self.model_weight.placements == unsharded_placements:
+        if (
+            self.model_weight.placements == unsharded_placements
+            or self.model_weight.holds_full_tensors
+        ):
             self._unsharded_model_weight = self.model_weight
         else:
             with self._symmetric_memory_context():
@@ -616,8 +619,8 @@ class FsdpParameterGroup:
             if rowwise_only and weight._columnwise_data is not None:
                 weight.update_usage(rowwise_usage=False)
 
-    def allocate_partial_grad_buffer(self) -> DBuffer:
-        """Allocate the unreduced reduce-scatter input buffer."""
+    def allocate_partial_grad_buffer(self) -> DBuffer | None:
+        """Allocate the unreduced reduce-scatter input buffer, or None if main_grad is full."""
         assert self.main_grad is not None
 
         grads: list[torch.Tensor] = []
@@ -625,6 +628,8 @@ class FsdpParameterGroup:
             if fsdp_parameter.unsharded.grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
             grads.append(fsdp_parameter.unsharded.grad)
+        if self.main_grad.holds_full_tensors:
+            return None
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
@@ -634,11 +639,33 @@ class FsdpParameterGroup:
                 device=grads[0].device,
             )
 
-    def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
-        """Pack full local gradients into an existing reduce-scatter input buffer."""
+    def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer | None) -> None:
+        """Pack full local gradients into partial_grad, or accumulate into main_grad if None."""
+        assert self.main_grad is not None
+
+        # zero_grad(set_to_none=True) clears sharded parameter grads, so this
+        # backward can write directly into main_grad. zero_grad(set_to_none=False)
+        # leaves sharded grads installed, so this backward accumulates into main_grad.
+        has_sharded_grads = self._has_sharded_grads()
+        if self._main_grad_is_stale:
+            # In ZeRO-1 and HFSDP, zero_grad(set_to_none=False) only zeros the smaller
+            # optimizer view. Clear the persistent full accumulation buffer before this
+            # new step; set_to_none=True needs no clear because this backward overwrites it.
+            if has_sharded_grads:
+                self.main_grad.local_buffer.zero_()
+            self._main_grad_is_stale = False
+
         # A future fused-wgrad path can write directly into these buffer views.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            partial_grad.get_tensor_view(index).copy_(fsdp_parameter.unsharded.grad)
+            grad = fsdp_parameter.unsharded.grad
+            if partial_grad is not None:
+                partial_grad.get_tensor_view(index).copy_(grad)
+            elif has_sharded_grads:
+                # Scale and accumulate in one kernel. For power-of-two scales this matches
+                # scaling the gradient first and then accumulating it bit for bit.
+                self.main_grad.get_tensor_view(index).add_(grad, alpha=self.grad_scale)
+            else:
+                torch.mul(grad, self.grad_scale, out=self.main_grad.get_tensor_view(index))
             fsdp_parameter.unsharded.grad = None
 
     def _has_sharded_grads(self) -> bool:
@@ -653,8 +680,12 @@ class FsdpParameterGroup:
             raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
         return has_any_grad
 
-    def reduce_partial_gradients(self, partial_grad: DBuffer, *, is_last_microbatch: bool) -> None:
+    def reduce_partial_gradients(
+        self, partial_grad: DBuffer | None, *, is_last_microbatch: bool
+    ) -> None:
         """Reduce a packed partial gradient buffer into sharded parameter gradients.
+
+        With ``partial_grad=None`` only the DP-outer finalization below remains.
 
         For HSDP/HFSDP main_grad rests DP-outer-Partial between microbatches,
         accumulating each backward through the standard zero_grad contract; the
@@ -667,19 +698,11 @@ class FsdpParameterGroup:
         assert self.main_grad is not None
         assert self.pre_optimizer_main_grad is not None
 
-        # zero_grad(set_to_none=True) clears sharded parameter grads, so this
-        # backward can reduce directly into main_grad. zero_grad(set_to_none=False)
-        # leaves sharded grads installed, so this backward accumulates into main_grad.
+        # copy_gradients_to_partial_buffer() already cleared a stale main_grad.
         has_sharded_grads = self._has_sharded_grads()
-        if self._main_grad_is_stale:
-            # In ZeRO-1 and HFSDP, zero_grad(set_to_none=False) only zeros the smaller
-            # optimizer view. Clear the persistent full accumulation buffer before this
-            # new step; set_to_none=True needs no clear because out= below overwrites it.
-            if has_sharded_grads:
-                self.main_grad.local_buffer.zero_()
-            self._main_grad_is_stale = False
-
-        if can_reduce_into_main_grad := (
+        if partial_grad is None:
+            reduced_grad = self.main_grad
+        elif can_reduce_into_main_grad := (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
         ):
             partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)
@@ -689,7 +712,7 @@ class FsdpParameterGroup:
 
         # Scale this backward's contribution before accumulating it so repeated
         # backwards do not repeatedly scale the running total.
-        if self.grad_scale != 1:
+        if self.grad_scale != 1 and partial_grad is not None:
             reduced_grad.local_buffer.mul_(self.grad_scale)
 
         if reduced_grad is not self.main_grad:
