@@ -59,6 +59,14 @@ def _strip_wrapper_prefixes(path):
     return '.'.join(parts)
 
 
+def _is_mfsdp_v2_param(param):
+    """Whether ``param`` is an MFSDP v2 DTensor.
+
+    v1 parameters are DTensors as well, but carry ``megatron_fsdp_dist_index``.
+    """
+    return isinstance(param, DTensor) and not hasattr(param, "megatron_fsdp_dist_index")
+
+
 def _intersect_slice(s1, s2):
     """Intersection of two step-1 slices, or an empty slice when they do not overlap."""
     start = max(s1.start, s2.start)
@@ -286,6 +294,16 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             f"got {data.shape[swiglu_shard_axis]}"
         )
 
+        if _is_mfsdp_v2_param(dist_param):
+            return tuple(
+                split_dtensor(
+                    data,
+                    data.shape[swiglu_shard_axis] // 2,
+                    dim=swiglu_shard_axis,
+                    update_uneven_dtensor_chunk_meta=True,
+                )
+            )
+
         fsdp_slice = dist_param.megatron_fsdp_slice
         megatron_fsdp_dist_index = dist_param.megatron_fsdp_dist_index
 
@@ -338,6 +356,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         )
         return weight_w, weight_v
 
+    parameters = {_strip_wrapper_prefixes(name): param for name, param in model.named_parameters()}
     model_state_dict = model_state_dict.copy()
     _swiglu_split_count = 0
     _swiglu_skip_count = 0
@@ -346,7 +365,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             if not _key_in_glu_layer(key):
                 _swiglu_skip_count += 1
                 continue
-            dist_param = model.get_parameter(f"module.{key}")
+            dist_param = parameters[_strip_wrapper_prefixes(key)]
             weight_w, weight_v = split_swiglu_linear_fc1(
                 model_state_dict[key],
                 dist_param,
@@ -377,10 +396,11 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
                     continue
                 new_opt_state_dict[f"{key}_w"] = opt_state_dict[key].copy()
                 new_opt_state_dict[f"{key}_v"] = opt_state_dict[key].copy()
-                for subkey in ["exp_avg", "exp_avg_sq"]:
-                    dist_param = model.get_parameter(
-                        expert_param_local_key(key[len("module.") :], num_experts)
-                    )
+                for subkey in ("exp_avg", "exp_avg_sq", "momentum_buffer"):
+                    if subkey not in opt_state_dict[key]:
+                        continue
+                    local_key = expert_param_local_key(key, num_experts)
+                    dist_param = parameters[_strip_wrapper_prefixes(local_key)]
                     weight_w, weight_v = split_swiglu_linear_fc1(
                         opt_state_dict[key][subkey],
                         dist_param,
@@ -511,6 +531,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         return results
 
     # ---- Model state dict ------------------------------------------------
+    parameters = {_strip_wrapper_prefixes(name): param for name, param in model.named_parameters()}
     model_state_dict = model_state_dict.copy()
     _gdn_split_count = 0
     for key in list(model_state_dict.keys()):
@@ -518,7 +539,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         if match is None:
             continue
         sizes, names, dim = match
-        dist_param = model.get_parameter(f"module.{key}")
+        dist_param = parameters[_strip_wrapper_prefixes(key)]
         sub_tensors = split_gdn_fused(model_state_dict[key], dist_param, sizes, dim)
         for sub_name, tensor in zip(names, sub_tensors):
             model_state_dict[f"{key}.{sub_name}"] = tensor
@@ -545,8 +566,10 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 sizes, names, dim = match
                 for sub_name in names:
                     new_opt_state[f"{key}.{sub_name}"] = opt_state[key].copy()
-                for subkey in ["exp_avg", "exp_avg_sq"]:
-                    dist_param = model.get_parameter(key[len("module.") :])
+                for subkey in ("exp_avg", "exp_avg_sq", "momentum_buffer"):
+                    if subkey not in opt_state[key]:
+                        continue
+                    dist_param = parameters[_strip_wrapper_prefixes(key)]
                     sub_tensors = split_gdn_fused(opt_state[key][subkey], dist_param, sizes, dim)
                     for sub_name, tensor in zip(names, sub_tensors):
                         new_opt_state[f"{key}.{sub_name}"][subkey] = tensor
@@ -569,6 +592,11 @@ def split_fused_fsdp_param(data, dist_param, split_sizes, is_expert_param=False,
     even two-way split to arbitrary section sizes.
     """
     assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
+
+    if _is_mfsdp_v2_param(dist_param):
+        return list(
+            split_dtensor(data, split_sizes, dim=split_dim, update_uneven_dtensor_chunk_meta=True)
+        )
 
     fsdp_slice = dist_param.megatron_fsdp_slice
     dist_index = dist_param.megatron_fsdp_dist_index
@@ -713,6 +741,7 @@ def handle_mla_down_proj_in_state_dict(model, model_state_dict, optimizer_state_
 
     rewritten = 0
 
+    parameters = {_strip_wrapper_prefixes(name): param for name, param in model.named_parameters()}
     model_state_dict = model_state_dict.copy()
     for key in list(model_state_dict.keys()):
         match = match_mla_fused_down_proj_key(key, fused_splits)
@@ -731,7 +760,7 @@ def handle_mla_down_proj_in_state_dict(model, model_state_dict, optimizer_state_
             continue
 
         sections = split_fused_fsdp_param(
-            model_state_dict[key], model.get_parameter(f'module.{key}'), split_sizes
+            model_state_dict[key], parameters[_strip_wrapper_prefixes(key)], split_sizes
         )
         for proj_name, section in zip(MLA_UNFUSED_DOWN_PROJS, sections):
             model_state_dict[f'{wrapper}{attention_path}.{proj_name}.{leaf}'] = section
@@ -767,8 +796,10 @@ def handle_mla_down_proj_in_state_dict(model, model_state_dict, optimizer_state_
             ]
             for new_key in new_keys:
                 new_optimizer_state[new_key] = optimizer_state[key].copy()
-            dist_param = model.get_parameter(key[len("module.") :])
-            for subkey in ["exp_avg", "exp_avg_sq"]:
+            dist_param = parameters[_strip_wrapper_prefixes(key)]
+            for subkey in ("exp_avg", "exp_avg_sq", "momentum_buffer"):
+                if subkey not in optimizer_state[key]:
+                    continue
                 sections = split_fused_fsdp_param(
                     optimizer_state[key][subkey], dist_param, split_sizes
                 )

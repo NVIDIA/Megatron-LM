@@ -115,6 +115,7 @@ def test_muon_matches_reference(
     excluded_names = ["block2.3.weight", "block2.3.bias"]
     muon_names = [name for name in params if name not in excluded_names]
     optimizer = muon.FsdpMuon([params[name] for name in muon_names], **kwargs)
+    fully_shard_optimizer(optimizer, precision_aware=True)
     reference_optimizer = Muon([reference_params[name] for name in muon_names], **kwargs)
     other_optimizer = torch.optim.SGD([params[n] for n in excluded_names], lr=0.01, foreach=False)
     fully_shard_optimizer(other_optimizer)
