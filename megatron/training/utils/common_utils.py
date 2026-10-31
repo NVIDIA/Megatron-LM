@@ -646,8 +646,8 @@ def is_first_or_last_pipeline_stage(vp_stage, pp_group=None, vp_size=None):
     Args:
         vp_stage: Virtual pipeline stage of the model chunk. None checks only the
             pipeline stage of the rank.
-        pp_group: Pipeline-parallel group of the model. None reads the stage from the
-            global parallel state.
+        pp_group: Pipeline-parallel group of the model. Omitting it is deprecated: the stage
+            is read from the global parallel state, with a ProcessGroupFallbackWarning.
         vp_size: Virtual pipeline size of the model, used with ``pp_group``. None means
             the model has no virtual pipeline stages.
     """
@@ -658,6 +658,9 @@ def is_first_or_last_pipeline_stage(vp_stage, pp_group=None, vp_size=None):
             is_first_stage = is_first_stage and vp_stage == 0
             is_last_stage = is_last_stage and vp_stage == vp_size - 1
         return is_first_stage or is_last_stage
+    warn_global_process_group_fallback(
+        "is_first_or_last_pipeline_stage", "pp_group", deprecated_in="0.21", removed_in="0.23"
+    )
     ignore_virtual = True
     if vp_stage is not None:
         ignore_virtual = False

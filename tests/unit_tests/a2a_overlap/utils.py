@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 
 from megatron.core import config
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
@@ -300,6 +301,7 @@ def build_gpt_model(config, vocab_size=512, max_seq_len=300):
         pre_process=True,
         post_process=True,
         max_sequence_length=max_seq_len,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
     model.cuda()
     return model
@@ -361,6 +363,7 @@ def overlap_train_step(model, optimizer, config, data):
         no_sync_func=nullcontext,
         total_num_tokens=torch.zeros([], dtype=torch.int, device="cuda"),
         check_first_val_step=lambda cond: cond,
+        cp_group_size=config.context_parallel_size,
     )
     torch.cuda.synchronize()
     loss = forward_data_store[0]['lm loss'].detach().clone()
