@@ -109,6 +109,13 @@ but custom training scripts must do the same work themselves.
 The same training `--cuda-graph-modules` options apply as for `local`, and the default is likewise
 whole-layer training capture when the flag is omitted.
 
+At replay, a TE graphed callable copies only the inputs it was captured with into the graph and
+ignores any other keyword argument. A graph that contains the attention therefore takes the rotary
+embedding as a graph input: `rope` from the model's rotary module, and any other embedding that the
+layer receives (for example `mrope`, `yarn`, or a vision encoder's 2D RoPE) with the layout and
+dtype it had in the eager warmup steps. Such models need `--cuda-graph-warmup-steps` > 0; a replay
+that passes a rotary embedding to a graph captured without one raises an error.
+
 ---
 
 ## Full-Iteration Training CUDA Graph (`--cuda-graph-impl full_iteration`)
