@@ -43,6 +43,7 @@ from examples.inference.utils import (
 )
 from megatron.core.inference.apis import MegatronAsyncLLM, MegatronLLM
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.parallel_state import get_registered_process_groups
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import configure_nvtx_profiling
 from megatron.inference.utils import (
@@ -295,7 +296,7 @@ def main():
         stop_words=args.stop_words,
     )
 
-    model = get_model_for_inference()
+    model = get_model_for_inference(pg_collection=get_registered_process_groups())
     inference_config = get_inference_config_from_model_and_args(model, args)
     requests = build_requests(args, tokenizer, sampling_params)
 

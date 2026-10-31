@@ -22,6 +22,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.fp8_utils import is_mxfp8tensor
+from megatron.core.parallel_state import TeardownStage, register_model_parallel_teardown
 from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
 
 try:
@@ -972,3 +973,12 @@ class VirtualExpertLoadBalancer:
         self.virtual_experts.storage.clear_accumulating_grads()
         fc2_grads = self.virtual_experts.hand_off_wgrads(1)
         return (*self.virtual_experts.hand_off_wgrads(0), *fc2_grads)
+
+
+def _finalize_virtual_experts() -> None:
+    """Release virtual-expert resources, resolving ``finalize`` on the class at call time."""
+    VirtualExpertLoadBalancer.finalize()
+
+
+# The shared symmetric-memory windows must be released while the expert group is alive.
+register_model_parallel_teardown(TeardownStage.RELEASE_COMMUNICATION, _finalize_virtual_experts)

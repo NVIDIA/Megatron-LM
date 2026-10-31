@@ -19,7 +19,6 @@ from evaluation.evaluation_datasets import get_evaluation_dataset
 from model import model_provider
 from multimodal_args import add_multimodal_extra_args
 
-from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
@@ -38,6 +37,10 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
     VLMInferenceWrapper,
 )
+from megatron.core.parallel_state import get_registered_process_groups
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage
+from megatron.core.process_groups_config import resolve_process_groups
+from megatron.core.utils import get_attr_wrapped_model
 from megatron.training import get_args, get_model, get_tokenizer, print_rank_0, is_last_rank
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
@@ -49,12 +52,21 @@ from megatron.training.global_vars import (
 from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
-def is_first_rank():
-    """First tensor and pipeline parallel rank."""
-    return (
-        parallel_state.is_pipeline_first_stage(ignore_virtual=True)
-        and parallel_state.get_tensor_model_parallel_rank() == 0
+def is_first_rank(pg_collection=None):
+    """First tensor and pipeline parallel rank.
+
+    Args:
+        pg_collection: Process groups of the model. None falls back to the global parallel
+            state with a ProcessGroupFallbackWarning; that fallback is deprecated.
+    """
+    pg_collection = resolve_process_groups(
+        pg_collection,
+        owner="examples.multimodal.run_text_generation.is_first_rank",
+        required=("tp", "pp"),
+        deprecated_in="0.21",
+        removed_in="0.23",
     )
+    return is_pp_first_stage(pg_collection.pp) and pg_collection.tp.rank() == 0
 
 
 def add_text_generation_args(parser):
@@ -125,9 +137,15 @@ def get_evaluation_dataloader(
     num_frames,
     num_workers,
     vision_model_type,
-    split="validation"
+    split="validation",
+    pg_collection=None,
 ):
-    """Build evaluation dataset."""
+    """Build evaluation dataset.
+
+    The samples are split over the data-parallel group of pg_collection, the process groups
+    of the model. None falls back to the global parallel state with a
+    ProcessGroupFallbackWarning; that fallback is deprecated.
+    """
     dataset = get_evaluation_dataset(
         task,
         input_image_path,
@@ -145,8 +163,15 @@ def get_evaluation_dataloader(
         split=split
     )
 
-    dp_rank = parallel_state.get_data_parallel_rank()
-    dp_world_size = parallel_state.get_data_parallel_world_size()
+    pg_collection = resolve_process_groups(
+        pg_collection,
+        owner="examples.multimodal.run_text_generation.get_evaluation_dataloader",
+        required=("dp_gtp_remat",),
+        deprecated_in="0.21",
+        removed_in="0.23",
+    )
+    dp_rank = pg_collection.dp_gtp_remat.rank()
+    dp_world_size = pg_collection.dp_gtp_remat.size()
 
     sampler = torch.utils.data.DistributedSampler(
         dataset, shuffle=False, num_replicas=dp_world_size, rank=dp_rank
@@ -163,6 +188,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
     """Text generation using a trained vision language model."""
     cfg = get_run_config()
     args = get_args()
+    pg_collection = get_attr_wrapped_model(model, "pg_collection")
 
     dataloader = get_evaluation_dataloader(
         config.task,
@@ -179,7 +205,8 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         args.num_frames,
         args.num_workers,
         args.vision_model_type,
-        config.split
+        config.split,
+        pg_collection=pg_collection,
     )
 
     num_img_embeddings_per_tile = get_num_image_embeddings(
@@ -228,7 +255,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
             forward_step = partial(VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles, args.decoder_seq_length)
 
         inference_context = StaticInferenceContext(max_batch_size=1, max_sequence_length=args.inference_max_seq_length)
-        if is_first_rank():
+        if is_first_rank(pg_collection):
 
             if args.use_mcore_inference:
                 inference_request = VLMInferenceRequest(
@@ -445,20 +472,22 @@ def get_output_path(config, dp_rank):
 
 def generate_and_write_samples(model, config, print_output=True):
     """Generate text and write to an output file."""
-    dp_rank = parallel_state.get_data_parallel_rank()
+    pg_collection = get_attr_wrapped_model(model, "pg_collection")
+    dp_rank = pg_collection.dp_gtp_remat.rank()
+    first_rank = is_first_rank(pg_collection)
 
-    if is_first_rank():
+    if first_rank:
         output_path = get_output_path(config, dp_rank)
         output_file = open(output_path, "w")
         print(f"output path: {output_file.name}")
 
     with torch.no_grad():
         for output in generate_samples(model, config, print_output):
-            if is_first_rank():
+            if first_rank:
                 output_file.write(json.dumps(output) + "\n")
                 output_file.flush()
 
-    if is_first_rank():
+    if first_rank:
         output_file.close()
 
 class VLMForwardStep(ForwardStep):
@@ -855,12 +884,33 @@ def eval_tasks():
 
     args = get_args()
 
-    def wrapped_model_provider(pre_process, post_process, add_encoder=True, add_decoder=True):
-        return model_provider(pre_process, post_process, add_encoder=add_encoder, add_decoder=add_decoder,
-                              parallel_output=False)
+    # get_model passes the config and the process groups of the grid it builds the model on.
+    def wrapped_model_provider(
+        pre_process,
+        post_process,
+        add_encoder=True,
+        add_decoder=True,
+        config=None,
+        pg_collection=None,
+    ):
+        return model_provider(
+            pre_process,
+            post_process,
+            add_encoder=add_encoder,
+            add_decoder=add_decoder,
+            parallel_output=False,
+            config=config,
+            pg_collection=pg_collection,
+        )
 
-    # Set up model and load checkpoint.
-    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=False)
+    # Set up model and load checkpoint. The model is built on the groups that
+    # initialize_megatron() registered.
+    model = get_model(
+        wrapped_model_provider,
+        model_type=ModelType.encoder_or_decoder,
+        wrap_with_ddp=False,
+        pg_collection=get_registered_process_groups(),
+    )
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None)

@@ -15,6 +15,7 @@ from examples.mimo.model_providers import mock as mock_model_provider
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from tests.unit_tests.test_utilities import Utils
@@ -116,7 +117,9 @@ class TestMimoModelTEQuantizationConfig:
                 mock_model_provider, "get_mock_language_model_config", return_value=language_config
             ),
         ):
-            model = mock_model_provider.model_provider_mock_vlm_single_encoder().cuda()
+            model = mock_model_provider.model_provider_mock_vlm_single_encoder(
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+            ).cuda()
 
         named_modules = dict(model.named_modules())
         module_names = {id(module): name for name, module in named_modules.items()}

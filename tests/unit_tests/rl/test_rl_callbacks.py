@@ -13,6 +13,16 @@ from megatron.training.callbacks import CallbackContext
 from megatron.training.config import RLConfig
 
 
+class FakeGroup:
+    """A process group of the given size."""
+
+    def __init__(self, size):
+        self._size = size
+
+    def size(self):
+        return self._size
+
+
 @pytest.fixture
 def env(monkeypatch):
     """Everything the logging callback reads from globals, and a stub for each sink it feeds."""
@@ -23,6 +33,9 @@ def env(monkeypatch):
         runtime_state=rl_utils.RLRuntimeState(),
         train_state=SimpleNamespace(iteration=9),
         profiles=[],
+        # The model being trained; the packed bins are spread over its 3 data-parallel ranks,
+        # a size no global grid of the test run has.
+        model=[SimpleNamespace(pg_collection=SimpleNamespace(dp_gtp_remat=FakeGroup(3)))],
     )
     monkeypatch.setattr(
         rl_callbacks, "get_args", SimpleNamespace  # only handed on to log_rl_throughput_metrics
@@ -34,9 +47,6 @@ def env(monkeypatch):
     monkeypatch.setattr(rl_callbacks, "log_iteration_profile", lambda **kw: env.profiles.append(kw))
     monkeypatch.setattr(rl_utils, "get_rl_runtime_state", lambda: env.runtime_state)
     monkeypatch.setattr(rl_utils, "log_rl_throughput_metrics", lambda *a: " tokens/s: 10 |")
-    monkeypatch.setattr(
-        "megatron.rl.sequence_packing_utils.mpu.get_data_parallel_world_size", lambda: 4
-    )
     monkeypatch.setattr("megatron.rl.sequence_packing_utils.get_num_microbatches", lambda: 3)
     return env
 
@@ -58,7 +68,7 @@ def test_logging_callback(env, packing, profile):
     callback = RLLoggingCallback(cfg, micro_batch_size=2, global_batch_size=6, save_dir="/ckpt")
     env.runtime_state.consumed_train_bins = 7
     context = CallbackContext(
-        model=None,
+        model=env.model,
         timers_to_log=["forward-compute"],
         log_fragments=[],
         batch_size=6,
@@ -83,7 +93,7 @@ def test_logging_callback(env, packing, profile):
 
     callback.on_tensorboard_log(context)
     scalars = {c.args[0]: c.args[1] for c in env.writer.add_scalar.call_args_list}
-    packing_metrics = {"bin-batch-size": 4 * 2 * 3, "consumed-bins": 7} if packing else {}
+    packing_metrics = {"bin-batch-size": 3 * 2 * 3, "consumed-bins": 7} if packing else {}
     assert scalars == {"grpo_collection_iteration": 9 // 4, **packing_metrics}
     assert all(c.args[1] == 9 for c in env.wandb_writer.log.call_args_list)
 
@@ -92,7 +102,7 @@ def test_logging_callback(env, packing, profile):
 @pytest.mark.parametrize("packing", [False, True])
 def test_logging_callback_lifecycle(env, monkeypatch, packing, profile):
     """on_train_start starts the profiler when enabled and on_train_end stops it;
-    on_train_step_end advances the bin counter under packing (4 dp x 2 mbs x 3 microbatches)."""
+    on_train_step_end advances the bin counter under packing (3 dp x 2 mbs x 3 microbatches)."""
     started, stopped = [], []
     monkeypatch.setattr(
         rl_callbacks,
@@ -108,14 +118,14 @@ def test_logging_callback_lifecycle(env, monkeypatch, packing, profile):
         save_dir="/ckpt",
     )
     env.runtime_state.consumed_train_bins = 7
-    context = CallbackContext(model=None)
+    context = CallbackContext(model=env.model)
 
     callback.on_train_start(context)
     callback.on_train_step_end(context)
     callback.on_train_end(context)
 
     assert started == [("/ckpt", {"log_to_wandb": True, "log_to_tensorboard": True})]
-    assert env.runtime_state.consumed_train_bins == (7 + 24 if packing else 7)
+    assert env.runtime_state.consumed_train_bins == (7 + 18 if packing else 7)
     assert stopped == ([True] if profile else [])
 
 

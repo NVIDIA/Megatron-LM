@@ -1,6 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import dataclasses
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -9,6 +11,7 @@ import torch
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.rl import rl_utils, sequence_packing_utils
 from megatron.training import arguments, global_vars
+from tests.unit_tests.test_utilities import Utils
 
 
 class MockTokenizer:
@@ -470,6 +473,7 @@ def test_packing_observability_metrics():
         packed_trajs=packed_trajs,
         packed_position_ids=None,
         packed_loss_mask=None,
+        dp_group=SimpleNamespace(size=lambda: 4),
     )
 
     # actual tokens = sum of all seq_lengths referenced by bin_seq_indices
@@ -481,11 +485,10 @@ def test_packing_observability_metrics():
     # avg seq length = mean of seq_lengths
     assert sequence_packing_utils.get_packing_avg_seq_length(ctx) == pytest.approx(22 / 4)
 
-    # efficiency = total_actual / (bins_per_rank * bin_size * num_ranks)
-    with patch('megatron.core.mpu.get_data_parallel_world_size', return_value=4):
-        eff = sequence_packing_utils.get_packing_efficiency(ctx)
-        # total_actual = sum(seq_lengths) = 22, capacity = 2 * 16 * 4 = 128
-        assert eff == pytest.approx(22 / 128)
+    # efficiency = total_actual / (bins_per_rank * bin_size * num_ranks of the bins' DP group)
+    eff = sequence_packing_utils.get_packing_efficiency(ctx)
+    # total_actual = sum(seq_lengths) = 22, capacity = 2 * 16 * 4 = 128
+    assert eff == pytest.approx(22 / 128)
 
 
 @pytest.mark.parametrize("num_sequences", [1, 10, 48, 49, 50])
@@ -557,18 +560,73 @@ def test_get_bins_bs_and_steps(ratio, local_bins, world, expected_bs):
             'megatron.rl.sequence_packing_utils.reconfigure_num_microbatches_calculator',
             side_effect=side_eff,
         ):
-            with patch('megatron.core.mpu.get_data_parallel_world_size', return_value=world):
-                sequence_packing_utils.update_microbatch_calculator(
-                    samples_ratio_per_step=ratio,
-                    num_bins_this_rank=local_bins,
-                    bin_seq_indices=[],
-                    global_batch_size=global_bs_in_seq,
-                    micro_batch_size=1,
-                    decrease_batch_size_if_needed=False,
-                )
+            sequence_packing_utils.update_microbatch_calculator(
+                samples_ratio_per_step=ratio,
+                num_bins_this_rank=local_bins,
+                bin_seq_indices=[],
+                global_batch_size=global_bs_in_seq,
+                micro_batch_size=1,
+                decrease_batch_size_if_needed=False,
+                dp_group=SimpleNamespace(size=lambda: world),
+            )
 
     # Iterator is local, batch size is global
     assert expected_bs == actual_bs
+
+
+@pytest.mark.skipif(
+    Utils.world_size < 4 or Utils.world_size % 4 != 0, reason="needs a multiple of 4 ranks"
+)
+def test_pack_all_trajectories_uses_given_process_groups(monkeypatch):
+    """pack_all_trajectories gathers the trajectories from, and distributes the bins over, the
+    data-parallel group it is given, and aligns the sequences for the context-parallel group it
+    is given, not for the global grid; the efficiency counts the ranks of that DP group."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        world_size = Utils.world_size
+        # The global grid has one data-parallel group over every rank and no context
+        # parallelism; the model being trained uses rank pairs for both.
+        dp_group, _ = torch.distributed.new_subgroups_by_enumeration(
+            [[rank, rank + 1] for rank in range(0, world_size, 2)]
+        )
+        cp_group, _ = torch.distributed.new_subgroups_by_enumeration(
+            [[start + i, start + i + 2] for start in range(0, world_size, 4) for i in (0, 1)]
+        )
+        tokenizer = MockTokenizer()
+        monkeypatch.setattr(sequence_packing_utils, "get_tokenizer", lambda: tokenizer)
+        monkeypatch.setattr(
+            sequence_packing_utils,
+            "get_nvtx_range",
+            lambda: (lambda *args, **kwargs: nullcontext()),
+        )
+        bin_size = 8
+        # Two sequences of 3 tokens on every rank.
+        trajs = torch.tensor([[1, 2, tokenizer.eod] + [tokenizer.pad] * 5] * 2)
+        generation_masks = torch.tensor([[False, True, True] + [False] * 5] * 2)
+
+        ctx = sequence_packing_utils.pack_all_trajectories(
+            trajs=trajs,
+            generation_masks=generation_masks,
+            inference_logprobs=None,
+            global_advantages=torch.zeros(4, device="cuda"),
+            bin_size=bin_size,
+            max_sequences_per_bin=4,
+            packing_algo="fifo",
+            dp_group=dp_group,
+            cp_group=cp_group,
+        )
+
+        assert ctx.dp_group is dp_group
+        # Gathered from the 2 ranks of the pair, not from every rank.
+        assert ctx.original_trajs.shape == (4, bin_size)
+        # Each sequence takes a slot of a multiple of 2 * CP size = 4 tokens, so two fit in a
+        # bin: 2 bins, one for each rank of the pair.
+        assert ctx.packer.seq_length_multiple == 4
+        assert ctx.packed_trajs.shape == (1, bin_size)
+        # 12 tokens in 1 bin of 8 tokens on each of the 2 ranks.
+        assert sequence_packing_utils.get_packing_efficiency(ctx) == pytest.approx(12 / 16)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize(
