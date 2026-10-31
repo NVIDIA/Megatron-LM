@@ -811,6 +811,7 @@ _DATASET_FIELD_SOURCES = {
     "inter_document_masking": "dataloader_inter_document_masking",
     "sft_mock_dataset_config_json": "sft_mock_dataset_config_json",
     "varlen_mock_dataset_config_json": "varlen_mock_dataset_config_json",
+    "varlen_pretokenized_dataset": "varlen_pretokenized_dataset",
     "varlen_sbhd_validation": "varlen_sbhd_validation",
 }
 
