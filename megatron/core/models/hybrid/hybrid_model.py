@@ -812,6 +812,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             rotary_pos_emb = self.rotary_pos_emb(
                 rotary_seq_len,
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+                cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
             )
         elif self.position_embedding_type == 'yarn' and hasattr(self, 'rotary_pos_emb'):
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
@@ -821,6 +822,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             rotary_pos_emb, _ = self.rotary_pos_emb(
                 rotary_seq_len,
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+                cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
             )
 
         # Wrap decoder_input to allow the decoder (HybridStack) to delete the
@@ -920,10 +922,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 mhc_multistream=mhc_multistream,
                 labels=labels,
                 loss_mask=loss_mask,
+                padding_mask=padding_mask,
                 mtp_input_mask=mtp_input_mask,
                 packed_seq_params=packed_seq_params,
                 cp_batch=cp_batch,
-                padding_mask=padding_mask,
             )
             if mtp_inputs.decoder_input is None:
                 assert mtp_inputs.input_ids is not None and mtp_inputs.position_ids is not None, (
@@ -945,8 +947,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 packed_seq_params=mtp_inputs.packed_seq_params,
                 embedding=self.embedding,
                 decoder_input=mtp_inputs.decoder_input,
-                mtp_input_mask=mtp_inputs.mtp_input_mask,
                 padding_mask=mtp_inputs.padding_mask,
+                mtp_input_mask=mtp_inputs.mtp_input_mask,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
             )

@@ -33,6 +33,7 @@ from tests.unit_tests.determinism.correctness.test_ssm_conv1d import (
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
+    deterministic_algorithms,
     seeded,
 )
 from tests.unit_tests.test_utilities import Utils

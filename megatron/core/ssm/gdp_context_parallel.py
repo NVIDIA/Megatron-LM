@@ -21,6 +21,7 @@ Strategy for householder-multiplied tensors (V, K, b):
     copy is independently partitioned by heads across CP ranks.
 """
 
+import copy
 from typing import Optional
 
 import torch
@@ -104,38 +105,62 @@ class GDPContextParallel:
         self.D_has_hdim = D_has_hdim
         self.sequence_is_contiguous = sequence_is_contiguous
 
-        self.cp_size = self.cp_group.size()
+        self._set_cp_params()
 
-        M = self.num_householder
+    def _set_cp_params(self) -> None:
+        """Recompute dimensions derived from the active CP group."""
+        self.cp_size = self.cp_group.size() if self.cp_group is not None else 1
 
         if self.cp_size == 1:
+            self.cp_rank = 0
             self.d_inner_local_tpcp = self.d_inner_local_tp
             self.nheads_local_tpcp = self.nheads_local_tp
             self.ngroups_local_tpcp = self.ngroups_local_tp
+            self.group_repeat_count = 1
             return
 
         self.cp_rank = self.cp_group.rank()
 
-        assert (
-            self.nheads_local_tp % self.cp_size == 0
-        ), "nheads must be evenly divisible by tp_size * cp_size"
+        assert self.nheads_local_tp % self.cp_size == 0, (
+            f"TP-local head count {self.nheads_local_tp} must be divisible by "
+            f"runtime CP size {self.cp_size}"
+        )
         self.nheads_local_tpcp = self.nheads_local_tp // self.cp_size
 
         self.d_inner_local_tpcp = self.d_inner_local_tp // self.cp_size
 
         # Group repeat logic (same as GDNContextParallel)
         if self.ngroups_local_tp < self.cp_size:
-            assert (
-                self.cp_size % self.ngroups_local_tp == 0
-            ), "cp_size must be evenly divisible by ngroups/tp_size"
+            assert self.cp_size % self.ngroups_local_tp == 0, (
+                f"runtime CP size {self.cp_size} must be divisible by "
+                f"TP-local group count {self.ngroups_local_tp}"
+            )
             self.group_repeat_count = self.cp_size // self.ngroups_local_tp
             self.ngroups_local_tpcp = 1
         else:
-            assert (
-                self.ngroups_local_tp % self.cp_size == 0
-            ), "ngroups must be evenly divisible by tp_size * cp_size"
+            assert self.ngroups_local_tp % self.cp_size == 0, (
+                f"TP-local group count {self.ngroups_local_tp} must be divisible by "
+                f"runtime CP size {self.cp_size}"
+            )
             self.group_repeat_count = 1
             self.ngroups_local_tpcp = self.ngroups_local_tp // self.cp_size
+
+    def _set_context_parallel_group(
+        self, cp_group: Optional[torch.distributed.ProcessGroup]
+    ) -> None:
+        """Set the active context-parallel group."""
+        self.cp_group = cp_group
+        self._set_cp_params()
+
+    def for_context_parallel_group(
+        self, cp_group: Optional[torch.distributed.ProcessGroup]
+    ) -> "GDPContextParallel":
+        """Return a forward-local view configured for ``cp_group``."""
+        if cp_group is self.cp_group:
+            return self
+        runtime_view = copy.copy(self)
+        runtime_view._set_context_parallel_group(cp_group)
+        return runtime_view
 
     def pre_conv_ssm(
         self, input_: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None

@@ -510,8 +510,15 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
             assert (
                 sum(sequence_lengths) == args.seq_length
             ), f"Sequence lengths sum {sum(sequence_lengths)} != total {args.seq_length}"
-            data_iterator = iter(
-                MockVariableLengthSequencePackingDataIterator(
+            # Like the scheduler, hand each PP stage only the fields it consumes.
+            unowned_keys = set()
+            if not parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+                unowned_keys.update(('tokens', 'position_ids'))
+            if not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                unowned_keys.update(('labels', 'loss_mask'))
+            data_iterator = (
+                {key: value for key, value in sample.items() if key not in unowned_keys}
+                for sample in MockVariableLengthSequencePackingDataIterator(
                     total_seq_length=args.seq_length,
                     sequence_lengths=sequence_lengths,  # Variable lengths, sum=8192
                     local_cp_size=local_cp_size,
@@ -529,6 +536,7 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
             vp_stage=None,
             dynamic_cp=dynamic_cp,
             pg_collection=pg_collection,
+            config=SimpleNamespace(sequence_parallel=tp > 1),
         )
 
         # Unpack the result. Scheduler THD always returns padding_mask.

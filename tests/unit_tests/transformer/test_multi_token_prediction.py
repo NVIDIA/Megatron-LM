@@ -4387,6 +4387,7 @@ class TestMultiTokenPredictionHybrid:
                     mhc_multistream=kwargs["mhc_multistream"],
                     labels=kwargs["labels"],
                     loss_mask=kwargs["loss_mask"],
+                    padding_mask=kwargs["padding_mask"],
                     mtp_input_mask=kwargs["mtp_input_mask"],
                     packed_seq_params=kwargs["packed_seq_params"],
                 )
@@ -4509,8 +4510,10 @@ class TestMultiTokenPredictionHybrid:
     @pytest.mark.parametrize("with_mask", [False, True])
     def test_forward_uses_mtp_cp_layout_inputs(self, monkeypatch, with_mask):
         model, hidden_states, call_counts, metric_avg_group = self._make_forward_stub()
-        contiguous_packed_seq_params = object()
-        zigzag_packed_seq_params = object()
+        static_cp_group = types.SimpleNamespace(size=lambda: 1)
+        runtime_cp_group = types.SimpleNamespace(size=lambda: 2)
+        contiguous_packed_seq_params = PackedSeqParams(local_cp_size=2, cp_group=runtime_cp_group)
+        zigzag_packed_seq_params = PackedSeqParams(local_cp_size=2, cp_group=runtime_cp_group)
         zigzag_hidden_states = hidden_states + 10.0
         padding_mask = torch.tensor([[False, True]]) if with_mask else None
         zigzag_padding_mask = torch.tensor([[True, False]]) if with_mask else None
@@ -4521,20 +4524,23 @@ class TestMultiTokenPredictionHybrid:
             "zigzag": zigzag_packed_seq_params,
         }
         cp_layout_plan = object()
-        cp_group = types.SimpleNamespace(size=lambda: 2)
-        tp_group = object()
+        tp_group = types.SimpleNamespace(size=lambda: 2)
         tp_cp_group = object()
+        runtime_tp_cp_group = object()
         model.pg_collection = types.SimpleNamespace(
-            cp=cp_group, tp=tp_group, tp_cp=tp_cp_group, dp_cp=metric_avg_group
+            cp=static_cp_group, tp=tp_group, tp_cp=tp_cp_group, dp_cp=metric_avg_group
         )
         model.mtp.config = types.SimpleNamespace(attention_cp_layout="zigzag")
-        model.mtp.cp_group = cp_group
+        model.mtp.cp_group = static_cp_group
         model.mtp.tp_group = tp_group
         model.mtp.tp_cp_group = tp_cp_group
         model.mtp.sequence_parallel = True
         model.mtp.prepare_cp_layout = types.MethodType(
             MultiTokenPredictionBlock.prepare_cp_layout, model.mtp
         )
+        # The batch fetch attaches the runtime TP x CP group to each layout's packed params.
+        contiguous_packed_seq_params.tp_cp_group = runtime_tp_cp_group
+        zigzag_packed_seq_params.tp_cp_group = runtime_tp_cp_group
 
         def convert_cp_layout_spy(
             layer_hidden_states,
@@ -4548,10 +4554,10 @@ class TestMultiTokenPredictionHybrid:
         ):
             assert source_layout == "contiguous"
             assert target_layout == "zigzag"
-            assert passed_cp_group is cp_group
+            assert passed_cp_group is runtime_cp_group
             assert sequence_parallel
             assert passed_tp_group is tp_group
-            assert passed_tp_cp_group is tp_cp_group
+            assert passed_tp_cp_group is runtime_tp_cp_group
             assert thd_plan is cp_layout_plan
             if layer_hidden_states.dtype == torch.bool:
                 torch.testing.assert_close(layer_hidden_states, (~padding_mask).transpose(0, 1))
@@ -4642,6 +4648,7 @@ class TestMultiTokenPredictionHybrid:
             assert captured["mtp"]["padding_mask"] is None
         assert captured["mtp_loss"]["labels"] is zigzag_labels
         assert captured["mtp_loss"]["loss_mask"] is zigzag_loss_mask
+        assert captured["mtp_loss"]["packed_seq_params"] is zigzag_packed_seq_params
         assert captured["mtp_loss"]["input_ids"] is zigzag_input_ids
         assert captured["mtp_loss"]["main_hidden_states"] is hidden_states
         torch.testing.assert_close(output, labels.to(dtype=hidden_states.dtype) + 1000.0)

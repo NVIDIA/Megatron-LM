@@ -19,7 +19,7 @@ from megatron.core.models.common.embeddings import (
     YarnRotaryEmbedding,
     apply_rotary_pos_emb,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
@@ -303,8 +303,10 @@ class DSAIndexerLossLoggingHelper:
             loss: The loss tensor.
             layer_number: Layer index of the loss, 1-indexed.
             num_layers: The number of total layers.
-            reduce_group: The group for reducing the loss.
-            avg_group: The group for averaging the loss.
+            reduce_group: Runtime CP group for a CP-partial loss sum. Its size weights
+                the contribution so fixed-group averaging yields the mean per logical sample.
+            avg_group: Runtime CP group for a CP-mean loss. Its contribution is already
+                normalized. No collective is performed here.
             raw_loss: The unscaled loss, before the indexer loss coefficient is applied.
                 Optional so call sites that do not track it (the fused-kernel path) keep
                 working; it is appended last to preserve the positional order above.
@@ -314,6 +316,9 @@ class DSAIndexerLossLoggingHelper:
             return
 
         tracker = DSAIndexerLossLoggingHelper.tracker
+        tracker["requires_dp_cp"] = tracker.get("requires_dp_cp", False) or any(
+            group is not None and group.size() > 1 for group in (reduce_group, avg_group)
+        )
         # Hybrid MTP layer numbers can exceed ``num_layers + mtp_num_layers``
         # because every prediction depth can contain multiple hybrid layers.
         needed = max(num_layers, layer_number)
@@ -325,7 +330,11 @@ class DSAIndexerLossLoggingHelper:
             )
             grown[: tracker["values"].shape[0]] = tracker["values"]
             tracker["values"] = grown
-        tracker["values"][layer_number - 1] += loss.detach()
+        # A CP-partial sum needs one factor of runtime CP before averaging over
+        # fixed rank slots; CP means are already normalized. This preserves the
+        # mean per logical sample when CP topology changes between microbatches.
+        contribution_scale = float(reduce_group.size()) if reduce_group is not None else 1.0
+        tracker["values"][layer_number - 1].add_(loss.detach(), alpha=contribution_scale)
         if raw_loss is not None:
             if "raw_values" not in tracker or tracker["raw_values"].shape[0] < needed:
                 grown = torch.zeros(
@@ -334,22 +343,24 @@ class DSAIndexerLossLoggingHelper:
                 if "raw_values" in tracker:
                     grown[: tracker["raw_values"].shape[0]] = tracker["raw_values"]
                 tracker["raw_values"] = grown
-            tracker["raw_values"][layer_number - 1] += raw_loss.detach()
-        tracker["reduce_group"] = reduce_group
-        tracker["avg_group"] = avg_group
+            tracker["raw_values"][layer_number - 1].add_(
+                raw_loss.detach(), alpha=contribution_scale
+            )
 
     @staticmethod
     def clean_loss_in_tracker(preserve_groups: bool = False):
-        """Clear the indexer losses."""
+        """Clear losses; ``preserve_groups`` is retained for caller compatibility.
+
+        Runtime group sizes are baked into the accumulation operation. Graph replay
+        only retains whether a fixed DP x CP group is required, without saved group pointers.
+        """
         tracker = DSAIndexerLossLoggingHelper.tracker
-        reduce_group = tracker.get("reduce_group") if preserve_groups else None
-        avg_group = tracker.get("avg_group") if preserve_groups else None
         if "values" in tracker:
             tracker["values"].zero_()
         if "raw_values" in tracker:
             tracker["raw_values"].zero_()
-        tracker["reduce_group"] = reduce_group
-        tracker["avg_group"] = avg_group
+        if not preserve_groups:
+            tracker["requires_dp_cp"] = False
 
     @staticmethod
     def reduce_loss_in_tracker(
@@ -358,12 +369,25 @@ class DSAIndexerLossLoggingHelper:
         """Collect and reduce indexer losses across every pipeline rank.
 
         Args:
-            pg_collection: Process groups used for pipeline and data-parallel reductions.
+            pg_collection: Fixed pipeline, DP and DP x CP groups, plus optional GTP-remat.
             num_layers: Total number of decoder and MTP layers. When provided, ranks without
                 local indexer losses contribute zeros to the pipeline-wide reduction.
         """
         tracker = DSAIndexerLossLoggingHelper.tracker
         pp_group = pg_collection.pp
+        dp_cp_group = getattr(pg_collection, "dp_cp", None)
+        if dp_cp_group is None:
+            cp_group = getattr(pg_collection, "cp", None)
+            dynamic_cp_groups = getattr(pg_collection, "dynamic_cp", None) or {}
+            if (
+                tracker.get("requires_dp_cp", False)
+                or (cp_group is not None and cp_group.size() > 1)
+                or any(group.size() > 1 for group in dynamic_cp_groups.values())
+            ):
+                raise ValueError("DSA indexer logging with CP requires a fixed dp_cp process group")
+            dp_cp_group = pg_collection.dp
+            if dp_cp_group is None:
+                raise ValueError("DSA indexer logging requires a dp or dp_cp process group")
 
         # Pipeline ranks can own different attention variants, so first agree on
         # a common tracker size. Cache the result because layer allocation is
@@ -397,28 +421,21 @@ class DSAIndexerLossLoggingHelper:
             if "raw_values" in tracker:
                 grown[: tracker["raw_values"].shape[0]] = tracker["raw_values"]
             tracker["raw_values"] = grown
+        # Contributions already carry their runtime CP weighting. Average once
+        # over the fixed data/context domain, preserving static CP and remat means.
+        contributing_ranks = dp_cp_group.size()
+        gtp_remat_group = getattr(pg_collection, "gtp_remat", None)
+        if gtp_remat_group is not None:
+            contributing_ranks *= gtp_remat_group.size()
         for values in (tracker["values"], tracker["raw_values"]):
             torch.distributed.all_reduce(values, group=pp_group)
-            # Reduce indexer losses across ranks.
-            if tracker.get('reduce_group') is not None:
-                torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
-            if tracker.get('avg_group') is not None:
-                torch.distributed.all_reduce(
-                    values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
-                )
-            # Sum over every rank holding a distinct micro-batch, then divide once. gtp_remat
-            # ranks each carry their own, so they are a second data dimension beside dp. CP is
-            # excluded on purpose: the loss is already summed across it before it gets here.
-            contributing_ranks = pg_collection.dp.size()
             torch.distributed.all_reduce(
-                values, group=pg_collection.dp, op=torch.distributed.ReduceOp.SUM
+                values, group=dp_cp_group, op=torch.distributed.ReduceOp.SUM
             )
-            gtp_remat_group = getattr(pg_collection, "gtp_remat", None)
             if gtp_remat_group is not None and gtp_remat_group.size() > 1:
                 torch.distributed.all_reduce(
                     values, group=gtp_remat_group, op=torch.distributed.ReduceOp.SUM
                 )
-                contributing_ranks *= gtp_remat_group.size()
             values /= contributing_ranks
 
     @staticmethod
@@ -440,7 +457,7 @@ class DSAIndexerLossLoggingHelper:
             loss_scale: Scale factor for the loss.
             iteration: Current training iteration.
             writer: TensorBoard writer.
-            pg_collection: Process groups used for pipeline and data-parallel reductions.
+            pg_collection: Fixed pipeline, DP and DP x CP groups, plus optional GTP-remat.
             wandb_writer: Weights & Biases writer.
             total_loss_dict: Dictionary to accumulate total losses.
             per_layer_logging: Whether to log per-layer losses.
@@ -448,7 +465,8 @@ class DSAIndexerLossLoggingHelper:
                 without a local indexer participate in the pipeline reduction.
             num_indexer_layers: Number of layers that own an indexer. Defaults to the
                 tracker size when every tracked layer owns one.
-            preserve_groups: Keep the saved reduction groups for CUDA Graph replays.
+            preserve_groups: Keep the fixed-group requirement across CUDA Graph replays.
+                Runtime weights are recorded directly in accumulation operations.
         """
         DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(
             pg_collection=pg_collection, num_layers=num_layers
@@ -2286,8 +2304,10 @@ class DSAIndexer(MegatronModule):
         rotary_pos_emb: torch.Tensor,
         mscale: float,
         cu_seqlens: Optional[torch.Tensor] = None,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """Apply RoPE to the input tensor."""
+        cp_group = self.pg_collection.cp if cp_group is None else cp_group
         # NoPE: no positional component; x is all nope, return unchanged.
         if not self.use_rope:
             return x
@@ -2311,7 +2331,7 @@ class DSAIndexer(MegatronModule):
             config=self.config,
             cu_seqlens=cu_seqlens,
             mscale=mscale,
-            cp_group=self.pg_collection.cp,
+            cp_group=cp_group,
             # This flag is for the MLA-style interleaving in RoPE.
             mla_rotary_interleaved=self.config.dsa_indexer_rope_interleaved,
         )
@@ -2325,6 +2345,7 @@ class DSAIndexer(MegatronModule):
         self, x: torch.Tensor, qr: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """All computations before topk."""
+        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
 
         # =========================================
@@ -2369,7 +2390,7 @@ class DSAIndexer(MegatronModule):
         # [seqlen, batch, index_n_heads * index_head_dim]
         #   -> [seqlen, batch, index_n_heads, index_head_dim]
         q = q.reshape(seqlen, bsz, self.index_n_heads, self.index_head_dim)
-        q = self._apply_rope(q, rotary_pos_emb, mscale, cu_seqlens=cu_seqlens_q)
+        q = self._apply_rope(q, rotary_pos_emb, mscale, cu_seqlens=cu_seqlens_q, cp_group=cp_group)
         if self.config.dsa_indexer_rotate_activation and self.index_kpool <= 1:
             q = rotate_activation(q)
 
@@ -2399,7 +2420,9 @@ class DSAIndexer(MegatronModule):
                 k = self.k_norm(k)
             # [seqlen, batch, index_head_dim] -> [seqlen, batch, 1, index_head_dim]
             k = k.reshape(seqlen, bsz, 1, self.index_head_dim)
-            k = self._apply_rope(k, rotary_pos_emb, mscale, cu_seqlens=cu_seqlens_kv)
+            k = self._apply_rope(
+                k, rotary_pos_emb, mscale, cu_seqlens=cu_seqlens_kv, cp_group=cp_group
+            )
             # [seqlen, batch, 1, index_head_dim] -> [seqlen, batch, index_head_dim]
             k = k.reshape(seqlen, bsz, self.index_head_dim)
 
@@ -2763,6 +2786,19 @@ class DSAttention(MegatronModule):
         if self.indexer is not None:
             self.indexer.backward_dw()
 
+    def _resolve_runtime_process_groups(
+        self, packed_seq_params: Optional[PackedSeqParams]
+    ) -> tuple[Optional[torch.distributed.ProcessGroup], ProcessGroupCollection]:
+        """Return forward-local process groups for the selected runtime CP size."""
+        static_cp_group = getattr(self.pg_collection, "cp", None)
+        cp_group = resolve_cp_group(static_cp_group, packed_seq_params)
+        if cp_group is static_cp_group:
+            return cp_group, self.pg_collection
+
+        runtime_pg_collection = copy.copy(self.pg_collection)
+        runtime_pg_collection.cp = cp_group
+        return cp_group, runtime_pg_collection
+
     def forward(
         self,
         query: torch.Tensor,
@@ -2833,7 +2869,7 @@ class DSAttention(MegatronModule):
         sq, b, _, _ = query.size()
         local_sequence_rows = x.size(0)
 
-        cp_group = getattr(self.pg_collection, "cp", None)
+        cp_group, runtime_pg_collection = self._resolve_runtime_process_groups(packed_seq_params)
         cp_size = get_pg_size(cp_group)
         cp_rank = cp_group.rank() if cp_group is not None else 0
         tp_group = getattr(self.pg_collection, "tp", None)
@@ -3177,7 +3213,7 @@ class DSAttention(MegatronModule):
                 indexer_loss_coeff,
                 float_mask,
                 sparse_indexer_loss,
-                self.pg_collection,
+                runtime_pg_collection,
                 varlen_starts,
                 varlen_ends,
                 key_positions,
@@ -3222,7 +3258,7 @@ class DSAttention(MegatronModule):
                 local_packed_cp_rank=cp_rank,
                 local_packed_cp_query_start=local_packed_cp_query_start,
                 local_packed_cp_query_len=local_packed_cp_query_len,
-                pg_collection=self.pg_collection,
+                pg_collection=runtime_pg_collection,
             )
         if fused_output is not None:
             output, indexer_loss = fused_output
@@ -3295,7 +3331,7 @@ class DSAttention(MegatronModule):
                     key=key.detach(),
                     softmax_scale=self.softmax_scale,
                     loss_coeff=indexer_loss_coeff,
-                    pg_collection=self.pg_collection,
+                    pg_collection=runtime_pg_collection,
                     query_valid_rows=query_valid_rows,
                     calculate_per_token_loss=self.config.calculate_per_token_loss,
                     use_relu=self.config.dsa_indexer_scoring_relu,

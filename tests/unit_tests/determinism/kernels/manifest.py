@@ -101,6 +101,7 @@ class KernelEntry:
 # Test-file prefixes used below.
 K = "tests/unit_tests/determinism/kernels/"
 C = "tests/unit_tests/determinism/correctness/"
+R = "tests/unit_tests/context_parallel/runtime/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
@@ -114,20 +115,20 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="fused_bias_swiglu",
         sources=("megatron/core/fusions/fused_bias_swiglu.py",),
-        tests=(K + "test_fused_activations.py",),
+        tests=(K + "test_fused_activations.py", R + 'test_activation_replay.py'),
         kind="torch.compile",
         notes="Elementwise; weighted variants reduce the per-token weight grad over ffn (Inductor tree reduction).",
     ),
     KernelEntry(
         name="fused_bias_geglu",
         sources=("megatron/core/fusions/fused_bias_geglu.py",),
-        tests=(K + "test_fused_activations.py",),
+        tests=(K + "test_fused_activations.py", R + 'test_activation_replay.py'),
         kind="torch.compile",
     ),
     KernelEntry(
         name="paged_stash_marker_propagation",
         sources=("megatron/core/extensions/transformer_engine.py",),
-        tests=(K + "test_fused_activations.py",),
+        tests=(K + "test_fused_activations.py", R + 'test_activation_replay.py'),
         kind="dispatch",
         notes="Propagates TE's grouped-tensor marker across fused-activation views and casts; "
         "the marked SwiGLU and QuickGeGLU replay test covers values and gradients.",
@@ -330,6 +331,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_te_wrappers.py",
             C + "test_fp8_determinism.py",
             K + "test_runtime_cp_attention.py",
+            R + 'test_te_replay.py',
         ),
         kind="te-wrapper",
         notes="TE Linear / LayerNormLinear / Norm / GroupedLinear / DotProductAttention / fused RoPE replayed standalone; "
@@ -553,7 +555,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/gated_delta_net/gdn2.py",
             "megatron/core/ssm/gated_delta_net/kda.py",
         ),
-        tests=(K + "test_ssm_kernels.py", K + "test_gated_norm.py", C + "test_hybrid_model.py"),
+        tests=(
+            K + "test_ssm_kernels.py",
+            K + "test_gated_norm.py",
+            C + "test_hybrid_model.py",
+            R + 'test_ssm_replay.py',
+        ),
         kind="torch.compile",
         notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic). "
         "Dynamic-inference decode runs the Megatron forks causal_conv1d_update and "
@@ -747,18 +754,31 @@ KERNELS: Tuple[KernelEntry, ...] = (
             C + "test_ssm_conv1d.py",
             K + "test_ssm_kernels.py",
             "tests/unit_tests/inference/engines/test_batch_invariant_mamba_prefix_caching.py",
+            R + 'test_ssm_replay.py',
         ),
         kind="dispatch",
         notes="Selects the pip causal_conv1d / mamba_ssm kernels (causal_conv1d_fn, "
         "mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined, causal_conv1d_update_cuda) or "
         "the Megatron forks (ops/common, ops/mamba2: varlen scan, causal_conv1d_update, "
         "selective_state_update). Module-level replay: test_ssm_conv1d.py::TestMambaMixerDeterminism; "
-        "kernels replayed piecewise in test_ssm_kernels.py.",
+        "kernels replayed piecewise in test_ssm_kernels.py. Runtime helper projections, "
+        "convolution and CP collectives are replayed in runtime/test_ssm_replay.py.",
+    ),
+    KernelEntry(
+        name="ssm_runtime_cp_collectives",
+        sources=(
+            "megatron/core/ssm/mamba_context_parallel.py",
+            "megatron/core/ssm/gdp_context_parallel.py",
+        ),
+        tests=(R + "test_ssm_replay.py",),
+        kind="dispatch",
+        notes="Runtime CP1/2/4/1 helper views replay the actual head-exchange collectives, "
+        "parameter-sliced convolution and backward without mutating the build-time helper.",
     ),
     KernelEntry(
         name="ssm_gated_delta_product",
         sources=("megatron/core/ssm/gated_delta_product.py",),
-        tests=(K + "test_ssm_kernels.py",),
+        tests=(K + "test_ssm_kernels.py", R + 'test_ssm_replay.py'),
         kind="dispatch",
         notes="Dispatches FLA chunk_gated_delta_product / l2_norm, the CuTeDSL gdp_attn kernel "
         "(gdp_cutedsl_kernel; not in the CI container, uncovered), causal_conv1d and the Megatron "
@@ -766,12 +786,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "replayed in test_ssm_kernels.py. ssm_decode also drives the speculative-decoding path, "
         "where causal_conv1d_update and the fused recurrence take several draft tokens per step and "
         "fill the conv / SSM rollback snapshot buffers; both are replayed there with the snapshots "
-        "as outputs. No module-level replay yet (HYBRID_CONFIGS has no GDP cell).",
+        "as outputs. Runtime chunkwise full-head gating and headwise helper convolution/collectives "
+        "are replayed in runtime/test_ssm_replay.py.",
     ),
     KernelEntry(
         name="rope_dispatch",
         sources=("megatron/core/models/common/embeddings/rope_utils.py",),
-        tests=(K + "test_te_wrappers.py",),
+        tests=(K + "test_te_wrappers.py", R + 'test_mla_replay.py', R + 'test_indexer_replay.py'),
         kind="dispatch",
         notes="apply_rotary_pos_emb selects TE fused RoPE (replayed in test_te_wrappers.py), "
         "flash-attn apply_rotary_emb (not in the CI container) or the unfused torch path.",
@@ -782,7 +803,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/multi_latent_attention.py",
             "megatron/core/transformer/experimental_attention_variant/absorbed_mla.py",
         ),
-        tests=(K + "test_fused_triton_kernels.py", K + "test_te_wrappers.py"),
+        tests=(
+            K + "test_fused_triton_kernels.py",
+            K + "test_te_wrappers.py",
+            R + 'test_mla_replay.py',
+        ),
         kind="dispatch",
         notes="Calls the Triton MLA YaRN RoPE kernels (fused_apply_mla_rope_for_q / _kv, replayed in "
         "test_fused_triton_kernels.py), TE fused RoPE and TE's fused MLA key/value RoPE + MXFP8 "
@@ -965,7 +990,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="dsa_dispatch",
         sources=("megatron/core/transformer/experimental_attention_variant/dsa.py",),
-        tests=(K + "test_fused_triton_kernels.py",),
+        tests=(K + "test_fused_triton_kernels.py", R + 'test_indexer_replay.py'),
         kind="dispatch",
         notes="DSA weights projection dispatches Transformer Engine general_gemm when available; "
         "replay covers the selected GEMM, deterministic torch fallback, and chunked KPool top-k.",

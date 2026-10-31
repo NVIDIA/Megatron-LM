@@ -1,6 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -9,10 +8,13 @@ from torch import Tensor
 
 @dataclass
 class PackedSeqParams:
-    '''
-    parameters to TEDotProductAttention and fused rope kernels for the
-    `thd` (packed) sequence format
-    '''
+    """Packed sequence boundaries and MCore's per-microbatch parallel topology.
+
+    Attention and fused RoPE kernels consume the sequence metadata. ``cp_group``,
+    ``local_cp_size`` and ``tp_cp_group`` are MCore-only fields and must be filtered
+    before forwarding arguments to Transformer Engine. Runtime CP includes a real
+    singleton group; ``local_cp_size`` requires a matching ``cp_group``.
+    """
 
     qkv_format: str = None
     cu_seqlens_q: Tensor = None
@@ -24,9 +26,11 @@ class PackedSeqParams:
     # Runtime dynamic context parallelism, set per microbatch by the packing scheduler.
     # When local_cp_size is set, cp_group is the matching runtime group,
     # including a singleton group when CP is disabled for this microbatch.
-    local_cp_size: int = None
-    cp_group: dist.ProcessGroup = None
-    total_tokens: int = None
+    local_cp_size: int | None = None
+    cp_group: dist.ProcessGroup | None = None
+    # TP x CP group matching cp_group; None unless sequence_parallel and TP > 1.
+    tp_cp_group: dist.ProcessGroup | None = None
+    total_tokens: int | None = None
     seq_idx: Tensor = None
     tokens_per_sample: int = None
     pad_between_seqs: bool = None
@@ -45,6 +49,8 @@ class PackedSeqParams:
         cu_seqlens_q_padded[-1] == max_seqlen then this additional sequence index will not be
         included.
         """
+        if self.local_cp_size is not None:
+            resolve_cp_group(None, self)
         cu_seqlens = (
             self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None else self.cu_seqlens_q
         )
@@ -74,8 +80,8 @@ class PackedSeqParams:
 
 
 def resolve_cp_group(
-    static_cp_group: Optional[dist.ProcessGroup], packed_seq_params: PackedSeqParams = None
-) -> Optional[dist.ProcessGroup]:
+    static_cp_group: dist.ProcessGroup | None, packed_seq_params: PackedSeqParams | None = None
+) -> dist.ProcessGroup | None:
     """Resolve and validate the context-parallel group for this microbatch."""
     if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
         assert (
@@ -87,3 +93,22 @@ def resolve_cp_group(
         )
         return packed_seq_params.cp_group
     return static_cp_group
+
+
+def resolve_tp_cp_group(
+    static_tp_cp_group: dist.ProcessGroup | None,
+    packed_seq_params: PackedSeqParams | None = None,
+    *,
+    sequence_parallel: bool,
+    tp_group: dist.ProcessGroup,
+) -> dist.ProcessGroup | None:
+    """Resolve the TP x CP group matching this microbatch's context-parallel group."""
+    if not sequence_parallel or tp_group.size() == 1:
+        return static_tp_cp_group
+    if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+        assert packed_seq_params.tp_cp_group is not None, (
+            "packed_seq_params.tp_cp_group must be set for runtime CP layout conversion "
+            "under sequence parallelism"
+        )
+        return packed_seq_params.tp_cp_group
+    return static_tp_cp_group
