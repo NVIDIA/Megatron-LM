@@ -81,7 +81,6 @@ try:
         in_fp8_activation_recompute_phase,
         reduce_scatter_along_first_dim,
     )
-    from transformer_engine.pytorch.module.base import get_dummy_wgrad
     from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
     from transformer_engine.pytorch.tensor import MXFP8TensorStorage, NVFP4TensorStorage
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
@@ -104,7 +103,6 @@ except (ImportError, ModuleNotFoundError):
     _NVFP4AllGatherAsyncHandle = MagicMock()
     gather_along_first_dim = reduce_scatter_along_first_dim = MagicMock()
     in_fp8_activation_recompute_phase = MagicMock()
-    get_dummy_wgrad = MagicMock()
     QuantizedTensor = MagicMock()
     MXFP8TensorStorage = NVFP4TensorStorage = MagicMock()
     MXFP8Quantizer = MagicMock()
@@ -2065,30 +2063,22 @@ class GTPShardedParam(torch.nn.Parameter):
     def _handle_megatron_grad_accum(param):
         """Handle megatron DDP and gradient-accumulation fusion.
 
-        Returns a cached dummy wgrad; sync callers use it as the graph-safe grad, async drains
-        discard it. The real gradient is already in main_grad; DDP only needs
+        The real gradient is already in main_grad; DDP only needs
         the readiness notification.
         """
         if hasattr(param, "grad_added_to_main_grad"):
             param.grad_added_to_main_grad = True
-        # Preserve the zero_out_wgrad convention for the placeholder returned to autograd.
-        if getattr(param, "zero_out_wgrad", False):
-            dummy_grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype, zero=True)
-        else:
-            dummy_grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype)
         hook = getattr(param, "_grad_accum_hook", None)
         if hook is not None:
             if _chain_is_graphed(param.chain_id):
                 register_capture_wgrad_finalize(param)
             # The real reduced gradient is already in main_grad. Discard any
-            # autograd placeholder before notifying DDP, including a dummy left
-            # by a previous MTP use or an ordinary warmup allocation. Capturing
-            # an add from that dummy could retain its address after it is freed.
+            # stale autograd gradient before notifying DDP.
             param.grad = None
             hook()
 
         param._set_rs_state(GTPWeightState.NONE)
-        return dummy_grad
+        return None
 
     def _wait_reduce_scatter(self, finalize_grad=False) -> bool:
         """Wait on this weight's in-flight wgrad reduce-scatter, optionally accumulating it.
@@ -2408,8 +2398,8 @@ class GTPShardedParam(torch.nn.Parameter):
         Accepts a single tensor (non-routed) or a list (routed experts).
 
         Returns:
-            Single tensor or list for sync (last weight) — backward returns this.
-            None or tuple of Nones for async — backward returns this.
+            None for a single weight. For routed experts, a list or tuple of
+            Nones matching the input count. The real grads are in main_grad.
         """
         batched = isinstance(wgrad, (list, tuple))
         wgrads = list(wgrad) if batched else [wgrad]

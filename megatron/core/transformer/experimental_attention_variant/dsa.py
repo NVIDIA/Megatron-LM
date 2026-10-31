@@ -38,11 +38,6 @@ logger = logging.getLogger(__name__)
 _DSA_WEIGHTS_PROJ_TE_GEMM_FALLBACK_WARNED = False
 
 try:
-    from transformer_engine.pytorch.module.base import get_dummy_wgrad
-except ImportError:
-    get_dummy_wgrad = None
-
-try:
     from fast_hadamard_transform import hadamard_transform
 except ImportError:
     hadamard_transform = None
@@ -2023,14 +2018,7 @@ class _DSAWeightsProjection(torch.autograd.Function):
             if getattr(linear, "fuse_wgrad_accumulation", False) and hasattr(
                 weight, "grad_added_to_main_grad"
             ):
-                # Keep a dummy grad for MCore's parameter hook, including delayed WGrad.
-                zero_dummy = getattr(weight, "zero_out_wgrad", False)
-                if get_dummy_wgrad is not None:
-                    grad_weight = get_dummy_wgrad(list(weight.shape), weight.dtype, zero=zero_dummy)
-                elif zero_dummy:
-                    grad_weight = torch.zeros_like(weight, requires_grad=False)
-                else:
-                    grad_weight = torch.empty_like(weight, requires_grad=False)
+                grad_weight = None
 
         return grad_input, grad_weight, None, None
 

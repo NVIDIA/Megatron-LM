@@ -11,7 +11,6 @@ contention; the bare TE modules are what the model-level suite composes, so a re
 localises to one kernel family.
 """
 
-import inspect
 import os
 from types import SimpleNamespace
 
@@ -268,8 +267,7 @@ class TestTEWrappers:
     @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 output projection requires Blackwell")
     def test_te_lm_head_two_uses_replays(self):
         """The MXFP8 LM head used twice in one backward pass, as by the main and MTP heads, with
-        its weight gradient accumulated into main_grad. TE versions that read
-        ``zero_tensor_dummy_wgrad`` hand autograd ZeroTensor dummies, whose sum is free."""
+        its weight gradient accumulated into main_grad without a tensor .grad."""
         seeded()
         config = _config(
             fp8="hybrid",
@@ -280,7 +278,6 @@ class TestTEWrappers:
         head = TELMHeadColumnParallelLinear(
             HIDDEN, 4096, config=config, init_method=init_method_normal(0.02), bias=False
         ).cuda()
-        assert head.weight.zero_tensor_dummy_wgrad
         # Called twice per microbatch: as for MTP's repeated layers, TE gets no
         # is_first_microbatch, so neither call overwrites main_grad.
         head.is_repeated_layer = True
@@ -303,10 +300,7 @@ class TestTEWrappers:
         assert_module_replays_bit_exact(
             module, (x, y), replays=3, contention=True, what="TELMHeadColumnParallelLinear x2"
         )
-        from transformer_engine.pytorch.module.base import get_dummy_wgrad
-
-        if "zero_tensor" in inspect.signature(get_dummy_wgrad).parameters:
-            assert head.weight.grad._is_zerotensor()
+        assert head.weight.grad is None
 
     @pytest.mark.parametrize(
         "backend", ["te", "torch"], ids=["te-general-gemm", "torch-mm-fallback"]

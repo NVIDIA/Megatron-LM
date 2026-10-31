@@ -616,13 +616,15 @@ class DistributedDataParallel(_BaseDataParallel):
                 assert param.requires_grad
                 cudagraph_wgrad_ready_event = getattr(param, '_cudagraph_wgrad_ready_event', None)
                 if self.ddp_config.overlap_grad_reduce and cudagraph_wgrad_ready_event is None:
-                    # GTP_remat keeps its real wgrad in main_grad (via finalize); param.grad here is
-                    # throwaway (None or a dummy), so skip this assert and rely on
-                    # grad_added_to_main_grad below.
+                    # GTP_remat drives grad readiness after its wgrad finalize step. For
+                    # other fused-wgrad parameters, main_grad already holds the gradient
+                    # even when autograd receives no param.grad.
                     if not getattr(param, 'is_gtp_weight_remat', False):
-                        assert (
-                            param.grad is not None
-                        ), 'param.grad being None is not safe when overlap_grad_reduce is True'
+                        assert param.grad is not None or param.grad_added_to_main_grad, (
+                            'param.grad must not be None when overlap_grad_reduce is True '
+                            'unless the gradient has already been accumulated into main_grad '
+                            '(i.e. param.grad_added_to_main_grad is True).'
+                        )
                 if param.grad is not None and (
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):

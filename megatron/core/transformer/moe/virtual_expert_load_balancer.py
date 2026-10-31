@@ -545,27 +545,16 @@ class _VirtualExperts(_GTPTEWeightBridge):
             if not sharded:
                 self.get_weight_table(i, "grad", tuple(p.main_grad for p in self.parameters[i]))
 
-    def hand_off_wgrads(self, fc_layer: int) -> tuple[torch.Tensor, ...]:
-        """Finish GTP reduction or return dummy grads to trigger DDP's grad-ready hooks.
-
-        Non-GTP weights already accumulated into main_grad; do not add their gradients again."""
-        from transformer_engine.pytorch.module.base import get_dummy_wgrad
+    def hand_off_wgrads(self, fc_layer: int) -> tuple[torch.Tensor | None, ...]:
+        """Finish GTP reduction or mark fused grads as accumulated in main_grad."""
 
         if self.gtp_leaders[fc_layer] is not None:
             return self._reduce_scatter_gtp_grads(fc_layer)
 
         parameters = self.parameters[fc_layer]
-        grads = []
         for parameter in parameters:
             parameter.grad_added_to_main_grad = True
-            grads.append(
-                get_dummy_wgrad(
-                    list(parameter.shape),
-                    parameter.dtype,
-                    zero=getattr(parameter, "zero_out_wgrad", False),
-                )
-            )
-        return tuple(grads)
+        return (None,) * len(parameters)
 
 
 # ---- Load balancer ---------------------------------------------------------------------------

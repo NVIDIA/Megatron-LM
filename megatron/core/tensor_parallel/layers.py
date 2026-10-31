@@ -55,7 +55,6 @@ except ImportError:
 
 try:
     import transformer_engine  # pylint: disable=unused-import
-    from transformer_engine.pytorch.module.base import get_dummy_wgrad
 
     HAVE_TE = True
 except ImportError:
@@ -309,8 +308,8 @@ class EmbeddingWithGradAccumulationFusion(torch.autograd.Function):
     """``F.embedding`` whose backward adds the weight gradient into ``weight.main_grad``.
 
     The embedding counterpart of the linear layers' ``gradient_accumulation_fusion``: the
-    backward accumulates into ``main_grad``, sets ``grad_added_to_main_grad`` and hands autograd
-    a ZeroTensor (no storage), so the DDP hook still runs but adds nothing. ``main_grad`` gets
+    backward accumulates into ``main_grad``, sets ``grad_added_to_main_grad`` and returns None
+    for the weight gradient. The DDP hook still runs and adds nothing. ``main_grad`` gets
     the values PyTorch's embedding backward followed by ``main_grad.add_`` gives it; when
     ``can_accumulate_embedding_wgrad`` allows, only the rows of the tokens that occur are
     touched instead of a dense ``[num_embeddings, hidden]`` gradient being built and added.
@@ -343,9 +342,7 @@ class EmbeddingWithGradAccumulationFusion(torch.autograd.Function):
                 )
             )
         weight.grad_added_to_main_grad = True
-        return None, torch._efficientzerotensor(
-            weight.shape, dtype=weight.dtype, device=weight.device
-        )
+        return None, None
 
 
 class VocabParallelEmbedding(torch.nn.Module):
@@ -895,35 +892,8 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                         )
 
             if hasattr(weight, "grad_added_to_main_grad"):
-                # When overlap_grad_reduce is True, need to ensure that backward hooks
-                # are all run on the main backprop thread to prevent deadlocks. Setup
-                # dummy grad_weight tensor to prevent backward hooks from being run
-                # in a background thread.
-                if getattr(weight, "zero_out_wgrad", False):
-                    if HAVE_TE:
-                        # get_dummy_wgrad function in TE enables reuse of single dummy wgrad buffer
-                        # across different layers/microbatches. The function accepts shape as list.
-                        grad_weight = get_dummy_wgrad(
-                            list(weight.main_grad.shape), input.dtype, zero=True
-                        )
-                    else:
-                        grad_weight = torch.zeros(
-                            weight.main_grad.shape,
-                            dtype=input.dtype,
-                            device=torch.cuda.current_device(),
-                            requires_grad=False,
-                        )
-                else:
-                    if HAVE_TE:
-                        grad_weight = get_dummy_wgrad(list(weight.main_grad.shape), input.dtype)
-                    else:
-                        grad_weight = torch.empty(
-                            weight.main_grad.shape,
-                            dtype=input.dtype,
-                            device=torch.cuda.current_device(),
-                            requires_grad=False,
-                        )
                 weight.grad_added_to_main_grad = True
+                grad_weight = None
             else:
                 grad_weight = None
         elif ctx.gtp_remat_size > 1 and sharded_weight.main_grad.dtype != total_input.dtype:

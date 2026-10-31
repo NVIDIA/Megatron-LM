@@ -599,6 +599,8 @@ class MegatronFSDP(torch.nn.Module):
         self.forward_hooks = {}
         self.backward_pre_hooks = {}
         self.grad_acc_hooks = {}
+        # Keep AccumulateGrad nodes alive for post hooks on fused None gradients.
+        self.grad_acc_nodes = []
 
         """
         An FSDP unit is a module designed to manage the lifecycle of model parameters
@@ -1201,11 +1203,17 @@ class MegatronFSDP(torch.nn.Module):
                 # Only register grad acc hook for parameters that require gradients.
                 if not param.requires_grad:
                     continue
+                # Tensor post-accumulate hooks are skipped when fused wgrad returns None.
+                # AccumulateGrad node post hooks run even for an undefined gradient on
+                # PyTorch 2.6+, on the parameter's device worker thread.
+                grad_acc = torch.autograd.graph.get_gradient_edge(param).node
+                self.grad_acc_nodes.append(grad_acc)
                 self.grad_acc_hooks[f"grad_acc and reduce for {self.param_to_name[param]}"] = (
-                    param.register_post_accumulate_grad_hook(
-                        lambda p: (
+                    grad_acc.register_hook(
+                        lambda *_, p=param: (
                             None
                             if getattr(p, 'skip_backward_post_hook', False)
+                            or (p.grad is None and not getattr(p, 'grad_added_to_main_grad', False))
                             else _process_post_backward_gradients([p])
                         )
                     )

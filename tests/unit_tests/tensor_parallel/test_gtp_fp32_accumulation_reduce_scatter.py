@@ -95,8 +95,7 @@ def test_gtp_fp32_accumulation_reduce_scatter_rounds_bf16_main_grad_once(async_o
             weight._release_wgrad_scratch()
             weight.main_grad.add_(out)
         else:
-            dummy = weight.wgrad_reduce_scatter(wgrad)
-            assert dummy.dtype == weight.dtype and dummy.shape == weight.shape
+            assert weight.wgrad_reduce_scatter(wgrad) is None
             assert weight.grad_added_to_main_grad
 
         torch.cuda.synchronize(device)

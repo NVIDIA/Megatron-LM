@@ -2018,12 +2018,6 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
             stride=stride,
         )
 
-        # With MTP the main and MTP heads use this weight in one backward pass, so autograd adds
-        # the dummy weight gradients TE returns once it has accumulated into main_grad: a
-        # [vocab, hidden] add whose result is discarded. TE versions that read this attribute
-        # return a ZeroTensor dummy, which costs nothing to add; older versions ignore it.
-        self.weight.zero_tensor_dummy_wgrad = True
-
         self.input_size = input_size
         self.output_size = output_size
         self.output_size_per_partition = divide(output_size, self.tp_size)
