@@ -389,8 +389,7 @@ def _update_router_expert_bias(
     Update the expert bias of the router for a global batch.
     This requires all-reduce of local_tokens_per_expert across TPxCPxDP ranks
     """
-    tokens_per_expert_list = []
-    expert_bias_list = []
+    expert_bias_groups = {}
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
             # Only update expert_bias if this module is in the training mode. There are special
@@ -403,22 +402,32 @@ def _update_router_expert_bias(
                 and module.expert_bias is not None
                 and not getattr(module, 'frozen_expert_bias', False)
             ):
-                tokens_per_expert_list.append(module.local_tokens_per_expert)
-                expert_bias_list.append(module.expert_bias)
-    # For hybrid models with both MoE and Dense layers, this list can be empty.
-    if len(expert_bias_list) == 0:
-        return
-    stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
-    stacked_expert_bias = torch.stack(expert_bias_list, dim=0)
-    stacked_updated_expert_bias = get_updated_expert_bias(
-        stacked_tokens_per_expert,
-        stacked_expert_bias,
-        config.moe_router_bias_update_rate,
-        tp_dp_cp_group=tp_dp_cp_group,
-    )
+                tokens_per_expert = module.local_tokens_per_expert
+                expert_bias = module.expert_bias
+                # Only stack compatible layers, without promoting integer token counts.
+                key = (
+                    tokens_per_expert.shape,
+                    expert_bias.shape,
+                    str(tokens_per_expert.dtype),
+                    str(expert_bias.dtype),
+                    str(tokens_per_expert.device),
+                    str(expert_bias.device),
+                )
+                expert_bias_groups.setdefault(key, []).append((tokens_per_expert, expert_bias))
 
-    for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
-        expert_bias.copy_(updated_expert_bias)
+    # Use the same collective order on every rank, regardless of bucket insertion order.
+    # As before, ranks must agree on the active layers and their order within each bucket.
+    for key in sorted(expert_bias_groups):
+        tokens_per_expert_list, expert_bias_list = zip(*expert_bias_groups[key])
+        stacked_updated_expert_bias = get_updated_expert_bias(
+            torch.stack(tokens_per_expert_list, dim=0),
+            torch.stack(expert_bias_list, dim=0),
+            config.moe_router_bias_update_rate,
+            tp_dp_cp_group=tp_dp_cp_group,
+        )
+
+        for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
+            expert_bias.copy_(updated_expert_bias)
 
 
 def _update_router_qb_beta(
