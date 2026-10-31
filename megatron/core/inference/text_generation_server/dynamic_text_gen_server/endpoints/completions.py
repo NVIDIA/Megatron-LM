@@ -420,13 +420,12 @@ try:
                     # When echo=False, only return generated tokens and their logprobs
                     tokens = [tokenizer.detokenize([tok]) for tok in generated_tokens_list]
 
-                    # Prepend [None] to match OpenAI format
-                    token_logprobs = [None] + list(generated_log_probs)
+                    token_logprobs = list(generated_log_probs)
 
                     # Build top_logprobs
                     top_logprobs = None
                     if generated_top_n_logprobs:
-                        top_logprobs = [None] + list(generated_top_n_logprobs)
+                        top_logprobs = list(generated_top_n_logprobs)
 
                     # Calculate text_offset for generated tokens only
                     text_offset = []
