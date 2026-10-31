@@ -391,6 +391,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "available in the H100 determinism bucket. Routing conversion is replayed separately.",
     ),
     KernelEntry(
+        name="dist_moe_runtime",
+        sources=(
+            "megatron/core/transformer/moe/megakernel/dist_moe/backend.py",
+            "megatron/core/transformer/moe/megakernel/dist_moe/runtime.py",
+            "megatron/core/transformer/moe/megakernel/dist_moe/weights.py",
+        ),
+        kind="dispatch",
+        exempt_reason="Dist-MoE requires Blackwell and the optional mcore-integration build; "
+        "the H100 determinism bucket cannot execute it. Shared route conversion is replayed "
+        "separately, and weight-layout contracts have optional GPU unit coverage.",
+    ),
+    KernelEntry(
         name="moe_router",
         sources=("megatron/core/transformer/moe/router.py",),
         tests=(
@@ -406,10 +418,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/moe/token_dispatcher.py",
             "megatron/core/transformer/moe/moe_layer.py",
         ),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(
+            K + "test_moe_kernels.py",
+            "tests/unit_tests/transformer/moe/test_dist_moe_megakernel.py",
+        ),
         kind="torch-op",
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
-        "virtual-expert routing metadata and probability gradients replay under stream contention.",
+        "virtual-expert routing metadata and probability gradients replay under stream contention. "
+        "The native shared contribution to a routed-only megakernel replays output and dgrad.",
     ),
     KernelEntry(
         name="moe_experts",

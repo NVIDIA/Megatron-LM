@@ -23,6 +23,7 @@ from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.megakernel import (
     build_megakernel_backend,
+    megakernel_shared_expert_context,
     megakernel_shared_expert_init_context,
     prepare_megakernel_shared_expert_config,
 )
@@ -423,7 +424,7 @@ class MoELayer(BaseMoELayer):
                         gate=self.config.moe_shared_expert_gate,
                         name=(name + ".shared_experts") if name is not None else None,
                     )
-            if self.shared_expert_overlap:
+            if self.shared_expert_overlap and self.config.moe_megakernel_backend is None:
                 assert self.token_dispatcher is not None
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
@@ -787,7 +788,27 @@ class MoELayer(BaseMoELayer):
                 probs, routing_map = self.route(
                     hidden_states, padding_mask, input_ids, packed_seq_params=packed_seq_params
                 )
-                return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
+                shared = None
+                if (
+                    not self.megakernel_experts.handles_shared_expert
+                    and self.use_shared_expert
+                    and self.shared_expert_overlap
+                ):
+                    # Use the native module and its autograd/DDP ownership on the
+                    # existing shared stream. The fork and join are captured too.
+                    self.shared_experts.wait_current_stream()
+                    with torch.cuda.stream(self.shared_experts.stream):
+                        with megakernel_shared_expert_context(self.config):
+                            shared = apply_module(self.shared_experts)(hidden_states)
+                routed = apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
+                if self.megakernel_experts.handles_shared_expert:
+                    return routed
+                if shared is not None:
+                    torch.cuda.current_stream().wait_stream(self.shared_experts.stream)
+                else:
+                    with megakernel_shared_expert_context(self.config):
+                        shared = self.shared_experts_compute(hidden_states)
+                return routed if shared is None else routed + shared
 
             if self.moe_layer_recompute and self.training:
                 output = precision_aware_checkpoint(
