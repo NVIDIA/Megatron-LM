@@ -689,6 +689,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         schedule_policy = SchedulePolicy(
             forward_prefetch_size=ddp_config.suggested_communication_unit_size,
             backward_prefetch_size=ddp_config.suggested_communication_unit_size,
+            # Recompute may call children without re-entering their owning FSDP unit.
+            unshard_all_planes_in_backward=(
+                ddp_config.fp8_param_gather and config.recompute_granularity is not None
+            ),
         )
         common_fully_shard_kwargs = dict(
             mixed_precision_policy=self.mp_policy,
