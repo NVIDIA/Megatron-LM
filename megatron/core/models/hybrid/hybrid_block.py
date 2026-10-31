@@ -45,7 +45,6 @@ from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     learned_output_contract,
 )
-from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.residual_recompute import (
     build_recompute_block_end_plan,
@@ -75,20 +74,20 @@ class HybridStackSubmodules:
     A class for the module specs for the HybridStack.
     """
 
-    mamba_layer: Union[ModuleSpec, type] = IdentityOp
-    gdn_layer: Union[ModuleSpec, type] = IdentityOp
+    mamba_layer: ModuleSpec | type | None = None
+    gdn_layer: ModuleSpec | type | None = None
     gdn2_layer: ModuleSpec | None = None
-    kda_layer: Union[ModuleSpec, type] = IdentityOp
-    attention_layer: Union[ModuleSpec, type] = IdentityOp
-    dsa_layer: Union[ModuleSpec, type] = IdentityOp
+    kda_layer: ModuleSpec | type | None = None
+    attention_layer: ModuleSpec | type | None = None
+    dsa_layer: ModuleSpec | type | None = None
     csa_layer: ModuleSpec | type | None = None
     csa_qk_layernorm_layer: ModuleSpec | type | None = None
-    mla_layer: Union[ModuleSpec, type] = IdentityOp
+    mla_layer: ModuleSpec | type | None = None
     mla_fused_down_proj_layer: ModuleSpec | None = None
-    mlp_layer: Union[ModuleSpec, type] = IdentityOp
-    moe_layer: Union[ModuleSpec, type] = IdentityOp
-    mtp_block_spec: Optional[ModuleSpec] = None
-    mtp_stack_submodules: Optional["HybridStackSubmodules"] = None
+    mlp_layer: ModuleSpec | type | None = None
+    moe_layer: ModuleSpec | type | None = None
+    mtp_block_spec: ModuleSpec | None = None
+    mtp_stack_submodules: "HybridStackSubmodules | None" = None
 
 
 class HybridStack(MegatronModule):
@@ -236,6 +235,7 @@ class HybridStack(MegatronModule):
                 quant_init_context = nullcontext()
             with quant_init_context:
                 if type(layer_config) is layer_utils.MambaLayerConfig:
+                    self._assert_submodule_configured(submodules, "mamba_layer")
                     layer = build_module(
                         submodules.mamba_layer,
                         config=layer_config,
@@ -246,6 +246,7 @@ class HybridStack(MegatronModule):
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.AttentionLayerConfig:
+                    self._assert_submodule_configured(submodules, "attention_layer")
                     layer = build_module(
                         submodules.attention_layer,
                         config=layer_config,
@@ -257,6 +258,7 @@ class HybridStack(MegatronModule):
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.DSALayerConfig:
+                    self._assert_submodule_configured(submodules, "dsa_layer")
                     layer = build_module(
                         submodules.dsa_layer,
                         config=layer_config,
@@ -268,16 +270,11 @@ class HybridStack(MegatronModule):
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.CSALayerConfig:
-                    csa_layer_spec = (
-                        submodules.csa_qk_layernorm_layer
-                        if layer_config.qk_layernorm
-                        else submodules.csa_layer
+                    csa_layer_spec_name = (
+                        "csa_qk_layernorm_layer" if layer_config.qk_layernorm else "csa_layer"
                     )
-                    if csa_layer_spec is None:
-                        raise ValueError(
-                            "C/H/W layers require the hybrid stack spec to provide `csa_layer` "
-                            "or, with qk_layernorm enabled, `csa_qk_layernorm_layer`."
-                        )
+                    self._assert_submodule_configured(submodules, csa_layer_spec_name)
+                    csa_layer_spec = getattr(submodules, csa_layer_spec_name)
                     layer = build_module(
                         csa_layer_spec,
                         config=layer_config,
@@ -289,17 +286,13 @@ class HybridStack(MegatronModule):
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.MLALayerConfig:
-                    mla_layer_spec = (
-                        submodules.mla_fused_down_proj_layer
+                    mla_layer_spec_name = (
+                        "mla_fused_down_proj_layer"
                         if getattr(layer_config, "mla_down_proj_fusion", False)
-                        else submodules.mla_layer
+                        else "mla_layer"
                     )
-                    # Only error if we actually try to use the MLA layer spec.
-                    if mla_layer_spec is None:
-                        raise ValueError(
-                            "`mla_down_proj_fusion=True` requires the hybrid stack spec to provide "
-                            "the fused MLA layer spec under `mla_fused_down_proj_layer`."
-                        )
+                    self._assert_submodule_configured(submodules, mla_layer_spec_name)
+                    mla_layer_spec = getattr(submodules, mla_layer_spec_name)
                     layer = build_module(
                         mla_layer_spec,
                         config=layer_config,
@@ -310,6 +303,7 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=pp_layer_offset,
                     )
                 elif type(layer_config) is layer_utils.MLPLayerConfig:
+                    self._assert_submodule_configured(submodules, "mlp_layer")
                     layer = build_module(
                         submodules.mlp_layer,
                         config=layer_config,
@@ -320,6 +314,7 @@ class HybridStack(MegatronModule):
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.MoELayerConfig:
+                    self._assert_submodule_configured(submodules, "moe_layer")
                     layer = build_module(
                         submodules.moe_layer,
                         config=layer_config,
@@ -331,15 +326,13 @@ class HybridStack(MegatronModule):
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.GDNLayerConfig:
-                    gdn_layer_spec = submodules.gdn_layer
-                    if layer_config.experimental_attention_variant == "gdn2":
-                        # Only error if we actually try to use the GDN2 layer spec.
-                        if submodules.gdn2_layer is None:
-                            raise ValueError(
-                                "`experimental_attention_variant='gdn2'` requires the hybrid "
-                                "stack spec to provide the GDN2 layer spec under `gdn2_layer`."
-                            )
-                        gdn_layer_spec = submodules.gdn2_layer
+                    gdn_layer_spec_name = (
+                        "gdn2_layer"
+                        if layer_config.experimental_attention_variant == "gdn2"
+                        else "gdn_layer"
+                    )
+                    self._assert_submodule_configured(submodules, gdn_layer_spec_name)
+                    gdn_layer_spec = getattr(submodules, gdn_layer_spec_name)
                     layer = build_module(
                         gdn_layer_spec,
                         config=layer_config,
@@ -352,6 +345,7 @@ class HybridStack(MegatronModule):
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.KDALayerConfig:
+                    self._assert_submodule_configured(submodules, "kda_layer")
                     layer = build_module(
                         submodules.kda_layer,
                         config=layer_config,
@@ -432,6 +426,15 @@ class HybridStack(MegatronModule):
         self._execution_layer_config_list = [
             self.layer_config_list[layer_index] for layer_index in self._execution_layer_indices
         ]
+
+    def _assert_submodule_configured(
+        self, submodules: HybridStackSubmodules, attr_name: str
+    ) -> None:
+        if getattr(submodules, attr_name, None) is None:
+            raise ValueError(
+                f"Tried to build a `{attr_name}` for `{self.__class__.__name__}`, but the "
+                f"`{submodules.__class__.__name__}` doesn't have a `{attr_name}` spec configured."
+            )
 
     def _shortcut_layer_pairs(self) -> tuple[tuple[int, int], ...]:
         """Return physical layer indices that must share one residual replay block."""
