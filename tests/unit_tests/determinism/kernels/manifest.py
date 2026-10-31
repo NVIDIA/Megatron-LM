@@ -169,12 +169,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="attention_kernels_and_dispatch",
         sources=("megatron/core/transformer/attention.py",),
-        tests=(K + "test_fused_activations.py", K + "test_runtime_cp_attention.py"),
+        tests=(
+            K + "test_fused_activations.py",
+            K + "test_runtime_cp_attention.py",
+            "tests/unit_tests/test_emerging_optimizers.py",
+        ),
         kind="dispatch",
         notes="Attention._apply_output_gate is replayed in test_fused_activations.py. "
         "Packed SelfAttention dispatch through RoPE and TE attention is replayed with runtime "
         "CP1/CP2/CP4, including input/parameter gradients and CP-state restoration, in "
-        "test_runtime_cp_attention.py.",
+        "test_runtime_cp_attention.py. QKV layout-driven optimizer dispatch is covered in "
+        "test_emerging_optimizers.py.",
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",
@@ -312,11 +317,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_tensor_parallel_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
+            "tests/unit_tests/tensor_parallel/test_tp_attrs_without_init.py",
         ),
         kind="torch-op",
         notes="VocabParallelEmbedding (weight[idx] deterministic branch vs F.embedding, and the main_grad "
         "accumulation of gradient_accumulation_fusion) and local Column/RowParallelLinear "
-        "incl. apex fused_weight_gradient_mlp_cuda gradient-accumulation fusion.",
+        "incl. apex fused_weight_gradient_mlp_cuda gradient-accumulation fusion. Optimizer "
+        "layout metadata propagation is covered in test_tp_attrs_without_init.py.",
     ),
     KernelEntry(
         name="vocab_parallel_cross_entropy",
@@ -779,13 +786,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/multi_latent_attention.py",
             "megatron/core/transformer/experimental_attention_variant/absorbed_mla.py",
         ),
-        tests=(K + "test_fused_triton_kernels.py", K + "test_te_wrappers.py"),
+        tests=(
+            K + "test_fused_triton_kernels.py",
+            K + "test_te_wrappers.py",
+            "tests/unit_tests/transformer/test_multi_latent_attention.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_absorbed_mla.py",
+        ),
         kind="dispatch",
         notes="Calls the Triton MLA YaRN RoPE kernels (fused_apply_mla_rope_for_q / _kv, replayed in "
         "test_fused_triton_kernels.py), TE fused RoPE and TE's fused MLA key/value RoPE + MXFP8 "
         "quantization (fused_mla_kv_rope_mxfp8, use_fused_mla_kv_rope_quant), both replayed in "
         "test_te_wrappers.py. The TE FusedMLAQUpProj GEMM path and mxfp8_quantize_only are not "
-        "replayed.",
+        "replayed. Owning-layer QKV layout metadata is covered in the MLA module tests.",
     ),
     KernelEntry(
         name="dsa_indexer_weights_projection",

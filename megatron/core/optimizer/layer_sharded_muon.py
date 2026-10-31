@@ -345,11 +345,11 @@ class LayerShardedMuon(TensorParallelMuon):
             be disjoint; groups sharing a (gtp_remat, tp) domain are automatically
             serialized (NCCL forbids concurrent collectives on one communicator).
         All other args: same as :class:`TensorParallelMuon`. In particular
-            ``split_qkv`` / ``is_qkv_fn`` / ``qkv_split_shapes``, ``tp_mode`` and
-            ``pg_collection`` only take effect on the paths that delegate to the
-            parent (the empty-``param_ns_homes`` fallback and the degenerate
-            single-rank domain, both of which run the parent's TP-aware
-            full-matrix Newton-Schulz). "Degenerate" means the LAYER-SHARDING
+            ``split_qkv`` / ``split_qkv_per_head`` / ``is_qkv_fn`` /
+            ``qkv_split_shapes``, ``tp_mode`` and ``pg_collection`` only take effect
+            on the paths that delegate to the parent (the empty-``param_ns_homes``
+            fallback and the degenerate single-rank domain, both of which run the
+            parent's TP-aware full-matrix Newton-Schulz). "Degenerate" means the LAYER-SHARDING
             domain (gtp_remat_size * tp_size) is trivial, not that the step is
             collective-free: with a non-trivial ``pg_collection.tp`` and
             partition_dim-tagged params (direct API only), the parent path
@@ -387,6 +387,7 @@ class LayerShardedMuon(TensorParallelMuon):
         concurrent_groups: bool = True,
         use_decoupled_weight_decay: bool = True,
         split_qkv: bool = False,
+        split_qkv_per_head: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
         qkv_split_shapes: list[int] | None = None,
         pg_collection: ProcessGroupCollection | None = None,
@@ -404,7 +405,7 @@ class LayerShardedMuon(TensorParallelMuon):
                 "active in this class; tp_mode selects the mode for the delegated "
                 "(fallback/degenerate) paths only."
             )
-        if split_qkv:
+        if split_qkv or split_qkv_per_head:
             # The layer-sharded exchange routes whole matrices to their NS homes
             # and never goes through TensorParallelMuon.orthogonalize, where
             # split-QKV is implemented — only the fallback and degenerate paths
@@ -412,8 +413,9 @@ class LayerShardedMuon(TensorParallelMuon):
             # depend on whether param_ns_homes happens to be set; reject it at
             # the class level rather than relying on validate_args alone.
             raise ValueError(
-                "LayerShardedMuon does not implement split-QKV Newton-Schulz on the "
-                "layer-sharded path; pass split_qkv=False (--muon-no-split-qkv)."
+                "LayerShardedMuon does not implement split-QKV or per-head QKV "
+                "Newton-Schulz on the layer-sharded path; pass split_qkv=False and "
+                "split_qkv_per_head=False (--muon-no-split-qkv)."
             )
         # Fail loudly on a Newton-Schulz configuration this stack cannot run (batched NS
         # floor, Triton/SM, batched SYRK kernel) before the parent's emerging-optimizers
@@ -431,6 +433,7 @@ class LayerShardedMuon(TensorParallelMuon):
             weight_decay=weight_decay,
             use_decoupled_weight_decay=use_decoupled_weight_decay,
             split_qkv=split_qkv,
+            split_qkv_per_head=split_qkv_per_head,
             is_qkv_fn=is_qkv_fn,
             qkv_split_shapes=qkv_split_shapes,
             fp32_matmul_prec=fp32_matmul_prec,

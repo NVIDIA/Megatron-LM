@@ -394,12 +394,17 @@ class TestConstructorGuards:
         with pytest.raises(ValueError, match="registry-level selector"):
             LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, tp_mode="layer_sharded")
 
-    def test_split_qkv_is_rejected(self):
-        """split_qkv would only apply on the fallback/degenerate paths, making
-        the update rule depend on whether homes are set — reject at the class."""
+    @pytest.mark.parametrize(
+        "split_kwargs",
+        ({"split_qkv": True}, {"split_qkv_per_head": True}),
+        ids=("projection", "per-head"),
+    )
+    def test_split_qkv_is_rejected(self, split_kwargs):
+        """QKV splitting would only apply on fallback/degenerate paths, making
+        the update rule depend on whether homes are set — reject both flags at the class."""
         p = torch.nn.Parameter(torch.randn(4, 4))
         with pytest.raises(ValueError, match="split-QKV"):
-            LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, split_qkv=True)
+            LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, **split_kwargs)
 
     def test_ns_batch_size_below_one_is_rejected(self):
         """ns_batch_size is validated like the parent's num_ns_steps, not clamped."""

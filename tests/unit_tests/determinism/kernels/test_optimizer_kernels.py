@@ -139,3 +139,43 @@ def test_fused_adam_step_replays():
         assert len(got) == len(ref)
         for j, (a, b) in enumerate(zip(ref, got)):
             assert bytes_equal(a, b), f"Adam tensor {j} differs on replay {i}"
+
+
+@pytest.mark.parametrize('heads,rows,cols', [(8, 512, 1024), (8, 128, 1024), (1, 128, 512)])
+@pytest.mark.parametrize('precision', ['highest', 'medium'])
+def test_muon_per_head_replays(heads, rows, cols, precision):
+    """Replay batched Q-head and shared K-head NS under side-stream GEMM contention."""
+    pytest.importorskip('emerging_optimizers')
+    from emerging_optimizers.utils import fp32_matmul_precision
+
+    from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon
+    from megatron.core.utils import is_emerging_optimizers_min_version
+
+    if not is_emerging_optimizers_min_version('0.3.0'):
+        pytest.skip('Batched per-head Muon requires emerging-optimizers >= 0.3.0')
+    seeded()
+    grad = torch.randn(heads * rows, cols, device='cuda', dtype=torch.float32)
+    param = torch.nn.Parameter(torch.zeros_like(grad))
+    param.qkv_split_shapes_global = [rows] * heads
+    optimizer = TensorParallelMuon(
+        [param],
+        split_qkv=True,
+        split_qkv_per_head=True,
+        is_qkv_fn=lambda p: True,
+        fp32_matmul_prec=precision,
+        extra_scale_factor=0.18,
+    )
+
+    def orthogonalize(x):
+        # step() normally owns this context; exercise the same precision dispatch.
+        with fp32_matmul_precision(precision):
+            return optimizer.orthogonalize(param, x)
+
+    assert_replays_bit_exact(
+        orthogonalize,
+        (grad,),
+        replays=4,
+        backward=False,
+        contention=True,
+        what='Muon per-head Newton-Schulz',
+    )
