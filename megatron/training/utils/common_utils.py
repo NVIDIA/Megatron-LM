@@ -419,6 +419,14 @@ def report_memory(name, process_group=None):
     string += f" | max reserved: {torch.cuda.max_memory_reserved() / mega_bytes:.2f}"
     if cfg.logger.log_device_memory_used:
         string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
+    try:
+        from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
+
+        buffer_report = gtp._GTP_CACHE.format_buffer_report() if gtp._GTP_CACHE else ""
+        if buffer_report:
+            string += " | gtp buffers: " + buffer_report
+    except Exception:  # pylint: disable=broad-except
+        pass
     is_dp_rank_0 = (
         get_pg_rank(process_group) == 0
         if process_group is not None

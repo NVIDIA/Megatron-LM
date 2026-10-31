@@ -86,6 +86,16 @@ class _FakeGroup:
         return self._rank
 
 
+@pytest.fixture
+def pooled_cache():
+    """Tests of the pooled cache's keyed reuse read buffers through ``get`` without issuing a
+    collective; the default slab policy binds eager-chain buffers at issue time."""
+    saved = gtp_module.GTP_CONFIG.eager_buffer_policy
+    gtp_module.update_gtp_config(eager_buffer_policy="pooled")
+    yield
+    gtp_module.update_gtp_config(eager_buffer_policy=saved)
+
+
 class TestGTPWeightCacheSchedulingDomain:
     @staticmethod
     def _make_param(group, chain_id):
@@ -95,7 +105,7 @@ class TestGTPWeightCacheSchedulingDomain:
         return param
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA event test")
-    def test_cache_reuse_isolated_by_chain_and_process_group(self):
+    def test_cache_reuse_isolated_by_chain_and_process_group(self, pooled_cache):
         cache = GTPWeightCache()
         group = _FakeGroup(size=2)
         other_group = _FakeGroup(size=2)
@@ -1158,7 +1168,7 @@ class TestWaitAsyncCommsFallback:
         return p
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    def test_fallback_accumulates_when_no_rs_handle(self):
+    def test_fallback_accumulates_when_no_rs_handle(self, pooled_cache):
         dtype = torch.bfloat16
         p = self._make_inflight_param(main_grad_fill=0.0)
 
@@ -1480,11 +1490,13 @@ class TestGTPBufferReuse:
     @pytest.mark.parametrize("fwd", [True, False], ids=["forward", "backward"])
     @pytest.mark.parametrize("readiness", ["missing", "in_flight", "ready"])
     def test_peek_returns_ready_current_data(
-        self, monkeypatch, four_rank_gtp_group, fwd, readiness
+        self, monkeypatch, pooled_cache, four_rank_gtp_group, fwd, readiness
     ):
         """Every readiness path exposes current bytes before consume, with exactly one gather.
 
-        Two same-key cache buffers prevent a key-only lookup from identifying the actual AG output.
+        Two same-key pooled buffers prevent a key-only lookup from identifying the actual AG
+        output (eager tickets bind their buffer at issue under the default policy, so the setup
+        below pins the pooled one).
         The first consume can replace its ticket; subsequent peeks must follow the actual gather.
         """
         check_states = True
