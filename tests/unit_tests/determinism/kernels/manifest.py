@@ -103,6 +103,13 @@ K = "tests/unit_tests/determinism/kernels/"
 C = "tests/unit_tests/determinism/correctness/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
+    KernelEntry(
+        name="csa_output_rope_reconstruction",
+        sources=("megatron/core/ops/attention/csa/output_rope.py",),
+        tests=(K + "test_csa_output_rope.py",),
+        kind="triton",
+        notes="Alias-safe output/gradient reconstruction, SBHD B>1 and THD/CP positions.",
+    ),
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
     KernelEntry(
         name="fused_bias_swiglu",
@@ -319,6 +326,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         name="transformer_engine_wrappers",
         sources=("megatron/core/extensions/transformer_engine.py",),
         tests=(
+            K + "test_mla_device_placement.py",
             K + "test_te_wrappers.py",
             C + "test_fp8_determinism.py",
             K + "test_runtime_cp_attention.py",
@@ -353,7 +361,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_utils",
         sources=("megatron/core/transformer/moe/moe_utils.py",),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(
+            K + "test_moe_kernels.py",
+            "tests/unit_tests/inference/test_batch_invariant_nvls.py",
+        ),
         kind="torch-op",
         notes="permute/unpermute (index_add_ vs scatter_add_), routing (index_put_ vs scatter), sort_chunks, aux loss, "
         "router gating GEMM, TE fused permutation/router kernels, global-batch quantile "
@@ -431,8 +442,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_batch_invariant_unpermute",
         sources=("megatron/core/transformer/moe/batch_invariant.py",),
-        tests=("tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",),
-        kind="torch-op",
+        tests=(
+            "tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",
+            "tests/unit_tests/transformer/moe/test_moe_batch_invariant_unpermute.py",
+            K + "test_moe_kernels.py",
+        ),
+        kind="triton",
+        notes="Fused rank-tree unpermute (probs=None) and its fixed-shape scatter backward "
+        "replay bit-exactly in test_moe_kernels.py and match the reference loop bitwise.",
     ),
     KernelEntry(
         name="inference_routing_mask_kernel",
@@ -666,6 +683,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_inference_kernels.py",
             K + "test_te_wrappers.py",
             "tests/unit_tests/transformer/test_te_layers_batch_invariant.py",
+            "tests/unit_tests/inference/test_batch_invariant_deepgemm_stride.py",
         ),
         kind="triton",
     ),

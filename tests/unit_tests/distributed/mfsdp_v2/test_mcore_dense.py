@@ -13,7 +13,10 @@ from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
+    fully_shard_context,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import ShardLayout
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -223,9 +226,9 @@ def test_nccl_ub_enables_symmetric_memory(process_group_collection, monkeypatch)
     fully_shard_context_calls = []
     original_fully_shard_context = mcore_fsdp_adapter.fully_shard_context
 
-    def record_fully_shard_context(*args, **kwargs):
-        fully_shard_context_calls.append(kwargs["use_symmetric_memory"])
-        return original_fully_shard_context(*args, **kwargs)
+    def record_fully_shard_context(context):
+        fully_shard_context_calls.append(context.use_symmetric_memory)
+        return original_fully_shard_context(context)
 
     monkeypatch.setattr(mcore_fsdp_adapter, "fully_shard_context", record_fully_shard_context)
     FullyShardedDataParallel(
@@ -291,7 +294,7 @@ def test_rejects_shared_context_without_caller_managed_grad_sync(
     """The adapter rejects an incompatible shared context before sharding the model."""
     config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4)
     layer = torch.nn.Linear(16, 16, device=distributed_setup.device)
-    with fully_shard_context(device=distributed_setup.device) as context:
+    with fully_shard_context(FsdpContext(device=distributed_setup.device)) as context:
         with pytest.raises(ValueError, match="caller_managed_grad_sync=True"):
             FullyShardedDataParallel(
                 config=config,

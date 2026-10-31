@@ -11,7 +11,6 @@ on:
     types: [completed]
 
 permissions:
-  pull-requests: write
   contents: read
   actions: read
 
@@ -41,16 +40,26 @@ jobs:
 
       - name: Set PR number
         id: pr
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          ARTIFACT_OUTCOME: ${{ steps.get-pr.outcome }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_run" ]; then
-            if [ "${{ steps.get-pr.outcome }}" != "success" ]; then
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            if [ "$ARTIFACT_OUTCOME" != "success" ]; then
               echo "No approval artifact found — review was not an approval. Skipping."
               exit 0
             fi
-            echo "number=$(cat pr-number/number)" >> $GITHUB_OUTPUT
+            pr_number=$(cat pr-number/number)
           else
-            echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+            pr_number="$EVENT_PR_NUMBER"
           fi
+
+          if [[ ! "$pr_number" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Invalid PR number"
+            exit 1
+          fi
+          printf 'number=%s\n' "$pr_number" >> "$GITHUB_OUTPUT"
 
       - name: Check out repository code
         if: steps.pr.outputs.number
@@ -65,11 +74,24 @@ jobs:
       - name: Install dependencies
         if: steps.pr.outputs.number
         run: |
-          pip install --no-cache-dir codeowners PyGithub slack-sdk
+          pip install --no-cache-dir PyGithub slack-sdk
+
+      - name: Create GitHub App token
+        id: app-token
+        if: steps.pr.outputs.number
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          # The community App has organization team access; the release App does not.
+          app-id: ${{ vars.COMMUNITY_BOT_ID }}
+          private-key: ${{ secrets.COMMUNITY_BOT_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-members: read
+          permission-pull-requests: write
 
       - name: Run Auto Swap Labels
         if: steps.pr.outputs.number
-        run: |
-          export GH_TOKEN=${{ secrets.PAT }}
-          export PR_NUMBER=${{ steps.pr.outputs.number }}
-          python tests/test_utils/python_scripts/swap_pr_labels.py
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: python tests/test_utils/python_scripts/swap_pr_labels.py

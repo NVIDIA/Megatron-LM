@@ -16,6 +16,7 @@ from transformer_engine.pytorch.optimizers import FusedAdam
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     Placements,
     fully_shard,
     fully_shard_context,
@@ -119,7 +120,7 @@ def _check_mxfp8_mlp_matches_reference(
         model = _make_mlp(device)
         torch.manual_seed(2026)
         reference = _make_mlp(device)
-    with fully_shard_context(device=device) as context:
+    with fully_shard_context(FsdpContext(device=device)) as context:
         fully_shard(model, mesh=mesh, placements=placements, shard_layout=shard_layout)
 
     # MLP weights share one quantized group; biases use a regular DBuffer.
@@ -239,7 +240,7 @@ def test_mxfp8_unshard_gathers_rowwise_for_forward_and_columnwise_for_backward(d
     with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
         model = _RecomputedMLP(device, use_reentrant=None)
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model.fc1, mesh=mesh, placements=_ZERO3_PLACEMENTS)
         fully_shard(model.fc2, mesh=mesh, placements=_ZERO3_PLACEMENTS)
         fully_shard(model, mesh=mesh, placements=_ZERO3_PLACEMENTS)
@@ -314,7 +315,7 @@ def test_mxfp8_activation_recompute_matches_no_recompute(
         with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
             torch.manual_seed(2026)
             model = _RecomputedMLP(device, use_reentrant)
-        with fully_shard_context(device=device):
+        with fully_shard_context(FsdpContext(device=device)):
             fully_shard(model.fc1, mesh=mesh, placements=placements)
             fully_shard(model.fc2, mesh=mesh, placements=placements)
             fully_shard(model, mesh=mesh, placements=placements)
