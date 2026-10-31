@@ -491,6 +491,14 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 f"> initialized pipeline model parallel with size "
                 f"{mpu.get_pipeline_model_parallel_world_size()}"
             )
+            if cfg.dist.preflight_check_parallel_topology != "off":
+                from megatron.training.parallel_topology_check import check_parallel_topology
+
+                check_parallel_topology(
+                    mode=cfg.dist.preflight_check_parallel_topology,
+                    process_groups=cfg.dist.preflight_check_process_groups,
+                    intra_node_process_groups=cfg.dist.preflight_intra_node_process_groups,
+                )
 
 
 def _init_autoresume():

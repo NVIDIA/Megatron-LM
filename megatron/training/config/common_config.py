@@ -166,6 +166,25 @@ class DistributedInitConfig:
     overlapped with other computation kernels.
     """
 
+    preflight_check_parallel_topology: Literal["off", "warn", "error"] = "off"
+    """Check how process groups are laid out across nodes after model parallel
+    initialization. A summary of `preflight_check_process_groups` is logged from rank 0.
+    If any group in `preflight_intra_node_process_groups` spans more than one node,
+    `warn` logs a warning and `error` stops the run before training starts.
+    """
+
+    preflight_check_process_groups: list[str] = field(
+        default_factory=lambda: ["tp", "cp", "ep", "dp", "pp"]
+    )
+    """Process groups to include in the parallel topology summary, for example
+    `dp,cp,ep,tp,dp_cp`. Comma separated and space separated values are both accepted.
+    """
+
+    preflight_intra_node_process_groups: list[str] = field(default_factory=lambda: ["tp"])
+    """Process groups expected to stay within a single node. The parallel topology check
+    warns or fails if any of them spans nodes.
+    """
+
     distributed_timeout_seconds_after_init: int | None = None
     """Timeout in seconds for process groups after initialization. This timeout is applied to all process groups after initialization and the first iteration completes."""
 
