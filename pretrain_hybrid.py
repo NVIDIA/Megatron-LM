@@ -30,7 +30,7 @@ from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, Moc
 from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.package_info import __version__ as mcore_version
-from megatron.core.parallel_state import get_context_parallel_group
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
@@ -42,6 +42,8 @@ from megatron.core.utils import (
     flatten_batch_for_packed_sequences,
     get_attr_wrapped_model,
     get_batch_on_this_tp_rank,
+    get_pg_rank,
+    get_pg_src_rank,
     get_te_version,
     get_torch_version,
 )
@@ -97,17 +99,27 @@ BATCH_KEYS = [
 
 
 def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroupCollection] = None):
-    """Generate a batch."""
+    """Generate a batch.
+
+    Args:
+        data_iterator: Iterator over this rank's micro-batches, or None on ranks that read
+            no data.
+        vp_stage: Virtual pipeline stage of the model chunk.
+        pg_collection: Process groups of the model. The batch is read on the first rank of
+            its tensor-parallel group, broadcast over that group and sharded over its
+            context-parallel group. None builds the groups from the global parallel state.
+    """
 
     args = get_args()
     config = core_transformer_config_from_args(args)
 
+    if pg_collection is None:
+        # Compatibility for direct entrypoint callers; forward_step passes the model's groups.
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["tp", "pp", "cp", "tp_cp", "dynamic_cp", "dynamic_tp_cp"]
+        )
+
     if args.sequence_packing_scheduler is not None:
-        if pg_collection is None:
-            # Compatibility for direct entrypoint callers; Core receives explicit groups.
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=["tp", "pp", "cp", "tp_cp", "dynamic_cp", "dynamic_tp_cp"]
-            )
         return get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
             vpp_size=config.virtual_pipeline_model_parallel_size,
@@ -126,8 +138,19 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
             return_context_parallel_batch=True,
         )
 
+    # With sequence parallelism, CP layout conversion runs over the joint TP x CP group.
+    use_tp_cp_group = config.sequence_parallel and config.tensor_model_parallel_size > 1
+    required_group_names = ["tp", "pp", "cp"]
+    if use_tp_cp_group:
+        required_group_names.append("tp_cp")
+    for group_name in required_group_names:
+        if vars(pg_collection).get(group_name) is None:
+            raise ValueError(f"get_batch requires pg_collection.{group_name}")
+    tp_group = pg_collection.tp
+    pp_group = pg_collection.pp
+
     cp_size = args.context_parallel_size
-    tp_rank = mpu.get_tensor_model_parallel_rank()
+    tp_rank = get_pg_rank(tp_group)
     is_sft = args.sft
     has_cu_seqlens = is_sft or args.dataloader_inter_document_masking
     create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
@@ -136,16 +159,16 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         mtp_num_layers=config.mtp_num_layers,
         ignore_virtual=False,
         vp_stage=vp_stage,
-        pp_group=mpu.get_pipeline_model_parallel_group(),
+        pp_group=pp_group,
+        vp_size=config.virtual_pipeline_model_parallel_size or 1,
+    )
+    is_first_or_last_stage = is_first_or_last_pipeline_stage(
+        vp_stage, pp_group=pp_group, vp_size=config.virtual_pipeline_model_parallel_size
     )
     # Dynamic CP always uses the sequence-packing path above.
     assert not args.dynamic_context_parallel
 
-    if (
-        not is_first_or_last_pipeline_stage(vp_stage)
-        and not mtp_on_this_rank
-        and not has_cu_seqlens
-    ):
+    if not is_first_or_last_stage and not mtp_on_this_rank and not has_cu_seqlens:
         return ContextParallelBatch(
             boundary_layout=config.linear_cp_layout,
             batches_by_layout={config.linear_cp_layout: dict.fromkeys(BATCH_KEYS)},
@@ -164,8 +187,8 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
 
     batch = get_batch_on_this_tp_rank(
         batch,
-        broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
-        broadcast_group=mpu.get_tensor_model_parallel_group(),
+        broadcast_src_rank=get_pg_src_rank(tp_group),
+        broadcast_group=tp_group,
         has_cu_seqlens=has_cu_seqlens,
         dynamic_cp=False,
         create_attention_mask_in_dataloader=create_attention_mask_in_dataloader,
@@ -175,13 +198,13 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         seq_length=args.seq_length,
         mtp_on_this_rank=mtp_on_this_rank,
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
-        is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
-        is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+        is_pipeline_first_stage=is_pp_first_stage(pp_group),
+        is_pipeline_last_stage=is_pp_last_stage(pp_group),
     )
 
     batch = flatten_batch_for_packed_sequences(batch)
 
-    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
+    if not is_first_or_last_stage and not mtp_on_this_rank:
         assert has_cu_seqlens
         batch = {
             **dict.fromkeys(BATCH_KEYS),
@@ -197,16 +220,12 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         batch,
         boundary_layout=config.linear_cp_layout,
         dynamic_cp=False,
-        cp_group=get_context_parallel_group(),
+        cp_group=pg_collection.cp,
         additional_layouts=additional_layouts,
         use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
         sequence_parallel=config.sequence_parallel,
-        tp_group=mpu.get_tensor_model_parallel_group(),
-        tp_cp_group=(
-            mpu.get_tensor_and_context_parallel_group()
-            if config.sequence_parallel and config.tensor_model_parallel_size > 1
-            else None
-        ),
+        tp_group=tp_group,
+        tp_cp_group=pg_collection.tp_cp if use_tp_cp_group else None,
         tokens_per_sample=args.seq_length,
     )
 

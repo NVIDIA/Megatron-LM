@@ -178,9 +178,12 @@ def _build_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, 
     else:
         # GPT layer spec needs re-creation since it depends on number of model layers.
         if config.heterogeneous_block_specs:
+            # The teacher is built on the student's process groups.
+            pg_collection = model_kwargs["pg_collection"]
             model_kwargs["transformer_layer_spec"] = get_gpt_heterogeneous_layer_spec(
                 config=config,
                 use_te=(args.transformer_impl == "transformer_engine"),
+                pp_rank=pg_collection.pp.rank() if pg_collection is not None else None,
             )
         else:
             # The teacher is built on the student's process groups.
@@ -366,6 +369,7 @@ def modelopt_gpt_hybrid_builder(
             transformer_layer_spec = get_gpt_heterogeneous_layer_spec(
                 config=config,
                 use_te=args.transformer_impl == "transformer_engine",
+                pp_rank=pp_rank,
             )
         elif args.export_default_te_spec:
             # Use the canonical full Transformer Engine spec (mirrors gpt_builder) instead
