@@ -99,7 +99,9 @@ class DistributedDataParallel(_BaseDataParallel):
         disable_bucketing: If true, force assign all parameters to a single bucket. If false,
             use standard bucketing policy: assign parameters to smaller buckets and all-reduce
             per bucket _if_ overlap_grad_reduce is True and pp_rank is 0.
-        pg_collection: Optional unified process group for distributed training.
+        pg_collection: Optional unified process group for distributed training. When omitted,
+            the groups come from the global parallel state; that fallback is deprecated and
+            emits a ``ProcessGroupFallbackWarning``.
         full_param_layout: Optional FullParamLayout providing pre-computed layouts for all
             dtype groups. When provided, each buffer uses the corresponding PerBufferParamLayout
             instead of computing a default one.

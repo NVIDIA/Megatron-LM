@@ -94,24 +94,13 @@
       "_VocabParallelCrossEntropy.forward:accessor:parallel_state.get_tensor_model_parallel_group"
     ],
     "megatron/core/tensor_parallel/generalized_tensor_parallelism.py": [
-      "gtp_replica_rank:accessor:parallel_state.get_data_parallel_rank",
-      "gtp_replica_rank:accessor:parallel_state.get_expert_data_parallel_rank"
+      "gtp_replica_rank:guarded:resolve_process_groups"
     ],
     "megatron/core/tensor_parallel/layers.py": [
-      "_initialize_affine_weight_cpu:accessor:parallel_state.get_tensor_model_parallel_rank",
-      "_initialize_affine_weight_cpu:accessor:parallel_state.get_tensor_model_parallel_world_size",
-      "param_is_not_gtp_duplicate:accessor:parallel_state.get_expert_gtp_weight_remat_rank",
-      "param_is_not_gtp_duplicate:accessor:parallel_state.get_gtp_weight_remat_rank",
-      "param_is_not_tensor_parallel_duplicate:accessor:parallel_state.get_tensor_model_parallel_rank"
+      "param_is_not_tensor_parallel_duplicate:guarded:resolve_process_groups"
     ],
     "megatron/core/tensor_parallel/random.py": [
-      "model_parallel_cuda_manual_seed:accessor:parallel_state.get_expert_gtp_weight_remat_rank",
-      "model_parallel_cuda_manual_seed:accessor:parallel_state.get_expert_gtp_weight_remat_world_size",
-      "model_parallel_cuda_manual_seed:accessor:parallel_state.get_expert_model_parallel_rank",
-      "model_parallel_cuda_manual_seed:accessor:parallel_state.get_expert_tensor_parallel_rank",
-      "model_parallel_cuda_manual_seed:accessor:parallel_state.get_gtp_weight_remat_rank",
-      "model_parallel_cuda_manual_seed:accessor:parallel_state.get_gtp_weight_remat_world_size",
-      "model_parallel_cuda_manual_seed:accessor:parallel_state.get_tensor_model_parallel_rank"
+      "model_parallel_cuda_manual_seed:guarded:resolve_process_groups"
     ],
     "megatron/core/transformer/attention.py": [
       "Attention.__init__:shim:use_mpu_process_groups"
@@ -148,15 +137,7 @@
       "MoEMetricsTracker._sync_metrics:accessor:parallel_state.get_pipeline_model_parallel_group"
     ],
     "megatron/core/transformer/moe/moe_utils.py": [
-      "get_default_pg_collection:accessor:parallel_state.get_context_parallel_group",
-      "get_default_pg_collection:accessor:parallel_state.get_expert_data_parallel_group",
-      "get_default_pg_collection:accessor:parallel_state.get_expert_data_parallel_group",
-      "get_default_pg_collection:accessor:parallel_state.get_expert_model_parallel_group",
-      "get_default_pg_collection:accessor:parallel_state.get_expert_tensor_and_model_parallel_group",
-      "get_default_pg_collection:accessor:parallel_state.get_expert_tensor_parallel_group",
-      "get_default_pg_collection:accessor:parallel_state.get_tensor_and_context_parallel_group",
-      "get_default_pg_collection:accessor:parallel_state.get_tensor_and_data_parallel_group",
-      "get_default_pg_collection:accessor:parallel_state.get_tensor_model_parallel_group",
+      "get_default_pg_collection:guarded:resolve_process_groups",
       "get_updated_expert_bias:accessor:parallel_state.get_tensor_and_data_parallel_group"
     ],
     "megatron/core/transformer/multi_latent_attention.py": [
@@ -199,5 +180,5 @@
       "make_tp_sharded_tensor_for_checkpoint:guarded:resolve_process_groups"
     ]
   },
-  "total": 103
+  "total": 84
 }
