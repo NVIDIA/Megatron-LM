@@ -101,6 +101,78 @@ def test_initialize_model_parallel_with_cp_and_gtp_remat():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize("sequence_shards", [1, 2])
+def test_gtp_optimizer_instances_keep_model_shards_local(sequence_shards):
+    """Two instances each contain complete CP, GTP, and EGTP partitions."""
+    if world_size != 8:
+        pytest.skip("Test requires eight ranks")
+
+    try:
+        Utils.initialize_model_parallel(
+            context_parallel_size=2 * sequence_shards,
+            gtp_remat_size=2,
+            expert_gtp_remat_size=2,
+            gtp_remat_num_sequence_shards=sequence_shards,
+            num_distributed_optimizer_instances=2,
+        )
+
+        def ranks(group):
+            return torch.distributed.get_process_group_ranks(group)
+
+        instance_ranks = list(range((rank // 4) * 4, (rank // 4 + 1) * 4))
+        inter_ranks = [rank % 4, rank % 4 + 4]
+        assert ranks(ps.get_intra_distributed_optimizer_instance_group()) == instance_ranks
+        assert ranks(ps.get_inter_distributed_optimizer_instance_group()) == inter_ranks
+        dense_partial_group = ps.get_data_parallel_group(
+            with_context_parallel=True, with_gtp_remat=True, partial_data_parallel=True
+        )
+        expert_partial_group = ps.get_expert_data_parallel_group(
+            with_gtp_remat=True, partial_expert_data_parallel=True
+        )
+        assert ranks(dense_partial_group) == instance_ranks
+        assert ranks(expert_partial_group) == instance_ranks
+        assert set(ranks(ps.get_gtp_weight_remat_group())).issubset(instance_ranks)
+        assert set(ranks(ps.get_expert_gtp_weight_remat_group())).issubset(instance_ranks)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("sequence_shards", [1, 2])
+def test_gtp_optimizer_instances_cannot_split_context_parallel_group(sequence_shards):
+    """Divisibility by DP x CP alone permits incorrect inter-instance gradient pairs."""
+    if world_size != 8:
+        pytest.skip("Test requires eight ranks")
+
+    try:
+        with pytest.raises(ValueError, match="dense data-parallel size"):
+            Utils.initialize_model_parallel(
+                context_parallel_size=4 * sequence_shards,
+                gtp_remat_size=2,
+                expert_gtp_remat_size=2,
+                gtp_remat_num_sequence_shards=sequence_shards,
+                num_distributed_optimizer_instances=2,
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_gtp_optimizer_instances_cannot_split_expert_replica_group():
+    """The expert optimizer needs at least one expert-DP rank in each instance."""
+    if world_size != 8:
+        pytest.skip("Test requires eight ranks")
+
+    try:
+        with pytest.raises(ValueError, match="expert data-parallel size"):
+            Utils.initialize_model_parallel(
+                expert_model_parallel_size=4,
+                gtp_remat_size=2,
+                expert_gtp_remat_size=2,
+                num_distributed_optimizer_instances=2,
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.parametrize('order', test_parallel_order)
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
