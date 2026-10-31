@@ -1134,6 +1134,7 @@ def process_mtp_loss(
     # when calculate_per_token_loss is enabled. This ensures MTP gradients are
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum()
+    cp_size = cp_group.size() if cp_group is not None else 1
 
     cumulative_mtp_input_mask = None
     rolled_num_tokens = original_num_tokens
@@ -1258,11 +1259,25 @@ def process_mtp_loss(
             mtp_layer_number, head_input, mtp_labels, layer_loss_mask
         )
 
+        # CP ranks own disjoint parts of the same examples. Use their combined
+        # counts so moving a target across a CP boundary cannot change its weight,
+        # including when a rank has no LM targets but receives a rolled MTP target.
+        if cp_size > 1:
+            token_counts = torch.stack((original_num_tokens, num_tokens))
+            torch.distributed.all_reduce(token_counts, group=cp_group)
+            normalization_original_tokens, normalization_tokens = token_counts.unbind()
+        else:
+            normalization_original_tokens = original_num_tokens
+            normalization_tokens = num_tokens
+        safe_normalization_tokens = normalization_tokens.clamp(min=1)
+
         if is_training:
             # Logging only: detach so nothing here keeps this head's graph alive.
             mtp_loss_for_log = (
-                torch.sum(mtp_loss.detach()) * (num_tokens > 0).to(mtp_loss.dtype)
-            ) / num_tokens.clamp(min=1)
+                torch.sum(mtp_loss.detach())
+                * (normalization_tokens > 0).to(mtp_loss.dtype)
+                * cp_size
+            ) / safe_normalization_tokens
 
             if metric_avg_group is None:
                 # Compatibility fallback for callers that have not migrated to explicit groups.
@@ -1279,21 +1294,20 @@ def process_mtp_loss(
             )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
         if config.calculate_per_token_loss:
-            # This uses local counts; exact parity for packed or uneven valid-token
-            # distributions across DP/CP ranks would require all-reduced counts.
             # When calculate_per_token_loss is enabled, finalize_model_grads will
             # divide all gradients by total_num_tokens (from main loss).
             # However, MTP has fewer valid tokens due to rolling. To ensure correct
             # per-token gradient weighting, we normalize by the rolled token count
-            # and re-scale by the original token count.
-            # Avoid division by zero
-            num_tokens_safe = torch.clamp(num_tokens, min=1)
+            # and re-scale by the original token count of this CP-shared microbatch.
             mtp_loss_normalized = (
-                mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
+                mtp_loss_scale
+                * mtp_loss
+                * (normalization_original_tokens / safe_normalization_tokens)
             )
         else:
-            safe_num_tokens = num_tokens.clamp(min=1)
-            mtp_loss_normalized = mtp_loss_scale * mtp_loss / safe_num_tokens
+            # The legacy path averages parameter gradients over DP and CP.
+            # Compensate the CP average when using a CP-wide denominator.
+            mtp_loss_normalized = mtp_loss_scale * cp_size * mtp_loss / safe_normalization_tokens
 
         if early_backward:
             # Same upstream gradient MTPLossAutoScaler.backward would supply, applied now. This
