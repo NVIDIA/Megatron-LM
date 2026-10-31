@@ -216,6 +216,34 @@ def test_fused_pad_routing_map_replays_and_matches_torch(
     assert torch.equal(fused["out"].to(torch_out["out"].dtype), torch_out["out"])
 
 
+def test_fused_pad_routing_map_replays_at_exact_capacity(experimental_enabled):
+    """An expert routed exactly num_tokens - num_to_pad tokens flips every zero left in its row.
+
+    This is the boundary of the feasibility check both padding paths run before the kernel;
+    the padded map must still replay and agree with the torch reference bit for bit.
+    """
+    seeded()
+    num_tokens, pad_multiple = 256, 128
+    routing_map = torch.zeros(num_tokens, 4, dtype=torch.bool, device="cuda")
+    routing_map[:200, 0] = True  # needs 56 more tokens and has exactly 56 zeros left
+    routing_map[:, 1] = True  # already aligned, nothing to flip
+    routing_map[::3, 2] = True  # 86 tokens, pads to 128
+    fused, _ = assert_replays_bit_exact(
+        lambda m: fused_pad_routing_map(m, pad_multiple),
+        (routing_map,),
+        backward=False,
+        what="fused_pad_routing_map at exact capacity",
+    )
+    torch_out, _ = assert_replays_bit_exact(
+        lambda m: pad_routing_map(m, pad_multiple),
+        (routing_map,),
+        backward=False,
+        what="pad_routing_map at exact capacity",
+    )
+    assert torch.equal(fused["out"].to(torch_out["out"].dtype), torch_out["out"])
+    assert torch_out["out"].sum(dim=0).tolist() == [256, 256, 128, 0]
+
+
 # --- indices <-> multihot ----------------------------------------------------------------
 
 

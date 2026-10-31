@@ -770,6 +770,38 @@ def test_group_limited_topk_replays():
     )
 
 
+# --- routing map padding ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("case", ["random", "exact-capacity"])
+def test_pad_routing_map_replays(case):
+    """Padding flips the first zeros of each expert row with a boolean-mask write.
+
+    The exact-capacity case sits on the boundary of the feasibility check that runs before
+    the write: one expert needs every zero left in its row.
+    """
+    seeded()
+    pad_multiple = 128
+    if case == "random":
+        routing_map, _ = _routing(num_tokens=4097, num_experts=64, topk=8)
+    else:
+        routing_map = torch.zeros(256, 4, dtype=torch.bool, device="cuda")
+        routing_map[:200, 0] = True  # needs 56 more tokens and has exactly 56 zeros left
+        routing_map[:, 1] = True  # already aligned, nothing to flip
+        routing_map[::3, 2] = True  # 86 tokens, pads to 128
+    outputs, _ = assert_replays_bit_exact(
+        lambda m: moe_utils.pad_routing_map(m, pad_multiple),
+        (routing_map,),
+        backward=False,
+        what=f"pad_routing_map[{case}]",
+    )
+    counts = outputs["out"].sum(dim=0)
+    assert torch.all(counts % pad_multiple == 0)
+    assert torch.all(outputs["out"][routing_map]), "padding may only add tokens"
+    if case == "exact-capacity":
+        assert counts.tolist() == [256, 256, 128, 0]
+
+
 @pytest.mark.parametrize(
     "fused",
     [
