@@ -67,6 +67,8 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         process_group: Optional[ProcessGroup] = None,
     ):
 
+        if config.decoder_num_repeats > 1:
+            raise ValueError("Repeated decoder execution does not support Torch FSDP")
         assert (
             HAVE_FSDP
         ), 'TorchFullyShardedDataParallel requires PyTorch >= 2.4.0 with FSDP 2 support.'

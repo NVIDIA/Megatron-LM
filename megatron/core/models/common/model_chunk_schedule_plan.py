@@ -596,6 +596,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         Returns:
             The model chunk schedule plan.
         """
+        if model.config.decoder_num_repeats > 1:
+            raise ValueError("Repeated decoder execution does not support schedule-plan execution")
         from megatron.core.models.common.utils import PostProcessNode, PreProcessNode
 
         pre_process_cls = self.PRE_PROCESS_NODE_CLASS or PreProcessNode

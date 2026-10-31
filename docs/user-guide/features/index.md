@@ -20,6 +20,7 @@ low_precision_training
 moe
 megatron_fsdp
 dist_optimizer
+looped_decoder
 checkpoint-merge
 optimizer_cpu_offload
 paged_stash

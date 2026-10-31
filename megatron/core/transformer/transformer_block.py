@@ -335,6 +335,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         )
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
+        # Register physical layers only once. The execution plan contains indices,
+        # so repeated computation cannot add parameter aliases or checkpoint keys.
+        if config.decoder_num_repeats > 1:
+            if len(self.layers) != config.num_layers:
+                raise ValueError("Repeated decoder execution requires all physical decoder layers")
+            self.layer_execution_order = config.get_decoder_layer_execution_order()
+        else:
+            self.layer_execution_order = tuple(range(len(self.layers)))
 
     def _build_layers(self):
         # Transformer layers.
@@ -588,6 +596,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        if self.config.decoder_num_repeats > 1:
+            if inference_context is not None:
+                raise ValueError("Repeated decoder execution does not support inference KV caches")
+            if extract_layer_indices:
+                raise ValueError(
+                    "Repeated decoder execution does not support extract_layer_indices"
+                )
         # Remove 'dynamic_inference_decode_only' from kwargs if present
         # this is only used to uniquely identify decode and non-decode cuda graph
         # runners in the cuda graph manager
@@ -713,7 +728,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # No intermediate_hidden_states requested: just hidden_states
                     hidden_states = checkpointed_result
             else:
-                for l_no, layer in enumerate(self.layers):
+                for l_no in self.layer_execution_order:
+                    layer = self.layers[l_no]
                     residual_accumulator = hidden_states
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
