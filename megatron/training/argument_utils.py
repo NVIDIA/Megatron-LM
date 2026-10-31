@@ -19,9 +19,9 @@ from typing import Any, Callable, Optional
 import torch
 import torch.nn.functional as F
 
-from megatron.core.optimizer import OptimizerConfig
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_fim_dataset import GPTFIMDatasetConfig
+from megatron.core.optimizer import OptimizerConfig
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
