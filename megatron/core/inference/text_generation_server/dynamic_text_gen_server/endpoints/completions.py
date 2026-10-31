@@ -10,9 +10,11 @@ from megatron.core.inference.inference_request import (
     unwrap_serialized_tensors,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.utils import detokenize_tokens
 
-from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
+from ..incremental_detokenizer import (
+    HuggingFaceFastIncrementalDetokenizer,
+    detokenize_generated_tokens,
+)
 from ..openai_streaming import json_safe_logprobs, json_safe_top_n_logprobs, openai_stream
 from .common import (
     abort_requests,
@@ -205,7 +207,11 @@ try:
             # Streaming currently supports only Hugging Face fast tokenizers.
             try:
                 incremental_detokenizers = [
-                    HuggingFaceFastIncrementalDetokenizer(tokenizer, prompt_tokens)
+                    HuggingFaceFastIncrementalDetokenizer(
+                        tokenizer,
+                        prompt_tokens,
+                        remove_eos=not sampling_params.detokenize_stop_sequence,
+                    )
                     for prompt_tokens in prompts_as_tokens
                 ]
             except ValueError as error:
@@ -356,8 +362,11 @@ try:
                 response_uid = result["uid"]
             collect_stage_metadata(response_metadata, result)
             generated_tokens = result.get("generated_tokens") or []
-            full_text = detokenize_tokens(
-                tokenizer, generated_tokens, remove_EOD=not sampling_params.detokenize_stop_sequence
+            full_text = detokenize_generated_tokens(
+                tokenizer,
+                prompts_as_tokens[request_idx],
+                generated_tokens,
+                remove_eos=not sampling_params.detokenize_stop_sequence,
             )
             text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
 

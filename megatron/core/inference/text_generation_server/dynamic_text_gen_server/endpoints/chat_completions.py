@@ -28,13 +28,13 @@ from megatron.core.inference.inference_request import (
     unwrap_serialized_tensors,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.text_generation_controllers.text_generation_controller import (
-    TextGenerationController,
-)
 from megatron.core.inference.utils import model_eos_token_ids
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
-from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
+from ..incremental_detokenizer import (
+    HuggingFaceFastIncrementalDetokenizer,
+    detokenize_generated_tokens,
+)
 from ..openai_streaming import (
     StreamingChatParser,
     json_safe_logprobs,
@@ -1230,7 +1230,11 @@ try:
             # Streaming currently supports only Hugging Face fast tokenizers.
             try:
                 incremental_detokenizers = [
-                    HuggingFaceFastIncrementalDetokenizer(tokenizer, prompt_tokens)
+                    HuggingFaceFastIncrementalDetokenizer(
+                        tokenizer,
+                        prompt_tokens,
+                        remove_eos=not sampling_params.detokenize_stop_sequence,
+                    )
                     for _ in range(n)
                 ]
             except ValueError as error:
@@ -1398,10 +1402,11 @@ try:
                 response_uid = result["uid"]
             collect_stage_metadata(response_metadata, result)
 
-            text_output = TextGenerationController.detokenize(
+            text_output = detokenize_generated_tokens(
                 tokenizer,
+                prompt_tokens,
                 result["generated_tokens"],
-                remove_EOD=not sampling_params.detokenize_stop_sequence,
+                remove_eos=not sampling_params.detokenize_stop_sequence,
             )
             # The engine always reports prompt_length (for usage), but drops the
             # prompt_tokens tensor unless return_prompt_tokens was set.
