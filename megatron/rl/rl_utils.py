@@ -120,6 +120,7 @@ from megatron.rl.sequence_packing_utils import (
 )
 from megatron.rl.server.inference.inference_interface_server import InferenceInterfaceServer
 from megatron.rl.types import KNOWN_ROLLOUT_STATUSES
+from megatron.training.config import InferenceConfigContainer
 from megatron.training.global_vars import (
     get_args,
     get_run_config,
@@ -689,13 +690,15 @@ def _eager_train_comm_warmup():
     )
 
 
-def get_inference_interface(args, loop, model):
+def get_inference_interface(args, loop, model, inference_container):
+    """Launch the rollout engine described by ``inference_container`` once and reuse it."""
     global _INFERENCE_INTERFACE
     if _INFERENCE_INTERFACE is None:
         _eager_train_comm_warmup()
         _INFERENCE_INTERFACE = loop.run_until_complete(
             MegatronLocal.launch(
                 model[0],
+                inference_container,
                 host='0.0.0.0',
                 port=8294,
                 verbose=args.inference_text_gen_server_logging)
@@ -813,7 +816,9 @@ def colocated_inference(
     inference_model: LanguageModule,
     optimizer: MegatronOptimizer,
     n_prompts: int,
-    samples_per_group: int
+    samples_per_group: int,
+    *,
+    inference_container: InferenceConfigContainer,
 ) -> tuple[GroupedRollouts, dict[str, FinishedRequestRecord]]:
     """Swap to the inference engine and collect rollout groups from it.
 
@@ -875,6 +880,7 @@ def colocated_inference(
             args.cuda_graph_impl,
             False, # offload optimizer during rollout collection is handled above
             training_model=model if has_separate_inference_model else None,
+            inference_container=inference_container,
         ) as inference_interface:
 
             runtime_state = get_rl_runtime_state()
@@ -952,6 +958,8 @@ def get_environment_rollouts(
     n_prompts: int,
     samples_per_group: int,
     run_inference: bool = True,
+    *,
+    inference_container: InferenceConfigContainer,
 ) -> tuple[GroupedRollouts, dict[str, FinishedRequestRecord]]:
     """Sample environment rollouts from an LLM.
 
@@ -966,7 +974,6 @@ def get_environment_rollouts(
     Returns:
         (GroupedRollouts, per-request metadata ledger)
     """
-    args = get_args()
     cfg = get_run_config()
     train_state = get_train_state()
     nvtx_range = get_nvtx_range()
@@ -976,7 +983,8 @@ def get_environment_rollouts(
     request_ledger: dict[str, FinishedRequestRecord] = {}
     if run_inference:
         rollouts, request_ledger = colocated_inference(
-            model, inference_model, optimizer, n_prompts, samples_per_group
+            model, inference_model, optimizer, n_prompts, samples_per_group,
+            inference_container=inference_container,
         )
     elif rank == 0:
         log_single_rank(
@@ -2855,6 +2863,8 @@ def get_grpo_data_iterator(
     is_correction: bool,
     buffered_rollouts: RerunDataIterator | None = None,
     optimizer_is_on_cpu: bool = False,
+    *,
+    inference_container: InferenceConfigContainer,
 ) -> RerunDataIterator:
     """
     Get the data iterator for GRPO training.
@@ -2898,6 +2908,7 @@ def get_grpo_data_iterator(
         rollouts, fresh_ledger = get_environment_rollouts(
             model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size,
             run_inference=run_inference,
+            inference_container=inference_container,
         )
         # Records persist until their rollout's join pops them (partial rollouts
         # deliver across window boundaries); never-joined residents are accepted.
@@ -2940,6 +2951,8 @@ def evaluate_and_print_results_rl(
     iteration: int,
     write_to_tensorboard: bool = True,
     training_model: Optional[list[LanguageModule]] = None,
+    *,
+    inference_container: InferenceConfigContainer,
 ):
     """Helper function to evaluate and dump results on screen.
 
@@ -2966,6 +2979,7 @@ def evaluate_and_print_results_rl(
             args.cuda_graph_impl,
             cfg.rl.rl_offload_optimizer_during_inference,
             training_model,
+            inference_container=inference_container,
         ) as inference_interface:
 
             loop = get_asyncio_loop()
@@ -3069,6 +3083,7 @@ def next_rollout_iterator(
     ref_state_dict: Optional[dict],
     rl_config: Any,
     train_config: Any,
+    inference_container: InferenceConfigContainer,
 ) -> Any:
     """The rollout iterator for this iteration, rebuilt on the GRPO schedule."""
     assert model is not None, "RLSetupCallback has not run; pass it in pretrain(callbacks=...)"
@@ -3090,6 +3105,7 @@ def next_rollout_iterator(
             buffered_rollouts=current_iterator,
             is_correction=rl_config.rl_inference_logprobs_is_correction,
             optimizer_is_on_cpu=rl_config.rl_offload_optimizer_during_inference,
+            inference_container=inference_container,
         )
 
 
@@ -3098,6 +3114,7 @@ def evaluate_rollouts(
     model: list,
     inference_model: Optional[list],
     optimizer: Any,
+    inference_container: InferenceConfigContainer,
     prefix: str,
     iteration: int,
     verbose: bool,
@@ -3118,6 +3135,7 @@ def evaluate_rollouts(
         iteration,
         write_to_tensorboard=write_to_tensorboard,
         training_model=training_model,
+        inference_container=inference_container,
     )
 
 
@@ -3222,6 +3240,8 @@ def megatron_rl_inference_mode(
     cuda_graph_impl: str,
     offload_optimizer_during_inference: bool,
     training_model: Optional[list[LanguageModule]] = None,
+    *,
+    inference_container: InferenceConfigContainer,
 ):
     """Manage the model inference context when collecting rollouts.
 
@@ -3310,7 +3330,7 @@ def megatron_rl_inference_mode(
         if cuda_graph_impl != "none" and not cfg.rl.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, cuda_graph_impl)
 
-        inference_interface = get_inference_interface(args, loop, model)
+        inference_interface = get_inference_interface(args, loop, model, inference_container)
         inference_interface.set_generation_epoch(train_state.iteration)
         loop.run_until_complete(inference_interface.resume())
 

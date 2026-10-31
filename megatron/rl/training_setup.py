@@ -13,10 +13,12 @@ from megatron.core.num_microbatches_calculator import (
     update_num_microbatches,
 )
 from megatron.core.utils import get_model_config
+from megatron.rl.config import rollout_model_is_separate
 from megatron.rl.inference.disagg import build_disagg_inference_model
 from megatron.rl.rl_utils import inference_model_alloc_context
 from megatron.training.callbacks import Callback, CallbackContext
 from megatron.training.checkpointing import load_checkpoint
+from megatron.training.config import InferenceConfigContainer
 from megatron.training.global_vars import get_args, get_run_config, get_train_state
 from megatron.training.training import get_model
 from megatron.training.utils import print_rank_0
@@ -29,21 +31,17 @@ except ImportError:
     HAVE_FSDP2 = False
 
 
-def build_rl_inference_model(
-    rl_config: Any, args: Any, config: Any, model_provider: Any, model_type: Any
+"""Name of the rollout engine's inference container YAML next to ``run_config.yaml`` in a
+checkpoint directory."""
+
+def build_rollout_inference_model(
+    inference_container: InferenceConfigContainer,
+    args: Any,
+    config: Any,
+    model_provider: Any,
+    model_type: Any,
 ) -> Optional[list]:
-    """Build a separate inference model with custom parallelism, if requested."""
-    if not rl_config.uses_separate_inference_model(
-        context_parallel_size=args.context_parallel_size, inference_shards=args.inference_shards
-    ):
-        if rl_config.rl_offload_inference_model_weights:
-            raise ValueError(
-                "--rl-offload-inference-model-weights requires a separate inference model. "
-                "This flag is only useful when doing refit since the weights are shared with "
-                "the training model."
-            )
-        return None
-    cfg_container = get_run_config()
+    """Build the rollout engine's separately parallelized model, if the deployment needs one."""
     if spec_declares_disaggregation(args.inference_shards):
         # Disaggregated rollouts build this rank's prefill/decode model on
         # the shard process groups maintained by the per-pool refit path.
@@ -51,51 +49,44 @@ def build_rl_inference_model(
             args,
             model_type,
             config,
-            cfg_container=cfg_container,
+            rl_config=get_run_config().rl,
+            model_config=inference_container.model,
             model_alloc_ctx=inference_model_alloc_context(),
         )
+    if not rollout_model_is_separate(inference_container, get_run_config().model):
+        return None
 
-    # RL inference doesn't support CP; when training uses CP>1, always build a
-    # separate CP=1 inference model (CP ranks become extra DP replicas, dp*=cp).
-    force_cp1_inference_model = args.context_parallel_size > 1
+    deployment = inference_container.model.transformer
     print_rank_0(
         "Building separate RL inference model with custom parallelism: "
-        f"TP={rl_config.rl_inference_tensor_model_parallel_size}, "
-        f"PP={rl_config.rl_inference_pipeline_model_parallel_size}, "
-        f"CP={1 if force_cp1_inference_model else None}, "
-        f"EP={rl_config.rl_inference_expert_model_parallel_size}, "
-        f"ExptTP={rl_config.rl_inference_expert_tensor_model_parallel_size}"
+        f"TP={deployment.tensor_model_parallel_size}, "
+        f"PP={deployment.pipeline_model_parallel_size}, "
+        f"CP={deployment.context_parallel_size}, "
+        f"EP={deployment.expert_model_parallel_size}, "
+        f"ExptTP={deployment.expert_tensor_parallel_size}"
     )
     inference_pg_collection = build_inference_pg_collection(
         args.world_size,
-        tp_size=rl_config.rl_inference_tensor_model_parallel_size,
-        pp_size=rl_config.rl_inference_pipeline_model_parallel_size,
-        cp_size=1 if force_cp1_inference_model else None,
-        ep_size=rl_config.rl_inference_expert_model_parallel_size,
-        expt_tp_size=rl_config.rl_inference_expert_tensor_model_parallel_size,
-        use_tp_pp_dp_mapping=cfg_container.dist.use_tp_pp_dp_mapping,
+        tp_size=deployment.tensor_model_parallel_size,
+        pp_size=deployment.pipeline_model_parallel_size,
+        cp_size=deployment.context_parallel_size,
+        ep_size=deployment.expert_model_parallel_size,
+        expt_tp_size=deployment.expert_tensor_parallel_size,
+        use_tp_pp_dp_mapping=get_run_config().dist.use_tp_pp_dp_mapping,
     )
 
-    # Build an isolated inference config so training config remains unchanged
+    # Build an isolated inference config so the training config remains unchanged.
     inference_config = copy.deepcopy(config)
-    if rl_config.rl_inference_tensor_model_parallel_size is not None:
-        inference_config.tensor_model_parallel_size = (
-            rl_config.rl_inference_tensor_model_parallel_size
-        )
-    if rl_config.rl_inference_pipeline_model_parallel_size is not None:
-        inference_config.pipeline_model_parallel_size = (
-            rl_config.rl_inference_pipeline_model_parallel_size
-        )
-    if force_cp1_inference_model:
-        inference_config.context_parallel_size = 1
-    if rl_config.rl_inference_expert_model_parallel_size is not None:
-        inference_config.expert_model_parallel_size = (
-            rl_config.rl_inference_expert_model_parallel_size
-        )
-    if rl_config.rl_inference_expert_tensor_model_parallel_size is not None:
-        inference_config.expert_tensor_parallel_size = (
-            rl_config.rl_inference_expert_tensor_model_parallel_size
-        )
+    for name in (
+        "tensor_model_parallel_size",
+        "pipeline_model_parallel_size",
+        "context_parallel_size",
+        "expert_model_parallel_size",
+        "expert_tensor_parallel_size",
+        "tensor_parallel_num_weight_shards",
+        "expert_tensor_parallel_num_weight_shards",
+    ):
+        setattr(inference_config, name, getattr(deployment, name))
 
     with inference_model_alloc_context():
         inference_model = get_model(
@@ -181,8 +172,8 @@ def reinitialize_grpo_microbatch_calculator(args: Any, data_parallel_size: int) 
 class RLSetupCallback(Callback):
     """Builds the RL loop's state at `on_data_init_start` and keeps it for the rollout hooks."""
 
-    def __init__(self, rl_config: Any, *, model_provider: Any, model_type: Any) -> None:
-        self._rl_config = rl_config
+    def __init__(self, inference_container: Any, *, model_provider: Any, model_type: Any) -> None:
+        self._inference_container = inference_container
         self._model_provider = model_provider
         self._model_type = model_type
         self.model: Optional[list] = None
@@ -195,8 +186,8 @@ class RLSetupCallback(Callback):
         cfg = get_run_config()
         self.model = context.model
         self.optimizer = context.optimizer
-        self.inference_model = build_rl_inference_model(
-            self._rl_config,
+        self.inference_model = build_rollout_inference_model(
+            self._inference_container,
             args,
             get_model_config(self.model[0]),
             self._model_provider,
@@ -205,10 +196,7 @@ class RLSetupCallback(Callback):
         if not cfg.validation.skip_train:
             # GRPO loop state; eval-only runs (--skip-train) evaluate the loaded weights directly.
             self.ref_state_dict = load_reference_state_dict(
-                self.model,
-                context.checkpointing_context,
-                args,
-                rollout_only=self._rl_config.rl_rollout_only,
+                self.model, context.checkpointing_context, args, rollout_only=cfg.rl.rl_rollout_only
             )
             # RL runs on the plain MPU groups: the loop's data-parallel size for them.
             reinitialize_grpo_microbatch_calculator(args, mpu.get_data_parallel_world_size())

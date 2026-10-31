@@ -19,7 +19,8 @@ from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import get_pg_size, log_single_rank
-from megatron.training.global_vars import get_args, get_run_config, get_tokenizer
+from megatron.training.config import InferenceConfigContainer
+from megatron.training.global_vars import get_run_config, get_tokenizer
 from megatron.training.utils import print_rank_0
 
 from ..server.api import InferenceServer
@@ -94,11 +95,10 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
         return data
 
     @classmethod
-    async def launch(cls, model: GPTModel, **kwargs):
+    async def launch(cls, model: GPTModel, inference_container: InferenceConfigContainer, **kwargs):
         # Import here to avoid circular imports
         from megatron.inference.utils import get_dynamic_inference_engine
 
-        args = get_args()
         cfg = get_run_config()
         tokenizer = get_tokenizer()
 
@@ -109,11 +109,9 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
                 "WARNING: Tokenizer has no BOS token so prompt will not have BOS token",
             )
 
-        # RL needs log probs, but not prompt log probs.
-        args.return_log_probs = True
-        args.skip_prompt_log_probs = True
-
-        inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(model=model)
+        inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(
+            model=model, setup_cfg=inference_container.inference
+        )
         inference_engine.local_metadata_ledger_enabled = True
         if inference_engine.context.config.disaggregation_shards is not None:
             print_rank_0(

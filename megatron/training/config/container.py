@@ -31,7 +31,6 @@ from megatron.training.config.resilience_config import (
     RerunStateMachineConfig,
     StragglerDetectionConfig,
 )
-from megatron.training.config.rl_config import RLConfig
 from megatron.training.config.training_config import (
     CheckpointConfig,
     LoggerConfig,
@@ -297,7 +296,6 @@ class PretrainConfigContainer(ConfigContainerBase):
     checkpoint: CheckpointConfig
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
     tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
-    rl: RLConfig = field(default_factory=RLConfig)
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
@@ -390,11 +388,9 @@ class PretrainConfigContainer(ConfigContainerBase):
 
 
     def validate(self) -> None:
-        """Validate each section, then the RL section against the rest of the run."""
-        self.rl.validate_ddp_config(self.ddp)
+        """Validate each section, then the run-level rules that span them."""
         super().validate()
-        global_batch_size, _, _ = self._resolve_batch_sizes()
-        self._validate_rl_config(global_batch_size)
+        self._resolve_batch_sizes()
         self.optimizer.validate_run(
             ddp_config=self.ddp,
             use_torch_fsdp2=self.dist.use_torch_fsdp2,
@@ -415,25 +411,6 @@ class PretrainConfigContainer(ConfigContainerBase):
             weight_decay=self.optimizer.weight_decay,
         )
         self._validate_data_section()
-
-    def _validate_rl_config(self, global_batch_size: int | None) -> None:
-        """Check RL policy against the supplied or resolved training batch size."""
-        transformer = getattr(self.model, "transformer", None)
-        cuda_graph_impl = None if transformer is None else transformer.cuda_graph_impl
-        self.rl.validate_run(
-            cuda_graph_impl=cuda_graph_impl,
-            micro_batch_size=self.train.micro_batch_size,
-            global_batch_size=global_batch_size,
-            train_iters=self.train.train_iters,
-            train_samples=self.train.train_samples,
-            skip_train=self.validation.skip_train,
-            load_optim=self.checkpoint.load_optim,
-            save_interval=self.checkpoint.save_interval,
-            exit_interval=self.train.exit_interval,
-            # The rollout deployment (inference shards, model CP) is not a pretrain section;
-            # validate_args checks that rule from the launch arguments.
-            separate_inference_model=None,
-        )
 
     def get_data_parallel_size(self, world_size: int) -> int | None:
         """The data-parallel size of this run's model layout, or ``None`` without a model config.
@@ -559,7 +536,6 @@ class PretrainConfigContainer(ConfigContainerBase):
         # TODO: Use get_batch_parallel_size(self) once topology inputs are config-owned.
         # Keep this temporary args dependency in framework finalization, not validation.
         batch_sizes = self._resolve_batch_sizes(get_batch_parallel_size(get_args()))
-        self._validate_rl_config(batch_sizes[0])
         (
             self.train.global_batch_size,
             self.validation.eval_global_batch_size,
@@ -602,8 +578,6 @@ class PretrainConfigContainer(ConfigContainerBase):
                 )
                 dataset.hybrid_context_parallel = False
         self.data.finalize()
-        if self.rl.perform_rl_step:
-            self.rl.finalize_ddp_config(self.ddp)
 
 
 def update_train_iters(train: TrainingConfig) -> None:
@@ -650,8 +624,9 @@ class InferenceConfigContainer(ConfigContainerBase):
     model: HybridModelConfig | GPTModelConfig
     """Which model to load for inference."""
 
-    checkpoint: CheckpointConfig
-    """Checkpoint configuration used to load model weights."""
+    checkpoint: CheckpointConfig | None = None
+    """Checkpoint to load the weights from; ``None`` for a deployment whose weights come from an
+    in-process training model (the RL rollout engine)."""
 
     inference: InferenceSetupConfig
     """Declarative inference settings (the serializable, args-shaped layer). Use
