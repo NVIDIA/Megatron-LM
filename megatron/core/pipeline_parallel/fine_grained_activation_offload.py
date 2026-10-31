@@ -1022,16 +1022,26 @@ class ChunkOffloadHandler:
         state = (src_tensor.device, cpu_backup, use_cpu_pool, view_meta)
         return state
 
-    @_otel_trace_fn('activation_offload', 'megatron.activation.reload')
-    def reload(self, state, non_blocking=None, stream=None):
-        """Reload."""
-        debug_rank("------reload")
-        dev, cpu_backup, use_cpu_pool, view_meta = state
-        if non_blocking is None:
-            non_blocking = cpu_backup.is_pinned()
-        gpu_tensor = torch.empty(
+    @staticmethod
+    def _allocate_reload_buffer(state):
+        """An empty GPU buffer for an offloaded ``state``, allocated on the current stream."""
+        dev, cpu_backup, _, _ = state
+        return torch.empty(
             cpu_backup.size(), dtype=cpu_backup.dtype, layout=cpu_backup.layout, device=dev
         )
+
+    @_otel_trace_fn('activation_offload', 'megatron.activation.reload')
+    def reload(self, state, non_blocking=None, stream=None, *, destination=None):
+        """Copy an offloaded ``state`` back to the GPU on the current stream.
+
+        ``destination`` is the buffer to copy into; when ``None`` it is allocated on the
+        current stream. ``stream`` is the one the pinned source is released against.
+        """
+        debug_rank("------reload")
+        dev, cpu_backup, use_cpu_pool, view_meta = state
+        gpu_tensor = self._allocate_reload_buffer(state) if destination is None else destination
+        if non_blocking is None:
+            non_blocking = cpu_backup.is_pinned()
         gpu_tensor.copy_(cpu_backup, non_blocking=non_blocking)
         if use_cpu_pool:
             self.cpu_tensor_pool.free(cpu_backup, stream=stream)
@@ -1267,21 +1277,38 @@ class ChunkOffloadHandler:
         return len(count_modules)
 
     def bulk_reload_group(self):
-        """Bulk reload group."""
+        """Reload the next offloaded group: allocate the GPU buffers on the current
+        (consumer) stream, copy into them on the H2D stream.
+
+        The buffer's allocation stream decides which allocator pool it returns to when
+        the backward frees it. Allocated on the H2D stream, those blocks could only be reused
+        by later reloads; allocated on the consumer stream, they recirculate like any other
+        activation. Stream order: the H2D stream waits for the consumer stream (a fresh block
+        may still be in use there) and, outside CUDA-graph capture, for the group's offload
+        event; the consumer waits for the group's reload event before its first use.
+        """
         debug_rank("----bulk_reload_group")
         group_to_reload = self._groups_to_reload[-1]
         nvtx_msg = "activation reloading " + group_to_reload._name
         nvtx_range_push(nvtx_msg)
+        consumer_stream = torch.cuda.current_stream()
+        staged = [
+            (tensor_tag, state, self._allocate_reload_buffer(state))
+            for tensor_tag, state in group_to_reload._tensors.items()
+            if isinstance(state, tuple)  # only tensors that were offloaded
+        ]
+        self.h2d_stream.wait_stream(consumer_stream)
+        if not is_graph_capturing():
+            # The offload event is recorded outside the graph; under capture the H2D stream is
+            # already ordered behind the capturing stream (on_group_start_backward).
+            group_to_reload.wait_offload_event(self.h2d_stream)
         with torch.cuda.stream(self.h2d_stream):
-            # Wait for offload to complete before reloading
-            if not is_graph_capturing():
-                group_to_reload.wait_offload_event(self.h2d_stream)
-            for tensor_tag, state in group_to_reload._tensors.items():
-                # Only reload if tensor was offloaded (stored as tuple)
-                if isinstance(state, tuple):
-                    recovered_tensor = self.reload(state, stream=self.h2d_stream)
-                    debug_rank(f"----recovered_tensor {recovered_tensor.shape}")
-                    group_to_reload.push_tensor(tensor_tag, recovered_tensor)
+            for tensor_tag, state, gpu_tensor in staged:
+                recovered_tensor = self.reload(
+                    state, stream=self.h2d_stream, destination=gpu_tensor
+                )
+                debug_rank(f"----recovered_tensor {recovered_tensor.shape}")
+                group_to_reload.push_tensor(tensor_tag, recovered_tensor)
             group_to_reload.record_reload_event(self.h2d_stream)
         self._groups_to_reload.pop()
         # Add the group to the reloading group to wait for the reload event.
