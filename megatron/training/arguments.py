@@ -1621,6 +1621,15 @@ def validate_args(args, defaults={}):
                 f'must be >= single sequence max length ({args.seq_length})'
             )
 
+    if args.sequence_packing_scheduler == 'dp_balanced' and args.cuda_graph_impl == 'transformer_engine':
+        assert args.use_varlen_dataset and args.micro_batch_size == 1, (
+            'Scheduler CUDA graphs require one variable-length sample per dataset item '
+            'and --micro-batch-size 1.'
+        )
+        assert args.step_batch_size_schedule is None, (
+            'Scheduler CUDA graphs require a fixed source global batch size.'
+        )
+
     # Data blend checks
     assert args.mock_data + \
            bool(args.data_path) + \

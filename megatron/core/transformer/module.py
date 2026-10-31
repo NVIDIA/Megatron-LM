@@ -349,7 +349,17 @@ class GraphableMegatronModule(MegatronModule):
                 v, torch.Tensor
             ), "CUDA graph accepts only Tensor inputs."
 
-        cg_index = getattr(self, 'current_microbatch', 0) % len(self.cuda_graphs)
+        microbatch_idx = getattr(self, 'current_microbatch', 0)
+        if (
+            getattr(self.config, "cuda_graph_dynamic_microbatches", False)
+            and self.config.pipeline_model_parallel_size > 1
+        ):
+            if microbatch_idx >= len(self.cuda_graphs):
+                raise RuntimeError(
+                    "Packed microbatch count exceeds the captured source-batch bound; "
+                    "recapture CUDA graphs before increasing the source batch size."
+                )
+        cg_index = microbatch_idx % len(self.cuda_graphs)
         cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(*args, **kwargs)
 
         for hook, hook_args in self.cuda_graph_manual_hooks:

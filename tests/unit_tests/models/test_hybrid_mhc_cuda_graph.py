@@ -1,0 +1,987 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""Real TE capture/replay regressions for the existing main mHC model entry points.
+
+Fused cases count the actual accelerated forward/backward launchers during CUDA
+capture, independently of eager warmup and reference execution. SM10x Blackwell
+also requires the cuTile projection and aggregation-backward paths; Hopper can
+use the supported Triton/native combination selected by the same auto policy.
+"""
+
+import inspect
+from collections import Counter
+from functools import wraps
+
+import pytest
+import torch
+
+from megatron.core import parallel_state
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.fusions import fused_mhc_kernels
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
+from megatron.core.num_microbatches_calculator import (
+    destroy_num_microbatches_calculator,
+    init_num_microbatches_calculator,
+)
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.schedules import get_pp_rank_microbatches, get_schedule_table
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel import random as tensor_parallel_random
+from megatron.core.tensor_parallel.random import (
+    initialize_rng_tracker,
+    model_parallel_cuda_manual_seed,
+)
+from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.cuda_graphs import (
+    TECudaGraphHelper,
+    _get_mtp_te_layers,
+    _layer_is_graphable,
+    convert_schedule_table_to_order,
+    set_current_microbatch,
+)
+from megatron.core.transformer.enums import AttnBackend, CudaGraphModule
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection_transformer_layer import (
+    HyperConnectionTransformerLayer,
+)
+from megatron.core.transformer.module import convert_module_to_dtype_except_fp32_marked
+from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.utils import is_te_min_version
+from tests.unit_tests.test_utilities import Utils
+
+
+def _record_mhc_backend_calls(monkeypatch):
+    """Observe real kernel dispatch without changing the selected implementation."""
+    calls = {'eager': Counter(), 'capture': Counter()}
+
+    def record(name, implementation):
+        @wraps(implementation)
+        def counted(*args, **kwargs):
+            phase = 'capture' if torch.cuda.is_current_stream_capturing() else 'eager'
+            result = implementation(*args, **kwargs)
+            calls[phase][name] += 1
+            return result
+
+        return counted
+
+    # These Python launchers are looked up directly by the autograd functions.
+    for name in (
+        '_triton_sinkhorn_fwd',
+        '_triton_sinkhorn_bwd',
+        '_cutile_sinkhorn_fwd',
+        '_cutile_sinkhorn_bwd',
+        '_cutile_h_aggregate_fwd',
+        '_cutile_h_aggregate_bwd',
+        '_cutile_h_post_bda_fwd',
+        '_cutile_h_post_bda_bwd',
+        '_cutile_proj_rms_compute_h_fwd',
+        '_cutile_fused_compute_h_proj_rms_bwd',
+    ):
+        implementation = getattr(fused_mhc_kernels, name, None)
+        if implementation is not None:
+            monkeypatch.setattr(fused_mhc_kernels, name, record(name, implementation))
+
+    # The other Triton launchers are saved in the implementation table at import.
+    for name in ('h_aggregate_fwd', 'h_post_bda_fwd', 'h_post_bda_bwd'):
+        implementation = fused_mhc_kernels._TRITON_IMPLS.get(name)
+        if implementation is not None:
+            monkeypatch.setitem(
+                fused_mhc_kernels._TRITON_IMPLS, name, record(f'_triton_{name}', implementation)
+            )
+    return calls
+
+
+def _expected_mhc_backend_calls(fused):
+    """Require acceleration for fused cases, using the existing auto policy."""
+    if not fused:
+        return set()
+    triton = fused_mhc_kernels.is_triton_available()
+    cutile = fused_mhc_kernels.is_cutile_available()
+    assert triton or cutile, 'The fused mHC case requires an accelerated backend.'
+    if torch.cuda.get_device_capability()[0] == 10:
+        assert cutile, 'The SM10x Blackwell fused mHC lane requires cuTile support.'
+
+    backend = 'triton' if triton else 'cutile'
+    expected = {
+        f'_{backend}_{operation}'
+        for operation in (
+            'sinkhorn_fwd',
+            'sinkhorn_bwd',
+            'h_aggregate_fwd',
+            'h_post_bda_fwd',
+            'h_post_bda_bwd',
+        )
+    }
+    if cutile:
+        expected.update(
+            {
+                '_cutile_h_aggregate_bwd',
+                '_cutile_proj_rms_compute_h_fwd',
+                '_cutile_fused_compute_h_proj_rms_bwd',
+            }
+        )
+    return expected
+
+
+@pytest.fixture(autouse=True)
+def _fresh_mhc_compile_cache(monkeypatch):
+    """Compile the native mHC kernels afresh for every test in this file.
+
+    mHC's native aggregate and post-BDA helpers use torch.compile and recompile per input
+    layout, grad mode and shape. Sharing that cache across this file's model shapes made a
+    test's eager reference and graph run round BF16 differently depending on test order, and
+    exhausted the default recompile limit, after which further variants run eagerly. As in
+    test_pp_mhc_compatibility.py, start each test from an empty cache, and allow it enough
+    recompiles to stay compiled.
+    """
+    monkeypatch.setattr(torch._dynamo.config, 'recompile_limit', 64)
+    torch.compiler.reset()
+    yield
+    torch.compiler.reset()
+
+
+_ATTENTION_GRAPH_SPLIT = dict(
+    recompute_granularity='selective',
+    recompute_modules=['mhc'],
+    mhc_recompute_attn_cuda_graph_split=True,
+)
+
+
+def _count_recompute_rebuilds(monkeypatch):
+    """Count checkpoint regions that actually re-run in backward."""
+    rebuilds = Counter()
+    rebuild = tensor_parallel_random._RecomputeRegion.rebuild
+
+    def counted_rebuild(region):
+        if region.state in (
+            tensor_parallel_random._RegionState.RECORDED,
+            tensor_parallel_random._RegionState.RELEASED,
+        ):
+            rebuilds['rebuild'] += 1
+        return rebuild(region)
+
+    monkeypatch.setattr(tensor_parallel_random._RecomputeRegion, 'rebuild', counted_rebuild)
+    return rebuilds
+
+
+def _record_bda_managers(monkeypatch):
+    """Record whether each HyperConnectionModule bias-dropout-add received a recompute manager."""
+    received = {}
+    original = HyperConnectionModule.fused_h_res_h_post_bda
+    signature = inspect.signature(original)
+
+    def recording(self, *args, **kwargs):
+        # GPT layers pass the manager positionally, Hybrid wrappers by keyword.
+        manager = signature.bind(self, *args, **kwargs).arguments.get('manager')
+        received.setdefault(id(self), []).append(manager is not None)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(HyperConnectionModule, 'fused_h_res_h_post_bda', recording)
+    return received
+
+
+def _attention_hyper_connection(layer):
+    if isinstance(layer, HyperConnectionHybridLayer):
+        return layer.hyper_connection
+    return layer.self_attention_hyper_connection
+
+
+def _config(kind, scopes, fused=False, tp=1, cp=1, ep=1, **overrides):
+    moe = 'moe' in kind
+    return TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        ffn_hidden_size=256,
+        activation_func=torch.nn.functional.silu if 'gdn' in kind else torch.nn.functional.gelu,
+        gated_linear_unit='gdn' in kind,
+        use_cpu_initialization=True,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        use_te_rng_tracker=True,
+        gradient_accumulation_fusion=False,
+        enable_mhc_connections=True,
+        mhc_num_residual_streams=2,
+        mhc_sinkhorn_iterations=3,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        cuda_graph_impl='transformer_engine' if scopes is not None else 'none',
+        cuda_graph_modules=scopes,
+        cuda_graph_warmup_steps=3,
+        use_fused_mhc=fused,
+        num_moe_experts=4 if moe else None,
+        moe_grouped_gemm=moe,
+        moe_router_topk=2,
+        moe_router_load_balancing_type='none',
+        moe_token_dispatcher_type='alltoall',
+        mtp_num_layers=2 if 'mtp' in kind else None,
+        tensor_model_parallel_size=tp,
+        context_parallel_size=cp,
+        expert_model_parallel_size=ep,
+        expert_tensor_parallel_size=tp,
+        add_bias_linear=not moe or tp == 1,
+        sequence_parallel=tp > 1,
+        linear_num_key_heads=4,
+        linear_num_value_heads=4,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        mamba_state_dim=16,
+        mamba_head_dim=32,
+        mamba_num_groups=1,
+        **overrides,
+    )
+
+
+def _model(kind, config, pg):
+    kwargs = dict(config=config, vocab_size=128, max_sequence_length=64, pg_collection=pg)
+    if kind.startswith('gpt'):
+        spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=config.num_moe_experts, moe_grouped_gemm=config.moe_grouped_gemm
+        )
+        spec.module = HyperConnectionTransformerLayer
+        spec.submodules.self_attention_hyper_connection = HyperConnectionModule
+        spec.submodules.mlp_hyper_connection = HyperConnectionModule
+        model = GPTModel(transformer_layer_spec=spec, position_embedding_type='rope', **kwargs)
+    else:
+        pattern = '*E' if 'moe' in kind else '*-'
+        if 'gdn' in kind:
+            pattern = 'G-'
+        if 'mamba' in kind:
+            pattern = 'M-'
+        if 'mtp' in kind:
+            pattern += ('/' + pattern) * config.mtp_num_layers
+        model = HybridModel(
+            hybrid_stack_spec=hybrid_stack_spec,
+            hybrid_layer_pattern=pattern,
+            position_embedding_type='rope',
+            **kwargs,
+        )
+    model.cuda().train()
+    convert_module_to_dtype_except_fp32_marked(model, torch.bfloat16)
+    # TECudaGraphHelper's reset protocol normally comes from MCore DDP. These
+    # tests compare every local gradient directly, without reducing it through DDP.
+    model.zero_grad_buffer = lambda: model.zero_grad(set_to_none=True)
+    return model
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not is_te_min_version('2.10.0'), reason='TE graph tests require TE >= 2.10')
+class TestMHCTEGraphs:
+    def setup_method(self):
+        self.helper = None
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+
+    def teardown_method(self):
+        if self.helper is not None and self.helper.graphs_created():
+            self.helper.delete_cuda_graphs()
+        destroy_num_microbatches_calculator()
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        'kind,scopes',
+        [
+            ('hybrid', [CudaGraphModule.attn, CudaGraphModule.mlp]),
+            ('hybrid_gdn', [CudaGraphModule.attn, CudaGraphModule.mlp]),
+            ('hybrid_mamba', [CudaGraphModule.mamba, CudaGraphModule.mlp]),
+            ('hybrid_mtp', [CudaGraphModule.attn, CudaGraphModule.mlp]),
+            ('hybrid_moe', [CudaGraphModule.attn, CudaGraphModule.moe_router]),
+            ('hybrid_moe_mtp', [CudaGraphModule.attn, CudaGraphModule.moe_router]),
+            (
+                'hybrid_moe',
+                [CudaGraphModule.attn, CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
+            ),
+            ('gpt', [CudaGraphModule.attn]),
+            ('gpt', [CudaGraphModule.mlp]),
+            ('gpt_moe', [CudaGraphModule.attn, CudaGraphModule.moe_router]),
+            (
+                'gpt_moe',
+                [CudaGraphModule.attn, CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
+            ),
+        ],
+    )
+    @pytest.mark.parametrize('fused', [False, True])
+    def test_capture_replay_all_gradients(self, kind, scopes, fused, monkeypatch):
+        self._run(kind, scopes, fused, monkeypatch)
+
+    def test_combined_hybrid_attention_moe_graph_is_rejected(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
+        config = _config('hybrid_moe', [CudaGraphModule.attn, CudaGraphModule.moe_router])
+        spec = get_gpt_layer_with_transformer_engine_spec(num_experts=4, moe_grouped_gemm=True)
+        inner = TransformerLayer(config, spec.submodules)
+        with pytest.raises(NotImplementedError, match='MoE-only inner layer'):
+            HyperConnectionHybridLayer(config, inner)
+
+    @pytest.mark.parametrize('kind', ['hybrid_moe', 'gpt_moe'])
+    @pytest.mark.parametrize('input_name', ['padding_mask', 'packed_seq_params'])
+    @pytest.mark.parametrize('method', ['_te_cuda_graph_capture', '_te_cuda_graph_replay'])
+    def test_te_training_rejects_inputs_without_static_samples(self, kind, input_name, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
+        config = _config(kind, [CudaGraphModule.attn, CudaGraphModule.moe_router])
+        model = _model(kind, config, ProcessGroupCollection.use_mpu_process_groups())
+        layer = model.decoder.layers[-1]
+        unsupported = (
+            torch.zeros(2, 8, dtype=torch.bool, device='cuda')
+            if input_name == 'padding_mask'
+            else object()
+        )
+        with pytest.raises(NotImplementedError, match=input_name):
+            getattr(layer, method)(
+                hidden_states=torch.ones(8, 2, 256, device='cuda', dtype=torch.bfloat16),
+                **{input_name: unsupported},
+            )
+
+    @pytest.mark.parametrize('kind', ['gpt', 'gpt_moe', 'hybrid', 'hybrid_gdn', 'hybrid_moe_mtp'])
+    @pytest.mark.parametrize('fused', [False, True])
+    def test_attention_graph_split_with_mhc_recompute(self, kind, fused, monkeypatch):
+        self._run(kind, [CudaGraphModule.attn], fused, monkeypatch, **_ATTENTION_GRAPH_SPLIT)
+
+    @pytest.mark.parametrize('kind', ['gpt_moe', 'hybrid_moe_mtp'])
+    def test_attention_graph_split_boundary(self, kind):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
+        config = _config(kind, [CudaGraphModule.attn], **_ATTENTION_GRAPH_SPLIT)
+        model = _model(kind, config, ProcessGroupCollection.use_mpu_process_groups())
+        layers = list(model.decoder.layers)
+        for mtp in getattr(getattr(model, 'mtp', None), 'layers', []):
+            layers.extend(_get_mtp_te_layers(mtp.mtp_model_layer))
+        graphable = [layer for layer in layers if _layer_is_graphable(layer, config)]
+        assert graphable
+        for layer in layers:
+            if isinstance(layer, HyperConnectionHybridLayer):
+                has_attention = layer._is_attention_graph_split()
+                assert has_attention == (layer in graphable)
+                attention_layer, hyper_connections = layer.inner_layer, [layer.hyper_connection]
+            else:
+                assert layer in graphable
+                attention_layer = layer
+                hyper_connections = [
+                    layer.self_attention_hyper_connection,
+                    layer.mlp_hyper_connection,
+                ]
+            if layer not in graphable:
+                continue
+            static_inputs = layer.get_layer_static_inputs(16, 2)
+            assert set(static_inputs) == {'hidden_states', 'attention_mask'}
+            assert static_inputs['hidden_states'].shape == (16, 2, config.hidden_size)
+            covered = {
+                id(module)
+                for submodule in layer._get_submodules_under_cudagraphs()
+                for module in submodule.modules()
+            }
+            assert id(attention_layer.input_layernorm) in covered
+            assert id(attention_layer.self_attention) in covered
+            for hyper_connection in hyper_connections:
+                assert not {id(module) for module in hyper_connection.modules()} & covered
+
+    def test_attention_graph_split_keeps_gdn_eager_for_scheduler_thd(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
+        config = _config('hybrid_gdn', [CudaGraphModule.attn], **_ATTENTION_GRAPH_SPLIT)
+        model = _model('hybrid_gdn', config, ProcessGroupCollection.use_mpu_process_groups())
+        gdn_wrapper = model.decoder.layers[0]
+        assert gdn_wrapper._is_attention_graph_split()
+        assert _layer_is_graphable(gdn_wrapper, config)
+        # GDN reads packed offsets on the host, so packed THD batches keep it eager.
+        config.sequence_packing_scheduler = 'dp_balanced'
+        assert not _layer_is_graphable(gdn_wrapper, config)
+
+    def test_attention_graph_split_rejects_compound_hybrid_layer(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
+        config = _config('hybrid', [CudaGraphModule.attn], **_ATTENTION_GRAPH_SPLIT)
+        spec = get_gpt_layer_with_transformer_engine_spec()
+        inner = TransformerLayer(config, spec.submodules)
+        with pytest.raises(NotImplementedError, match='attention-only inner layers'):
+            HyperConnectionHybridLayer(config, inner)
+
+    @pytest.mark.parametrize('kind', ['hybrid_moe_mtp', 'gpt_moe'])
+    def test_parallel_capture_replay(self, kind, monkeypatch):
+        self._run(
+            kind,
+            [CudaGraphModule.attn, CudaGraphModule.moe_router],
+            False,
+            monkeypatch,
+            tp=2,
+            cp=2,
+            ep=2,
+        )
+
+    def _run(self, kind, scopes, fused, monkeypatch, tp=1, cp=1, ep=1, **overrides):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=cp,
+            expert_model_parallel_size=ep,
+            expert_tensor_parallel_size=tp,
+        )
+        model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
+        attention_graph_split = overrides.get('mhc_recompute_attn_cuda_graph_split', False)
+        reference_overrides = {
+            name: value
+            for name, value in overrides.items()
+            if name != 'mhc_recompute_attn_cuda_graph_split'
+        }
+        expected_backend_calls = _expected_mhc_backend_calls(fused)
+        backend_calls = _record_mhc_backend_calls(monkeypatch)
+        rebuilds = _count_recompute_rebuilds(monkeypatch)
+        bda_managers = _record_bda_managers(monkeypatch)
+        init_num_microbatches_calculator(
+            rank=0,
+            global_batch_size=2,
+            micro_batch_size=2,
+            data_parallel_size=1,
+            decrease_batch_size_if_needed=False,
+        )
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        config = _config(kind, scopes, fused, tp, cp, ep, **overrides)
+        graphed = _model(kind, config, pg)
+        reference = _model(kind, _config(kind, None, fused, tp, cp, ep, **reference_overrides), pg)
+        reference.load_state_dict(graphed.state_dict(), strict=True)
+        optimizer = torch.optim.SGD(graphed.parameters(), lr=0.01)
+        reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
+        initial_keys = set(graphed.state_dict())
+
+        local_seq = 32 // cp
+        ids = torch.arange(local_seq, device='cuda').expand(2, -1).contiguous()
+        positions = ids.clone()
+        inputs = [
+            torch.randn(local_seq // tp, 2, 128, device='cuda', dtype=torch.bfloat16)
+            for _ in range(4)
+        ]
+
+        def step(model, value):
+            model.zero_grad(set_to_none=True)
+
+            def own_gradient(parameter):
+                # TE reuses gradient buffers between captured backward graphs.
+                # Native DDP immediately copies into owned main_grad storage;
+                # this standalone optimizer must likewise own each .grad before
+                # the next backward graph can reuse its returned buffer.
+                parameter.grad = parameter.grad.clone()
+
+            handles = [
+                parameter.register_post_accumulate_grad_hook(own_gradient)
+                for parameter in model.parameters()
+                if parameter.requires_grad
+            ]
+            try:
+                hidden = value.detach().clone().requires_grad_()
+                output = model(
+                    input_ids=ids, position_ids=positions, attention_mask=None, decoder_input=hidden
+                )
+                output.float().square().mean().backward()
+            finally:
+                for handle in handles:
+                    handle.remove()
+            grads = {
+                name: None if p.grad is None else p.grad.detach().clone()
+                for name, p in model.named_parameters()
+            }
+            return output.detach().clone(), hidden.grad.detach().clone(), grads
+
+        # Warm up off the default stream, as TE does for its own warmup. Retained
+        # AccumulateGrad nodes must not pull the default stream into capture.
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                step(graphed, inputs[0])
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        graphed.zero_grad(set_to_none=True)
+        self.helper = TECudaGraphHelper([graphed], config, 32, 2, pg_collection=pg)
+        expected = list(graphed.decoder.layers)
+        for mtp in getattr(getattr(graphed, 'mtp', None), 'layers', []):
+            expected.extend(_get_mtp_te_layers(mtp.mtp_model_layer))
+        expected = [layer for layer in expected if _layer_is_graphable(layer, config)]
+        assert self.helper.flattened_callables == expected and expected
+        if 'mtp' in kind:
+            # Two MTP depths of two layers each; only attention layers are graphed in the split.
+            assert sum(self.helper.flattened_callables_is_mtp) == (
+                2 if attention_graph_split else 4
+            )
+        self.helper.create_cudagraphs()
+        assert self.helper.graphs_created()
+        # Python dispatch runs when recording a CUDA graph, not on its replay.
+        # Counting capture separately prevents eager warmup from proving this.
+        # The attention graph split captures no mHC operation at all.
+        assert set(backend_calls['capture']) == (
+            set() if attention_graph_split else expected_backend_calls
+        ), backend_calls
+        print(f'mHC fused={fused}; captured backend calls: {dict(backend_calls["capture"])}')
+        assert all(layer.cuda_graphs for layer in expected)
+        assert set(graphed.state_dict()) == initial_keys
+
+        hooks = Counter()
+        graphed._make_forward_pre_hook = lambda: lambda module: hooks.update([id(module)])
+        self.helper.cuda_graph_set_manual_hooks()
+        covered_modules = {
+            id(module)
+            for layer in expected
+            for submodule in layer._get_submodules_under_cudagraphs()
+            for module in submodule.modules()
+            if next(module.parameters(recurse=False), None) is not None
+        }
+        if attention_graph_split:
+            hyper_connections = [
+                module
+                for layer in expected
+                for module in (
+                    [layer.hyper_connection]
+                    if isinstance(layer, HyperConnectionHybridLayer)
+                    else [layer.self_attention_hyper_connection, layer.mlp_hyper_connection]
+                )
+            ]
+            assert (
+                not {id(module) for hc in hyper_connections for module in hc.modules()}
+                & covered_modules
+            )
+        for layer in expected:
+            if isinstance(layer, HyperConnectionHybridLayer) and layer._is_partial_moe_graph():
+                assert (
+                    not {id(module) for module in layer.inner_layer.mlp.experts.modules()}
+                    & covered_modules
+                )
+
+        replay_calls = Counter()
+        for layer in expected:
+            graphs = layer.cuda_graphs
+
+            def counted(*args, _layer=layer, _graph=graphs[0], **kwargs):
+                replay_calls[id(_layer)] += 1
+                return _graph(*args, **kwargs)
+
+            counted.reset = graphs[0].reset
+            layer.cuda_graphs = [counted]
+
+        for index, value in enumerate(inputs):
+            set_current_microbatch(graphed, index)
+            assert all(layer.current_microbatch == index for layer in expected)
+            expected_output, expected_input_grad, expected_grads = step(reference, value)
+            backend_calls['eager'].clear()
+            rebuilds.clear()
+            bda_managers.clear()
+            actual_output, actual_input_grad, actual_grads = step(graphed, value)
+            if attention_graph_split:
+                # mHC runs eagerly around the replayed graphs, and its recompute regions re-run.
+                assert expected_backend_calls <= set(backend_calls['eager']), backend_calls
+                assert rebuilds['rebuild'] > 0
+                # The eager attention-side bias-dropout-add stays a recompute checkpoint.
+                for layer in expected:
+                    assert bda_managers[id(_attention_hyper_connection(layer))] == [True]
+            torch.testing.assert_close(actual_output, expected_output, rtol=2e-2, atol=2e-3)
+            torch.testing.assert_close(actual_input_grad, expected_input_grad, rtol=2e-2, atol=2e-3)
+            assert actual_grads.keys() == expected_grads.keys()
+            for name, expected_grad in expected_grads.items():
+                actual_grad = actual_grads[name]
+                assert (actual_grad is None) == (expected_grad is None), name
+                if expected_grad is not None:
+                    torch.testing.assert_close(
+                        actual_grad,
+                        expected_grad,
+                        rtol=3e-2,
+                        atol=2e-3,
+                        msg=lambda message: f'replay={index} gradient {name}: {message}',
+                    )
+            mhc_grads = [
+                grad
+                for name, grad in actual_grads.items()
+                if 'hyper_connection' in name or 'mhc' in name
+            ]
+            assert mhc_grads and all(grad is not None for grad in mhc_grads)
+            assert any(torch.count_nonzero(grad) for grad in mhc_grads)
+            reference_optimizer.step()
+            optimizer.step()
+            for (name, actual), (reference_name, reference_param) in zip(
+                graphed.named_parameters(), reference.named_parameters()
+            ):
+                assert name == reference_name
+                torch.testing.assert_close(
+                    actual,
+                    reference_param,
+                    rtol=3e-2,
+                    atol=2e-3,
+                    msg=lambda message: f'replay={index} parameter {name}: {message}',
+                )
+            assert all(replay_calls[id(layer)] == index + 1 for layer in expected)
+            assert set(hooks) == covered_modules
+            assert all(count == index + 1 for count in hooks.values())
+        if not fused:
+            assert not any(backend_calls.values()), backend_calls
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize('impl', ['transformer_engine', 'full_iteration'])
+@pytest.mark.parametrize(
+    'extra,error',
+    [
+        ({'recompute_granularity': 'selective', 'recompute_modules': ['mhc']}, 'selective mHC'),
+        (
+            {'fine_grained_activation_offloading': True, 'offload_modules': ['core_attn']},
+            'offloading',
+        ),
+        ({'overlap_moe_expert_parallel_comm': True}, 'EP A2A overlap'),
+    ],
+)
+def test_mhc_graph_combination_guards(impl, extra, error):
+    with pytest.raises((NotImplementedError, AssertionError), match=error):
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            enable_mhc_connections=True,
+            cuda_graph_impl=impl,
+            **extra,
+        )
+
+
+def _split_config(**overrides):
+    kwargs = dict(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        enable_mhc_connections=True,
+        cuda_graph_impl='transformer_engine',
+        cuda_graph_modules=['attn'],
+        **_ATTENTION_GRAPH_SPLIT,
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+@pytest.mark.launch_on_gb200
+def test_mhc_attention_graph_split_config_admits_selective_mhc_recompute():
+    config = _split_config()
+    assert config.cuda_graph_modules == [CudaGraphModule.attn]
+    assert config.recompute_modules == ['mhc']
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize(
+    'overrides,error',
+    [
+        ({'enable_mhc_connections': False, 'recompute_modules': []}, 'enable_mhc_connections'),
+        ({'cuda_graph_impl': 'full_iteration', 'cuda_graph_modules': []}, 'transformer_engine'),
+        ({'cuda_graph_modules': ['attn', 'mlp']}, 'cuda_graph_modules'),
+        ({'recompute_modules': ['core_attn']}, "'mhc' in recompute_modules"),
+        ({'recompute_modules': ['mhc', 'layernorm']}, 'supports recompute_modules'),
+    ],
+)
+def test_mhc_attention_graph_split_config_requirements(overrides, error):
+    with pytest.raises(ValueError, match=error):
+        _split_config(**overrides)
+
+
+@pytest.mark.launch_on_gb200
+def test_mhc_te_graphs_reject_mhc_recompute_without_the_split():
+    with pytest.raises(NotImplementedError, match='mhc_recompute_attn_cuda_graph_split'):
+        _split_config(mhc_recompute_attn_cuda_graph_split=False)
+
+
+@pytest.mark.launch_on_gb200
+def test_mhc_te_graphs_reject_scheduler_thd_without_the_split():
+    with pytest.raises(NotImplementedError, match='scheduler-packed THD'):
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            enable_mhc_connections=True,
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_modules=['attn'],
+            sequence_packing_scheduler='dp_balanced',
+            max_seqlen_per_dp_cp_rank=16,
+            pad_packed_seq_alignment='max',
+            thd_max_packed_sequences=4,
+        )
+
+
+@pytest.mark.launch_on_gb200
+def test_mhc_te_repeated_mtp_is_rejected():
+    with pytest.raises(NotImplementedError, match='independent MTP layers'):
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            enable_mhc_connections=True,
+            cuda_graph_impl='transformer_engine',
+            mtp_num_layers=2,
+            mtp_use_repeated_layer=True,
+        )
+
+
+def _scheduler_thd_split_models(kind, chunks):
+    # One graphable attention layer per pipeline stage and chunk. Hybrid stages also
+    # carry an eager MLP wrapper, which ends their mHC recompute block.
+    config = TransformerConfig(
+        num_layers=(2 if kind == 'gpt' else 4) * chunks,
+        hidden_size=64,
+        ffn_hidden_size=128,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        enable_mhc_connections=True,
+        mhc_num_residual_streams=2,
+        mhc_sinkhorn_iterations=3,
+        cuda_graph_impl='transformer_engine',
+        cuda_graph_modules=[CudaGraphModule.attn],
+        thd_max_packed_sequences=4,
+        cuda_graph_dynamic_microbatches=True,
+        sequence_packing_scheduler='dp_balanced',
+        max_seqlen_per_dp_cp_rank=16,
+        pad_packed_seq_alignment='max',
+        cuda_graph_warmup_steps=1,
+        use_te_rng_tracker=True,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        pipeline_model_parallel_size=2,
+        context_parallel_size=2,
+        virtual_pipeline_model_parallel_size=chunks if chunks > 1 else None,
+        microbatch_group_size_per_vp_stage=2,
+        attention_backend=AttnBackend.fused,
+        deterministic_mode=True,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        is_hybrid_model=kind == 'hybrid',
+        **_ATTENTION_GRAPH_SPLIT,
+    )
+    pg = ProcessGroupCollection.use_mpu_process_groups()
+    models = []
+    for chunk in range(chunks):
+        kwargs = dict(
+            config=config,
+            vocab_size=128,
+            max_sequence_length=32,
+            position_embedding_type='rope',
+            pg_collection=pg,
+            vp_stage=chunk if chunks > 1 else None,
+        )
+        if kind == 'gpt':
+            spec = get_gpt_layer_with_transformer_engine_spec()
+            spec.module = HyperConnectionTransformerLayer
+            spec.submodules.self_attention_hyper_connection = HyperConnectionModule
+            spec.submodules.mlp_hyper_connection = HyperConnectionModule
+            model = GPTModel(transformer_layer_spec=spec, **kwargs)
+        else:
+            model = HybridModel(
+                hybrid_stack_spec=hybrid_stack_spec,
+                hybrid_layer_pattern='|'.join(['*-'] * 2 * chunks),
+                **kwargs,
+            )
+        models.append(
+            DistributedDataParallel(
+                config,
+                DistributedDataParallelConfig(),
+                model.cuda(),
+                disable_bucketing=True,
+                pg_collection=pg,
+            )
+        )
+    return config, models
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not is_te_min_version('2.18.0'), reason='Packed TE graphs require TE >= 2.18')
+@pytest.mark.parametrize('chunks', [1, 2])
+@pytest.mark.parametrize('kind', ['gpt', 'hybrid'])
+def test_attention_graph_split_scheduler_thd_replay(kind, chunks, monkeypatch):
+    """Scheduler-packed THD replay with mHC recompute matches eager mHC layers.
+
+    Each stage runs its whole mHC decoder, so the mHC recompute managers release and rebuild
+    their checkpoints around the replayed attention graphs, while packing changes both the
+    microbatch count and the valid sequence boundaries.
+    """
+    Utils.initialize_model_parallel(
+        pipeline_model_parallel_size=2,
+        context_parallel_size=2,
+        virtual_pipeline_model_parallel_size=chunks if chunks > 1 else None,
+    )
+    rebuilds = _count_recompute_rebuilds(monkeypatch)
+    helper = None
+    # Match training initialization: DDP keeps AccumulateGrad nodes alive, so construct
+    # and warm up on the non-default training stream.
+    training_stream = torch.cuda.Stream()
+    training_stream.wait_stream(torch.cuda.current_stream())
+    try:
+        with torch.cuda.stream(training_stream):
+            monkeypatch.setenv('NVTE_FLASH_ATTN', '0')
+            monkeypatch.setenv('NVTE_FUSED_ATTN', '1')
+            monkeypatch.setenv('NVTE_UNFUSED_ATTN', '0')
+            monkeypatch.setenv('NVTE_ALLOW_NONDETERMINISTIC_ALGO', '0')
+            model_parallel_cuda_manual_seed(321, te_rng_tracker=True, force_reset_rng=True)
+            init_num_microbatches_calculator(
+                rank=0,
+                global_batch_size=4,
+                micro_batch_size=1,
+                data_parallel_size=1,
+                decrease_batch_size_if_needed=False,
+            )
+            config, models = _scheduler_thd_split_models(kind, chunks)
+            helper = TECudaGraphHelper(models, config, 32, 1, optimizers=[])
+            for model, callables in zip(models, helper.callables_per_chunk):
+                assert callables == [
+                    layer
+                    for layer in model.module.decoder.layers
+                    if _layer_is_graphable(layer, config)
+                ]
+                assert len(callables) == 1
+            rotary = models[0].module.rotary_pos_emb(32, packed_seq=True)
+            # (physical, valid) cumulative offsets at the fixed capacity of 4 documents. Compared
+            # documents are partly valid, and the second packing has fewer documents, padded
+            # with repeated trailing offsets as the scheduler pads its metadata.
+            packings = [
+                ([0, 8, 16, 24, 32], [0, 6, 14, 22, 22]),
+                ([0, 16, 32, 32, 32], [0, 12, 28, 28, 28]),
+            ]
+            packed, valid_rows = [], []
+            cp_rank = parallel_state.get_context_parallel_rank()
+            for physical, valid in packings:
+                offsets = [
+                    torch.tensor(values, dtype=torch.int32, device='cuda')
+                    for values in (valid, physical)
+                ]
+                packed.append(
+                    PackedSeqParams(
+                        qkv_format='thd',
+                        cu_seqlens_q=offsets[0],
+                        cu_seqlens_kv=offsets[0].clone(),
+                        cu_seqlens_q_padded=offsets[1],
+                        cu_seqlens_kv_padded=offsets[1].clone(),
+                        max_seqlen_q=32,
+                        max_seqlen_kv=32,
+                        pad_between_seqs=True,
+                    )
+                )
+                # THD context parallelism splits each document into 2*CP chunks and gives this
+                # rank chunks cp_rank and 2*CP-1-cp_rank. Keep only its valid local rows.
+                rows = []
+                for index in range(len(physical) - 1):
+                    length = physical[index + 1] - physical[index]
+                    valid_length = valid[index + 1] - valid[index]
+                    chunk_size = length // 4
+                    for chunk_index in (cp_rank, 3 - cp_rank):
+                        positions = range(chunk_index * chunk_size, (chunk_index + 1) * chunk_size)
+                        rows.extend(position < valid_length for position in positions)
+                valid_rows.append(torch.tensor(rows, device='cuda'))
+                assert len(rows) == 16
+
+            def run_decoder(chunk, mb, hidden):
+                return models[chunk].module.decoder(
+                    hidden_states=hidden,
+                    attention_mask=None,
+                    rotary_pos_emb=rotary,
+                    packed_seq_params=packed[mb % 2],
+                )
+
+            def valid(mb, tensor):
+                return tensor[valid_rows[mb % 2]]
+
+            def parameter_grads(chunk):
+                return {
+                    name: param.main_grad.detach().clone()
+                    for name, param in models[chunk].module.decoder.named_parameters()
+                    if param.requires_grad
+                }
+
+            inputs, expected, expected_params = {}, {}, {}
+            for chunk in range(chunks):
+                for mb in range(4):
+                    hidden = torch.randn(
+                        16, 1, 64, dtype=torch.bfloat16, device='cuda', requires_grad=True
+                    )
+                    inputs[chunk, mb] = hidden.detach().clone()
+                    output = run_decoder(chunk, mb, hidden)
+                    value = output.detach().clone()
+                    valid(mb, output).float().sum().backward()
+                    expected[chunk, mb] = value, hidden.grad.detach().clone()
+                    if mb in (1, 3):
+                        expected_params[chunk, mb + 1] = parameter_grads(chunk)
+                models[chunk].zero_grad_buffer()
+            del hidden, output
+            assert rebuilds['rebuild'] > 0
+
+            helper.create_cudagraphs()
+            assert helper.graphs_created()
+            replays = []
+            graphed_layers = [layer for layers in helper.callables_per_chunk for layer in layers]
+            for layer in graphed_layers:
+                assert len(layer.cuda_graphs) == 4
+                counted_graphs = []
+                for graph_index, graph in enumerate(layer.cuda_graphs):
+
+                    def counted(*args, _layer=layer, _index=graph_index, _graph=graph, **kwargs):
+                        assert _index == _layer.current_microbatch % len(_layer.cuda_graphs)
+                        replays.append((id(_layer), _layer.current_microbatch))
+                        return _graph(*args, **kwargs)
+
+                    counted.reset = graph.reset
+                    counted_graphs.append(counted)
+                layer.cuda_graphs = counted_graphs
+            bda_managers = _record_bda_managers(monkeypatch)
+            for count in (4, 2, 4):
+                _, _, warmup, _ = get_pp_rank_microbatches(
+                    count, chunks, 2, p2p_communicator=helper.p2p_communicator
+                )
+                order = convert_schedule_table_to_order(
+                    warmup, chunks, get_schedule_table(count, chunks, 2)
+                )
+                forwards, backwards, pending = [0] * chunks, [0] * chunks, {}
+                rebuilds.clear()
+                replays.clear()
+                bda_managers.clear()
+                for entry in order:
+                    chunk = abs(entry) - 1
+                    if entry > 0:
+                        mb = forwards[chunk]
+                        forwards[chunk] += 1
+                        set_current_microbatch(models[chunk], mb)
+                        hidden = inputs[chunk, mb].clone().requires_grad_(True)
+                        output = run_decoder(chunk, mb, hidden)
+                        torch.testing.assert_close(
+                            valid(mb, output),
+                            valid(mb, expected[chunk, mb][0]),
+                            msg=lambda m: f'output count={count} chunk={chunk} mb={mb}: {m}',
+                        )
+                        pending[chunk, mb] = hidden, output
+                    else:
+                        mb = backwards[chunk]
+                        backwards[chunk] += 1
+                        hidden, output = pending.pop((chunk, mb))
+                        valid(mb, output).float().sum().backward()
+                        torch.testing.assert_close(
+                            hidden.grad,
+                            expected[chunk, mb][1],
+                            msg=lambda m: f'input grad count={count} chunk={chunk} mb={mb}: {m}',
+                        )
+                assert not pending
+                # Every graphed layer replayed once per packed microbatch, and the mHC recompute
+                # regions around the replays, including the attention-side bias-dropout-add,
+                # re-ran in backward.
+                assert sorted(replays) == sorted(
+                    (id(layer), mb) for layer in graphed_layers for mb in range(count)
+                )
+                assert rebuilds['rebuild'] > 0
+                for layer in graphed_layers:
+                    assert bda_managers[id(_attention_hyper_connection(layer))] == [True] * count
+                for chunk in range(chunks):
+                    actual = parameter_grads(chunk)
+                    assert actual.keys() == expected_params[chunk, count].keys()
+                    for name, grad in actual.items():
+                        torch.testing.assert_close(
+                            grad,
+                            expected_params[chunk, count][name],
+                            msg=lambda m: f'parameter {name} count={count} chunk={chunk}: {m}',
+                        )
+                    models[chunk].zero_grad_buffer()
+    finally:
+        torch.cuda.current_stream().wait_stream(training_stream)
+        if helper is not None and helper.graphs_created():
+            helper.delete_cuda_graphs()
+        destroy_num_microbatches_calculator()
+        Utils.destroy_model_parallel()

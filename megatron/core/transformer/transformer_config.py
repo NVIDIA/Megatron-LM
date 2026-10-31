@@ -1334,6 +1334,20 @@ class TransformerConfig(ModelParallelConfig):
     cuda_graph_modules has no effect when cuda_graph_impl="none" and must be empty when
     cuda_graph_impl="full_iteration"."""
 
+    thd_max_packed_sequences: Optional[int] = None
+    """THD metadata capacity, including the dummy padding document.
+
+    Bounds real-document packing and fixes all four cumulative-offset tensor
+    shapes in eager and TE graph execution. Padding reserves one document slot.
+    """
+
+    cuda_graph_dynamic_microbatches: bool = False
+    """Allow TE graph replay when packing reduces the source microbatch count.
+
+    A fixed source global batch size bounds graph instances. Input slots stay
+    live until backward, independently of the number of packed microbatches.
+    """
+
     cuda_graph_modules: Union[str, CudaGraphModule, List[str], List[CudaGraphModule]] = "full"
     """Selects training capture coverage within per-layer CUDA graphs (local and
     transformer_engine implementations).
@@ -1438,6 +1452,21 @@ class TransformerConfig(ModelParallelConfig):
     If None, all layers in the transformer block share a single recompute block.
 
     Must be a positive integer when set."""
+
+    mhc_recompute_attn_cuda_graph_split: bool = False
+    """Combine selective mHC recompute with attention-only Transformer Engine CUDA graphs.
+
+    Each mHC attention sublayer then captures only its input layernorm and self-attention.
+    The mHC aggregate before the graph and the mHC bias-dropout-add after it run eagerly, so
+    the mHC recompute manager registers and recomputes them as in eager training. TE copies
+    the eager aggregate into the graph's static input and owns that copy for the graph's
+    backward, so no checkpoint output aliases graph memory and the aggregate itself is not
+    checkpointed. The MLP sublayer stays eager.
+
+    Requires ``cuda_graph_impl='transformer_engine'``, ``cuda_graph_modules=['attn']`` and
+    selective recompute of ``mhc``, optionally with ``mla_up_proj``. Applies to GPT
+    ``HyperConnectionTransformerLayer`` and to HybridStack mHC wrappers around attention-only
+    layers; other HybridStack wrappers run eagerly."""
 
     ####################
     # Wide Residual Configuration
@@ -4007,6 +4036,71 @@ class TransformerConfig(ModelParallelConfig):
             )
             setattr(self, migration_attr, migration_value)
         self.cuda_graph_modules = normalized_scopes
+
+        uses_mhc_recompute = self.recompute_granularity == 'selective' and 'mhc' in (
+            self.recompute_modules or []
+        )
+        if self.mhc_recompute_attn_cuda_graph_split:
+            if not self.enable_mhc_connections:
+                raise ValueError(
+                    'mhc_recompute_attn_cuda_graph_split requires enable_mhc_connections=True.'
+                )
+            if self.cuda_graph_impl != 'transformer_engine':
+                raise ValueError(
+                    'mhc_recompute_attn_cuda_graph_split requires '
+                    "cuda_graph_impl='transformer_engine'."
+                )
+            if self.cuda_graph_modules != [CudaGraphModule.attn]:
+                raise ValueError(
+                    "mhc_recompute_attn_cuda_graph_split requires cuda_graph_modules=['attn']; "
+                    'the mHC MLP sublayers stay eager.'
+                )
+            if not uses_mhc_recompute:
+                raise ValueError(
+                    'mhc_recompute_attn_cuda_graph_split requires selective recompute with '
+                    "'mhc' in recompute_modules."
+                )
+            if set(self.recompute_modules) - {'mhc', 'mla_up_proj'}:
+                raise ValueError(
+                    'mhc_recompute_attn_cuda_graph_split supports recompute_modules '
+                    f"['mhc'] or ['mhc', 'mla_up_proj']; got {self.recompute_modules}."
+                )
+        if self.enable_mhc_connections and self.cuda_graph_impl in (
+            'transformer_engine',
+            'full_iteration',
+        ):
+            if uses_mhc_recompute and not self.mhc_recompute_attn_cuda_graph_split:
+                raise NotImplementedError(
+                    'mHC CUDA graphs capture the mHC aggregate and bias-dropout-add, which '
+                    'selective mHC recompute must run eagerly. For Transformer Engine graphs, '
+                    'set mhc_recompute_attn_cuda_graph_split=True to capture only the input '
+                    'layernorm and self-attention of each mHC attention sublayer.'
+                )
+            if self.fine_grained_activation_offloading or self.cpu_offloading:
+                raise NotImplementedError(
+                    'mHC CUDA graphs do not yet support activation offloading.'
+                )
+            if self.overlap_moe_expert_parallel_comm:
+                raise NotImplementedError('mHC CUDA graphs do not yet support EP A2A overlap.')
+            if (
+                self.cuda_graph_impl == 'transformer_engine'
+                and self.sequence_packing_scheduler is not None
+                and not self.mhc_recompute_attn_cuda_graph_split
+            ):
+                raise NotImplementedError(
+                    'mHC TE graphs support scheduler-packed THD sequences only with '
+                    'mhc_recompute_attn_cuda_graph_split.'
+                )
+            if self.cuda_graph_impl == 'transformer_engine' and self.mtp_use_repeated_layer:
+                raise NotImplementedError(
+                    'mHC TE graphs require independent MTP layers; disable mtp_use_repeated_layer.'
+                )
+            if self.cuda_graph_impl == 'transformer_engine' and self.num_moe_experts:
+                if not self.cuda_graph_modules or CudaGraphModule.moe in self.cuda_graph_modules:
+                    raise NotImplementedError(
+                        'mHC TE graphs support partial MoE capture only. Select attn and/or '
+                        'moe_router (optionally moe_preprocess), not whole-layer or moe capture.'
+                    )
         assert all(
             isinstance(scope, CudaGraphModule) for scope in self.cuda_graph_modules
         ), f"cuda_graph_modules must be a list of CudaGraphModule, got {self.cuda_graph_modules}."
@@ -4017,6 +4111,32 @@ class TransformerConfig(ModelParallelConfig):
             "local",
             "full_iteration",
         ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
+
+        if self.thd_max_packed_sequences is not None:
+            assert self.sequence_packing_scheduler == "dp_balanced"
+            assert not self.dynamic_context_parallel
+            pad_enabled = self.pad_packed_seq_alignment is not None or (
+                self.fp8 is not None and self.fp8_recipe == Fp8Recipe.mxfp8
+            )
+            assert self.thd_max_packed_sequences >= (
+                2 if pad_enabled else 1
+            ), "THD metadata capacity must leave room for the dummy padding document."
+        if self.cuda_graph_dynamic_microbatches:
+            assert self.cuda_graph_impl == "transformer_engine"
+            assert self.sequence_packing_scheduler == "dp_balanced"
+            assert not self.overlap_moe_expert_parallel_comm and not self.delay_wgrad_compute
+            assert not self.moe_paged_stash
+        if (
+            self.sequence_packing_scheduler is not None
+            and self.cuda_graph_impl == "transformer_engine"
+        ):
+            assert self.pad_packed_seq_alignment in ("max", self.max_seqlen_per_dp_cp_rank)
+            assert self.thd_max_packed_sequences is not None
+            assert self.pipeline_model_parallel_size == 1 or self.cuda_graph_dynamic_microbatches
+            assert self.cuda_graph_modules == [
+                CudaGraphModule.attn
+            ], "Scheduler-produced THD CUDA graphs currently support attention capture only."
+            assert is_te_min_version("2.18.0"), "Packed TE graphs require TE >= 2.18.0."
 
         self.inference_cuda_graph_scope = normalize_inference_cuda_graph_scope(
             self.inference_cuda_graph_scope, self.cuda_graph_impl
