@@ -374,6 +374,39 @@ def test_mxfp8_quantize_replays():
     assert_replays_bit_exact(fn, (x,), backward=False, what="mxfp8_quantize")
 
 
+def test_quantize_routed_mxfp8_input_replays():
+    """The valid-token-gated routed-layout MXFP8 quantizer replays bit-exactly."""
+    from megatron.core.inference.quantization.mxfp8_quantize import quantize_routed_mxfp8_input
+
+    seeded()
+    x = torch.randn(4096, 2688, device="cuda", dtype=torch.bfloat16)
+    valid = _dev_scalar(2500)
+
+    def fn(x):
+        data, scale = quantize_routed_mxfp8_input(x, 2688, valid)
+        return data[:2500].view(torch.uint8), scale[:2500]
+
+    assert_replays_bit_exact(fn, (x,), backward=False, what="quantize_routed_mxfp8_input")
+
+
+def test_flashinfer_routing_pack_replays():
+    """The valid-token-gated routing pack feeding the FlashInfer routed MoE replays bit-exactly."""
+    from megatron.core.inference.moe.flashinfer_mxfp8 import pack_routed_mxfp8_routing
+
+    seeded()
+    rows, valid, topk = 4096, 2500, 6
+    valid_tokens = _dev_scalar(valid)
+    routing_map = torch.randint(-1, 128, (rows, topk), device="cuda", dtype=torch.int64)
+    probs = torch.rand(rows, topk, device="cuda", dtype=torch.float32)
+
+    def fn(routing_map, probs):
+        return pack_routed_mxfp8_routing(routing_map, probs, valid_tokens)
+
+    assert_replays_bit_exact(
+        fn, (routing_map, probs), backward=False, what="pack_routed_mxfp8_routing"
+    )
+
+
 @pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
 def test_mxfp8_quantize_rows_replays():
     """Live-row MXFP8 quantization replays and matches the whole-buffer kernel on live rows."""

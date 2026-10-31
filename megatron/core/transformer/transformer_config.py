@@ -1555,6 +1555,9 @@ class TransformerConfig(ModelParallelConfig):
     host-known EP-wide token ceiling fits. Prefill, mixed, static-inference,
     and oversized decode graphs retain the full dispatcher buffer. Requires
     the NVLS inference dispatcher and EP > 1.
+
+    FlashInfer routed MXFP8 MoE ignores it, with a warning: that path bounds its work by
+    the dispatcher's device-side token count instead.
     """
 
     inference_moe_nvfp4_recipe: Optional[Literal['per_token']] = None
@@ -2345,6 +2348,12 @@ class TransformerConfig(ModelParallelConfig):
                         "fp8_recipe='mxfp8' or inference_moe_nvfp4_recipe, "
                         "inference_moe_token_dispatcher_type='nvls' and "
                         "expert_model_parallel_size > 1"
+                    )
+                if self.inference_moe_nvfp4_recipe is None:
+                    warnings.warn(
+                        "inference_flashinfer_mxfp8_token_capacity is ignored by FlashInfer routed "
+                        "MXFP8 MoE, which bounds its work by the dispatcher's device-side token "
+                        "count."
                     )
 
             if self.batch_invariant_mode:

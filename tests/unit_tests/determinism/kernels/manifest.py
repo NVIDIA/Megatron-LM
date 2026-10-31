@@ -416,7 +416,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/transformer/moe/experts.py",),
         tests=(K + "test_moe_kernels.py",),
         kind="te-wrapper",
-        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
+        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert; the "
+        "InferenceGroupedMLP FlashInfer MXFP8 path is replayed on Blackwell with FlashInfer.",
     ),
     KernelEntry(
         name="moe_fused_a2a",
@@ -677,6 +678,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "ordered_reduce_scatter_v (multi-rank) is not replayed here.",
     ),
     KernelEntry(
+        name="inference_flashinfer_active_tokens",
+        sources=("megatron/core/inference/moe/flashinfer_active_tokens.py",),
+        tests=(K + "test_flashinfer_active_tokens.py",),
+        kind="triton",
+        training_path=False,
+        notes="Temporary stand-in for FlashInfer's num_active_tokens (flashinfer-ai/flashinfer#6783 "
+        "and #6784): persistent finalize / combine kernels over the live rows. Delete this entry "
+        "with the module once the FlashInfer floor ships the argument (unwind steps in the module "
+        "docstring).",
+    ),
+    KernelEntry(
         name="batch_invariant_kernels",
         sources=("megatron/core/transformer/custom_layers/batch_invariant_kernels.py",),
         tests=(
@@ -828,7 +840,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_mxfp8_quantize_replays) or FlashInfer mxfp8_quantize / mm_mxfp8 / fused MoE, which need "
         "flashinfer on Blackwell. The clamped CUTLASS BF16/MXFP8 adapters are replayed "
         "by test_flashinfer_clamped_relu2_replays with top-k=1, including CUDA graphs; "
-        "the default atomic top-k finalize and routed backend are not covered by that test.",
+        "the default atomic top-k finalize and routed backend are not covered by that test. "
+        "flashinfer_mxfp8.py's valid-token-gated routing pack is replayed in "
+        "test_flashinfer_routing_pack_replays.",
     ),
     KernelEntry(
         name="inference_flashinfer_nvfp4_moe",

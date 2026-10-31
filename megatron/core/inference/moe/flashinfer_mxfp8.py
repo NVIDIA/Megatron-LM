@@ -3,11 +3,9 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 
 try:
     from flashinfer import mxfp8_quantize
@@ -20,12 +18,8 @@ except ImportError as exc:
     _FLASHINFER_CUTLASS_MXFP8_IMPORT_ERROR = exc
 
 try:
-    from flashinfer import mxfp8_quantize, shuffle_matrix_a
-    from flashinfer.fused_moe import (
-        Fp8QuantizationType,
-        WeightLayout,
-        trtllm_fp8_block_scale_routed_moe,
-    )
+    from flashinfer import shuffle_matrix_a
+    from flashinfer.fused_moe import Fp8QuantizationType, WeightLayout
     from flashinfer.utils import get_shuffle_matrix_sf_a_row_indices
 
     HAVE_FLASHINFER_ROUTED_MXFP8 = True
@@ -34,10 +28,25 @@ except ImportError as exc:
     HAVE_FLASHINFER_ROUTED_MXFP8 = False
     _FLASHINFER_ROUTED_MXFP8_IMPORT_ERROR = exc
 
+# UNWIND(flashinfer num_active_tokens): once flashinfer-ai/flashinfer#6784 ships,
+# import trtllm_fp8_block_scale_routed_moe from flashinfer.fused_moe instead.
+from megatron.core.inference.moe.flashinfer_active_tokens import trtllm_fp8_block_scale_routed_moe
+from megatron.core.inference.quantization.mxfp8_quantize import quantize_routed_mxfp8_input
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.utils import null_decorator
 
-logger = logging.getLogger(__name__)
-_LOGGED_TOKEN_POLICIES: set[tuple[str, int, int]] = set()
+try:
+    import triton
+    import triton.language as tl
+
+    HAVE_TRITON = True
+except ImportError:
+    from unittest.mock import MagicMock
+
+    triton = MagicMock()
+    triton.jit = null_decorator
+    tl = MagicMock()
+    HAVE_TRITON = False
 
 
 def require_flashinfer_cutlass_mxfp8() -> None:
@@ -311,42 +320,50 @@ def prepare_routed_mxfp8_weights(
     )
 
 
+@triton.jit
+def _pack_routing_kernel(
+    routing_ptr,  # [rows, TOPK] int expert ids; -1 marks an unrouted slot
+    probs_ptr,  # [rows, TOPK] fp32 routing weights
+    packed_ptr,  # [rows, TOPK] int32 output: (expert_id << 16) | bf16 weight bits
+    valid_tokens_ptr,  # scalar int32 CUDA tensor: rows beyond it are packed as expert -1
+    num_entries,  # rows * TOPK
+    TOPK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Pack routing into TRT-LLM's format, forcing every row beyond valid_tokens to expert -1."""
+    pid = tl.program_id(0)
+    valid_entries = tl.load(valid_tokens_ptr) * TOPK
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    in_bounds = offs < num_entries
+    live = in_bounds & (offs < valid_entries)
+    expert_ids = tl.load(routing_ptr + offs, mask=live, other=-1).to(tl.int32)
+    probs = tl.load(probs_ptr + offs, mask=live, other=0.0).to(tl.float32)
+    # Round-to-nearest-even fp32 -> bf16 on the bit pattern (probabilities are finite).
+    prob_bits = probs.to(tl.int32, bitcast=True)
+    weight_bits = ((prob_bits + 0x7FFF + ((prob_bits >> 16) & 1)) >> 16) & 0xFFFF
+    tl.store(packed_ptr + offs, (expert_ids << 16) | weight_bits, mask=in_bounds)
+
+
 def pack_routed_mxfp8_routing(
-    expert_ids: torch.Tensor, probabilities: torch.Tensor
+    routing_map: torch.Tensor, probs: torch.Tensor, valid_tokens: torch.Tensor
 ) -> torch.Tensor:
-    """Pack global expert IDs and BF16 routing weights for TRT-LLM MoE."""
-    probability_bits = (
-        probabilities.to(torch.bfloat16).contiguous().view(torch.int16).to(torch.int32)
+    """Pack expert ids and BF16 routing weights as `(expert_id << 16) | weight_bits` int32.
+
+    Every slot of rows at or beyond valid_tokens is packed as expert -1, so the TRT-LLM routing
+    kernel skips them regardless of the stale contents of the buffers.
+    """
+    if not HAVE_TRITON:
+        raise RuntimeError("FlashInfer routed MXFP8 MoE requires triton for its routing pack.")
+    rows, topk = routing_map.shape
+    assert (
+        probs.shape == routing_map.shape and routing_map.is_contiguous() and probs.is_contiguous()
     )
-    return (expert_ids.to(torch.int32) << 16) | (probability_bits & 0xFFFF)
-
-
-def _unwrap_output(output) -> torch.Tensor:
-    """Normalize FlashInfer's 0.6.x tensor/list return variants."""
-    if isinstance(output, (list, tuple)):
-        return output[0]
-    return output
-
-
-def quantize_routed_mxfp8_input(
-    hidden_states: torch.Tensor, padded_hidden_size: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pad and quantize routed-MoE input, returning a 2D uint8 scale matrix."""
-    require_flashinfer_routed_mxfp8()
-    hidden_padding = padded_hidden_size - hidden_states.shape[-1]
-    if hidden_padding < 0:
-        raise ValueError(
-            f"padded hidden size {padded_hidden_size} is smaller than input hidden size "
-            f"{hidden_states.shape[-1]}"
-        )
-    padded_hidden = F.pad(hidden_states, (0, hidden_padding)) if hidden_padding else hidden_states
-    quantized_hidden, hidden_scale = mxfp8_quantize(padded_hidden, False)
-    hidden_scale = (
-        hidden_scale.contiguous()
-        .view(torch.uint8)
-        .reshape(hidden_states.shape[0], padded_hidden.shape[1] // 32)
+    packed = torch.empty(rows, topk, dtype=torch.int32, device=routing_map.device)
+    num_entries, block = rows * topk, 1024
+    _pack_routing_kernel[(triton.cdiv(num_entries, block),)](
+        routing_map, probs, packed, valid_tokens, num_entries, TOPK=topk, BLOCK=block
     )
-    return quantized_hidden, hidden_scale
+    return packed
 
 
 def select_routed_mxfp8_active_rows(
@@ -367,6 +384,13 @@ def select_routed_mxfp8_active_rows(
     if use_bounded_rows:
         return min(token_capacity, full_rows), "bounded-decode"
     return full_rows, "full"
+
+
+def _unwrap_output(output) -> torch.Tensor:
+    """Normalize FlashInfer's 0.6.x tensor/list return variants."""
+    if isinstance(output, (list, tuple)):
+        return output[0]
+    return output
 
 
 def flashinfer_cutlass_mxfp8_moe(
@@ -450,10 +474,16 @@ def flashinfer_routed_mxfp8_moe_prequantized(
     local_expert_offset: int,
     top_k: int,
     activation_type: int,
+    output: torch.Tensor,
+    num_active_tokens: torch.Tensor,
 ) -> torch.Tensor:
-    """Launch routed MXFP8 MoE with prequantized input and packed routing."""
+    """Launch routed MXFP8 MoE with prequantized input and packed routing.
+
+    The kernel routes, computes and finalizes only rows [0, num_active_tokens), written in fp32
+    into `output`; the rows beyond are left untouched. Returns `output`.
+    """
     require_flashinfer_routed_mxfp8()
-    output = trtllm_fp8_block_scale_routed_moe(
+    trtllm_fp8_block_scale_routed_moe(
         topk_ids=packed_routing,
         routing_bias=None,
         hidden_states=quantized_hidden,
@@ -476,11 +506,13 @@ def flashinfer_routed_mxfp8_moe_prequantized(
         use_shuffled_weight=True,
         weight_layout=WeightLayout.MajorK.value,
         do_finalize=True,
+        output=output,
+        num_active_tokens=num_active_tokens,
         tune_max_num_tokens=max(quantized_hidden.shape[0], 128),
         fp8_quantization_type=Fp8QuantizationType.MxFp8,
         activation_type=activation_type,
     )
-    return _unwrap_output(output)[:, : fc2_weight.logical_rows]
+    return output
 
 
 def flashinfer_routed_mxfp8_moe(
@@ -494,18 +526,24 @@ def flashinfer_routed_mxfp8_moe(
     local_expert_offset: int,
     activation_type: int,
     out: torch.Tensor | None = None,
-    token_capacity: int | None = None,
-    use_bounded_rows: bool = False,
+    valid_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run the FlashInfer TRT-LLM routed MXFP8 MoE kernel.
+    """Run the FlashInfer TRT-LLM routed MXFP8 MoE kernel on a fixed-size token buffer.
 
-    When token_capacity is set and the controller marks the current graph safe,
-    only that fixed prefix is processed. Prefill, mixed steps, and too-large decode
-    configurations process the full input.
-    Invalid rows in the bounded prefix must already have expert ID -1.
+    Args:
+        hidden_states: [rows, hidden_size] bf16 gathered tokens; only [0, valid_tokens) are live.
+        routing_map: [rows, top_k] expert ids; -1 marks an unrouted slot.
+        probabilities: [rows, top_k] fp32 routing weights.
+        fc1_weight, fc2_weight: prepared TRT-LLM Major-K expert weights.
+        num_experts: global expert count.
+        local_expert_offset: first global expert id owned by this rank.
+        activation_type: FlashInfer ActivationType value.
+        out: optional contiguous fp32 [rows, hidden_size] buffer, e.g. the reduce-scatter
+            symmetric buffer; allocated when None.
+        valid_tokens: scalar int32 CUDA tensor with the live row count; None -> every row is live.
 
-    The row choice is made when each CUDA graph is built, so graph replay sees fixed
-    shapes/addresses.
+    Returns:
+        `out`. Rows at or beyond valid_tokens are left untouched.
     """
     if hidden_states.shape[-1] != fc1_weight.logical_cols:
         raise ValueError(
@@ -521,31 +559,22 @@ def flashinfer_routed_mxfp8_moe(
             f"FlashInfer routed MoE requires FP32 probabilities; got {probabilities.dtype}"
         )
 
-    full_rows = hidden_states.shape[0]
-    active_rows, policy = select_routed_mxfp8_active_rows(
-        full_rows, token_capacity=token_capacity, use_bounded_rows=use_bounded_rows
-    )
-    if token_capacity is not None:
-        policy_key = (policy, token_capacity, full_rows)
-        if policy_key not in _LOGGED_TOKEN_POLICIES:
-            _LOGGED_TOKEN_POLICIES.add(policy_key)
-            logger.info(
-                "FlashInfer MXFP8 token policy: %s active_rows=%d full_rows=%d "
-                "configured_capacity=%d",
-                policy,
-                active_rows,
-                full_rows,
-                token_capacity,
-            )
+    rows, hidden_size = hidden_states.shape[0], fc2_weight.logical_rows
+    if valid_tokens is None:
+        valid_tokens = torch.full((1,), rows, dtype=torch.int32, device=hidden_states.device)
+    if out is None:
+        out = torch.empty(rows, hidden_size, dtype=torch.float32, device=hidden_states.device)
+    elif out.shape != (rows, hidden_size) or out.dtype != torch.float32 or not out.is_contiguous():
+        raise ValueError(
+            f"out must be a contiguous fp32 [{rows}, {hidden_size}] buffer; got {out.dtype} "
+            f"{tuple(out.shape)}"
+        )
 
-    selected_hidden_states = hidden_states[:active_rows]
-    selected_routing_map = routing_map[:active_rows]
-    selected_probabilities = probabilities[:active_rows]
     quantized_hidden, hidden_scale = quantize_routed_mxfp8_input(
-        selected_hidden_states, fc1_weight.padded_cols
+        hidden_states, fc1_weight.padded_cols, valid_tokens
     )
-    packed_routing = pack_routed_mxfp8_routing(selected_routing_map, selected_probabilities)
-    output = flashinfer_routed_mxfp8_moe_prequantized(
+    packed_routing = pack_routed_mxfp8_routing(routing_map, probabilities, valid_tokens)
+    return flashinfer_routed_mxfp8_moe_prequantized(
         quantized_hidden,
         hidden_scale,
         packed_routing,
@@ -553,15 +582,8 @@ def flashinfer_routed_mxfp8_moe(
         fc2_weight,
         num_experts=num_experts,
         local_expert_offset=local_expert_offset,
-        top_k=selected_routing_map.shape[1],
+        top_k=routing_map.shape[1],
         activation_type=activation_type,
+        output=out,
+        num_active_tokens=valid_tokens,
     )
-
-    if out is not None:
-        if out.shape[0] < output.shape[0] or out.shape[1:] != output.shape[1:]:
-            raise ValueError(
-                f"output buffer shape {tuple(out.shape)} cannot hold {tuple(output.shape)}"
-            )
-        out[: output.shape[0]].copy_(output)
-        return out
-    return output

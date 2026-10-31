@@ -94,6 +94,10 @@ except ImportError:
 
 from megatron.core.inference.moe import ActivationType as McoreActivationType
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
+
+# UNWIND(flashinfer num_active_tokens): once flashinfer-ai/flashinfer#6783 ships,
+# import cutlass_fused_moe from flashinfer.fused_moe instead.
+from megatron.core.inference.moe.flashinfer_active_tokens import cutlass_fused_moe
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
     FlashInferCutlassMXFP8Weight,
     FlashInferRoutedMXFP8Weight,
@@ -1792,9 +1796,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     num_experts=self.num_local_experts * self.ep_group.size(),
                     local_expert_offset=self.ep_group.rank() * self.num_local_experts,
                     activation_type=self._flashinfer_activation_type.value,
+                    valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
                     out=out,
-                    token_capacity=self._flashinfer_mxfp8_token_capacity,
-                    use_bounded_rows=InferenceMode.use_bounded_mxfp8_rows(),
                 )
             return output, None
         if self._nvfp4_weights is not None:
@@ -1811,6 +1814,30 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 use_bounded_rows=InferenceMode.use_bounded_mxfp8_rows(),
             )
             return output, None
+        rsv = NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None
+        # The NVLS dispatcher reads the fp32 RSV buffer back whenever its expert-TP x EP group has
+        # more than one rank; then the kernel finalizes only the live rows, in fp32, into it.
+        if rsv is not None and self.ep_group.size() * self.config.expert_tensor_parallel_size > 1:
+            cutlass_fused_moe(
+                hidden_states,
+                routing_map.int(),
+                probs,
+                self._fc1_weight,
+                self._fc2_weight,
+                torch.float32,
+                quant_scales=None,
+                activation_type=self._flashinfer_activation_type,
+                **(
+                    {"clamped_relu2_limit": self._flashinfer_clamp_limit}
+                    if self._activation_clamp_scale is not None
+                    else {}
+                ),
+                ep_size=self.ep_group.size(),
+                ep_rank=self.ep_group.rank(),
+                output=rsv,
+                num_active_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
+            )
+            return rsv, None
         output = fused_moe.cutlass_fused_moe(
             hidden_states,
             routing_map.int(),
