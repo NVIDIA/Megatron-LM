@@ -29,6 +29,7 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.extensions.transformer_engine import (
     mark_grouped_tensor as _mark_te_grouped_tensor,
 )
+from megatron.core.fp8_utils import is_grouped_tensor
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -138,6 +139,25 @@ def _require_te_tanh_clamp_support(config) -> None:
         "Transformer Engine providing ops.ScaledTanhSReLU(tanh_clamp_scale=...). Upgrade "
         "Transformer Engine, or unset use_transformer_engine_op_fuser to use the unfused path."
     )
+
+
+def _paged_stash_group_start(
+    hidden_states: torch.Tensor, probs: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Mark the start of the expert layer group for paged stashing.
+
+    The schedule hook is an identity autograd Function, whose output autograd derives with
+    ``view_as``. A Transformer Engine GroupedTensor, the expert input under MXFP8 token dispatch,
+    does not support that, so the hook then goes on the probs: they feed the same fused op, so
+    the hook still runs before its forward and after its backward.
+    """
+    if not is_grouped_tensor(hidden_states):
+        return paged_stash_group_start(hidden_states), probs
+    assert probs.requires_grad or not torch.is_grad_enabled(), (
+        "Paged stashing with a GroupedTensor expert input needs probs that require grad, to run "
+        "the schedule hook in backward."
+    )
+    return hidden_states, paged_stash_group_start(probs)
 
 
 class GroupedLinearFc1Interface(Protocol):
@@ -896,12 +916,16 @@ class TEGroupedMLP(MegatronModule):
         self._ensure_main_grad(self.linear_fc1)
         self._ensure_main_grad(self.linear_fc2)
 
-    def _get_paged_stash_scope(self, permuted_local_hidden_states, tokens_per_expert):
-        """Start a paged-stash group and return the input and saved-tensor context."""
+    def _get_paged_stash_scope(
+        self, permuted_local_hidden_states, permuted_probs, tokens_per_expert
+    ):
+        """Start a paged-stash group and return the input, probs and saved-tensor context."""
         if not self.config.moe_paged_stash:
-            return permuted_local_hidden_states, nullcontext()
+            return permuted_local_hidden_states, permuted_probs, nullcontext()
 
-        permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
+        permuted_local_hidden_states, permuted_probs = _paged_stash_group_start(
+            permuted_local_hidden_states, permuted_probs
+        )
         max_num_tokens = permuted_local_hidden_states.shape[0]
         # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
         # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
@@ -909,11 +933,15 @@ class TEGroupedMLP(MegatronModule):
         avg_num_tokens = (
             int(max_num_tokens // cap_factor) if cap_factor is not None and cap_factor > 0 else None
         )
-        return permuted_local_hidden_states, get_paged_stash_context(
-            name="grouped_mlp",
-            max_num_tokens=max_num_tokens,
-            num_tokens_tensor=tokens_per_expert.sum(),
-            avg_num_tokens=avg_num_tokens,
+        return (
+            permuted_local_hidden_states,
+            permuted_probs,
+            get_paged_stash_context(
+                name="grouped_mlp",
+                max_num_tokens=max_num_tokens,
+                num_tokens_tensor=tokens_per_expert.sum(),
+                avg_num_tokens=avg_num_tokens,
+            ),
         )
 
     def _fused_forward(
@@ -979,8 +1007,8 @@ class TEGroupedMLP(MegatronModule):
                 "The Transformer Engine operation-fuser MoE path requires "
                 "moe_use_grouped_tensor=True."
             )
-        permuted_local_hidden_states, stash_context = self._get_paged_stash_scope(
-            permuted_local_hidden_states, tokens_per_expert
+        permuted_local_hidden_states, permuted_probs, stash_context = self._get_paged_stash_scope(
+            permuted_local_hidden_states, permuted_probs, tokens_per_expert
         )
         fine_grained_activation_offloading = getattr(self, "offload_fused_group_mlp", False)
         offload_name = "fused_group_mlp"
@@ -1308,8 +1336,8 @@ class TEGroupedMLP(MegatronModule):
         elif isinstance(tokens_per_expert, torch.Tensor):
             tokens_per_expert = tokens_per_expert.tolist()
 
-        permuted_local_hidden_states, stash_context = self._get_paged_stash_scope(
-            permuted_local_hidden_states, tokens_per_expert
+        permuted_local_hidden_states, permuted_probs, stash_context = self._get_paged_stash_scope(
+            permuted_local_hidden_states, permuted_probs, tokens_per_expert
         )
         with stash_context:
             output = self._unfused_forward(
