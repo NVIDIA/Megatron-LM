@@ -5719,6 +5719,85 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
+    def test_chunked_prefill_waits_for_whole_prompt_kv(self) -> None:
+        """A long prompt must not start a chunked prefill it cannot finish.
+
+        Nine usable 8-token blocks, a 32-token step budget, and a 3-block paused budget.
+        Request 0 decodes in one block. Request 1's 67-token prompt needs nine blocks, so
+        only eight are free. Had its chunks taken all eight, request 0 would pause for a
+        second block within the paused budget, and neither request could ever move.
+        Both must finish.
+        """
+        block_size_tokens = 8
+
+        def config(**kwargs):
+            return DynamicEngineTestConfig(
+                num_requests=0,
+                max_sequence_length=128,
+                context_block_size_tokens=block_size_tokens,
+                context_max_requests=3,
+                context_max_tokens=32,
+                enable_chunked_prefill=True,
+                model_provider="gpt",
+                **kwargs,
+            )
+
+        block_size_bytes = self._build_test_env(config()).engine.context.block_size_bytes
+        env = self._build_test_env(
+            config(
+                context_buffer_size_gb=(9 + 1.5) * block_size_bytes / 1024**3,
+                context_paused_buffer_size_gb=(3 + 0.5) * block_size_bytes / 1024**3,
+            )
+        )
+        engine = env.engine
+        allocator = engine.context.kv_block_allocator
+        assert (allocator.pool_size, allocator.paused_limit) == (10, 3)
+
+        # Paged attention kernels need 256-token blocks; scheduling needs no real logits.
+        def mock_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            logits = torch.zeros(
+                *tokens.shape, env.config.vocab_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            if env.config.materialize_only_last_token_logits:
+                logits = engine.context.last_token_logits(logits).unsqueeze(0)
+            return logits
+
+        engine.controller.inference_wrapped_model.model.forward = mock_forward
+
+        def add(request_id, prompt_length, limit):
+            engine._add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=torch.arange(
+                        1, prompt_length + 1, dtype=torch.int64, device=torch.cuda.current_device()
+                    ),
+                    sampling_params=SamplingParams(num_tokens_to_generate=limit, termination_id=-1),
+                )
+            )
+
+        add(0, prompt_length=2, limit=11)
+        for _ in range(6):
+            if len(engine.get_request(0).generated_tokens) == 3:
+                break
+            engine.step_modern()
+        assert len(engine.get_request(0).generated_tokens) == 3
+        add(1, prompt_length=67, limit=1)
+
+        finished = {}
+        for _ in range(60):
+            if not engine.has_unfinished_requests():
+                break
+            for request in engine.step_modern()["finished_requests"]:
+                finished[request.request_id] = request
+        assert not engine.has_unfinished_requests(), list(engine.waiting_request_ids)
+        assert {i: len(r.generated_tokens) for i, r in finished.items()} == {0: 11, 1: 1}
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
     def test_prefix_caching_single_token_effective_chunk(self):
         """A prefix-cache hit on all but the last prompt token computes only that token."""
         block_size = 16

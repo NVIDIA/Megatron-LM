@@ -4139,7 +4139,13 @@ class DynamicInferenceEngine(AbstractEngine):
         return self._matches_cg_admission(candidate)
 
     def _can_schedule_chunked_prefill(self, req) -> bool:
-        """Return whether the queue-head request can admit at least one prompt token.
+        """Return whether the queue-head request can start or continue a chunked prefill.
+
+        A partial prefill keeps its KV blocks until it finishes and is never preempted,
+        so a new chunked prefill starts only when KV for its whole remaining prompt is
+        available. Otherwise it could take the last free blocks and wait forever on
+        requests that are paused for want of a block. A continuation needs KV for at
+        least one more prompt token.
 
         Args:
             req: Queue-head inference request.
@@ -4147,10 +4153,10 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             bool: Whether request, token, and KV-cache capacity permit a chunk.
         """
-        request_can_be_added, _, kv_cache_available = self.context.check_availability(
-            req, prefill_chunk_length=1
-        )
         is_continuing_chunk = self.context.chunked_prefill_request_id == req.request_id
+        request_can_be_added, _, kv_cache_available = self.context.check_availability(
+            req, prefill_chunk_length=1 if is_continuing_chunk else None
+        )
         token_capacity_available = self.context.active_token_count < self.context.max_tokens
         return (
             (is_continuing_chunk or request_can_be_added)
