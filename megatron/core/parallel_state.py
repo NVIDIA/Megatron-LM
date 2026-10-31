@@ -625,6 +625,32 @@ def _inject_gtp_remat_axis(order_str: str, after: str = "cp") -> str:
     return "-".join(toks)
 
 
+def _optimizer_instance_rank_layout(rank_sets, num_instances):
+    """Map each rank to its optimizer instance and corresponding inter-instance peers.
+
+    ``rank_sets`` are the ordered replica groups for one parameter class. The
+    distributed optimizer owns contiguous slices of each group, and its
+    inter-instance collective pairs equal shard positions in those slices.
+    """
+    instance_by_rank = {}
+    inter_by_rank = {}
+    for ranks in rank_sets:
+        if len(ranks) % num_instances:
+            raise ValueError(
+                f"Replica group size {len(ranks)} must be divisible by "
+                f"num_distributed_optimizer_instances ({num_instances})"
+            )
+        local_size = len(ranks) // num_instances
+        for local_index in range(local_size):
+            peers = tuple(ranks[i * local_size + local_index] for i in range(num_instances))
+            for instance_id, peer in enumerate(peers):
+                if peer in instance_by_rank:
+                    raise ValueError(f"Rank {peer} occurs in multiple optimizer replica groups")
+                instance_by_rank[peer] = instance_id
+                inter_by_rank[peer] = peers
+    return instance_by_rank, inter_by_rank
+
+
 # pylint: disable=C0301
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
@@ -986,6 +1012,23 @@ def initialize_model_parallel(
         f"but got {token_rank_generator.get_ranks('pp')} "
         f"and {expert_decoder_rank_generator.get_ranks('pp')}"
     )
+
+    if num_distributed_optimizer_instances > 1:
+        # Dense and expert buckets use one expert-derived inter-instance group. Each
+        # rank must therefore have the same instance and shard-position peers in both
+        # replica layouts, regardless of which model-parallel axes are active.
+        dense_ids, dense_inter = _optimizer_instance_rank_layout(
+            weight_replica_rank_sets, num_distributed_optimizer_instances
+        )
+        expert_ids, expert_inter = _optimizer_instance_rank_layout(
+            expert_decoder_rank_generator.get_ranks("dp"), num_distributed_optimizer_instances
+        )
+        if dense_ids != expert_ids or dense_inter != expert_inter:
+            raise ValueError(
+                f"Dense and expert optimizer-instance layouts disagree for rank order {order!r}. "
+                "Use 'tp-cp-ep-dp-pp' (or 'tp-cp-ep-pp-dp' when supported); if a built-in "
+                "order fails, report a Megatron bug."
+            )
 
     timeout = timedelta(minutes=distributed_timeout_minutes)
 

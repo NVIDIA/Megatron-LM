@@ -101,6 +101,44 @@ def test_initialize_model_parallel_with_cp_and_gtp_remat():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize('order', ['tp-cp-ep-dp-pp', 'tp-cp-ep-pp-dp'])
+def test_multi_instance_optimizer_layout_accepts_builtin_orders(order):
+    """Dense and expert optimizer instances align for the built-in rank orders."""
+    if world_size != 8:
+        pytest.skip("Test requires eight ranks")
+
+    try:
+        Utils.initialize_model_parallel(
+            pipeline_model_parallel_size=2,
+            context_parallel_size=2,
+            expert_model_parallel_size=2,
+            num_distributed_optimizer_instances=2,
+            order=order,
+        )
+        assert ps.get_inter_distributed_optimizer_instance_group().size() == 2
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_multi_instance_optimizer_layout_rejects_custom_order():
+    """Divisible dense and expert replica sizes can still give different peers."""
+    if world_size != 8:
+        pytest.skip("Test requires eight ranks")
+
+    try:
+        with pytest.raises(ValueError, match="optimizer-instance layouts disagree"):
+            Utils.initialize_model_parallel(
+                context_parallel_size=2,
+                expert_model_parallel_size=2,
+                gtp_remat_size=1,
+                expert_gtp_remat_size=1,
+                num_distributed_optimizer_instances=2,
+                order='tp-cp-dp-ep-pp',
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.parametrize('order', test_parallel_order)
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
