@@ -27,6 +27,7 @@ from typing import Any
 
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
+from megatron.training.config.utils import serialize_value
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 
@@ -283,9 +284,6 @@ class DataConfig:
         sections); Megatron Core's derived values (``mock``, ``split_matrix``, ``token_dtype_code``)
         are read-only properties, not fields, and are never written.
         """
-        from megatron.training.config.utils import serialize_value
-
-        convert = serialize_value
         dataset = None
         if self.dataset is not None:
             cls = type(self.dataset)
@@ -293,10 +291,10 @@ class DataConfig:
             for f in fields(self.dataset):
                 if not f.init or f.name == "tokenizer" or f.name in CONTAINER_WRITTEN_FIELDS:
                     continue
-                dataset[f.name] = convert(getattr(self.dataset, f.name))
+                dataset[f.name] = serialize_value(getattr(self.dataset, f.name))
         return {
             "_target_": f"{type(self).__module__}.{type(self).__qualname__}",
             "dataset": dataset,
-            "dataloader": convert(self.dataloader),
-            "dataset_type": convert(self.dataset_type),
+            "dataloader": serialize_value(self.dataloader),
+            "dataset_type": serialize_value(self.dataset_type),
         }
