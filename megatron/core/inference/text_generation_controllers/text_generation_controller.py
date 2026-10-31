@@ -16,6 +16,7 @@ from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
 
 from megatron.core import parallel_state
+from megatron.core.fp8_utils import is_mxfp8_output_proj_active
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
@@ -294,6 +295,10 @@ class TextGenerationController(MTPControllerMixin):
     # it) for batched `torch.isin`. Empty => the model declares a single eos.
     extra_eos_token_id_set: frozenset = frozenset()
 
+    # Inference consumes logits in fp32, so they are held and broadcast in fp32.
+    # The LM head emits them in fp32 when it can; otherwise they are upcast out of the model.
+    _logits_dtype: torch.dtype = torch.float32
+
     def __init__(self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer):
         self.inference_wrapped_model = inference_wrapped_model
         self.model_config = self.inference_wrapped_model.model.config
@@ -383,6 +388,37 @@ class TextGenerationController(MTPControllerMixin):
         """
         self._get_stop_word_finished_ids_callback = callback
 
+    def _try_allocate_symmetric_logits_buffer(self, max_logits, logits_dtype, device):
+        """`[1, max_logits, vocab]` from dedicated symmetric memory as (tensor, handle), or None."""
+        from megatron.core.inference.communication.torch_symm_triton import is_device_nvls_capable
+        from megatron.core.inference.symmetric_memory import (
+            HAVE_TORCH_SYMM_MEM,
+            HAVE_TRITON,
+            SymmetricMemoryManager,
+        )
+
+        if getattr(self.model_config, 'inference_disable_triton_nvls_kernels', False):
+            return None
+        if not (HAVE_TORCH_SYMM_MEM and HAVE_TRITON):
+            return None
+        if not is_device_nvls_capable(torch.device(device)):
+            return None
+        tp_group = self.inference_wrapped_model.tp_group
+        element_size = torch.tensor([], dtype=logits_dtype).element_size()
+        # Shard rows must stay 128-bit aligned for the multicast store.
+        if (self.vocab_size // get_pg_size(tp_group)) * element_size % 16 != 0:
+            return None
+
+        size_mb = -(-max_logits * self.vocab_size * element_size // (1024 * 1024)) + 1
+        arena = SymmetricMemoryManager.get_buffer(
+            "tp_logits", process_group=tp_group, size_mb=size_mb
+        )
+        allocation = arena.maybe_get_tensor([1, max_logits, self.vocab_size], logits_dtype)
+        if allocation["tensor"] is None:
+            return None
+        allocation["tensor"].zero_()
+        return allocation["tensor"], allocation["handle"]
+
     def _init_dynamic_sampling_tensors(self):
         """Initialize tensors needed for dynamic sampling."""
         context = self.inference_wrapped_model.inference_context
@@ -397,15 +433,37 @@ class TextGenerationController(MTPControllerMixin):
         self._get_stop_word_finished_ids_callback = None
 
         device = torch.cuda.current_device()
-        logits_dtype = self.inference_wrapped_model.config.params_dtype
+        logits_dtype = self._logits_dtype
 
         self._sampling_backend = context.config.sampling_backend
         self._enable_cuda_graph = self.model_config.cuda_graph_impl == "local"
 
         # Initialize bookkeeping tensors.
         if self._enable_cuda_graph:
-            self._all_logits_cuda = torch.zeros(
-                (1, max_logits, self.vocab_size), dtype=logits_dtype, device=device
+            tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
+            symmetric = None
+            if tp_size > 1:
+                # Under TP, prefer a symmetric-memory buffer: each rank then multicast-stores
+                # its logits shard straight into its column block, gather and transpose fused,
+                # no copy. Otherwise a plain buffer and the in-forward copy.
+                symmetric = self._try_allocate_symmetric_logits_buffer(
+                    max_logits, logits_dtype, device
+                )
+            if symmetric is not None:
+                self._all_logits_cuda, context.logits_buffer_multicast_handle = symmetric
+            else:
+                self._all_logits_cuda = torch.zeros(
+                    (1, max_logits, self.vocab_size), dtype=logits_dtype, device=device
+                )
+            context.logits_output_buffer = self._all_logits_cuda
+            # At TP 1, the LM head is instructed to write the GEMM result in-place into the
+            # (fp32) buffer, unless the head cannot: it must emit fp32 natively (not the case
+            # without TE general_gemm or under batch-invariant mode) and take a preallocated
+            # output (not the case for TE MXFP8). Otherwise the forward falls back to a copy.
+            context.logits_output_in_place = (
+                tp_size == 1
+                and getattr(self._language_model, "lm_head_can_emit_fp32", False)
+                and not is_mxfp8_output_proj_active(self.model_config)
             )
         else:
             self._all_logits_cuda = None
@@ -995,17 +1053,16 @@ class TextGenerationController(MTPControllerMixin):
 
             if is_pipeline_last_stage(self.pp_group):
                 assert logits is not None and torch.Size(logits_shape) == logits.shape
+            elif self._enable_cuda_graph:
+                logits = self._all_logits_cuda[:, :logits_seq_len, :]
 
             logits = broadcast_from_last_pipeline_stage(
-                logits_shape,
-                dtype=self.model_config.params_dtype,
-                tensor=logits,
-                pp_group=self.pp_group,
+                logits_shape, dtype=self._logits_dtype, tensor=logits, pp_group=self.pp_group
             )
 
-        # Copy logits to contiguous buffer.
         if self._enable_cuda_graph:
-            self._all_logits_cuda[:, :logits_seq_len, :].copy_(logits[:, :logits_seq_len, :])
+            # Ensure that the model wrote the logits into the correct buffer.
+            assert logits.data_ptr() == self._all_logits_cuda.data_ptr()
         else:
             self._all_logits_cuda = logits
 
@@ -1728,6 +1785,8 @@ class TextGenerationController(MTPControllerMixin):
             input_ids (Tensor): Dummy input token IDs.
             position_ids (Tensor): Dummy input position IDs.
         """
+        # The forward overwrites `_all_logits_cuda`: nothing pending may still await sampling.
+        assert not self._async_sched_forward.is_valid
         self._dynamic_step_forward_logits(input_ids, position_ids)
 
     def _run_dummy_legacy_step(self, input_ids: Tensor, position_ids: Tensor) -> None:
@@ -3945,7 +4004,7 @@ class TextGenerationController(MTPControllerMixin):
                     # and then broadcast the sampled tokens rather than broadcasting the raw logits.
                     logits = broadcast_from_last_pipeline_stage(
                         [batch_size, logits_seq_len, self.vocab_size],
-                        dtype=self.model_config.params_dtype,
+                        dtype=self._logits_dtype,
                         tensor=logits,
                         pp_group=self.pp_group,
                     )
