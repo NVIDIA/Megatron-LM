@@ -56,6 +56,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
 )
+from megatron.core.transformer.experimental_attention_variant.dsv4_batched_linear import (
+    DSv4BatchedLinear,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_latent_attention import (
@@ -275,6 +278,7 @@ hybrid_stack_spec = ModuleSpec(
                                 compressor=_csa_compressor, indexer=_csa_indexer
                             ),
                         ),
+                        linear_o_group_proj=DSv4BatchedLinear,
                         linear_proj=TERowParallelLinear,
                         q_layernorm=IdentityOp,
                         kv_layernorm=IdentityOp,
@@ -301,6 +305,7 @@ hybrid_stack_spec = ModuleSpec(
                                 compressor=_csa_compressor, indexer=_csa_indexer
                             ),
                         ),
+                        linear_o_group_proj=DSv4BatchedLinear,
                         linear_proj=TERowParallelLinear,
                         q_layernorm=_csa_qk_norm,
                         kv_layernorm=_csa_qk_norm,
