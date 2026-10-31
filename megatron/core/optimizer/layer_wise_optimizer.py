@@ -841,19 +841,22 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             full_param_layouts: List of :class:`FullParamLayout` (one per model
                 chunk).  ``None`` triggers the legacy fallback.
         """
-        # Simplify when dp_cp group size is 1.
         dp_cp_size = get_pg_size(self.dp_cp)
-        if dp_cp_size == 1:
+        expt_dp_size = get_pg_size(self.expt_dp)
+        # Dense and expert parameters can have different data-parallel groups.
+        if dp_cp_size == 1 and expt_dp_size == 1:
             self.dp_cp_params_list = None
             self.expt_dp_params_list = None
             return
-
-        expt_dp_size = get_pg_size(self.expt_dp)
 
         if full_param_layouts is not None:
             self._shard_params_from_layout(optimizers, full_param_layouts, dp_cp_size, expt_dp_size)
         else:
             self._shard_params_ping_pong(optimizers, dp_cp_size, expt_dp_size)
+
+        # A singleton dense group needs no synchronization, even when experts do.
+        if dp_cp_size == 1:
+            self.dp_cp_params_list = None
 
     def _shard_params_from_layout(self, optimizers, full_param_layouts, dp_cp_size, expt_dp_size):
         """Derive shard assignments from the param layout."""
@@ -1084,12 +1087,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     def broadcast_params(self):
         """All rank broadcast updated local params."""
         # Broadcast linear layer weights to all other ranks. Kept as reference test.
-        if self.dp_cp_params_list is None:
-            return
-        for i, params in enumerate(self.dp_cp_params_list):
-            src_global_rank = torch.distributed.get_global_rank(self.dp_cp, i)
-            for p in params:
-                torch.distributed.broadcast(p, src_global_rank, self.dp_cp)
+        if self.dp_cp_params_list is not None:
+            for i, params in enumerate(self.dp_cp_params_list):
+                src_global_rank = torch.distributed.get_global_rank(self.dp_cp, i)
+                for p in params:
+                    torch.distributed.broadcast(p, src_global_rank, self.dp_cp)
         if self.expt_dp_params_list is None:
             return
         for i, params in enumerate(self.expt_dp_params_list):
