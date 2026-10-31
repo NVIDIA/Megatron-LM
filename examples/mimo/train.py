@@ -15,13 +15,8 @@ import torch
 from megatron.training import get_args, pretrain, print_rank_0
 from megatron.training.global_vars import set_run_config
 
-from megatron.core.parallel_state import (
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_src_rank,
-    get_context_parallel_group,
-    get_data_parallel_group,
-)
+from megatron.core.process_groups_config import resolve_process_groups
+from megatron.core.utils import unwrap_model
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -107,15 +102,27 @@ def add_mimo_args(parser):
 
 
 
-def get_batch(data_iterator: Iterator[Dict[str, Any]]):
+def get_batch(data_iterator: Iterator[Dict[str, Any]], pg_collection=None):
     """Generate a batch for MIMO model training.
 
     Args:
         data_iterator: Iterator over the dataset
+        pg_collection: Process groups of the language model. The batch is read on the first
+            rank of its tensor-parallel group and broadcast over that group. None falls back to
+            the global parallel state with a ProcessGroupFallbackWarning; that fallback is
+            deprecated.
 
     Returns:
         tuple: Batch data for model training
     """
+    pg_collection = resolve_process_groups(
+        pg_collection,
+        owner="examples.mimo.train.get_batch",
+        required=("tp",),
+        deprecated_in="0.21",
+        removed_in="0.23",
+    )
+    tp_group = pg_collection.tp
     args = get_args()
 
     # Assert that pipeline parallelism are not supported yet
@@ -125,7 +132,7 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     # Broadcast data - only get data on tensor parallel rank 0
     # data iterator is None on other tp ranks
     # TP Rank-0 reads next batch.
-    if get_tensor_model_parallel_rank() == 0:
+    if tp_group.rank() == 0:
         try:
             data = next(data_iterator)
             has_data = torch.tensor([1], dtype=torch.uint8, device='cuda')
@@ -135,9 +142,8 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     else:
         has_data = torch.empty(1, dtype=torch.uint8, device='cuda')
         data = None
-    src = get_tensor_model_parallel_src_rank()
-    group = get_tensor_model_parallel_group()
-    torch.distributed.broadcast(has_data, src, group=group)
+    src = torch.distributed.get_global_rank(tp_group, 0)
+    torch.distributed.broadcast(has_data, src, group=tp_group)
 
     if has_data.item() == 0:
         # iterator exhausted on all ranks
@@ -158,20 +164,41 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     # For the modality inputs, the keys can be arbitrary
     # so we do a broadcast of the schema followed by a broadcast of the actual data
     # check broadcast_nested_data_batch for more details
-    batch = _canonicalize_packed_sequence_metadata(broadcast_nested_data_batch(data))
+    batch = _canonicalize_packed_sequence_metadata(
+        broadcast_nested_data_batch(data, tp_group=tp_group)
+    )
 
     return batch
 
-def loss_func(loss_mask, output_tensor):
+def loss_func(loss_mask, output_tensor, pg_collection=None):
     """Simple loss function for MIMO model training.
 
     Args:
         loss_mask: mask indicating which tokens contribute to the loss
         output_tensor: model output tensor
+        pg_collection: Process groups of the language model. The loss is summed over its
+            context-parallel group, and the reported loss over its data-parallel group. None
+            falls back to the global parallel state with a ProcessGroupFallbackWarning; that
+            fallback is deprecated.
     Returns:
         tuple: (loss, num_tokens, metrics_dict)
     """
+    pg_collection = resolve_process_groups(
+        pg_collection,
+        owner="examples.mimo.train.loss_func",
+        required=("cp", "dp_gtp_remat"),
+        deprecated_in="0.21",
+        removed_in="0.23",
+    )
     args = get_args()
+    # torch.distributed reduces over all ranks for a None group.
+    if pg_collection.dp_gtp_remat is None or (
+        args.context_parallel_size > 1 and pg_collection.cp is None
+    ):
+        raise ValueError(
+            "loss_func requires pg_collection.dp_gtp_remat, and pg_collection.cp when "
+            "context_parallel_size > 1"
+        )
     losses = output_tensor.float()
 
     loss_mask = loss_mask.contiguous().view(-1).float()
@@ -187,12 +214,12 @@ def loss_func(loss_mask, output_tensor):
     # If CP is active, reduce the loss across all CP ranks 
     # as they have loss calculated for their own sequence shards.
     if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=get_context_parallel_group())
+        torch.distributed.all_reduce(loss, group=pg_collection.cp)
         loss_for_backward = loss[0].clone()
     # For reporting, clone and detach the loss. This creates a new tensor 
     # that doesn't require gradients and is independent of the computation graph.
     reporting_loss = loss.clone().detach()
-    torch.distributed.all_reduce(reporting_loss, group=get_data_parallel_group())
+    torch.distributed.all_reduce(reporting_loss, group=pg_collection.dp_gtp_remat)
 
     local_num_tokens = loss[1].clone().detach().to(torch.int)
 
@@ -209,18 +236,24 @@ def forward_step(data_iterator, model):
     Returns:
         tuple: (output_tensor, loss_function)
     """
-    data_batch = get_batch(data_iterator)
+    # The batch and the loss belong to the language model; on this single grid the encoders
+    # share its tensor-parallel group.
+    pg_collection = unwrap_model(model).language_model.pg_collection
+    data_batch = get_batch(data_iterator, pg_collection=pg_collection)
     output_tensor, loss_mask = model(**data_batch)
     
     # Return output and loss function
-    return output_tensor, partial(loss_func, loss_mask)
+    return output_tensor, partial(loss_func, loss_mask, pg_collection=pg_collection)
 
 
-def train_valid_test_datasets_provider(*provider_args, **provider_kwargs):
+def train_valid_test_datasets_provider(*provider_args, pg_collection=None, **provider_kwargs):
     """Dataset provider for MIMO model training.
 
     Args:
         *provider_args: Additional arguments for the dataset provider
+        pg_collection: Process groups of the run, which select the ranks that read data and
+            shard it. None falls back to the global parallel state with a
+            ProcessGroupFallbackWarning; that fallback is deprecated.
         **provider_kwargs: Additional keyword arguments for the dataset provider
     """
     runtime_args = get_args()
@@ -240,7 +273,7 @@ def train_valid_test_datasets_provider(*provider_args, **provider_kwargs):
             f"Available providers: {list(_DATASET_PROVIDERS.keys())}"
         ) from e
 
-    return dataset_provider(*provider_args, **provider_kwargs)
+    return dataset_provider(*provider_args, pg_collection=pg_collection, **provider_kwargs)
 
 def model_provider(
     pre_process: bool = True,

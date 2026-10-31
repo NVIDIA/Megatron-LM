@@ -141,7 +141,7 @@
       "_unwrap_model_cores:accessor:parallel_state.get_data_parallel_group"
     ],
     "megatron/core/ssm/mamba_mixer.py": [
-      "ExtendedRMSNorm.sharded_state_dict:accessor:parallel_state.get_tensor_model_parallel_group"
+      "ExtendedRMSNorm.sharded_state_dict:guarded:resolve_process_groups"
     ],
     "megatron/core/tensor_parallel/cross_entropy.py": [
       "_VocabParallelCrossEntropy.forward:accessor:parallel_state.get_tensor_model_parallel_group"
@@ -192,7 +192,7 @@
     ],
     "megatron/core/transformer/module.py": [
       "Float16Module.forward:accessor:parallel_state.get_pipeline_model_parallel_group",
-      "MegatronModule.sharded_state_dict:accessor:parallel_state.get_tensor_model_parallel_group"
+      "MegatronModule.sharded_state_dict:guarded:resolve_process_groups"
     ],
     "megatron/core/transformer/moe/batch_invariant.py": [
       "unpermute:accessor:parallel_state.get_expert_model_parallel_world_size"
@@ -238,11 +238,10 @@
       "get_transformer_layer_offset:accessor:parallel_state.get_pipeline_model_parallel_rank"
     ],
     "megatron/core/transformer/utils.py": [
-      "ensure_metadata_has_dp_cp_group:accessor:parallel_state.get_data_parallel_group",
-      "ensure_metadata_has_dp_cp_group:accessor:parallel_state.get_data_parallel_group",
+      "ensure_metadata_has_dp_cp_group:guarded:resolve_process_groups",
       "make_sharded_object_for_checkpoint:accessor:parallel_state.get_data_parallel_rank",
       "make_sharded_object_for_checkpoint:accessor:parallel_state.get_tensor_model_parallel_rank",
-      "make_sharded_tensors_for_checkpoint:accessor:parallel_state.get_data_parallel_group"
+      "make_sharded_tensors_for_checkpoint:guarded:resolve_process_groups"
     ],
     "megatron/core/utils.py": [
       "check_param_hashes_across_dp_replicas:accessor:parallel_state.get_data_parallel_group",
@@ -251,11 +250,9 @@
       "get_tensor_model_parallel_group_if_none:accessor:parallel_state.get_tensor_model_parallel_group",
       "log_on_each_pipeline_stage:accessor:parallel_state.get_data_parallel_rank",
       "log_on_each_pipeline_stage:accessor:parallel_state.get_tensor_model_parallel_rank",
-      "make_sharded_tensor_for_checkpoint:accessor:parallel_state.get_data_parallel_group",
-      "make_sharded_tensor_for_checkpoint:accessor:parallel_state.get_tensor_model_parallel_group",
-      "make_tp_sharded_tensor_for_checkpoint:accessor:parallel_state.get_data_parallel_group",
-      "make_tp_sharded_tensor_for_checkpoint:accessor:parallel_state.get_tensor_model_parallel_group"
+      "make_sharded_tensor_for_checkpoint:guarded:resolve_process_groups",
+      "make_tp_sharded_tensor_for_checkpoint:guarded:resolve_process_groups"
     ]
   },
-  "total": 155
+  "total": 152
 }
