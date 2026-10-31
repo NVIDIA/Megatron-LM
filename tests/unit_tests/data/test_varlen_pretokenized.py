@@ -36,7 +36,7 @@ def _config(tokenizer, seq_length=64, cp=1, sbhd=False) -> SimpleNamespace:
         varlen_sbhd_validation=sbhd,
         data_parallel_size=1,
         context_parallel_size=cp,
-        hybrid_context_parallel=False,
+        dynamic_context_parallel=False,
         sequence_parallel_size=1,
     )
 
