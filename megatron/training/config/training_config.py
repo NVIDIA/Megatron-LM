@@ -762,19 +762,8 @@ class CheckpointConfig:
     exchange algorithm. Pass it explicitly on the inference command line."""
 
     def __post_init__(self):
-        from megatron.training.utils import has_nvrx_checkpointing_async_support
-
         assert self.async_strategy in ["nvrx"], \
             f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx."
-
-        if (
-            self.async_save
-            and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]
-        ):
-            assert has_nvrx_checkpointing_async_support(), (
-                "A compatible nvidia-resiliency-ext installation is required to enable "
-                "async save with async_strategy='nvrx'."
-            )
 
         if self.verify_integrity:
             assert self.ckpt_format == "torch_dist", \
