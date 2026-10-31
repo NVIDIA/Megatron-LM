@@ -111,9 +111,17 @@ fi
 
 cd $TEST_PATH
 
+# Only the latest dev suite participates in the portable GB200 migration.
+# Legacy and LTS keep their original H100 coverage even if the caller opts in.
+if [[ "$TAG" != "latest" || "$ENVIRONMENT" != "dev" ]]; then
+    export UNIT_TEST_GB200_ENABLED=false
+fi
+
 MARKER=()
 if [[ "$PLATFORM" == "gb200" ]]; then
     MARKER+=("launch_on_gb200")
+elif [[ "${UNIT_TEST_GB200_ENABLED:-false}" == "true" ]]; then
+    MARKER+=("not gb200_only")
 fi
 
 if [[ "$TAG" == "legacy" ]]; then
