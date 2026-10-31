@@ -17,6 +17,16 @@ from .range import intersect_ranges
 
 
 @dataclasses.dataclass(frozen=True)
+class OwnerPlan:
+    """The owners of a buffer's tensors, and which tensors need communication to reach them."""
+
+    tensor_to_owner: dict[int, int]
+    # Tensors whose shards sit on several ranks. Gather and scatter post P2P only for these, so
+    # a buffer without any needs no communication.
+    split_tensors: frozenset[int]
+
+
+@dataclasses.dataclass(frozen=True)
 class _OwnerWork:
     """A tensor's compute cost and eligible owner ranks in buffer order."""
 
@@ -26,7 +36,7 @@ class _OwnerWork:
     candidates: list[int]
 
 
-def assign_owner_work(buffers: Iterable[DBuffer]) -> list[dict[int, int]]:
+def assign_owner_work(buffers: Iterable[DBuffer]) -> list[OwnerPlan]:
     """Jointly assign tensors with at least two dimensions to global ranks holding their shards.
 
     Account for single-candidate tensors across all buffers first, then assign the remaining
@@ -53,8 +63,8 @@ def assign_owner_work(buffers: Iterable[DBuffer]) -> list[dict[int, int]]:
         buffers: Distributed buffers, which may be on different DP meshes.
 
     Returns:
-        One tensor-index-to-owner mapping per buffer, in input order. Buffers with no
-        eligible tensors have an empty mapping.
+        One plan per buffer, in input order: the tensor-index-to-owner mapping and the tensors
+        whose shards span ranks. Buffers with no eligible tensors have an empty plan.
     """
     buffers = list(buffers)
 
@@ -64,20 +74,21 @@ def assign_owner_work(buffers: Iterable[DBuffer]) -> list[dict[int, int]]:
         positions_by_mesh.setdefault(buffer.mesh, []).append(position)
 
     # Step 2: assign owners within each mesh, then put the results back in input order.
-    assignments: list[dict[int, int]] = [{} for _ in buffers]
+    plans: list[OwnerPlan] = [OwnerPlan({}, frozenset()) for _ in buffers]
     for positions in positions_by_mesh.values():
         mesh_buffers = [buffers[position] for position in positions]
-        mesh_assignments = _assign_owner_work_on_mesh(mesh_buffers)
-        for position, tensor_to_owner in zip(positions, mesh_assignments, strict=True):
-            assignments[position] = tensor_to_owner
-    return assignments
+        mesh_plans = _assign_owner_work_on_mesh(mesh_buffers)
+        for position, plan in zip(positions, mesh_plans, strict=True):
+            plans[position] = plan
+    return plans
 
 
-def _assign_owner_work_on_mesh(buffers: list[DBuffer]) -> list[dict[int, int]]:
+def _assign_owner_work_on_mesh(buffers: list[DBuffer]) -> list[OwnerPlan]:
     """Jointly assign the tensors of buffers that share one mesh."""
     mesh = buffers[0].mesh
     ranks = mesh.mesh.flatten().tolist()
     assignments: list[dict[int, int]] = [{} for _ in buffers]
+    split_tensors: list[set[int]] = [set() for _ in buffers]
     work_items: list[_OwnerWork] = []
     for buffer_index, buffer in enumerate(buffers):
         layout = buffer.layout
@@ -100,6 +111,8 @@ def _assign_owner_work_on_mesh(buffers: list[DBuffer]) -> list[dict[int, int]]:
                     f"No eligible owner for tensor {tensor_index} with shape {shape}; "
                     "no rank owns a shard."
                 )
+            if len(candidates) > 1:
+                split_tensors[buffer_index].add(tensor_index)
             short_dim = min(shape[0], non_leading_numel(shape))
             cost = shape.numel() * (short_dim * 5 + 1)
             work_items.append(_OwnerWork(buffer_index, tensor_index, cost, candidates))
@@ -118,4 +131,7 @@ def _assign_owner_work_on_mesh(buffers: list[DBuffer]) -> list[dict[int, int]]:
         owner = min(item.candidates, key=lambda rank: running_cost[rank])
         assignments[item.buffer_index][item.tensor_index] = owner
         running_cost[owner] += item.cost
-    return assignments
+    return [
+        OwnerPlan(assignment, frozenset(split))
+        for assignment, split in zip(assignments, split_tensors, strict=True)
+    ]

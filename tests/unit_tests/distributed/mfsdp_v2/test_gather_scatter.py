@@ -86,7 +86,8 @@ def test_gather_scatter_round_trip(subgroup, placement, distributed_setup):
     full_tensors = _known_full_tensors(dbuffer)
     original = dbuffer.local_buffer.clone()
     this_rank = mesh.get_rank()
-    (tensor_to_owner,) = assign_owner_work([dbuffer])
+    (plan,) = assign_owner_work([dbuffer])
+    tensor_to_owner = plan.tensor_to_owner
     assert set(tensor_to_owner) == {0, 1}
     # Reverse traversal on odd ranks to check that P2P is independent of dictionary order.
     if this_rank % 2:
@@ -135,7 +136,8 @@ def test_gather_scatter_with_stream(distributed_setup):
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     dbuffer = DBuffer.empty(mesh, [RowAtomic()], [(8, 4), (4, 4)], torch.float32, device)
     full_tensors = _known_full_tensors(dbuffer)
-    (tensor_to_owner,) = assign_owner_work([dbuffer])
+    (plan,) = assign_owner_work([dbuffer])
+    tensor_to_owner = plan.tensor_to_owner
     this_rank = mesh.get_rank()
     owned = {i for i, owner in tensor_to_owner.items() if owner == this_rank}
     destination = {
@@ -171,7 +173,7 @@ def test_gather_scatter_pipelines_buffers(distributed_setup):
     shapes = [[(8, 4), (4, 4)], [(6, 4)], [(4, 8), (8, 8)]]
     dbuffers = [DBuffer.empty(mesh, [RowAtomic()], s, torch.float32, device) for s in shapes]
     full_tensors = [_known_full_tensors(dbuffer) for dbuffer in dbuffers]
-    tensor_to_owners = [assign_owner_work([dbuffer])[0] for dbuffer in dbuffers]
+    tensor_to_owners = [assign_owner_work([dbuffer])[0].tensor_to_owner for dbuffer in dbuffers]
     owned = [{i for i, owner in t2o.items() if owner == this_rank} for t2o in tensor_to_owners]
     destinations = [
         {i: torch.empty_like(full[i]) for i in owned_i}

@@ -33,11 +33,8 @@ def _get_sorted_rank_ranges(buffer: DBuffer) -> dict[int, Range]:
     mesh = buffer.mesh
     if mesh.ndim != 1 or not isinstance(buffer.placements[0], Shard):
         raise NotImplementedError("Owner gather/scatter requires a 1-D sharded DBuffer.")
-    rank_ranges = [
-        (rank, buffer.layout.get_rank_range(mesh, buffer.placements, rank))
-        for rank in mesh.mesh.tolist()
-    ]
-    return dict(sorted(rank_ranges, key=lambda item: item[1].start))
+    rank_ranges = buffer.layout.get_rank_ranges(mesh, buffer.placements)
+    return dict(sorted(rank_ranges.items(), key=lambda item: item[1].start))
 
 
 def gather(
