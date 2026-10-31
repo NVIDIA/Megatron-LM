@@ -39,6 +39,7 @@ except ImportError:
     correct_amax_history_if_needed = None
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     RuntimePolicy,
     fully_shard_context,
 )
@@ -388,8 +389,10 @@ def _ddp_wrap(
         ) and ddp_config.megatron_fsdp_version == 2
         construction_context = (
             fully_shard_context(
-                runtime_policy=RuntimePolicy(
-                    use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True
+                FsdpContext(
+                    runtime_policy=RuntimePolicy(
+                        use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True
+                    )
                 )
             )
             if is_mfsdp_v2
