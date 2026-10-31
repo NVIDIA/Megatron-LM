@@ -152,8 +152,6 @@ class MegatronModule(torch.nn.Module):
         When this flag is set, TE modules will update their fp8 parameter cache.
         If kitchen is being used, kitchen controls quantization level.
         A quant_recipe (e.g. from --te-precision-config-file) also enables the flag.
-        With moe_training_matches_inference, this also drops the MoE value pass's cached
-        kernel weights, which its next forward rebuilds from the parameters.
         """
         if is_first_microbatch_tracked(self.config):
             if not hasattr(self, "modules_with_is_first_microbatch"):
@@ -163,22 +161,6 @@ class MegatronModule(torch.nn.Module):
                         self.modules_with_is_first_microbatch.append(m)
             for m in self.modules_with_is_first_microbatch:
                 m.is_first_microbatch = True
-        self.release_inference_value_pass_weights()
-
-    def release_inference_value_pass_weights(self):
-        """Drops the MoE value pass's cached kernel weights (moe_training_matches_inference).
-
-        set_is_first_microbatch calls this. A caller that needs the memory between
-        forward-backward calls, for example for colocated generation, can call it after
-        a call; the next value pass rebuilds the weights from the parameters.
-        """
-        if getattr(self.config, "moe_training_matches_inference", False):
-            if not hasattr(self, "modules_with_inference_value_pass_weights"):
-                self.modules_with_inference_value_pass_weights = [
-                    m for m in self.modules() if hasattr(m, "_inference_value_pass_weights")
-                ]
-            for m in self.modules_with_inference_value_pass_weights:
-                m._inference_value_pass_weights = None
 
     def set_symmetric_ar(self, set_to: Optional[str] = None) -> None:
         """

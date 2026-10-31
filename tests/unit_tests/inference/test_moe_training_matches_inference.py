@@ -226,7 +226,7 @@ def _layer_pair(recipe, gen_config, train_config, max_tokens=LOCAL_TOKENS):
     Generation converts as production does: MXFP8 replaces TE's MXFP8 parameters
     with MCore ``MXFP8Tensor``s at load, NVFP4 quantizes the BF16 stacks on the
     first forward. Training keeps its parameters and the value pass derives the
-    kernel weights from them once per forward-backward call.
+    kernel weights from them once per optimizer step.
     """
     from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
 
@@ -258,6 +258,11 @@ def _elements_that_differ(got, want) -> int:
     differing = torch.tensor([float((got != want).sum().item())], device="cuda")
     torch.distributed.all_reduce(differing, op=torch.distributed.ReduceOp.MAX)
     return int(differing.item())
+
+
+def _optimizer_step():
+    """An optimizer step, which is what tells the value pass the parameters moved."""
+    torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.0).step()
 
 
 @pytest.fixture
@@ -538,8 +543,8 @@ class TestValuePassRuns:
         assert len(seen) == 1, "the eval forward did not take the FlashInfer kernel"
 
     @pytest.mark.parametrize("recipe", list(RECIPES))
-    def test_kernel_weights_are_built_once_per_forward_backward_call(self, recipe, monkeypatch):
-        """Later microbatches reuse the kernel weights; the next call rebuilds them.
+    def test_kernel_weights_are_built_once_per_optimizer_step(self, recipe, monkeypatch):
+        """Passes between optimizer steps reuse the kernel weights; a step drops them.
 
         Each build first runs the expert linears' pre-forward hooks, which is where DDP
         finishes an overlapped parameter all-gather before the weights are read.
@@ -558,17 +563,17 @@ class TestValuePassRuns:
         experts.linear_fc1.register_forward_pre_hook(lambda *_: hook_calls.append(1))
         hidden = _hidden(train_config, seed=0)
         with torch.no_grad(), _fp8_context(train_config):
-            layer.set_is_first_microbatch()
+            _optimizer_step()
             layer(hidden)
             layer(hidden)
-            layer.set_is_first_microbatch()
+            _optimizer_step()
             layer(hidden)
         assert len(builds) == 2
         assert len(hook_calls) == 2
 
     @pytest.mark.parametrize("recipe", list(RECIPES))
     def test_release_frees_the_kernel_weights_and_the_next_pass_rebuilds_them(self, recipe):
-        """A caller can free the kernel weights between forward-backward calls.
+        """A caller can free the kernel weights between optimizer steps.
 
         The next value pass rebuilds them and matches the pass before the release.
         """
@@ -578,11 +583,11 @@ class TestValuePassRuns:
         hidden = _hidden(train_config, seed=0)
         with torch.no_grad(), _fp8_context(train_config):
             before = layer(hidden)[0].clone()
-            assert layer.experts._inference_value_pass_weights is not None
-            layer.release_inference_value_pass_weights()
-            assert layer.experts._inference_value_pass_weights is None
+            assert layer.experts in training_matches_inference._value_pass_weights
+            training_matches_inference.release_inference_value_pass_weights(layer)
+            assert layer.experts not in training_matches_inference._value_pass_weights
             after = layer(hidden)[0]
-        assert layer.experts._inference_value_pass_weights is not None
+        assert layer.experts in training_matches_inference._value_pass_weights
         assert torch.equal(before, after)
 
 
@@ -601,9 +606,8 @@ class TestTrainGenParity:
         """After the parameters move, the value pass matches a refreshed generation.
 
         The update is applied to both layers' BF16 parameters, and generation
-        requantizes as a refit would. The value pass keeps its kernel weights within
-        a forward-backward call and rebuilds them when the next one starts, which
-        the pipeline schedules mark with ``set_is_first_microbatch``.
+        requantizes as a refit would. The value pass keeps its kernel weights until
+        the next optimizer step and rebuilds them after it.
         """
         _skip_unless_supported(recipe)
         gen_config, train_config = _generation_and_training_configs(recipe)
@@ -625,14 +629,14 @@ class TestTrainGenParity:
         with torch.no_grad(), InferenceMode.active():
             gen_out, _ = gen_layer(hidden)
         with torch.no_grad():
-            same_call_out, _ = train_layer(hidden)
-            train_layer.set_is_first_microbatch()
+            same_step_out, _ = train_layer(hidden)
+            _optimizer_step()
             train_out, _ = train_layer(hidden)
 
         assert _elements_that_differ(gen_out, stale_gen_out) > 0, "the update moved nothing"
         assert (
-            _elements_that_differ(same_call_out, stale_train_out) == 0
-        ), "the value pass rebuilt its kernel weights within one forward-backward call"
+            _elements_that_differ(same_step_out, stale_train_out) == 0
+        ), "the value pass rebuilt its kernel weights without an optimizer step"
         differing = _elements_that_differ(train_out, gen_out)
         assert differing == 0, (
             f"{recipe}: after a weight update, {differing}/{train_out.numel()} elements "

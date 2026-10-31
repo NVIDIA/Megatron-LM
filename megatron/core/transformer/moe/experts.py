@@ -45,7 +45,6 @@ from megatron.core.transformer.mlp import (
     apply_swiglu_sharded_factory,
 )
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe import training_matches_inference
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
@@ -1462,18 +1461,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self._flashinfer_clamp_limit = None
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
         self._flashinfer_mxfp8_token_capacity = config.inference_flashinfer_mxfp8_token_capacity
-        self._training_matches_inference = config.moe_training_matches_inference
-        # True during training_matches_inference's value pass.
-        self._in_inference_value_pass = False
-        # The value pass's kernel weights, kept until the parameters may have moved:
-        # MegatronModule.set_is_first_microbatch drops them at the first microbatch of
-        # every forward-backward call, when TE refreshes its quantized weights.
-        # MegatronModule.release_inference_value_pass_weights frees them earlier.
-        self._inference_value_pass_weights = None
-        if self._training_matches_inference:
-            self.register_load_state_dict_post_hook(
-                lambda module, _: setattr(module, "_inference_value_pass_weights", None)
-            )
 
     @torch.inference_mode(False)
     def _build_flashinfer_clamp_limit(self, device: torch.device) -> None:
@@ -1907,8 +1894,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
         """Forward pass with backend-selected inference grouped GEMMs:
 
         - Training: delegates to parent TEGroupedMLP.
-        - The moe_training_matches_inference value pass: the FlashInfer kernel on
-          weights built from the training parameters.
         - Inference + FlashInfer: fused BF16 or MXFP8 MoE. tokens_per_expert is not
           used in this path; the FlashInfer kernels operate directly on routing_map.
         - Inference + torch: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets.
@@ -1928,14 +1913,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
             assert (
                 not self.config.fp8
                 or self.config.fp8_recipe != Fp8Recipe.mxfp8
-                or self._training_matches_inference
+                or self.config.moe_training_matches_inference
             ), "MXFP8 inference optimized is not compatible with training / colocated RL."
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
-
-        if self._in_inference_value_pass:
-            return training_matches_inference.expert_value_pass(
-                self, permuted_local_hidden_states, permuted_probs, routing_map
-            )
 
         # Lazily build concatenated weights on first forward (after checkpoint load)
         if not self._concatenated_weights_built:

@@ -9,11 +9,12 @@ layer's unchanged training forward, which the activation checkpoint recomputes.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+import weakref
 from itertools import chain
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
+from torch.optim.optimizer import register_optimizer_step_post_hook
 
 from megatron.core import utils
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
@@ -78,7 +79,7 @@ def training_matches_inference_forward(
 def _generation_forward(layer: MoELayer, hidden_states: torch.Tensor, input_ids):
     """The layer's generation forward, on training's token counts."""
     try:
-        with InferenceMode.active(), _experts_value_pass(layer.experts):
+        with InferenceMode.active():
             layer.select_token_dispatcher()
             dispatcher = layer.token_dispatcher
             # Normally allocated by the inference context.
@@ -100,8 +101,7 @@ def _generation_forward(layer: MoELayer, hidden_states: torch.Tensor, input_ids)
                 output = _chunked_dispatch_and_compute(layer, dispatch_input, probs)
             else:
                 dispatched_input, probs = layer.dispatch(dispatch_input, probs)
-                output, _ = layer.routed_experts_compute(dispatched_input, probs)
-                output = layer.combine(output)
+                output = layer.combine(_routed_experts_compute(layer, dispatched_input, probs))
             return layer.postprocess(output, shared_expert_output), None
     finally:
         # Outside InferenceMode, this restores the training dispatcher for the recompute.
@@ -199,39 +199,72 @@ def _chunked_dispatch_and_compute(layer: MoELayer, hidden_states, probs):
             rows = min(max(rows, min_rows), dispatched_input.shape[0])
             dispatched_input, chunk_probs = dispatched_input[:rows], chunk_probs[:rows]
             dispatcher.routing_map = dispatcher.routing_map[:rows]
-            output, _ = layer.routed_experts_compute(dispatched_input, chunk_probs)
-            outputs.append(layer.combine(output))
+            outputs.append(
+                layer.combine(_routed_experts_compute(layer, dispatched_input, chunk_probs))
+            )
     finally:
         NVLSAllGatherVDispatcher._real_token_count_tensor = real_token_count
         dispatcher._local_tokens = num_tokens
     return torch.cat(outputs)
 
 
-@contextmanager
-def _experts_value_pass(experts: InferenceGroupedMLP):
-    """Serve the experts' generation forwards inside this block from the training parameters.
+def _routed_experts_compute(layer: MoELayer, hidden_states, probs):
+    """``MoELayer.routed_experts_compute`` on generation's dispatcher, with the experts'
+    generation forward replaced by ``expert_value_pass``.
 
-    Generation's own weights are built from parameters it owns, which training's are not, so
-    the block runs the FlashInfer kernel on weights rebuilt from the training parameters.
+    Generation's expert weights are built from parameters it owns, which training's are
+    not, so the value pass runs the FlashInfer kernel on weights built from the training
+    parameters.
     """
-    experts._in_inference_value_pass = True
-    try:
-        yield
-    finally:
-        experts._in_inference_value_pass = False
+    dispatcher = layer.token_dispatcher
+    hidden_states, _, probs = dispatcher.dispatch_postprocess(hidden_states, probs)
+    output, _ = expert_value_pass(layer.experts, hidden_states, probs, dispatcher.routing_map)
+    return dispatcher.combine_preprocess(output)
+
+
+# The value pass's kernel weights per experts module, kept here rather than on the
+# module. Weak keys, so a deleted model frees its entries.
+_value_pass_weights: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_hooked_on_load: weakref.WeakSet = weakref.WeakSet()
+_optimizer_step_hook = None
+
+
+def _drop_value_pass_weights(module, *_):
+    _value_pass_weights.pop(module, None)
+
+
+def release_inference_value_pass_weights(model: torch.nn.Module) -> None:
+    """Free the value pass's cached kernel weights in ``model``.
+
+    For a caller that needs the memory, for example before colocated generation. The
+    next value pass rebuilds them from the parameters.
+    """
+    for module in model.modules():
+        _drop_value_pass_weights(module)
 
 
 def expert_value_pass(experts: InferenceGroupedMLP, hidden_states, probs, routing_map):
     """The experts' value pass: generation's FlashInfer kernel on the training parameters.
 
-    The kernel weights are rebuilt from the parameters on the first microbatch of each
-    forward-backward call, after which the parameters cannot move until the next one, and
-    reused for the rest of it.
+    The kernel weights are built from the parameters on the first value pass after an
+    optimizer step, and reused until the next step, a checkpoint load, or
+    ``release_inference_value_pass_weights``. A process-wide optimizer step post-hook and
+    a load_state_dict post-hook on the experts, both registered here, drop them, so
+    neither the training pipeline nor the experts module keeps any value-pass state.
     """
+    global _optimizer_step_hook
     assert routing_map is not None, "routing_map is required for the training forward."
-    if experts._inference_value_pass_weights is None:
-        experts._inference_value_pass_weights = _build_value_pass_weights(experts)
-    mxfp8_weights, nvfp4_weights = experts._inference_value_pass_weights
+    weights = _value_pass_weights.get(experts)
+    if weights is None:
+        if _optimizer_step_hook is None:
+            _optimizer_step_hook = register_optimizer_step_post_hook(
+                lambda *_: _value_pass_weights.clear()
+            )
+        if experts not in _hooked_on_load:
+            experts.register_load_state_dict_post_hook(_drop_value_pass_weights)
+            _hooked_on_load.add(experts)
+        weights = _value_pass_weights[experts] = _build_value_pass_weights(experts)
+    mxfp8_weights, nvfp4_weights = weights
     kwargs = dict(
         num_experts=experts.num_local_experts * experts.ep_group.size(),
         local_expert_offset=experts.ep_group.rank() * experts.num_local_experts,
