@@ -37,7 +37,7 @@ permissions:
 
 jobs:
   code-freeze:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_code_freeze.yml@61445a177938967f70c94094b98402e979452151 # github app authentication
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_code_freeze.yml@9804c761eea4e3afad5e98cca0234d9e46c78adf # github app authentication
     with:
       app-id: ${{ vars.BOT_ID }}
       environment-name: main
@@ -48,6 +48,7 @@ jobs:
       dry-run: ${{ inputs.dry-run }}
       next-pre-release: ""
       next-dev: ""
+      update-release-docs: true
       release-branch-prefix: core_
     secrets:
       SLACK_WEBHOOK: ${{ inputs.dry-run && secrets.SLACK_CI_CHANNEL_WEBHOOK ||secrets.SLACK_MAIN_CHANNEL_WEBHOOK }}
