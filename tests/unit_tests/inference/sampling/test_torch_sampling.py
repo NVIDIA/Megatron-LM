@@ -38,7 +38,11 @@ class TestLogProbsKernelDtype:
         num_rows = 4
 
         logits = torch.randn(num_rows, vocab_size, dtype=logits_dtype)
-        temperature = torch.ones(num_rows)
+        temperature = (
+            torch.tensor([0.5, 0.75, 1.25, 2.0])
+            if logits_dtype == torch.float32
+            else torch.ones(num_rows)
+        )
         top_k = torch.zeros(num_rows, dtype=torch.long)
         top_p = torch.zeros(num_rows)
 
@@ -50,9 +54,9 @@ class TestLogProbsKernelDtype:
         assert log_probs.dtype == torch.float32
         assert log_probs.shape == (num_rows, vocab_size)
 
-        # The fp32 result should match computing log_softmax directly on the
-        # fp32-upcast logits -- not the (lossy) low-precision computation.
-        expected = torch.log_softmax(logits.float(), dim=-1)
+        # The fp32 result should match scaling and normalizing the fp32-upcast
+        # logits -- not quantizing temperature division in the input dtype.
+        expected = torch.log_softmax(logits.float() / temperature.unsqueeze(1), dim=-1)
         torch.testing.assert_close(log_probs, expected)
 
     def test_low_precision_logits_do_not_collapse_tail_precision(self):
