@@ -2,6 +2,7 @@
 import copy
 import gc
 import random
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -15,6 +16,7 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
+from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import BucketStatus
 from megatron.core.fp8_utils import HAVE_TE
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
 from megatron.core.hyper_comm_grid import HyperCommGrid
@@ -27,6 +29,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version, is_torch_min_version
+from megatron.training.utils import common_utils
 from tests.unit_tests.distributed.mfsdp_v1.utils import (
     make_gpt_mock_data_iterator,
     make_moe_args_model_and_optimizer,
@@ -293,6 +296,51 @@ class TestFullyShardedDataParallel:
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def test_params_norm_leaves_param_gathers_in_flight(self, monkeypatch):
+        """calc_params_l2_norm reads the DTensor shards without releasing the parameter
+        all-gathers that the optimizer step starts for the next forward."""
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+
+        fsdp_model = self._build_fsdp_model()
+        optimizer = DistributedOptimizer(
+            optimizer=None,
+            config=OptimizerConfig(optimizer="adam", lr=1.0),
+            grad_scaler=None,
+            init_state_fn=None,
+            model_chunks=[fsdp_model],
+            per_model_buffers={0: [fsdp_model.param_and_grad_buffer]},
+            data_parallel_group=fsdp_model.megatron_fsdp_dist_index.get_dp_group(),
+            data_parallel_group_gloo=None,
+            data_parallel_group_idx=0,
+            distributed_optimizer_instance_id=0,
+        )
+        optimizer.zero_grad()
+        fsdp_model(torch.randn(2, 13, device="cuda")).sum().backward()
+        optimizer.step()
+
+        # The step's start_param_sync swaps in the raw parameters and gathers the first bucket.
+        pipeline = fsdp_model.module.all_gather_pipeline
+        status = dict(pipeline.bucket_status)
+        assert any(s != BucketStatus.EMPTY for s in status.values())
+        assert not fsdp_model.module.is_param_fsdp_distributed
+
+        monkeypatch.setattr(
+            common_utils, "get_args", lambda: SimpleNamespace(use_megatron_fsdp=True)
+        )
+        norm = common_utils.calc_params_l2_norm([fsdp_model])
+
+        assert pipeline.bucket_status == status
+        assert not fsdp_model.module.is_param_fsdp_distributed
+
+        names = [name for name, _ in fsdp_model.distributed_named_parameters()]
+        fsdp_model.stop_communication()
+        assert names == [name for name, _ in fsdp_model.module.module.named_parameters()]
+        expected = common_utils.calc_dtensor_params_l2_norm(
+            [param for _, param in fsdp_model.named_parameters()]
+        )
+        assert norm == expected
 
     def test_fsdp_expt_device_mesh(self):
         """Test that expt_device_mesh is None for dense models and not None for MoE models."""

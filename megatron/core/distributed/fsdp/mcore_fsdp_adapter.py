@@ -563,6 +563,10 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         self.module.synchronize_gradient_reduce()
         self.module.synchronize_param_gather()
 
+    def distributed_named_parameters(self):
+        """Named DTensor parameters of the wrapped module, without stopping communication."""
+        return self.module.distributed_named_parameters()
+
     def sync_rng_states_across_tp_group(self):
         """
         Synchronize the tensor parallel random number generator states.
