@@ -1166,8 +1166,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             step = torch.tensor(steps[0], dtype=torch.float)
 
             for s in state_dict_state.values():
-                # Native PyTorch state dict requires step (i.e., iteration).
-                s["step"] = step
+                # Each parameter needs its own counter: Adam increments it in place.
+                # Sharing one tensor increments the step once per parameter on resume.
+                s["step"] = step.detach().clone()
         elif isinstance(self.optimizer, HybridDeviceOptimizer):
             # Handle Torch AdamW special case, which, unlike FusedAdam, Torch AdamW
             # has an extra optimizer state "step".

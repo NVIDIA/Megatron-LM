@@ -111,6 +111,21 @@ class DistributedDataParallel(_BaseDataParallel):
         config: TransformerConfig, ddp_config: DistributedDataParallelConfig
     ) -> None:
         """Validate model settings that depend on the data-parallel configuration."""
+        if config.decoder_num_repeats > 1:
+            if ddp_config.overlap_grad_reduce or ddp_config.overlap_param_gather:
+                raise ValueError(
+                    "Repeated decoder execution requires DDP communication overlap off"
+                )
+            if ddp_config.use_megatron_fsdp or ddp_config.use_custom_fsdp:
+                raise ValueError("Repeated decoder execution supports ordinary Megatron DDP only")
+            if ddp_config.delay_wgrad_compute:
+                raise ValueError(
+                    "Repeated decoder execution does not support delayed weight gradients"
+                )
+            if ddp_config.num_distributed_optimizer_instances != 1:
+                raise ValueError(
+                    "Repeated decoder execution requires one distributed optimizer instance"
+                )
         if config.moe_virtual_expert_load_balance and config.fp8:
             if not ddp_config.fp8_param_gather:
                 raise ValueError(
@@ -147,6 +162,8 @@ class DistributedDataParallel(_BaseDataParallel):
 
         # If bucket_size is not provided as an input, use sane default based on dp_group size.
         dp_group = process_group_dict['dp_group']
+        if config.decoder_num_repeats > 1 and dp_group.size() not in (1, 2):
+            raise ValueError("Repeated decoder execution supports decoder DP size 1 or 2 only")
         if ddp_config.bucket_size is None:
             ddp_config.bucket_size = max(40000000, 1000000 * dp_group.size())
         # Set bucket_size to infinity if overlap_grad_reduce is False.
