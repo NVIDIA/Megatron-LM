@@ -34,6 +34,7 @@ from model_providers.llava_vlm import model_provider_llava_vlm
 from model_providers.mock import model_provider_mock_vlm_single_encoder
 from utils.data_helpers import broadcast_nested_data_batch
 
+from examples.mimo.training.args import add_mimo_dcp_args
 from megatron.core.enums import ModelType
 from megatron.core.utils import unwrap_model
 
@@ -74,6 +75,7 @@ def _canonicalize_packed_sequence_metadata(batch: Dict[str, Any]) -> Dict[str, A
 
 def add_mimo_args(parser):
     """Add MIMO-specific arguments to the parser."""
+    add_mimo_dcp_args(parser)
     group = parser.add_argument_group('MIMO', 'MIMO specific arguments')
 
     # MIMO-specific parameters

@@ -143,6 +143,11 @@ graph and runs one encoder backward at `finish_backward()`.
 `prepare_source` callback returns samples, feature slices and a callable mapping
 ordered media IDs to local encoder inputs. The adapter uses lazy execution for
 this contract; returning an input dictionary retains whole-step encoding.
+The example CLI names this choice
+`--mimo-dcp-encoder-schedule {whole-step,per-round}` (default: `whole-step`).
+Model/data adapters map the selected schedule to the corresponding input contract.
+Both modes plan the complete source batch before execution. `per-round` describes
+encoder execution granularity; it does not itself imply overlap between GPU pools.
 The callback owns dataset/model-specific policies. Call `install()`
 explicitly to register the packing adapter and gradient-finalization wrapper.
 The adapter defaults to the caller's process-group collection for runtime CP
