@@ -68,6 +68,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 HAVE_TE = moe_utils.HAVE_TE
 HAVE_TE_PERMUTE = HAVE_TE and moe_utils.fused_permute is not None
 HAVE_TE_ROUTER = HAVE_TE and is_te_min_version("2.7.0")
+HAVE_TE_DETERMINISTIC_AUX_LOSS = moe_utils.te_supports_deterministic_moe_aux_loss()
 from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_DEEP_EP_V2
 
 NUM_TOKENS, HIDDEN, NUM_EXPERTS, TOPK = 16384, 2048, 64, 8
@@ -776,18 +777,17 @@ def test_group_limited_topk_replays():
         False,
         pytest.param(
             True,
-            marks=[
-                pytest.mark.skipif(not HAVE_TE_ROUTER, reason="TE>=2.7 needed"),
-                pytest.mark.xfail(
-                    strict=False,
-                    reason="TE fused_moe_aux_loss reduces with atomicAdd (open gap, recorded not gated)",
-                ),
-            ],
+            marks=pytest.mark.skipif(
+                not HAVE_TE_DETERMINISTIC_AUX_LOSS,
+                reason="TE deterministic fused MoE aux loss needed",
+            ),
         ),
     ],
 )
 @pytest.mark.parametrize("all_padding", [False, True])
-def test_switch_load_balancing_loss_replays(fused, all_padding):
+@pytest.mark.parametrize("torch_enabled", [False, True])
+def test_switch_load_balancing_loss_replays(fused, all_padding, torch_enabled):
+    """An explicit deterministic request replays with either PyTorch global setting."""
     seeded()
     routing_map, probs = _routing(num_tokens=65536, num_experts=256, topk=8)
     if all_padding:
@@ -799,12 +799,46 @@ def test_switch_load_balancing_loss_replays(fused, all_padding):
 
     def fn(probs):
         return moe_utils.switch_load_balancing_loss_func(
-            probs, tokens_per_expert, total_num_tokens, 8, 256, 1e-2, fused=fused
+            probs,
+            tokens_per_expert,
+            total_num_tokens,
+            8,
+            256,
+            1e-2,
+            fused=fused,
+            deterministic=True,
         )
 
-    assert_replays_bit_exact(
-        fn, (probs,), replays=4, what=f"aux loss[fused={fused}, all_padding={all_padding}]"
-    )
+    with deterministic_algorithms(torch_enabled):
+        assert_replays_bit_exact(
+            fn,
+            (probs,),
+            replays=4,
+            contention=True,
+            what=f"aux loss[fused={fused}, all_padding={all_padding}, "
+            f"torch_deterministic={torch_enabled}]",
+        )
+
+
+@pytest.mark.skipif(not HAVE_TE_ROUTER, reason="TE>=2.7 needed")
+@pytest.mark.xfail(
+    strict=False,
+    reason="Negative control: floating-point atomic accumulation may repeat on some hardware.",
+)
+def test_default_fused_aux_loss_is_the_racy_path():
+    """The default atomic branch remains non-deterministic without an explicit request."""
+    seeded()
+    routing_map, probs = _routing(num_tokens=65536, num_experts=256, topk=8)
+    tokens_per_expert = routing_map.sum(dim=0)
+
+    def fn(probs):
+        return moe_utils.switch_load_balancing_loss_func(
+            probs, tokens_per_expert, 65536, 8, 256, 1e-2, fused=True
+        )
+
+    with deterministic_algorithms(False):
+        differing = count_differing_replays(fn, (probs,), replays=8, backward=False)
+    assert differing > 0, "atomic aux loss happened to repeat bit-exactly on this hardware/shape"
 
 
 @pytest.mark.parametrize("router_dtype", [torch.float32, torch.float64])
@@ -1076,6 +1110,8 @@ class TestMoEModules:
             moe_router_score_function="sigmoid" if expert_bias else "softmax",
             moe_router_enable_expert_bias=expert_bias,
             moe_router_fusion=True,
+            # Dense TopK coverage should not require TE's deterministic aux-loss API.
+            moe_router_aux_loss_fusion=False,
             moe_token_dispatcher_type="flex",
             moe_flex_dispatcher_backend=backend,
         )

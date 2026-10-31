@@ -368,7 +368,11 @@ def test_seq_aux_loss_restores_batch_size_for_per_token_scaling(monkeypatch):
     router = TopKRouter.__new__(TopKRouter)
     object.__setattr__(router, "topk", 2)
     object.__setattr__(
-        router, "config", SimpleNamespace(num_moe_experts=2, moe_router_aux_loss_fusion=False)
+        router,
+        "config",
+        SimpleNamespace(
+            num_moe_experts=2, moe_router_aux_loss_fusion=False, deterministic_mode=False
+        ),
     )
     object.__setattr__(router, "get_aux_loss_coeff", lambda _name: 1.0)
     object.__setattr__(
