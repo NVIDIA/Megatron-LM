@@ -68,6 +68,98 @@ from megatron.core.transformer.fsdp_dtensor_checkpoint import (
 # ============================================================================
 # Test the slice/path helpers shared by the SwiGLU, GDN and MLA handlers
 # ============================================================================
+class TestMambaCheckpointLayout:
+    """Exercise the real handler's names, values and aliasing without distributed setup."""
+
+    @pytest.mark.parametrize("legacy_conv", [False, True])
+    @pytest.mark.parametrize("wrapper", ["", "module.", "module.module."])
+    def test_model_and_adam_components(self, monkeypatch, legacy_conv, wrapper):
+        from megatron.core.ssm.mamba_mixer import MambaMixer
+
+        # Only construction is stubbed: native distributed coverage builds a real mixer.
+        mixer = MambaMixer.__new__(MambaMixer)
+        torch.nn.Module.__init__(mixer)
+        mixer.d_inner, mixer.ngroups, mixer.d_state, mixer.nheads = 12, 2, 3, 4
+        mixer.in_proj = torch.nn.Linear(7, 40, bias=False)
+        if legacy_conv:
+            mixer.conv1d = torch.nn.Conv1d(24, 24, 4, groups=24)
+        else:
+            mixer.conv1d_weight = torch.nn.Parameter(torch.empty(24, 1, 4))
+            mixer.conv1d_bias = torch.nn.Parameter(torch.empty(24))
+        model = torch.nn.Module()
+        model.mixer = mixer
+        state = {}
+        optimizer = {"state": {}, "param_groups": [{"lr": 0.001}], "param_to_group_meta": {}}
+        for index, (name, param) in enumerate(model.named_parameters()):
+            key = wrapper + name
+            state[key] = torch.arange(param.numel()).reshape(param.shape).float() + index * 1000
+            optimizer["state"][key] = {
+                "step": torch.tensor(7),
+                "exp_avg": state[key] + 10000,
+                "exp_avg_sq": state[key] + 20000,
+            }
+            optimizer["param_to_group_meta"][key] = {"lr": 0.001, "step": 7}
+        original_keys = set(state)
+        monkeypatch.setattr(
+            fsdp_dtensor_checkpoint,
+            "split_fused_fsdp_param",
+            lambda data, param, sizes: torch.split(data, sizes, dim=0),
+        )
+        converted, converted_optimizer = fsdp_dtensor_checkpoint.handle_mamba_in_state_dict(
+            model, state, optimizer
+        )
+        assert set(state) == original_keys
+        assert set(optimizer["state"]) == original_keys
+        assert converted_optimizer["param_groups"] is optimizer["param_groups"]
+        for raw_key, raw_tensor in state.items():
+            if raw_key.endswith("in_proj.weight"):
+                sizes, names = [12, 12, 6, 6, 4], ["z", "x", "B", "C", "dt"]
+            else:
+                sizes, names = [12, 6, 6], ["x", "B", "C"]
+            disk_key = raw_key.replace("conv1d_", "conv1d.")
+            offset = 0
+            for size, name in zip(sizes, names):
+                key = f"{disk_key}.{name}"
+                torch.testing.assert_close(converted[key], raw_tensor[offset : offset + size])
+                assert (
+                    converted[key].untyped_storage().data_ptr()
+                    == raw_tensor.untyped_storage().data_ptr()
+                )
+                for moment in ("exp_avg", "exp_avg_sq"):
+                    original = optimizer["state"][raw_key][moment]
+                    actual = converted_optimizer["state"][key][moment]
+                    torch.testing.assert_close(actual, original[offset : offset + size])
+                    assert (
+                        actual.untyped_storage().data_ptr() == original.untyped_storage().data_ptr()
+                    )
+                assert converted_optimizer["state"][key]["step"].item() == 7
+                assert (
+                    converted_optimizer["param_to_group_meta"][key]
+                    is optimizer["param_to_group_meta"][raw_key]
+                )
+                offset += size
+        assert len(converted) == 11
+        assert len(converted_optimizer["state"]) == 11
+        assert len(converted_optimizer["param_to_group_meta"]) == 11
+        assert set(optimizer["param_to_group_meta"]) == original_keys
+        legacy_model, legacy_optimizer = fsdp_dtensor_checkpoint.handle_mamba_in_state_dict(
+            model,
+            state,
+            optimizer,
+            checkpoint_metadata={f"model.{key}": None for key in original_keys},
+        )
+        assert legacy_model is state
+        assert legacy_optimizer is optimizer
+
+    def test_non_mamba_is_noop(self):
+        state, optimizer = {"in_proj.weight": torch.ones(4, 4)}, {"state": {}}
+        model_state, optimizer_state = fsdp_dtensor_checkpoint.handle_mamba_in_state_dict(
+            torch.nn.Linear(4, 4), state, optimizer
+        )
+        assert model_state is state
+        assert optimizer_state is optimizer
+
+
 class TestSharedSliceHelpers:
     """These three are used by every fused-parameter handler, so pin their semantics."""
 
