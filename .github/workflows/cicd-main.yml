@@ -202,6 +202,7 @@ jobs:
       mbridge_suite:  ${{ steps.configure.outputs.mbridge_suite }}
       run_mbridge:    ${{ steps.configure.outputs.run_mbridge }}
       run_nemo_rl:    ${{ steps.configure.outputs.run_nemo_rl }}
+      functional_coverage: ${{ steps.configure.outputs.functional_coverage }}
       run_functional: ${{ steps.configure.outputs.run_functional }}
       run_h100_functional: ${{ steps.configure.outputs.run_h100_functional }}
       h100_cloud: ${{ steps.configure.outputs.h100_cloud }}
@@ -283,6 +284,12 @@ jobs:
 
           HAS_RUN_TESTS=$(echo "$LABELS"      | jq 'any(. == "Run tests")')
           HAS_RUN_FUNCTIONAL=$(echo "$LABELS" | jq 'any(. == "Run functional tests")')
+          FUNCTIONAL_COVERAGE=$(echo "$LABELS" | jq 'any(. == "Collect functional coverage")')
+          # Keep full-suite approval and serialization in the existing queue
+          # policy: the coverage label alone must not expand the test matrix.
+          if [ "$HAS_RUN_FUNCTIONAL" != "true" ]; then
+            FUNCTIONAL_COVERAGE=false
+          fi
           HAS_LTS=$(echo "$LABELS"            | jq 'any(. == "container::lts")')
           HAS_MBRIDGE=$(echo "$LABELS"        | jq 'any(. == "Run MBridge tests")')
           HAS_NEMO_RL=$(echo "$LABELS"        | jq 'any(. == "Run NeMoRL tests")')
@@ -297,6 +304,7 @@ jobs:
           RUN_FUNCTIONAL=false
           if [ "$HAS_RUN_TESTS" == "true" ] \
             || [ "$HAS_RUN_FUNCTIONAL" == "true" ] \
+            || [ "$FUNCTIONAL_COVERAGE" == "true" ] \
             || [ "$IS_MERGE_GROUP" == "true" ] \
             || [ "$IS_CI_WORKLOAD" == "true" ] \
             || [ "$EVENT_NAME" == "workflow_dispatch" ] \
@@ -363,7 +371,7 @@ jobs:
             fi
           fi
 
-          if [ "$IS_MERGE_GROUP" == "true" ]; then
+          if [ "$FUNCTIONAL_COVERAGE" == "true" ] || [ "$IS_MERGE_GROUP" == "true" ]; then
             SCOPE=L1; N_REPEAT=1; LIGHTWEIGHT=false
           elif [ "$HAS_RUN_TESTS" == "true" ]; then
             SCOPE=L1; N_REPEAT=1; LIGHTWEIGHT=true
@@ -428,6 +436,14 @@ jobs:
             CADENCE_OUTPUT="$CADENCE"
           fi
 
+          # Coverage baselines match the merge-queue matrix, including when
+          # requested on a PR. Do not shorten training or bypass cadence.
+          if [ "$FUNCTIONAL_COVERAGE" == "true" ]; then
+            CADENCE=mergegroup
+            CADENCE_OUTPUT=mergegroup
+            CADENCE_BYPASS=false
+          fi
+
           DEV=true
 
           # The repository variable sets the default; labels override it.
@@ -467,6 +483,7 @@ jobs:
           echo "mbridge_suite=$MBRIDGE_SUITE"   | tee -a $GITHUB_OUTPUT
           echo "run_mbridge=$RUN_MBRIDGE"       | tee -a $GITHUB_OUTPUT
           echo "run_nemo_rl=$RUN_NEMO_RL"       | tee -a $GITHUB_OUTPUT
+          echo "functional_coverage=$FUNCTIONAL_COVERAGE" | tee -a $GITHUB_OUTPUT
           echo "run_functional=$RUN_FUNCTIONAL" | tee -a $GITHUB_OUTPUT
           echo "run_h100_functional=$RUN_H100_FUNCTIONAL" | tee -a $GITHUB_OUTPUT
           echo "h100_cloud=$H100_CLOUD" | tee -a $GITHUB_OUTPUT
@@ -503,6 +520,7 @@ jobs:
           | \`dev\` | \`$DEV\` |
           | \`run_mbridge\` | \`$RUN_MBRIDGE\` |
           | \`run_nemo_rl\` | \`$RUN_NEMO_RL\` |
+          | \`functional_coverage\` | \`$FUNCTIONAL_COVERAGE\` |
           | \`run_functional\` | \`$RUN_FUNCTIONAL\` |
           | \`run_h100_functional\` | \`$RUN_H100_FUNCTIONAL\` |
           | \`h100_cloud\` | \`$H100_CLOUD\` |
@@ -1201,6 +1219,14 @@ jobs:
 
           echo "integration-tests-h100=$(cat integration-tests-h100.json)" | tee -a "$GITHUB_OUTPUT"
 
+      - name: Upload expected functional coverage matrix
+        if: needs.configure.outputs.functional_coverage == 'true'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: coverage-functional-matrix-h100-${{ github.run_id }}-${{ github.run_attempt }}
+          path: integration-tests-h100.json
+          if-no-files-found: error
+
   cicd-integration-tests-latest-h100:
     timeout-minutes: 60
     strategy:
@@ -1242,6 +1268,7 @@ jobs:
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
           lightweight: ${{ needs.configure.outputs.lightweight }}
           cadence: ${{ needs.configure.outputs.cadence }}
+          functional_coverage: ${{ needs.configure.outputs.functional_coverage }}
           sha: ${{ needs.configure.outputs.sha }}
 
   cicd-parse-integration-tests-gb200:
@@ -1299,6 +1326,14 @@ jobs:
 
           echo "integration-tests-gb200=$(cat integration-tests-gb200.json)" | tee -a "$GITHUB_OUTPUT"
 
+      - name: Upload expected functional coverage matrix
+        if: needs.configure.outputs.functional_coverage == 'true'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: coverage-functional-matrix-gb200-${{ github.run_id }}-${{ github.run_attempt }}
+          path: integration-tests-gb200.json
+          if-no-files-found: error
+
   cicd-integration-tests-latest-gb200:
     timeout-minutes: 60
     strategy:
@@ -1343,6 +1378,7 @@ jobs:
           lightweight: ${{ needs.configure.outputs.lightweight }}
           platform: dgx_gb200
           cadence: ${{ needs.configure.outputs.cadence }}
+          functional_coverage: ${{ needs.configure.outputs.functional_coverage }}
           sha: ${{ needs.configure.outputs.sha }}
 
   Nemo_CICD_Test:
