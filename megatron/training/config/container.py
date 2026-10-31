@@ -1,9 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
+import logging
 import os
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
-from dataclasses import is_dataclass
+from dataclasses import replace
 from typing import Any, Type, TypeVar
 
 try:
@@ -39,11 +40,18 @@ from megatron.training.config.training_config import (
     TrainingConfig,
     ValidationConfig,
 )
-from megatron.training.config.utils import sanitize_dataclass_config
+from megatron.training.config.utils import sanitize_dataclass_config, serialize_dataclass
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.models import GPTModelConfig, HybridModelConfig, Serializable
+from megatron.training.models import (
+    BertModelConfig,
+    LLaVAModelConfig,
+    MimoBuildConfig,
+    T5ModelConfig,
+)
+from megatron.training.models.base import ModelConfig
 
 T = TypeVar("T", bound="ConfigContainerBase")
+logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True)
 class ConfigContainerBase:
@@ -170,67 +178,7 @@ class ConfigContainerBase:
         Returns:
             Dictionary representation of this config
         """
-        result = {}
-        result["_target_"] = f"{self.__class__.__module__}.{self.__class__.__qualname__}"
-
-        for f in dataclass_fields(self):
-            if f.name.startswith("_"):
-                continue
-
-            value = getattr(self, f.name)
-            result[f.name] = self._convert_value_to_dict(value)
-
-        return result
-
-    @classmethod
-    def _convert_value_to_dict(cls, value: Any) -> Any:
-        """
-        Recursively convert a value to a dictionary representation.
-
-        Handles:
-        - ConfigContainer instances (using to_dict)
-        - Serializable instances (using as_dict)
-        - Classes which implement a to_cfg_dict method
-        - Regular dataclasses (converting each non-private field)
-        - Lists and tuples (converting each element)
-        - Dictionaries (converting each value)
-        - Other types (kept as-is)
-
-        Args:
-            value: The value to convert
-
-        Returns:
-            The converted value
-        """
-        if isinstance(value, ConfigContainerBase):
-            return value.to_dict()
-        elif isinstance(value, Serializable):
-            return value.as_dict()
-        elif hasattr(value, "to_cfg_dict"):
-            # Allow non-Container classes to implement own custom method
-            return value.to_cfg_dict()
-        elif is_dataclass(value) and not isinstance(value, type):
-            # Handle regular dataclasses
-            result = {}
-
-            # Add _target_ field for instantiation
-            result["_target_"] = f"{value.__class__.__module__}.{value.__class__.__qualname__}"
-
-            # Convert each field, handling nested dataclasses properly
-            for field in dataclass_fields(value):
-                if field.name.startswith("_"):
-                    continue
-
-                field_value = getattr(value, field.name)
-                result[field.name] = cls._convert_value_to_dict(field_value)
-
-            return result
-        elif isinstance(value, (list, tuple)):
-            return [cls._convert_value_to_dict(item) for item in value]
-        elif isinstance(value, dict):
-            return {k: cls._convert_value_to_dict(v) for k, v in value.items()}
-        else:
-            return value
+        return serialize_dataclass(self)
 
     def to_yaml(self, yaml_path: str) -> None:
         """
@@ -278,11 +226,11 @@ class ConfigContainerBase:
 
 @dataclass(kw_only=True)
 class PretrainConfigContainer(ConfigContainerBase):
-    """Top-level container holding all configuration objects."""
+    """Training configuration; requires a model with a non-null transformer config."""
 
     train: TrainingConfig
     validation: ValidationConfig = field(default_factory=ValidationConfig)
-    model: HybridModelConfig | GPTModelConfig
+    model: ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoBuildConfig
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
     data: DataConfig = field(default_factory=DataConfig)
@@ -300,6 +248,70 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
+
+    def get_model_world_size(self) -> int:
+        """Return ranks in the model grid, which may be a subset of the launch."""
+        launch_world_size = safe_get_world_size()
+        world_size = (
+            self.model.mimo_llm_world_size if isinstance(self.model, MimoBuildConfig) else None
+        )
+        if world_size is None:
+            world_size = launch_world_size
+        if not 0 < world_size <= launch_world_size:
+            raise ValueError("Training model world size must fit within the global launch")
+        return world_size
+
+    def get_parallel_layout(self, model_world_size: int) -> GTPParallelLayout:
+        """Build the model's parallel layout without discovering the launch environment.
+
+        ``model_world_size`` is the number of ranks assigned to this model, not
+        necessarily the global launch size. Runtime callers resolve it through
+        ``get_model_world_size()``; callers inspecting a hypothetical layout may
+        supply it directly. Transformer CP already includes GTP sequence shards,
+        whereas the layout's CP excludes them.
+        """
+        transformer = self.model.transformer
+        tp = transformer.tensor_model_parallel_size
+        pp = transformer.pipeline_model_parallel_size
+        cp = transformer.context_parallel_size
+        weight_size = transformer.gtp_weight_remat_size
+        if min(tp, pp, cp, weight_size) < 1:
+            raise ValueError("Parallel sizes must be positive")
+        sequence_shards = transformer.gtp_remat_num_sequence_shards
+        if cp % sequence_shards:
+            raise ValueError("Runtime context-parallel size must contain the GTP sequence shards")
+        return GTPParallelLayout(
+            world_size=model_world_size,
+            tp=tp,
+            pp=pp,
+            cp=cp // sequence_shards,
+            weight_size=weight_size,
+            num_sequence_shards=sequence_shards,
+        )
+
+    def get_data_parallel_size(self) -> int:
+        """Return replica DP, excluding batch partitions within GTP weight groups."""
+        return self.get_parallel_layout(self.get_model_world_size()).dp
+
+    def get_batch_parallel_size(self) -> int:
+        """Return independent batch partitions, including GTP batch shards but not CP."""
+        return self.get_parallel_layout(self.get_model_world_size()).batch_parallel_size
+
+    def finalize_optimizer_config(self, optimizer: OptimizerConfig) -> OptimizerConfig:
+        """Derive configured or legacy-built optimizer precision from the finalized model."""
+        precision = {
+            name: getattr(self.model.transformer, name)
+            for name in ("fp16", "bf16", "params_dtype", "fp8_recipe")
+        }
+        changes = {
+            name: (getattr(optimizer, name), value)
+            for name, value in precision.items()
+            if getattr(optimizer, name) != value
+        }
+        if changes:
+            logger.warning("Overriding optimizer precision from model config (old, new): %s", changes)
+        # Reconstruct so optimizer-local derived precision settings are recomputed too.
+        return replace(optimizer, **precision)
 
     def _resolve_batch_sizes(
         self, batch_parallel_size: int | None = None
@@ -389,9 +401,40 @@ class PretrainConfigContainer(ConfigContainerBase):
 
 
     def validate(self) -> None:
-        """Validate each section, then the RL section against the rest of the run."""
+        """Validate each section and the cross-config GTP, batch-size, and RL policies."""
+        if self.model is None:
+            raise ValueError("Training requires a model config")
+        if getattr(self.model, "transformer", None) is None:
+            raise ValueError("Training requires model.transformer to be configured")
         self.rl.validate_ddp_config(self.ddp)
         super().validate()
+        # Config-only topology checks also run when validating a recipe off-cluster.
+        # Launch world-size checks remain in the runtime parallel-size helpers.
+        transformer = self.model.transformer
+        tp = transformer.tensor_model_parallel_size
+        pp = transformer.pipeline_model_parallel_size
+        cp = transformer.context_parallel_size
+        weight_size = transformer.gtp_weight_remat_size
+        if min(tp, pp, cp, weight_size) < 1:
+            raise ValueError("Parallel sizes must be positive")
+        sequence_shards = transformer.gtp_remat_num_sequence_shards
+        if cp % sequence_shards:
+            raise ValueError("Runtime context-parallel size must contain the GTP sequence shards")
+        if isinstance(self.model, MimoBuildConfig) and self.model.mimo_llm_world_size is not None:
+            world_size = self.model.mimo_llm_world_size
+            if world_size <= 0:
+                raise ValueError("MIMO language-model world size must be positive")
+            if world_size % (tp * pp * (cp // sequence_shards) * weight_size):
+                raise ValueError(
+                    "MIMO language-model world size must be divisible by its model parallel size"
+                )
+        if sequence_shards > 1:
+            if self.checkpoint.ckpt_format != "torch_dist":
+                raise ValueError("GTP sequence sharding requires torch_dist checkpoints")
+            if self.dist.use_torch_fsdp2 or self.ddp.use_megatron_fsdp:
+                raise ValueError("GTP sequence sharding uses Megatron DDP, not FSDP")
+            if self.dist.use_tp_pp_dp_mapping:
+                raise ValueError("GTP sequence sharding does not support TP-PP-DP mapping")
         global_batch_size, _, _ = self._resolve_batch_sizes()
         self._validate_rl_config(global_batch_size)
         self._validate_data_section()
@@ -420,34 +463,6 @@ class PretrainConfigContainer(ConfigContainerBase):
             skip_train=self.validation.skip_train,
             weight_decay=self.optimizer.weight_decay,
         )
-
-    def get_data_parallel_size(self, world_size: int) -> int | None:
-        """The data-parallel size of this run's model layout, or ``None`` without a model config.
-
-        The same quotient as ``validate_args``: ``world_size // (tp * pp * cp * weight-remat)`` with
-        the *configured* context-parallel size. The model config stores the resolved one (configured
-        CP times the GTP sequence shards), so the shards are divided out first; ``GTPParallelLayout``
-        checks the divisions.
-        """
-        transformer = getattr(self.model, "transformer", None)
-        if transformer is None:
-            return None
-        shards = getattr(transformer, "gtp_remat_num_sequence_shards", 1) or 1
-        resolved_cp = transformer.context_parallel_size
-        if resolved_cp % shards:
-            raise ValueError(
-                f"context_parallel_size ({resolved_cp}) must be a multiple of the GTP sequence "
-                f"shards ({shards})."
-            )
-        layout = GTPParallelLayout(
-            world_size=world_size,
-            tp=transformer.tensor_model_parallel_size,
-            pp=transformer.pipeline_model_parallel_size,
-            cp=resolved_cp // shards,
-            weight_size=getattr(transformer, "gtp_weight_remat_size", 1) or 1,
-            num_sequence_shards=shards,
-        )
-        return layout.dp
 
     def _validate_data_section(self) -> None:
         """Cross-section checks for ``data.dataset``, one per field.
@@ -489,9 +504,7 @@ class PretrainConfigContainer(ConfigContainerBase):
                 f"validation.multiple_validation_sets={validation.multiple_validation_sets}; the "
                 "container writes this field at finalize(), leave it unset."
             )
-        transformer = getattr(self.model, "transformer", None)
-        if transformer is None:
-            return  # no model config (pretrain_hybrid_flex.py): the layout fields have no owner
+        transformer = self.model.transformer
         if (
             dataset.context_parallel_size is not None
             and dataset.context_parallel_size != transformer.context_parallel_size
@@ -525,16 +538,13 @@ class PretrainConfigContainer(ConfigContainerBase):
             )
 
     def _finalize(self) -> None:
-        from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
-        from megatron.training import get_args
-
         dataset = self.data.dataset
-        transformer = getattr(self.model, "transformer", None)
+        transformer = self.model.transformer
         data_parallel_size = None
-        if dataset is not None and transformer is not None:
+        if dataset is not None:
             # The world size is known here: data_parallel_size gets the agreement check the other
             # fields got at validation, before anything is written.
-            data_parallel_size = self.get_data_parallel_size(safe_get_world_size())
+            data_parallel_size = self.get_data_parallel_size()
             if dataset.data_parallel_size not in (1, data_parallel_size):
                 raise ValueError(
                     f"data.dataset.data_parallel_size={dataset.data_parallel_size} disagrees with "
@@ -542,34 +552,37 @@ class PretrainConfigContainer(ConfigContainerBase):
                     f"(data_parallel_size={data_parallel_size}); the container writes this field "
                     "at finalize(), leave it unset."
                 )
-        # TODO: Use get_batch_parallel_size(self) once topology inputs are config-owned.
-        # Keep this temporary args dependency in framework finalization, not validation.
-        batch_sizes = self._resolve_batch_sizes(get_batch_parallel_size(get_args()))
+        batch_sizes = self._resolve_batch_sizes(self.get_batch_parallel_size())
         self._validate_rl_config(batch_sizes[0])
+        # Resolve RNG and model settings before deriving optimizer precision.
+        super()._finalize()
+        finalize_model = getattr(self.model, "finalize", None)
+        if callable(finalize_model):
+            finalize_model()
+        optimizer = self.finalize_optimizer_config(self.optimizer)
         (
             self.train.global_batch_size,
             self.validation.eval_global_batch_size,
             self.validation.eval_micro_batch_size,
         ) = batch_sizes
-        super()._finalize()
+        self.optimizer = optimizer
         self.scheduler.finalize_scheduler_config(self.optimizer.weight_decay)
         self._resolve_scheduler_step_fields()
         if dataset is not None:
             # The seven fields other sections own (CONTAINER_WRITTEN_FIELDS): the validation flags
-            # from the validation config, the layout from the model config when there is one (the
+            # from the validation config, the layout from the required model config (the
             # deprecated hybrid_context_parallel alias is folded into dynamic_context_parallel).
             dataset.full_validation = self.validation.full_validation
             dataset.multiple_validation_sets = self.validation.multiple_validation_sets
-            if transformer is not None:
-                dataset.data_parallel_size = data_parallel_size
-                dataset.context_parallel_size = transformer.context_parallel_size
-                dataset.sequence_parallel_size = transformer.tensor_model_parallel_size * int(
-                    bool(transformer.sequence_parallel)
-                )
-                dataset.dynamic_context_parallel = bool(
-                    getattr(transformer, "dynamic_context_parallel", False)
-                )
-                dataset.hybrid_context_parallel = False
+            dataset.data_parallel_size = data_parallel_size
+            dataset.context_parallel_size = transformer.context_parallel_size
+            dataset.sequence_parallel_size = transformer.tensor_model_parallel_size * int(
+                bool(transformer.sequence_parallel)
+            )
+            dataset.dynamic_context_parallel = bool(
+                getattr(transformer, "dynamic_context_parallel", False)
+            )
+            dataset.hybrid_context_parallel = False
         self.data.finalize()
         if self.rl.perform_rl_step:
             self.rl.finalize_ddp_config(self.ddp)
@@ -616,8 +629,8 @@ class InferenceConfigContainer(ConfigContainerBase):
     ``DistributedDataParallelConfig``, ``RerunStateMachineConfig``, ``StragglerDetectionConfig``.
     """
 
-    model: HybridModelConfig | GPTModelConfig
-    """Which model to load for inference."""
+    model: ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoBuildConfig | None
+    """Model to load, or None for args-only entrypoints without model inputs."""
 
     checkpoint: CheckpointConfig
     """Checkpoint configuration used to load model weights."""

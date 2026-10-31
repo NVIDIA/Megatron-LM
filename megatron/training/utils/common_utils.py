@@ -103,6 +103,7 @@ def calc_params_l2_norm(
         )
 
     args = get_args()
+    cfg = get_run_config()
 
     if getattr(args, 'use_megatron_fsdp', False):
         # All Megatron FSDP parameters are expected to be PyTorch DTensor.
@@ -185,7 +186,9 @@ def calc_params_l2_norm(
             if is_expert:
                 assert param_is_not_shared(param)
                 param = to_local_if_dtensor(param)
-                data, is_sharded = _get_param_data(param, force_create_fp32_copy, args.bf16)
+                data, is_sharded = _get_param_data(
+                    param, force_create_fp32_copy, cfg.model.transformer.bf16
+                )
                 if data is None:
                     continue
                 if is_gtp:
@@ -195,7 +198,9 @@ def calc_params_l2_norm(
             else:
                 if param_is_not_shared(param):
                     param = to_local_if_dtensor(param)
-                    data, is_sharded = _get_param_data(param, force_create_fp32_copy, args.bf16)
+                    data, is_sharded = _get_param_data(
+                        param, force_create_fp32_copy, cfg.model.transformer.bf16
+                    )
                     if data is None:
                         continue
                     if is_gtp:
@@ -593,9 +598,9 @@ def print_rank_last(message):
         print(message, flush=True)
 
 
-def is_hybrid_model(args):
+def is_hybrid_model(model_config):
     """Returns True if the model is a hybrid Mamba-Transformer model."""
-    return args.hybrid_layer_pattern is not None
+    return getattr(model_config, "hybrid_layer_pattern", None) is not None
 
 
 def is_gtp_remat_active(args):

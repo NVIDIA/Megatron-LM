@@ -9,9 +9,12 @@ the default CPU generator -- except, on the pre-fix code, iterator creation itse
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import megatron.training.datasets.data_samplers as data_samplers
+from megatron.core.transformer import TransformerConfig
+from megatron.training.models import GPTModelConfig
 from tests.unit_tests.test_utilities import Utils
 
 SEED = 1234
@@ -41,6 +44,11 @@ class TestDataLoaderResume:
 
     def test_building_data_iterators_does_not_move_cpu_rng(self, monkeypatch, run_config):
         Utils.initialize_model_parallel(1, 1)
+        run_config.model = GPTModelConfig(
+            transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+            seq_length=16,
+        )
+
         run_config.train.micro_batch_size = 1
         run_config.train.global_batch_size = Utils.world_size
         monkeypatch.setattr(
@@ -85,3 +93,44 @@ class TestDataLoaderResume:
             "building the data iterators moved the CPU RNG off the state load_checkpoint "
             "restored, so the resumed run diverges from the run that saved"
         )
+
+    @pytest.mark.parametrize(
+        "dynamic_cp,scheduler",
+        [(False, None), (False, "dp_balanced"), (True, "default_dynamic_cp")],
+    )
+    def test_sampler_and_collation_use_model_config(
+        self, monkeypatch, run_config, dynamic_cp, scheduler
+    ):
+        Utils.initialize_model_parallel(1, 1)
+        run_config.train.micro_batch_size = 1
+        run_config.train.global_batch_size = 2 * Utils.world_size
+        run_config.model = GPTModelConfig(
+            transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+            seq_length=16,
+        )
+        run_config.model.transformer.dynamic_context_parallel = dynamic_cp
+        run_config.model.transformer.sequence_packing_scheduler = scheduler
+        monkeypatch.setattr(
+            data_samplers,
+            "get_args",
+            lambda: SimpleNamespace(
+                dataloader_type="single",
+                micro_batch_size=1,
+                global_batch_size=2 * Utils.world_size,
+                num_workers=0,
+                dynamic_context_parallel=not dynamic_cp,
+                sequence_packing_scheduler=None if scheduler else "dp_balanced",
+                use_varlen_dataset=False,
+                varlen_sbhd_validation=False,
+            ),
+        )
+
+        loader = data_samplers.build_pretraining_data_loader(_Dataset(), consumed_samples=0)
+
+        assert isinstance(loader.batch_sampler, data_samplers.MegatronPretrainingSampler)
+        batch = next(iter(loader))
+        if dynamic_cp or scheduler is not None:
+            assert isinstance(batch, list)
+            assert len(batch) == 1
+        else:
+            assert batch.shape == (1, 1)

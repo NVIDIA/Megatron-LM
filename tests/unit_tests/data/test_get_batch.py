@@ -24,7 +24,7 @@ from megatron.core.utils import (
     _get_batch_on_this_cp_rank_per_sequence_balancing,
     flatten_batch_for_packed_sequences,
 )
-from megatron.training import arguments, global_vars
+from megatron.training import global_vars
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -979,8 +979,9 @@ def test_get_batch_builds_required_cp_layouts():
         micro_batch_size=1,
         global_batch_size=global_batch_size,
     )
-    args.linear_cp_layout = "contiguous"
-    args.attention_cp_layout = "zigzag"
+    cfg = pretrain_hybrid.get_run_config()
+    cfg.model.transformer.linear_cp_layout = "contiguous"
+    cfg.model.transformer.attention_cp_layout = "zigzag"
 
     tokens = torch.arange(seq_length, dtype=torch.int64).view(1, -1)
     batch = {
@@ -1074,6 +1075,38 @@ def create_pretrain_data_iterator(
     return iter([batch])
 
 
+def test_intermediate_pipeline_batch_uses_config_layout(monkeypatch):
+    args = SimpleNamespace(
+        sft=False,
+        dataloader_inter_document_masking=False,
+        create_attention_mask_in_dataloader=False,
+        linear_cp_layout="zigzag",
+    )
+    config = SimpleNamespace(
+        sequence_packing_scheduler=None,
+        context_parallel_size=2,
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=None,
+        dynamic_context_parallel=False,
+        linear_cp_layout="contiguous",
+    )
+    monkeypatch.setattr(pretrain_hybrid, "get_args", lambda: args)
+    monkeypatch.setattr(
+        pretrain_hybrid,
+        "get_run_config",
+        lambda: SimpleNamespace(model=SimpleNamespace(transformer=config)),
+    )
+    monkeypatch.setattr(pretrain_hybrid.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(pretrain_hybrid, "is_first_or_last_pipeline_stage", lambda stage: False)
+    monkeypatch.setattr(pretrain_hybrid, "mtp_on_this_rank_func", lambda **kwargs: False)
+
+    batch = get_batch(None)
+
+    assert set(batch.batches_by_layout) == {"contiguous"}
+    assert all(value is None for value in batch.get_batch().values())
+    assert batch.get_packed_seq_params() is None
+
+
 def test_sequence_packing_batch_uses_context_parallel_batch_interface():
     tokens = torch.tensor([[1, 2]])
     labels = torch.tensor([[2, 3]])
@@ -1094,8 +1127,10 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
         },
         packed_seq_params_by_layout={"zigzag": packed_seq_params},
     )
-    args = SimpleNamespace(sequence_packing_scheduler="dp_balanced", dynamic_context_parallel=False)
+    args = SimpleNamespace(sequence_packing_scheduler=None, dynamic_context_parallel=True)
     config = SimpleNamespace(
+        sequence_packing_scheduler="dp_balanced",
+        dynamic_context_parallel=False,
         virtual_pipeline_model_parallel_size=None,
         pipeline_model_parallel_layout=None,
         mtp_num_layers=1,
@@ -1104,7 +1139,11 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
 
     with (
         patch.object(pretrain_hybrid, "get_args", return_value=args),
-        patch.object(pretrain_hybrid, "core_transformer_config_from_args", return_value=config),
+        patch.object(
+            pretrain_hybrid,
+            "get_run_config",
+            return_value=SimpleNamespace(model=SimpleNamespace(transformer=config)),
+        ),
         patch.object(pretrain_hybrid, "mtp_on_this_rank_func", return_value=True),
         patch.object(
             pretrain_hybrid,
@@ -1129,41 +1168,42 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
 
 
 @pytest.mark.parametrize("script", [pretrain_gpt, pretrain_hybrid], ids=["gpt", "hybrid"])
-def test_get_batch_caches_config_until_args_replaced(script, monkeypatch):
-    args = SimpleNamespace(sequence_packing_scheduler="dp_balanced", dynamic_context_parallel=False)
+def test_get_batch_reuses_run_config_without_rebuilding(script, monkeypatch):
+    args = SimpleNamespace()
     configs = [
         SimpleNamespace(
+            sequence_packing_scheduler="dp_balanced",
+            dynamic_context_parallel=False,
             virtual_pipeline_model_parallel_size=None,
             pipeline_model_parallel_layout=None,
             mtp_num_layers=None,
         )
         for _ in range(2)
     ]
-    build_config = MagicMock(side_effect=configs)
+    cfg = SimpleNamespace(model=SimpleNamespace(transformer=configs[0]))
     result = object()
     fetch_batch = MagicMock(return_value=result)
-    monkeypatch.setattr(script, "_transformer_config_cache", None)
     monkeypatch.setattr(script, "get_args", lambda: args)
-    monkeypatch.setattr(script, "core_transformer_config_from_args", build_config)
+    monkeypatch.setattr(script, "get_run_config", lambda: cfg)
     monkeypatch.setattr(script, "mtp_on_this_rank_func", lambda **kwargs: False)
     monkeypatch.setattr(script, "get_batch_on_this_rank_for_sequence_packing", fetch_batch)
     pg_collection = ProcessGroupCollection(pp=object())
 
-    # Repeated microbatches with the same args object reuse one config.
+    # Repeated microbatches use the already-built config, regardless of CLI object identity.
     for _ in range(2):
         assert script.get_batch(None, pg_collection=pg_collection) is result
         assert fetch_batch.call_args.kwargs["config"] is configs[0]
-    build_config.assert_called_once_with(args)
-
-    # Replacing args with an equal but distinct object rebuilds the config.
     previous_args = args
     args = SimpleNamespace(**vars(previous_args))
     assert args == previous_args and args is not previous_args
+    assert script.get_batch(None, pg_collection=pg_collection) is result
+    assert fetch_batch.call_args.kwargs["config"] is configs[0]
+
+    # A new run supplies its own model config; no cached CLI config leaks across runs.
+    cfg = SimpleNamespace(model=SimpleNamespace(transformer=configs[1]))
     for _ in range(2):
         assert script.get_batch(None, pg_collection=pg_collection) is result
         assert fetch_batch.call_args.kwargs["config"] is configs[1]
-    assert build_config.call_count == 2
-    assert build_config.call_args.args[0] is args
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
@@ -1675,14 +1715,24 @@ def test_packed_sequence_dataset_built_on_rank(
     tp_rank = mpu.get_tensor_model_parallel_rank()
     pp_rank = mpu.get_pipeline_model_parallel_rank()
 
-    args = SimpleNamespace(sequence_packing_scheduler=sequence_packing_scheduler)
-    config = SimpleNamespace(pipeline_model_parallel_layout=None, mtp_num_layers=None)
+    # Deliberately stale CLI settings must not control config-owned dataset placement.
+    args = SimpleNamespace(
+        sequence_packing_scheduler=None if sequence_packing_scheduler else "dp_balanced"
+    )
+    config = SimpleNamespace(
+        sequence_packing_scheduler=sequence_packing_scheduler,
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=None,
+    )
     vp_stages = [None] if vp_size is None else range(vp_size)
-    # The scripts pass the shared predicate (megatron.training.datasets.providers), which reads
-    # the arguments and the transformer config at call time from these two modules.
+    # Both scripts use the shared predicate, which reads the run's model config.
     with (
         patch.object(global_vars, "get_args", return_value=args),
-        patch.object(arguments, "core_transformer_config_from_args", return_value=config),
+        patch.object(
+            global_vars,
+            "get_run_config",
+            return_value=SimpleNamespace(model=SimpleNamespace(transformer=config)),
+        ),
     ):
         for vp_stage in vp_stages:
             built = script.is_dataset_built_on_rank(

@@ -229,7 +229,7 @@ def test_inference_factory_keeps_automatic_model_construction(monkeypatch, expli
     args, _ = cli_config()
     model = object()
     build = Mock(return_value=model)
-    monkeypatch.setattr(argument_utils, "gpt_config_from_args", build)
+    monkeypatch.setattr(argument_utils, "model_config_from_args", build)
     kwargs = {"model_cfg": None} if explicit_none else {}
     config = argument_utils.inference_cfg_container_from_args(args, **kwargs)
     assert config.model is model

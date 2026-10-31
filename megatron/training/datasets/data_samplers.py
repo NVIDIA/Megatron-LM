@@ -43,6 +43,8 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         # torch-compatible dataloader and define samplers, if needed.
         return dataset
 
+    cfg = get_run_config()
+
     # Use eval-specific batch sizes for validation/test splits
     is_eval = split in (Split.valid, Split.test)
     micro_batch_size = cfg.validation.eval_micro_batch_size if is_eval else cfg.train.micro_batch_size
@@ -103,8 +105,8 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     # normally.
     if (
         (args.use_varlen_dataset and not args.varlen_sbhd_validation)
-        or args.dynamic_context_parallel
-        or args.sequence_packing_scheduler is not None
+        or cfg.model.transformer.dynamic_context_parallel
+        or cfg.model.transformer.sequence_packing_scheduler is not None
     ):
         extra_kwargs = {"collate_fn": lambda x: x}
     else:

@@ -572,7 +572,11 @@ if __name__ == "__main__":
         extra_args_provider=add_multimodal_extra_args,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
-    full_config = pretrain_cfg_container_from_args(args)
+    from megatron.training.argument_utils import model_config_from_args
+    from megatron.training.models import LLaVAModelConfig
+
+    model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
     pretrain(
         full_config,

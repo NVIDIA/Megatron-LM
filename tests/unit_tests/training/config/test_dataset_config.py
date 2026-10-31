@@ -16,7 +16,6 @@ from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, Moc
 from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.config import DataConfig, DataloaderConfig
-from megatron.training.config.container import ConfigContainerBase
 from megatron.training.config.dataset_config import (
     CONTAINER_WRITTEN_FIELDS,
     dataset_family_from_type,
@@ -26,7 +25,7 @@ from megatron.training.config.dataset_config import (
     resolve_dataset_class,
 )
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
-from megatron.training.config.utils import sanitize_dataclass_config
+from megatron.training.config.utils import sanitize_dataclass_config, serialize_value
 from megatron.training.config.yaml_utils import safe_yaml_representers
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
@@ -242,7 +241,7 @@ def test_data_section_round_trips_through_yaml_with_the_class():
         dataloader=DataloaderConfig(num_workers=0),
         dataset_type=GPTDataset,
     )
-    as_dict = ConfigContainerBase._convert_value_to_dict(data)
+    as_dict = serialize_value(data)
     assert as_dict == data.to_cfg_dict()
     with safe_yaml_representers():
         text = yaml.safe_dump(as_dict, default_flow_style=False)

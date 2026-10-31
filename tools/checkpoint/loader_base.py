@@ -127,6 +127,14 @@ class MegatronCheckpointLoaderBase:
 
         self._maybe_ensure_additional_required_arguments()
 
+    def build_model_config(self):
+        """Select the model family before initializing shared runtime services."""
+        from megatron.training.argument_utils import model_config_from_args
+        from megatron.training.models import BertModelConfig
+
+        config_cls = BertModelConfig if self.args.model_type == "BERT" else None
+        return model_config_from_args(self.margs, model_config_cls=config_cls)
+
     def initialize_megatron_env(self):
         """
         Initialize Megatron global variables and fused kernels.
@@ -140,7 +148,7 @@ class MegatronCheckpointLoaderBase:
             self.queue.put("exit")
             sys.exit(1)
 
-        cfg = inference_cfg_container_from_args(self.margs, build_model_config=False)
+        cfg = inference_cfg_container_from_args(self.margs, self.build_model_config())
         set_global_variables(self.margs, cfg, build_tokenizer=self.build_tokenizer)
         mpu.set_tensor_model_parallel_world_size(self.margs.tensor_model_parallel_size)
         mpu.set_pipeline_model_parallel_world_size(self.margs.pipeline_model_parallel_size)

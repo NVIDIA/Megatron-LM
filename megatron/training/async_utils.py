@@ -10,6 +10,7 @@ import time
 from abc import ABC
 from typing import TYPE_CHECKING, Any
 
+from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.dist_checkpointing.strategies.nvrx import (
     make_nvrx_async_request,
 )
@@ -129,7 +130,7 @@ def build_otel_worker_bootstrap(args):
         'span_groups': worker_span_groups,
         'resolved_span_groups': resolved_span_groups,
         'rank': args.rank,
-        'world_size': args.world_size,
+        'world_size': safe_get_world_size(),
         # Same reasoning as _set_telemetry(): building these calls NVML
         # (_detect_gpu_identity), and the worker discards them when 'enabled' is
         # False, so don't build them on the disabled path. The key is always

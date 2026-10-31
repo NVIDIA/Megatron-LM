@@ -10,9 +10,12 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
+from megatron.core.transformer import TransformerConfig
 from megatron.training import arguments, global_vars, initialize
 from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.models import GPTModelConfig
 
 
 @pytest.mark.parametrize("load_checkpoint", [False, True])
@@ -82,6 +85,11 @@ def test_resume_updates_microbatches_before_setup_validation(
     args.load = "checkpoint"
     args.data_parallel_size = 1
     args.micro_batch_size = 1
+    run_config.model = GPTModelConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        seq_length=16,
+        vocab_size=128,
+    )
     train_state = TrainState()
     model = [SimpleNamespace()]
     monkeypatch.setattr(training, "get_args", lambda: args)
@@ -125,6 +133,11 @@ def test_resume_updates_microbatches_before_setup_validation(
 def test_runtime_services_initialize_training_only_when_requested(
     monkeypatch, build_tokenizer, enable_runtime_flags, training_kwargs, run_config
 ):
+    run_config.model = GPTModelConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        seq_length=16,
+        vocab_size=128,
+    )
     args = Namespace(enable_experimental=enable_runtime_flags)
     run_config.dist.disable_jit_fuser = enable_runtime_flags
     experimental = Mock()
@@ -195,6 +208,8 @@ def test_inference_distributed_initialization_without_training_fields(
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
     args.rank = 0
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    monkeypatch.setattr(global_vars, '_GLOBAL_RUN_CONFIG', cfg)
     for name in (
         "micro_batch_size",
         "global_batch_size",
@@ -230,7 +245,7 @@ def test_inference_distributed_initialization_without_training_fields(
 
     distributed.assert_called_once()
     seeds.assert_called_once()
-    assert seeds.call_args.args[0] == run_config.rng.seed
+    assert seeds.call_args.args[0] == cfg.rng.seed
 
 
 def test_inference_rejects_training_tp_overlap_before_initialization(monkeypatch, run_config):
@@ -250,8 +265,6 @@ def test_inference_rejects_training_tp_overlap_before_initialization(monkeypatch
 def test_distributed_training_services_require_explicit_opt_in(
     monkeypatch, run_config, native_model, decoder_overlap
 ):
-    import torch
-
     from megatron.core.transformer import TransformerConfig
     from megatron.training.models import GPTModelConfig
 
@@ -260,6 +273,7 @@ def test_distributed_training_services_require_explicit_opt_in(
     args = parser.parse_args([])
     args.rank = 0
     args.async_save = True
+    args.world_size = 1
     args.use_persistent_ckpt_worker = True
     args.tp_comm_overlap = not native_model
     args.num_layers, args.hidden_size, args.num_attention_heads = 4, 128, 8
@@ -278,6 +292,10 @@ def test_distributed_training_services_require_explicit_opt_in(
             seq_length=1024,  # Position capacity must not be used for buffer sizing.
             tp_comm_overlap_cfg={"qkv_fprop": {"method": "ring_exchange"}},
         )
+    else:
+        from megatron.training.argument_utils import model_config_from_args
+
+        run_config.model = model_config_from_args(args)
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     monkeypatch.setattr(initialize, "setup_logging", Mock())
     monkeypatch.setattr(initialize, "print_rank_0", Mock())
