@@ -49,6 +49,7 @@ jobs:
       has_tests: ${{ steps.plan.outputs.has_tests }}
     steps:
       # All selection runs here. GPU jobs only execute the resulting plan.
+      # Dummy workflow-only change to validate Testmon selection.
       - name: Checkout
         id: checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
