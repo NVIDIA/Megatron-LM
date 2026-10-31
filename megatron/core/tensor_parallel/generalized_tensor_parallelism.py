@@ -2540,6 +2540,23 @@ class GTPShardedParam(torch.nn.Parameter):
         """Backward counterpart of :meth:`peek_group_for_forward`."""
         return self._peek_gathered_weight(fwd=False)
 
+    def get_group_forward_storage(self) -> tuple[torch.Tensor, ...]:
+        """Return warmed forward storage for pointer metadata, without issuing a gather.
+
+        Contents may belong to another group sharing the cache. Consumers must still
+        peek and materialize normally before reading these buffers.
+        """
+        if not self.prefetch_initialized:
+            raise RuntimeError("GTP forward storage requires a completed eager warmup")
+        cache = get_global_GTP_cache()
+        sources = []
+        for weight in self._weights:
+            slot = cache._slots.get(weight._ag_ticket_fwd)
+            if slot is None or slot.buf is None:
+                raise RuntimeError("GTP forward storage is not initialized")
+            sources.append(weight._strip_padding(slot.buf))
+        return tuple(sources)
+
     def finalize_group_grads(self, wgrads, nvtx_label=None):
         """Protocol: reduce-scatter the group's freshly computed weight grad(s)."""
         return self.wgrad_reduce_scatter(wgrads, nvtx_label=nvtx_label)

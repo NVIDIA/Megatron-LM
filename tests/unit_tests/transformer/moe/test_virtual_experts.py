@@ -33,10 +33,12 @@ from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 from triton.runtime import _allocation
 
 from megatron.core import parallel_state as ps
+from megatron.core import rerun_state_machine as rerun
 from megatron.core.activations import squared_relu
 from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import DistributedDataParallelConfig, param_and_grad_buffer
 from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
@@ -94,6 +96,11 @@ def hybridep_kernel_cache(tmp_path_factory):
 @pytest.fixture(autouse=True)
 def virtual_expert_environment(monkeypatch, hybridep_kernel_cache):
     """Keep the recipe's kernel/offload settings local to these tests."""
+    # DDP's FP32-accumulation constructor changes process-global dispatch.
+    # Start each test with native reduce-scatter and restore the prior state at teardown.
+    monkeypatch.setattr(
+        param_and_grad_buffer, "dist_reduce_scatter_func", dist.reduce_scatter_tensor
+    )
     monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
     monkeypatch.setenv("NVTE_USE_CUTLASS_GROUPED_GEMM", "0")
     monkeypatch.setenv("NVTE_CPU_OFFLOAD_V1", "1")
@@ -1397,4 +1404,239 @@ def test_virtual_expert_upstream_router_formats(monkeypatch, mode, compact_suppo
         assert bool(calls) == (mode == "fused")
     finally:
         destroy_moe_metrics_tracker()
+        Utils.destroy_model_parallel()
+
+
+@requires_hybridep
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize(
+    "mxfp8,mtp",
+    [(False, False), (True, False), (False, True), (True, True)],
+    ids=["bf16", "mxfp8", "bf16-mtp", "mxfp8-mtp"],
+)
+def test_virtual_expert_full_iteration_lifecycle(monkeypatch, request, mxfp8, mtp):
+    """Capture after one warmup, compare changing-input replays, then reset and recapture."""
+    if mxfp8:
+        request.getfixturevalue("mxfp8_grouped_mlp")
+    # GTP streams are keyed by process-group identity and outlive earlier test models.
+    # Full capture must not join their uncaptured streams at gradient finalization.
+    monkeypatch.setattr(gtp, "_AG_STREAMS", {})
+    monkeypatch.setattr(gtp, "_RS_STREAMS", {})
+    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "0")
+    monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+    monkeypatch.setattr(
+        fused_a2a.HybridEPBuffer,
+        "__init__",
+        partialmethod(fused_a2a.HybridEPBuffer.__init__, load_cached_kernels=True),
+    )
+    monkeypatch.setattr(
+        rerun, "_GLOBAL_RERUN_STATE_MACHINE", rerun.RerunStateMachine(mode=rerun.RerunMode.DISABLED)
+    )
+    Utils.initialize_model_parallel(
+        expert_model_parallel_size=2, gtp_remat_size=4, expert_gtp_remat_size=2
+    )
+    gtp.reset_gtp_state()
+    gtp._GTP_PARAMS.clear()
+    monkeypatch.setattr(gtp.GTP_CONFIG, "async_reduction", True)
+    monkeypatch.setattr(gtp.GTP_CONFIG, "weight_prefetch", True)
+    monkeypatch.setattr(gtp.GTP_CONFIG, "eager_wgrad_ring_size", 2)
+    monkeypatch.setattr(gtp.GTP_CONFIG, "calculate_per_token_loss", mtp)
+    initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+    model_parallel_cuda_manual_seed(1234)
+    torch.manual_seed(1234)
+    pg = ProcessGroupCollection.use_mpu_process_groups()
+    config = TransformerConfig(
+        num_layers=3,
+        hidden_size=128,
+        num_attention_heads=4,
+        ffn_hidden_size=256,
+        moe_ffn_hidden_size=256,
+        num_moe_experts=4,
+        expert_model_parallel_size=2,
+        tensor_parallel_num_weight_shards=4,
+        expert_tensor_parallel_num_weight_shards=2,
+        moe_router_topk=2,
+        moe_router_dtype="fp32",
+        moe_router_load_balancing_type="quantile_balancing",
+        moe_aux_loss_coeff=0,
+        moe_router_score_function="sigmoid",
+        moe_router_topk_scaling_factor=3.16,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_virtual_expert_load_balance=True,
+        moe_grouped_gemm=True,
+        moe_use_grouped_tensor=True,
+        use_transformer_engine_op_fuser=True,
+        use_fused_weighted_squared_relu=True,
+        activation_func=squared_relu,
+        gradient_accumulation_fusion=True,
+        add_bias_linear=False,
+        normalization="RMSNorm",
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        hidden_dropout=0,
+        attention_dropout=0,
+        fp8="e4m3" if mxfp8 else None,
+        fp8_recipe="mxfp8",
+        fp8_param=mxfp8,
+        moe_router_padding_for_quantization=mxfp8,
+        mtp_num_layers=2 if mtp else None,
+        mtp_use_repeated_layer=mtp,
+        # HSM draws fresh random selections; compare fixed-input gradients here.
+        mtp_hsm=False,
+        mtp_loss_scaling_factor=0.1,
+        calculate_per_token_loss=mtp,
+        cuda_graph_impl="full_iteration",
+    )
+    with get_fp8_context(config, is_init=True):
+        module = HybridModel(
+            config,
+            hybrid_stack_spec,
+            vocab_size=128,
+            max_sequence_length=32,
+            hybrid_layer_pattern="EEE/E/E" if mtp else "EEE",
+            pg_collection=pg,
+        ).cuda()
+    # Match training's DDP setup: its retained AccumulateGrad nodes belong to capture.
+    capture_stream = get_shared_capture_stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        model = DDP(
+            config,
+            DistributedDataParallelConfig(
+                grad_reduce_in_fp32=False,
+                overlap_grad_reduce=True,
+                check_for_nan_in_grad=True,
+                average_in_collective=False,
+                use_distributed_optimizer=mxfp8,
+                fp8_param_gather=mxfp8,
+                reuse_grad_buf_for_mxfp8_param_ag=mxfp8,
+            ),
+            module,
+            pg_collection=pg,
+        )
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    experts = [layer for layer in module.modules() if isinstance(layer, MoELayer)]
+    plans = []
+    for layer in experts:
+        manager = layer.token_dispatcher._comm_manager
+        dispatch = manager.plan_dispatch
+
+        def record_plan(*args, manager=manager, dispatch=dispatch):
+            dispatch(*args)
+            if torch.cuda.is_current_stream_capturing():
+                plans.append(manager._plan)
+
+        monkeypatch.setattr(manager, "plan_dispatch", record_plan)
+    # MXFP8 rounds tiny nonempty experts to full blocks. Alternate the overloaded
+    # owner so even this small test transfers virtual experts in both directions.
+    routing_bias = torch.tensor([-100, -100, 100, 100], device="cuda")
+    optimizer = (
+        get_megatron_optimizer(
+            OptimizerConfig(
+                optimizer="adam",
+                lr=1e-5,
+                bf16=True,
+                use_distributed_optimizer=mxfp8,
+                fp8_recipe="mxfp8",
+                reuse_grad_buf_for_mxfp8_param_ag=mxfp8,
+                clip_grad=0,
+            ),
+            [model],
+            use_gloo_process_groups=False,
+            pg_collection=pg,
+        )
+        if mxfp8
+        else None
+    )
+    gtp.classify_gtp_remat_chains(model, cuda_graph_modules=[], cuda_graph_impl="full_iteration")
+    tokens = torch.zeros((2, 16), device="cuda", dtype=torch.long)
+    labels = torch.zeros_like(tokens)
+    positions = torch.arange(16, device="cuda").expand_as(tokens)
+    rng = torch.Generator(device="cuda").manual_seed(73)
+    inputs = [
+        (
+            torch.randint(0, 128, tokens.shape, device="cuda", generator=rng),
+            torch.randint(0, 128, labels.shape, device="cuda", generator=rng),
+        )
+        for _ in range(4)
+    ]
+
+    def set_inputs(index):
+        tokens.copy_(inputs[index][0])
+        labels.copy_(inputs[index][1])
+        for layer in experts:
+            layer.router.qb_beta.copy_(routing_bias if index % 2 else -routing_bias)
+
+    def forward_backward(**_):
+        model.zero_grad_buffer()
+        if optimizer is not None:
+            for child in optimizer.chained_optimizers:
+                child._copy_main_params_to_param_buffer()
+        model.set_is_first_microbatch()
+        with get_fp8_context(config):
+            loss = model(
+                tokens,
+                positions,
+                attention_mask=None,
+                labels=labels,
+                loss_mask=torch.ones_like(tokens, dtype=torch.float32),
+            )
+        loss.sum().backward()
+        gtp.wait_for_gtp_grad_reduction_on_current_stream()
+        model.finish_grad_sync()
+        return [loss.detach().clone(), *[p.main_grad.clone() for p in model.parameters()]]
+
+    wrapper = FullCudaGraphWrapper(forward_backward, cuda_graph_warmup_steps=1)
+    wrapper.reset_cuda_graph()
+    kwargs = dict(
+        model=[model], data_iterator=None, num_microbatches=1, seq_length=16, forward_only=False
+    )
+    try:
+        for generation in range(2):
+            plans.clear()
+            actual = []
+            for step in range(9):
+                set_inputs(step % 4)
+                result = wrapper(**kwargs)
+                torch.cuda.synchronize()
+                if step >= 1:
+                    actual.append([t.detach().cpu().clone() for t in result])
+            assert wrapper.cuda_graph["training"] is not None
+            active = torch.stack([(plan.experts_to_copy >= 0).any() for plan in plans]).any().int()
+            dist.all_reduce(active)
+            assert active.item(), "The test must exercise virtual-expert transfers"
+            slots = [
+                p._gtp_eager_wgrad_ring_slot
+                for p in model.parameters()
+                if hasattr(p, "_gtp_eager_wgrad_ring_slot")
+            ]
+            assert slots and len({id(slot) for slot in slots}) < len(slots)
+            wrapper.reset_cuda_graph()
+            expected = []
+            for index in range(len(inputs)):
+                set_inputs(index)
+                expected.append([v.detach().cpu().clone() for v in forward_backward()])
+            for step, result in enumerate(actual, start=1):
+                for name, value, reference in zip(
+                    ["loss", *[name for name, _ in model.named_parameters()]],
+                    result,
+                    expected[step % 4],
+                ):
+                    _assert_numerical_parity(
+                        value,
+                        reference,
+                        1e-5 if name == "loss" else 0.005,
+                        f"generation {generation}, step {step}: {name}",
+                        peak_tolerance=1e-5 if name == "loss" else 0.01,
+                    )
+    finally:
+        torch.cuda.synchronize()
+        wrapper.reset_cuda_graph()
+        VirtualExpertLoadBalancer.finalize()
+        FP8GlobalStateManager.reset()
+        gtp.reset_gtp_state()
+        gtp._GTP_PARAMS.clear()
+        destroy_moe_metrics_tracker()
+        fused_a2a.reset_hybrid_ep_buffer()
         Utils.destroy_model_parallel()
