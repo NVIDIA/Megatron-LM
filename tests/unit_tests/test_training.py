@@ -130,20 +130,19 @@ def test_native_builder_uses_dist_and_ddp_configs(monkeypatch, run_config, fsdp2
 
 @pytest.mark.parametrize("optimizer", [None, "optimizer"])
 @pytest.mark.parametrize("layer_wise", [False, True])
-def test_should_disable_forward_pre_hook_needs_a_live_optimizer(optimizer, layer_wise):
+def test_should_disable_forward_pre_hook_needs_a_live_optimizer(optimizer, layer_wise, run_config):
     """The pre-hooks belong to the distributed optimizer's overlapped param-gather, so the loop
     toggles them only when an optimizer was built (not under --skip-train or
     --rl-rollout-only --no-load-optim)."""
-    args = SimpleNamespace(
-        use_megatron_fsdp=False,
-        use_distributed_optimizer=not layer_wise,
-        use_layer_wise_distributed_optimizer=layer_wise,
-        overlap_param_gather=True,
-    )
+    args = SimpleNamespace(use_megatron_fsdp=False)
+    run_config.optimizer.use_distributed_optimizer = not layer_wise
+    run_config.optimizer.use_layer_wise_distributed_optimizer = layer_wise
+    run_config.optimizer.overlap_param_gather = True
     assert training.should_disable_forward_pre_hook(args, optimizer) is (optimizer is not None)
-    args.overlap_param_gather = False
+    run_config.optimizer.overlap_param_gather = False
     assert not training.should_disable_forward_pre_hook(args, optimizer)
-    args.overlap_param_gather = args.use_megatron_fsdp = True
+    run_config.optimizer.overlap_param_gather = True
+    args.use_megatron_fsdp = True
     assert not training.should_disable_forward_pre_hook(args, optimizer)
 
 
