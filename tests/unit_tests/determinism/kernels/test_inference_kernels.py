@@ -438,6 +438,45 @@ def test_mixed_precision_parameter_conversion_replays():
     )
 
 
+@pytest.mark.skipif(
+    not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
+    reason="FlashInfer routed MXFP8 needs Blackwell",
+)
+def test_flashinfer_routed_mxfp8_writeback_replays():
+    """Refit writes through to FlashInfer's routed MXFP8 layout bit-exactly."""
+    from megatron.core.inference.moe.flashinfer_mxfp8 import (
+        HAVE_FLASHINFER_ROUTED_MXFP8,
+        attach_routed_mxfp8_writeback,
+        prepare_routed_mxfp8_weights,
+    )
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+    if not HAVE_FLASHINFER_ROUTED_MXFP8:
+        pytest.skip("needs FlashInfer routed MXFP8")
+    seeded()
+    initial, update = (
+        torch.randn(2, 96, 128, device="cuda", dtype=torch.bfloat16) for _ in range(2)
+    )
+
+    def refit(initial, update):
+        experts = [MXFP8Tensor.from_bf16(w, backend="triton") for w in initial]
+        routed = prepare_routed_mxfp8_weights(
+            MXFP8Tensor(
+                data=torch.stack([e.data for e in experts]),
+                scale=torch.stack([e.scale for e in experts]),
+                backend="triton",
+            )
+        )
+        for i, (expert, value) in enumerate(zip(experts, update)):
+            attach_routed_mxfp8_writeback(expert, routed, i)
+            expert.copy_(value)
+        return routed.data.view(torch.uint8), routed.scale
+
+    assert_replays_bit_exact(
+        refit, (initial, update), backward=False, contention=True, what="routed MXFP8 writeback"
+    )
+
+
 # --- inference MoE permute / unpermute --------------------------------------------------------
 
 

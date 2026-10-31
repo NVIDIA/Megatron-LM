@@ -1365,18 +1365,23 @@ class TestMoEModules:
         not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
         reason="MXFP8 parameter storage needs Blackwell",
     )
-    @pytest.mark.parametrize("backend", ["vllm", "flashinfer"])
-    def test_mxfp8_weight_stacking_replays(self, backend):
-        """Canonical and CUTLASS execution expert stacks replay bit-exactly."""
+    @pytest.mark.parametrize("backend", ["vllm", "flashinfer_cutlass", "flashinfer_routed"])
+    def test_mxfp8_expert_weight_build_replays(self, backend):
+        """Canonical, CUTLASS and write-through routed expert stacks build bit-exactly."""
         from types import SimpleNamespace
 
         from megatron.core.inference.moe import InferenceGroupedGemmBackend
-        from megatron.core.inference.moe.flashinfer_mxfp8 import HAVE_FLASHINFER_CUTLASS_MXFP8
+        from megatron.core.inference.moe.flashinfer_mxfp8 import (
+            HAVE_FLASHINFER_CUTLASS_MXFP8,
+            HAVE_FLASHINFER_ROUTED_MXFP8,
+        )
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
         from megatron.core.transformer.moe.experts import InferenceGroupedMLP
 
-        if backend == "flashinfer" and not HAVE_FLASHINFER_CUTLASS_MXFP8:
+        if backend == "flashinfer_cutlass" and not HAVE_FLASHINFER_CUTLASS_MXFP8:
             pytest.skip("requires FlashInfer CUTLASS MXFP8")
+        if backend == "flashinfer_routed" and not HAVE_FLASHINFER_ROUTED_MXFP8:
+            pytest.skip("requires FlashInfer routed MXFP8")
 
         class GroupedMLPStub:
             _stack_mxfp8_linear_weight = InferenceGroupedMLP._stack_mxfp8_linear_weight
@@ -1390,9 +1395,10 @@ class TestMoEModules:
             grouped = GroupedMLPStub()
             grouped.num_local_experts = 2
             grouped.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.from_config(
-                backend
+                backend.split("_")[0]
             )
-            grouped._activation_clamp_scale = 16.0
+            # A clamp selects FlashInfer CUTLASS; without one FlashInfer uses the routed kernel.
+            grouped._activation_clamp_scale = None if backend == "flashinfer_routed" else 16.0
             grouped.linear_fc1 = SimpleNamespace()
             grouped.linear_fc2 = SimpleNamespace()
             for linear, offset in ((grouped.linear_fc1, 0), (grouped.linear_fc2, 2)):
@@ -1411,7 +1417,7 @@ class TestMoEModules:
             )
 
         assert_replays_bit_exact(
-            build_stacks, weights, backward=False, what=f"{backend} MXFP8 expert-weight stacking"
+            build_stacks, weights, backward=False, what=f"{backend} MXFP8 expert-weight build"
         )
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")

@@ -97,6 +97,7 @@ from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
     FlashInferCutlassMXFP8Weight,
     FlashInferRoutedMXFP8Weight,
+    attach_routed_mxfp8_writeback,
     flashinfer_cutlass_mxfp8_moe,
     flashinfer_routed_mxfp8_moe,
     prepare_cutlass_mxfp8_weights,
@@ -1588,7 +1589,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         """Build contiguous expert stacks after checkpoint loading.
 
         Torch, vLLM and FlashInfer CUTLASS rebind each per-expert MXFP8Tensor to
-        its stacked view. Only FlashInfer routed needs a separate Major-K copy.
+        its stacked view. FlashInfer routed derives a shuffled Major-K stack and makes
+        the canonical tensors write through to it, releasing their storage.
         """
 
         use_flashinfer = (
@@ -1624,6 +1626,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     concatenated_weight.padded_rows,
                     concatenated_weight.padded_cols,
                 )
+                for i in range(self.num_local_experts):
+                    weight = InferenceGroupedMLP._unwrap_mxfp8_weight(getattr(linear, f'weight{i}'))
+                    attach_routed_mxfp8_writeback(weight, concatenated_weight, i)
             else:
                 concatenated_weight = stacked_weight
             setattr(self, buf_name, concatenated_weight)
@@ -1659,20 +1664,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
         ):
             # Selective-precision recipes also build BF16 expert weights for
             # FlashInfer. BF16 and CUTLASS MXFP8 share canonical storage and are
-            # refit directly; only routed MXFP8 needs a derived copy refreshed.
+            # refit directly; routed MXFP8 is written through by refit as well.
             return False
 
-        for linear_name, buf_name in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS:
-            flashinfer_weight = getattr(self, buf_name)
-            canonical_weight = self._stack_mxfp8_linear_weight(linear_name, "triton")
-            if isinstance(flashinfer_weight, FlashInferRoutedMXFP8Weight):
-                require_flashinfer_routed_mxfp8()
-                prepare_routed_mxfp8_weights(canonical_weight, out=flashinfer_weight)
-            else:
-                raise TypeError(
-                    "FlashInfer MXFP8 weights must use CUTLASS or routed layout; "
-                    f"got {type(flashinfer_weight).__name__}"
-                )
+        # Refit already wrote through to the routed weights (attach_routed_mxfp8_writeback);
+        # returning True still makes refit synchronize before graphs replay.
         return True
 
     @torch.inference_mode(False)
