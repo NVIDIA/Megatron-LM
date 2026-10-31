@@ -11,6 +11,7 @@ Additionally, InternViT introduces some unique features like Layer Scaling.
 Those code changes are gathered here.
 """
 from functools import partial
+from typing import Optional
 
 import torch
 
@@ -23,11 +24,8 @@ from megatron.core.extensions.transformer_engine import (
     TEDotProductAttention,
     TERowParallelLinear,
 )
-from megatron.core.parallel_state import (
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
+from megatron.core.parallel_state import get_tensor_model_parallel_group
+from megatron.core.process_groups_config import global_process_group_fallback
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import DotProductAttention
@@ -37,9 +35,12 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
-from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
+    make_sharded_tensors_for_checkpoint,
+)
 from megatron.core.typed_torch import copy_signature, not_none
-from megatron.core.utils import divide
+from megatron.core.utils import divide, get_pg_rank, get_pg_size
 
 try:
     import apex
@@ -67,6 +68,7 @@ class InternViTRMSNorm(MegatronModule):
         eps: float = 1e-6,
         sequence_parallel: bool = False,
         compute_var: bool = False,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """Custom RMSNorm for InternViT.
 
@@ -77,16 +79,34 @@ class InternViTRMSNorm(MegatronModule):
             sequence_parallel (bool): Set to true if sequence parallelism is being used,
               this marks the weights as needing to be allreduced.
             compute_var (bool): Indicator to compute statistic manually.
+            tp_group (torch.distributed.ProcessGroup, optional): Tensor-parallel group of the
+              owning model. The statistic is gathered over it, and the checkpoint shards or
+              replicates the weight over its ranks. None falls back to the global
+              tensor-parallel group, with a ProcessGroupFallbackWarning, once the group is
+              needed; that fallback is deprecated.
         """
         super().__init__(config=config)
         self.config = config
         self.eps = eps
         self.weight = torch.nn.Parameter(torch.ones(hidden_size))
         self._compute_var = compute_var
+        self.tp_group = tp_group
 
         assert not sequence_parallel, "Sequence parallelism is not supported with InternViT."
 
         setattr(self.weight, 'sequence_parallel', sequence_parallel)
+
+    def _resolve_tp_group(self):
+        """Return the tensor-parallel group, falling back to the global one if none was given."""
+        if self.tp_group is None:
+            with global_process_group_fallback(
+                "examples.multimodal.nvlm.internvit.InternViTRMSNorm",
+                "tp_group",
+                deprecated_in="0.21",
+                removed_in="0.23",
+            ):
+                self.tp_group = get_tensor_model_parallel_group()
+        return self.tp_group
 
     def _norm(self, x, var):
         if var is None:
@@ -114,11 +134,12 @@ class InternViTRMSNorm(MegatronModule):
 
     def _gather_var(self, input_, max_dim):
         """Compute statistic across the non-dummy heads."""
-        world_size = get_tensor_model_parallel_world_size()
+        tp_group = self._resolve_tp_group()
+        world_size = get_pg_size(tp_group)
 
         # Size and dimension.
         last_dim = input_.dim() - 1
-        rank = get_tensor_model_parallel_rank()
+        rank = get_pg_rank(tp_group)
 
         num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         valid_ranks = 24 // num_attention_heads_per_partition
@@ -141,20 +162,29 @@ class InternViTRMSNorm(MegatronModule):
 
         tensor_list = [torch.empty_like(var) for _ in range(world_size)]
         tensor_list[rank] = var
-        torch.distributed.all_gather(tensor_list, var, group=get_tensor_model_parallel_group())
+        torch.distributed.all_gather(tensor_list, var, group=tp_group)
 
         output = torch.cat(tensor_list, dim=last_dim).contiguous()
 
         return output.sum(-1, keepdim=True)
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata={}):
+        # Both branches shard or replicate the weight over the tensor-parallel group.
+        tp_group = self._resolve_tp_group()
 
         # in InternVitSelfAttention the q_layernorm and k_layernorm weights
         # are tensor-parallel so must be converted to sharded tensors
         if 'q_layernorm' in prefix or 'k_layernorm' in prefix:
             state_dict = self.state_dict(prefix='', keep_vars=True)
+            # Fill in a missing group on a copy, so that the default argument stays empty.
+            metadata = ensure_metadata_has_dp_cp_group(dict(metadata or {}))
             return make_sharded_tensors_for_checkpoint(
-                state_dict, prefix, {'weight': 0}, sharded_offsets
+                state_dict,
+                prefix,
+                {'weight': 0},
+                sharded_offsets,
+                tp_group=tp_group,
+                dp_cp_group=metadata['dp_cp_group'],
             )
         else:
             return super().sharded_state_dict(prefix, sharded_offsets, metadata)
@@ -192,6 +222,8 @@ class InternViTSelfAttention(SelfAttention):
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name='qkv',
+            tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
         )
 
         qk_layernorm_hidden_size = (
@@ -202,12 +234,14 @@ class InternViTSelfAttention(SelfAttention):
             hidden_size=qk_layernorm_hidden_size,
             config=self.config,
             eps=self.config.layernorm_epsilon,
+            tp_group=self.pg_collection.tp,
         )
 
         self.k_layernorm = not_none(submodules.k_layernorm)(
             hidden_size=qk_layernorm_hidden_size,
             config=self.config,
             eps=self.config.layernorm_epsilon,
+            tp_group=self.pg_collection.tp,
         )
 
 
@@ -221,7 +255,8 @@ class InternViTTEDotProductAttention(TEDotProductAttention):
 
         # This makes sure the dummy attention heads are zeroed out.
         mask = torch.ones_like(out, dtype=out.dtype, device=out.device)
-        rank = get_tensor_model_parallel_rank()
+        # Rank in the tensor-parallel group this attention was built with.
+        rank = get_pg_rank(self._tp_group)
         max_dim = out.shape[-1]  # 128
         valid_ranks = 6
 
@@ -234,11 +269,35 @@ class InternViTTEDotProductAttention(TEDotProductAttention):
         return out
 
 
+class InternViTTransformerLayer(LayerScalingTransformerLayer):
+    """LayerScalingTransformerLayer whose input and pre-MLP RMSNorms use the layer's TP group."""
+
+    @copy_signature(LayerScalingTransformerLayer.__init__)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # TransformerLayer builds its norms without a process group. InternViTRMSNorm shards or
+        # replicates its weight in the checkpoint over a tensor-parallel group, so rebuild both
+        # norms on the group of this layer.
+        self.input_layernorm = self.submodules_config.input_layernorm(
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+            tp_group=self.pg_collection.tp,
+        )
+        self.pre_mlp_layernorm = self.submodules_config.pre_mlp_layernorm(
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+            tp_group=self.pg_collection.tp,
+        )
+
+
 def get_internvit_layer_spec(use_te) -> ModuleSpec:
     mlp = get_mlp_module_spec(use_te)  # no norm
 
     return ModuleSpec(
-        module=LayerScalingTransformerLayer,
+        module=InternViTTransformerLayer,
         submodules=TransformerLayerSubmodules(
             input_layernorm=InternViTRMSNorm,
             self_attention=ModuleSpec(

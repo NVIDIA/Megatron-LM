@@ -192,6 +192,7 @@ class MLP(MegatronModule):
 
         self.input_size = input_size if input_size != None else self.config.hidden_size
 
+        self.pg_collection = pg_collection
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         if ffn_hidden_size is None:
             if is_expert:
@@ -392,7 +393,10 @@ class MLP(MegatronModule):
         self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
         """Return the sharded state dictionary of the module."""
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        dp_cp_group = None
+        if self.pg_collection is not None:
+            dp_cp_group = self.pg_collection.dp_cp_gtp_remat or self.pg_collection.dp_cp
+        metadata = ensure_metadata_has_dp_cp_group(metadata, dp_cp_group)
         sharded_state_dict = {}
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         for name, module in self._modules.items():

@@ -376,7 +376,8 @@ class Utils:
         ps.set_pipeline_model_parallel_world_size(pipeline_model_parallel_size)
 
 
-# Pipeline-stage predicates read the global grid, but the process-group checker does not count them.
+# Pipeline-stage predicates read the global grid. The process-group checker counts them as
+# deprecated functions, not as accessors.
 _STAGE_PREDICATES = ("is_pipeline_first_stage", "is_pipeline_last_stage")
 
 

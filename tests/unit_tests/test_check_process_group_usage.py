@@ -6,6 +6,7 @@ Run directly with ``python tests/unit_tests/test_check_process_group_usage.py`` 
 GPU fixtures used when pytest collects the enclosing unit-test package.
 """
 
+import ast
 import contextlib
 import importlib.util
 import io
@@ -255,15 +256,80 @@ class TestDetection(unittest.TestCase):
             "initialize_model_parallel",
             "destroy_model_parallel",
             "is_initialized",
-            "get_virtual_pipeline_model_parallel_rank",
-            "get_virtual_pipeline_model_parallel_world_size",
-            "get_global_memory_buffer",
+            "model_parallel_is_initialized",
+            "register_process_groups",
+            "build_process_group_collection",
             "get_nccl_options",
-            "get_all_ranks",
         ]
         self.assertEqual(
             self.hits(IMPORT + "\n".join(f"parallel_state.{name}()" for name in names)), []
         )
+
+    def test_flags_other_deprecated_functions(self):
+        names = [
+            "is_pipeline_first_stage",
+            "is_pipeline_last_stage",
+            "is_rank_in_embedding_group",
+            "is_rank_in_position_embedding_group",
+            "get_virtual_pipeline_model_parallel_rank",
+            "set_virtual_pipeline_model_parallel_rank",
+            "get_virtual_pipeline_model_parallel_world_size",
+            "set_virtual_pipeline_model_parallel_world_size",
+            "get_all_ranks",
+            "set_tensor_model_parallel_world_size",
+            "set_tensor_model_parallel_rank",
+            "set_pipeline_model_parallel_world_size",
+            "set_pipeline_model_parallel_rank",
+            "set_data_parallel_rank",
+            "set_expert_model_parallel_world_size",
+            "set_expert_model_parallel_rank",
+            "set_expert_tensor_parallel_world_size",
+            "set_expert_tensor_parallel_rank",
+            "get_dynamic_data_context_parallel_group_map",
+            "get_dynamic_tensor_data_context_parallel_group_map",
+            "get_global_memory_buffer",
+            "destroy_global_memory_buffer",
+            "_set_global_memory_buffer",
+        ]
+        for name in names:
+            cases = [
+                (IMPORT, f"parallel_state.{name}()"),
+                ("from megatron.core import mpu\n", f"mpu.{name}()"),
+                (f"from megatron.core.parallel_state import {name}\n", f"{name}()"),
+            ]
+            for prefix, call in cases:
+                with self.subTest(prefix=prefix, call=call):
+                    self.assertEqual(
+                        self.hits(prefix + call), [f"<module>:function:parallel_state.{name}"]
+                    )
+
+    def test_call_after_a_fallback_warning_is_not_guarded(self):
+        # Only resolve_process_groups() is guarded: a direct call keeps its kind even when
+        # warn_global_process_group_fallback() precedes it.
+        self.assertEqual(
+            self.hits(
+                "from megatron.core import parallel_state, process_groups_config as pgc\n"
+                "def schedule(vp_size=None):\n"
+                "    if vp_size is None:\n"
+                "        pgc.warn_global_process_group_fallback('schedule', 'vp_size')\n"
+                "        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()\n"
+            ),
+            ["schedule:function:parallel_state.get_virtual_pipeline_model_parallel_world_size"],
+        )
+
+    def test_counts_every_deprecated_parallel_state_function(self):
+        # Megatron Core's own calls do not emit ParallelStateDeprecationWarning, so the ratchet is
+        # what tracks them: it counts a call of every function that parallel_state deprecates.
+        source = (REPO_ROOT / "megatron" / "core" / "parallel_state.py").read_text(encoding="utf-8")
+        deprecated = sorted(
+            node.name
+            for node in ast.parse(source).body
+            if isinstance(node, ast.FunctionDef)
+            and any("_deprecated_accessor" in ast.unparse(d) for d in node.decorator_list)
+        )
+        self.assertTrue(deprecated)
+        hits = self.hits(IMPORT + "\n".join(f"parallel_state.{name}()" for name in deprecated))
+        self.assertEqual(sorted(hit.rpartition(".")[2] for hit in hits), deprecated)
 
     def test_ignores_unrelated_imports_and_getters(self):
         self.assertEqual(
@@ -391,6 +457,25 @@ class TestRatchet(unittest.TestCase):
         self.assertEqual(json.loads(self.allowlist.read_text())["total"], 1)
         self.assertEqual(self.run_check(), 0)
 
+    def test_new_function_use_points_to_its_own_replacement(self):
+        # A new stage predicate, virtual-pipeline or memory-buffer call has no group to accept
+        # instead, so its error names the other replacements; a new group read's error does not.
+        hint = "A 'function' use has a replacement of its own"
+        cases = {
+            "parallel_state.set_virtual_pipeline_model_parallel_rank(0)": True,
+            "parallel_state.get_global_memory_buffer()": True,
+            CALL: False,
+        }
+        for call, has_hint in cases.items():
+            with self.subTest(call=call):
+                self.write_baseline("")
+                self.source.write_text(IMPORT + call, encoding="utf-8")
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(checker.main([]), 1)
+                self.assertIn("1 new use(s) of global parallel_state", output.getvalue())
+                self.assertEqual(hint in output.getvalue(), has_hint)
+
     def test_stats_does_not_hide_new_calls_in_check_mode(self):
         self.source.write_text(IMPORT + CALL + "; " + CALL, encoding="utf-8")
         self.assertEqual(self.run_check("--stats"), 0)
@@ -405,11 +490,11 @@ class TestRatchet(unittest.TestCase):
             self.assertEqual(checker.main(["--stats"]), 0)
         lines = output.getvalue().splitlines()
         self.assertEqual(
-            lines[0], "2 global process-group read(s) across 1 file(s) in megatron/core"
+            lines[0], "2 use(s) of global parallel_state across 1 file(s) in megatron/core"
         )
         self.assertEqual(
             [line.split() for line in lines[1:]],
-            [["accessor", "1"], ["shim", "0"], ["guarded", "1"]],
+            [["accessor", "1"], ["function", "0"], ["shim", "0"], ["guarded", "1"]],
         )
 
     def test_conversion_to_resolve_process_groups_swaps_the_entry(self):

@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import time
+import weakref
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
@@ -23,6 +24,7 @@ from torch.utils._pytree import tree_map as tree_map_pyt
 
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.parallel_state import TeardownStage, register_model_parallel_teardown
 from megatron.core.process_groups_config import amax_reduction_group, resolve_process_groups
 from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
@@ -592,6 +594,11 @@ class _CudagraphGlobalRecord:
     _saved_tensors_observer = None
     _te_capture_started = False
 
+    # Every live runner. 'create_cudagraphs' clears 'cudagraph_record' after capture,
+    # so 'release_all_cuda_graphs' finds created graphs through this set. Weak
+    # references, so the set does not extend runner lifetimes.
+    all_runners: "weakref.WeakSet" = weakref.WeakSet()
+
     @classmethod
     def _enable_saved_tensors_observer(cls):
         """Observe Python 'save_for_backward' calls while recording and capturing graphs."""
@@ -805,8 +812,24 @@ def create_cudagraphs():
     return _CudagraphGlobalRecord.create_cudagraphs()
 
 
+def _reset_cuda_graph_runner(runner):
+    """Drop a runner's graphs and capture state so that it records and captures again."""
+    runner.cudagraph_created = False
+    runner.fwd_graph_recorded = False
+    runner.bwd_graph_recorded = False
+    runner.fwd_graph = None
+    runner.bwd_graph = None
+    runner.mempool = None
+    runner._gtp_fwd_params_to_ensure_ready = ()
+
+
 def delete_cuda_graphs():
-    """Delete all CUDA graphs."""
+    """Delete the graphs of recorded runners and reset the global capture state.
+
+    Runners whose graphs 'create_cudagraphs' already created are not in the record
+    and keep their graphs; for example, training graphs survive an inference engine's
+    suspend. 'release_all_cuda_graphs' releases those as well.
+    """
 
     _CudagraphGlobalRecord._disable_saved_tensors_observer()
 
@@ -817,14 +840,7 @@ def delete_cuda_graphs():
     ]:
         runner = record[0]
         assert isinstance(runner, _CudaGraphRunner)
-
-        runner.cudagraph_created = False
-        runner.fwd_graph_recorded = False
-        runner.bwd_graph_recorded = False
-        runner.fwd_graph = None
-        runner.bwd_graph = None
-        runner.mempool = None
-        runner._gtp_fwd_params_to_ensure_ready = ()
+        _reset_cuda_graph_runner(runner)
 
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
@@ -837,6 +853,26 @@ def delete_cuda_graphs():
     torch.cuda.empty_cache()
 
     CudaGraphManager.global_mempool = None
+
+
+def release_all_cuda_graphs():
+    """Release the graphs of every live runner and reset the global capture state.
+
+    Unlike 'delete_cuda_graphs', this includes graphs that were already created,
+    including partial captures that never reached the record. A captured graph keeps
+    the communicators of its collectives alive, and destroying such a communicator
+    waits for the graph, so model-parallel teardown must release every graph first.
+    Does nothing if no runner is alive and no graph memory pool exists.
+    """
+    runners = list(_CudagraphGlobalRecord.all_runners)
+    if not runners and CudaGraphManager.global_mempool is None:
+        return
+    for runner in runners:
+        _reset_cuda_graph_runner(runner)
+    delete_cuda_graphs()
+
+
+register_model_parallel_teardown(TeardownStage.RELEASE_CUDA_GRAPHS, release_all_cuda_graphs)
 
 
 class _GraphStatus(Enum):
@@ -1036,6 +1072,7 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fwd_graph = None
         self.bwd_graph = None
         self.bwd_graph_replay_complete_event = torch.cuda.Event()
+        _CudagraphGlobalRecord.all_runners.add(self)
 
         self.fwd_graph_recorded = False
         self.bwd_graph_recorded = False

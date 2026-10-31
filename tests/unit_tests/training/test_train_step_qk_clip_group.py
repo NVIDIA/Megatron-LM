@@ -6,8 +6,10 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+import torch
 
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core import process_groups_config
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.training import training as training_mod
 
 
@@ -79,7 +81,7 @@ def _clip_qk_call(model_pg_collection):
     return kwargs
 
 
-def test_clip_qk_reduces_over_the_model_gtp_inclusive_group():
+def test_clip_qk_reduces_over_the_model_gtp_inclusive_group(run_config):
     pg_collection = ProcessGroupCollection(dp_cp=object(), dp_cp_gtp_remat=object())
 
     kwargs = _clip_qk_call(pg_collection)
@@ -87,9 +89,37 @@ def test_clip_qk_reduces_over_the_model_gtp_inclusive_group():
     assert kwargs == {"log_max_only": False, "dp_cp_group": pg_collection.dp_cp_gtp_remat}
 
 
-def test_clip_qk_uses_dp_cp_when_the_collection_has_no_gtp_remat_group():
-    pg_collection = ProcessGroupCollection(dp_cp=object())
+def test_clip_qk_uses_dp_cp_when_the_collection_has_no_gtp_remat_axis(run_config):
+    pg_collection = ProcessGroupCollection(dp_cp=object(), gtp_remat=None)
 
     kwargs = _clip_qk_call(pg_collection)
 
     assert kwargs["dp_cp_group"] is pg_collection.dp_cp
+
+
+def test_clip_qk_uses_dp_cp_with_a_warning_when_the_collection_has_no_gtp_remat_fields(
+    run_config, monkeypatch
+):
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+    pg_collection = ProcessGroupCollection(dp_cp=object())
+
+    with pytest.warns(
+        ProcessGroupFallbackWarning,
+        match="train_step was called without `pg_collection.dp_cp_gtp_remat`",
+    ):
+        kwargs = _clip_qk_call(pg_collection)
+
+    assert kwargs["dp_cp_group"] is pg_collection.dp_cp
+
+
+def test_clip_qk_rejects_active_gtp_remat_without_its_gtp_inclusive_group(run_config, monkeypatch):
+    # dp_cp holds only a part of the ranks that read distinct data.
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    pg_collection = ProcessGroupCollection(
+        dp_cp=object(), gtp_remat=SimpleNamespace(size=lambda: 2)
+    )
+
+    with pytest.raises(
+        ValueError, match="train_step requires pg_collection to set dp_cp_gtp_remat"
+    ):
+        _clip_qk_call(pg_collection)
