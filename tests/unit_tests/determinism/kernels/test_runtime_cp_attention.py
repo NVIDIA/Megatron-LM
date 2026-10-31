@@ -231,16 +231,23 @@ def test_packed_attention_runtime_cp_replays(build_cp_size, fused_rope, monkeypa
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and flash-attn")
+@pytest.mark.parametrize("flash_attention_version", [2, 4])
 @pytest.mark.parametrize("path", ["prefill", "decode"])
-def test_flash_decode_dispatch_config_softmax_scale_replays(path):
-    """The dynamic-inference attention dispatch honors config.softmax_scale deterministically."""
+def test_flash_decode_dispatch_config_softmax_scale_replays(path, flash_attention_version):
+    """The dynamic-inference attention dispatch honors config.softmax_scale deterministically.
+
+    The KV sequences are long enough for FlashAttention-4's split-KV heuristic to engage, which
+    the dispatch must keep off where FA4 cannot split KV (Hopper).
+    """
     from megatron.core.transformer import attention as attention_module
 
-    if (
+    if flash_attention_version == 2 and (
         attention_module.flash_attn_varlen_func is None
         or attention_module.flash_attn_with_kvcache is None
     ):
         pytest.skip("requires flash-attn")
+    if flash_attention_version == 4 and not attention_module.HAVE_FA4:
+        pytest.skip("requires FlashAttention-4")
 
     from megatron.core.models.gpt.gpt_layer_specs import (
         get_gpt_layer_with_transformer_engine_submodules,
@@ -266,7 +273,8 @@ def test_flash_decode_dispatch_config_softmax_scale_replays(path):
             hidden_dropout=0.0,
             add_bias_linear=False,
             softmax_scale=0.25,  # Not 1/sqrt(head_dim): the choice must be observable.
-            flash_attention_version=2,  # Pin FA2 so every environment replays the same kernel.
+            # Pin the version so every environment replays the same kernel.
+            flash_attention_version=flash_attention_version,
         )
         submodules = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
         module = SelfAttention(
@@ -276,10 +284,12 @@ def test_flash_decode_dispatch_config_softmax_scale_replays(path):
         scale_probe = torch.empty(1, heads, head_dim, device="cuda")
         assert module.get_softmax_scale(scale_probe) == 0.25
 
-        # Paged KV cache: two requests with 24 and 32 cached tokens. Flash-attn requires the block
-        # size to be divisible by 256, so each request gets one 256-token page.
-        page_size, num_pages = 256, 2
-        lengths_k = (24, 32)
+        # Paged KV cache: two requests with 600 and 700 cached tokens, past the four 128-token
+        # tiles beyond which FlashAttention-4 splits the KV sequence. Flash-attn requires the
+        # block size to be divisible by 256, so each request gets three 256-token pages.
+        page_size, pages_per_request = 256, 3
+        num_pages = 2 * pages_per_request
+        lengths_k = (600, 700)
         inputs = dict(
             k=torch.randn(
                 num_pages, page_size, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16
@@ -291,7 +301,9 @@ def test_flash_decode_dispatch_config_softmax_scale_replays(path):
                 [0, lengths_k[0], sum(lengths_k)], device="cuda", dtype=torch.int32
             ),
             seqlens_k=torch.tensor(lengths_k, device="cuda", dtype=torch.int32),
-            block_table=torch.tensor([[0], [1]], device="cuda", dtype=torch.int32),
+            block_table=torch.arange(num_pages, device="cuda", dtype=torch.int32).view(
+                2, pages_per_request
+            ),
             max_seqlen_k=max(lengths_k),
         )
         if path == "prefill":

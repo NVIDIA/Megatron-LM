@@ -81,6 +81,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.attention import HAVE_FA4
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import AttnBackend, CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -4414,6 +4415,42 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             # through the attention kernel, not the CG capture path.
             num_cuda_graphs=None,
         )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("flash_attention_version", [None, 4], ids=["auto", "fa4"])
+    @pytest.mark.parametrize("num_cuda_graphs", [None, 1], ids=["eager", "cuda_graphs"])
+    def test_long_context_on_hopper_with_fa4_installed(
+        self, num_cuda_graphs: Optional[int], flash_attention_version: Optional[int]
+    ) -> None:
+        """FlashAttention-4 cannot split the KV sequence on Hopper; inference must not ask it to.
+
+        FA4's split heuristic engages once the KV sequence spans more than four 128-token
+        tiles. A 1000-token prompt crosses that in prefill and decode, and under CUDA graphs
+        decode runs with max_seqlen_k = max_sequence_length. Unpinned (FA3 if installed, else
+        unsplit FA4) and FA4-pinned runs must complete and match FA2 token for token.
+        """
+        if not HAVE_FA4 or torch.cuda.get_device_capability()[0] != 9:
+            pytest.skip("needs FlashAttention-4 on a Hopper (SM90) GPU")
+        test_kwargs = dict(
+            hidden_size=512,  # head_dim 128
+            num_requests=1,
+            min_prompt_length=1000,
+            max_prompt_length=1000,
+            num_tokens_to_generate=4,
+            num_gap_steps=0,
+            num_cuda_graphs=num_cuda_graphs,
+            force_build_cuda_graphs=num_cuda_graphs is not None,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+        env = self._run_test(flash_attention_version=flash_attention_version, **test_kwargs)
+        reference = self._run_test(flash_attention_version=2, **test_kwargs)
+        assert all(request.status == Status.COMPLETED for request in env.requests)
+        assert [request.generated_tokens for request in env.requests] == [
+            request.generated_tokens for request in reference.requests
+        ]
 
     @pytest.mark.internal
     @pytest.mark.skipif(
