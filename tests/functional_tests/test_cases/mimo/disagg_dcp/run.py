@@ -30,6 +30,7 @@ from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training import get_args
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.global_vars import get_run_config, get_train_state
 
@@ -169,8 +170,17 @@ def prepare_source(source, *, args, topology):
     tasks = [MediaTask(item["image_id"], 5) for item in source["media"]]
     assignments, slices = assign_media_to_producers(tasks, producers)
     pixels = {item["image_id"]: item["pixels"] for item in source["media"]}
-    local = [pixels[task.media_id] for task in assignments.get(dist.get_rank(), ())]
-    inputs = {"images": {"clip": {"x": torch.stack(local).cuda().bfloat16()}}} if local else {}
+    local_ids = [task.media_id for task in assignments.get(dist.get_rank(), ())]
+
+    def encoder_inputs(media_ids):
+        local = [pixels[mid] for mid in media_ids]
+        return {"images": {"clip": {"x": torch.stack(local).cuda().bfloat16()}}} if local else {}
+
+    inputs = (
+        encoder_inputs
+        if args.mimo_dcp_encoder_schedule == "per-round"
+        else encoder_inputs(local_ids)
+    )
     return source["samples"], slices, inputs
 
 
@@ -265,6 +275,10 @@ if __name__ == "__main__":
         assert len(models) == 1
         adapter = models[0].mimo_packed_step
         if reference_transport:
+            if get_args().mimo_dcp_encoder_schedule == "per-round":
+                raise ValueError(
+                    "The fixture's fixed-offset reference requires whole-step encoding"
+                )
             adapter.runtime.bridge = IdentityFeatureReference(adapter)
         if dist.get_world_size() == 20:
             prepare = adapter.prepare

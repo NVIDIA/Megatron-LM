@@ -18,6 +18,7 @@ from examples.mimo.model_providers import resolve_provider
 from examples.mimo.model_providers.nemotron_moe_vlm import add_model_provider_args
 from examples.mimo.training.args import (
     add_hetero_grid_args,
+    add_mimo_dcp_args,
     build_module_grid_specs,
     validate_hetero_grid_args,
 )
@@ -46,6 +47,7 @@ def extra_args_provider(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     """Register model-provider, heterogeneous-grid, and mock-data arguments."""
     parser = add_model_provider_args(parser)
     parser = add_hetero_grid_args(parser)
+    parser = add_mimo_dcp_args(parser)
     parser = add_mock_data_args(parser)
     parser = add_encoder_prefetch_args(parser)
     return parser

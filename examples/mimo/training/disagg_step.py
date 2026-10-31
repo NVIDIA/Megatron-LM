@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Synchronous disjoint-role adapter for native packed MIMO training."""
+"""Disjoint-role adapter for native packed MIMO training."""
 
 import torch
 import torch.distributed as dist
@@ -8,7 +8,7 @@ import torch.distributed as dist
 from examples.mimo.training.packed_step import PackedMimoStep
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.packing import prepare_mimo_step
-from megatron.core.models.mimo.runtime import MimoStepRuntime
+from megatron.core.models.mimo.runtime import LazyMimoStepRuntime, MimoStepRuntime
 from megatron.core.pipeline_parallel.schedules import forward_backward_no_pipelining
 from megatron.core.rerun_state_machine import RerunDataIterator
 
@@ -18,8 +18,9 @@ class PackedDisaggMimoStep(PackedMimoStep):
 
     All roles prepare one source batch. Only decoder ranks pack it; their leader
     publishes the immutable per-round routes. Encoder ranks execute those routes
-    without a decoder loss, accumulate returned feature gradients, and backpropagate
-    once before the existing heterogeneous finalizer and optimizer run.
+    without a decoder loss. Whole-step encoding retains one graph until finalization;
+    per-round encoding overlaps local encoder work with the current decoder round.
+    Both use the existing heterogeneous finalizer and optimizer once per source step.
     """
 
     def __init__(self, model, topology, prepare_source, *, modality_name):
@@ -44,6 +45,7 @@ class PackedDisaggMimoStep(PackedMimoStep):
                 rank for line in topology.grids[modality_name].get_rank_enum("pp") for rank in line
             )
         )
+        self.producer_ranks = producers
         self.runtime = MimoStepRuntime(
             dist.group.WORLD, producer_ranks=producers, decoder_ranks=self.decoder_ranks
         )
@@ -84,20 +86,49 @@ class PackedDisaggMimoStep(PackedMimoStep):
                 self.plan.source_tokens,
                 self.plan.source_tokens_squared,
                 not self.model.training,
+                callable(inputs),
             )
         dist.broadcast_object_list(message, src=self.decoder_ranks[0])
-        self.routes, tokens, squared, forward_only = message[0]
+        self.routes, tokens, squared, forward_only, per_round = message[0]
         if forward_only != (not self.model.training):
             raise RuntimeError("Encoder and decoder execution modes disagree")
+        if per_round != callable(inputs):
+            raise RuntimeError("Encoder and decoder input contracts disagree")
+        runtime_type = LazyMimoStepRuntime if per_round else MimoStepRuntime
+        if type(self.runtime) is not runtime_type:
+            self.runtime = runtime_type(
+                dist.group.WORLD,
+                producer_ranks=self.producer_ranks,
+                decoder_ranks=self.decoder_ranks,
+            )
+            self.model.mimo_step_runtime = self.runtime
+        empty = torch.empty(
+            (0, self.model.config.hidden_size), device=device, dtype=self.model.config.params_dtype
+        )
+        if per_round:
+            encoder_autocast = torch.is_autocast_enabled("cuda")
+            encoder_autocast_dtype = torch.get_autocast_dtype("cuda")
+
+            def encode(media_ids):
+                with torch.autocast("cuda", enabled=encoder_autocast, dtype=encoder_autocast_dtype):
+                    return self.model.encode_modalities(inputs(media_ids)).get(
+                        self.modality_name, empty
+                    )
+
+            self.runtime.begin_lazy_step(
+                self.routes, slices, encode, empty, forward_only=forward_only
+            )
+        else:
+            self._begin_whole_step(inputs, slices, empty, forward_only)
+        items = self.plan.rounds if self.is_decoder else self.routes
+        return RerunDataIterator(iter(items)), len(self.routes), float(tokens), float(squared)
+
+    def _begin_whole_step(self, inputs, slices, empty, forward_only):
+        """Validate the eager feature contract collectively before entering transport."""
+        device = empty.device
         with torch.set_grad_enabled(not forward_only):
             encoded = self.model.encode_modalities(inputs) if not self.is_decoder else {}
-        features = encoded.get(self.modality_name)
-        if features is None:
-            features = torch.empty(
-                (0, self.model.config.hidden_size),
-                device=device,
-                dtype=self.model.config.params_dtype,
-            )
+        features = encoded.get(self.modality_name, empty)
         expected = max(
             (
                 piece.offset + piece.length
@@ -120,8 +151,6 @@ class PackedDisaggMimoStep(PackedMimoStep):
                 "Encoder output shape, dtype or device disagrees with the media contract"
             )
         self.runtime.begin_step(features, len(self.routes), forward_only=forward_only)
-        items = self.plan.rounds if self.is_decoder else self.routes
-        return RerunDataIterator(iter(items)), len(self.routes), float(tokens), float(squared)
 
     def run(self, *, model, data_iterator, num_microbatches, forward_only=False, **kwargs):
         """Keep the native decoder schedule; encoder-only ranks service its rounds."""
@@ -148,7 +177,14 @@ class PackedDisaggMimoStep(PackedMimoStep):
             )
         for _ in range(num_microbatches):
             transfer = self.runtime.route(next(data_iterator))
-            self.runtime.complete_round(transfer)
+            if isinstance(self.runtime, LazyMimoStepRuntime):
+                # Current features have been delivered. Work on independent encoder
+                # graphs while decoder ranks run their native forward/backward.
+                self.runtime.backward_ready()
+                self.runtime.prefetch_next_round()
+                self.runtime.complete_round(transfer, defer_encoder_backward=True)
+            else:
+                self.runtime.complete_round(transfer)
         if forward_only:
             self.runtime.finish_forward()
             self.routes = None

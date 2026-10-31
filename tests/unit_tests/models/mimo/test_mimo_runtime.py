@@ -121,6 +121,7 @@ def test_public_preparation_and_runtime_lifecycle(runtime_groups, dynamic, lazy)
     domain, producers, ranks, cp_groups = runtime_groups
     rank = dist.get_rank()
     is_decoder = rank in ranks
+    prefetch = lazy and not is_decoder
     limit = 32 if dynamic else 64
     scheduler = (DefaultDynamicCPScheduler if dynamic else DpBalancedScheduler)(
         limit, cp_size=2, dp_size=2, microbatch_group_size_per_vp_stage=None
@@ -207,11 +208,12 @@ def test_public_preparation_and_runtime_lifecycle(runtime_groups, dynamic, lazy)
         previous_offsets = {}
         rebased_after_release = False
         round_index = -1
+        encode_round = -1
 
         def encode(media_ids):
             media_ids = tuple(media_ids)
             assert media_ids
-            assert all(lifetimes[mid][0] == round_index for mid in media_ids)
+            assert all(lifetimes[mid][0] == encode_round for mid in media_ids)
             assert len({lifetimes[mid] for mid in media_ids}) == 1
             assert list(media_ids) == sorted(media_ids, key=lambda mid: slices[mid].offset)
             encode_calls.append((round_index, media_ids))
@@ -239,6 +241,9 @@ def test_public_preparation_and_runtime_lifecycle(runtime_groups, dynamic, lazy)
         with torch.no_grad():
             begin()
         assert runtime.active and not encode_calls
+        if lazy:
+            with pytest.raises(RuntimeError, match="pending round"):
+                runtime.prefetch_next_round()
         with pytest.raises(RuntimeError, match="active MIMO"):
             begin()
         finish = runtime.finish_forward if forward_only else runtime.finish_backward
@@ -247,7 +252,28 @@ def test_public_preparation_and_runtime_lifecycle(runtime_groups, dynamic, lazy)
         for round_index, plans in enumerate(rounds):
             item = plan.rounds[round_index] if is_decoder else None
             group = item.cp_group if is_decoder else None
+            encode_round = round_index
             transfer = runtime.route(plans, group)
+            if prefetch:
+                if runtime._ready_backward:
+                    with pytest.raises(RuntimeError, match="Drain ready"):
+                        runtime.prefetch_next_round()
+                    with pytest.raises(RuntimeError, match="Drain ready"):
+                        runtime.complete_round(transfer, defer_encoder_backward=True)
+                runtime.backward_ready()
+                encode_round = round_index + 1
+                runtime.prefetch_next_round()
+                calls = len(encode_calls)
+                runtime.prefetch_next_round()
+                assert len(encode_calls) == calls
+                assert runtime.pending is transfer and runtime.completed_rounds == round_index
+                assert all(
+                    chunk.first_round <= round_index + 1 and chunk.last_round >= round_index
+                    for chunk in runtime.live_chunks
+                )
+            elif lazy:
+                with pytest.raises(ValueError, match="producer-only"):
+                    runtime.prefetch_next_round()
             if lazy:
                 for original, routed in zip(plans, transfer.plans):
                     for source, destination in zip(original.features, routed.features):
@@ -283,21 +309,25 @@ def test_public_preparation_and_runtime_lifecycle(runtime_groups, dynamic, lazy)
             assert len(backward_calls) == completed_chunks
             if not completed_chunks:
                 assert encoder.grad is None
-            runtime.complete_round(transfer)
+            if prefetch:
+                runtime.complete_round(transfer, defer_encoder_backward=True)
+            else:
+                runtime.complete_round(transfer)
             if lazy:
                 encoded_ids = [mid for _, ids in encode_calls for mid in ids]
                 expected_ids = {
-                    mid for mid, (first, _) in lifetimes.items() if first <= round_index
+                    mid for mid, (first, _) in lifetimes.items() if first <= round_index + prefetch
                 }
                 assert len(encoded_ids) == len(set(encoded_ids))
                 assert set(encoded_ids) == expected_ids
+                last_released = round_index - (prefetch and not forward_only)
                 expected_backward = (
-                    sum(last <= round_index for _, last in set(lifetimes.values()))
+                    sum(last <= last_released for _, last in set(lifetimes.values()))
                     if not forward_only
                     else 0
                 )
                 assert len(backward_calls) == expected_backward
-                assert all((ref() is None) == (last <= round_index) for last, ref in graph_refs)
+                assert all((ref() is None) == (last <= last_released) for last, ref in graph_refs)
                 assert runtime.active  # Also true between empty / pure-text rounds.
             with pytest.raises(RuntimeError, match="stale or completed"):
                 runtime.complete_round(transfer)
@@ -312,6 +342,10 @@ def test_public_preparation_and_runtime_lifecycle(runtime_groups, dynamic, lazy)
         finish()
         assert not runtime.active
         assert runtime.local_features is runtime.feature_gradient is runtime.pending is None
+        if lazy:
+            assert not runtime.live_chunks and not runtime._ready_backward
+            with pytest.raises(RuntimeError, match="active source step"):
+                runtime.backward_ready()
         expected_backward = len(set(lifetimes.values())) if lazy else bool(assigned.get(rank))
         assert backward_calls == [1] * (expected_backward if not forward_only else 0)
         assert all(ref() is None for _, ref in graph_refs)

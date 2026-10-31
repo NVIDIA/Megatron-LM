@@ -211,9 +211,24 @@ enabled through their usual model flags and keep their existing semantics.
 
 The supported disaggregated path requires BF16, encoder TP=CP=PP=1, decoder
 TP=PP=1, distributed Adam, and no GTP rematerialization. DDP/parameter-gather
-overlap, MoE communication overlap, encoder prefetch, and rerun are disabled.
-Projectors stay on E. The encoder retains one source step's activation graph
-until all decoder rounds return their gradients, then executes backward once.
+overlap, MoE communication overlap, the separate frozen-encoder prefetch loader,
+and rerun are disabled. Projectors stay on E.
+
+With `--mimo-dcp-encoder-schedule whole-step` (default), the encoder retains one
+source step's activation graph until all decoder rounds return their gradients,
+then executes backward once. Adapters supporting `per-round` return the same
+ordered-media callback used by the colocated adapter. Encoder ranks send the
+current round, backward completed graphs from the preceding round, pre-encode
+the next round, and then collect the current round's feature gradients. Local
+encoder forward/backward can thus overlap the decoder's native forward/backward
+on disjoint GPUs. The decoder schedule and the global packing plan are unchanged.
+There is one pending feature transfer, at most one completed round awaiting
+encoder backward, and one round of prefetch. Shared media graphs remain live
+through their last consumer. The final encoder backward drains before native
+gradient finalization and the optimizer update; evaluation releases graphs
+without gradient messages. Reduced batching may offset overlap gains, so measure
+whole-step time and peak memory for the workload.
+
 Each pack's complete features are gathered to its leader and replicated within
 that CP group; this is not selective transmission to individual token owners.
 
