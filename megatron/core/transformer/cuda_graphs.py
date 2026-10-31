@@ -594,6 +594,7 @@ class _CudagraphGlobalRecord:
     'record_bwd_graph."""
     cudagraph_record: list[tuple] = []
     cudagraph_inference_record: list[tuple] = []
+    cudagraph_created_runners: list = []
     _saved_tensors_observer = None
     _te_capture_started = False
 
@@ -777,9 +778,12 @@ class _CudagraphGlobalRecord:
         )
 
         # Mark cuda graphs as created.
+        cls.cudagraph_created_runners = []
         for g in cls.cudagraph_record:
             runner = g[0]
             runner.cudagraph_created = True
+            if runner not in cls.cudagraph_created_runners:
+                cls.cudagraph_created_runners.append(runner)
 
         # Reset global record.
         cls.cudagraph_created = True
@@ -816,11 +820,16 @@ def delete_cuda_graphs():
     _CudagraphGlobalRecord._disable_saved_tensors_observer()
 
     # Reset runners.
-    for record in [
-        *_CudagraphGlobalRecord.cudagraph_record,
-        *_CudagraphGlobalRecord.cudagraph_inference_record,
-    ]:
-        runner = record[0]
+    all_runners = [
+        *_CudagraphGlobalRecord.cudagraph_created_runners,
+        *[record[0] for record in _CudagraphGlobalRecord.cudagraph_record],
+        *[record[0] for record in _CudagraphGlobalRecord.cudagraph_inference_record],
+    ]
+    seen_runner_ids = set()
+    for runner in all_runners:
+        if id(runner) in seen_runner_ids:
+            continue
+        seen_runner_ids.add(id(runner))
         assert isinstance(runner, _CudaGraphRunner)
 
         runner.cudagraph_created = False
@@ -835,6 +844,7 @@ def delete_cuda_graphs():
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
     _CudagraphGlobalRecord.cudagraph_inference_record = []
+    _CudagraphGlobalRecord.cudagraph_created_runners = []
     _GTP_RUNNER_STREAMS.clear()
 
     # TODO: Optional?: Force garbage collection to clean up memory
