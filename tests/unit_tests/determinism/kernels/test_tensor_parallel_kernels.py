@@ -33,6 +33,7 @@ from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
+    _wgrad_gemm,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
@@ -264,6 +265,24 @@ class TestTensorParallelLayers:
             module, (x,), replays=3, contention=True, what="column linear[bf16 input, fp32 output]"
         )
         assert outputs["out[0]"].dtype is torch.float32
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_fsdp_wgrad_gemm_replays(dtype, accumulate):
+    """Replay both overwrite and accumulation into FSDP's FP32 main-gradient buffer."""
+    seeded()
+    x = torch.randn(4096, 512, device="cuda", dtype=dtype)
+    dy = torch.randn(4096, 1024, device="cuda", dtype=dtype)
+    main_grad = torch.randn(1024, 512, device="cuda", dtype=torch.float32)
+    assert_replays_bit_exact(
+        lambda grad, dy, x: _wgrad_gemm(grad, dy, x, accumulate=accumulate),
+        (main_grad, dy, x),
+        replays=3,
+        backward=False,
+        contention=True,
+        what=f"FSDP wgrad GEMM[{dtype}, accumulate={accumulate}]",
+    )
 
 
 # --- apex fused layer norm ------------------------------------------------------------------

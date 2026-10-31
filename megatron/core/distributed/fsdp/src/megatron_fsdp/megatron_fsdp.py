@@ -362,6 +362,10 @@ class MegatronFSDP(torch.nn.Module):
                 param.__fsdp_param__ = True
 
         self._init_fsdp_param_and_grad_buffer()
+        # no_shard can skip the unshard hooks, so fused wgrad writers need this
+        # policy before the first forward, including when no FSDP units are registered.
+        for param in self.module.parameters():
+            param.overwrite_main_grad = self._reduces_grad_every_backward(param)
         self._register_fsdp_hooks(self.module)
         self.microbatch_count = 0
         self.is_param_fsdp_distributed = False

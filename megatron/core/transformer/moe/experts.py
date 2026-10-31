@@ -883,12 +883,11 @@ class TEGroupedMLP(MegatronModule):
         """Expose FSDP main_grad buffers required by TE fused wgrad accumulation."""
         if not getattr(linear_module, "fuse_wgrad_accumulation", False):
             return
+        # FSDP owns overwrite_main_grad: persistent buffers must retain prior microbatches.
         for param in linear_module.parameters(recurse=False):
             get_main_grad = getattr(param, "get_main_grad", None)
             if get_main_grad is not None and getattr(param, "main_grad", None) is None:
                 param.main_grad = get_main_grad()
-            if hasattr(param, "overwrite_main_grad"):
-                param.overwrite_main_grad = True
 
     def _ensure_main_grad_for_fused_impl(self) -> None:
         """Expose wrapper parameter main_grad buffers before TE fused ops run."""

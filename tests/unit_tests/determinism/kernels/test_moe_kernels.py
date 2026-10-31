@@ -73,6 +73,47 @@ from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_DEEP_EP_V
 NUM_TOKENS, HIDDEN, NUM_EXPERTS, TOPK = 16384, 2048, 64, 8
 
 
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+@pytest.mark.parametrize("overwrite_main_grad", (False, True))
+def test_expert_main_grad_policy_replays(dtype, overwrite_main_grad):
+    """Expert buffer preparation preserves overwrite/accumulation across GEMM replays."""
+    from megatron.core.tensor_parallel.layers import _wgrad_gemm
+
+    seeded()
+    linear = torch.nn.Linear(64, 128, bias=False, device="cuda", dtype=dtype)
+    linear.fuse_wgrad_accumulation = True
+    linear.weight.overwrite_main_grad = overwrite_main_grad
+    initial_grad = torch.ones(128, 64, device="cuda", dtype=torch.float32)
+    inputs = tuple(
+        torch.randint(0, 4, shape, device="cuda").to(dtype)
+        for shape in ((32, 64), (32, 128), (64, 64), (64, 128))
+    )
+
+    def write_grads(main_grad, x1, dy1, x2, dy2):
+        linear.weight.main_grad = None
+        linear.weight.get_main_grad = lambda: main_grad
+        for x, dy in ((x1, dy1), (x2, dy2)):
+            TEGroupedMLP._ensure_main_grad(linear)
+            _wgrad_gemm(
+                linear.weight.main_grad, dy, x, accumulate=not linear.weight.overwrite_main_grad
+            )
+        return main_grad
+
+    outputs, _ = assert_replays_bit_exact(
+        write_grads,
+        (initial_grad, *inputs),
+        backward=False,
+        contention=True,
+        replays=3,
+        what=f"expert main_grad[{dtype}, overwrite={overwrite_main_grad}]",
+    )
+    x1, dy1, x2, dy2 = inputs
+    expected = dy2.float().T @ x2.float()
+    if not overwrite_main_grad:
+        expected += initial_grad + dy1.float().T @ x1.float()
+    torch.testing.assert_close(outputs["out"], expected, rtol=0, atol=0)
+
+
 # --- virtual-expert planning ----------------------------------------------------------------
 
 
