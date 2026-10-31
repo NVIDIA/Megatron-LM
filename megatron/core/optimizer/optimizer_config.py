@@ -163,6 +163,15 @@ class OptimizerConfig:
     weight_decay: float = 0.01
     """Weight decay coefficient for L2 regularization."""
 
+    rmsnorm_weight_decay_mult: Optional[float] = None
+    """Multiplier on scheduled global weight decay for RMSNorm gamma parameters.
+
+    ``None`` preserves the default weight-decay policy. Set to 1.0 for full decay,
+    0.5 for half decay, or 0.0 to disable decay on RMSNorm gamma. Must be finite and
+    nonnegative. When set, takes precedence over ``apply_wd_to_qk_layernorm`` for
+    RMSNorm gamma only; other parameters retain their existing policy.
+    """
+
     apply_wd_to_qk_layernorm: bool = False
     """If true, apply weight decay to qk layernorm as a special case."""
 
@@ -426,6 +435,12 @@ class OptimizerConfig:
 
     def __post_init__(self):
         """Check the validity of the config."""
+
+        if self.rmsnorm_weight_decay_mult is not None and (
+            not math.isfinite(self.rmsnorm_weight_decay_mult)
+            or self.rmsnorm_weight_decay_mult < 0.0
+        ):
+            raise ValueError("rmsnorm_weight_decay_mult must be a finite nonnegative value")
 
         # The following condition is used to avoid repetition in distrib_optimizer.py.
         # This is because in distrib_optimizer.py, the process to handle parameters are

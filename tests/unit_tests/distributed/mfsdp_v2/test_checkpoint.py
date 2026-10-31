@@ -22,6 +22,7 @@ from torch.distributed.tensor import DTensor, Shard
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     Placements,
     fully_shard,
     fully_shard_context,
@@ -118,7 +119,7 @@ def test_post_wrap_assign_true_load_raises(distributed_setup):
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     checkpoint = nn.Linear(4, 4, bias=False, device=device).state_dict()
     model = nn.Linear(4, 4, bias=False, device=device)
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     with pytest.raises(RuntimeError, match=r"load_state_dict\(assign=True\)"):
@@ -134,7 +135,7 @@ def _build_sharded(
         # source; a correct load must overwrite them.
         for parameter in model.parameters():
             nn.init.zeros_(parameter)
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model.fc1, mesh=mesh, placements=_default_placements())
         fully_shard(model.fc2, mesh=mesh, placements=_default_placements())
     optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
@@ -149,7 +150,7 @@ def _build_packed_sharded(
 ) -> tuple[nn.Module, torch.optim.Optimizer]:
     """Shard a :class:`_PackedModel`, whose packing no canonical ``Shard(0)`` split describes."""
     model = _PackedModel().to(device=device)
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model.block, mesh=mesh, placements=_default_placements())
         fully_shard(model.linear, mesh=mesh, placements=_default_placements())
     optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
@@ -171,7 +172,7 @@ def _build_tied_sharded(
         for parameter in model.parameters():
             nn.init.zeros_(parameter)
     # A tied weight cannot belong to two FsdpModules, so the parent owns the whole group.
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model, mesh=mesh, placements=_default_placements())
     optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
     fully_shard_optimizer(optimizer)

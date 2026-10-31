@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 import logging
 import os
@@ -24,6 +24,7 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.tensor_parallel.gtp_parallel_layout import GTPParallelLayout
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
+from megatron.training.config.dataset_config import DataConfig
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
 from megatron.training.config.resilience_config import (
@@ -90,7 +91,7 @@ class ConfigContainerBase:
         rng = getattr(self, "rng", None)
         if rng is not None:
             rng.finalize_model_config(getattr(self, "model", None))
-    
+
     @classmethod
     def from_dict(
         cls: Type[T],
@@ -232,7 +233,10 @@ class PretrainConfigContainer(ConfigContainerBase):
     model: ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoBuildConfig
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
-    # dataset: GPTDatasetConfig # TODO (@maanug): add support
+    data: DataConfig = field(default_factory=DataConfig)
+    """The dataset config, the loader settings and the dataset class. The GPT entry points build
+    their datasets from it (``gpt_data_config_from_args``); every other entry point carries the
+    loader settings only (``data.dataset is None``). See ``megatron.training.config.dataset_config``."""
     ddp: DistributedDataParallelConfig = field(default_factory=DistributedDataParallelConfig)
     dist: DistributedInitConfig = field(default_factory=DistributedInitConfig)
     rng: RNGConfig = field(default_factory=RNGConfig)
@@ -433,6 +437,7 @@ class PretrainConfigContainer(ConfigContainerBase):
                 raise ValueError("GTP sequence sharding does not support TP-PP-DP mapping")
         global_batch_size, _, _ = self._resolve_batch_sizes()
         self._validate_rl_config(global_batch_size)
+        self._validate_data_section()
 
     def _validate_rl_config(self, global_batch_size: int | None) -> None:
         """Check RL policy against the supplied or resolved training batch size."""
@@ -459,7 +464,94 @@ class PretrainConfigContainer(ConfigContainerBase):
             weight_decay=self.optimizer.weight_decay,
         )
 
+    def _validate_data_section(self) -> None:
+        """Cross-section checks for ``data.dataset``, one per field.
+
+        The model capacity covers the sample length. A value given on the dataset config for one
+        of the six fields other sections own (``CONTAINER_WRITTEN_FIELDS``) must agree with that
+        section: the container writes these fields at ``finalize()``, the arguments and the saved
+        file leave them at Megatron Core's defaults, so a differing explicit value is a mistake.
+        ``data_parallel_size`` needs the world size as well and is checked at ``finalize()``.
+        """
+        dataset = self.data.dataset
+        if dataset is None:
+            return
+        capacity = getattr(self.model, "seq_length", None)
+        if isinstance(capacity, int) and isinstance(dataset.sequence_length, int):
+            if capacity < dataset.sequence_length:
+                raise ValueError(
+                    f"model.seq_length ({capacity}, the position-embedding capacity, "
+                    "--max-position-embeddings) must be greater than or equal to "
+                    f"data.dataset.sequence_length ({dataset.sequence_length}, --seq-length)."
+                )
+        validation = self.validation
+        if (
+            dataset.full_validation is not None
+            and dataset.full_validation != validation.full_validation
+        ):
+            raise ValueError(
+                f"data.dataset.full_validation={dataset.full_validation} disagrees with "
+                f"validation.full_validation={validation.full_validation}; the container writes "
+                "this field at finalize(), leave it unset."
+            )
+        if (
+            dataset.multiple_validation_sets is not None
+            and dataset.multiple_validation_sets != validation.multiple_validation_sets
+        ):
+            raise ValueError(
+                f"data.dataset.multiple_validation_sets={dataset.multiple_validation_sets} "
+                "disagrees with "
+                f"validation.multiple_validation_sets={validation.multiple_validation_sets}; the "
+                "container writes this field at finalize(), leave it unset."
+            )
+        transformer = self.model.transformer
+        if (
+            dataset.context_parallel_size is not None
+            and dataset.context_parallel_size != transformer.context_parallel_size
+        ):
+            raise ValueError(
+                f"data.dataset.context_parallel_size={dataset.context_parallel_size} disagrees "
+                "with model.transformer.context_parallel_size="
+                f"{transformer.context_parallel_size}; the container writes this field at "
+                "finalize(), leave it unset."
+            )
+        sequence_parallel_size = transformer.tensor_model_parallel_size * int(
+            bool(transformer.sequence_parallel)
+        )
+        if dataset.sequence_parallel_size not in (0, sequence_parallel_size):
+            raise ValueError(
+                f"data.dataset.sequence_parallel_size={dataset.sequence_parallel_size} disagrees "
+                "with the model layout (tensor_model_parallel_size * sequence_parallel = "
+                f"{sequence_parallel_size}); the container writes this field at finalize(), leave "
+                "it unset."
+            )
+        dynamic_context_parallel = bool(getattr(transformer, "dynamic_context_parallel", False))
+        # The deprecated hybrid_context_parallel alias counts as the canonical flag here (Core
+        # warns about it in validate_without_tokenizer()); finalize() folds it and clears it.
+        if (
+            dataset.dynamic_context_parallel or dataset.hybrid_context_parallel
+        ) and not dynamic_context_parallel:
+            raise ValueError(
+                "data.dataset.dynamic_context_parallel=True disagrees with "
+                "model.transformer.dynamic_context_parallel=False; the container writes this field "
+                "at finalize(), leave it unset."
+            )
+
     def _finalize(self) -> None:
+        dataset = self.data.dataset
+        transformer = self.model.transformer
+        data_parallel_size = None
+        if dataset is not None:
+            # The world size is known here: data_parallel_size gets the agreement check the other
+            # fields got at validation, before anything is written.
+            data_parallel_size = self.get_data_parallel_size()
+            if dataset.data_parallel_size not in (1, data_parallel_size):
+                raise ValueError(
+                    f"data.dataset.data_parallel_size={dataset.data_parallel_size} disagrees with "
+                    "the model layout and the world size "
+                    f"(data_parallel_size={data_parallel_size}); the container writes this field "
+                    "at finalize(), leave it unset."
+                )
         batch_sizes = self._resolve_batch_sizes(self.get_batch_parallel_size())
         self._validate_rl_config(batch_sizes[0])
         # Resolve RNG and model settings before deriving optimizer precision.
@@ -476,6 +568,22 @@ class PretrainConfigContainer(ConfigContainerBase):
         self.optimizer = optimizer
         self.scheduler.finalize_scheduler_config(self.optimizer.weight_decay)
         self._resolve_scheduler_step_fields()
+        if dataset is not None:
+            # The seven fields other sections own (CONTAINER_WRITTEN_FIELDS): the validation flags
+            # from the validation config, the layout from the required model config (the
+            # deprecated hybrid_context_parallel alias is folded into dynamic_context_parallel).
+            dataset.full_validation = self.validation.full_validation
+            dataset.multiple_validation_sets = self.validation.multiple_validation_sets
+            dataset.data_parallel_size = data_parallel_size
+            dataset.context_parallel_size = transformer.context_parallel_size
+            dataset.sequence_parallel_size = transformer.tensor_model_parallel_size * int(
+                bool(transformer.sequence_parallel)
+            )
+            dataset.dynamic_context_parallel = bool(
+                getattr(transformer, "dynamic_context_parallel", False)
+            )
+            dataset.hybrid_context_parallel = False
+        self.data.finalize()
         if self.rl.perform_rl_step:
             self.rl.finalize_ddp_config(self.ddp)
 

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import ast
 import builtins
@@ -7,6 +7,7 @@ import enum
 import importlib
 import inspect
 import itertools
+import json
 import types
 import typing
 import warnings
@@ -18,15 +19,21 @@ from typing import Any, Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+from megatron.core.datasets.gpt_fim_dataset import GPTFIMDatasetConfig
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.core.tuning import AutotunePolicy
 from megatron.training.config import (
     CheckpointConfig,
+    DataConfig,
+    DataloaderConfig,
     DistributedInitConfig,
     InferenceConfigContainer,
     InferenceSetupConfig,
     LoggerConfig,
+    MultiModalTokenizerConfig,
     PretrainConfigContainer,
     ProfilingConfig,
     RerunStateMachineConfig,
@@ -37,8 +44,8 @@ from megatron.training.config import (
     TokenizerConfig,
     TrainingConfig,
     ValidationConfig,
-    MultiModalTokenizerConfig,
 )
+from megatron.training.config.dataset_config import dataset_type_from_family
 from megatron.training.models import (
     BertModelConfig,
     GPTModelConfig,
@@ -48,6 +55,7 @@ from megatron.training.models import (
     ModelConfig,
     T5ModelConfig,
 )
+from megatron.training.utils import warn_rank_0
 
 # TODO: support arg renames
 
@@ -414,6 +422,9 @@ def core_transformer_config_from_args(args, config_class=None):
     for f in dataclasses.fields(config_class):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
+    # The training sequence length, not max_position_embeddings (which GPTModelConfig.seq_length
+    # carries): core modules that size buffers per sample (NCCL EP) read it from the config.
+    kw_args['max_seq_length_per_sample'] = args.seq_length
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
     kw_args['deallocate_pipeline_outputs'] = not _mfsdp_v2_disables_pipeline_output_dealloc(args)
     kw_args['pipeline_dtype'] = args.params_dtype
@@ -859,9 +870,204 @@ def _model_config_kwargs_from_args(args: Namespace, model_config_cls: type) -> d
     return kwargs
 
 
-def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> PretrainConfigContainer:
-    """Build a PretrainConfigContainer from the argparse arguments."""
+# args attribute -> Megatron Core GPTDatasetConfig field, as the legacy entry-point factories read
+# them. The fields the container writes (layout, validation flags) are listed separately.
+_DATASET_FIELD_SOURCES = {
+    "random_seed": "seed",
+    "sequence_length": "seq_length",
+    "split": "split",
+    "num_dataset_builder_threads": "num_dataset_builder_threads",
+    "path_to_cache": "data_cache_path",
+    "mmap_bin_files": "mmap_bin_files",
+    "reset_position_ids": "reset_position_ids",
+    "reset_attention_mask": "reset_attention_mask",
+    "eod_mask_loss": "eod_mask_loss",
+    "create_attention_mask": "create_attention_mask_in_dataloader",
+    "object_storage_cache_path": "object_storage_cache_path",
+    "mid_level_dataset_surplus": "mid_level_dataset_surplus",
+    "allow_ambiguous_pad_tokens": "allow_ambiguous_pad_tokens",
+    "fast_cache_load": "dataloader_fast_cache_load",
+    "defer_npy_index_mmap": "dataloader_defer_npy_index_mmap",
+    "inter_document_masking": "dataloader_inter_document_masking",
+    "sft_mock_dataset_config_json": "sft_mock_dataset_config_json",
+    "varlen_mock_dataset_config_json": "varlen_mock_dataset_config_json",
+    "varlen_sbhd_validation": "varlen_sbhd_validation",
+}
+
+
+def requested_dataset_family(args: Namespace) -> str:
+    """The dataset family the legacy flags select: --sft, else --use-varlen-dataset, else
+    --fim-data, else gpt, the precedence of the legacy providers. --sft with --use-varlen-dataset
+    is rejected as ``validate_args`` rejects it; several family flags warn which one wins."""
+    selected = [
+        family
+        for family, flag in (("sft", "sft"), ("varlen", "use_varlen_dataset"), ("fim", "fim_data"))
+        if getattr(args, flag, False)
+    ]
+    if "sft" in selected and "varlen" in selected:
+        raise ValueError(
+            "--use-varlen-dataset and --sft are mutually exclusive; both select the "
+            "packed-sequence dataset family. Pick one."
+        )
+    if len(selected) > 1:
+        warn_rank_0(f"{selected} were all requested; '{selected[0]}' wins, as in the providers.")
+    return selected[0] if selected else "gpt"
+
+
+def _resolve_data_sources(args: Namespace):
+    """``(blend, blend_per_split, sequences_per_dataset)`` from the legacy path arguments.
+
+    ``--mock-data`` next to a file-backed source is rejected here: ``validate_args`` counts only the
+    inline path spellings, and no entry point could build that combination.
+    """
+    from megatron.training.utils import get_blend_and_blend_per_split
+
+    file_backed = (
+        getattr(args, "data_args_path", None) is not None
+        or getattr(args, "per_split_data_args_path", None) is not None
+    )
+    if getattr(args, "mock_data", False) and file_backed:
+        raise ValueError("A single data source must be provided in training mode, else None")
+    blend, blend_per_split = get_blend_and_blend_per_split(args)
+    sequences_per_dataset = None
+    path = getattr(args, "per_dataset_sequences_path", None)
+    if path is not None:
+        with open(path, "r") as f:
+            sequences_per_dataset = json.load(f)
+    return blend, blend_per_split, sequences_per_dataset
+
+
+def _container_written_fields_from_args(args: Namespace) -> dict[str, Any]:
+    """What a standalone (container-less) dataset config takes from ``args`` for the fields the
+    container writes otherwise (``CONTAINER_WRITTEN_FIELDS``: the layout, the validation flags)."""
+    return {
+        "data_parallel_size": args.data_parallel_size,
+        "context_parallel_size": args.context_parallel_size,
+        "sequence_parallel_size": args.tensor_model_parallel_size * int(bool(args.sequence_parallel)),
+        "dynamic_context_parallel": args.dynamic_context_parallel,
+        "hybrid_context_parallel": args.hybrid_context_parallel,  # False after validate_args
+        "full_validation": args.full_validation,
+        "multiple_validation_sets": args.multiple_validation_sets,
+    }
+
+
+def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> DataConfig:
+    """Build ``cfg.data`` for a GPT entry point from the legacy arguments.
+
+    One factory for ``pretrain_gpt.py``, ``pretrain_hybrid.py``, ``pretrain_hybrid_flex.py`` and
+    ``tools/prepare_cache.py``: every data argument is forwarded to the dataset config. The data
+    paths are resolved into ``blend`` / ``blend_per_split``, the sequences file into
+    ``sequences_per_dataset``, the five ``--fim-*-token`` flags into ``fim_extra_tokens``, and the
+    dataset class follows the family flags with the legacy precedence (``--sft``, else
+    ``--use-varlen-dataset``, else ``--fim-data``, else gpt; ``--mock-data`` selects the family's
+    mock class); with no data source and no ``--mock-data`` the mock class is selected where the
+    family has one (with a warning), as Megatron-Bridge does. What an entry point cannot build it
+    rejects itself (``pretrain_hybrid_flex.py``: varlen; the cache tool: mock, sft and fim).
+
+    ``random_seed`` is the section's own setting, filled from ``--seed`` and saved with the section
+    (independent of ``cfg.rng.seed`` after construction, as in Megatron-Bridge). The layout and
+    validation fields the container writes at ``finalize()`` (``CONTAINER_WRITTEN_FIELDS``) are left
+    unset for a container; ``standalone=True`` fills them from ``args`` for callers without one
+    (``tools/prepare_cache.py``, the legacy ``core_gpt_dataset_config_from_args`` wrappers). The
+    returned config has no tokenizer: ``DataConfig.bind_tokenizer`` binds the run's and runs
+    Megatron Core's ``validate()``.
+    """
+    family = requested_dataset_family(args)
+    blend, blend_per_split, sequences_per_dataset = _resolve_data_sources(args)
+    has_source = blend is not None or (blend_per_split is not None and any(blend_per_split))
+    mock_requested = bool(getattr(args, "mock_data", False))
+    dataset_type = dataset_type_from_family(family, mock=False)
+    if mock_requested or not has_source:
+        mock_class = dataset_type_from_family(family, mock=True)
+        if mock_class is not None:
+            dataset_type = mock_class
+            if not mock_requested:
+                warn_rank_0(
+                    f"No data source is declared; building the mock {family} dataset "
+                    f"({mock_class.__name__})."
+                )
+        # Otherwise (fim) the real class stays and DataConfig.validate() reports the missing source.
+
+    kwargs: dict[str, Any] = {
+        field_name: deepcopy(getattr(args, source))
+        for field_name, source in _DATASET_FIELD_SOURCES.items()
+    }
+    kwargs["blend"] = blend
+    kwargs["blend_per_split"] = blend_per_split
+    kwargs["sequences_per_dataset"] = sequences_per_dataset
+    if standalone:
+        kwargs.update(_container_written_fields_from_args(args))
+    if family == "fim":
+        kwargs.update(
+            fim_rate=args.fim_rate,
+            fim_spm_rate=args.fim_spm_rate,
+            fim_extra_tokens={
+                "prefix": args.fim_prefix_token,
+                "middle": args.fim_middle_token,
+                "suffix": args.fim_suffix_token,
+                "pad": args.fim_pad_token,
+                "eod": args.fim_eod_token,
+            },
+            fim_split_sample=args.fim_split_sample,
+            fim_fragment_rate=args.fim_fragment_rate,
+            fim_no_prefix=args.fim_no_prefix,
+        )
+        dataset = GPTFIMDatasetConfig(**kwargs)
+    else:
+        dataset = GPTDatasetConfig(**kwargs)
+    return DataConfig(
+        dataset=dataset, dataloader=dataloader_config_from_args(args), dataset_type=dataset_type
+    )
+
+
+def core_gpt_dataset_config_from_args(
+    args: Namespace, *, tokenizer: Any = None, dataset_type: type | None = None
+) -> GPTDatasetConfig:
+    """A standalone dataset config from the legacy arguments, with its tokenizer bound.
+
+    The call shape the GPT entry points had before ``cfg.data`` existed, kept for scripts that build
+    the dataset config outside the container (the providers build from ``cfg.data``): the section of
+    ``gpt_data_config_from_args(args, standalone=True)`` (the layout and validation fields and the
+    seed from ``args``), the dataset class pinned to ``dataset_type`` when given
+    (``tools/prepare_cache.py`` builds ``GPTDataset`` whatever the flags name), validated, then bound
+    to ``tokenizer``, else to the run's registered tokenizer, else to one built from ``args``
+    (Megatron Core's ``validate()`` runs then).
+    """
+    data = gpt_data_config_from_args(args, standalone=True)
+    if dataset_type is not None:
+        data.dataset_type = dataset_type
+    data.validate()
+    if tokenizer is None:
+        from megatron.training import global_vars
+
+        # The run's tokenizer when one is registered, as the entry points' own factories did
+        # since #8391; tools/prepare_cache.py registers none and builds one from the arguments.
+        tokenizer = global_vars._GLOBAL_TOKENIZER
+        if tokenizer is None:
+            tokenizer = build_tokenizer(args)
+    data.bind_tokenizer(tokenizer)
+    return data.dataset
+
+
+def dataloader_config_from_args(args: Namespace) -> DataloaderConfig:
+    """Loader settings from the legacy arguments (every entry point carries them)."""
+    return deepcopy(_default_config_from_args(DataloaderConfig, args))
+
+
+def pretrain_cfg_container_from_args(
+    args: Namespace, model_cfg=None, *, data_cfg: DataConfig | None = None
+) -> PretrainConfigContainer:
+    """Build a PretrainConfigContainer from the argparse arguments.
+
+    ``data_cfg`` is the ``data`` section; the GPT entry points pass
+    ``gpt_data_config_from_args(args)``. Without it the section carries the loader
+    settings only, for entry points whose datasets are built by their own callbacks (nothing
+    dataset-related is validated, bound or read for them).
+    """
     from megatron.training.training import get_megatron_ddp_config, get_megatron_optimizer_config
+
+    if data_cfg is None:
+        data_cfg = DataConfig(dataloader=dataloader_config_from_args(args))
 
     if model_cfg is None:
         model_cfg = model_config_from_args(args)
@@ -886,6 +1092,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         model=model_cfg,
         optimizer=optim_cfg,
         scheduler=_default_config_from_args(SchedulerConfig, args),
+        data=data_cfg,
         ddp=ddp_config,
         dist=deepcopy(_default_config_from_args(DistributedInitConfig, args)),
         rng=_default_config_from_args(RNGConfig, args),

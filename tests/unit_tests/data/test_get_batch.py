@@ -24,6 +24,7 @@ from megatron.core.utils import (
     _get_batch_on_this_cp_rank_per_sequence_balancing,
     flatten_batch_for_packed_sequences,
 )
+from megatron.training import global_vars
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -1724,10 +1725,11 @@ def test_packed_sequence_dataset_built_on_rank(
         mtp_num_layers=None,
     )
     vp_stages = [None] if vp_size is None else range(vp_size)
+    # Both scripts use the shared predicate, which reads the run's model config.
     with (
-        patch.object(script, "get_args", return_value=args),
+        patch.object(global_vars, "get_args", return_value=args),
         patch.object(
-            script,
+            global_vars,
             "get_run_config",
             return_value=SimpleNamespace(model=SimpleNamespace(transformer=config)),
         ),

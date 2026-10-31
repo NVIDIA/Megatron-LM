@@ -592,6 +592,8 @@ def test_training_batch_topology_uses_model_config(
     expected_batch,
 ):
     from examples.mimo.training.builder import MimoBuildConfig
+    from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
+    from megatron.training.config import DataConfig
 
     args = _runtime_args()
     args.world_size = args.mimo_llm_world_size = 999
@@ -612,6 +614,16 @@ def test_training_batch_topology_uses_model_config(
         seq_length=32,
         vocab_size=128,
         mimo_llm_world_size=mimo_llm_world_size,
+    )
+    run_config.data = DataConfig(
+        dataset_type=MockGPTDataset,
+        dataset=GPTDatasetConfig(
+            random_seed=1234,
+            sequence_length=32,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+        ),
     )
     microbatches = Mock()
     monkeypatch.setattr(global_vars, "init_num_microbatches_calculator", microbatches)
@@ -639,6 +651,11 @@ def test_training_batch_topology_uses_model_config(
     assert run_config.get_model_world_size() == (mimo_llm_world_size or world_size)
     assert run_config.get_data_parallel_size() == expected_dp
     assert run_config.get_batch_parallel_size() == expected_batch
+    assert run_config.data.dataset.data_parallel_size == expected_dp
+    assert (
+        run_config.data.dataset.context_parallel_size
+        == run_config.model.transformer.context_parallel_size
+    )
     assert microbatches.call_args.kwargs['data_parallel_size'] == expected_batch
     assert telemetry[0]['dl.data_parallel.size'] == expected_dp
     assert telemetry[0]['dl.tensor_parallel.size'] == 2
@@ -1270,6 +1287,9 @@ def test_dataset_helpers_use_registered_model(
 ):
     import importlib
 
+    from megatron.training.argument_utils import gpt_data_config_from_args
+    from megatron.training.datasets import providers
+
     entrypoint = importlib.import_module(module_name)
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
@@ -1295,14 +1315,13 @@ def test_dataset_helpers_use_registered_model(
     )
     cfg = run_config
     cfg.model = GPTModelConfig(transformer=transformer, seq_length=64)
+    cfg.train.micro_batch_size = 1
+    cfg.data = gpt_data_config_from_args(args)
     # TP=2, PP=3, CP=2 gives DP=2 independently of the stale CLI topology.
     monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 24)
     global_vars.set_args(args)
-    monkeypatch.setattr(entrypoint, "get_tokenizer", Mock())
-    monkeypatch.setattr(entrypoint, "get_blend_and_blend_per_split", lambda args: (None, None))
-    monkeypatch.setattr(entrypoint, "GPTDatasetConfig", SimpleNamespace)
-
-    dataset = entrypoint.core_gpt_dataset_config_from_args(args)
+    cfg.finalize()
+    dataset = cfg.data.dataset
     assert dataset.context_parallel_size == 2
     assert dataset.sequence_parallel_size == 2
     assert dataset.dynamic_context_parallel is (sequence_packing_scheduler == "default_dynamic_cp")
@@ -1314,11 +1333,13 @@ def test_dataset_helpers_use_registered_model(
     monkeypatch.setattr(
         entrypoint.mpu, "get_virtual_pipeline_model_parallel_world_size", lambda: None
     )
-    monkeypatch.setattr(entrypoint, "is_first_or_last_pipeline_stage", lambda stage: False)
+    monkeypatch.setattr(
+        "megatron.training.utils.is_first_or_last_pipeline_stage", lambda stage: False
+    )
     # MTP requires data here; packing also requires data on every pipeline stage.
     assert entrypoint.is_dataset_built_on_rank()
     assert entrypoint.is_dataset_built_on_rank(is_packed_sequence=True)
-    monkeypatch.setattr(entrypoint, "mtp_on_this_rank_func", lambda **kwargs: False)
+    monkeypatch.setattr(providers, "mtp_on_this_rank", lambda **kwargs: False)
     assert entrypoint.is_dataset_built_on_rank() is (sequence_packing_scheduler is not None)
     assert entrypoint.is_dataset_built_on_rank(is_packed_sequence=True)
     monkeypatch.setattr(entrypoint.mpu, "get_tensor_model_parallel_rank", lambda: 1)
