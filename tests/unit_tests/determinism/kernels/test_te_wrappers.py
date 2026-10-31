@@ -409,7 +409,7 @@ class TestTEWrappers:
             not _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR
             or not te_supports_batch_invariant_grouped_gemm()
         ):
-            pytest.skip("Requires TE grouped-tensor API, SM100, and cuBLASLt 13.5.1")
+            pytest.skip("Requires TE grouped-tensor API, SM100 or SM103, and cuBLASLt 13.5.1")
         monkeypatch.delenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", raising=False)
         calls = set()
         original_mm = grouped_linear.general_grouped_gemm_for_grouped_tensor
