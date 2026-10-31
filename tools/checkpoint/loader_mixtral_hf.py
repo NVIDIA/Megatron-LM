@@ -270,7 +270,7 @@ def _load_checkpoint(queue, args):
     md.seq_length = margs.seq_length
     md.num_attention_heads = margs.num_attention_heads
     md.max_position_embeddings = margs.max_position_embeddings
-    md.tokenizer_type = margs.tokenizer_type
+    md.tokenizer_type = cfg.tokenizer.tokenizer_type
     md.iteration = 1
     md.params_dtype = margs.params_dtype
     md.bert_binary_head = margs.bert_binary_head
@@ -282,7 +282,7 @@ def _load_checkpoint(queue, args):
     md.swiglu = margs.swiglu
     md.previous_tensor_parallel_size = margs.tensor_model_parallel_size
     md.previous_pipeline_parallel_size = margs.pipeline_model_parallel_size
-    md.true_vocab_size = margs.vocab_size # skips padding in saver
+    md.true_vocab_size = cfg.tokenizer.vocab_size  # Original HF vocabulary size.
     md.make_vocab_size_divisible_by = None
     md.checkpoint_args = margs
     md.consumed_train_samples = 0

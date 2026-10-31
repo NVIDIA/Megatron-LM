@@ -26,6 +26,16 @@ from examples.mimo.training.args import add_hetero_grid_args
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.transformer.enums import AttnBackend
 
+
+@pytest.fixture(autouse=True)
+def tokenizer_config(monkeypatch):
+    from examples.mimo.model_providers import nemotron_moe_vlm as provider
+
+    tokenizer = SimpleNamespace(padded_vocab_size=512, vocab_size=256)
+    monkeypatch.setattr(provider, "get_run_config", lambda: SimpleNamespace(tokenizer=tokenizer))
+    return tokenizer
+
+
 # (num_layers, hybrid_layer_pattern) is the ONLY architecture delta between the
 # 20L and 54L Nemotron presets; every other field is shared. num_layers follows
 # the pattern length (get_hybrid_total_layer_count): 20 and 54 layer-tokens.
@@ -483,6 +493,7 @@ def test_language_model_spec_builds_mamba():
     args.expert_tensor_parallel_num_weight_shards = args.mimo_llm_expt_tp
     spec = language_model_spec(args, pg_collection=None, llm_grid=None)
     assert spec.module is MambaModel
+    assert spec.params["vocab_size"] == 512
     assert spec.params["config"].num_layers == 20
     assert spec.params["config"].expert_model_parallel_size == 2
     assert spec.params["config"].expert_tensor_parallel_size == 2
