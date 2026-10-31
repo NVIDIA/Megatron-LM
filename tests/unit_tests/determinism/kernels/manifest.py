@@ -409,7 +409,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_moe_kernels.py",),
         kind="torch-op",
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
-        "virtual-expert routing metadata and probability gradients replay under stream contention.",
+        "virtual-expert routing metadata and probability gradients replay under stream contention; "
+        "HybridEP dispatch/combine on the static receive budget replays (EP=4), including the "
+        "CUDA-graph case that skips setup_metadata.",
     ),
     KernelEntry(
         name="moe_experts",
