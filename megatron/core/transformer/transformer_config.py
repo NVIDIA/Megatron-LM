@@ -902,6 +902,14 @@ class TransformerConfig(ModelParallelConfig):
     CUDA graphs are not supported. For the first MoE layer (no preceding layer), falls back to 
     standard routing."""
 
+    inference_shortcut_moe_overlap: bool = False
+    """Overlap Shortcut MoE routing, expert compute and communication with GDP or attention inference.
+    The unsplit predecessor and routed experts run independently until their
+    outputs join in prefill, mixed and decode batches. Requires BF16 inference-optimized
+    language layers, TP=CP=1, dynamic batching, vLLM expert GEMMs, and NVLS.
+    Serial inference and the existing training schedule remain the default.
+    """
+
     moe_shortcut_post_norm: bool = False
     """Apply the configured normalization to the combined routed and shared expert output.
     Requires moe_shortcut_connection = True."""
@@ -2663,6 +2671,36 @@ class TransformerConfig(ModelParallelConfig):
                 self.moe_flex_dispatcher_num_sms is None or self.moe_flex_dispatcher_num_sms > 0,
                 "moe_flex_dispatcher_num_sms>0",
             )
+
+        if self.inference_shortcut_moe_overlap and not self.moe_shortcut_connection:
+            raise ValueError("inference_shortcut_moe_overlap requires Shortcut MoE")
+
+        if self.inference_shortcut_moe_overlap:
+            if self.transformer_impl != "inference_optimized":
+                raise ValueError(
+                    "inference_shortcut_moe_overlap requires "
+                    "transformer_impl='inference_optimized' for the language model"
+                )
+            if self.params_dtype != torch.bfloat16 or self.fp8 or self.fp4:
+                raise ValueError("inference_shortcut_moe_overlap requires BF16 without FP8 or FP4")
+            if self.tensor_model_parallel_size != 1 or self.context_parallel_size != 1:
+                raise ValueError("inference_shortcut_moe_overlap requires TP=1 and CP=1")
+            if self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.VLLM:
+                raise ValueError("inference_shortcut_moe_overlap requires the vllm expert backend")
+            if self.inference_moe_token_dispatcher_type != "nvls":
+                raise ValueError("inference_shortcut_moe_overlap requires the NVLS dispatcher")
+            if self.inference_disable_triton_nvls_kernels:
+                raise ValueError("inference_shortcut_moe_overlap requires Triton NVLS kernels")
+            if self.fine_grained_activation_offloading:
+                raise ValueError(
+                    "inference_shortcut_moe_overlap requires "
+                    "fine_grained_activation_offloading=False"
+                )
+            if self.batch_invariant_mode or self.gdp_cutedsl_kernel:
+                raise ValueError(
+                    "inference_shortcut_moe_overlap does not support batch-invariant mode "
+                    "or CuTeDSL GDP kernels"
+                )
 
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:

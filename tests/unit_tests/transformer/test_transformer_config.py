@@ -1,13 +1,17 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import argparse
 from contextlib import nullcontext
+from copy import deepcopy
 
 import pytest
 import torch
 
 from megatron.core.activations import squared_relu
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
+from megatron.training.arguments import _add_inference_args, _add_network_size_args
 
 
 def _make_glu_interleave_config(**overrides):
@@ -714,3 +718,69 @@ def test_dynamic_cp_rejects_unsupported_config(overrides, message):
             sequence_packing_scheduler="default_dynamic_cp",
             **overrides,
         )
+
+
+def _make_transformer_config(**kwargs) -> TransformerConfig:
+    return TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4, **kwargs)
+
+
+def _make_shortcut_inference_overlap_config(**overrides) -> TransformerConfig:
+    settings = {
+        "num_layers": 2,
+        "hidden_size": 128,
+        "num_attention_heads": 4,
+        "num_moe_experts": 2,
+        "moe_router_topk": 1,
+        "moe_router_pre_softmax": True,
+        "moe_router_dtype": "fp32",
+        "moe_shortcut_connection": True,
+        "expert_tensor_parallel_size": 1,
+        "transformer_impl": "inference_optimized",
+        "normalization": "RMSNorm",
+        "add_bias_linear": False,
+        "params_dtype": torch.bfloat16,
+        "bf16": True,
+        "inference_grouped_gemm_backend": "vllm",
+        "inference_moe_token_dispatcher_type": "nvls",
+        "inference_shortcut_moe_overlap": True,
+    }
+    settings.update(overrides)
+    return TransformerConfig(**settings)
+
+
+def test_shortcut_inference_overlap_accepts_supported_config():
+    config = _make_shortcut_inference_overlap_config(
+        cuda_graph_impl="local", inference_cuda_graph_scope=InferenceCudaGraphScope.block
+    )
+    assert config.inference_shortcut_moe_overlap
+
+
+def test_shortcut_inference_overlap_is_cleared_from_vision_config():
+    from examples.mimo.model_providers.radio_encoder import _make_dense_non_hybrid
+
+    language_config = _make_shortcut_inference_overlap_config()
+    vision_config = deepcopy(language_config)
+    _make_dense_non_hybrid(vision_config)
+
+    assert language_config.inference_shortcut_moe_overlap
+    assert vision_config.inference_shortcut_moe_overlap is False
+    assert vision_config.moe_shortcut_connection is False
+
+
+def test_shortcut_inference_overlap_cli_has_only_production_controls():
+    config = _make_transformer_config()
+    assert config.inference_shortcut_moe_overlap is False
+
+    parser = argparse.ArgumentParser()
+    _add_network_size_args(parser)
+    _add_inference_args(parser)
+    required = ["--num-layers", "2", "--hidden-size", "128", "--num-attention-heads", "4"]
+    defaults = parser.parse_args(required)
+    enabled = parser.parse_args(required + ["--inference-shortcut-moe-overlap"])
+    disabled = parser.parse_args(
+        required + ["--inference-shortcut-moe-overlap", "--no-inference-shortcut-moe-overlap"]
+    )
+
+    assert defaults.inference_shortcut_moe_overlap is False
+    assert enabled.inference_shortcut_moe_overlap
+    assert disabled.inference_shortcut_moe_overlap is False
