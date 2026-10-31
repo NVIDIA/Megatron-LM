@@ -705,11 +705,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         schedule_policy = SchedulePolicy(
             forward_prefetch_size=ddp_config.suggested_communication_unit_size,
             backward_prefetch_size=ddp_config.suggested_communication_unit_size,
+            register_hooks=not config.overlap_moe_expert_parallel_comm,
         )
         common_fully_shard_kwargs = dict(
             mixed_precision_policy=self.mp_policy,
             schedule_policy=schedule_policy,
-            register_hooks=not config.overlap_moe_expert_parallel_comm,
             shard_layout=(
                 ShardLayout.PADDED
                 if ddp_config.megatron_fsdp_padded_shards
