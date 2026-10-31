@@ -661,7 +661,7 @@ The DP collective only covers the replicate axis; the gtp_remat axis is complete
 
 **Buffer caching.** The per-buffer lists are concatenated once at init into a single flat view for fast iteration in the grad-reduction hot path.
 
-> **Single distopt instance with GTP_remat.** GTP_remat currently requires `num_distributed_optimizer_instances == 1` (asserted in `parallel_state.py`): partial-distopt sharding of the data domain would need gtp_remat-aware sizing. The dist-opt grad-stats group is therefore the full world.
+> **Multiple distopt instances with GTP_remat/EGTP_remat.** The instance count must divide the dense DP degree *after* TP, CP, PP, and GTP_remat have been factored out, and the expert DP degree after ETP, EP, PP, and EGTP_remat have been factored out. Each instance then contains complete CP and GTP_remat model partitions. DDP reduces gradient shards within an instance and all-reduces corresponding shards across instances; GTP_remat/EGTP_remat complete their separate reductions as above. Gradient statistics cover every model shard in one instance, excluding the duplicate optimizer copies in other instances. For the built-in rank orders, these divisibility conditions make the dense and expert inter-instance peers coincide.
 
 ### 3.3 Distributed checkpointing (DCP)
 

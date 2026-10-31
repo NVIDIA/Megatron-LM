@@ -853,14 +853,6 @@ def initialize_model_parallel(
         local_world_size if local_world_size is not None else torch.distributed.get_world_size()
     )
 
-    # GTP_remat requires a single distributed-optimizer instance: partial-distopt sharding of the
-    # data domain would need gtp_remat-aware sizing. Assert early so all group builds below can
-    # assume one instance when GTP_remat/EGTP is active.
-    assert not (
-        (gtp_remat_size > 1 or expert_gtp_remat_size > 1)
-        and num_distributed_optimizer_instances > 1
-    ), "GTP_remat with num_distributed_optimizer_instances > 1 is not yet supported."
-
     # Resolve weight placement separately from token ownership. Only bootstrap sees
     # the shared CP/GTP factors; downstream consumers receive concrete groups.
     layout = None
@@ -986,6 +978,30 @@ def initialize_model_parallel(
         f"but got {token_rank_generator.get_ranks('pp')} "
         f"and {expert_decoder_rank_generator.get_ranks('pp')}"
     )
+
+    optimizer_instance_ids = None
+    if (
+        gtp_remat_size > 1 or expert_gtp_remat_size > 1
+    ) and num_distributed_optimizer_instances > 1:
+        # Each instance must contain complete CP and GTP model partitions. Dividing only
+        # the dense weight-replica count (DP x CP) could instead split CP, causing the
+        # expert-derived inter-instance group to pair different GTP weight shards.
+        if data_parallel_size % num_distributed_optimizer_instances:
+            raise ValueError(
+                "GTP with multiple distributed optimizer instances requires the number of "
+                "instances to divide the dense data-parallel size (excluding CP and GTP)"
+            )
+        if expert_data_parallel_size % num_distributed_optimizer_instances:
+            raise ValueError(
+                "GTP with multiple distributed optimizer instances requires the number of "
+                "instances to divide the expert data-parallel size (excluding ETP, EP, PP, and EGTP)"
+            )
+        # Use the dense layout to group one copy of the optimizer state for gradient statistics.
+        optimizer_instance_ids = {}
+        for ranks in weight_replica_rank_sets:
+            local_size = len(ranks) // num_distributed_optimizer_instances
+            for index, peer in enumerate(ranks):
+                optimizer_instance_ids[peer] = index // local_size
 
     timeout = timedelta(minutes=distributed_timeout_minutes)
 
@@ -1254,11 +1270,23 @@ def initialize_model_parallel(
             if rank in dp_cp_ranks:
                 _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = group
 
-        # GTP_remat requires a single distributed-optimizer instance (asserted above), so the
-        # per-instance partial full group is just the full group.
-        _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = (
-            _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT
-        )
+            if optimizer_instance_ids is not None:
+                for instance_id in range(num_distributed_optimizer_instances):
+                    instance_ranks = [
+                        r for r in dp_cp_ranks if optimizer_instance_ids[r] == instance_id
+                    ]
+                    instance_group = create_group(
+                        instance_ranks,
+                        timeout=timeout,
+                        pg_options=get_nccl_options("intra_gtp_remat_dp_cp", nccl_comm_cfgs),
+                        group_desc="INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT",
+                    )
+                    if rank in instance_ranks:
+                        _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = instance_group
+        if optimizer_instance_ids is None:
+            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = (
+                _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT
+            )
     else:
         # GTP_remat inactive: the full data-distribution groups coincide with the defaults.
         _DATA_PARALLEL_GROUP_WITH_GTP_REMAT = _DATA_PARALLEL_GROUP
@@ -1681,9 +1709,23 @@ def initialize_model_parallel(
             )
             if rank in dp_ranks:
                 _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = group
-        _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = (
-            _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT
-        )
+            if optimizer_instance_ids is not None:
+                for instance_id in range(num_distributed_optimizer_instances):
+                    instance_ranks = [
+                        r for r in dp_ranks if optimizer_instance_ids[r] == instance_id
+                    ]
+                    instance_group = create_group(
+                        instance_ranks,
+                        timeout=timeout,
+                        pg_options=get_nccl_options("intra_ep_gtp_remat_dp", nccl_comm_cfgs),
+                        group_desc="INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT",
+                    )
+                    if rank in instance_ranks:
+                        _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = instance_group
+        if optimizer_instance_ids is None:
+            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = (
+                _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT
+            )
     else:
         _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = _EXPERT_DATA_PARALLEL_GROUP
         _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = (
@@ -1699,23 +1741,27 @@ def initialize_model_parallel(
     ), "Intra distributed optimizer instance group is already initialized"
 
     if gtp_remat_size > 1 or expert_gtp_remat_size > 1:
-        # GTP_remat requires num_distributed_optimizer_instances == 1 (asserted above); dist-opt
-        # grad-stats group (used only for grad-norm + num_zeros reductions) must span the ENTIRE
-        # world. The per-instance accumulation below would NOT: gtp/egtp are factored out of
-        # expert_data_parallel_size (via expert_gtp_remat_size), so expert-generator groups omit
-        # gtp/egtp axes — under-counting the grad-norm for gtp/egtp-sharded params. Build one
-        # full-world group from all tp-ep-pp groups instead (get_ranks already applies rank_offset).
+        # Gradient statistics need every model shard, including GTP and EGTP, but exactly
+        # one copy of the optimizer state. The expert generator's ordinary per-instance
+        # groups omit the remat axes, so collect all ranks assigned to each instance.
         all_ranks = sorted(
             r for ranks in expert_decoder_rank_generator.get_ranks('tp-ep-pp') for r in ranks
         )
-        intra_dist_opt_instance_group = create_group(
-            all_ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("intra_dist_opt_instance", nccl_comm_cfgs),
-            group_desc="INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP",
-        )
-        if rank in all_ranks:
-            _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = intra_dist_opt_instance_group
+        for instance_id in range(num_distributed_optimizer_instances):
+            instance_ranks = (
+                all_ranks
+                if optimizer_instance_ids is None
+                else [r for r in all_ranks if optimizer_instance_ids[r] == instance_id]
+            )
+            assert len(instance_ranks) == len(all_ranks) // num_distributed_optimizer_instances
+            instance_group = create_group(
+                instance_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("intra_dist_opt_instance", nccl_comm_cfgs),
+                group_desc="INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP",
+            )
+            if rank in instance_ranks:
+                _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = instance_group
     else:
         model_parallel_group_id = 0
         intra_dist_opt_ranks = []
