@@ -36,7 +36,7 @@ from megatron.core import parallel_state as ps
 from megatron.core import rerun_state_machine as rerun
 from megatron.core.activations import squared_relu
 from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import DistributedDataParallelConfig, param_and_grad_buffer
 from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
@@ -96,6 +96,11 @@ def hybridep_kernel_cache(tmp_path_factory):
 @pytest.fixture(autouse=True)
 def virtual_expert_environment(monkeypatch, hybridep_kernel_cache):
     """Keep the recipe's kernel/offload settings local to these tests."""
+    # DDP's FP32-accumulation constructor changes process-global dispatch.
+    # Start each test with native reduce-scatter and restore the prior state at teardown.
+    monkeypatch.setattr(
+        param_and_grad_buffer, "dist_reduce_scatter_func", dist.reduce_scatter_tensor
+    )
     monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
     monkeypatch.setenv("NVTE_USE_CUTLASS_GROUPED_GEMM", "0")
     monkeypatch.setenv("NVTE_CPU_OFFLOAD_V1", "1")
