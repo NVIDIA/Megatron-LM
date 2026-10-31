@@ -73,7 +73,8 @@ def test_serving_and_rl_build_shard_models_with_global_parallel_args(monkeypatch
             args,
             ModelType.encoder_or_decoder,
             training_config.transformer,
-            cfg_container=SimpleNamespace(model=training_config, rl=RLConfig()),
+            rl_config=RLConfig(),
+            model_config=training_config,
             model_alloc_ctx=nullcontext(),
         )[0]
         for model in (serving, rl):
@@ -94,30 +95,17 @@ def test_serving_and_rl_build_shard_models_with_global_parallel_args(monkeypatch
         Utils.destroy_model_parallel()
 
 
-@pytest.mark.parametrize(
-    "field",
-    [
-        "rl_inference_tensor_model_parallel_size",
-        "rl_inference_pipeline_model_parallel_size",
-        "rl_inference_expert_model_parallel_size",
-        "rl_inference_expert_tensor_model_parallel_size",
-        "rl_verify_model_weights_swap",
-        "refit_method",
-    ],
-)
+@pytest.mark.parametrize("field", ["rl_verify_model_weights_swap", "refit_method"])
 def test_disagg_rl_rejects_ignored_overrides(field):
+    """The parallelism overrides are rejected when the deployment is composed
+    (tests/unit_tests/rl/test_rollout_inference_config.py); the refit settings here."""
     from megatron.rl.inference.disagg import build_disagg_inference_model
 
     config = RLConfig()
-    value = (
-        "nixl"
-        if field == "refit_method"
-        else True if field == "rl_verify_model_weights_swap" else 1
-    )
-    setattr(config, field, value)
+    setattr(config, field, "nixl" if field == "refit_method" else True)
     with pytest.raises(ValueError, match=field.replace("_", "-")):
         build_disagg_inference_model(
-            None, None, None, cfg_container=SimpleNamespace(rl=config), model_alloc_ctx=None
+            None, None, None, rl_config=config, model_config=None, model_alloc_ctx=None
         )
 
 

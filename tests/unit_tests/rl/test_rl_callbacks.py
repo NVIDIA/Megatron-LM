@@ -140,8 +140,9 @@ def test_maybe_initialize_rl_profiler(monkeypatch):
     )
 
 
-def test_checkpoint_callback(monkeypatch):
-    """on_checkpoint_saved compacts the rollout bank at the durable iteration."""
+def test_checkpoint_callback_compacts_the_bank(monkeypatch):
+    """on_checkpoint_saved compacts the rollout bank at the durable iteration; the run's record is
+    written by save_checkpoint from the registered RL run config, not by the callback."""
     compacted = []
     monkeypatch.setattr(rl_utils, "maybe_compact_rollout_bank", compacted.append)
     RLCheckpointCallback().on_checkpoint_saved(CallbackContext(model=None, durable_iteration=40))

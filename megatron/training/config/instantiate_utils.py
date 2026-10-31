@@ -87,6 +87,7 @@ class _Keys(str, Enum):
 _DEFAULT_ALLOWED_PREFIXES: tuple[str, ...] = (
     "megatron.training.",
     "megatron.core.",
+    "megatron.rl.",
     "torch.",
     "transformers.",
     "signal.",

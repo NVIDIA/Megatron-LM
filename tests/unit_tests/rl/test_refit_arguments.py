@@ -2,11 +2,11 @@
 
 from argparse import ArgumentParser
 
-from megatron.training.arguments import _add_rl_args
+from megatron.rl.config import add_rl_args
 
 
 def test_refit_execution_batch_bytes_argument():
-    parser = _add_rl_args(ArgumentParser())
+    parser = add_rl_args(ArgumentParser())
 
     assert parser.parse_args([]).refit_execution_batch_bytes is None
     assert (

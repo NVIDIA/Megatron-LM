@@ -19,20 +19,19 @@ from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopySer
 from megatron.core.resharding.copy_services.nccl_m2n_copy_service import NCCLM2NCopyService
 from megatron.core.resharding.copy_services.nvshmem_copy_service import NVSHMEMCopyService
 from megatron.core.resharding.refit import swap_model_weights
+from megatron.rl.config import add_rl_args, rl_run_config_container_from_args
 from megatron.training import get_args
 from megatron.training import get_model as get_training_model
 from megatron.training import print_rank_0
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.global_vars import (
-    get_run_config,
-    set_run_config,
-)
+from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.initialize import initialize_megatron
-
+from megatron.training.utils import is_hybrid_model
 
 def add_benchmark_args(parser):
-    """Add benchmark-specific arguments."""
+    """Add the RL section and the benchmark arguments."""
+    add_rl_args(parser)
     group = parser.add_argument_group(title='refit benchmark')
 
     group.add_argument(
@@ -167,6 +166,7 @@ def print_results(timings):
     if torch.distributed.get_rank() == 0:
         args = get_args()
         cfg = get_run_config()
+        destination = cfg.inference.model.transformer
         mean_time = sum(timings) / len(timings)
         min_time = min(timings)
         max_time = max(timings)
@@ -177,8 +177,8 @@ def print_results(timings):
             'world_size': torch.distributed.get_world_size(),
             'source_tp': args.tensor_model_parallel_size,
             'source_pp': args.pipeline_model_parallel_size,
-            'destination_tp': cfg.rl.rl_inference_tensor_model_parallel_size,
-            'destination_pp': cfg.rl.rl_inference_pipeline_model_parallel_size,
+            'destination_tp': destination.tensor_model_parallel_size,
+            'destination_pp': destination.pipeline_model_parallel_size,
             'num_layers': args.num_layers,
             'hidden_size': args.hidden_size,
             'sequence_length': args.seq_length,
@@ -211,6 +211,7 @@ def benchmark_collocated():
     """Benchmark refit in collocated mode (both models on same GPUs)."""
     args = get_args()
     cfg = get_run_config()
+    destination = cfg.inference.model.transformer
     world_size = torch.distributed.get_world_size()
 
     # Calculate parallelism
@@ -220,9 +221,9 @@ def benchmark_collocated():
     src_world = src_tp * src_pp * src_ep
     src_dp = world_size // src_world
 
-    dst_tp = cfg.rl.rl_inference_tensor_model_parallel_size or src_tp
-    dst_pp = cfg.rl.rl_inference_pipeline_model_parallel_size or src_pp
-    dst_ep = cfg.rl.rl_inference_expert_model_parallel_size or src_ep
+    dst_tp = destination.tensor_model_parallel_size
+    dst_pp = destination.pipeline_model_parallel_size
+    dst_ep = destination.expert_model_parallel_size
     dst_world = dst_tp * dst_pp * dst_ep
     dst_dp = world_size // dst_world
 
@@ -248,7 +249,7 @@ def benchmark_collocated():
         tp_size=dst_tp,
         pp_size=dst_pp,
         ep_size=dst_ep,
-        expt_tp_size=cfg.rl.rl_inference_expert_tensor_model_parallel_size,
+        expt_tp_size=destination.expert_tensor_parallel_size,
         use_tp_pp_dp_mapping=cfg.dist.use_tp_pp_dp_mapping,
     )
 
@@ -257,8 +258,7 @@ def benchmark_collocated():
         dst_config.expert_model_parallel_size = dst_ep
     dst_config.tensor_model_parallel_size = dst_tp
     dst_config.pipeline_model_parallel_size = dst_pp
-    if cfg.rl.rl_inference_expert_tensor_model_parallel_size:
-        dst_config.expert_tensor_parallel_size = cfg.rl.rl_inference_expert_tensor_model_parallel_size
+    dst_config.expert_tensor_parallel_size = destination.expert_tensor_parallel_size
 
     dst_model = get_training_model(
         lambda pre_process, post_process, **kwargs: model_provider(
@@ -299,6 +299,7 @@ def benchmark_non_collocated():
     """Benchmark refit in non-collocated mode (separate GPU sets)."""
     args = get_args()
     cfg = get_run_config()
+    destination = cfg.inference.model.transformer
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
 
@@ -308,9 +309,9 @@ def benchmark_non_collocated():
     src_ep = args.expert_model_parallel_size
     src_world = src_tp * src_pp * src_ep
 
-    dst_tp = cfg.rl.rl_inference_tensor_model_parallel_size or src_tp
-    dst_pp = cfg.rl.rl_inference_pipeline_model_parallel_size or src_pp
-    dst_ep = cfg.rl.rl_inference_expert_model_parallel_size or src_ep
+    dst_tp = destination.tensor_model_parallel_size
+    dst_pp = destination.pipeline_model_parallel_size
+    dst_ep = destination.expert_model_parallel_size
     dst_world = dst_tp * dst_pp * dst_ep
 
     required_size = src_world + dst_world
@@ -324,7 +325,6 @@ def benchmark_non_collocated():
 
     # Determine rank roles
     is_src_rank = rank < src_world
-    is_dst_rank = src_world <= rank < required_size
     is_idle_rank = rank >= required_size
 
     # Print config
@@ -341,7 +341,7 @@ def benchmark_non_collocated():
         tp_size=dst_tp,
         pp_size=dst_pp,
         ep_size=dst_ep,
-        expt_tp_size=cfg.rl.rl_inference_expert_tensor_model_parallel_size,
+        expt_tp_size=destination.expert_tensor_parallel_size,
         use_tp_pp_dp_mapping=cfg.dist.use_tp_pp_dp_mapping,
         rank_offset=src_world,
     )
@@ -370,8 +370,7 @@ def benchmark_non_collocated():
             dst_config.expert_model_parallel_size = dst_ep
         dst_config.tensor_model_parallel_size = dst_tp
         dst_config.pipeline_model_parallel_size = dst_pp
-        if cfg.rl.rl_inference_expert_tensor_model_parallel_size:
-            dst_config.expert_tensor_parallel_size = cfg.rl.rl_inference_expert_tensor_model_parallel_size
+        dst_config.expert_tensor_parallel_size = destination.expert_tensor_parallel_size
 
         dst_model = get_training_model(
             lambda pre_process, post_process, **kwargs: model_provider(
@@ -422,9 +421,12 @@ def main():
         },
         ignore_unknown_args=False,
     )
-    # The RL section is read from the run config, like the training loop does; the benchmark
-    # builds its models from a provider, so the container carries no model config.
-    set_run_config(pretrain_cfg_container_from_args(args))
+    # The RL run config, composed as train_rl.py composes it:
+    # the pretrain sections (the benchmark builds its models so they carry no model config),
+    # the destination deployment described like the RL loop's rollout engine, and the RL section.
+    model_cfg = hybrid_config_from_args(args) if is_hybrid_model(args) else gpt_config_from_args(args)
+    rl_run_config = rl_run_config_container_from_args(args, rollout_model_cfg=model_cfg)
+    set_run_config(rl_run_config)
     # This synthetic benchmark does not construct datasets, so it does not
     # require the native dataset index helper.
     initialize_megatron(training=True, skip_dependency_compilation=True)
