@@ -100,6 +100,7 @@ class TextGenerationControllerTestBase:
         transformer_impl: str = None,
         position_embedding_type: str = None,
         mtp_use_repeated_layer: bool = False,
+        vocab_size: int = 100,
     ):
         # When transformer_impl == "inference_optimized" the model is built with the
         # NVLS symmetric-memory inference linears (RMSNorm, no bias, flash attention);
@@ -119,7 +120,7 @@ class TextGenerationControllerTestBase:
             model_parallel_cuda_manual_seed(123, inference_rng_tracker=True)
         self.batch_size = batch_size
         self.hidden_size = 32
-        self.vocab_size = 100
+        self.vocab_size = vocab_size
         self.sequence_length = 60 if fp8 else 64  # Test padding for fp8
         transformer_config = TransformerConfig(
             num_layers=4,
@@ -250,6 +251,40 @@ class TextGenerationControllerTestBase:
         # Mirror what StaticInferenceEngine/DynamicInferenceEngine do at engine start:
         # the model is being driven by an inference workload, so InferenceMode is active.
         InferenceMode.set_active()
+
+    def _generate_dynamic(self, num_tokens_to_generate=8, prompt_seed=1234):
+        """Run `batch_size` seeded prompts through dynamic generation to completion;
+        returns the sampled tokens of every step."""
+        self.mock_tokenizer.vocab_size = self.vocab_size
+        self.mock_tokenizer.eod = self.vocab_size - 1
+        self.mock_tokenizer.detokenize.side_effect = lambda x, skip_special_tokens=False: ' '.join(
+            [
+                ''.join(random.choices(string.ascii_letters, k=random.randint(4, 10)))
+                for _ in range(len(x))
+            ]
+        )
+        self.mock_tokenizer.offsets.side_effect = lambda _, s: [
+            i for i, c in enumerate(s) if c == ' '
+        ] + [len(s)]
+        context = self.text_generation_controller.inference_wrapped_model.inference_context
+        for request_id in range(self.batch_size):
+            generator = torch.Generator().manual_seed(prompt_seed + request_id)
+            context.add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=torch.randint(
+                        0, self.vocab_size - 1, (7 + request_id,), generator=generator
+                    ).to(torch.cuda.current_device()),
+                    sampling_params=SamplingParams(
+                        top_k=10, num_tokens_to_generate=num_tokens_to_generate
+                    ),
+                )
+            )
+        sampled_per_step = []
+        while context.has_unfinished_requests():
+            result = self.text_generation_controller.generate_output_tokens_dynamic_batch()
+            sampled_per_step.append(result["sample"].tolist())
+        return sampled_per_step
 
 
 def _make_async_sched_context(total_request_count=2, paused_request_count=0):
@@ -4248,52 +4283,138 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
         InferenceMode.unset_active()
         Utils.destroy_model_parallel()
 
-    def setup_model(
-        self,
-        dtype,
-        symmetric_ar_type=None,
-        fp8: bool = False,
-        tensor_model_parallel_size: int = 2,
-        pipeline_model_parallel_size: int = 1,
-        batch_size: int = 4,
-        static: bool = True,
-        use_training_random_init: bool = False,
-        materialize_only_last_token_logits: bool = False,
-        num_speculative_tokens: int = 0,
-        block_size_tokens: int = 256,
-        enable_prefix_caching: bool = False,
-        max_requests: int = None,
-        mtp_num_layers: int = 0,
-        sequence_parallel: bool = False,
-        expert_model_parallel_size: int = 1,
-        num_moe_experts: int = None,
-        hybrid_layer_pattern: str = None,
-    ):
+    def setup_model(self, dtype, **kwargs):
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tensor_model_parallel_size,
-            pipeline_model_parallel_size=pipeline_model_parallel_size,
-            expert_model_parallel_size=expert_model_parallel_size,
+            tensor_model_parallel_size=kwargs.get("tensor_model_parallel_size", 2),
+            pipeline_model_parallel_size=kwargs.get("pipeline_model_parallel_size", 1),
+            expert_model_parallel_size=kwargs.get("expert_model_parallel_size", 1),
         )
-        super().setup_model(
-            dtype,
-            symmetric_ar_type=symmetric_ar_type,
-            fp8=fp8,
-            tensor_model_parallel_size=tensor_model_parallel_size,
-            pipeline_model_parallel_size=pipeline_model_parallel_size,
-            batch_size=batch_size,
-            static=static,
-            use_training_random_init=use_training_random_init,
-            materialize_only_last_token_logits=materialize_only_last_token_logits,
-            num_speculative_tokens=num_speculative_tokens,
-            block_size_tokens=block_size_tokens,
-            enable_prefix_caching=enable_prefix_caching,
-            max_requests=max_requests,
-            mtp_num_layers=mtp_num_layers,
-            sequence_parallel=sequence_parallel,
-            expert_model_parallel_size=expert_model_parallel_size,
-            num_moe_experts=num_moe_experts,
-            hybrid_layer_pattern=hybrid_layer_pattern,
+        super().setup_model(dtype, **kwargs)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        "tp_size, pp_size", [(1, 1), (1, 2), (2, 1)], ids=["tp1-pp1", "tp1-pp2", "tp2-pp1"]
+    )
+    def test_logits_are_fp32(self, tp_size, pp_size):
+        """Inference holds logits in fp32: the CUDA-graph buffer is allocated in it and at PP 2
+        the first stage receives the broadcast in it. The bf16 head emits fp32 directly when TE
+        general_gemm is available and upcasts otherwise. With the buffer the model writes each
+        step's logits into it inside the forward and the controller asserts the identity every
+        step; without it there is none. Generation with and without the buffer samples the same
+        tokens (both run the same eager kernels here).
+        """
+        generated = {}
+        for cuda_graph_impl in ("none", "local"):
+            if generated:
+                self.teardown_method(None)
+            self.setup_model(
+                torch.bfloat16,
+                tensor_model_parallel_size=tp_size,
+                pipeline_model_parallel_size=pp_size,
+                static=False,
+                use_training_random_init=True,
+                cuda_graph_impl=cuda_graph_impl,
+            )
+            controller = self.text_generation_controller
+            context = controller.inference_wrapped_model.inference_context
+            if cuda_graph_impl == "local":
+                assert context.logits_output_buffer is controller._all_logits_cuda
+                assert controller._all_logits_cuda.shape[-1] == self.vocab_size
+            else:
+                assert context.logits_output_buffer is None
+                assert controller._all_logits_cuda is None
+            generated[cuda_graph_impl] = self._generate_dynamic()
+            assert controller._all_logits_cuda.dtype is torch.float32
+        assert generated["none"] == generated["local"]
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="multimem collectives need CUDA")
+    def test_multimem_all_gather_last_dim_layout(self):
+        """`multimem_all_gather(last_dim_width=...)` lands each rank's shard in its column
+        block of the output; the default layout still concatenates along dim 0."""
+        from megatron.core.inference.communication.torch_symm_triton import (
+            is_device_nvls_capable,
+            multimem_all_gather,
         )
+        from megatron.core.inference.symmetric_memory import (
+            HAVE_TORCH_SYMM_MEM,
+            HAVE_TRITON,
+            SymmetricMemoryManager,
+        )
+
+        if not (
+            HAVE_TORCH_SYMM_MEM and HAVE_TRITON and is_device_nvls_capable(torch.device("cuda"))
+        ):
+            pytest.skip("NVLS symmetric memory unavailable on this platform")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        rank, world_size = tp_group.rank(), tp_group.size()
+        rows, width = 5, 64  # bf16: 128-byte shard rows, 16-byte divisible
+        arena = SymmetricMemoryManager.get_buffer("test_logits", process_group=tp_group, size_mb=1)
+        allocation = arena.maybe_get_tensor([rows, world_size * width], torch.bfloat16)
+        if allocation["tensor"] is None:
+            pytest.skip("symmetric memory unavailable on this platform")
+        output, handle = allocation["tensor"], allocation["handle"]
+        shards = [
+            (torch.arange(rows * width, device="cuda").reshape(rows, width) + 1000 * r).to(
+                torch.bfloat16
+            )
+            for r in range(world_size)
+        ]
+        try:
+            multimem_all_gather(
+                output, shards[rank], handle, barrier_before=True, last_dim_width=width
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(output, torch.cat(shards, dim=-1))
+            flat = output.view(world_size * rows, width)
+            multimem_all_gather(flat, shards[rank], handle, barrier_before=True)
+            torch.cuda.synchronize()
+            assert torch.equal(flat, torch.cat(shards, dim=0))
+        finally:
+            SymmetricMemoryManager.destroy("test_logits")
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_logits_buffer_multicast_gather_matches_gathered_generation_tp2(self):
+        """With the logits buffer in symmetric memory each rank multicast-stores its shard
+        straight into its column block, zero copies at TP 2, and generation matches the
+        no-buffer run token for token (both run the same eager kernels here). The vocab is
+        128 so an fp32 shard row (64 values) is 16-byte divisible as the store requires.
+        Skips only where NVLS symmetric memory is unavailable.
+        """
+        from megatron.core.inference.communication.torch_symm_triton import is_device_nvls_capable
+        from megatron.core.inference.symmetric_memory import HAVE_TORCH_SYMM_MEM, HAVE_TRITON
+
+        generated = {}
+        for cuda_graph_impl in ("none", "local"):
+            if generated:
+                self.teardown_method(None)
+            self.setup_model(
+                torch.bfloat16,
+                tensor_model_parallel_size=2,
+                pipeline_model_parallel_size=1,
+                static=False,
+                use_training_random_init=True,
+                cuda_graph_impl=cuda_graph_impl,
+                vocab_size=128,
+            )
+            context = self.text_generation_controller.inference_wrapped_model.inference_context
+            if cuda_graph_impl == "local" and context.logits_buffer_multicast_handle is None:
+                nvls_available = (
+                    HAVE_TORCH_SYMM_MEM
+                    and HAVE_TRITON
+                    and is_device_nvls_capable(torch.device(torch.cuda.current_device()))
+                )
+                assert not nvls_available, "NVLS is available but no symmetric buffer"
+                pytest.skip("NVLS symmetric memory unavailable on this platform")
+            generated[cuda_graph_impl] = self._generate_dynamic()
+        assert generated["none"] == generated["local"]
 
     @pytest.mark.parametrize("static", [True, False])
     @pytest.mark.parametrize("tp_size", [1, 2])

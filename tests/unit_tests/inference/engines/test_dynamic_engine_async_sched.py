@@ -1634,7 +1634,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "last-logits" in signals:
             assert context.config.materialize_only_last_token_logits
             assert runtime["last-logits-forward"] == runtime["model-forward"]
-            assert runtime["logits-dtype:torch.bfloat16"] > 0
+            assert runtime["logits-dtype:torch.float32"] > 0
         if "events" in signals:
             for request in env.requests:
                 event_types = [event.type for event in request.events]
