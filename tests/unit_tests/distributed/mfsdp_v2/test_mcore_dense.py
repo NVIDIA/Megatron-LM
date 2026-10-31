@@ -8,6 +8,8 @@ import pytest
 import torch
 import transformer_engine.pytorch as te
 from torch.distributed.tensor import DTensor
+from transformer_engine.common.recipe import MXFP8BlockScaling
+from transformer_engine.pytorch.distributed import checkpoint as te_checkpoint
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
@@ -16,6 +18,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataPa
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     fully_shard_context,
+    fully_shard_optimizer,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import ShardLayout
@@ -26,7 +29,10 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import (
+    CheckpointWithoutOutput,
+    model_parallel_cuda_manual_seed,
+)
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -101,6 +107,98 @@ def test_mxfp8_parameters(process_group_collection):
             for parameter in group.fsdp_parameters:
                 parameters.append(parameter.unsharded)
     assert any(isinstance(p, MXFP8Tensor) for p in parameters)
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] < 10,
+    reason="MXFP8 requires Blackwell-or-newer CUDA hardware.",
+)
+@pytest.mark.parametrize("recompute_granularity", ["selective", "full"])
+def test_mxfp8_recompute_inside_unit_matches_no_recompute(
+    process_group_collection, distributed_setup, recompute_granularity
+):
+    """Recomputing a root-owned projection preserves losses, gradients and updates."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("Sharded MXFP8 recomputation requires at least two ranks.")
+    device = distributed_setup.device
+    recipe = MXFP8BlockScaling()
+
+    class Projection(torch.nn.Module):
+        """Checkpoint a child projection without re-entering the root FSDP unit."""
+
+        def __init__(self, recompute):
+            super().__init__()
+            self.recompute = recompute
+            self.proj = te.Linear(128, 128, params_dtype=torch.bfloat16, device=device)
+            self.output = te.Linear(128, 128, params_dtype=torch.bfloat16, device=device)
+
+        def forward(self, value):
+            """Exercise selective output-discard and full checkpoint rebuilds."""
+            checkpoint = None
+            if self.recompute == "selective":
+                checkpoint = CheckpointWithoutOutput()
+                hidden = checkpoint.checkpoint(self.proj, value)
+            elif self.recompute == "full":
+                hidden = te_checkpoint(self.proj, value, use_reentrant=True)
+            else:
+                hidden = self.proj(value)
+            output = self.output(torch.nn.functional.gelu(hidden))
+            if checkpoint is not None:
+                checkpoint.discard_output_and_register_recompute(output)
+            return output
+
+    def train(recompute):
+        """Run three updates through the adapter and retain local training state."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+            fp8_param=True,
+            gradient_accumulation_fusion=False,
+            recompute_granularity=recompute,
+            recompute_method="uniform" if recompute == "full" else None,
+            recompute_num_layers=1 if recompute == "full" else None,
+        )
+        torch.manual_seed(2026)
+        with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
+            module = Projection(recompute)
+        wrapped = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                fp8_param_gather=True,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=module,
+            pg_collection=process_group_collection,
+        )
+        optimizer = torch.optim.SGD(wrapped.parameters(), lr=0.01)
+        fully_shard_optimizer(optimizer)
+        losses, gradients, weights = [], [], []
+        for step in range(3):
+            optimizer.zero_grad(set_to_none=True)
+            torch.manual_seed(4321 + distributed_setup.rank + step)
+            value = torch.randn(32, 128, device=device, dtype=torch.bfloat16, requires_grad=True)
+            with te.autocast(recipe=recipe):
+                output = wrapped(value)
+            loss = output.float().square().mean()
+            loss.backward()
+            wrapped.finish_grad_sync()
+            losses.append(loss.detach())
+            gradients.append([p.grad.to_local().clone() for p in wrapped.parameters()])
+            optimizer.step()
+            weights.append([p.to_local().clone() for p in wrapped.parameters()])
+        return losses, gradients, weights
+
+    expected = train(None)
+    actual = train(recompute_granularity)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(process_group_collection):
