@@ -1777,13 +1777,14 @@ class TransformerConfig(ModelParallelConfig):
         if self.linear_cp_mode == "chunkwise" and self.linear_cp_layout != "contiguous":
             raise ValueError("linear_cp_mode='chunkwise' requires linear_cp_layout='contiguous'.")
         if (
-            self.context_parallel_size > 1
-            and self.attention_cp_layout == "contiguous"
+            self.attention_cp_layout == "contiguous"
             and self.experimental_attention_variant != "dsv4_hybrid"
-        ):
-            raise ValueError(
-                "attention_cp_layout='contiguous' is not yet supported with context parallelism."
+            and (
+                self.dynamic_context_parallel
+                or (self.context_parallel_size > 1 and self.sequence_packing_scheduler is not None)
             )
+        ):
+            raise ValueError("Contiguous attention CP does not support dynamic CP.")
         if (
             self.context_parallel_size > 1
             and self.linear_cp_layout != self.attention_cp_layout
