@@ -1703,6 +1703,18 @@ class InferenceGroupedMLP(TEGroupedMLP):
         prepare_routed_nvfp4_weights(self._fc1_weight, self._fc2_weight, out=self._nvfp4_weights)
         return True
 
+    def refresh_cache(self) -> None:
+        """Requantize the per-token NVFP4 expert weights after a refit.
+
+        Refit writes the BF16 stacks, so without this the NVFP4 kernel keeps
+        serving the weights quantized at the first forward.
+        """
+        super().refresh_cache()
+        if self.refresh_flashinfer_nvfp4_weights():
+            # Requantization is asynchronous. Synchronize before another stream replays
+            # graphs that read these derived weight buffers.
+            torch.cuda.synchronize()
+
     @torch.inference_mode(False)  # needed for non-colocated inference.
     def _build_concatenated_weights(self):
         """Create big contiguous weight tensors that share storage with TE's per-expert parameters.
@@ -1895,7 +1907,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         if not InferenceMode.is_active():
             assert (
-                not self.config.fp8 or self.config.fp8_recipe != Fp8Recipe.mxfp8
+                not self.config.fp8
+                or self.config.fp8_recipe != Fp8Recipe.mxfp8
+                or self.config.moe_training_matches_inference
             ), "MXFP8 inference optimized is not compatible with training / colocated RL."
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
