@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import contextlib
 import os
 import time
 import urllib.request as req
@@ -13,9 +14,10 @@ import torch
 
 import megatron.core.utils as util
 import megatron.training.utils as training_util
-from megatron.core import config
+from megatron.core import config, parallel_state
 from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
@@ -324,6 +326,118 @@ def test_cross_check_param_hashes_across_dp_replicas():
 
     # Teardown.
     _deinit_distributed()
+
+
+@contextlib.contextmanager
+def _forbid_global_process_groups():
+    """Make every parallel_state group, rank and world-size accessor raise when called."""
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("read a process group of the global parallel state")
+
+    with contextlib.ExitStack() as stack:
+        for name in dir(parallel_state):
+            if name.startswith("get_") and name.endswith(
+                ("_group", "_groups", "_gloo", "_rank", "_ranks", "_world_size")
+            ):
+                stack.enter_context(patch.object(parallel_state, name, _raise))
+        yield
+
+
+def _dense_and_expert_model(dense_value, expert_value):
+    """Return a model chunk with one dense and one expert (``allreduce=False``) parameter."""
+    model = torch.nn.ModuleDict(
+        {
+            "dense": torch.nn.Linear(8, 8, bias=False, device="cuda"),
+            "expert": torch.nn.Linear(8, 8, bias=False, device="cuda"),
+        }
+    )
+    model.dense.weight.data.fill_(dense_value)
+    model.expert.weight.data.fill_(expert_value)
+    model.expert.weight.allreduce = False
+    return model
+
+
+@pytest.mark.skipif(
+    Utils.world_size < 4 or Utils.world_size % 2 != 0,
+    reason="needs an even number of ranks, at least 4",
+)
+class TestCheckParamHashesWithModelGroups:
+    """check_param_hashes_across_dp_replicas compares hashes across the groups it is given.
+
+    The global grid has one data-parallel group and one expert data-parallel group, each of
+    all ranks. The given groups are laid out differently: dense replicas are pairs of adjacent
+    ranks, and expert replicas are the ranks of equal parity. Parameters are equal within each
+    given group and differ across groups, so comparing across a global group fails.
+    """
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel()
+        self.grid = HyperCommGrid([2, torch.distributed.get_world_size() // 2], ["dp", "expt_dp"])
+        self.dp_group = self.grid.create_pg("dp")
+        self.expt_dp_group = self.grid.create_pg("expt_dp")
+        self.dp_ranks = torch.distributed.get_process_group_ranks(self.dp_group)
+        self.expt_dp_ranks = torch.distributed.get_process_group_ranks(self.expt_dp_group)
+
+    def teardown_method(self, method):
+        self.grid.destroy()
+        Utils.destroy_model_parallel()
+
+    def _model(self):
+        return _dense_and_expert_model(float(self.dp_ranks[0]), float(self.expt_dp_ranks[0]))
+
+    @pytest.mark.parametrize("cross_check", [False, True])
+    def test_compares_across_the_given_groups(self, cross_check):
+        model = self._model()
+
+        with _forbid_global_process_groups():
+            assert util.check_param_hashes_across_dp_replicas(
+                [model], cross_check, dp_group=self.dp_group, expt_dp_group=self.expt_dp_group
+            )
+        # Without groups, the check compares across the global groups, which span ranks whose
+        # parameters differ.
+        assert not util.check_param_hashes_across_dp_replicas([model], cross_check=True)
+
+    @pytest.mark.parametrize("cross_check", [False, True])
+    def test_detects_a_mismatch_within_the_given_groups(self, cross_check):
+        rank = torch.distributed.get_rank()
+        model = self._model()
+        # Rank 1 changes a dense parameter and rank 2 an expert parameter. Neither is the first
+        # rank of the group across which that parameter is compared.
+        if rank == 1:
+            model.dense.weight.data.add_(100.0)
+        if rank == 2:
+            model.expert.weight.data.add_(100.0)
+
+        with _forbid_global_process_groups():
+            hashes_match = util.check_param_hashes_across_dp_replicas(
+                [model], cross_check, dp_group=self.dp_group, expt_dp_group=self.expt_dp_group
+            )
+
+        if cross_check:
+            # Every rank of a group that contains a changed parameter sees the mismatch.
+            expected = 1 not in self.dp_ranks and 2 not in self.expt_dp_ranks
+        else:
+            # Each rank compares with the first rank of its group, whose parameters are unchanged.
+            expected = rank not in (1, 2)
+        assert hashes_match == expected
+
+    def test_requires_the_group_of_each_parameter_kind(self):
+        model = self._model()
+        dense_model = torch.nn.Linear(8, 8, bias=False, device="cuda")
+        dense_model.weight.data.fill_(float(self.dp_ranks[0]))
+
+        with _forbid_global_process_groups():
+            with pytest.raises(ValueError, match="has expert parameters"):
+                util.check_param_hashes_across_dp_replicas([model], dp_group=self.dp_group)
+            with pytest.raises(ValueError, match="has non-expert parameters"):
+                util.check_param_hashes_across_dp_replicas(
+                    [model], expt_dp_group=self.expt_dp_group
+                )
+            # A model without expert parameters needs no expert group.
+            assert util.check_param_hashes_across_dp_replicas(
+                [dense_model], True, dp_group=self.dp_group
+            )
 
 
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
