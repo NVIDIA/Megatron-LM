@@ -2496,11 +2496,13 @@ def _forward_backward_grad_context(args):
 def _build_pg_collection_from_parallel_state(args):
     """Return the process groups of the global parallel grid as one collection.
 
-    pretrain() builds the model and runs the training loop on this collection, and get_model()
-    builds one when it is called without a collection. With ``--create-all-gather-group`` the
-    collection also carries the separate data-parallel all-gather communicators (``dp_cp_ag``,
-    and ``expt_dp_ag`` with expert parallelism), which Megatron-FSDP uses to overlap the
-    parameter all-gather with the gradient reduce-scatter.
+    pretrain() builds the model and its optimizer and runs the training loop on this collection,
+    and get_model() builds one when it is called without a collection. The collection carries
+    the Gloo groups the distributed optimizer uses for checkpoint I/O (``intra_dp_cp_gloo`` and
+    ``intra_expt_dp_gloo``), or None for those the job did not create. With
+    ``--create-all-gather-group`` the collection also carries the separate data-parallel
+    all-gather communicators (``dp_cp_ag``, and ``expt_dp_ag`` with expert parallelism), which
+    Megatron-FSDP uses to overlap the parameter all-gather with the gradient reduce-scatter.
     """
     cfg = get_run_config()
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -2841,7 +2843,13 @@ def setup_model_and_optimizer(
     cfg_container: PretrainConfigContainer | None = None,
     pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None = None,
 ):
-    """Setup model and optimizer."""
+    """Setup model and optimizer.
+
+    pg_collection: process groups that the model and its optimizer are built on. With Gloo
+        process groups enabled, a ProcessGroupCollection also supplies them
+        (``intra_dp_cp_gloo`` and ``intra_expt_dp_gloo``). None makes get_model() build the
+        model on the global parallel state, and the optimizer reads it as well.
+    """
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use cfg_container; remaining settings still use legacy args.
     cfg = cfg_container if cfg_container is not None else get_run_config()
@@ -2989,9 +2997,8 @@ def setup_model_and_optimizer(
             model,
             config_overrides=config_overrides,
             use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
-            # A collection carries no Gloo groups, so get_megatron_optimizer accepts one only
-            # without them; with Gloo groups it builds all of its groups from parallel_state.
-            pg_collection=None if cfg.dist.use_gloo_process_groups else pg_collection,
+            # With Gloo process groups, the optimizer takes them from this collection as well.
+            pg_collection=pg_collection,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
