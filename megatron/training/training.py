@@ -2166,7 +2166,10 @@ def pretrain(
     wandb_writer = get_wandb_writer()
     if wandb_writer:
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
-        wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
+        # A relaunch resumes the same wandb run, which may hold an earlier job name.
+        wandb_writer.config.update(
+            {'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")}, allow_val_change=True
+        )
 
     # OTel: megatron.startup deliberately stays open into train() -- its
     # preamble (weight-hash check, sniff test, cuda-graph setup) is init, not
