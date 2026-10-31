@@ -384,6 +384,51 @@ class TestHybridModel:
         assert grad_enabled == [expected_grad_enabled]
         assert output.requires_grad is expected_grad_enabled
 
+    @pytest.mark.parametrize("tied", [False, True])
+    def test_mtp_output_weight_receives_gradient(self, tied):
+        """An MTP stage must not own an output weight bypassed by its tied embedding."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=1,
+            gradient_accumulation_fusion=False,
+        )
+        kwargs = dict(
+            config=config,
+            vocab_size=128,
+            max_sequence_length=4,
+            pre_process=False,
+            post_process=True,
+            share_embeddings_and_output_weights=tied,
+        )
+        model = HybridModel(
+            **kwargs, hybrid_stack_spec=hybrid_stack_spec, hybrid_layer_pattern="-/-"
+        )
+        assert model.mtp_process
+
+        # Use the same weight selection as model postprocessing, without running
+        # the decoder or requiring a multi-stage training schedule.
+        output_weight = model.shared_embedding_or_output_weight() if tied else None
+        device = next(model.parameters()).device
+        hidden = torch.randn(4, 1, config.hidden_size, device=device)
+        logits, _ = model.output_layer(hidden, weight=output_weight)
+        logits.square().mean().backward()
+
+        if tied:
+            assert output_weight is model.embedding.word_embeddings.weight
+            assert output_weight.grad is not None
+        # With the old allocation condition, tied MTP stages fail here: the
+        # registered output_layer.weight is unused and has no gradient.
+        missing = [
+            name
+            for name, parameter in model.output_layer.named_parameters()
+            if parameter.requires_grad and parameter.grad is None
+        ]
+        assert not missing, f"Output projection owns unused trainable parameters: {missing}"
+        assert (model.output_layer.weight is None) == tied
+
     def test_mtp_rejects_tp_overlap(self):
         model_config = TransformerConfig(
             num_layers=1,
