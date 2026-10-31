@@ -269,6 +269,20 @@ class TestTraining:
         flags = (train_state.do_train, train_state.do_valid, train_state.do_test)
         assert flags == (True, True, True)
 
+    def test_build_train_valid_test_data_iterators_resume_without_eval_interval(self, run_config):
+        """Resuming without eval_interval should not count any consumed validation samples."""
+        run_config.train.train_samples = None
+        run_config.validation.eval_interval = None
+        train_state = get_train_state()
+        train_state.iteration = 10
+        train_state.consumed_train_samples = 0
+        train_state.consumed_valid_samples = 0
+
+        build_train_valid_test_data_iterators(mock_train_valid_test_datasets_provider)
+
+        assert train_state.consumed_train_samples == 10
+        assert train_state.consumed_valid_samples == 0
+
     def test_params_norm_is_computed_only_when_it_can_be_logged(self, run_config):
         args = SimpleNamespace(
             log_params_norm=True, log_interval=20, tensorboard_dir=None, tensorboard_log_interval=1

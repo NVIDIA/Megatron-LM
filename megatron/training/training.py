@@ -5974,10 +5974,16 @@ def get_train_valid_test_num_samples():
             eval_iters = cfg.validation.eval_iters
         else:
             assert cfg.train.train_iters is not None
-            total_eval_points = cfg.train.train_iters // cfg.validation.eval_interval + 1
-            if cfg.validation.start_eval_at_iter is not None:
-                skipped_eval_points = cfg.validation.start_eval_at_iter // cfg.validation.eval_interval
-                total_eval_points = max(0, total_eval_points - skipped_eval_points)
+            if cfg.validation.eval_interval:
+                total_eval_points = cfg.train.train_iters // cfg.validation.eval_interval + 1
+                if cfg.validation.start_eval_at_iter is not None:
+                    skipped_eval_points = (
+                        cfg.validation.start_eval_at_iter // cfg.validation.eval_interval
+                    )
+                    total_eval_points = max(0, total_eval_points - skipped_eval_points)
+            else:
+                # Without eval_interval, validation only runs once, after training.
+                total_eval_points = 1
             eval_iters = total_eval_points * cfg.validation.eval_iters
         eval_samples = eval_iters * cfg.validation.eval_global_batch_size
     test_samples = cfg.validation.eval_iters * cfg.validation.eval_global_batch_size
@@ -6082,7 +6088,8 @@ def backfill_consumed_samples_from_iteration():
 
         train_state.consumed_train_samples = train_state.iteration * cfg.train.global_batch_size
     if train_state.iteration > 0 and train_state.consumed_valid_samples == 0:
-        if cfg.train.train_samples is None:
+        # Without eval_interval, no validation runs during training, so none was consumed.
+        if cfg.train.train_samples is None and cfg.validation.eval_interval:
             effective_start = cfg.validation.start_eval_at_iter if cfg.validation.start_eval_at_iter is not None else 0
             skipped_intervals = effective_start // cfg.validation.eval_interval
             train_state.consumed_valid_samples = (
