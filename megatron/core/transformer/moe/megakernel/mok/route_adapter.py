@@ -33,19 +33,37 @@ if not HAVE_TRITON:
 def _routing_map_to_indices_kernel(
     probs_ptr,
     routing_map_ptr,
+    padding_mask_ptr,
     probs_indices_ptr,
     indices_ptr,
+    batch_size,
+    padding_mask_batch_stride,
+    padding_mask_seq_stride,
     num_experts: tl.constexpr,
     topk: tl.constexpr,
     num_experts_block_size: tl.constexpr,
     topk_block_size: tl.constexpr,
+    has_padding_mask: tl.constexpr,
 ):
-    """Compact one dense routing-map row and gather its router probabilities."""
+    """Compact one dense routing-map row and gather its router probabilities.
+
+    With a padding mask, padding tokens keep no routes. Token rows are sequence-first
+    (``token = seq_idx * batch_size + batch_idx``); the mask is batch-first ``[batch, seq]``.
+    """
     token_idx = tl.program_id(0)
     expert_offsets = tl.arange(0, num_experts_block_size)
     expert_mask = expert_offsets < num_experts
     row_offset = token_idx * num_experts
     routed = tl.load(routing_map_ptr + row_offset + expert_offsets, mask=expert_mask, other=0) != 0
+    if has_padding_mask:
+        seq_idx = token_idx // batch_size
+        batch_idx = token_idx - seq_idx * batch_size
+        is_padding = tl.load(
+            padding_mask_ptr
+            + batch_idx * padding_mask_batch_stride
+            + seq_idx * padding_mask_seq_stride
+        )
+        routed = routed & (is_padding == 0)
     route_positions = tl.cumsum(routed.to(tl.int32), axis=0) - 1
     topk_offsets = tl.arange(0, topk_block_size)
     topk_mask = topk_offsets < topk
@@ -98,10 +116,12 @@ class RoutingMapToIndices(torch.autograd.Function):
     order. Rows with fewer than topk routes are padded with -1 indices
     and zero probabilities. The backward pass scatters router-weight gradients
     into the corresponding positions of the dense probability tensor.
+    An optional padding mask removes every route of the padding tokens, as
+    drop_padding_routes does, without materializing the masked inputs.
     """
 
     @staticmethod
-    def forward(ctx, probs, routing_map, topk):
+    def forward(ctx, probs, routing_map, topk, padding_mask=None):
         """Compact authoritative dense routes into fixed-width MOK inputs."""
         if not HAVE_TRITON:
             raise RuntimeError("routing_map_to_mok_inputs requires Triton")
@@ -118,6 +138,20 @@ class RoutingMapToIndices(torch.autograd.Function):
         if type(topk) is not int or topk <= 0 or topk > probs.shape[1]:
             raise ValueError("topk must be a positive integer no greater than num_experts")
         num_tokens, num_experts = probs.shape
+        if padding_mask is None:
+            batch_size, padding_mask_strides = 1, (0, 0)
+        else:
+            if padding_mask.ndim != 2 or padding_mask.numel() != num_tokens:
+                raise ValueError(
+                    "padding_mask must be a [batch, seq] mask with one entry per token, got "
+                    f"{tuple(padding_mask.shape)} for {num_tokens} tokens"
+                )
+            if padding_mask.device != probs.device:
+                raise ValueError("padding_mask must be on the probs device")
+            if padding_mask.dtype != torch.bool:
+                padding_mask = padding_mask.bool()
+            batch_size = padding_mask.shape[0]
+            padding_mask_strides = padding_mask.stride()
         probs_indices = torch.empty((num_tokens, topk), dtype=torch.float32, device=probs.device)
         indices = torch.empty((num_tokens, topk), dtype=torch.int32, device=probs.device)
         if num_tokens > 0:
@@ -127,24 +161,33 @@ class RoutingMapToIndices(torch.autograd.Function):
             _routing_map_to_indices_kernel[(num_tokens,)](
                 probs,
                 routing_map,
+                # Unread without a mask; any tensor serves as the pointer argument.
+                routing_map if padding_mask is None else padding_mask,
                 probs_indices,
                 indices,
+                batch_size,
+                *padding_mask_strides,
                 num_experts=num_experts,
                 topk=topk,
                 num_experts_block_size=num_experts_block_size,
                 topk_block_size=topk_block_size,
+                has_padding_mask=padding_mask is not None,
                 num_warps=num_warps,
             )
         ctx.save_for_backward(indices)
         ctx.num_experts = num_experts
         ctx.probs_dtype = probs.dtype
         ctx.mark_non_differentiable(indices)
+        # Backward ignores the (integer) indices gradient; do not have autograd fill zeros for it.
+        ctx.set_materialize_grads(False)
         return probs_indices, indices
 
     @staticmethod
     def backward(ctx, grad_probs_indices, grad_indices):
         """Scatter compact routing-weight gradients back to the dense tensor."""
         del grad_indices
+        if grad_probs_indices is None:
+            return None, None, None, None
         (indices,) = ctx.saved_tensors
         num_tokens, topk = indices.shape
         grad_probs = torch.empty(
@@ -164,19 +207,26 @@ class RoutingMapToIndices(torch.autograd.Function):
                 topk_block_size=topk_block_size,
                 num_warps=num_warps,
             )
-        return grad_probs, None, None
+        return grad_probs, None, None, None
 
 
 def routing_map_to_mok_inputs(
-    probs: torch.Tensor, routing_map: torch.Tensor, topk: int
+    probs: torch.Tensor,
+    routing_map: torch.Tensor,
+    topk: int,
+    padding_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compact an authoritative routing map into fixed-width MOK inputs.
     Args:
         probs: Dense router probabilities with shape [num_tokens, num_experts].
         routing_map: Dense boolean/integer route map with the same shape as probs.
         topk: Maximum number of valid routes emitted per token.
+        padding_mask: Optional batch-first [bsz, seq_length] mask of the sequence-first
+            tokens, True for padding. Padding tokens get no routes; the result equals
+            routing_map_to_mok_inputs(*drop_padding_routes(probs, routing_map, padding_mask), topk),
+            in values and in the gradient of probs.
     Returns:
         A pair (probs_indices, indices) with shapes [num_tokens, topk].
         probs_indices is float32 and indices is int32 with -1 padding.
     """
-    return RoutingMapToIndices.apply(probs, routing_map, topk)
+    return RoutingMapToIndices.apply(probs, routing_map, topk, padding_mask)

@@ -787,14 +787,25 @@ class MoELayer(BaseMoELayer):
                 probs, routing_map = self.route(
                     hidden_states, padding_mask, input_ids, packed_seq_params=packed_seq_params
                 )
-                return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
+                # Like dropless HybridEP, the megakernel gives padding tokens no routes and skips
+                # them. It masks after route(), so this also covers the unmasked router outputs
+                # that a moe_router CUDA graph replay returns.
+                return apply_module(self.megakernel_experts)(
+                    hidden_states, probs, routing_map, padding_mask
+                )
 
             if self.moe_layer_recompute and self.training:
                 output = precision_aware_checkpoint(
                     megakernel_forward, self.config, self.tp_group, hidden_states, padding_mask
                 )
             else:
-                output = megakernel_forward(hidden_states, padding_mask)
+                try:
+                    output = megakernel_forward(hidden_states, padding_mask)
+                except MoECudaGraphPartialCaptureSignal as e:
+                    # Capturing cuda_graph_modules=[..., "moe_router"]: the layer's CUDA graph
+                    # ends after the router and returns its outputs. The shared expert runs inside
+                    # the megakernel, so it adds no graph output.
+                    return e.get_early_return_outputs(hidden_states, None)
             return output, None
 
         # MoE forward: route -> dispatch -> compute -> combine
