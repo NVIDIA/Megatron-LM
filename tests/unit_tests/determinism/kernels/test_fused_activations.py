@@ -291,6 +291,31 @@ class TestFusedCrossEntropy:
         )
         assert grads["in[0]"].dtype == dtype
 
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+    @pytest.mark.xfail(
+        strict=False,
+        reason="op-catalog lists the fused cross entropy as non-deterministic; recorded, not gated",
+    )
+    def test_fused_vocab_parallel_cross_entropy_confident_targets_replay(self, dtype):
+        """Rows whose target leads by tens take the target-free sum and the target-gradient
+        write of the fused path."""
+        seeded()
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        vocab = 32768
+        logits = torch.randn(TOKENS, vocab, device="cuda", dtype=torch.float32)
+        target = torch.randint(0, vocab * tp_group.size(), (TOKENS,), device="cuda")
+        start = tp_group.rank() * vocab
+        rows = torch.nonzero((target >= start) & (target < start + vocab)).squeeze(-1)
+        logits[rows, target[rows] - start] += torch.linspace(
+            20.0, 95.0, rows.numel(), device="cuda"
+        )
+        assert_replays_bit_exact(
+            lambda l, t: fused_vocab_parallel_cross_entropy(l, t, tp_group),
+            (logits.to(dtype).requires_grad_(True), target),
+            replays=4,
+            what="fused_vocab_parallel_cross_entropy (confident targets)",
+        )
+
     @staticmethod
     def _peak_bytes(fn, logits, target):
         """Peak allocation of one forward + backward beyond what is live before it."""
