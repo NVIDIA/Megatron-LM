@@ -57,6 +57,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV2,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     RuntimePolicy,
     fully_shard_context,
 )
@@ -2451,8 +2452,10 @@ def wrap_model_chunks_with_ddp(
     ) and ddp_config.megatron_fsdp_version == 2
     construction_context = (
         fully_shard_context(
-            runtime_policy=RuntimePolicy(
-                use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True
+            FsdpContext(
+                runtime_policy=RuntimePolicy(
+                    use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True
+                )
             )
         )
         if is_mfsdp_v2
