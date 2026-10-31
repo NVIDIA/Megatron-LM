@@ -949,8 +949,10 @@ class TestRLUtils:
         training_lang_module.train.assert_called_once()
         if separate_training_model:
             lang_module.train.assert_not_called()
-        if has_optimizer:
+        if has_optimizer and not separate_training_model:
             optimizer.prepare_model_params_for_param_sync.assert_called_once_with()
+        elif has_optimizer:
+            optimizer.prepare_model_params_for_param_sync.assert_not_called()
 
     @pytest.mark.parametrize("do_train", [True, False], ids=["training", "eval_only"])
     def test_evaluate_and_print_results_rl_wandb_step_handling(self, monkeypatch, do_train):
