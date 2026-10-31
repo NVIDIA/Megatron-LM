@@ -42,6 +42,8 @@ from ..utils import (
 def _get_main_grad_attr(param: torch.nn.Parameter):
     if hasattr(param, "main_grad"):
         return "main_grad"
+    if hasattr(param, "decoupled_grad"):
+        return "decoupled_grad"
     return "grad"
 
 
@@ -278,6 +280,7 @@ def _allreduce_embedding_grad(
             model_module = model[0]
 
         ddp_config = model_module.ddp_config
+        fsdp_buffer = getattr(model_module, "param_and_grad_buffer", None)
         model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
 
         weight = weight_getter(model_module)
@@ -287,6 +290,12 @@ def _allreduce_embedding_grad(
         grad_attr = _get_main_grad_attr(weight)
         orig_grad = getattr(weight, grad_attr)
         if ddp_config.use_megatron_fsdp:
+            if orig_grad is None and fsdp_buffer is not None and weight.requires_grad:
+                # V1 hides empty shards from the optimizer, but these ranks must still
+                # participate in the DP gather and the cross-stage reduction.
+                name = fsdp_buffer.param_to_name.get(getattr(weight, "orig_param", weight))
+                orig_grad = fsdp_buffer.dist_main_grad.get(name)
+                assert orig_grad is None or orig_grad._local_tensor.numel() == 0
             # Expand the uneven (flat-buffer) sharded embedding grad to the full logical gradient
             # so the cross-stage all-reduce below combines matching rows (see _full_embedding_grad).
             grad = _full_embedding_grad(orig_grad)
