@@ -2830,6 +2830,12 @@ def get_megatron_ddp_config(
         for f in dataclasses.fields(DistributedDataParallelConfig):
             if hasattr(args, f.name):
                 kwargs[f.name] = getattr(args, f.name)
+        # The expert wgrad overlap also delays TE's expert wgrad to backward_dw(), so DDP must hook
+        # those modules (fired from backward_dw) instead of autograd; otherwise param.grad is never
+        # cleared and a stale gradient is added to main_grad in the next iteration.
+        kwargs["delay_wgrad_compute"] = (
+            args.delay_wgrad_compute or args.overlap_dispatch_backward_with_experts_wgrad
+        )
         kwargs["grad_reduce_in_fp32"] = args.accumulate_allreduce_grads_in_fp32
         kwargs["check_for_nan_in_grad"] = args.check_for_nan_in_loss_and_grad
         kwargs["check_for_large_grads"] = args.check_for_large_grads
