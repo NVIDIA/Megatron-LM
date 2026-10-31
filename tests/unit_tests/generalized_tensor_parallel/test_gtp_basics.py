@@ -609,18 +609,19 @@ class TestLatentProjectionChainClassification:
         gtp_module.classify_gtp_remat_chains(
             _Model(), cuda_graph_modules=cuda_graph_modules, cuda_graph_impl=cuda_graph_impl
         )
-        return tuple(param.chain_id for param in params)
+        assert params[0].chain_id == params[1].chain_id
+        return tuple(gtp_module._chain_is_graphed(param.chain_id) for param in params)
 
     def test_eager_latent_projections_are_ungraphed(self):
-        assert self._chains() == (GTPChain.UNGRAPHED.value, GTPChain.UNGRAPHED.value)
+        assert self._chains() == (False, False)
 
     def test_local_router_captures_both_latent_projections(self):
         chains = self._chains(cuda_graph_modules={"moe_router"}, cuda_graph_impl="local")
-        assert chains == (GTPChain.GRAPHED.value, GTPChain.GRAPHED.value)
+        assert chains == (True, True)
 
     def test_unrelated_local_scope_leaves_latent_projections_ungraphed(self):
         chains = self._chains(cuda_graph_modules={"mamba", "attn"}, cuda_graph_impl="local")
-        assert chains == (GTPChain.UNGRAPHED.value, GTPChain.UNGRAPHED.value)
+        assert chains == (False, False)
 
 
 class TestGroupedDoubleBuffer:
