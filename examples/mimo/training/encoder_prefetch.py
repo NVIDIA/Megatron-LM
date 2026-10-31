@@ -43,7 +43,7 @@ def add_encoder_prefetch_args(parser: argparse.ArgumentParser) -> argparse.Argum
     return parser
 
 
-def validate_encoder_prefetch_args(args, *, rerun_mode: str) -> None:
+def validate_encoder_prefetch_args(args) -> None:
     if not args.mimo_encoder_prefetch:
         return
     if not args.freeze_vit:
@@ -60,7 +60,7 @@ def validate_encoder_prefetch_args(args, *, rerun_mode: str) -> None:
             raise ValueError(f"encoder prefetch requires encoder {label}=1")
     if args.mimo_encoder_prefetch_depth <= 0:
         raise ValueError("encoder prefetch depth must be positive")
-    if rerun_mode != "disabled":
+    if args.rerun_mode != "disabled":
         raise ValueError("encoder prefetch does not support rerun modes")
 
 

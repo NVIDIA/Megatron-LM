@@ -2922,15 +2922,8 @@ def _add_training_args(parser):
 def _add_rerun_machine_args(parser):
     from megatron.training.config import RerunStateMachineConfig
 
-    rerun_factory = ArgumentGroupFactory(
-        RerunStateMachineConfig, exclude=["check_for_nan_in_loss", "rerun_mode"]
-    )
+    rerun_factory = ArgumentGroupFactory(RerunStateMachineConfig, exclude=["check_for_nan_in_loss"])
     group = rerun_factory.build_group(parser, "rerun engine")
-    group.add_argument('--rerun-mode', default='validate_results',
-                       choices=['disabled', 'validate_results',
-                                'report_determinism_stats', 'report_stats'],
-                       help='Rerun mode. report_stats is a legacy alias for '
-                       'report_determinism_stats.')
 
     return parser
 
