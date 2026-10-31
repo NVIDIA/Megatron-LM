@@ -39,6 +39,10 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.num_microbatches_calculator import (
+    destroy_num_microbatches_calculator,
+    init_num_microbatches_calculator,
+)
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as offload,
@@ -51,6 +55,8 @@ from megatron.core.tensor_parallel.random import (
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
+from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe import fused_a2a, moe_utils
 from megatron.core.transformer.moe import router as router_module
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -1165,6 +1171,190 @@ def test_virtual_expert_recompute_offload_scopes(
         for name, expected in reference.items():
             _assert_bitwise_parity(actual[name], expected, name)
     finally:
+        Utils.destroy_model_parallel()
+
+
+@requires_hybridep
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(
+    not hasattr(torch.autograd.graph, "set_override_stale_capture_stream"),
+    reason="requires torch.autograd.graph.set_override_stale_capture_stream",
+)
+def test_virtual_expert_te_cuda_graph_training_parity(monkeypatch):
+    """Replay TE-captured virtual-expert MoE layers and match eager training.
+
+    TE writes the runtime expert weights' gradients into main_grad and returns None to autograd,
+    so these leaves get no gradient in the captured backward and their AccumulateGrad nodes keep
+    the stream they were created on. If such a node from an eager step is still alive, autograd's
+    end-of-backward sync between its non-capturing stream and the capturing stream would cross
+    the capture boundary. TECudaGraphHelper must enable the stale-capture-stream override, which
+    skips that sync; without it, PyTorch raises during capture.
+    """
+    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "0")
+    # Compare graph replay with eager execution without nondeterministic TE algorithms.
+    monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+    monkeypatch.setattr(
+        fused_a2a.HybridEPBuffer,
+        "__init__",
+        partialmethod(fused_a2a.HybridEPBuffer.__init__, load_cached_kernels=True),
+    )
+    Utils.initialize_model_parallel(expert_model_parallel_size=2)
+    pg = ProcessGroupCollection.use_mpu_process_groups()
+    seq_length, micro_batch_size, warmup_steps, num_steps = 16, 2, 2, 5
+    set_override = torch.autograd.graph.set_override_stale_capture_stream
+    override_calls = []
+
+    def tracked_override(enabled):
+        override_calls.append(enabled)
+        return set_override(enabled)
+
+    def train(graphed):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        model_parallel_cuda_manual_seed(1234)
+        torch.manual_seed(1234)
+        overrides = dict(
+            num_layers=2,
+            num_moe_experts=4,
+            ffn_hidden_size=256,
+            moe_ffn_hidden_size=256,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="none",
+            moe_aux_loss_coeff=0,
+            hidden_dropout=0,
+            attention_dropout=0,
+        )
+        if graphed:
+            overrides.update(
+                cuda_graph_impl="transformer_engine",
+                cuda_graph_modules=[CudaGraphModule.moe],
+                cuda_graph_warmup_steps=warmup_steps,
+            )
+        config = _virtual_expert_hybridep_config(**overrides)
+        module = model = optimizer = helper = loss = None
+        history = []
+        try:
+            module = HybridModel(
+                config,
+                hybrid_stack_spec,
+                vocab_size=128,
+                max_sequence_length=seq_length,
+                hybrid_layer_pattern="EE",
+                pg_collection=pg,
+            ).cuda()
+            # Build DDP on a side stream, as megatron/training does for TE graphs, so the
+            # AccumulateGrad nodes it retains do not reference the default stream. Without the
+            # override, PyTorch rejects stale default-stream nodes during capture whether or not
+            # the model uses virtual experts, which would mask the failure this test targets.
+            current_stream = torch.cuda.current_stream()
+            ddp_stream = torch.cuda.Stream()
+            ddp_stream.wait_stream(current_stream)
+            with torch.cuda.stream(ddp_stream):
+                model = DDP(
+                    config,
+                    DistributedDataParallelConfig(grad_reduce_in_fp32=True),
+                    module,
+                    pg_collection=pg,
+                )
+            current_stream.wait_stream(ddp_stream)
+            optimizer = get_megatron_optimizer(
+                OptimizerConfig(
+                    optimizer="sgd", lr=1e-2, sgd_momentum=0, weight_decay=0, clip_grad=0, bf16=True
+                ),
+                [model],
+                use_gloo_process_groups=False,
+                pg_collection=pg,
+            )
+            if graphed:
+                helper = TECudaGraphHelper(
+                    model=[model],
+                    config=config,
+                    seq_length=seq_length,
+                    micro_batch_size=micro_batch_size,
+                    optimizers=[optimizer],
+                    pg_collection=pg,
+                )
+            for step in range(num_steps):
+                if graphed and step == warmup_steps:
+                    # `loss` still holds the last eager step's autograd graph, so the runtime
+                    # weights' AccumulateGrad nodes, created on the default stream by the eager
+                    # steps, reach the captured backward with only None gradients. Without the
+                    # override, autograd's end-of-backward sync with their stream would raise.
+                    # Start from the process-initial setting, not one an earlier test enabled.
+                    set_override(False)
+                    with monkeypatch.context() as capture_patch:
+                        capture_patch.setattr(
+                            torch.autograd.graph,
+                            "set_override_stale_capture_stream",
+                            tracked_override,
+                        )
+                        helper.create_cudagraphs()
+                    assert override_calls == [True]
+                    assert all(layer.cuda_graphs for layer in module.decoder.layers)
+                model.zero_grad_buffer()
+                optimizer.zero_grad()
+                rng = torch.Generator(device="cuda").manual_seed(5678 + step)
+                tokens = torch.randint(
+                    0, 128, (micro_batch_size, seq_length), device="cuda", generator=rng
+                )
+                labels = torch.randint(
+                    0, 128, (micro_batch_size, seq_length), device="cuda", generator=rng
+                )
+                positions = torch.arange(seq_length, device="cuda").expand(micro_batch_size, -1)
+                loss = model(tokens, positions, attention_mask=None, labels=labels)
+                loss.sum().backward()
+                model.finish_grad_sync()
+                torch.cuda.synchronize()
+                history.append(
+                    {
+                        "loss": loss.detach().float().cpu(),
+                        **{
+                            name: parameter.main_grad.detach().float().cpu().clone()
+                            for name, parameter in module.named_parameters()
+                        },
+                    }
+                )
+                assert optimizer.step()[0], "optimizer skipped an update"
+            return history
+        finally:
+            torch.cuda.synchronize()
+            if helper is not None and helper.graphs_created():
+                helper.delete_cuda_graphs()
+            del helper, loss, optimizer, model, module
+            VirtualExpertLoadBalancer.finalize()
+            destroy_moe_metrics_tracker()
+            gc.collect()
+            fused_a2a.reset_hybrid_ep_buffer()
+
+    try:
+        # TECudaGraphHelper sizes TE's warmup from the number of microbatches.
+        init_num_microbatches_calculator(
+            rank=0,
+            global_batch_size=micro_batch_size,
+            micro_batch_size=micro_batch_size,
+            data_parallel_size=1,
+            decrease_batch_size_if_needed=False,
+        )
+        reference = train(False)
+        actual = train(True)
+        assert len(actual) == len(reference) == num_steps
+        for step, (values, expected) in enumerate(zip(actual, reference)):
+            assert values.keys() == expected.keys()
+            for name in values:
+                if name == "loss":
+                    tolerance, peak_tolerance = 1e-5, 1e-5
+                else:
+                    tolerance, peak_tolerance = 0.005, 0.01
+                _assert_numerical_parity(
+                    values[name],
+                    expected[name],
+                    tolerance,
+                    f"step {step}: {name}",
+                    peak_tolerance=peak_tolerance,
+                )
+    finally:
+        # Preserve MCore's enabled policy even if this regression test fails.
+        set_override(True)
+        destroy_num_microbatches_calculator()
         Utils.destroy_model_parallel()
 
 
