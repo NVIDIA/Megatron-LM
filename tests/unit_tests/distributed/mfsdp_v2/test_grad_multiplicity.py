@@ -12,6 +12,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     Placements,
     RuntimePolicy,
     fully_shard,
@@ -26,7 +27,9 @@ def _sharded_unit(setup, model, grad_accumulation_count):
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
     placements = Placements([0], [Shard(0)], [Shard(0)], [Shard(0)])
     with fully_shard_context(
-        device=setup.device, runtime_policy=RuntimePolicy(caller_managed_grad_sync=True)
+        FsdpContext(
+            device=setup.device, runtime_policy=RuntimePolicy(caller_managed_grad_sync=True)
+        )
     ):
         fully_shard(
             model,

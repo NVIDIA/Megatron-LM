@@ -8,6 +8,8 @@ from typing import Optional, Sequence, Union
 
 import torch
 
+from megatron.core.inference.moe.sigmoid_topk import HAVE_TRITON as HAVE_SIGMOID_TOPK_KERNEL
+from megatron.core.inference.moe.sigmoid_topk import is_sigmoid_topk_supported, sigmoid_topk_routing
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
@@ -1443,6 +1445,35 @@ class InferenceTopKRouter(TopKRouter):
             precomputed_indices=precomputed_indices,
         )
 
+    def _uses_sigmoid_topk_kernel(
+        self, logits: torch.Tensor, precomputed_indices: Optional[torch.Tensor]
+    ) -> bool:
+        """Whether this inference call uses the fused sigmoid top-k kernel.
+
+        It is selected by config.inference_moe_router_backend='triton' and covers sigmoid
+        scores with an expert bias, fp32 logits and supported shapes, without
+        group-limited routing, router replay, precomputed indices or TE's fused
+        router; batch-invariant mode keeps its uncompiled reference path. forward()
+        only reaches this path while InferenceMode is active, whether or not
+        gradients are enabled, and the kernel's outputs carry no autograd graph.
+        Expert selection matches the compiled path; for top-k of eight or more a
+        probability can differ from it in the last bit.
+        """
+        return (
+            self.config.inference_moe_router_backend == 'triton'
+            and HAVE_SIGMOID_TOPK_KERNEL
+            and logits.is_cuda
+            and logits.dtype == torch.float32
+            and self.score_function == "sigmoid"
+            and self.expert_bias is not None
+            and is_sigmoid_topk_supported(logits.shape[-1], self.topk)
+            and precomputed_indices is None
+            and self.config.moe_router_group_topk is None
+            and not self.config.moe_router_fusion
+            and self.router_replay is None
+            and not is_batch_invariant_mode_enabled()
+        )
+
     def _forward(
         self,
         input: torch.Tensor,
@@ -1473,6 +1504,13 @@ class InferenceTopKRouter(TopKRouter):
             if is_batch_invariant_mode_enabled()
             else self._compiled_topk_routing
         )
+        if self._uses_sigmoid_topk_kernel(logits, precomputed_indices):
+            return sigmoid_topk_routing(
+                logits.contiguous(),
+                self.expert_bias.float(),
+                self.topk,
+                self.config.moe_router_topk_scaling_factor,
+            )
         probs, top_indices = routing(
             logits,
             self.topk,
