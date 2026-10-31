@@ -29,6 +29,7 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.extensions.transformer_engine import (
     mark_grouped_tensor as _mark_te_grouped_tensor,
 )
+from megatron.core.fp8_utils import is_grouped_tensor
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -727,13 +728,6 @@ class TEGroupedMLP(MegatronModule):
         register_grouped_linear_params(
             op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
         )
-        # FP8 dispatch: the FC1 input arrives as an opaque MXFP8 carrier tensor (TE EP dispatch
-        # packs E4M3 data + scales into a plain tensor's storage); tell TE to rebuild the
-        # grouped view at the op boundary.
-        # Only works with TE PR https://github.com/NVIDIA/TransformerEngine/pull/3355
-        # TODO: remove after TE support the grouped tensor path
-        if getattr(self.config, 'moe_dispatch_fwd_dtype', 'bf16') == 'mxfp8':
-            op.ep_mxfp8_carrier_input = True
         ops.append(op)
 
         # Activation and post-multiply probs (SwiGLU, clamped GLU, or SReLU).
@@ -838,13 +832,6 @@ class TEGroupedMLP(MegatronModule):
             op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
         )
         op.wgrad_store = self.linear_fc2.wgrad_store
-        # FP8 combine backward: the FC2 output grad arrives as an opaque MXFP8 carrier tensor
-        # (TE EP combine backward, same packing as dispatch); tell TE to rebuild the grouped
-        # view at the op boundary.
-        # Only works with TE PR https://github.com/NVIDIA/TransformerEngine/pull/3355
-        # TODO: remove after TE support the grouped tensor path
-        if getattr(self.config, 'moe_combine_bwd_dtype', 'bf16') == 'mxfp8':
-            op.ep_mxfp8_carrier_grad = True
         ops.append(op)
 
         # Emulate submodule pre-forward hooks
@@ -987,12 +974,14 @@ class TEGroupedMLP(MegatronModule):
             fine_grained_activation_offloading, permuted_local_hidden_states, offload_name
         )
         with fused_group_mlp_manager as permuted_local_hidden_states:
-            # NCCL-EP zero-copy is active exactly when ``output_buffer`` is not None, and then the
-            # fused-MLP input aliases the persistent symm buffer (also the fc2 output combine
-            # reads), whose storage is non-resizable — so skip the force-release in that case.
+            # In case of MXFP8 Dispatch permuted_local_hidden_states is GroupedTensor which does
+            # not have a single backing storage to release. Rely on garbage collection to do its
+            # job.
             forced_released_tensors = (
                 [permuted_local_hidden_states]
-                if fine_grained_activation_offloading and output_buffer is None
+                if fine_grained_activation_offloading
+                and output_buffer is None
+                and not is_grouped_tensor(permuted_local_hidden_states)
                 else []
             )
             with stash_context:

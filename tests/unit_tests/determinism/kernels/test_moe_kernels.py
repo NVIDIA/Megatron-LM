@@ -1230,24 +1230,28 @@ class TestMoEModules:
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     @pytest.mark.parametrize(
-        "offload_modules,offloaded_group",
+        "offload_modules,offloaded_group,op_fuser",
         [
-            (["expert_fc1", "moe_act"], "fused_group_mlp"),
-            (["expert_fc1"], "expert_fc1"),
-            (["moe_act"], "moe_act"),
+            (["expert_fc1", "moe_act"], "fused_group_mlp", False),
+            (["expert_fc1"], "expert_fc1", False),
+            (["moe_act"], "moe_act", False),
+            (["expert_fc1", "moe_act"], "fused_group_mlp", True),
         ],
-        ids=["fc1+act->one_group", "fc1", "act"],
+        ids=["fc1+act->one_group", "fc1", "act", "fused-mxfp8"],
     )
     def test_te_grouped_mlp_replays_under_fine_grained_offloading(
-        self, offload_modules, offloaded_group
+        self, offload_modules, offloaded_group, op_fuser
     ):
-        """Unfused ``TEGroupedMLP`` with its activations really offloaded to CPU and reloaded.
+        """``TEGroupedMLP`` activations are offloaded and replay bit-exactly.
 
         Two experts modules run back to back because the offload manager always keeps the
         last group of each name resident; the first module's group is the one that travels.
-        With both unfused knobs set, fc1 input and activation input go as ONE group named like
-        the fused path's (``fused_group_mlp``); a single knob keeps its own group.
+        The MXFP8 op-fuser case covers the fused input release path changed in this PR.
         """
+        if op_fuser and (
+            not is_te_min_version("2.21.0") or torch.cuda.get_device_capability()[0] < 10
+        ):
+            pytest.skip("MXFP8 op-fuser dispatch needs TE >= 2.21 and Blackwell")
         self._init()
         seeded()
         PipelineOffloadManager.reset_instance()
@@ -1257,17 +1261,20 @@ class TestMoEModules:
             fine_grained_activation_offloading=True,
             offload_modules=offload_modules,
             min_offloaded_tensor_size=1024,
+            use_transformer_engine_op_fuser=op_fuser,
+            **({"fp8": "e4m3", "fp8_recipe": "mxfp8"} if op_fuser else {}),
         )
         spec = get_gpt_layer_with_transformer_engine_spec(num_experts=8, moe_grouped_gemm=True)
 
         def build():
-            experts = get_submodules(spec.submodules.mlp).experts(
-                num_local_experts=8,
-                config=config,
-                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
-            )
+            with get_fp8_context(config, is_init=True):
+                experts = get_submodules(spec.submodules.mlp).experts(
+                    num_local_experts=8,
+                    config=config,
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                )
             assert isinstance(experts, TEGroupedMLP)
-            assert not experts._with_fused_impl
+            assert experts._with_fused_impl is op_fuser
             return experts.cuda()
 
         stack = torch.nn.ModuleList([build(), build()])
@@ -1289,8 +1296,9 @@ class TestMoEModules:
                 p.grad = None
             h = hidden.clone().requires_grad_(True)
             pr = probs.clone().requires_grad_(True)
-            out, _ = stack[0](h, tokens_per_expert, pr)
-            out, _ = stack[1](out, tokens_per_expert, pr)
+            with get_fp8_context(config):
+                out, _ = stack[0](h, tokens_per_expert, pr)
+                out, _ = stack[1](out, tokens_per_expert, pr)
             out.backward(torch.ones_like(out))
             torch.cuda.synchronize()
             FineGrainedActivationOffloadingInterface.reset()
@@ -1314,7 +1322,9 @@ class TestMoEModules:
             ref = run()
             for i in range(1, 4):
                 for name, a, b in zip(names, ref, run()):
-                    assert bytes_equal(a, b), f"TEGroupedMLP[offload] replay {i}: {name} differs"
+                    assert bytes_equal(
+                        a, b
+                    ), f"TEGroupedMLP[offload, op_fuser={op_fuser}] replay {i}: {name} differs"
         finally:
             PipelineOffloadManager.reset_instance()
 
