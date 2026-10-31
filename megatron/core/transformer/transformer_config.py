@@ -1646,6 +1646,12 @@ class TransformerConfig(ModelParallelConfig):
     quant_recipe: Optional[RecipeConfig] = None
     """Configuration of any per-module quantization settings to be applied to the model"""
 
+    ####################
+    # Stability
+    ####################
+    apply_per_token_grad_clipping: bool = False
+    """Clip output-layer input gradients using a median/MAD threshold over the local tensor."""
+
     transformer_impl: Literal['local', 'transformer_engine', 'inference_optimized'] = (
         "transformer_engine"
     )
