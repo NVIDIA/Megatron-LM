@@ -1236,15 +1236,6 @@ try:
             except ValueError as error:
                 return Response(str(error), status=400)
 
-            streams = [
-                client.add_request_streaming(
-                    prompt_tokens,
-                    sampling_params_for_choice(sampling_params, index),
-                    multi_modal_data=prepared_multimodal_data,
-                    offload_params=offload_params,
-                )
-                for index in range(n)
-            ]
             chat_parsers = None
             if parsers:
                 marker_prefixes = (
@@ -1280,6 +1271,22 @@ try:
                     )
                     for _ in range(n)
                 ]
+            streams = []
+            stream_request_ids = []
+            try:
+                for index in range(n):
+                    stream = client.add_request_streaming(
+                        prompt_tokens,
+                        sampling_params_for_choice(sampling_params, index),
+                        multi_modal_data=prepared_multimodal_data,
+                        offload_params=offload_params,
+                    )
+                    streams.append(stream)
+                    stream_request_ids.append(stream.request_id)
+            except Exception as error:
+                abort_requests(client, stream_request_ids, f"submission failed: {error}")
+                logger.error("Error submitting request: %s", error)
+                return Response(f"Error submitting request: {error}", status=500)
             include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
             response = Response(
                 openai_stream(
@@ -1337,6 +1344,11 @@ try:
             abort_requests(client, request_ids, "client disconnected")
             raise
         except Exception as e:
+            # gather returns as soon as one request raises, but does not cancel
+            # the remaining engine work. Abort every admitted request: completed
+            # IDs are harmless no-ops at the client, while pending siblings
+            # would otherwise keep generating after this HTTP response ends.
+            abort_requests(client, request_ids, f"inference failed: {e}")
             logger.error(f"Error during inference: {e}")
             return Response(f"Error during inference: {e}", status=500)
 

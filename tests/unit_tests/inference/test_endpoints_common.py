@@ -607,7 +607,7 @@ async def test_include_stop_str_in_output_keeps_the_stop_sequence_in_the_respons
                 ]
             ),
             "Error during inference: boom",
-            [],
+            [1, 2, 3],
             id="engine-error",
         ),
     ],
@@ -902,3 +902,33 @@ async def test_streaming_fans_out_and_reports_usage_on_request(path, include_usa
         else []
     )
     assert client.aborted == []
+
+
+@pytest.mark.asyncio
+@PATHS
+async def test_streaming_partial_admission_failure_aborts_admitted_work(path, monkeypatch):
+    class PartiallyFailingClient(ReplyingClient):
+        def add_request_streaming(
+            self, prompt_tokens, sampling_params, *, multi_modal_data=None, offload_params=None
+        ):
+            if len(self.prompt_tokens) == 2:
+                raise RuntimeError("zmq send failed")
+            self.prompt_tokens.append(list(prompt_tokens))
+            self.sampling_params.append(sampling_params)
+            self.multi_modal_data.append(multi_modal_data)
+            self.offload_params.append(offload_params)
+            request_id = len(self.prompt_tokens)
+            self.streamed.append(request_id)
+            return AsyncStream(
+                request_id=request_id,
+                cancel=lambda request_id=request_id: self.aborted.append(request_id),
+            )
+
+    client = PartiallyFailingClient()
+    app = build_streaming_app(path, client, monkeypatch)
+
+    response = await app.test_client().post(path, json={**FAN_OUT_BODIES[path], "stream": True})
+
+    assert response.status_code == 500
+    assert await response.get_data(as_text=True) == "Error submitting request: zmq send failed"
+    assert client.aborted == [1, 2]
