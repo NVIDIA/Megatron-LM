@@ -99,9 +99,13 @@ no optimizer-step network traffic. Persistent ownership stays unchanged;
 full inputs and updates exist temporarily on compute owners.
 
 Gathers and scatters return their P2P works instead of waiting, so communication
-overlaps Newton–Schulz. Before a group is orthogonalized, the gathers of the next
-`lookahead` groups are posted, and a group's updates are applied once `lookahead`
-later groups have been scattered, so each scatter overlaps their Newton–Schulz.
+overlaps Newton–Schulz. Before a group that needs communication is orthogonalized, the
+gathers of the next `lookahead` such groups are posted, and its updates are applied once
+`lookahead` later ones have been scattered, so each scatter overlaps their Newton–Schulz.
+The groups whose tensors all sit on one rank (no communication) are split evenly between
+both ends, with the other groups in between, and the first of them runs before any gather
+is posted. They orthogonalize their momentum and apply the result right after, with no
+gather or scatter, so their Newton–Schulz hides the first gathers and the last scatters.
 Each group in flight holds its momentum inputs, full tensors, and received
 updates, so `lookahead` trades memory for overlap; zero gives the
 non-overlapped order.

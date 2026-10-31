@@ -4,7 +4,7 @@
 
 import pytest
 import torch
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import Replicate
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import layout_builder
@@ -191,6 +191,21 @@ def test_get_local_range_rejects_mesh_size_mismatch(distributed_setup):
     assert layout.rank_to_offset == tuple(range(0, 32, 4))
     rank = mesh.get_local_rank(0)
     assert layout.get_local_range(mesh, [RowAtomic()]) == Range(rank * 8, 8)
+
+
+def test_get_rank_ranges_matches_get_rank_range(distributed_setup):
+    """Every rank's range, keyed by its global rank, as get_rank_range returns it."""
+    if distributed_setup.world_size < 4:
+        pytest.skip("Needs four ranks to test the noncontiguous mesh [1, 3].")
+    mesh = DeviceMesh(distributed_setup.device.type, [1, 3])
+    if mesh.get_coordinate() is None:
+        pytest.skip("Rank is outside the test mesh [1, 3].")
+    layout = layout_builder.build_for_row_atomic(
+        [torch.Size((4, 4)), torch.Size((2, 4))], dp_size=2
+    )
+    ranges = layout.get_rank_ranges(mesh, [RowAtomic()])
+    assert ranges == {1: Range(0, 12), 3: Range(12, 12)}
+    assert ranges == {rank: layout.get_rank_range(mesh, [RowAtomic()], rank) for rank in (1, 3)}
 
 
 def test_get_tensor_range():

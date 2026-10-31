@@ -27,6 +27,11 @@ def _layout(
     )
 
 
+def _owners(buffers) -> list[dict[int, int]]:
+    """The tensor-to-owner mapping of each buffer's plan."""
+    return [plan.tensor_to_owner for plan in assign_owner_work(buffers)]
+
+
 @pytest.mark.parametrize(
     "shapes, offsets, size, ranks, expected",
     [
@@ -57,7 +62,7 @@ def test_assign_owner_work(shapes, offsets, size, ranks, expected, distributed_s
         pytest.skip("Rank is outside the test mesh.")
     layout = _layout(shapes, offsets, size, mesh.size())
     buffer = DBuffer(mesh, [RowAtomic()], layout, torch.float32, distributed_setup.device)
-    assert assign_owner_work([buffer]) == [expected]
+    assert _owners([buffer]) == [expected]
 
 
 def test_assign_owner_work_requires_a_nonempty_shard(distributed_setup):
@@ -70,7 +75,7 @@ def test_assign_owner_work_requires_a_nonempty_shard(distributed_setup):
         distributed_setup.device,
     )
     with pytest.raises(RuntimeError, match="No eligible owner for tensor 0"):
-        assign_owner_work([buffer])
+        _owners([buffer])
 
 
 def test_assign_owner_work_cost_uses_full_shape(distributed_setup):
@@ -79,7 +84,7 @@ def test_assign_owner_work_cost_uses_full_shape(distributed_setup):
     buffer = DBuffer.empty(
         mesh, [Replicate()], [(3, 3), (2, 3, 4)], torch.float32, distributed_setup.device
     )
-    assert assign_owner_work([buffer]) == [{0: 1, 1: 0}]
+    assert _owners([buffer]) == [{0: 1, 1: 0}]
 
 
 def test_assign_owner_work_uses_buffer_placements(distributed_setup):
@@ -90,7 +95,7 @@ def test_assign_owner_work_uses_buffer_placements(distributed_setup):
         mesh, [Replicate(), RowAtomic()], layout, torch.float32, distributed_setup.device
     )
     # Every rank holds the tensor; a hard-coded all-RowAtomic layout picks the last rank.
-    assert assign_owner_work([buffer]) == [{0: 0}]
+    assert _owners([buffer]) == [{0: 0}]
 
 
 @pytest.mark.parametrize("ranks", [[0, 1], [1, 3]])
@@ -124,8 +129,8 @@ def test_assign_owner_work_across_groups(
         )
         for shape, size in [(first_shape, first_size), (second_shape, second_size)]
     ]
-    assert assign_owner_work([buffers[0]]) == [{0: ranks[0]}]
-    assert assign_owner_work(iter(buffers)) == [
+    assert _owners([buffers[0]]) == [{0: ranks[0]}]
+    assert _owners(iter(buffers)) == [
         {index: ranks[owner] for index, owner in owners.items()} for owners in expected
     ]
 
@@ -140,9 +145,9 @@ def test_assign_owner_work_empty_groups(distributed_setup):
     vector_buffer = DBuffer.empty(
         mesh, [Replicate()], [(4,)], torch.float32, distributed_setup.device
     )
-    assert assign_owner_work([]) == []
-    assert assign_owner_work([empty_buffer]) == [{}]
-    assert assign_owner_work([empty_buffer, buffer, vector_buffer]) == [{}, {1: 0}, {}]
+    assert _owners([]) == []
+    assert _owners([empty_buffer]) == [{}]
+    assert _owners([empty_buffer, buffer, vector_buffer]) == [{}, {1: 0}, {}]
 
 
 def test_assign_owner_work_tie_breaks_by_tensor_index(distributed_setup):
@@ -150,7 +155,7 @@ def test_assign_owner_work_tie_breaks_by_tensor_index(distributed_setup):
     buffer = DBuffer.empty(
         mesh, [Replicate()], [(8, 8), (8, 8)], torch.float32, distributed_setup.device
     )
-    assert assign_owner_work([buffer]) == [{0: 0, 1: 1}]
+    assert _owners([buffer]) == [{0: 0, 1: 1}]
 
 
 @pytest.mark.parametrize("other_ranks", [[0], [0, 2]])
@@ -166,7 +171,21 @@ def test_assign_owner_work_plans_each_mesh_independently(other_ranks, distribute
         DBuffer.empty(mesh, [RowAtomic()], [(8, 8)], torch.float32, distributed_setup.device)
         for mesh in (first, second, first)
     ]
-    first_alone = assign_owner_work([buffers[0], buffers[2]])
-    second_alone = assign_owner_work([buffers[1]])
+    first_alone = _owners([buffers[0], buffers[2]])
+    second_alone = _owners([buffers[1]])
     # Results keep the input order even though the meshes interleave.
-    assert assign_owner_work(buffers) == [first_alone[0], second_alone[0], first_alone[1]]
+    assert _owners(buffers) == [first_alone[0], second_alone[0], first_alone[1]]
+
+
+def test_assign_owner_work_reports_split_tensors(distributed_setup):
+    """Only tensors whose shards sit on several ranks need communication."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("Needs two ranks.")
+    mesh = DeviceMesh(distributed_setup.device.type, [0, 1])
+    if mesh.get_coordinate() is None:
+        pytest.skip("Rank is outside the test mesh.")
+    layout = _layout([(6, 4), (4, 2)], [20, 8], 64, mesh.size())
+    buffer = DBuffer(mesh, [RowAtomic()], layout, torch.float32, distributed_setup.device)
+    (plan,) = assign_owner_work([buffer])
+    assert plan.split_tensors == {0}
+    assert plan.tensor_to_owner[1] == 0

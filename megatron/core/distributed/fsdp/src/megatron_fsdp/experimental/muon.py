@@ -2,6 +2,7 @@
 
 """Muon with sharded momentum and owner-compute updates for MFSDP v2."""
 
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, cast
@@ -35,6 +36,7 @@ class _FsdpGroupAssignment:
     fsdp_group: FsdpParameterGroup
     tensor_to_optimizer_group_index: dict[int, int]
     tensor_to_owner_rank: dict[int, int]
+    has_comm: bool  # Whether any of the optimized tensors spans ranks.
 
 
 @dataclass(frozen=True)
@@ -82,9 +84,10 @@ class FsdpMuon(Muon):
     Momentum remains sharded. Owner assignments balance orthogonalization across a
     fixed set of buffers and are computed during initialization. Each step gathers,
     orthogonalizes, and scatters each buffer on the caller's CUDA stream. Transfers are
-    asynchronous: the gathers of the next ``lookahead`` buffers are posted before the current one
-    is orthogonalized, and a buffer's updates are applied after ``lookahead`` later buffers have
-    been scattered, so each scatter overlaps their Newton-Schulz.
+    asynchronous: before a buffer that needs communication is orthogonalized, the gathers of the
+    next ``lookahead`` such buffers are posted, and its updates are applied after ``lookahead``
+    later ones have been scattered, so each scatter overlaps their Newton-Schulz. Buffers whose
+    tensors all sit on one rank need no communication; they run at both ends of the step.
     Full matrices exist only on their assigned owners.
     The FSDP groups may use different meshes; owners are planned separately for each mesh.
     Parameters and optimizer groups must have the same order on every DP rank, and
@@ -103,10 +106,10 @@ class FsdpMuon(Muon):
 
     Args:
         *args: Positional arguments passed unchanged to EO's ``Muon``.
-        lookahead: Number of buffers whose gathers are posted ahead of the one being
-            orthogonalized, and whose scatters are posted before a buffer's updates are applied.
-            Each buffer in flight adds its momentum inputs, full tensors, and received updates to
-            the peak memory. Zero gives the non-overlapped order.
+        lookahead: Number of buffers that need communication whose gathers are posted ahead of
+            the one being orthogonalized, and whose scatters are posted before a buffer's updates
+            are applied. Each buffer in flight adds its momentum inputs, full tensors, and received
+            updates to the peak memory. Zero gives the non-overlapped order.
         **kwargs: Keyword arguments passed unchanged to EO's ``Muon``.
     """
 
@@ -132,18 +135,20 @@ class FsdpMuon(Muon):
                 fsdp_groups[fsdp_group] = None
                 param_to_optimizer_group_index[param] = group_index
         self._fsdp_group_assignments = []
-        for fsdp_group, tensor_to_owner_rank in zip(
+        for fsdp_group, plan in zip(
             fsdp_groups, assign_owner_work(group.main_weight for group in fsdp_groups), strict=True
         ):
+            tensor_to_optimizer_group_index = {
+                i: param_to_optimizer_group_index[fp.sharded]
+                for i, fp in enumerate(fsdp_group.fsdp_parameters)
+                if fp.sharded in param_to_optimizer_group_index
+            }
             self._fsdp_group_assignments.append(
                 _FsdpGroupAssignment(
                     fsdp_group=fsdp_group,
-                    tensor_to_optimizer_group_index={
-                        i: param_to_optimizer_group_index[fp.sharded]
-                        for i, fp in enumerate(fsdp_group.fsdp_parameters)
-                        if fp.sharded in param_to_optimizer_group_index
-                    },
-                    tensor_to_owner_rank=tensor_to_owner_rank,
+                    tensor_to_optimizer_group_index=tensor_to_optimizer_group_index,
+                    tensor_to_owner_rank=plan.tensor_to_owner,
+                    has_comm=not plan.split_tensors.isdisjoint(tensor_to_optimizer_group_index),
                 )
             )
         self._validate_parameter_groups()
@@ -164,7 +169,9 @@ class FsdpMuon(Muon):
         if closure is not None:
             raise ValueError("closure is not supported")
 
-        groups: list[tuple[FsdpParameterGroup, dict[int, int], dict[int, int]]] = []
+        # Per FSDP group with gradients: the group, its active tensors, and their owners.
+        free: list[tuple[FsdpParameterGroup, dict[int, int], dict[int, int]]] = []
+        comm: list[tuple[FsdpParameterGroup, dict[int, int], dict[int, int]]] = []
         for assignment in self._fsdp_group_assignments:
             fsdp_group: FsdpParameterGroup = assignment.fsdp_group
             active: dict[int, int] = {
@@ -175,28 +182,62 @@ class FsdpMuon(Muon):
             if not active:
                 continue
             owners = {i: assignment.tensor_to_owner_rank[i] for i in active}
-            groups.append((fsdp_group, active, owners))
+            (comm if assignment.has_comm else free).append((fsdp_group, active, owners))
 
-        # Software pipeline over groups. While a group is orthogonalized, the gathers of the next
-        # `lookahead` groups and the scatters of the previous `lookahead` groups are in flight, so
-        # communication overlaps Newton-Schulz and only those groups hold buffers. Every rank posts
-        # transfers in the same order.
-        gathers = [self._gather(*group) for group in groups[: self.lookahead]]
-        scatters: list[_Transfer] = []
-        for i in range(len(groups)):
-            if i + self.lookahead < len(groups):
-                gathers.append(self._gather(*groups[i + self.lookahead]))
-            gathered = gathers.pop(0)
+        # A group without communication needs no gather, so its Newton-Schulz can hide the
+        # communication of the others. Split those groups evenly between both ends: the first ones
+        # hide the first gathers and the last ones hide the last scatters.
+        front, back = free[: (len(free) + 1) // 2], free[(len(free) + 1) // 2 :]
+
+        # The groups with communication form a software pipeline. While one is orthogonalized, the
+        # gathers of the next `lookahead` groups and the scatters of the previous `lookahead`
+        # groups are in flight, so communication overlaps Newton-Schulz and only those groups hold
+        # buffers. Every rank posts them in the same order, whatever its other groups are.
+        inflight_gathers: deque[_Transfer] = deque()
+        inflight_scatters: deque[_Transfer] = deque()
+        for group in front[:1]:
+            self._orthogonalize_without_comm(*group)  # Runs while the gathers below are posted.
+        inflight_gathers.extend(self._gather(*group) for group in comm[: self.lookahead])
+        for group in front[1:]:
+            self._orthogonalize_without_comm(*group)
+        for i in range(len(comm)):
+            if i + self.lookahead < len(comm):
+                inflight_gathers.append(self._gather(*comm[i + self.lookahead]))
+            gathered = inflight_gathers.popleft()
             gathered.wait()
             self._orthogonalize_updates(
                 gathered.fsdp_group, gathered.tensor_to_optimizer_group_index, gathered.full_updates
             )
-            scatters.append(self._scatter(gathered))
+            inflight_scatters.append(self._scatter(gathered))
             del gathered  # Drop the gather, and with it the momentum inputs it holds.
-            if len(scatters) > self.lookahead:
-                self._apply_scattered_updates(scatters.pop(0))
-        for scattered in scatters:
+            if len(inflight_scatters) > self.lookahead:
+                self._apply_scattered_updates(inflight_scatters.popleft())
+        for group in back:
+            self._orthogonalize_without_comm(*group)
+        for scattered in inflight_scatters:
             self._apply_scattered_updates(scattered)
+
+    def _orthogonalize_without_comm(
+        self,
+        fsdp_group: FsdpParameterGroup,
+        tensor_to_optimizer_group_index: dict[int, int],
+        tensor_to_owner: dict[int, int],
+    ) -> None:
+        """Update a group none of whose tensors spans ranks, with no gather or scatter.
+
+        The owner of a tensor is the only rank holding it, so its momentum input is already the
+        full tensor: orthogonalize it directly.
+        """
+        this_rank: int = fsdp_group.mesh.get_rank()
+        owned: dict[int, int] = {
+            i: group_index
+            for i, group_index in tensor_to_optimizer_group_index.items()
+            if tensor_to_owner[i] == this_rank
+        }
+        inputs = self._compute_momentum_inputs(fsdp_group, tensor_to_optimizer_group_index)
+        full_updates: dict[int, torch.Tensor] = {i: inputs[i] for i in owned}
+        self._orthogonalize_updates(fsdp_group, owned, full_updates)
+        self._apply_local_updates(fsdp_group, owned, full_updates, None)
 
     def _apply_scattered_updates(self, scattered: _Transfer) -> None:
         """Wait for a group's scatter, then apply its updates."""
@@ -226,9 +267,13 @@ class FsdpMuon(Muon):
             The posted gather, holding the momentum inputs and the owners' full-tensor destinations.
         """
         buffer: DBuffer = fsdp_group.main_weight
-        momentum_inputs: DBuffer = self._compute_momentum_inputs(
-            fsdp_group, tensor_to_optimizer_group_index
+        momentum_inputs: DBuffer = DBuffer(
+            buffer.mesh, buffer.placements, buffer.layout, buffer.dtype, buffer.device
         )
+        for i, local_input in self._compute_momentum_inputs(
+            fsdp_group, tensor_to_optimizer_group_index
+        ).items():
+            momentum_inputs.get_tensor_view(i).copy_(local_input)
         this_rank: int = fsdp_group.mesh.get_rank()
         full_updates: dict[int, torch.Tensor] = {
             i: torch.empty(buffer.layout.tensor_shapes[i], dtype=buffer.dtype, device=buffer.device)
@@ -263,12 +308,12 @@ class FsdpMuon(Muon):
 
     def _compute_momentum_inputs(
         self, fsdp_group: FsdpParameterGroup, tensor_to_optimizer_group_index: dict[int, int]
-    ) -> DBuffer:
-        """Apply local weight decay, update momentum, and build inputs for orthogonalization."""
-        buffer: DBuffer = fsdp_group.main_weight
-        momentum_inputs: DBuffer = DBuffer(
-            buffer.mesh, buffer.placements, buffer.layout, buffer.dtype, buffer.device
-        )
+    ) -> dict[int, torch.Tensor]:
+        """Apply local weight decay, update momentum, and return each tensor's local input.
+
+        Without Nesterov the input is the momentum buffer itself, so callers must not modify it.
+        """
+        inputs: dict[int, torch.Tensor] = {}
         for i, group_index in tensor_to_optimizer_group_index.items():
             group: dict[str, Any] = self.param_groups[group_index]
             param: DTensor = cast(DTensor, fsdp_group.fsdp_parameters[i].sharded)
@@ -276,7 +321,6 @@ class FsdpMuon(Muon):
             state: dict[str, Any] = self.state[param]
             if not state:
                 state["momentum_buffer"] = torch.zeros_like(param)
-            local_input: torch.Tensor = momentum_inputs.get_tensor_view(i)
             momentum: torch.Tensor = state["momentum_buffer"].to_local()
             grad: torch.Tensor = param.grad.to_local().to(momentum.dtype).reshape(momentum.shape)
             # Match EO's decay before momentum without calling its private helper.
@@ -297,11 +341,8 @@ class FsdpMuon(Muon):
                         raise ValueError(f"Invalid weight decay method: {self.weight_decay_method}")
             # EO's OrthogonalizedOptimizer.step implements momentum inline, without a helper.
             momentum.lerp_(grad, 1 - group["momentum"])
-            if self.nesterov:
-                torch.lerp(grad, momentum, group["momentum"], out=local_input.view_as(momentum))
-            else:
-                local_input.copy_(momentum.reshape(local_input.shape))
-        return momentum_inputs
+            inputs[i] = torch.lerp(grad, momentum, group["momentum"]) if self.nesterov else momentum
+        return inputs
 
     def _orthogonalize_updates(
         self,
@@ -322,9 +363,12 @@ class FsdpMuon(Muon):
         fsdp_group: FsdpParameterGroup,
         tensor_to_optimizer_group_index: dict[int, int],
         full_updates: dict[int, torch.Tensor],
-        local_updates: DBuffer,
+        local_updates: DBuffer | None,
     ) -> None:
-        """Apply owned result slices and received updates to local parameter shards."""
+        """Apply owned result slices and received updates to local parameter shards.
+
+        `local_updates` may be None when `full_updates` holds every tensor.
+        """
         buffer: DBuffer = fsdp_group.main_weight
         for i, group_index in tensor_to_optimizer_group_index.items():
             param: DTensor = cast(DTensor, fsdp_group.fsdp_parameters[i].sharded)
@@ -334,6 +378,7 @@ class FsdpMuon(Muon):
                 offset: int = max(buffer.offset - buffer.layout.get_tensor_range(i).start, 0)
                 update: torch.Tensor = full_updates[i].view(-1).narrow(0, offset, weight.numel())
             else:
+                assert local_updates is not None
                 update = local_updates.get_tensor_view(i)
             update = update.reshape(weight.shape).to(weight.dtype)
             # These hooks are inherited from EO's OrthogonalizedOptimizer, via Muon.

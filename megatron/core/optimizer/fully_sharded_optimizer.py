@@ -326,19 +326,26 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         ``get_data_parallel_group_if_dtensor`` always sees plain tensors, returns None,
         and the layout is gone by the time the norm is taken.
         """
-        total_norm_squared = torch.zeros(
-            (), dtype=torch.float32, device=torch.cuda.current_device()
-        )
+        # Group the local gradients by replication, so that each group takes one foreach norm
+        # instead of several small kernels per parameter.
+        grads_by_replication: dict[int, list[torch.Tensor]] = {}
         for parameter in self.get_parameters():
             # MFSDP v2 reduces into parameter.grad; it never populates decoupled_grad,
             # which is a v1 param-and-grad-buffer concept.
             grad = parameter.grad
             if grad is None:
                 continue
-            replication = count_replication(grad)
             local_grad = grad.to_local()
             if local_grad.numel() > 0:
-                total_norm_squared += local_grad.float().pow(2).sum() / replication
+                grads_by_replication.setdefault(count_replication(grad), []).append(
+                    local_grad.float()
+                )
+        total_norm_squared = torch.zeros(
+            (), dtype=torch.float32, device=torch.cuda.current_device()
+        )
+        for replication, local_grads in grads_by_replication.items():
+            norms = torch.stack(torch._foreach_norm(local_grads))
+            total_norm_squared += norms.square().sum() / replication
 
         torch.distributed.all_reduce(
             total_norm_squared,
@@ -405,15 +412,14 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
 
         assert not self._casted_grads
         for parameter in self.get_parameters():
-            if parameter.grad is None:
-                continue
-            if parameter.grad.dtype == parameter.data.dtype:
+            original_grad = parameter.grad
+            # parameter.data would dispatch through DTensor on every call.
+            if original_grad is None or original_grad.dtype == parameter.dtype:
                 continue
 
-            original_grad = parameter.grad
             parameter.grad = None
-            parameter.grad_dtype = parameter.data.dtype
-            parameter.grad = original_grad.to(dtype=parameter.data.dtype)
+            parameter.grad_dtype = parameter.dtype
+            parameter.grad = original_grad.to(dtype=parameter.dtype)
             self._casted_grads.append((parameter, original_grad))
 
     @override
