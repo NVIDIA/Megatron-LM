@@ -28,13 +28,14 @@ class FsdpContext:
     """Runtime stream and prefetch state shared by FSDP roots constructed together."""
 
     allgather_stream: torch.cuda.Stream
-    reduce_scatter_stream: torch.cuda.Stream
+    inner_reduction_stream: torch.cuda.Stream
+    # Aliases inner_reduction_stream unless DP-outer overlap is enabled.
+    outer_reduction_stream: torch.cuda.Stream
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
     # unnecessary because each parameter group tracks whether model_weight is stale
     # after syncing from main_weight.
     is_last_microbatch: bool
     use_symmetric_memory: bool
-    unify_communication_stream: bool
     caller_managed_grad_sync: bool
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
@@ -69,6 +70,8 @@ class FsdpContext:
                 that mesh. Every TensorAtomic parameter needs an entry; other entries are
                 ignored. Tensors are packed by owner without changing logical parameter order.
         """
+        overlap_allgather_reduction = runtime_policy.overlap_allgather_reduction
+        overlap_outer_communication = runtime_policy.overlap_outer_communication
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
         if device.type != "cuda":
@@ -76,7 +79,6 @@ class FsdpContext:
 
         self.is_last_microbatch = True
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
-        self.unify_communication_stream = runtime_policy.unify_communication_stream
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
         self.forward_order = ExecutionOrder()
         self.backward_order = ExecutionOrder()
@@ -90,13 +92,27 @@ class FsdpContext:
         self._module_names = WeakKeyDictionary()
         self.parameter_to_owner = parameter_to_owner
         self._is_finalized = False
-        self.allgather_stream = torch.cuda.Stream(device)
-        if self.unify_communication_stream:
-            # A unified stream lets an all-gather reuse the storage released by a
-            # preceding reduce-scatter.
-            self.reduce_scatter_stream = self.allgather_stream
-        else:
-            self.reduce_scatter_stream = torch.cuda.Stream(device)
+        # The two overlap options independently split streams from the inner
+        # reduction stream. With (overlap_allgather_reduction,
+        # overlap_outer_communication), the assignments are:
+        #   (False, False): all-gather and both reductions share one stream.
+        #   (True, False):  all-gather is separate; both reductions share a stream.
+        #   (False, True):  all-gather and inner reduction share; outer is separate.
+        #   (True, True):   all-gather, inner reduction, and outer reduction each
+        #                  have a separate stream.
+        # Outer all-gather separation is not implemented yet; the outer option
+        # currently affects only reduction.
+        self.inner_reduction_stream = torch.cuda.Stream(device)
+        self.allgather_stream = (
+            torch.cuda.Stream(device)
+            if overlap_allgather_reduction
+            else self.inner_reduction_stream
+        )
+        self.outer_reduction_stream = (
+            torch.cuda.Stream(device)
+            if overlap_outer_communication
+            else self.inner_reduction_stream
+        )
 
     @property
     def is_finalized(self) -> bool:
@@ -177,7 +193,9 @@ class FsdpContext:
         and before reading or modifying gradients. This enqueues a stream dependency;
         it does not block the CPU or wait for reductions that have not yet been launched.
         """
-        self.current_stream().wait_stream(self.reduce_scatter_stream)
+        self.current_stream().wait_stream(self.inner_reduction_stream)
+        if self.outer_reduction_stream is not self.inner_reduction_stream:
+            self.current_stream().wait_stream(self.outer_reduction_stream)
 
     def post_backward(self) -> None:
         """Finish backward cleanup and automatically synchronize the last microbatch."""
