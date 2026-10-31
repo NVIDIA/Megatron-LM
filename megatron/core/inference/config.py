@@ -83,7 +83,7 @@ class MambaInferenceStateConfig:
 
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
-        recurrent_symbols = (Symbols.MAMBA, Symbols.GDN)
+        recurrent_symbols = Symbols.RECURRENT_STATE_LAYERS
         if layer_type_list is not None and any(
             symbol in layer_type_list for symbol in recurrent_symbols
         ):
@@ -145,6 +145,17 @@ class MambaInferenceStateConfig:
                 gdp_num_householder=gdp_num_householder,
             )
         return None
+
+
+def layer_types_from_model(model: MegatronModule) -> Optional[List[str]]:
+    """Layer types of this pipeline stage's main decoder, or None for a non-hybrid model.
+
+    Lets `DynamicInferenceContext` give KV-cache planes to the attention layers of every hybrid
+    model, including one without Mamba or GDN layers, which has no `MambaInferenceStateConfig`.
+    """
+    decoder = get_attr_wrapped_model(model, "decoder")
+    layer_type_list = getattr(decoder, "layer_type_list", None)
+    return list(layer_type_list) if layer_type_list is not None else None
 
 
 def mtp_layer_types_from_model(model: MegatronModule) -> Optional[List[str]]:
@@ -522,6 +533,12 @@ class InferenceConfig:
 
     mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None
     """The Mamba inference state config if the model is a hybrid model."""
+
+    layer_type_list: Optional[List[str]] = None
+    """Layer types of this pipeline stage's main decoder, one symbol per layer, for a hybrid
+    model, or None for a non-hybrid model. Read by `DynamicInferenceContext` to give KV-cache
+    planes to the attention layers only. Defaults to the list in `mamba_inference_state_config`
+    when that is set."""
 
     mtp_layer_type_list: Optional[List[str]] = None
     """Layer types of one MTP draft-head depth, one symbol per layer, or None for a non-hybrid
