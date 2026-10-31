@@ -9,6 +9,7 @@ from typing import Optional
 
 import torch
 
+from megatron.core.parallel_state import TeardownStage, register_model_parallel_teardown
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tensor_parallel.random import (
     cudagraph_needs_generator_registration,
@@ -356,8 +357,10 @@ class FullCudaGraphWrapper:
         """Increment current training/validation iteration."""
         FullCudaGraphWrapper.curr_iteration[stage] += 1
 
-    def reset_cuda_graph(self, stage=None):
+    @classmethod
+    def reset_cuda_graph(cls, stage=None):
         """Reset CUDA graph."""
+        had_graph = any(graph is not None for graph in cls.cuda_graph.values())
         if stage is None or stage == 'training':
             if FullCudaGraphWrapper.cuda_graph['training'] is not None:
                 del FullCudaGraphWrapper.cuda_graph['training']
@@ -372,4 +375,24 @@ class FullCudaGraphWrapper:
             FullCudaGraphWrapper.result['validation'] = None
             FullCudaGraphWrapper.curr_iteration['validation'] = 0
             get_rerun_state_machine().clear_deferred_validations("validation")
-        gc.collect()
+        if had_graph:
+            gc.collect()
+
+
+def _release_full_cuda_graphs() -> None:
+    """Release the full-iteration graphs, which keep their captured communicators alive.
+
+    The next model-parallel lifetime warms up and captures again. Deferred validations
+    are recorded only while a graph is captured, so without a graph this resets the
+    iteration state directly: reset_cuda_graph() would initialize the rerun state machine
+    implicitly, and a later explicit initialization would then fail.
+    """
+    if any(graph is not None for graph in FullCudaGraphWrapper.cuda_graph.values()):
+        FullCudaGraphWrapper.reset_cuda_graph()
+        return
+    for stage in FullCudaGraphWrapper.cuda_graph:
+        FullCudaGraphWrapper.result[stage] = None
+        FullCudaGraphWrapper.curr_iteration[stage] = 0
+
+
+register_model_parallel_teardown(TeardownStage.RELEASE_CUDA_GRAPHS, _release_full_cuda_graphs)

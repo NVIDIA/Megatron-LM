@@ -27,14 +27,21 @@ from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
+    TeardownStage,
     get_amax_reduction_group,
     get_context_parallel_group,
     get_hierarchical_context_parallel_groups,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_world_size,
     model_parallel_is_initialized,
+    register_model_parallel_teardown,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+    resolve_gtp_remat_group,
+    warn_global_process_group_fallback,
+)
 from megatron.core.quantization.quant_config import QuantizationConfig
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_observation import suspend_tensor_observations
@@ -108,6 +115,38 @@ HAVE_TE_GDN = _TE_LINEAR_ATTENTION is not None
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 _EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
+
+
+def _te_autocast_depth() -> int:
+    """Return the nesting depth of Transformer Engine autocast contexts."""
+    if is_te_min_version("2.15.0"):
+        return FP8GlobalStateManager.quantization_state.autocast_depth
+    if is_te_min_version("2.9.0"):
+        return FP8GlobalStateManager.AUTOCAST_DEPTH
+    return FP8GlobalStateManager.FP8_AUTOCAST_DEPTH
+
+
+def _check_te_autocast_exited() -> None:
+    """Refuse model-parallel teardown inside a Transformer Engine autocast context.
+
+    On exit, an open context can reduce FP8 scaling statistics over its process group,
+    which teardown destroys, and it reads the global state that teardown resets. A
+    negative depth is accepted: in-process restart with NVIDIA Resiliency Extension
+    resets TE before the interrupted main thread unwinds its autocast, whose exit then
+    decrements the reset depth below zero.
+    """
+    if _te_autocast_depth() > 0:
+        raise RuntimeError("Exit Transformer Engine autocast before destroying model parallelism.")
+
+
+def _reset_te_global_state() -> None:
+    """Drop TE's FP8 reduction groups and per-model tensor caches."""
+    FP8GlobalStateManager.reset()
+
+
+if HAVE_TE:
+    register_model_parallel_teardown(TeardownStage.VALIDATE, _check_te_autocast_exited)
+    register_model_parallel_teardown(TeardownStage.RESET_STATE, _reset_te_global_state)
 
 
 def _set_expert_parameter_attributes(
@@ -593,6 +632,47 @@ def _init_gtp_remat_context(
     )
     yield out_features
     _gtp_attach_post_init(module, gtp_ctx, is_grouped=is_grouped, replica_group=replica_group)
+
+
+def _gtp_replica_group(
+    pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None,
+    name: str,
+    gtp_remat_group: Optional[torch.distributed.ProcessGroup],
+    *,
+    owner: str,
+) -> Optional[torch.distributed.ProcessGroup]:
+    """Return the group ``name`` of ``pg_collection`` that replicates a layer's GTP weight shards.
+
+    Distributed checkpointing elects the writer of each GTP weight shard among its replicas, the
+    data-parallel peers outside the gtp_remat axis: ``dp_cp`` for a dense layer and ``expt_dp``
+    for an expert layer. The layer stamps this group on its shards when it is built. A layer
+    without GTP weight remat (``gtp_remat_group`` is None or has a single rank) has no GTP
+    shards, so this returns None.
+
+    A layer with GTP shards whose collection does not hold the group, or that has no collection,
+    also gets None, and ``gtp_replica_rank`` then elects the writer over the global group when
+    the checkpoint is saved. That fallback is deprecated, so this emits a
+    ``ProcessGroupFallbackWarning`` while the layer is built, where the caller can still pass the
+    group.
+
+    Args:
+        pg_collection: The layer's collection, or None.
+        name: ``dp_cp`` or ``expt_dp``.
+        gtp_remat_group: The layer's gtp_remat group, from ``resolve_gtp_remat_group``.
+        owner: Name of the layer class, used in the warning.
+    """
+    if gtp_remat_group is None or gtp_remat_group.size() <= 1:
+        return None
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        # Like resolve_gtp_remat_group: only the language model's collection has GTP axes.
+        pg_collection = pg_collection.get_language_model_collection()
+    # An unset field and an explicit None both leave the shards to the global fallback.
+    group = None if pg_collection is None else vars(pg_collection).get(name)
+    if group is None:
+        warn_global_process_group_fallback(
+            owner, f"pg_collection.{name}", deprecated_in="0.21", removed_in="0.23"
+        )
+    return group
 
 
 def split_te_layernorm_column_parallel_linear(
@@ -1638,7 +1718,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             extra_kwargs,
             rng_via_kwarg=False,
             out_split_size=self.tp_size,
-            replica_group=getattr(pg_collection, "dp_cp", None),
+            replica_group=_gtp_replica_group(
+                pg_collection, "dp_cp", gtp_remat_group, owner=type(self).__name__
+            ),
         )
 
         with init_quant_context, init_gtp_remat_context as gtp_output_size:
@@ -1830,7 +1912,12 @@ class TEColumnParallelLinear(TELinear):
             tp_group=tp_group,
             name=name,
             gtp_remat_group=gtp_remat_group,
-            gtp_replica_group=getattr(pg_collection, "expt_dp" if is_expert else "dp_cp", None),
+            gtp_replica_group=_gtp_replica_group(
+                pg_collection,
+                "expt_dp" if is_expert else "dp_cp",
+                gtp_remat_group,
+                owner=type(self).__name__,
+            ),
         )
 
         # Set proper partition_stride
@@ -2103,7 +2190,12 @@ class TERowParallelLinear(TELinear):
             tp_group=tp_group,
             name=name,
             gtp_remat_group=gtp_remat_group,
-            gtp_replica_group=getattr(pg_collection, "expt_dp" if is_expert else "dp_cp", None),
+            gtp_replica_group=_gtp_replica_group(
+                pg_collection,
+                "expt_dp" if is_expert else "dp_cp",
+                gtp_remat_group,
+                owner=type(self).__name__,
+            ),
         )
         if config.use_cpu_initialization:
             world_size = get_pg_size(tp_group)
@@ -2303,6 +2395,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             )
 
         if pg_collection is None:
+            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection(
                 tp=get_tensor_model_parallel_group(check_initialized=False),
                 cp=get_context_parallel_group(check_initialized=False),
@@ -2315,10 +2408,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             assert hasattr(
                 pg_collection, "cp"
             ), "TEDotProductAttention pg_collection must have cp pg"
-            if cp_comm_type == "a2a+p2p":
-                assert hasattr(
-                    pg_collection, "hcp"
-                ), "TEDotProductAttention pg_collection must have hierarchical cp pg"
         self._tp_group = pg_collection.tp
 
         if is_te_min_version("0.10.0"):
@@ -2350,9 +2439,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                         "hierarchical cp commucation."
                     )
                     extra_kwargs["cp_comm_type"] = "a2a+p2p"
-                    extra_kwargs["cp_group"] = get_hierarchical_context_parallel_groups(
-                        check_initialized=False
-                    )
+                    # The global-group fallbacks and use_mpu_process_groups() carry hcp; a
+                    # collection built for another grid must set it.
+                    if vars(pg_collection).get("hcp") is None:
+                        raise ValueError(
+                            "TEDotProductAttention with cp_comm_type='a2a+p2p' requires "
+                            "pg_collection.hcp (the hierarchical context-parallel groups)"
+                        )
+                    extra_kwargs["cp_group"] = pg_collection.hcp
                 else:
                     extra_kwargs["cp_comm_type"] = cp_comm_type
 
@@ -2720,6 +2814,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             # The comms between TP and EP group is explicitly handled by MoE token dispatcher.
             # So we disable comms by making TE agnostic of model parallel.
             if pg_collection is None:
+                warn_global_process_group_fallback(type(self).__name__)
                 pg_collection = ProcessGroupCollection.use_mpu_process_groups()
             self._pg_collection = pg_collection
             assert is_expert, "TEGroupedLinear only supports expert parallelism"
@@ -2788,7 +2883,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 is_expert=True,
                 is_grouped=True,
                 out_split_size=tp_size if parallel_mode == "column" else 1,
-                replica_group=getattr(pg_collection, "expt_dp", None),
+                replica_group=_gtp_replica_group(
+                    pg_collection, "expt_dp", gtp_remat_group, owner=type(self).__name__
+                ),
             )
 
             with init_quant_context, init_gtp_remat_context as output_size:

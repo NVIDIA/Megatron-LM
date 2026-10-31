@@ -47,6 +47,7 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server impo
     start_text_gen_server,
     stop_text_gen_server,
 )
+from megatron.core.parallel_state import get_registered_process_groups  # noqa: E402
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer  # noqa: E402
 from megatron.core.utils import (  # noqa: E402
     configure_nvtx_profiling,
@@ -201,7 +202,8 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
     args = get_args()
 
     if not is_vlm:
-        return get_dynamic_inference_engine()
+        # The model is built on the groups of the grid that initialize_megatron() registered.
+        return get_dynamic_inference_engine(pg_collection=get_registered_process_groups())
 
     tokenizer = build_tokenizer(args)
     model = get_vlm_model(is_vlm=True)

@@ -19,6 +19,8 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.parallel_state import get_registered_process_groups
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
 from megatron.inference.utils import (
@@ -34,7 +36,6 @@ sys.path.append(
 from functools import partial
 from typing import List
 
-from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
@@ -80,8 +81,9 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
             args.inference_max_requests, args.inference_max_sequence_length
         )
         inference_wrapped_model = GPTInferenceWrapper(model, context)
+        pp_group = inference_wrapped_model.pp_group
         inference_wrapped_model.model_is_pipeline_parallel = not (
-            mpu.is_pipeline_first_stage() and mpu.is_pipeline_last_stage()
+            is_pp_first_stage(pp_group) and is_pp_last_stage(pp_group)
         )
         text_generation_controller = TextGenerationController(
             inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
@@ -166,7 +168,7 @@ def main():
 
     args = get_args()
 
-    model = get_model_for_inference()
+    model = get_model_for_inference(pg_collection=get_registered_process_groups())
 
     tokenizer = build_tokenizer(args)
 
