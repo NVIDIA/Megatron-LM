@@ -99,12 +99,24 @@ no optimizer-step network traffic. Persistent ownership stays unchanged;
 full inputs and updates exist temporarily on compute owners.
 
 Gathers and scatters return their P2P works instead of waiting, so communication
-overlaps Newton–Schulz. Before a group is orthogonalized, the gathers of the next
-`lookahead` groups are posted, and a group's updates are applied once `lookahead`
-later groups have been scattered, so each scatter overlaps their Newton–Schulz.
-Each group in flight holds its momentum inputs, full tensors, and received
-updates, so `lookahead` trades memory for overlap; zero gives the
-non-overlapped order.
+overlaps Newton–Schulz. The momentum updates and gathers run on a side CUDA stream, so
+they do not queue behind earlier Newton–Schulz kernels. The gathers of all groups that
+need communication are posted before the first is orthogonalized, and their updates are
+applied at the end of the step.
+Groups whose tensors all sit on one rank need no communication: they orthogonalize their
+momentum directly and apply the result at once. The first one is enqueued before
+the gathers are posted, so the GPU has work while the host posts them; the others run
+after the groups that need communication and hide its last scatters.
+
+In the order they are enqueued (N: Newton–Schulz, G: gather on the side stream, S: scatter,
+A: apply the updates), with `free` the groups that need no communication:
+
+```text
+N(free[0]) | G(all groups) | for each group i: N(i), S(i) | N(free[1:]) | A(all groups)
+```
+
+Every group in flight holds its full tensors and received updates until the end of the
+step, which adds to the peak memory.
 
 A simpler alternative in [issue #5533](https://github.com/NVIDIA/Megatron-LM/issues/5533)
 all-gathers boundary-matrix inputs and duplicates orthogonalization. The

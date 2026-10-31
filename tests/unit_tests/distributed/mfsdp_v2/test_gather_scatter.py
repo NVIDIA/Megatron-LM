@@ -14,6 +14,7 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import DBuffer, layout_builder
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.gather_scatter import (
     gather,
+    get_sorted_rank_ranges,
     scatter,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.owner_planning import (
@@ -107,6 +108,19 @@ def test_gather_scatter_round_trip(subgroup, placement, distributed_setup):
         torch.testing.assert_close(destination[i], full_tensors[i] + 2, atol=0, rtol=0)
     assert set(destination) == owned
     torch.testing.assert_close(dbuffer.local_buffer, original, atol=0, rtol=0)
+
+    # Rank ranges computed once by the caller give the same result.
+    precomputed = {i: torch.empty_like(tensor) for i, tensor in destination.items()}
+    _wait(
+        gather(
+            source,
+            precomputed,
+            tensor_to_owner=tensor_to_owner,
+            rank_ranges=get_sorted_rank_ranges(source),
+        )
+    )
+    for i in owned:
+        torch.testing.assert_close(precomputed[i], destination[i], atol=0, rtol=0)
 
     for tensor in destination.values():
         tensor.add_(1)

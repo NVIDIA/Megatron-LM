@@ -59,7 +59,6 @@ def _train(
     return torch.stack(losses)
 
 
-@pytest.mark.parametrize("lookahead", [0, 2])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("weight_decay_method", ["decoupled", "independent", "l2", "palm"])
 @pytest.mark.parametrize(
@@ -79,11 +78,11 @@ def _train(
     ],
 )
 def test_muon_matches_reference(
-    distributed_setup, dtype, weight_decay_method, nesterov, kernel_options, lookahead
+    distributed_setup, dtype, weight_decay_method, nesterov, kernel_options
 ):
     """FSDP and unsharded Muon should produce identical loss curves.
 
-    Each linear layer is its own FSDP group, so lookahead pipelines several groups' communication.
+    Each linear layer is its own FSDP group, so several groups' communication is in flight at once.
     """
     world_size = distributed_setup.world_size
     if world_size < 2 or world_size % 2:
@@ -118,7 +117,7 @@ def test_muon_matches_reference(
     )
     excluded_names = ["block2.3.weight", "block2.3.bias"]
     muon_names = [name for name in params if name not in excluded_names]
-    optimizer = muon.FsdpMuon([params[name] for name in muon_names], lookahead=lookahead, **kwargs)
+    optimizer = muon.FsdpMuon([params[name] for name in muon_names], **kwargs)
     fully_shard_optimizer(optimizer, precision_aware=True)
     reference_optimizer = Muon([reference_params[name] for name in muon_names], **kwargs)
     other_optimizer = torch.optim.SGD([params[n] for n in excluded_names], lr=0.01, foreach=False)

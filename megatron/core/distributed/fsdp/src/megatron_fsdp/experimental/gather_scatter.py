@@ -28,8 +28,12 @@ from .dbuffer import DBuffer
 from .range import Range, intersect_ranges
 
 
-def _get_sorted_rank_ranges(buffer: DBuffer) -> dict[int, Range]:
-    """Return sharded buffer ranges keyed by global rank, in buffer offset order."""
+def get_sorted_rank_ranges(buffer: DBuffer) -> dict[int, Range]:
+    """Return sharded buffer ranges keyed by global rank, in buffer offset order.
+
+    They depend only on the buffer's mesh, placements, and layout, so callers that gather or
+    scatter many buffers sharing them can compute the ranges once and pass them as `rank_ranges`.
+    """
     mesh = buffer.mesh
     if mesh.ndim != 1 or not isinstance(buffer.placements[0], Shard):
         raise NotImplementedError("Owner gather/scatter requires a 1-D sharded DBuffer.")
@@ -41,7 +45,11 @@ def _get_sorted_rank_ranges(buffer: DBuffer) -> dict[int, Range]:
 
 
 def gather(
-    source: DBuffer, destination: dict[int, torch.Tensor], *, tensor_to_owner: dict[int, int]
+    source: DBuffer,
+    destination: dict[int, torch.Tensor],
+    *,
+    tensor_to_owner: dict[int, int],
+    rank_ranges: dict[int, Range] | None = None,
 ) -> list[dist.Work]:
     """Gather full tensors from local chunks to their owners via P2P.
 
@@ -62,6 +70,7 @@ def gather(
             does not own are never written to.
         tensor_to_owner: Participating tensor index to owner global rank. Each owner must
             hold a nonempty shard of its tensor; see `assign_owner_work`.
+        rank_ranges: `get_sorted_rank_ranges(source)`, if the caller already has it.
 
     Returns:
         The posted P2P works, empty if this rank has none. Wait on each before using the
@@ -70,7 +79,8 @@ def gather(
     mesh = source.mesh
     this_rank = mesh.get_rank()
     layout = source.layout
-    rank_ranges = _get_sorted_rank_ranges(source)
+    if rank_ranges is None:
+        rank_ranges = get_sorted_rank_ranges(source)
     group = mesh.get_group()
 
     # Build the P2P ops: send non-owned chunks to their owners, receive owned ones.
@@ -109,7 +119,11 @@ def gather(
 
 
 def scatter(
-    source: dict[int, torch.Tensor], destination: DBuffer, *, tensor_to_owner: dict[int, int]
+    source: dict[int, torch.Tensor],
+    destination: DBuffer,
+    *,
+    tensor_to_owner: dict[int, int],
+    rank_ranges: dict[int, Range] | None = None,
 ) -> list[dist.Work]:
     """Scatter full result tensors from the owners to the other ranks via P2P.
 
@@ -131,6 +145,7 @@ def scatter(
             be a separate scratch DBuffer for updates the caller will apply later.
         tensor_to_owner: Participating tensor index to owner global rank. Each owner must
             hold a nonempty shard of its tensor; see `assign_owner_work`.
+        rank_ranges: `get_sorted_rank_ranges(destination)`, if the caller already has it.
 
     Returns:
         The posted P2P works, empty if this rank has none. Wait on each before using the
@@ -139,7 +154,8 @@ def scatter(
     mesh = destination.mesh
     this_rank = mesh.get_rank()
     layout = destination.layout
-    rank_ranges = _get_sorted_rank_ranges(destination)
+    if rank_ranges is None:
+        rank_ranges = get_sorted_rank_ranges(destination)
     group = mesh.get_group()
 
     # Build the P2P ops: send owned result chunks, receive the ones held here.
