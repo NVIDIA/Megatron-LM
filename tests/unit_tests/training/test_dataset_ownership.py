@@ -533,9 +533,7 @@ def test_the_deprecated_hybrid_alias_is_folded_into_dynamic_context_parallel(
     assert not (set(CONTAINER_WRITTEN_FIELDS) & set(cfg.to_dict()["data"]["dataset"]))
 
 
-def test_model_owned_dataset_layout_survives_a_reload(
-    container_factory, monkeypatch, tokenizer
-):
+def test_model_owned_dataset_layout_survives_a_reload(container_factory, monkeypatch, tokenizer):
     """Reloading reconstructs dataset layout from the authoritative model section."""
     _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 8)
@@ -634,9 +632,7 @@ def test_get_data_parallel_size_rejects_an_indivisible_world(container_factory):
     with pytest.raises(ValueError, match="divisible"):
         cfg.get_parallel_layout(6)
     cfg.model = _layout(
-        context_parallel_size=3,
-        gtp_weight_remat_size=2,
-        tensor_parallel_num_sequence_shards=2,
+        context_parallel_size=3, gtp_weight_remat_size=2, tensor_parallel_num_sequence_shards=2
     )
     with pytest.raises(ValueError, match="must contain the GTP sequence shards"):
         cfg.get_parallel_layout(12)
