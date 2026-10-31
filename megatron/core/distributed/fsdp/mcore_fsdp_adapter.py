@@ -201,6 +201,8 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         device: Optional[torch.device] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
+        if config.decoder_num_repeats > 1:
+            raise ValueError("Repeated decoder execution does not support Megatron FSDP")
         if not HAVE_MEGATRON_FSDP:
             raise IMPORT_MEGATRON_FSDP_ERROR
 
@@ -616,6 +618,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ValueError: If required process groups are missing or the configuration
                 requests a feature unsupported by MFSDP v2.
         """
+        if config.decoder_num_repeats > 1:
+            raise ValueError("Repeated decoder execution does not support Megatron FSDP")
         if not HAVE_MEGATRON_FSDP:
             raise IMPORT_MEGATRON_FSDP_ERROR
         if pg_collection is None:

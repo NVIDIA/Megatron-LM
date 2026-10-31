@@ -192,6 +192,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         vp_stage: Optional[int] = None,
         hybrid_layer_config_list: Optional[Sequence[HybridLayerEntry]] = None,
     ) -> None:
+        if config.decoder_num_repeats > 1:
+            raise ValueError(
+                "Repeated decoder execution supports TransformerBlock, not HybridModel"
+            )
         # Snapshot the container immediately. If the root config is also used as a layer entry,
         # detach it before applying model-level normalization so that entry remains caller-owned.
         hybrid_layer_config_list_snapshot = (

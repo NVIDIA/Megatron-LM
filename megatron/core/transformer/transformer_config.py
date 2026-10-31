@@ -72,6 +72,17 @@ class TransformerConfig(ModelParallelConfig):
     num_layers: int = field(default=0, metadata={"argparse_meta": {"default": None}})
     """Number of transformer layers in a transformer block."""
 
+    decoder_num_repeats: int = 1
+    """Total executions of the shared decoder middle segment, including the first pass.
+    One preserves ordinary execution. This changes compute depth, not physical layer count.
+    """
+
+    decoder_repeat_start: Optional[int] = None
+    """First physical decoder layer to repeat (zero-based, inclusive)."""
+
+    decoder_repeat_end: Optional[int] = None
+    """End of the repeated physical decoder segment (zero-based, exclusive)."""
+
     mtp_num_layers: Optional[int] = None
     """Number of Multi-Token Prediction (MTP) Layers.
     MTP extends the prediction scope to multiple future tokens at each position.
@@ -1786,11 +1797,82 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
             )
 
+    def _validate_decoder_repetition(self):
+        """Reject unsupported shared-parameter decoder training configurations early."""
+        if type(self.decoder_num_repeats) is not int or self.decoder_num_repeats < 1:
+            raise ValueError("decoder_num_repeats must be a positive integer")
+        start, end = self.decoder_repeat_start, self.decoder_repeat_end
+        if start is not None or end is not None or self.decoder_num_repeats > 1:
+            if not (
+                type(start) is int and type(end) is int and 0 <= start < end <= self.num_layers
+            ):
+                raise ValueError(
+                    "decoder repetition requires 0 <= decoder_repeat_start < "
+                    "decoder_repeat_end <= num_layers (zero-based, end exclusive)"
+                )
+        if self.decoder_num_repeats == 1:
+            return
+        if not self.bf16 or self.fp16 or self.params_dtype != torch.bfloat16:
+            raise ValueError("Repeated decoder execution requires BF16 parameters and bf16=True")
+        unsupported = {
+            "tensor_model_parallel_size": self.tensor_model_parallel_size != 1,
+            "pipeline_model_parallel_size": self.pipeline_model_parallel_size != 1,
+            "context_parallel_size": self.context_parallel_size != 1,
+            "expert_model_parallel_size": self.expert_model_parallel_size != 1,
+            "tensor_parallel_num_weight_shards": self.tensor_parallel_num_weight_shards
+            not in (None, 1),
+            "virtual_pipeline_model_parallel_size": self.virtual_pipeline_model_parallel_size
+            is not None,
+            "pipeline_model_parallel_layout": self.pipeline_model_parallel_layout is not None,
+            "sequence_parallel": self.sequence_parallel,
+            "gtp_weight_remat_size": self.gtp_weight_remat_size != 1,
+            "dynamic_context_parallel": self.dynamic_context_parallel,
+            "hybrid_context_parallel": self.hybrid_context_parallel,
+            "recompute_granularity": self.recompute_granularity is not None,
+            "fp8": self.fp8 is not None,
+            "fp4": self.fp4 is not None,
+            "num_moe_experts": self.num_moe_experts is not None,
+            "mtp_num_layers": bool(self.mtp_num_layers),
+            "cpu_offloading": self.cpu_offloading,
+            "fine_grained_activation_offloading": self.fine_grained_activation_offloading,
+            "delay_wgrad_compute": self.delay_wgrad_compute,
+            "quant_recipe": self.quant_recipe is not None,
+            "use_kitchen": self.use_kitchen,
+            "use_kitchen_attention": self.use_kitchen_attention,
+            "cuda_graph_impl": self.cuda_graph_impl != "none",
+            "enable_cuda_graph": self.enable_cuda_graph,
+            "external_cuda_graph": self.external_cuda_graph,
+            "enable_mhc_connections": self.enable_mhc_connections,
+            "wide_residual": self.wide_residual is not None,
+            "heterogeneous_block_specs": self.heterogeneous_block_specs,
+            "multi_latent_attention": self.multi_latent_attention,
+        }
+        for name, enabled in unsupported.items():
+            if enabled:
+                raise ValueError(f"Repeated decoder execution does not support {name}")
+
+    def get_decoder_layer_execution_order(self) -> tuple[int, ...]:
+        """Map logical execution positions to physical decoder layers.
+
+        Parameters, layer numbers, optimizer state and checkpoint keys remain physical.
+        The middle segment is shared across all repetitions; the prefix and suffix run once.
+        """
+        if self.decoder_num_repeats == 1:
+            return tuple(range(self.num_layers))
+        start, end = self.decoder_repeat_start, self.decoder_repeat_end
+        assert start is not None and end is not None
+        return (
+            tuple(range(start))
+            + tuple(range(start, end)) * self.decoder_num_repeats
+            + tuple(range(end, self.num_layers))
+        )
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
+        self._validate_decoder_repetition()
         super().__post_init__()
         self._validate_cp_layouts()
 
