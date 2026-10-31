@@ -7,7 +7,6 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 
-from megatron.core import mpu, parallel_state
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
@@ -17,15 +16,11 @@ from megatron.core.num_microbatches_calculator import (
     get_current_global_batch_size,
     get_micro_batch_size,
 )
-from megatron.core.parallel_state import (
-    get_context_parallel_group,
-    get_data_parallel_rank,
-    get_data_parallel_world_size,
-    get_dynamic_data_context_parallel_groups,
-    get_pipeline_model_parallel_rank,
-    get_pipeline_model_parallel_world_size,
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    resolve_process_groups,
+    warn_global_process_group_fallback,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer import TransformerConfig
@@ -36,8 +31,12 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.utils import (
     StragglerDetector,
     flatten_batch_for_packed_sequences,
+    get_attr_wrapped_model,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
+    get_pg_rank,
+    get_pg_size,
+    get_pg_src_rank,
 )
 from megatron.elastification.arguments import add_flextron_args
 from megatron.training import (
@@ -52,10 +51,7 @@ from megatron.training import (
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
-from megatron.training.global_vars import (
-    get_run_config,
-    set_run_config,
-)
+from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 
 # modelopt distillation
@@ -92,11 +88,19 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
     Args:
         pre_process (bool, optional): Set to true if you need to compute embeddings. Defaults to True.
         post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
+        pg_collection (ProcessGroupCollection, optional): Process groups the model is built on.
+            None falls back to the global process groups with a deprecation warning.
 
 
     Returns:
         HybridModel: The returned model
     """
+    if pg_collection is None:
+        warn_global_process_group_fallback(
+            "pretrain_hybrid_flex.model_provider", deprecated_in="0.21", removed_in="0.23"
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
     args = get_args()
     if has_nvidia_modelopt:
 
@@ -145,7 +149,8 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
         position_embedding_type=args.position_embedding_type,
         rotary_percent=args.rotary_percent,
         rotary_base=args.rotary_base,
-        vp_stage=vp_stage
+        vp_stage=vp_stage,
+        pg_collection=pg_collection,
     )
     from megatron.elastification.flextron_utils import (
         inject_flextron_forward_logic,
@@ -175,25 +180,58 @@ BATCH_KEYS = [
 ]
 
 
-def get_batch(data_iterator, vp_stage=None):
-    """Generate a batch."""
+def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroupCollection] = None):
+    """Generate a batch.
+
+    Args:
+        data_iterator: Iterator over this rank's micro-batches, or None on ranks that read
+            no data.
+        vp_stage: Virtual pipeline stage of the model chunk.
+        pg_collection: Process groups of the model. The batch is read on the first rank of
+            its tensor-parallel group, broadcast over that group and sharded over its
+            context-parallel group, or over its ``dynamic_cp`` groups with dynamic context
+            parallelism. None falls back to the global process groups with a deprecation
+            warning.
+    """
 
     args = get_args()
     config = core_transformer_config_from_args(args)
 
+    dynamic_cp = args.dynamic_context_parallel
+    required_group_names = ["tp", "pp", "cp"]
+    if dynamic_cp:
+        required_group_names.append("dynamic_cp")
+    pg_collection = resolve_process_groups(
+        pg_collection,
+        owner="pretrain_hybrid_flex.get_batch",
+        required=required_group_names,
+        deprecated_in="0.21",
+        removed_in="0.23",
+    )
+    # A None group would make torch.distributed use the default (WORLD) group.
+    for group_name in required_group_names:
+        if vars(pg_collection)[group_name] is None:
+            raise ValueError(f"get_batch requires pg_collection.{group_name}")
+    tp_group = pg_collection.tp
+    pp_group = pg_collection.pp
+
     cp_size = args.context_parallel_size
-    tp_rank = mpu.get_tensor_model_parallel_rank()
+    tp_rank = get_pg_rank(tp_group)
     is_sft = args.sft
     has_cu_seqlens = is_sft or getattr(args, 'dataloader_inter_document_masking', False)
-    dynamic_cp = args.dynamic_context_parallel
     mtp_on_this_rank = mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,
         mtp_num_layers=config.mtp_num_layers,
         ignore_virtual=False,
         vp_stage=vp_stage,
+        pp_group=pp_group,
+        vp_size=config.virtual_pipeline_model_parallel_size or 1,
+    )
+    is_first_or_last_stage = is_first_or_last_pipeline_stage(
+        vp_stage, pp_group=pp_group, vp_size=config.virtual_pipeline_model_parallel_size
     )
 
-    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank and not has_cu_seqlens:
+    if not is_first_or_last_stage and not mtp_on_this_rank and not has_cu_seqlens:
         return None, None, None, None, None, None, None
 
     batch = {}
@@ -208,8 +246,8 @@ def get_batch(data_iterator, vp_stage=None):
 
     batch = get_batch_on_this_tp_rank(
         batch,
-        broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
-        broadcast_group=mpu.get_tensor_model_parallel_group(),
+        broadcast_src_rank=get_pg_src_rank(tp_group),
+        broadcast_group=tp_group,
         has_cu_seqlens=has_cu_seqlens,
         dynamic_cp=dynamic_cp,
         create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
@@ -219,23 +257,23 @@ def get_batch(data_iterator, vp_stage=None):
         seq_length=args.seq_length,
         mtp_on_this_rank=mtp_on_this_rank,
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
-        is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
-        is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+        is_pipeline_first_stage=is_pp_first_stage(pp_group),
+        is_pipeline_last_stage=is_pp_last_stage(pp_group),
     )
 
     batch = flatten_batch_for_packed_sequences(batch)
 
     # Intermediate PP stage under SFT only needs THD metadata (matches the
     # pretrain_hybrid.py PP-SFT shortcut, collapsed to the flex 7-tuple shape).
-    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
+    if not is_first_or_last_stage and not mtp_on_this_rank:
         assert has_cu_seqlens
         return None, None, None, None, None, batch['cu_seqlens'], batch['max_seqlen']
 
     batch = get_batch_on_this_cp_rank(
         batch,
         dynamic_cp=dynamic_cp,
-        cp_group=get_context_parallel_group(),
-        dynamic_cp_group_func=get_dynamic_data_context_parallel_groups,
+        cp_group=pg_collection.cp,
+        dynamic_cp_group_func=lambda group_size: pg_collection.dynamic_cp[group_size],
         use_per_sequence_balancing=(
             getattr(args, 'dataloader_inter_document_masking', False) and not is_sft
         ),
@@ -347,9 +385,32 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
     else:
         return (loss, num_tokens, {'lm loss': reporting_loss})
 
-def get_grad_acc_based_random_choice(args, choices=None, prob=None, base_seed=42, training=True):
 
-    dp_size = get_data_parallel_world_size()
+def get_grad_acc_based_random_choice(
+    args, choices=None, prob=None, base_seed=42, training=True, pg_collection=None
+):
+    """Draw a random choice seeded by the training iteration and the micro-batch index in it.
+
+    Args:
+        args: Megatron arguments.
+        choices: Values to choose from; None draws a uniform number in [0, 1).
+        prob: Probabilities of ``choices``; None chooses uniformly.
+        base_seed: Seed offset of the draws.
+        training: Whether the draw is for a training step; evaluation after the last executed
+            step uses the schedule of that step.
+        pg_collection: Process groups of the model. The size of its ``dp_gtp_remat`` group,
+            whose ranks train on distinct samples, sets the number of gradient-accumulation
+            steps. None falls back to the global process groups with a deprecation warning.
+    """
+
+    pg_collection = resolve_process_groups(
+        pg_collection,
+        owner="pretrain_hybrid_flex.get_grad_acc_based_random_choice",
+        required=("dp_gtp_remat",),
+        deprecated_in="0.21",
+        removed_in="0.23",
+    )
+    dp_size = get_pg_size(pg_collection.dp_gtp_remat)
     grad_accumulation_steps = get_current_global_batch_size() // (get_micro_batch_size() * dp_size)
     global _global_choice_counter
 
@@ -415,23 +476,22 @@ def forward_step(data_iterator, model: HybridModel):
         for grp, sq in sorted(groups.items()):
             print_rank_0(f"[PARAMS_NORM]   {grp}: {sq**0.5:.2f}")
 
+    # The batch and the budget schedule use the process groups the model was built on.
+    pg_collection = get_attr_wrapped_model(model, "pg_collection")
+
     # Get the batch.
     timers('batch-generator', log_level=2).start()
     global stimer
     with stimer(bdata=True):
-        (
-            tokens,
-            labels,
-            loss_mask,
-            attention_mask,
-            position_ids,
-            cu_seqlens,
-            max_seqlen,
-        ) = get_batch(data_iterator)
+        tokens, labels, loss_mask, attention_mask, position_ids, cu_seqlens, max_seqlen = get_batch(
+            data_iterator, pg_collection=pg_collection
+        )
     timers('batch-generator').stop()
 
     if (
-        get_grad_acc_based_random_choice(args=args, training=model.training)
+        get_grad_acc_based_random_choice(
+            args=args, training=model.training, pg_collection=pg_collection
+        )
         < args.original_model_sample_prob
     ):
         # Funnel "full-model sample" through the regular router-driven path
@@ -449,7 +509,11 @@ def forward_step(data_iterator, model: HybridModel):
         budget_probs = [float(p) for p in budget_probs]
         budget_probs = [p / sum(budget_probs) for p in budget_probs]
         selected_budget = get_grad_acc_based_random_choice(
-            args=args, choices=args.budget_list, prob=budget_probs, training=model.training
+            args=args,
+            choices=args.budget_list,
+            prob=budget_probs,
+            training=model.training,
+            pg_collection=pg_collection,
         )
         flextron_kwargs = {'budget': selected_budget}
 
@@ -461,15 +525,36 @@ def forward_step(data_iterator, model: HybridModel):
     return output_tensor, partial(loss_func, loss_mask, model=model, selected_budget=selected_budget)
 
 
+def is_dataset_built_on_rank(vp_stage=None, pg_collection=None):
+    """Whether the dataset should be built on the current rank.
 
-def is_dataset_built_on_rank(vp_stage=None):
-    ignore_virtual = True
-    if vp_stage is not None:
-        ignore_virtual = False
+    Args:
+        vp_stage: Virtual pipeline stage of the model chunk. None checks only the pipeline stage
+            of the rank.
+        pg_collection: Process groups of the run. The datasets are built on the first rank of
+            its tensor-parallel group in the first and last stages of its pipeline-parallel
+            group. None falls back to the global process groups with a deprecation warning.
+    """
+    pg_collection = resolve_process_groups(
+        pg_collection,
+        owner="pretrain_hybrid_flex.is_dataset_built_on_rank",
+        required=("tp", "pp"),
+        deprecated_in="0.21",
+        removed_in="0.23",
+    )
+    # A None tensor-parallel group would build the datasets on every rank, and without a
+    # pipeline group is_first_or_last_pipeline_stage reads the global pipeline stage.
+    for group_name in ("tp", "pp"):
+        if vars(pg_collection)[group_name] is None:
+            raise ValueError(f"is_dataset_built_on_rank requires pg_collection.{group_name}")
     return (
-        mpu.is_pipeline_first_stage(ignore_virtual=ignore_virtual, vp_stage=vp_stage)
-        or mpu.is_pipeline_last_stage(ignore_virtual=ignore_virtual, vp_stage=vp_stage)
-    ) and mpu.get_tensor_model_parallel_rank() == 0
+        is_first_or_last_pipeline_stage(
+            vp_stage,
+            pp_group=pg_collection.pp,
+            vp_size=get_args().virtual_pipeline_model_parallel_size,
+        )
+        and get_pg_rank(pg_collection.tp) == 0
+    )
 
 
 def core_gpt_dataset_config_from_args(args):
@@ -501,13 +586,26 @@ def core_gpt_dataset_config_from_args(args):
     )
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
+def train_valid_test_datasets_provider(
+    train_val_test_num_samples, vp_stage=None, pg_collection=None
+):
     """Build the train test and validation datasets.
 
     Args:
         train_val_test_num_samples : A list containing the number of samples in train test and validation.
+        vp_stage: Virtual pipeline stage of the model chunk the datasets are built for.
+        pg_collection: Process groups of the run, which decide the ranks that build the
+            datasets (see ``is_dataset_built_on_rank``). None falls back to the global process
+            groups with a deprecation warning.
     """
     args = get_args()
+    pg_collection = resolve_process_groups(
+        pg_collection,
+        owner="pretrain_hybrid_flex.train_valid_test_datasets_provider",
+        required=("tp", "pp"),
+        deprecated_in="0.21",
+        removed_in="0.23",
+    )
 
     config = core_gpt_dataset_config_from_args(args)
 
@@ -524,8 +622,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type,
         train_val_test_num_samples,
-        partial(is_dataset_built_on_rank, vp_stage=vp_stage),
-        config
+        partial(is_dataset_built_on_rank, vp_stage=vp_stage, pg_collection=pg_collection),
+        config,
     ).build()
 
     print_rank_0("> finished creating GPT datasets ...")

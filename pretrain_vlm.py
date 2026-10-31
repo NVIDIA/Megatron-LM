@@ -12,7 +12,7 @@ from functools import partial
 
 import torch
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.multimodal_dataset import MockMultimodalDataset, MultimodalDatasetConfig
 from megatron.core.enums import ModelType
@@ -27,8 +27,14 @@ from megatron.core.models.vision.vit_layer_specs import (
     get_vit_layer_with_local_spec,
     get_vit_layer_with_transformer_engine_spec,
 )
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import get_submodules, import_module
+from megatron.core.utils import get_attr_wrapped_model, get_pg_rank
 from megatron.training import (
     get_args,
     get_timers,
@@ -67,12 +73,22 @@ def model_provider(
         add_decoder (bool): Construct the decoder module (used with pipeline parallelism). Defaults to True. When we use pipelining, the decoder
             will live on only a subset of the pipeline stages (specifically, every stage after the first one).
         parallel_output (bool): Enable model parallel output.
+        pg_collection: Process groups of the model. Omitting it is deprecated: the groups are
+            built from the global parallel state, with a ProcessGroupFallbackWarning.
 
     Returns:
         model (megatron.core.models.multimodal.llava_model.LLaVAModel): A multimodal model
     """
     args = get_args()
     vision_model_type = "clip"
+
+    if pg_collection is None:
+        # LLaVAModel requires an explicit process-group collection; training passes the run's
+        # groups, and direct callers that omit them get the global parallel grid.
+        warn_global_process_group_fallback(
+            "pretrain_vlm.model_provider", deprecated_in="0.21", removed_in="0.23"
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     assert (
         args.ckpt_format == 'torch'
@@ -225,13 +241,14 @@ def model_provider(
         language_rotary_base=args.rotary_base,
         language_rope_scaling=args.use_rope_scaling,
         language_rope_scaling_factor=args.rope_scaling_factor,
-        pre_process=parallel_state.is_pipeline_first_stage(),
-        post_process=parallel_state.is_pipeline_last_stage(),
-        add_encoder=parallel_state.is_pipeline_first_stage(),
+        pre_process=is_pp_first_stage(pg_collection.pp),
+        post_process=is_pp_last_stage(pg_collection.pp),
+        add_encoder=is_pp_first_stage(pg_collection.pp),
         add_decoder=True,
         img_h=args.img_h,
         img_w=args.img_w,
         patch_dim=args.patch_dim,
+        pg_collection=pg_collection,
     )
 
     model.freeze(
@@ -243,11 +260,31 @@ def model_provider(
     return model
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples):
+def is_dataset_built_on_rank(pg_collection=None):
+    """Whether the datasets should be built on the current rank.
+
+    Args:
+        pg_collection: Process groups of the run. The datasets are built on the first rank of
+            its tensor-parallel group. Omitting it is deprecated: the group is taken from the
+            global parallel state, with a ProcessGroupFallbackWarning.
+    """
+    if pg_collection is None:
+        warn_global_process_group_fallback(
+            "pretrain_vlm.is_dataset_built_on_rank", deprecated_in="0.21", removed_in="0.23"
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
+    if vars(pg_collection).get("tp") is None:
+        raise ValueError("is_dataset_built_on_rank requires pg_collection.tp")
+    return get_pg_rank(pg_collection.tp) == 0
+
+
+def train_valid_test_datasets_provider(train_val_test_num_samples, pg_collection=None):
     """Build the train test and validation datasets.
 
     Args:
         train_val_test_num_samples : A list containing the number of samples in train, validation, and test sets.
+        pg_collection: Process groups of the run, which decide the ranks that build the
+            datasets (see is_dataset_built_on_rank).
 
     Returns:
         train_ds, val_ds, test_ds (megatron.core.datasets.multimodal_dataset.MockMultimodalDataset): Train, validation, and test datasets, respectively.
@@ -275,7 +312,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         MockMultimodalDataset,
         train_val_test_num_samples,
-        lambda: parallel_state.get_tensor_model_parallel_rank() == 0,
+        partial(is_dataset_built_on_rank, pg_collection=pg_collection),
         config,
     ).build()
 
@@ -320,25 +357,41 @@ def _preprocess_data_for_llava(data):
     return data
 
 
-def get_batch(data_iterator):
+def get_batch(data_iterator, pg_collection=None):
     """Generate a batch.
 
     Args:
         data_iterator: Iterable dataset.
+        pg_collection: Process groups of the model. The batch is broadcast from the first
+            rank of its tensor-parallel group. Omitting it is deprecated: the group is built
+            from the global parallel state, with a ProcessGroupFallbackWarning.
 
     Returns:
         sample: A data sample with images, tokens, etc.
     """
     args = get_args()
     cp_size = args.context_parallel_size
+    if pg_collection is None:
+        # Compatibility for direct entrypoint callers; forward_step passes the model's groups.
+        warn_global_process_group_fallback(
+            "pretrain_vlm.get_batch", deprecated_in="0.21", removed_in="0.23"
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
+    if vars(pg_collection).get("tp") is None:
+        raise ValueError("get_batch requires pg_collection.tp")
+    tp_group = pg_collection.tp
     # Broadcast data.
     if data_iterator is not None:
         data = next(data_iterator)
     else:
         data = None
 
-    data_i = tensor_parallel.broadcast_data(["tokens", "position_ids", "labels"], data, torch.int64)
-    data_f = tensor_parallel.broadcast_data(["image", "loss_mask"], data, torch.float32)
+    data_i = tensor_parallel.broadcast_data(
+        ["tokens", "position_ids", "labels"], data, torch.int64, tp_group=tp_group
+    )
+    data_f = tensor_parallel.broadcast_data(
+        ["image", "loss_mask"], data, torch.float32, tp_group=tp_group
+    )
 
     batch = dict()
     packed_seq_params = None
@@ -417,7 +470,7 @@ def forward_step(data_iterator, model: LLaVAModel):
     # Get the batch.
     timers('batch-generator', log_level=2).start()
     tokens, position_ids, labels, images, loss_mask, attention_mask, packed_seq_params = get_batch(
-        data_iterator
+        data_iterator, pg_collection=get_attr_wrapped_model(model, "pg_collection")
     )
     timers('batch-generator').stop()
 
