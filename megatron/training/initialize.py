@@ -447,9 +447,10 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 
                 assert HAVE_GTP, (
-                    "GTP requires TransformerEngine >= 2.19. "
-                    "Set both --gtp_remat-weight-remat-size and "
-                    "--expert-generalized-tensor-parallel-remat-size to 1 to disable GTP."
+                    "GTP requires TransformerEngine >= 2.19. To disable GTP, leave "
+                    "--tensor-parallel-num-weight-shards and "
+                    "--expert-tensor-parallel-num-weight-shards unset, or set them equal to "
+                    "--tensor-model-parallel-size and --expert-tensor-parallel-size."
                 )
             # Dense grid: world_size must be divisible by
             # TP * PP * (runtime_CP / gtp_remat_num_sequence_shards) * GTP_remat.
