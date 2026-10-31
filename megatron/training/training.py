@@ -3015,6 +3015,11 @@ def setup_model_and_optimizer(
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
+    # Memory at the setup boundaries. The in-loop report_memory() calls only fire once an
+    # iteration has completed, so a run that dies during startup (e.g., an OOM while loading
+    # a checkpoint into a grid that fits fine from scratch) otherwise leaves no memory trace.
+    setup_dp_group = _get_memory_report_dp_group(_get_model_pg_collection(model[0]))
+    report_memory("(after model and optimizer build)", process_group=setup_dp_group)
 
     if args.moe_use_upcycling:
         torch.distributed.barrier()
@@ -3121,6 +3126,18 @@ def setup_model_and_optimizer(
         train_state.resume_iteration = 0
         train_state.num_floating_point_operations_so_far = 0
         train_state.resume_num_floating_point_operations = 0.0
+    # Paired with the report after the model/optimizer build: the delta is what loading the
+    # checkpoint cost. On the from-scratch path, iteration is 0 and this is the baseline.
+    report_memory(
+        f"(after checkpoint load, iteration {train_state.iteration})", process_group=setup_dp_group
+    )
+    # Clear temporary allocations created by load_checkpoint. Run this here to allow for
+    # re-claim from objects created within the scope of load_checkpoint.
+    torch.cuda.empty_cache()
+    report_memory(
+        f"(after empty_cache after checkpoint load, iteration {train_state.iteration})",
+        process_group=setup_dp_group,
+    )
 
     # [ModelOpt]: Load the teacher checkpoint for ModelOpt distillation if applicable.
     # Import locally to prevent circular import: megatron.post_training.checkpointing
@@ -3286,6 +3303,24 @@ def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
         # global batch size may be rounded down when batch-size decrease is enabled.
         return get_current_running_global_batch_size()
     return samples_seen_in_iteration
+
+
+def _get_memory_report_dp_group(
+    pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None,
+):
+    """Resolve the DP group that gates report_memory's rank-0 print.
+
+    A MultiModuleProcessGroupCollection carries no axes of its own, so unwrap it to the
+    language model's collection first, or, on a rank that owns only encoders, to that
+    rank's own module. Mirrors the cross-entropy warmup resolution in pretrain().
+    """
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        pg_collection = (
+            pg_collection.get_language_model_collection()
+            if pg_collection.has_language_model()
+            else next(iter(pg_collection))
+        )
+    return pg_collection.dp if pg_collection is not None else None
 
 
 def _get_model_pg_collection(
@@ -5027,6 +5062,13 @@ def train(
     # per-interval counter; the first loop pass opens the first block.
     _end_otel_startup_span()
     _start_otel_train_span()
+
+    # Last report before the loop. Weights, optimizer state, any loaded checkpoint and the
+    # symmetric-memory pools are all resident by now, so a run that OOMs on iteration 1 still
+    # has a number to line up against a healthy run. CUDA graph pools are captured later.
+    report_memory(
+        "(before first iteration)", process_group=_get_memory_report_dp_group(model_pg_collection)
+    )
 
     def _finished_training(iteration):
         return (cfg.train.train_iters and iteration >= cfg.train.train_iters) or (
