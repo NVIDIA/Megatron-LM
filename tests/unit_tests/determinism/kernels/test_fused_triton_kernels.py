@@ -192,10 +192,7 @@ def test_dsa_index_share_support_replays_across_forward_scopes(with_attention_ma
 
     seeded()
     config = SimpleNamespace(
-        dsa_indexer_topk=8,
-        dsa_indexer_topk_freq=4,
-        dsa_indexer_skip_topk_offset=1,
-        kv_channels=16,
+        dsa_indexer_topk=8, dsa_indexer_topk_freq=4, dsa_indexer_skip_topk_offset=1, kv_channels=16
     )
     attention = dsa.DSAttention(
         config=config,
@@ -223,17 +220,17 @@ def test_dsa_index_share_support_replays_across_forward_scopes(with_attention_ma
         for carrier, indices, valid_length in zip(carriers, supports, lengths):
             with dsa._dsa_index_share_carrier_scope(carrier):
                 attention._get_index_share_topk_holder(None, attention_mask)[1] = indices
-                attention._get_index_share_topk_length_holder(None, attention_mask)[1] = (
-                    valid_length
-                )
+                attention._get_index_share_topk_length_holder(None, attention_mask)[
+                    1
+                ] = valid_length
 
         replayed = []
         for carrier, indices, valid_length in zip(carriers, supports, lengths):
             with dsa._dsa_index_share_carrier_scope(carrier):
                 actual_indices = attention._get_index_share_topk_holder(None, attention_mask)[1]
-                actual_length = attention._get_index_share_topk_length_holder(
-                    None, attention_mask
-                )[1]
+                actual_length = attention._get_index_share_topk_length_holder(None, attention_mask)[
+                    1
+                ]
                 assert bytes_equal(actual_indices, indices)
                 assert bytes_equal(actual_length, valid_length)
                 replayed.extend((actual_indices.clone(), actual_length.clone()))
@@ -248,11 +245,7 @@ def test_dsa_index_share_support_replays_across_forward_scopes(with_attention_ma
         return tuple(replayed)
 
     assert_replays_bit_exact(
-        run,
-        (),
-        backward=False,
-        contention=True,
-        what="DSA per-forward index-share support",
+        run, (), backward=False, contention=True, what="DSA per-forward index-share support"
     )
 
 
