@@ -60,6 +60,7 @@ class TestGPTModel:
                 transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
                 vocab_size=100,
                 max_sequence_length=4,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
         self.mock_log_single_rank = mock_log_single_rank
 
@@ -119,6 +120,7 @@ class TestGPTModel:
                 transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
                 vocab_size=100,
                 max_sequence_length=4,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
         assert config.mtp_hsm is True
@@ -139,6 +141,7 @@ class TestGPTModel:
                 transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
                 vocab_size=100,
                 max_sequence_length=4,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
     @pytest.mark.internal
@@ -375,6 +378,7 @@ class TestGPTWithFusedOps:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(use_te_op_fuser=True),
             vocab_size=100,
             max_sequence_length=4,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method) -> None:
@@ -437,6 +441,7 @@ def test_gpt_with_te_activation_func(num_experts, gated_linear_unit):
         ),
         vocab_size=128,
         max_sequence_length=128,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     # test
@@ -679,6 +684,7 @@ class TestGPTWithDynamicInference:
             vocab_size=128,
             max_sequence_length=DynamicInferenceContext.TOKEN_ROUNDER,
             parallel_output=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         self.gpt_model = Float16Module(self.gpt_model.config, self.gpt_model)
 

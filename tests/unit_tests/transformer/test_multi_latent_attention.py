@@ -1512,6 +1512,7 @@ def test_parallel_multi_latent_attention_correctness(
             pre_process=pre_process,
             post_process=post_process,
             vp_stage=vp_stage,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         return gpt_model
 
@@ -1942,8 +1943,9 @@ class TestFusedMLASelfAttention:
         gathered_q = torch.cat([q_shard, torch.zeros_like(q_shard)], dim=-1)
         captured = {}
 
-        def fake_gather_from_tensor_model_parallel_region(tensor):
+        def fake_gather_from_tensor_model_parallel_region(tensor, group):
             captured["q_shard"] = tensor
+            captured["group"] = group
             return gathered_q
 
         monkeypatch.setattr(mla_module, "get_pg_size", lambda group: tp_size)
@@ -1958,6 +1960,7 @@ class TestFusedMLASelfAttention:
         q_compressed, kv_combined = self.fused_attention._qkv_down_projection(hidden)
 
         torch.testing.assert_close(captured["q_shard"], q_shard)
+        assert captured["group"] is self.fused_attention.tp_group
         torch.testing.assert_close(q_compressed, gathered_q)
         torch.testing.assert_close(kv_combined, kv_shard)
 

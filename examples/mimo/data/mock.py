@@ -11,6 +11,8 @@ from typing import Callable, Dict, List, Optional
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from megatron.core.process_groups_config import resolve_process_groups
+
 
 def create_mock_image(image_size: int = 336) -> torch.Tensor:
     """
@@ -237,9 +239,15 @@ def _collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     }
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples):
-    """Provide datasets for training, validation, and testing."""
-    from megatron.core import mpu
+def train_valid_test_datasets_provider(train_val_test_num_samples, pg_collection=None):
+    """Provide datasets for training, validation, and testing.
+
+    Args:
+        train_val_test_num_samples: Target sizes of the train, validation and test datasets.
+        pg_collection: Process groups of the run. The datasets are built on the first rank of
+            its tensor-parallel group. None falls back to the global parallel state with a
+            ProcessGroupFallbackWarning; that fallback is deprecated.
+    """
     from megatron.training import get_args
 
     args = get_args()
@@ -250,8 +258,15 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     print(f"Image sequence length: {args.image_seq_length}")
     print(f"Total sequence length: {args.total_seq_length}")
 
+    pg_collection = resolve_process_groups(
+        pg_collection,
+        owner="examples.mimo.data.mock.train_valid_test_datasets_provider",
+        required=("tp",),
+        deprecated_in="0.21",
+        removed_in="0.23",
+    )
     # Only build dataset on tensor parallel rank 0
-    if mpu.get_tensor_model_parallel_rank() == 0:
+    if pg_collection.tp.rank() == 0:
 
         from examples.mimo.data.mock import MockVLMDataset
 

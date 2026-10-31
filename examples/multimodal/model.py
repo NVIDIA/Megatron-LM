@@ -21,7 +21,10 @@ from layer_specs import (
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.utils import log_single_rank
 from megatron.training import get_args, get_tokenizer, print_rank_0
@@ -49,7 +52,9 @@ def model_provider(
             will live on only a subset of the pipeline stages (specifically, every stage after the first one).
         vp_stage: Optional virtual pipeline stage. Used with virtual pipeline parallelism.
         config: Optional transformer config. If None, will be created from args.
-        pg_collection: Optional process group collection. If None, will use default.
+        pg_collection: Process groups of the grid the model runs on. If None, the groups of the
+            global parallel grid are used with a ProcessGroupFallbackWarning; that fallback is
+            deprecated.
         parallel_output (bool): Enable parallel model output.
 
     Returns:
@@ -59,8 +64,11 @@ def model_provider(
     use_te = args.use_te
 
     if pg_collection is None:
-        # LLaVAModel requires an explicit process-group collection; this example runs on the
-        # global parallel grid, so resolve that fallback here rather than inside megatron/core.
+        # LLaVAModel requires an explicit process-group collection. A caller that omits it gets
+        # the groups of the global parallel grid; that fallback is deprecated.
+        warn_global_process_group_fallback(
+            "examples.multimodal.model.model_provider", deprecated_in="0.21", removed_in="0.23"
+        )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     print_rank_0('building a multimodal model ...')
@@ -169,6 +177,8 @@ def model_provider(
                 use_transformer_engine=use_te,
                 normalization=args.normalization,
                 qk_l2_norm=getattr(args, 'qk_l2_norm', False),
+                vp_stage=vp_stage,
+                pp_rank=pg_collection.pp.rank() if pg_collection is not None else None,
             )
         else:
             language_transformer_layer_spec = get_layer_spec_te(

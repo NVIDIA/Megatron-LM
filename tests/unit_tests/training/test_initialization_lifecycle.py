@@ -168,18 +168,20 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
     monkeypatch.setattr(initialize.inprocess_restart, "maybe_force_nccl_backend_init", Mock())
     monkeypatch.setattr(initialize.mpu, "model_parallel_is_initialized", lambda: False)
     monkeypatch.setattr(initialize.mpu, "initialize_model_parallel", init_mpu)
+    # The logged sizes come from the collection that initialize_model_parallel returns.
     for name in (
         "get_tensor_model_parallel_world_size",
         "get_pipeline_model_parallel_world_size",
         "get_gtp_weight_remat_world_size",
     ):
-        monkeypatch.setattr(initialize.mpu, name, lambda: 1)
+        monkeypatch.setattr(initialize.mpu, name, Mock(side_effect=AssertionError(name)))
     for name in ("TORCH_FR_DUMP_TEMP_FILE", "TORCH_NCCL_DEBUG_INFO_TEMP_FILE"):
         monkeypatch.delenv(name, raising=False)
     store = object()
 
-    initialize._initialize_distributed(None, None, store)
+    pg_collection = initialize._initialize_distributed(None, None, store)
 
+    assert pg_collection is init_mpu.return_value
     set_device.assert_called_once_with(1)
     init_pg.assert_called_once_with(
         backend="gloo", store=store, world_size=4, rank=0, timeout=timedelta(minutes=37)
