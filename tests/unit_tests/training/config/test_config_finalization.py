@@ -9,6 +9,7 @@ import pytest
 
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig
+from megatron.rl.config import RLRunConfigContainer
 from megatron.training import global_vars
 from megatron.training.config import (
     CheckpointConfig,
@@ -56,7 +57,15 @@ def test_validation_is_read_only_and_finalization_runs_once(
     if not inference:
         cfg.train.micro_batch_size = 1
         cfg.train.global_batch_size = 8
-        cfg.rl = RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
+        # The RL run config shares the fixture's sections; it validates the RL section against
+        # the run and derives its DDP layout within its own lifecycle.
+        cfg = RLRunConfigContainer.from_pretrain(
+            cfg,
+            inference=InferenceConfigContainer(
+                model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
+            ),
+            rl=RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True),
+        )
     before = copy.deepcopy(cfg.to_dict())
     for _ in range(2):
         cfg.validate()
@@ -69,11 +78,11 @@ def test_validation_is_read_only_and_finalization_runs_once(
     model_finalize = Mock(wraps=model.finalize)
     monkeypatch.setattr(model, "finalize", model_finalize)
     cfg.finalize()
+    if not inference:
+        assert cfg.ddp.grad_buffer_offload
     assert cfg._finalized
     assert cfg.rng.te_rng_tracker is (transformer_impl == "transformer_engine")
     assert transformer.use_te_rng_tracker is cfg.rng.te_rng_tracker
-    if not inference:
-        assert cfg.ddp.grad_buffer_offload
     after = copy.deepcopy(cfg.to_dict())
     cfg.validate()
     cfg.finalize()
@@ -193,7 +202,13 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
     run_config.model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
     run_config.train.micro_batch_size = 1
     run_config.train.global_batch_size = 8
-    run_config.rl = RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
+    run_config = RLRunConfigContainer.from_pretrain(
+        run_config,
+        inference=InferenceConfigContainer(
+            model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
+        ),
+        rl=RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True),
+    )
     if invalid_policy == "ddp_offload":
         transformer.fp8 = "hybrid"
         run_config.ddp.fp8_param_gather = True

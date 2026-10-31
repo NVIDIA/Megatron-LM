@@ -37,7 +37,6 @@ from megatron.training.config.resilience_config import (
     RerunStateMachineConfig,
     StragglerDetectionConfig,
 )
-from megatron.training.config.rl_config import RLConfig
 from megatron.training.config.training_config import (
     CheckpointConfig,
     LoggerConfig,
@@ -295,7 +294,6 @@ class PretrainConfigContainer(ConfigContainerBase):
     checkpoint: CheckpointConfig
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
     tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
-    rl: RLConfig = field(default_factory=RLConfig)
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
@@ -444,7 +442,7 @@ class PretrainConfigContainer(ConfigContainerBase):
                 self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
 
     def validate(self) -> None:
-        """Validate each section and the cross-config GTP, batch-size, and RL policies."""
+        """Validate each section and the cross-config GTP and batch-size policies."""
         if self.model is None:
             raise ValueError("Training requires a model config")
         if getattr(self.model, "transformer", None) is None:
@@ -482,9 +480,8 @@ class PretrainConfigContainer(ConfigContainerBase):
         self._validate_checkpoint()
         if self.fault_tolerance.enable_ft_package and not self.checkpoint.save:
             raise ValueError("checkpointing save dir must be set to enable fault tolerance")
-        global_batch_size, _, _ = self._resolve_batch_sizes()
+        self._resolve_batch_sizes()
         self._validate_ddp_config()
-        self._validate_rl_config(global_batch_size)
         optimizer.validate_run(
             ddp_config=self.ddp,
             use_torch_fsdp2=isinstance(self.ddp, TorchFullyShardedDataParallelConfig),
@@ -542,7 +539,7 @@ class PretrainConfigContainer(ConfigContainerBase):
         """Check wrapper requirements without deriving or mutating other configs."""
         # DDP's copy is derived during finalization; recipes only set optimizer policy.
         if self.optimizer.reuse_grad_buf_for_mxfp8_param_ag and not self.ddp.use_megatron_fsdp:
-            if self.ddp.grad_buffer_offload or self.rl.requires_grad_buffer_offload:
+            if self.ddp.grad_buffer_offload:
                 raise ValueError(
                     "Gradient-buffer offload is incompatible with "
                     "--reuse-grad-buf-for-mxfp8-param-ag: "
@@ -612,24 +609,6 @@ class PretrainConfigContainer(ConfigContainerBase):
                 "Manual FSDP registration requires Megatron FSDP v1 with NCCL user buffers."
             )
 
-    def _validate_rl_config(self, global_batch_size: int | None) -> None:
-        """Check RL policy against the supplied or resolved training batch size."""
-        transformer = getattr(self.model, "transformer", None)
-        cuda_graph_impl = None if transformer is None else transformer.cuda_graph_impl
-        self.rl.validate_run(
-            cuda_graph_impl=cuda_graph_impl,
-            micro_batch_size=self.train.micro_batch_size,
-            global_batch_size=global_batch_size,
-            train_iters=self.train.train_iters,
-            train_samples=self.train.train_samples,
-            skip_train=self.validation.skip_train,
-            load_optim=self.checkpoint.load_optim,
-            save_interval=self.checkpoint.save_interval,
-            exit_interval=self.train.exit_interval,
-            # The rollout deployment (inference shards, model CP) is not a pretrain section;
-            # validate_args checks that rule from the launch arguments.
-            separate_inference_model=None,
-        )
 
     def _validate_data_section(self) -> None:
         """Cross-section checks for ``data.dataset``, one per field.
@@ -727,7 +706,6 @@ class PretrainConfigContainer(ConfigContainerBase):
                     "at finalize(), leave it unset."
                 )
         batch_sizes = self._resolve_batch_sizes(self.get_batch_parallel_size())
-        self._validate_rl_config(batch_sizes[0])
         # Resolve RNG and model settings before deriving optimizer precision.
         super()._finalize()
         optimizer = self._optimizer_with_model_precision()
@@ -848,8 +826,6 @@ class PretrainConfigContainer(ConfigContainerBase):
                 getattr(transformer, "dynamic_context_parallel", False)
             )
         self.data.finalize()
-        if self.rl.requires_grad_buffer_offload:
-            self.ddp.grad_buffer_offload = True
         self.ddp.finalize()
 
 

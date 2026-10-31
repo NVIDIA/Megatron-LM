@@ -16,6 +16,7 @@ from megatron.core.parallel_state import is_pipeline_last_stage
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
 from megatron.rl.callbacks import RLCheckpointCallback, RLLoggingCallback
+from megatron.rl.config import add_rl_args, rl_run_config_container_from_args
 from megatron.rl.rl_utils import (
     calculate_grpo_loss,
     evaluate_rollouts,
@@ -28,11 +29,7 @@ from megatron.rl.rl_utils import (
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.rl.training_setup import RLSetupCallback
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
-from megatron.training.argument_utils import (
-    gpt_config_from_args,
-    hybrid_config_from_args,
-    pretrain_cfg_container_from_args,
-)
+from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.utils import is_hybrid_model
@@ -416,8 +413,12 @@ if __name__ == "__main__":
                 pg_collection=pg_collection,
             )
 
+    def _add_rl_entry_args(parser):
+        """RL entry point: the inference server flags plus the RL section."""
+        return add_rl_args(add_inference_args(parser))
+
     args = parse_and_validate_args(
-        extra_args_provider=add_inference_args,
+        extra_args_provider=_add_rl_entry_args,
         args_defaults={},
     )
     assert not args.reset_attention_mask, (
@@ -428,14 +429,22 @@ if __name__ == "__main__":
         model_cfg = hybrid_config_from_args(args, vocab_size_from_tokenizer=True)
     else:
         model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
-    full_config = pretrain_cfg_container_from_args(args, model_cfg)
+    # The RL run config: the pretrain sections, the rollout engine's deployment (the training
+    # model with the RL inference parallelism when it differs, where its weights come from, their
+    # placement, the engine settings) and the RL section, one pretrain container by inheritance.
+    # initialize_megatron finalizes it: the pretrain derivations, the deployment's, and the RL
+    # gradient-buffer layout on the DDP config, before model construction.
+    full_config = rl_run_config_container_from_args(args, model_cfg)
     set_run_config(full_config)
     rl_cfg = full_config.rl
+    inference_container = full_config.inference
     assert rl_cfg.perform_rl_step, "train_rl.py requires --perform-rl-step."
     rl_model_provider = partial(model_provider, _model_builder)
 
     rl_setup = RLSetupCallback(
-        rl_cfg, model_provider=rl_model_provider, model_type=ModelType.encoder_or_decoder
+        inference_container,
+        model_provider=rl_model_provider,
+        model_type=ModelType.encoder_or_decoder,
     )
 
     def next_train_iterator(iteration, current_iterator):
@@ -448,6 +457,7 @@ if __name__ == "__main__":
             ref_state_dict=rl_setup.ref_state_dict,
             rl_config=rl_cfg,
             train_config=full_config.train,
+            inference_container=inference_container,
         )
 
     def run_eval(**kwargs):
@@ -455,6 +465,7 @@ if __name__ == "__main__":
             model=rl_setup.model,
             inference_model=rl_setup.inference_model,
             optimizer=rl_setup.optimizer,
+            inference_container=inference_container,
             **kwargs,
         )
 

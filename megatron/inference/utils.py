@@ -32,6 +32,7 @@ from megatron.training.checkpointing import (
     load_checkpoint,
     read_metadata,
 )
+from megatron.training.config import InferenceSetupConfig
 from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.global_vars import get_run_config, get_tokenizer
 from megatron.training.models import (
@@ -451,22 +452,15 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
     return parser
 
 
-def get_inference_config_from_model_and_args(model: MegatronModule, args):
-    """Returns an `InferenceConfig` constructed from the model and command line arguments.
-
-    Delegates to ``InferenceSetupConfig.to_inference_config`` so the declarative
-    ``InferenceSetupConfig`` (built from args) is the single source of truth for translating
-    inference args into the runtime engine ``InferenceConfig``.
-    """
-    from megatron.training.argument_utils import inference_cfg_from_args
-
-    # Get metrics writer if logging is enabled and on the logging rank.
-    # Use the same rank convention as training (last rank logs).
+def get_inference_config(
+    model: MegatronModule, setup_cfg: InferenceSetupConfig, *, is_logging_rank: bool
+):
+    """Build the runtime `InferenceConfig`."""
     metrics_writer = None
     if (
-        args.inference_logging_step_interval > 0
-        and args.inference_wandb_logging
-        and args.rank == (args.world_size - 1)
+        setup_cfg.inference_logging_step_interval > 0
+        and setup_cfg.inference_wandb_logging
+        and is_logging_rank
     ):
         metrics_writer = get_wandb_writer()
         if metrics_writer is None:
@@ -476,18 +470,28 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
                 "WARNING: --rl-inference-logging-step-interval is set but no metrics writer "
                 "wandb module is available. Inference logging will be disabled.",
             )
-
-    setup_cfg = inference_cfg_from_args(args)
     return setup_cfg.to_inference_config(model, metrics_writer=metrics_writer)
 
 
+def get_inference_config_from_model_and_args(model: MegatronModule, args):
+    """Returns an `InferenceConfig` constructed from the model and command line arguments."""
+    from megatron.training.argument_utils import inference_cfg_from_args
+
+    return get_inference_config(
+        model, inference_cfg_from_args(args), is_logging_rank=args.rank == (args.world_size - 1)
+    )
+
+
 def get_dynamic_inference_engine(
-    model: MegatronModule | None = None, engine_class: type[DynamicInferenceEngine] | None = None
+    model: MegatronModule | None = None,
+    setup_cfg: InferenceSetupConfig | None = None,
+    engine_class: type[DynamicInferenceEngine] | None = None,
 ) -> DynamicInferenceEngine:
     """Build a dynamic inference engine.
 
     Args:
         model: Model to serve. Builds and loads one when omitted.
+        setup_cfg: Inference config.
         engine_class: Optional engine implementation override. When omitted,
             the core factory selects the implementation from the inference
             configuration.
@@ -497,7 +501,12 @@ def get_dynamic_inference_engine(
         model = get_model_for_inference()
     tokenizer = get_tokenizer()
 
-    inference_config = get_inference_config_from_model_and_args(model, args)
+    if setup_cfg is None:
+        inference_config = get_inference_config_from_model_and_args(model, args)
+    else:
+        inference_config = get_inference_config(
+            model, setup_cfg, is_logging_rank=args.rank == (args.world_size - 1)
+        )
     return build_dynamic_inference_engine(
         model=model, tokenizer=tokenizer, inference_config=inference_config, engine_cls=engine_class
     )
