@@ -12,6 +12,7 @@ from megatron.rl import rl_utils
 from megatron.rl.sequence_packing_utils import SequencePacker, create_packed_seq_params_for_bin
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
+from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from tests.unit_tests.test_utilities import Utils
 
@@ -48,14 +49,15 @@ def _set_minimal_args():
     args = parse_args(ignore_unknown_args=True)
     args.num_layers = 8
     args.num_attention_heads = 8
-    args.vocab_size = VOCAB
     args.hidden_size = 128
     args.max_position_embeddings = 256
     args.seq_length = 256
     args.micro_batch_size = 1
     args.wandb_project = None
     args = validate_args(args)
-    set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
+    cfg = pretrain_cfg_container_from_args(args)
+    cfg.tokenizer = TokenizerConfig(vocab_size=VOCAB)
+    set_global_variables(args, cfg, build_tokenizer=False)
 
 
 @pytest.fixture

@@ -493,7 +493,8 @@ if __name__ == "__main__":
         })
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    set_run_config(cfg)
     initialize_megatron(training=False)
 
     check_arguments()
@@ -521,7 +522,7 @@ if __name__ == "__main__":
 
         import_kwargs = {"dtype": import_dtype}
         if "trust_remote_code" in inspect.signature(import_mcore_gpt_from_hf).parameters:
-            import_kwargs.update({"trust_remote_code": args.trust_remote_code})
+            import_kwargs.update({"trust_remote_code": cfg.tokenizer.trust_remote_code})
         if (
             "moe_router_dtype" in inspect.signature(import_mcore_gpt_from_hf).parameters
             and getattr(args, "moe_router_dtype", None)

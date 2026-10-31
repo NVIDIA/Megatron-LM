@@ -545,6 +545,14 @@ def test_config_first_matches_legacy_tokenizer_and_model_inputs(
 
     legacy_args = deepcopy(args)
     legacy_tokenizer = build_tokenizer(legacy_args)
+    # Reproduce the legacy tokenizer-first padding update on args.
+    if legacy_args.pad_vocab_size and legacy_args.padded_vocab_size is None:
+        legacy_args.padded_vocab_size = calculate_padded_vocab_size(
+            legacy_tokenizer.vocab_size,
+            legacy_args.make_vocab_size_divisible_by,
+            legacy_args.tensor_model_parallel_size,
+            logging_enabled=False,
+        )
     legacy_model = adapter(legacy_args, config=deepcopy(transformer))
 
     model = adapter(args, config=deepcopy(transformer), vocab_size_from_tokenizer=True)
@@ -552,9 +560,8 @@ def test_config_first_matches_legacy_tokenizer_and_model_inputs(
     global_vars.set_args(args)
     global_vars._build_tokenizer(cfg, args)
     resolve_tokenizer_vocab_size(cfg)
-    if not (pad_vocab and checkpoint_vocab is None):
-        assert model.as_dict() == legacy_model.as_dict()
-        assert cfg.tokenizer.padded_vocab_size == legacy_args.padded_vocab_size
+    assert model.as_dict() == legacy_model.as_dict()
+    assert cfg.tokenizer.padded_vocab_size == legacy_args.padded_vocab_size
     assert global_vars.get_tokenizer().vocab_size == legacy_tokenizer.vocab_size
 
 
@@ -670,7 +677,6 @@ def test_checkpoint_vocabulary_precedence_survives_runtime_setup(
     assert model.vocab_size == expected
     cfg = SimpleNamespace(model=model, tokenizer=_default_config_from_args(TokenizerConfig, args))
     global_vars.set_args(args)
-    # breakpoint()
     global_vars._build_tokenizer(cfg, args)
     resolve_tokenizer_vocab_size(cfg)
 
@@ -769,6 +775,12 @@ def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(
 
     monkeypatch.setattr(global_vars, "_build_tokenizer", tokenize)
     expected_vocab = {"tokenizer": 256, "checkpoint": 512, "explicit": 768}
+    expected_tokenizer_vocab = {
+        "tokenizer": 256,
+        "checkpoint": 512,
+        "explicit": 256,
+        "custom": None,
+    }
 
     def writer(received_args):
         assert received_args is args
@@ -778,14 +790,7 @@ def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(
             assert cfg.validation.eval_micro_batch_size == 2
         if model is not None:
             assert model.vocab_size == expected_vocab[vocabulary]
-        expected_padded_vs = args.padded_vocab_size or calculate_padded_vocab_size(
-            args.vocab_size,
-            args.make_vocab_size_divisible_by,
-            args.tensor_model_parallel_size,
-            logging_enabled=False,
-        )
-        expected_padded_vs = None if vocabulary == "custom" else expected_padded_vs
-        assert cfg.tokenizer.padded_vocab_size == expected_padded_vs
+        assert cfg.tokenizer.padded_vocab_size == expected_tokenizer_vocab[vocabulary]
         events.append("writer")
 
     monkeypatch.setattr(global_vars, "_set_wandb_writer", writer)

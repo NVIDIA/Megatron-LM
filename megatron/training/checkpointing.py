@@ -229,12 +229,12 @@ def check_checkpoint_args(
                 f'{arg_name} value from checkpoint ({checkpoint_value}) is not equal to '
                 f'the input argument value ({args_value}).'
             )
-    if args.vocab_file:
+    if cfg.tokenizer.vocab_file:
         _compare('max_position_embeddings')
         _compare('make_vocab_size_divisible_by')
         if not args.use_dist_ckpt:
-            _compare('padded_vocab_size')
-        _compare('tokenizer_type')
+            _compare('padded_vocab_size', config_section='tokenizer')
+        _compare('tokenizer_type', config_section='tokenizer')
     if cfg.rng.data_parallel_random_init:
         _compare('data_parallel_random_init', config_section='rng')
     if check_training_state and args.phase_transition_iterations:
