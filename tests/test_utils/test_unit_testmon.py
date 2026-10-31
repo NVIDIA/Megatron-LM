@@ -237,35 +237,6 @@ def test_new_case_in_existing_file_is_discovered_from_old_baseline(project, cach
     assert _snapshot(cache / "prod") == before
 
 
-def test_single_worker_selection_can_differ_from_recipe_rank_union(project, cache):
-    before = _snapshot(cache / "prod")
-    (project / "tests/test_ranked.py").write_text(
-        "import os\nimport pytest\n\n"
-        "rank = int(os.environ['RANK'])\n"
-        "world_size = int(os.environ['WORLD_SIZE'])\n\n"
-        "@pytest.mark.parametrize('value', range(rank + 1),\n"
-        "    ids=lambda value: f'world-{world_size}-rank-{rank}-value-{value}')\n"
-        "def test_ranked(value):\n"
-        "    raise AssertionError('selection must not execute tests')\n"
-    )
-    result = _invoke(project, cache, "select", world_size=1)
-    assert result.returncode == 0, result.stdout + result.stderr
-    phase = cache / ".testmon-work/prod"
-    single = set((phase / "rank-0/selected-tests").read_text().splitlines())
-    recipe = set()
-    for rank in range(2):
-        result = _invoke(project, cache, "select", rank=rank, world_size=2)
-        assert result.returncode == 0, result.stdout + result.stderr
-        recipe.update((phase / f"rank-{rank}/selected-tests").read_text().splitlines())
-    assert single == {"tests/test_ranked.py::test_ranked[world-1-rank-0-value-0]"}
-    assert recipe == {
-        "tests/test_ranked.py::test_ranked[world-2-rank-0-value-0]",
-        "tests/test_ranked.py::test_ranked[world-2-rank-1-value-0]",
-        "tests/test_ranked.py::test_ranked[world-2-rank-1-value-1]",
-    }
-    assert _snapshot(cache / "prod") == before
-
-
 def test_changed_function_selects_and_runs_only_affected_cases_in_same_file(project, tmp_path):
     parameter_ids = ["space value", 'quote " and $value']
     (project / "tests/test_app.py").write_text(
@@ -371,7 +342,6 @@ def test_invalid_baseline_falls_back_before_private_copy(project, cache, problem
             'run_testmon_phase() { RANK=0 WORLD_SIZE=1 "$TEST_PYTHON" "$WRAPPER" '
             '--mode "$1" --phase "$2" --cache-dir "$UNIT_TESTMON_CACHE_DIR" '
             '-- -q -c "$PROJECT/pytest.ini" "$PROJECT/tests"; }',
-            "select_testmon_tests() {" + _function(runner, "select_testmon_tests") + "\n}",
             "run_enforced_tests() {" + _function(runner, "run_enforced_tests") + "\n}",
             "run_enforced_tests",
         )
@@ -426,68 +396,45 @@ def test_empty_phase_does_not_launch_pytest(tmp_path):
 
 
 @pytest.mark.parametrize("recipe_gpus", [2, 4, 8])
-@pytest.mark.parametrize("selection_gpus", [None, "1", "recipe"])
-@pytest.mark.parametrize("mode", ["select-only", "full", "enforce", "preselected", "baseline"])
-def test_single_worker_override_only_applies_to_selection(mode, selection_gpus, recipe_gpus):
+def test_native_selection_uses_recipe_topology(tmp_path, recipe_gpus):
     runner = _source("tests/unit_tests/run_ci_test.sh")
     start = runner.index("MASTER_ADDR=${MASTER_ADDR:-localhost}")
     end = runner.index("export ONE_LOGGER_JOB_CATEGORY=test", start)
-    environment = {
-        **os.environ,
-        "UNIT_TESTMON_MODE": mode,
-        "GPUS_PER_NODE": str(recipe_gpus),
-        "NUM_NODES": "2",
-        "SLURM_NODEID": "1",
-        "LOG_DIR": "/tmp/unit-test-logs",
-        "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
-    }
-    environment.pop("UNIT_TESTMON_SELECTION_GPUS", None)
-    if selection_gpus is not None:
-        environment["UNIT_TESTMON_SELECTION_GPUS"] = selection_gpus
     result = subprocess.run(
         ["bash", "-e", "-u", "-o", "pipefail"],
-        input=runner[start:end]
-        + '\nprintf "%s\\n" "${DISTRIBUTED_ARGS[@]}" "$CUDA_VISIBLE_DEVICES"\n',
-        env=environment,
+        input="\n".join(
+            (
+                runner[start:end],
+                'uv() { printf "%s\\n" "$@"; }',
+                "UNIT_TESTMON_INSTALLED=true",
+                "run_testmon_phase() {" + _function(runner, "run_testmon_phase") + "\n}",
+                "run_testmon_phase select prod --collect-only tests/unit_tests/example",
+            )
+        ),
+        env={
+            **os.environ,
+            "GPUS_PER_NODE": str(recipe_gpus),
+            "NUM_NODES": "2",
+            "SLURM_NODEID": "1",
+            "LOG_DIR": str(tmp_path),
+            "UNIT_TESTMON_CACHE_DIR": str(tmp_path / "cache"),
+        },
         text=True,
         capture_output=True,
         check=True,
     )
     arguments = result.stdout.splitlines()
-    single = mode == "select-only" and selection_gpus != "recipe"
-    assert arguments[arguments.index("--nproc_per_node") + 1] == (
-        "1" if single else str(recipe_gpus)
-    )
-    assert arguments[arguments.index("--nnodes") + 1] == ("1" if single else "2")
-    assert arguments[arguments.index("--node_rank") + 1] == ("0" if single else "1")
-    assert arguments[-1] == environment["CUDA_VISIBLE_DEVICES"]
-
-
-@pytest.mark.parametrize("selection_gpus", ["0", "2", "all"])
-def test_selection_worker_override_rejects_unsupported_values(selection_gpus):
-    runner = _source("tests/unit_tests/run_ci_test.sh")
-    start = runner.index("MASTER_ADDR=${MASTER_ADDR:-localhost}")
-    end = runner.index("export ONE_LOGGER_JOB_CATEGORY=test", start)
-    result = subprocess.run(
-        ["bash", "-e", "-u", "-o", "pipefail"],
-        input=runner[start:end],
-        env={
-            **os.environ,
-            "UNIT_TESTMON_MODE": "select-only",
-            "UNIT_TESTMON_SELECTION_GPUS": selection_gpus,
-            "LOG_DIR": "/tmp/unit-test-logs",
-        },
-        text=True,
-        capture_output=True,
-    )
-    assert result.returncode == 1, result.stdout + result.stderr
-    assert "must be '1' or 'recipe'" in result.stdout
+    assert arguments[arguments.index("--nproc_per_node") + 1] == str(recipe_gpus)
+    assert arguments[arguments.index("--nnodes") + 1] == "2"
+    assert arguments[arguments.index("--node_rank") + 1] == "1"
+    assert arguments[arguments.index("--mode") + 1] == "select"
 
 
 @pytest.mark.parametrize(
     "failed_step",
     [
         "",
+        "cleanup",
         "collect/prod",
         "merge/prod",
         "mandatory/prod",
@@ -496,16 +443,21 @@ def test_selection_worker_override_rejects_unsupported_values(selection_gpus):
         "mandatory/experimental",
     ],
 )
-def test_selection_only_never_executes_tests_or_full_fallback(tmp_path, failed_step):
+def test_native_selection_executes_in_bucket_or_falls_back(tmp_path, failed_step):
     runner = _source("tests/unit_tests/run_ci_test.sh")
     cache = tmp_path / "cache"
     stale = cache / ".testmon-work/stale"
     stale.parent.mkdir(parents=True)
     stale.touch()
+    # Skip coverage synthesis in this shell orchestration test.
+    (tmp_path / ".coverage.unit_tests").touch()
     script = "\n".join(
         (
             "set -euo pipefail",
             "BUCKET=tests/unit_tests/example IGNORE_ARGS=() MARKER_ARG='not flaky'",
+            "UNIT_TEST_REPEAT=2",
+            'rm() { if [[ "$FAILED_STEP" == cleanup ]]; then echo cleanup >> "$EVENTS"; '
+            'return 7; else command rm "$@"; fi; }',
             'event() { echo "$1/$2" >> "$EVENTS"; [[ "$1/$2" != "$FAILED_STEP" ]] || return 7; }',
             'run_testmon_phase() { event collect "$2"; }',
             'merge_rank_selections() { event merge "$1" || return; '
@@ -513,15 +465,12 @@ def test_selection_only_never_executes_tests_or_full_fallback(tmp_path, failed_s
             'echo tests/unit_tests/test_example.py::test_one > "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/selected-tests"; }',
             'apply_mandatory_tests() { event mandatory "$1" || return; '
             ': > "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/mandatory-tests"; }',
-            'forbidden() { echo FORBIDDEN >> "$EVENTS"; return 99; }',
-            "run_full_tests() { forbidden; }",
-            "run_selected_phase() { forbidden; }",
-            "run_baseline_tests() { forbidden; }",
-            "coverage() { forbidden; }",
-            "uv() { forbidden; }",
+            'run_full_tests() { echo full >> "$EVENTS"; }',
+            'run_selected_phase() { event execute "$1"; }',
+            "coverage() { return 0; }",
             'write_testmon_summary() { echo "$1" >> "$EVENTS"; }',
-            "select_testmon_tests() {" + _function(runner, "select_testmon_tests") + "\n}",
-            runner[runner.index('case "$UNIT_TESTMON_MODE" in') :],
+            "run_enforced_tests() {" + _function(runner, "run_enforced_tests") + "\n}",
+            "run_enforced_tests",
         )
     )
     events = tmp_path / "events"
@@ -531,7 +480,6 @@ def test_selection_only_never_executes_tests_or_full_fallback(tmp_path, failed_s
         cwd=tmp_path,
         env={
             **os.environ,
-            "UNIT_TESTMON_MODE": "select-only",
             "UNIT_TESTMON_CACHE_DIR": str(cache),
             "FAILED_STEP": failed_step,
             "EVENTS": str(events),
@@ -540,12 +488,12 @@ def test_selection_only_never_executes_tests_or_full_fallback(tmp_path, failed_s
         capture_output=True,
         timeout=10,
     )
-    assert result.returncode == (7 if failed_step else 0), result.stdout + result.stderr
+    assert result.returncode == 0, result.stdout + result.stderr
     executed = events.read_text().splitlines()
-    assert "FORBIDDEN" not in executed
-    assert not stale.exists()
+    assert stale.exists() == (failed_step == "cleanup")
     if failed_step:
-        assert executed[-1] == failed_step
+        assert executed[-3:] == [failed_step, "full fallback: Testmon selection failed", "full"]
+        assert not any(event.startswith("execute/") for event in executed)
     else:
         assert executed == [
             "collect/prod",
@@ -554,12 +502,35 @@ def test_selection_only_never_executes_tests_or_full_fallback(tmp_path, failed_s
             "collect/experimental",
             "merge/experimental",
             "mandatory/experimental",
-            "GPU selection completed",
+            "execute/prod",
+            "execute/experimental",
+            "execute/prod",
+            "execute/experimental",
+            "selective tests passed",
         ]
-        for phase in ("prod", "experimental"):
-            assert (cache / ".testmon-work" / phase / "selected-tests").is_file()
-            assert (cache / ".testmon-work" / phase / "mandatory-tests").is_file()
-    assert not list(tmp_path.glob(".coverage*"))
+
+
+def test_missing_rank_selection_cannot_be_accepted(tmp_path):
+    phase = tmp_path / ".testmon-work/prod/rank-0"
+    phase.mkdir(parents=True)
+    (phase / "selected-tests").write_text("tests/test_example.py::test_one\n")
+    runner = _source("tests/unit_tests/run_ci_test.sh")
+    result = subprocess.run(
+        ["bash", "-e", "-u", "-o", "pipefail"],
+        input="\n".join(
+            (
+                "NUM_NODES=1 GPUS_PER_NODE=2",
+                "merge_rank_selections() {" + _function(runner, "merge_rank_selections") + "\n}",
+                "merge_rank_selections prod",
+            )
+        ),
+        env={**os.environ, "UNIT_TESTMON_CACHE_DIR": str(tmp_path)},
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 1
+    assert "Expected 2 Testmon selections for prod, found 1" in result.stdout
+    assert not (phase.parent / "selected-tests").exists()
 
 
 def test_selected_test_failure_does_not_run_full_bucket(tmp_path):
@@ -578,7 +549,6 @@ def test_selected_test_failure_does_not_run_full_bucket(tmp_path):
                 'apply_mandatory_tests() { : > "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/mandatory-tests"; }',
                 "run_selected_phase() { return 1; }",
                 "run_full_tests() { echo UNEXPECTED_FULL_BUCKET; }",
-                "select_testmon_tests() {" + _function(runner, "select_testmon_tests") + "\n}",
                 "run_enforced_tests() {" + _function(runner, "run_enforced_tests") + "\n}",
                 "run_enforced_tests",
             )
@@ -641,121 +611,5 @@ def test_mode_is_passed_as_container_environment():
     gb200_recipe = _source("tests/test_utils/recipes/gb200/unit-tests.yaml")
 
     assert '"UNIT_TESTMON_MODE": unit_testmon_mode' in launcher
-    assert '"UNIT_TESTMON_SELECTION_GPUS": unit_testmon_selection_gpus' in launcher
-    assert 'click.Choice(["1", "recipe"])' in launcher
-    assert '["full", "enforce", "preselected", "baseline", "select-only"]' in launcher
+    assert '["full", "enforce", "baseline"]' in launcher
     assert "{unit_testmon_mode}" not in h100_recipe + gb200_recipe
-
-
-@pytest.mark.parametrize("mismatch", [None, "schema", "mode", "source_sha", "bucket", "platform"])
-def test_saved_gpu_selection_is_prepared_only_for_its_checkout_and_bucket(tmp_path, mismatch):
-    cache = tmp_path / "cache"
-    bucket = "tests/unit_tests/example/**/*.py"
-    plan = {
-        "schema": 1,
-        "mode": "selected",
-        "source_sha": "a" * 40,
-        "bucket": bucket,
-        "platform": "dgx_h100",
-        "phases": {
-            "prod": ['tests/unit_tests/example/test_case.py::test_case[space $value]'],
-            "experimental": [],
-        },
-        "mandatory_files": ["tests/unit_tests/example/test_required.py"],
-    }
-    if mismatch is not None:
-        plan[mismatch] = 2 if mismatch == "schema" else "different"
-    path = tmp_path / "plan.json"
-    path.write_text(json.dumps(plan))
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(WRAPPER_PATH),
-            "prepare",
-            "--plan",
-            str(path),
-            "--cache-dir",
-            str(cache),
-            "--bucket",
-            bucket,
-            "--platform",
-            "dgx_h100",
-            "--source-sha",
-            "a" * 40,
-        ],
-        text=True,
-        capture_output=True,
-        timeout=30,
-    )
-    assert result.returncode == (0 if mismatch is None else 2), result.stdout + result.stderr
-    if mismatch is None:
-        for phase in ("prod", "experimental"):
-            output = cache / ".testmon-work" / phase
-            assert (output / "selected-tests").read_text().splitlines() == plan["phases"][phase]
-            assert (output / "mandatory-tests").read_text().splitlines() == plan["mandatory_files"]
-    else:
-        assert not cache.exists()
-
-
-@pytest.mark.parametrize(
-    ("validation_status", "selected_runs"), [(0, 2), (1, 0)], ids=["valid-plan", "invalid-plan"]
-)
-def test_saved_gpu_plan_execution(tmp_path, validation_status, selected_runs):
-    cache = tmp_path / "cache"
-    for phase, content in (
-        ("prod", "tests/unit_tests/test_example.py::test_one\n"),
-        ("experimental", ""),
-    ):
-        directory = cache / ".testmon-work" / phase
-        directory.mkdir(parents=True)
-        (directory / "selected-tests").write_text(content)
-        (directory / "mandatory-tests").write_text("")
-    (tmp_path / ".coverage.unit_tests").touch()
-    runner = _source("tests/unit_tests/run_ci_test.sh")
-    functions = "\n".join(
-        name + "() {" + _function(runner, name) + "\n}"
-        for name in ("run_selected_phase", "write_testmon_summary", "run_enforced_tests")
-    )
-    script = "\n".join(
-        (
-            "set -euo pipefail",
-            "DISTRIBUTED_ARGS=() IGNORE_ARGS=()",
-            "MARKER_ARG='not flaky_in_dev'",
-            "UNIT_TEST_REPEAT=2 NUM_NODES=1 GPUS_PER_NODE=8 PLATFORM=h100",
-            "BUCKET=tests/unit_tests/test_example.py",
-            "git() { echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; }",
-            'run_full_tests() { echo full >> "$EVENTS"; }',
-            "run_testmon_phase() { echo 'unexpected GPU selection' >&2; return 99; }",
-            "coverage() { return 0; }",
-            "uv() {",
-            '  if [[ "$*" == *"testmon_selector.py prepare"* ]]; then return "$VALIDATION_STATUS"; fi',
-            '  echo "$*" >> "$EVENTS"',
-            "}",
-            functions,
-            "run_enforced_tests",
-        )
-    )
-    events = tmp_path / "events"
-    events.touch()
-    result = subprocess.run(
-        ["bash"],
-        input=script,
-        cwd=tmp_path,
-        env={
-            **os.environ,
-            "UNIT_TESTMON_MODE": "preselected",
-            "UNIT_TESTMON_CACHE_DIR": str(cache),
-            "EVENTS": str(events),
-            "VALIDATION_STATUS": str(validation_status),
-        },
-        text=True,
-        capture_output=True,
-        timeout=10,
-    )
-    assert result.returncode == validation_status, result.stdout + result.stderr
-    executed = events.read_text().splitlines()
-    assert "full" not in executed
-    assert sum("torch.distributed.run" in event for event in executed) == selected_runs
-    assert len(executed) == selected_runs
-    assert all("test_example.py::test_one" in event for event in executed)
-    assert "unexpected GPU selection" not in result.stderr

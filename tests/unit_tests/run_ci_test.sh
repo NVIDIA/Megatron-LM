@@ -78,15 +78,11 @@ if [[ "$ENVIRONMENT" != "lts" && "$ENVIRONMENT" != "dev" ]]; then
     usage
 fi
 
-if [[ "$UNIT_TESTMON_MODE" != "full" && "$UNIT_TESTMON_MODE" != "enforce" && "$UNIT_TESTMON_MODE" != "preselected" && "$UNIT_TESTMON_MODE" != "baseline" && "$UNIT_TESTMON_MODE" != "select-only" ]]; then
+if [[ "$UNIT_TESTMON_MODE" != "full" && "$UNIT_TESTMON_MODE" != "enforce" && "$UNIT_TESTMON_MODE" != "baseline" ]]; then
     echo "Error: invalid Testmon mode: $UNIT_TESTMON_MODE"
     usage
 fi
 if [[ "$UNIT_TESTMON_MODE" != "full" && ( "$TAG" != "latest" || "$ENVIRONMENT" != "dev" ) ]]; then
-    if [[ "$UNIT_TESTMON_MODE" == "select-only" ]]; then
-        echo "GPU selection requires the latest dev suite."
-        exit 1
-    fi
     echo "Testmon is only enabled for the latest dev suite; running the full bucket."
     UNIT_TESTMON_MODE=full
 fi
@@ -149,23 +145,6 @@ MASTER_PORT=${MASTER_PORT:-29500}
 NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
-if [[ "$UNIT_TESTMON_MODE" == "select-only" ]]; then
-    case "${UNIT_TESTMON_SELECTION_GPUS:-1}" in
-    1)
-        # Keep all devices visible for hardware-dependent collection while
-        # starting only one real worker. Execution retains the recipe topology.
-        GPUS_PER_NODE=1
-        NUM_NODES=1
-        NODE_RANK=0
-        ;;
-    recipe)
-        ;;
-    *)
-        echo "UNIT_TESTMON_SELECTION_GPUS must be '1' or 'recipe'."
-        exit 1
-        ;;
-    esac
-fi
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
     --nnodes $NUM_NODES
@@ -355,32 +334,18 @@ run_selected_phase() {
     return "$rc"
 }
 
-select_testmon_tests() {
-    local target
-    target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
-    rm -rf -- "$UNIT_TESTMON_CACHE_DIR/.testmon-work" || return
-    run_testmon_phase select prod \
-        -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target" || return
-    merge_rank_selections prod || return
-    apply_mandatory_tests prod || return
-    run_testmon_phase select experimental \
-        -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target" || return
-    merge_rank_selections experimental || return
-    apply_mandatory_tests experimental || return
-}
-
 run_enforced_tests() {
-    local prod_count experimental_count mandatory_count
-    if [[ "${UNIT_TESTMON_MODE:-enforce}" == "preselected" ]]; then
-        # Consume the saved decision without running selection again.
-        if ! uv run --no-sync python tests/unit_tests/testmon_selector.py prepare \
-                --plan "$UNIT_TESTMON_CACHE_DIR/plan.json" --cache-dir "$UNIT_TESTMON_CACHE_DIR" \
-                --bucket "$BUCKET" --platform "dgx_$PLATFORM" \
-                --source-sha "$(git rev-parse HEAD)"; then
-            write_testmon_summary "Saved selection plan is unavailable or invalid"
-            return 1
-        fi
-    elif ! select_testmon_tests; then
+    local target prod_count experimental_count mandatory_count
+    target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
+    if ! rm -rf -- "$UNIT_TESTMON_CACHE_DIR/.testmon-work" \
+        || ! run_testmon_phase select prod \
+            -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target" \
+        || ! merge_rank_selections prod \
+        || ! apply_mandatory_tests prod \
+        || ! run_testmon_phase select experimental \
+            -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target" \
+        || ! merge_rank_selections experimental \
+        || ! apply_mandatory_tests experimental; then
         write_testmon_summary "full fallback: Testmon selection failed"
         run_full_tests
         return
@@ -416,13 +381,7 @@ full)
 baseline)
     run_baseline_tests
     ;;
-select-only)
-    # The grouped selector exports these files and schedules execution separately.
-    # Never execute tests, including a full fallback, in the selection job.
-    select_testmon_tests || exit $?
-    write_testmon_summary "GPU selection completed"
-    ;;
-enforce|preselected)
+enforce)
     run_enforced_tests
     ;;
 esac

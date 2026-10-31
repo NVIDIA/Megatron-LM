@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import importlib.util
 import json
 import os
 import re
@@ -768,36 +767,26 @@ def test_full_test_guards_override_selective_requests(
 
 
 @pytest.mark.parametrize("platform", ["h100", "gb200"])
-def test_unit_tests_share_gpu_selection_before_the_existing_bucket_runners(
+def test_unit_tests_select_and_execute_in_each_existing_gpu_bucket(
     tmp_path, shell_environment, platform
 ):
     workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
-    assert set(workflow["jobs"]) == {"select", "run"}
-    selection = workflow["jobs"]["select"]
-    assert selection["runs-on"] == "${{ fromJSON(inputs.runner) }}"
-    assert "strategy" not in selection
-    planning = _step("_unit-tests.yml", "select", "plan")
-    assert planning["env"]["CONTAINER_IMAGE"] == "${{ inputs.container-image }}"
-    assert planning["env"]["UNIT_TESTMON_COMPARE_SELECTIONS"] == (
-        "${{ vars.UNIT_TESTMON_COMPARE_SELECTIONS || 'true' }}"
-    )
-    assert "'uv', ['run', '--no-sync', 'python'" in planning["with"]["script"]
+    assert set(workflow["jobs"]) == {"run"}
     job = workflow["jobs"]["run"]
-    assert job["needs"] == "select"
+    assert "needs" not in job and "if" not in job
     assert job["runs-on"] == "${{ fromJSON(inputs.runner) }}"
     assert job["strategy"]["fail-fast"] is False
-    assert job["strategy"]["matrix"]["include"] == (
-        "${{ fromJSON(needs.select.result == 'success' && needs.select.outputs.matrix || inputs.buckets) }}"
-    )
+    assert job["strategy"]["matrix"]["include"] == "${{ fromJSON(inputs.buckets) }}"
     action = job["steps"][-1]["with"]
     assert action["container-image"] == "${{ inputs.container-image }}"
     assert action["test_case"] == "${{ matrix.bucket }}"
     assert action["timeout"] == "${{ matrix.timeout || 30 }}"
+    assert action["sha"] == "${{ inputs.sha }}"
     assert (
         action["unit_test_pr_files_artifact_id"] == "${{ inputs.unit_test_pr_files_artifact_id }}"
     )
-    assert action["unit_testmon_plan_artifact"] == "${{ matrix.plan_artifact }}"
-    assert action["unit_testmon_mode"] == "${{ matrix.mode || 'full' }}"
+    assert "unit_testmon_plan_artifact" not in action
+    assert "UNIT_TESTMON_COMPARE_SELECTIONS" not in yaml.safe_dump(workflow)
 
     callers = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())["jobs"]
     suffix = "" if platform == "h100" else "-gb200"
@@ -813,6 +802,9 @@ def test_unit_tests_share_gpu_selection_before_the_existing_bucket_runners(
         if platform == "h100"
         else "${{ toJSON(needs.is-not-external-contributor.outputs.selected_runner_gb200) }}"
     )
+    assert caller["with"]["unit_testmon_mode"] == (
+        "${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}"
+    )
     parser = _step("cicd-main.yml", parser_job, "parse-unit-tests")
     result, parsed = _run(parser["run"], tmp_path, shell_environment)
     assert result.returncode == 0, result.stderr
@@ -824,466 +816,38 @@ def test_unit_tests_share_gpu_selection_before_the_existing_bucket_runners(
     ]
 
 
-@pytest.mark.parametrize("setting,expected", [("", 180), ("true", 180), ("false", 90)])
-def test_gpu_selection_timeout_allows_both_worker_configurations(setting, expected):
-    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
-    expression = workflow["jobs"]["select"]["timeout-minutes"]
-    expression = expression.removeprefix("${{").removesuffix("}}")
-    expression = expression.replace("&&", "and").replace("||", "or")
-    variables = SimpleNamespace(UNIT_TESTMON_COMPARE_SELECTIONS=setting)
-    assert eval(expression, {"__builtins__": {}}, {"vars": variables}) == expected
-
-
 @pytest.mark.parametrize("mode", ["enforce", "full"])
 @pytest.mark.parametrize("branch", ["main", "dev", "core_r0.20.0", "pull-request/8523", ""])
-def test_grouped_gpu_selection_preserves_main_only_baselines_and_full_requests(mode, branch):
+def test_gpu_selection_preserves_main_only_baselines_and_full_requests(mode, branch):
     workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
-    expression = workflow["jobs"]["select"]["if"].replace("&&", "and")
+    action = workflow["jobs"]["run"]["steps"][-1]["with"]
+    expression = action["unit_testmon_mode"].removeprefix("${{").removesuffix("}}")
+    expression = expression.replace("&&", "and").replace("||", "or")
     inputs = SimpleNamespace(unit_testmon_mode=mode, unit_testmon_target_branch=branch)
     assert eval(expression, {"__builtins__": {}}, {"inputs": inputs}) == (
-        mode == "enforce" and branch == "main"
+        "enforce" if mode == "enforce" and branch == "main" else "full"
     )
 
 
-@pytest.mark.parametrize(
-    "result,has_tests,cancelled,expected",
-    [
-        ("success", "true", False, True),
-        ("success", "false", False, False),
-        ("failure", "false", False, True),
-        ("skipped", "", False, True),
-        ("success", "", False, True),
-        ("success", "true", True, False),
-    ],
-)
-def test_gpu_bucket_dispatch_only_skips_verified_empty_selection(
-    result, has_tests, cancelled, expected
-):
-    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
-    expression = workflow["jobs"]["run"]["if"].removeprefix("${{").removesuffix("}}")
-    expression = (
-        expression.replace("!cancelled()", "not cancelled").replace("&&", "and").replace("||", "or")
-    )
-    needs = SimpleNamespace(
-        select=SimpleNamespace(result=result, outputs=SimpleNamespace(has_tests=has_tests))
-    )
-    assert (
-        eval(expression, {"__builtins__": {}}, {"needs": needs, "cancelled": cancelled}) == expected
-    )
-
-
-@pytest.mark.parametrize("has_tests", [False, True], ids=["empty", "selected"])
-def test_coverage_requires_artifacts_or_verified_empty_selections(tmp_path, has_tests):
-    bucket = "tests/unit_tests/test_example.py"
-    callers = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())["jobs"]
-    coverage = _step("cicd-main.yml", "Coverage", "coverage")
-    for variable, job, output in (
-        ("H100_BUCKETS", "cicd-parse-unit-tests", "unit-tests"),
-        ("GB200_BUCKETS", "cicd-parse-unit-tests-gb200", "unit-tests-gb200"),
-    ):
-        assert job in callers["Coverage"]["needs"]
-        assert coverage["env"][variable] == (
-            "${{ needs." + job + ".outputs." + output + " || '[]' }}"
-        )
-
-    for platform in ("dgx_h100", "dgx_gb200"):
-        directory = tmp_path / f"unit-test-plan-{platform}"
-        directory.mkdir()
-        (directory / "plan.json").write_text(
-            json.dumps(
-                {
-                    "schema": 1,
-                    "source_sha": "a" * 40,
-                    "bucket": bucket,
-                    "platform": platform,
-                    "mode": "selected",
-                    "phases": {"prod": [bucket] if has_tests else [], "experimental": []},
-                }
-            )
-        )
-    result, outputs = _run(
-        coverage["run"],
-        tmp_path,
-        {
-            "SELECTIVE": "true",
-            "H100_BUCKETS": json.dumps([{"bucket": bucket}]),
-            "GB200_BUCKETS": json.dumps([{"bucket": bucket}]),
-            "SOURCE_SHA": "a" * 40,
-        },
-    )
-    # Missing coverage is valid only when every bucket selected no tests.
-    assert (result.returncode == 0) == (not has_tests), result.stdout + result.stderr
-    assert outputs == ({} if has_tests else {"has_coverage": "false"})
-
-
-@pytest.mark.parametrize(
-    "scenario",
-    [
-        "mixed",
-        "empty",
-        "cache-error",
-        "selector-error",
-        "missing-output",
-        "invalid-pr",
-        "upload-error",
-    ],
-)
-def test_grouped_native_gpu_selection(
-    tmp_path: Path, scenario: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    pytest.importorskip("testmon")
-    buckets = [
-        {"bucket": f"tests/unit_tests/{name}/**/*.py", "timeout": 40}
-        for name in (["empty"] if scenario == "empty" else ["selected", "empty", "full"])
+@pytest.mark.parametrize("has_coverage", [True, False])
+def test_gpu_selection_requires_uploaded_coverage_without_plan_exceptions(tmp_path, has_coverage):
+    coverage = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())["jobs"][
+        "Coverage"
     ]
-    unit_tests = tmp_path / "tests/unit_tests"
-    unit_tests.mkdir(parents=True)
-    for script in (
-        "testmon_cache.py",
-        "testmon_selector.py",
-        "testmon_mandatory.py",
-        "find_test_cases.py",
-    ):
-        (unit_tests / script).symlink_to(ROOT / "tests/unit_tests" / script)
-    (unit_tests / "testmon_mandatory_tests.yaml").write_text("mappings: []\n")
-    dataset = tmp_path / "tests/test_utils/python_scripts/download_unit_tests_dataset.py"
-    dataset.parent.mkdir(parents=True)
-    dataset.write_text("")
-    recipe = tmp_path / "tests/test_utils/recipes/h100/unit-tests.yaml"
-    recipe.parent.mkdir(parents=True)
-    recipe.write_text(
-        json.dumps({"products": [{"test_case": [entry["bucket"] for entry in buckets]}]})
+    assert coverage["needs"] == ["Nemo_CICD_Test", "pre-flight"]
+    assert "unit-test-plan-" not in yaml.safe_dump(coverage)
+    assert "has_coverage" not in yaml.safe_dump(coverage)
+    stale_plan = tmp_path / "unit-test-plan-old"
+    stale_plan.mkdir()
+    (stale_plan / "plan.json").write_text(
+        json.dumps({"mode": "selected", "phases": {"prod": [], "experimental": []}})
     )
-    selected = unit_tests / "selected/test_case.py"
-    selected.parent.mkdir()
-    selected.write_text("def test_case(): pass\n")
-    pr_files = tmp_path / "pr-files"
-    pr_files.mkdir()
-    (pr_files / "changed-files").write_text("")
-    (pr_files / "metadata.json").write_text(
-        json.dumps({"tested_sha": "a" * 40, "changed_files": 0, "changed_paths": 0})
-    )
-    if scenario == "invalid-pr":
-        (pr_files / "metadata.json").write_text(
-            json.dumps({"tested_sha": "a" * 40, "changed_files": 3001, "changed_paths": 0})
-        )
-    environment = {
-        **os.environ,
-        "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}",
-        "PYTHONPATH": str(unit_tests),
-        "BUCKETS": json.dumps(buckets),
-        "RECIPE_PLATFORM": "dgx_h100",
-        "SOURCE_SHA": "a" * 40,
-        "TARGET_BRANCH": "main",
-        "PR_FILES_DIR": str(pr_files),
-        "CONTAINER_IMAGE": "ci-test-image",
-        "RUNNER_TEMP": str(tmp_path),
-        "GITHUB_RUN_ID": "123",
-        "GITHUB_RUN_ATTEMPT": "2",
-        "GITHUB_OUTPUT": str(tmp_path / "outputs"),
-        "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
-    }
-    # Empty recorded databases are sufficient: a new file is selected, and a
-    # bucket without files is skipped. Use real cache validation and selection.
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            """
-import json, os
-from pathlib import Path
-from testmon.db import DB
-from testmon_cache import PHASES, cache_identity, record_phase, finalize
-for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
-    if '/full/' in entry['bucket']:
-        continue
-    directory = Path('saved') / str(index)
-    for phase in PHASES:
-        database = directory / phase / '.testmondata'
-        database.parent.mkdir(parents=True)
-        DB(str(database)).con.close()
-        record_phase(directory, phase)
-    identity = cache_identity(Path.cwd(), entry['bucket'], 'dgx_h100')
-    finalize(directory, identity, 'b' * 40, '111-1')
-""",
-        ],
-        cwd=tmp_path,
-        env=environment,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    spec = importlib.util.spec_from_file_location(
-        "select_unit_tests", ROOT / ".github/scripts/select_unit_tests.py"
-    )
-    assert spec is not None and spec.loader is not None
-    selector = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(selector)
-    monkeypatch.chdir(tmp_path)
-    for key, value in environment.items():
-        monkeypatch.setenv(key, value)
-    uploads = []
-    restores = 0
-
-    def actions(operation, *args):
-        nonlocal restores
-        if operation == "restore":
-            path, key, prefix, key_file = args
-            assert path == "assets_dir/testmon"
-            assert key == f"{prefix}lookup-123-2"
-            assert not Path(path).exists(), "previous bucket cache was not cleared"
-            index = restores
-            restores += 1
-            if scenario == "cache-error" and index == 0:
-                raise subprocess.CalledProcessError(1, [operation])
-            saved = tmp_path / "saved" / str(index)
-            if saved.exists():
-                shutil.copytree(saved, path)
-            Path(key_file).write_text(f"{prefix}111-1" if saved.exists() else "")
-        else:
-            assert operation == "upload"
-            if scenario == "upload-error":
-                raise subprocess.CalledProcessError(1, [operation])
-            name, plan, root = args
-            assert root == "assets_dir/testmon-plan"
-            assert plan == f"{root}/plan.json"
-            uploads.append({"name": name, "plan": json.loads(Path(plan).read_text())})
-
-    monkeypatch.setattr(selector, "_actions", actions)
-
-    launches = []
-
-    def launch(bucket, selection_gpus="1"):
-        shutil.rmtree(Path("assets_dir/testmon/.testmon-work"), ignore_errors=True)
-        launches.append(bucket)
-        if scenario == "selector-error" and "/selected/" in bucket:
-            raise subprocess.CalledProcessError(1, ["native-gpu-collection"])
-        for phase in ("prod", "experimental"):
-            directory = Path("assets_dir/testmon/.testmon-work") / phase
-            directory.mkdir(parents=True)
-            (directory / "selected-tests").write_text(
-                "tests/unit_tests/selected/test_case.py::test_case\n"
-                if "/selected/" in bucket
-                else ""
-            )
-            (directory / "mandatory-tests").write_text("")
-        if scenario == "missing-output" and "/selected/" in bucket:
-            (Path("assets_dir/testmon/.testmon-work/experimental/selected-tests")).unlink()
-
-    monkeypatch.setattr(selector, "_launch_gpu_selection", launch)
-    monkeypatch.setattr(
-        selector, "_clear_cache", lambda path: shutil.rmtree(path) if path.exists() else None
-    )
-    if scenario == "upload-error":
-        with pytest.raises(subprocess.CalledProcessError):
-            selector.main()
-        assert not (tmp_path / "outputs").exists()
-        return
-    selector.main()
-    assert restores == len(buckets)
-    outputs = dict(line.split("=", 1) for line in (tmp_path / "outputs").read_text().splitlines())
-    matrix = json.loads(outputs["matrix"])
-    assert outputs["has_tests"] == str(scenario != "empty").lower()
-    assert [entry["bucket"] for entry in matrix] == [
-        entry["bucket"]
-        for entry in buckets
-        if scenario == "invalid-pr" or entry["bucket"] != "tests/unit_tests/empty/**/*.py"
-    ]
-    assert [entry["mode"] for entry in matrix] == (
-        ["full", "full", "full"]
-        if scenario == "invalid-pr"
-        else (
-            []
-            if scenario == "empty"
-            else [
-                (
-                    "full"
-                    if scenario in {"cache-error", "selector-error", "missing-output"}
-                    else "preselected"
-                ),
-                "full",
-            ]
-        )
-    )
-    assert all(entry["timeout"] == 40 for entry in matrix)
-    assert bool(caplog.records) == (scenario != "empty")
-    for upload in uploads:
-        plan = upload["plan"]
-        assert re.fullmatch(r"unit-test-plan-dgx_h100-[0-9a-f]{16}-123-2", upload["name"])
-        expected = (
-            ["tests/unit_tests/selected/test_case.py::test_case"]
-            if "/selected/" in plan["bucket"]
-            else []
-        )
-        assert plan["phases"] == {"prod": expected, "experimental": expected}
-        assert plan["source_sha"] == "a" * 40
-        matches = [entry for entry in matrix if entry["bucket"] == plan["bucket"]]
-        assert bool(matches) == bool(expected)
-        if matches:
-            assert matches[0]["plan_artifact"] == upload["name"]
-    assert bool(uploads) == (scenario != "invalid-pr")
-    if scenario == "invalid-pr":
-        assert not launches
-    else:
-        assert any("/empty/" in upload["plan"]["bucket"] for upload in uploads)
-    assert all(entry["plan_artifact"] == "" for entry in matrix if entry["mode"] == "full")
-
-
-@pytest.mark.parametrize(
-    "bucket",
-    [
-        "tests/unit_tests/inference/test_batch_invariant_fp8.py",
-        "tests/unit_tests/inference/test_disagg_transport.py",
-    ],
-)
-def test_grouped_gpu_selection_preserves_always_full_buckets(tmp_path, monkeypatch, bucket):
-    spec = importlib.util.spec_from_file_location(
-        "select_unit_tests", ROOT / ".github/scripts/select_unit_tests.py"
-    )
-    selector = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(selector)
-    monkeypatch.chdir(tmp_path)
-    for key, value in {
-        "TARGET_BRANCH": "main",
-        "RECIPE_PLATFORM": "dgx_h100",
-        "GITHUB_RUN_ID": "123",
-        "GITHUB_RUN_ATTEMPT": "1",
-        "RUNNER_TEMP": str(tmp_path),
-        "GITHUB_OUTPUT": str(tmp_path / "outputs"),
-        "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
-        "BUCKETS": json.dumps([{"bucket": bucket}]),
-    }.items():
-        monkeypatch.setenv(key, value)
-
-    def unexpected(*args):
-        pytest.fail("Always-full buckets must not restore caches or run collection")
-
-    monkeypatch.setattr(selector, "_actions", unexpected)
-    monkeypatch.setattr(selector, "_python", unexpected)
-    monkeypatch.setattr(selector, "_launch_gpu_selection", unexpected)
-    selector.main()
-    output = dict(line.split("=", 1) for line in (tmp_path / "outputs").read_text().splitlines())
-    assert output["has_tests"] == "true"
-    assert json.loads(output["matrix"]) == [{"bucket": bucket, "mode": "full", "plan_artifact": ""}]
-
-
-@pytest.mark.parametrize("platform", ["dgx_h100", "dgx_gb200"])
-def test_grouped_selector_launches_native_selection_without_execution(
-    tmp_path, monkeypatch, platform
-):
-    spec = importlib.util.spec_from_file_location(
-        "select_unit_tests", ROOT / ".github/scripts/select_unit_tests.py"
-    )
-    selector = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(selector)
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("RECIPE_PLATFORM", platform)
-    monkeypatch.setenv("CONTAINER_IMAGE", "existing-ci-image")
-    calls = []
-    monkeypatch.setattr(
-        selector.subprocess, "run", lambda command, **kwargs: calls.append((command, kwargs))
-    )
-    bucket = "tests/unit_tests/generalized_tensor_parallel/**/*.py"
-    selector._launch_gpu_selection(bucket)
-    command, options = calls[0]
-    assert command[:2] == [
-        sys.executable,
-        "tests/test_utils/python_scripts/launch_nemo_run_workload.py",
-    ]
-    assert command[command.index("--unit-testmon-mode") + 1] == "select-only"
-    assert command[command.index("--unit-testmon-selection-gpus") + 1] == "1"
-    assert command[command.index("--test-case") + 1] == bucket
-    assert command[command.index("--container-image") + 1] == "existing-ci-image"
-    assert command[command.index("--platform") + 1] == platform
-    assert options["check"] is True
-    assert options["env"]["PYTHONPATH"] == str(tmp_path)
-
-
-@pytest.mark.parametrize(
-    "scenario",
-    [
-        "single",
-        "match",
-        "different",
-        "mandatory-different",
-        "single-fails",
-        "reference-fails",
-        "exception",
-        "default-validation",
-        "invalid-config",
-    ],
-)
-def test_single_worker_selection_is_compared_and_can_retain_recipe_ranks(
-    tmp_path, monkeypatch, scenario
-):
-    spec = importlib.util.spec_from_file_location(
-        "select_unit_tests", ROOT / ".github/scripts/select_unit_tests.py"
-    )
-    selector = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(selector)
-    bucket = "tests/unit_tests/example/**/*.py"
-    monkeypatch.setenv("RECIPE_PLATFORM", "dgx_h100")
-    if scenario == "default-validation":
-        monkeypatch.delenv("UNIT_TESTMON_COMPARE_SELECTIONS", raising=False)
-    elif scenario == "invalid-config":
-        monkeypatch.setenv("UNIT_TESTMON_COMPARE_SELECTIONS", "ture")
-    else:
-        monkeypatch.setenv(
-            "UNIT_TESTMON_COMPARE_SELECTIONS",
-            "false" if scenario in {"single", "single-fails", "exception"} else "true",
-        )
-    monkeypatch.setenv(
-        "UNIT_TESTMON_MULTI_RANK_BUCKETS",
-        json.dumps({"dgx_h100": [bucket]} if scenario == "exception" else {}),
-    )
-    calls = []
-
-    def collect(name, directory, workers):
-        assert name == bucket and directory == tmp_path
-        calls.append(workers)
-        if (scenario == "single-fails" and workers == "1") or (
-            scenario == "reference-fails" and workers == "recipe"
-        ):
-            raise subprocess.CalledProcessError(1, ["native-collection"])
-        selected = ["tests/unit_tests/example/test_case.py::test_common"]
-        mandatory = []
-        if scenario == "different" and workers == "recipe":
-            selected.append("tests/unit_tests/example/test_case.py::test_other_rank")
-        if scenario == "mandatory-different" and workers == "recipe":
-            mandatory.append("tests/unit_tests/example/test_required.py")
-        return {
-            "mode": "selected",
-            "selection_gpus": workers,
-            "phases": {"prod": selected, "experimental": []},
-            "mandatory_files": mandatory,
-        }
-
-    monkeypatch.setattr(selector, "_collect_gpu_selection", collect)
-    if scenario == "invalid-config":
-        with pytest.raises(ValueError, match="UNIT_TESTMON_COMPARE_SELECTIONS"):
-            selector._collect_for_bucket(bucket, tmp_path)
-        assert calls == []
-        return
-    if scenario == "reference-fails":
-        with pytest.raises(subprocess.CalledProcessError):
-            selector._collect_for_bucket(bucket, tmp_path)
-        return
-    plan = selector._collect_for_bucket(bucket, tmp_path)
-    if scenario in {"different", "mandatory-different", "single-fails", "exception"}:
-        assert plan["selection_gpus"] == "recipe"
-    else:
-        assert plan["selection_gpus"] == "1"
-    assert calls == (
-        ["recipe"]
-        if scenario == "exception"
-        else ["1"] if scenario == "single" else ["1", "recipe"]
-    )
-    if scenario in {"match", "different", "mandatory-different", "default-validation"}:
-        assert plan["rank_comparison"]["equivalent"] == (
-            scenario in {"match", "default-validation"}
-        )
-    if scenario == "different":
-        assert plan["rank_comparison"]["differences"]["prod"]["recipe_only"] == [
-            "tests/unit_tests/example/test_case.py::test_other_rank"
-        ]
-        assert "tests/unit_tests/example/test_case.py::test_other_rank" in plan["phases"]["prod"]
+    if has_coverage:
+        report = tmp_path / "coverage-unit-test-example"
+        report.mkdir()
+        (report / ".coverage").touch()
+    result, outputs = _run(_step("cicd-main.yml", "Coverage", "coverage")["run"], tmp_path, {})
+    assert (result.returncode == 0) == has_coverage, result.stdout + result.stderr
+    assert outputs == {}
+    if not has_coverage:
+        assert "Missing unit-test coverage artifacts" in result.stderr
