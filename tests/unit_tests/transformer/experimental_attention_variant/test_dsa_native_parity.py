@@ -2172,6 +2172,9 @@ def test_cudnn_attention_backward_pads_small_local_head_count(monkeypatch):
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
+    # The head padding depends on the device SM; pin SM90 so the expected shapes below hold
+    # on any CUDA device, including pre-SM90 ones where the real lookup raises.
+    monkeypatch.setattr(dsa_cudnn_kernels, "_current_sm", lambda: (9, 0))
 
     sq, batch_size, num_heads, attn_dim, value_dim, skv = 2, 1, 8, 4, 3, 4
     grad_query, grad_kv = dsa_cudnn_kernels._run_sparse_attention_backward(
