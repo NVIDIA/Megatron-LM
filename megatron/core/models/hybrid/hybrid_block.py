@@ -830,7 +830,10 @@ class HybridStack(MegatronModule):
                                 physical_layer_idx, hidden_states
                             )
 
-                    if residual_stream_recompute_context is not None:
+                    if (
+                        residual_stream_recompute_context is not None
+                        and self.config.residual_stream_recompute_num_layers != 1
+                    ):
                         residual_stream_recompute_context.finalize(hidden_states)
                     self._finalize_mhc_recompute_layer(
                         manager=mhc_manager,

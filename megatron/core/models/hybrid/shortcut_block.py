@@ -605,4 +605,10 @@ class ShortcutMoEBlock(MegatronModule):
             )
         if cp_layout_state is not None:
             output = cp_layout_state.finalize_layer(self.moe_local_idx, output)
+        if (
+            moe_recompute_context is not None
+            and self.config.residual_stream_recompute_num_layers == 1
+        ):
+            # Finalize both halves inside the block's FSDP backward boundary.
+            moe_recompute_context.finalize(output)
         return output

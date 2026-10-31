@@ -1152,6 +1152,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 output = self._forward_mlp(
                     hidden_states, kwargs.get("inference_context", None), **mlp_kwargs
                 )
+            if (
+                residual_stream_recompute_context is not None
+                and self.config.residual_stream_recompute_num_layers == 1
+            ):
+                residual_stream_recompute_context.finalize(output)
             return output, context
 
     def _forward_pre_mlp_layernorm(

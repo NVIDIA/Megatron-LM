@@ -219,19 +219,11 @@ class _RecordingOrdinaryTransformerLayer(TransformerLayer):
 
 
 class _RecordingMambaLayer(WideResidualMambaLayer):
-    def forward(
-        self,
-        hidden_states,
-        *args,
-        packed_seq_params=None,
-        residual_stream_recompute_context=None,
-        **kwargs,
-    ):
-        del args, kwargs
+    def forward(self, *args, **kwargs):
         self.event_log.append("mamba_forward")
-        self.received_packed_seq_params = packed_seq_params
-        self.received_residual_recompute_context = residual_stream_recompute_context
-        return hidden_states
+        self.received_packed_seq_params = kwargs.get("packed_seq_params")
+        self.received_residual_recompute_context = kwargs.get("residual_stream_recompute_context")
+        return super().forward(*args, **kwargs)
 
 
 class _OffloadedQKVBranch(_TransformerBranch):
@@ -803,10 +795,14 @@ class TestResidualStreamRecomputeIntegration:
     @pytest.mark.parametrize(
         "fp32_residual_connection", [False, True], ids=["native-residual", "fp32-residual"]
     )
-    def test_hybrid_stack_matches_eager_forward_and_backward(self, fp32_residual_connection):
+    @pytest.mark.parametrize("block_size", [1, 2], ids=["layer-replay", "stack-replay"])
+    def test_hybrid_stack_matches_eager_forward_and_backward(
+        self, fp32_residual_connection, block_size
+    ):
         recomputed_config = _wide_recompute_config(
             fp32_residual_connection=fp32_residual_connection
         )
+        recomputed_config.residual_stream_recompute_num_layers = block_size
         reference_config = copy.deepcopy(recomputed_config)
         reference_config.recompute_granularity = None
         reference_config.recompute_modules = ["core_attn"]
@@ -859,8 +855,10 @@ class TestResidualStreamRecomputeIntegration:
         assert reference_output.dtype == expected_dtype
         assert recomputed_output.dtype == expected_dtype
 
-    def test_hybrid_mamba_cp_layout_finalizes_before_residual_replay(self, monkeypatch):
+    @pytest.mark.parametrize("block_size", [1, 2])
+    def test_hybrid_mamba_cp_layout_replay_finalization(self, monkeypatch, block_size):
         config = _wide_recompute_config(num_layers=1)
+        config.residual_stream_recompute_num_layers = block_size
         stack = HybridStack(
             config,
             HybridStackSubmodules(mamba_layer=_recording_mamba_spec()),
@@ -874,6 +872,7 @@ class TestResidualStreamRecomputeIntegration:
         layer_packed_seq_params = object()
 
         class _RecordingCPLayoutState:
+            input_hidden_states = None
             finalized_hidden_states = None
 
             def prepare_layer(self, layer_index, hidden_states):
@@ -890,6 +889,7 @@ class TestResidualStreamRecomputeIntegration:
             def finalize_layer(self, layer_index, hidden_states):
                 assert layer_index == 0
                 events.append("cp_finalize")
+                self.input_hidden_states = hidden_states
                 self.finalized_hidden_states = hidden_states + 1.0
                 return self.finalized_hidden_states
 
@@ -925,21 +925,33 @@ class TestResidualStreamRecomputeIntegration:
             packed_seq_params=boundary_packed_seq_params,
         )
 
-        assert events == [
-            "cp_build",
-            "cp_prepare",
-            "mamba_forward",
-            "cp_finalize",
-            "replay_finalize",
-        ]
         assert stack.layers[0].received_packed_seq_params is layer_packed_seq_params
         assert stack.layers[0].received_residual_recompute_context is not None
         assert len(replay_inputs) == 1
-        assert replay_inputs[0] is cp_layout_state.finalized_hidden_states
+        if block_size == 1:
+            assert events == [
+                "cp_build",
+                "cp_prepare",
+                "mamba_forward",
+                "replay_finalize",
+                "cp_finalize",
+            ]
+            assert replay_inputs[0] is cp_layout_state.input_hidden_states
+        else:
+            assert events == [
+                "cp_build",
+                "cp_prepare",
+                "mamba_forward",
+                "cp_finalize",
+                "replay_finalize",
+            ]
+            assert replay_inputs[0] is cp_layout_state.finalized_hidden_states
         assert output.shape == hidden_states.shape
 
-    def test_hybrid_mtp_stack_stays_ordinary_width_and_skips_residual_replay(self):
+    @pytest.mark.parametrize("block_size", [1, 2])
+    def test_hybrid_mtp_stack_stays_ordinary_width_and_skips_residual_replay(self, block_size):
         config = _wide_recompute_config(num_layers=1)
+        config.residual_stream_recompute_num_layers = block_size
         stack = HybridStack(
             config,
             HybridStackSubmodules(attention_layer=_ordinary_recording_layer_spec()),
