@@ -28,11 +28,22 @@ def _padded_controller_logits(values: tuple[float, ...]) -> torch.Tensor:
     "with_retention", [False, True], ids=("identity_carry", "learned_retention")
 )
 @pytest.mark.parametrize("fp32_residual", [False, True], ids=("bf16_residual", "fp32_residual"))
-def test_fused_streamwise_read_write_replays_fwd_bwd(with_retention, fp32_residual):
-    """Replay fused outputs and every activation/controller gradient under contention."""
+@pytest.mark.parametrize(
+    "stream_width,backward_tile",
+    [(256, (64, 128)), (1024, (16, 512))],
+    ids=("shared_tile", "wide_backward_tile"),
+)
+def test_fused_streamwise_read_write_replays_fwd_bwd(
+    with_retention, fp32_residual, stream_width, backward_tile
+):
+    """Replay fused outputs and every activation/controller gradient under contention.
+
+    A width of 1024 selects the 16 x 512 backward tile; a width of 256 keeps the backward
+    kernels on the forward tile.
+    """
 
     seeded()
-    num_streams, stream_width = 3, 256
+    num_streams = 3
     residual_dtype = torch.float32 if fp32_residual else torch.bfloat16
     branch_dtype = torch.bfloat16
     residual = torch.randn(
@@ -48,6 +59,11 @@ def test_fused_streamwise_read_write_replays_fwd_bwd(with_retention, fp32_residu
     read_logits = _padded_controller_logits((-0.8, -0.7, -0.6))
     write_logits = _padded_controller_logits((-0.01, 0.0, 0.01))
     retention_logits = _padded_controller_logits((4.8, 4.9, 5.0)) if with_retention else None
+
+    block_batch, block_width, _ = streamwise_residual_ops._streamwise_backward_block_config(
+        CONTENTION_TOKENS, stream_width
+    )
+    assert (block_batch, block_width) == backward_tile
 
     assert streamwise_residual_ops._can_use_streamwise_triton(
         residual,

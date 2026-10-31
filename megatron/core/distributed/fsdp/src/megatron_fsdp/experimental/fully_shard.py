@@ -18,23 +18,48 @@ import dataclasses
 import functools
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 
 from torch import nn
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .context import FsdpContext, current_fully_shard_context
+from .context import FsdpContext
 from .module import FsdpModule
+from .placement import ShardLayout
 from .schedule import SchedulePolicy
 
-# TODO(wujingyue): Separate fully_shard_context from FsdpContext in a follow-up PR.
-# Scope management and shared runtime state are separate responsibilities (SRP):
-# https://blog.cleancoder.com/uncle-bob/2014/05/08/SingleReponsibilityPrinciple.html
-# Keep this alias for now to avoid changing callers and limit this PR's scope.
-fully_shard_context = FsdpContext
+_FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
 
 MeshAxis = int | str
+
+
+@contextmanager
+def fully_shard_context(context: FsdpContext) -> Iterator[FsdpContext]:
+    """Activate ``context`` for FSDP construction, finalizing it on successful exit."""
+    if _FSDP_CONTEXT.get() is not None:
+        raise RuntimeError("fully_shard_context does not support nesting.")
+    if context.is_finalized:
+        raise RuntimeError("Cannot enter fully_shard_context after construction is finalized.")
+    token = _FSDP_CONTEXT.set(context)
+    try:
+        yield context
+        context.finalize()
+    finally:
+        _FSDP_CONTEXT.reset(token)
+
+
+def current_fully_shard_context() -> FsdpContext | None:
+    """Return the innermost active ``fully_shard_context``, or ``None``.
+
+    Read-only counterpart of :func:`fully_shard_context`: it never creates, joins, or
+    finalizes a context, and returns ``None`` whenever no ``fully_shard_context`` scope is
+    active. Callers that must share one context -- for example per-chunk wrappers built by
+    a single wrap call -- use it to join the caller's ambient context instead of opening a
+    second one.
+    """
+    return _FSDP_CONTEXT.get()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -72,6 +97,7 @@ def fully_shard(
     schedule_policy: SchedulePolicy = SchedulePolicy(),
     register_hooks: bool = True,
     grad_accumulation_count: int | None = None,
+    shard_layout: ShardLayout = ShardLayout.PADDED,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -107,6 +133,10 @@ def fully_shard(
             window, including contributions from separate GraphTasks and delayed
             weight gradients. Defaults to one per owned trainable parameter.
             The scheduler must declare the complete count before sharding the unit.
+        shard_layout: How RowAtomic/BlockAtomic parameter groups are split across ranks.
+            ``ShardLayout.PADDED`` (default) pads every group to equal shards;
+            ``ShardLayout.UNPADDED`` packs each group without padding and splits it at row
+            boundaries (32-row block boundaries for MXFP8) into generally unequal shards.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -139,6 +169,7 @@ def fully_shard(
             use_symmetric_memory=context.use_symmetric_memory,
             register_hooks=register_hooks,
             grad_accumulation_count=grad_accumulation_count,
+            shard_layout=shard_layout,
         )
     except Exception:
         module.__class__ = original_cls

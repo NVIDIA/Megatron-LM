@@ -1151,6 +1151,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     causal=True,
                     window_size=window_size,
                     num_splits=0 if not self.batch_invariant_mode else 1,
+                    return_lse=need_lse,
                     **softcap_kwargs,
                 )
             elif use_fa3:
@@ -1298,6 +1299,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         causal=True,
                         window_size=window_size,
                         num_splits=0 if not self.batch_invariant_mode else 1,
+                        return_lse=need_lse,
                         **softcap_kwargs,
                     )
                     if need_lse:
@@ -1335,9 +1337,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         ), "Batch invariant mode is not supported for flash attention 2"
                         kvcache_ret = flash_attn_with_kvcache(**flash_attn_args)
                     if need_lse:
-                        # FA2/FA3 *_with_kvcache return (out, softmax_lse) when
-                        # return_softmax_lse=True.
-                        output_total, softmax_lse = kvcache_ret
+                        # FA3 may append kernel metadata after (out, softmax_lse),
+                        # while FA2 returns exactly those two values.
+                        output_total, softmax_lse, *_ = kvcache_ret
                         # output_total: (B, S, H, D); softmax_lse: (B, H, S)
                         output_total = self._apply_sink_softmax_correction_bshd(
                             output_total, softmax_lse, softmax_offset
@@ -1752,7 +1754,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     # Clear the outputs for padding tokens when using quantization scales
                     # to avoid corrupting amax calculations
                     if is_using_quantization_scales(self.config):
-                        core_attn_out[inference_context.padding_slice] = 0.0
+                        inference_context.zero_padding_tokens(core_attn_out)
 
             core_attn_out = core_attn_manager.group_offload(
                 core_attn_out, forced_released_tensors=[query, key, value]

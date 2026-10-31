@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron global variables."""
 
@@ -19,7 +19,6 @@ from megatron.core.num_microbatches_calculator import (
     unset_num_microbatches_calculator,
 )
 from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 from megatron.training.state import TrainState
 
@@ -197,8 +196,9 @@ def initialize_runtime_services(
 
     cfg = get_run_config()
     if build_tokenizer:
-        _build_tokenizer(args)
-    resolve_tokenizer_vocab_size(cfg, getattr(args, "padded_vocab_size", None))
+        _build_tokenizer(cfg, args)
+    resolve_tokenizer_vocab_size(cfg)
+    _bind_dataset_tokenizer(cfg)
     _set_wandb_writer(args)
     _set_telemetry(args, include_training=training)
 
@@ -301,11 +301,29 @@ def _set_train_state():
     _GLOBAL_TRAIN_STATE = TrainState()
 
 
-def _build_tokenizer(args):
+def _build_tokenizer(cfg, args):
     """Initialize tokenizer."""
+    from megatron.training.models.gpt import GPTModelConfig
+    from megatron.training.models.hybrid import HybridModelConfig
+    from megatron.training.vocab_utils import build_tokenizer_and_pad_vocab_size
+
     global _GLOBAL_TOKENIZER
     _ensure_var_is_not_initialized(_GLOBAL_TOKENIZER, 'tokenizer')
-    _GLOBAL_TOKENIZER = build_tokenizer(args)
+
+    if isinstance(cfg.model, (GPTModelConfig, HybridModelConfig)):
+        make_vocab_size_divisible_by = cfg.model.make_vocab_size_divisible_by
+        tp_size = cfg.model.transformer.tensor_model_parallel_size
+    else:
+        make_vocab_size_divisible_by = args.make_vocab_size_divisible_by
+        tp_size = args.tensor_model_parallel_size
+
+    _GLOBAL_TOKENIZER = build_tokenizer_and_pad_vocab_size(cfg.tokenizer, make_vocab_size_divisible_by, tp_size)
+
+    # TODO (@maanug): remove this WAR once all reads from args.padded_vocab_size 
+    # have been updated to read from cfg.tokenizer.padded_vocab_size
+    if getattr(args, "padded_vocab_size", None) is None:
+        args.padded_vocab_size = cfg.tokenizer.padded_vocab_size
+
     # Resolve the declared model field once, before any args-to-config conversion.
     # The tokenizer includes added tokens; padded_vocab_size also includes TP padding.
     if (
@@ -318,10 +336,31 @@ def _build_tokenizer(args):
     return _GLOBAL_TOKENIZER
 
 
-def rebuild_tokenizer(args):
+def rebuild_tokenizer(cfg, args):
     global _GLOBAL_TOKENIZER
     _GLOBAL_TOKENIZER = None
-    return _build_tokenizer(args)
+    return _build_tokenizer(cfg, args)
+
+
+def _bind_dataset_tokenizer(cfg) -> None:
+    """Bind the run's tokenizer to ``cfg.data.dataset`` (Megatron Core's ``validate()`` runs then).
+
+    Only GPT entry points carry a dataset there, and nothing happens without a tokenizer
+    (``build_tokenizer=False``: the provider then reports the unbound config). The container must
+    be finalized first, as ``initialize_megatron`` and ``set_global_variables`` do (the fields other
+    sections own are written then). ``DataConfig.bind_tokenizer`` decides the rest: a config bound
+    earlier to this tokenizer is left as is, one bound to another tokenizer is an error.
+    """
+    data = getattr(cfg, "data", None)
+    if getattr(data, "dataset", None) is None or _GLOBAL_TOKENIZER is None:
+        return
+    if not getattr(cfg, "_finalized", False):
+        raise RuntimeError(
+            "cfg.data.dataset cannot bind the tokenizer before the container is finalized: call "
+            "cfg.finalize() before initialize_runtime_services(), as initialize_megatron() and "
+            "set_global_variables() do."
+        )
+    data.bind_tokenizer(_GLOBAL_TOKENIZER)
 
 
 def _set_tensorboard_writer(args):

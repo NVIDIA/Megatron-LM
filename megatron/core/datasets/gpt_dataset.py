@@ -1,9 +1,10 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 import os
 import time
-from dataclasses import dataclass, field
+import warnings
+from dataclasses import dataclass
 from math import ceil
 from typing import Dict, Optional, Tuple
 
@@ -59,20 +60,23 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     Set to 0 if sequence parallel is not enabled regardless of TP size.
     """
 
-    hybrid_context_parallel: bool = False
-    """Option to enable hybrid context parallelism. When setting this to True, 
+    dynamic_context_parallel: bool = False
+    """Option to enable dynamic context parallelism. When setting this to True,
     each sample should be divisible by the data parallel size * context parallel size * 2.
-    If sequence parallel is enabled, it should be divisible by the 
+    If sequence parallel is enabled, it should be divisible by the
     data parallel size * context parallel size * sequence parallel size * 2.
     """
+
+    hybrid_context_parallel: bool = False
+    """Deprecated alias for ``dynamic_context_parallel``. ``validate_without_tokenizer()`` warns
+    about it and raises when it is set together with ``dynamic_context_parallel``; it does not
+    rewrite it (nothing is assigned there): normalize the alias where the config is built, as
+    ``validate_args`` and the training container do."""
 
     sequences_per_dataset: Optional[Dict[str, int]] = None
     """If provided, the sequence and document counts for each dataset. 
        Check --per-dataset-sequences-path
     """
-
-    token_dtype_code: Optional[int] = field(init=False, default=None)
-    """The dtype code for the token ids. 4 for int32, 8 for uint16."""
 
     context_parallel_size: Optional[int] = None
     """The size of the context parallel group. Needed for padding in packed sequences."""
@@ -117,32 +121,65 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     TODO: drop this field once a functional test covers THD-vs-SBHD numerical
     parity in CI."""
 
-    def __post_init__(self) -> None:
-        """Do asserts and set fields post init"""
-        super().__post_init__()
+    def validate(self) -> None:
+        """Check a complete config: ``validate_without_tokenizer()``, then the tokenizer and what
+        follows from it. Assertions only, idempotent.
 
-        assert self.tokenizer is not None
+        What ``__post_init__`` asserted before: a config can be constructed before its tokenizer
+        exists and completed later, so run this once it is complete
+        (``BlendedMegatronDatasetBuilder`` runs it before building). ``token_dtype_code`` follows
+        from the tokenizer.
+        """
+        super().validate()
 
-        assert self.reset_position_ids is not None
-        assert self.reset_attention_mask is not None
-        assert self.eod_mask_loss is not None
+        assert (
+            self.tokenizer is not None
+        ), "tokenizer must be bound before the config is validated or the datasets are built."
 
-        if self.varlen_sbhd_validation:
-            assert not self.hybrid_context_parallel, (
-                "--varlen-sbhd-validation is incompatible with "
-                "--hybrid-context-parallel (SBHD mode is not packed)."
-            )
-
-        self.token_dtype_code = (
-            None
-            if self.tokenizer.vocab_size is None
-            else (4 if self.tokenizer.vocab_size > numpy.iinfo(numpy.uint16).max + 1 else 8)
-        )
         if self.sequences_per_dataset is not None:
             assert (
                 self.token_dtype_code is not None
             ), "Tokenizer vocab size is not set, deactivate --per-dataset-sequences-path or \
             fix the tokenizer."
+
+    def validate_without_tokenizer(self) -> None:
+        """The checks that need no tokenizer: the base class's, the three masking / loss booleans,
+        the deprecated ``hybrid_context_parallel`` alias (warned about, an error together with
+        ``dynamic_context_parallel``, not rewritten) and the SBHD / dynamic-CP exclusion.
+        ``validate()`` runs them first; a caller that checks a config before its tokenizer exists
+        runs this alone."""
+        super().validate_without_tokenizer()
+
+        assert self.reset_position_ids is not None, "reset_position_ids must be defined."
+        assert self.reset_attention_mask is not None, "reset_attention_mask must be defined."
+        assert self.eod_mask_loss is not None, "eod_mask_loss must be defined."
+
+        if self.hybrid_context_parallel:
+            warnings.warn(
+                "GPTDatasetConfig.hybrid_context_parallel is deprecated; use "
+                "dynamic_context_parallel instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.dynamic_context_parallel:
+                raise ValueError(
+                    "Cannot set both hybrid_context_parallel and dynamic_context_parallel"
+                )
+
+        if self.varlen_sbhd_validation:
+            assert not (self.dynamic_context_parallel or self.hybrid_context_parallel), (
+                "--varlen-sbhd-validation is incompatible with "
+                "--dynamic-context-parallel (SBHD mode is not packed)."
+            )
+
+    @property
+    def token_dtype_code(self) -> Optional[int]:
+        """The dtype code for the token ids, 4 for int32 and 8 for uint16, from the tokenizer's
+        vocabulary size; None without a tokenizer or a vocabulary size."""
+        vocab_size = None if self.tokenizer is None else self.tokenizer.vocab_size
+        if vocab_size is None:
+            return None
+        return 4 if vocab_size > numpy.iinfo(numpy.uint16).max + 1 else 8
 
 
 class GPTDataset(MegatronDataset):

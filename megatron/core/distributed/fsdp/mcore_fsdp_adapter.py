@@ -55,8 +55,11 @@ try:
         MixedPrecisionPolicy,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+        FsdpContext,
         Placements,
+        RuntimePolicy,
         SchedulePolicy,
+        ShardLayout,
         fully_shard,
         fully_shard_context,
         microbatch,
@@ -691,6 +694,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             mixed_precision_policy=self.mp_policy,
             schedule_policy=schedule_policy,
             register_hooks=not config.overlap_moe_expert_parallel_comm,
+            shard_layout=(
+                ShardLayout.PADDED
+                if ddp_config.megatron_fsdp_padded_shards
+                else ShardLayout.UNPADDED
+            ),
         )
         # Join the caller's ambient context when one is active (VPP chunks); otherwise
         # open and finalize our own. MCore's finalize_model_grads() owns the wait
@@ -698,15 +706,18 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         active_context = current_fully_shard_context()
         if active_context is None:
             construction_context = fully_shard_context(
-                device=device,
-                use_symmetric_memory=ddp_config.nccl_ub,
-                caller_managed_grad_sync=True,
+                FsdpContext(
+                    device=device,
+                    runtime_policy=RuntimePolicy(
+                        use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True
+                    ),
+                )
             )
         else:
             if not active_context.caller_managed_grad_sync:
                 raise ValueError(
                     "MCore MFSDP v2 requires shared contexts to be constructed with "
-                    "caller_managed_grad_sync=True."
+                    "RuntimePolicy(caller_managed_grad_sync=True)."
                 )
             construction_context = nullcontext(active_context)
         with construction_context:
@@ -889,6 +900,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             )
         if ddp_config.nccl_ub and ddp_config.disable_symmetric_registration:
             raise ValueError("MFSDP v2 requires symmetric registration when nccl_ub is enabled.")
+        if ddp_config.nccl_ub and not ddp_config.megatron_fsdp_padded_shards:
+            raise ValueError(
+                "MFSDP v2 megatron_fsdp_padded_shards=False is incompatible with nccl_ub: "
+                "symmetric-memory collectives require equal shard sizes."
+            )
         if ddp_config.fsdp_manual_registration:
             raise ValueError("MFSDP v2 does not support fsdp_manual_registration.")
         if ddp_config.num_buckets is not None:
