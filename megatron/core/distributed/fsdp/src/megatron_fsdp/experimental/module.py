@@ -32,7 +32,7 @@ from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
 from .execution_order import ExecutionOrder
-from .module_utils import get_parameter_owner
+from .module_utils import get_parameter_owner, is_in_backward
 from .parameter_group import (
     FsdpParameter,
     FsdpParameterGroup,
@@ -42,11 +42,6 @@ from .parameter_group import (
 from .phase import Phase
 from .placement import BlockAtomic, RowAtomic, ShardLayout
 from .schedule import SchedulePolicy
-
-
-def _is_in_backward() -> bool:
-    """Return whether the current thread is executing an autograd GraphTask."""
-    return torch._C._current_graph_task_id() != -1
 
 
 class FsdpModule:
@@ -277,7 +272,7 @@ class FsdpModule:
         context.ensure_finalized()
         # A reentrant checkpoint recomputes before the child module's backward-pre
         # hook runs. The active autograd GraphTask identifies that recomputation.
-        is_recomputing = self.phase is Phase.BACKWARD or _is_in_backward()
+        is_recomputing = self.phase is Phase.BACKWARD or is_in_backward()
         if self.phase is not Phase.BACKWARD:
             self.phase = Phase.FORWARD
         # forward/backward each span multiple lifecycle methods (pre_forward ->
@@ -364,13 +359,18 @@ class FsdpModule:
             raise ValueError(
                 f"Unsharding requires a FORWARD, BACKWARD, or None phase, got {phase!r}."
             )
+        # Recomputation that does not re-enter this module's pre_forward reads MXFP8 rowwise
+        # planes in backward, so gather them together with columnwise ones. Other dtype
+        # weights serve both phases already.
+        if phase is Phase.BACKWARD and self._schedule_policy.unshard_all_planes_in_backward:
+            phase = None
         with torch.cuda.stream(self.context.allgather_stream):
             for group in self._parameter_groups:
                 group.unshard_parameters(phase)
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
-        is_recomputing = self.phase is Phase.BACKWARD or _is_in_backward()
+        is_recomputing = self.phase is Phase.BACKWARD or is_in_backward()
         if is_recomputing:
             self._release_unsharded_storage(rowwise_only=True)
         else:
